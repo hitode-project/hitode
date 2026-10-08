@@ -2350,6 +2350,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     crate::gir_capture::record(region, snapshot.origin, bytes, &instructions);
     #[cfg(feature = "gir-lift")]
     crate::gir::diagnostics::record(&instructions, region.start);
+    #[cfg(feature = "gir-lower")]
+    crate::gir::diagnostics::record_lower(&instructions, region.start, snapshot.base, snapshot.len);
     Ok(Compiled {
         perf_ranges,
         ir_counts: ir_counts.map(|counts| {

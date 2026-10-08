@@ -2,6 +2,7 @@
 //! scheduling stay in adv-machine; all ABI layouts and dispositions live here.
 pub(super) mod context;
 mod mapping;
+mod native;
 pub(super) mod phase;
 mod system_service;
 pub(crate) use phase::uncaught_query_blocker;
@@ -49,6 +50,21 @@ pub(crate) fn install<B: Backend>(machine: &mut Machine<B>) {
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    native::register(registry);
+    crate::stdcall(
+        registry,
+        "ntdll.dll",
+        "RtlAddVectoredExceptionHandler",
+        2,
+        |env| add_vectored(env, env.arg(0), GuestPtr::new(env.arg(1))),
+    );
+    crate::stdcall(
+        registry,
+        "ntdll.dll",
+        "RtlRemoveVectoredExceptionHandler",
+        1,
+        |env| remove_vectored(env, GuestPtr::new(env.arg(0))),
+    );
     for api in [
         add_vectored_ABI,
         remove_vectored_ABI,
@@ -201,7 +217,7 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint
         }
     };
     mapping::normalize_context(&record, &mut checkpoint.state);
-    dispatch(env, checkpoint, record)
+    dispatch_origin(env, checkpoint, record, native::Source::Hardware)
 }
 
 struct Record {
@@ -227,6 +243,15 @@ struct Search {
 }
 
 fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcome {
+    dispatch_origin(env, checkpoint, record, native::Source::Raise)
+}
+
+fn dispatch_origin(
+    env: &mut Env<'_>,
+    checkpoint: Checkpoint,
+    record: Record,
+    source: native::Source,
+) -> Outcome {
     let mut outer: Vec<_> = env
         .ext
         .try_get::<FrameDispatch>()
@@ -270,7 +295,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
     }
     let vectored = env.ext.get_or_default::<Vectored>().order.clone();
     let active = phase::enter(env, phase::Phase::Dispatch, record.code);
-    search(
+    native::deliver(
         env,
         Search {
             checkpoint,
@@ -283,6 +308,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
             outer: outer.into(),
             nested: None,
         },
+        source,
     )
 }
 
@@ -338,7 +364,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         return Outcome::call_on_stack(
             handler.0,
             [search.scratch + POINTERS],
-            search.scratch,
+            search.scratch.min(env.cpu.reg(Reg::Esp)),
             move |env, result| match result.value() {
                 u32::MAX => resume(env, search),
                 0 => self::search(env, search),
@@ -421,30 +447,43 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
     if let Err(error) = handler_frame(env, search.scratch + HANDLER_FRAME, args, handler) {
         return Outcome::Fail(format!("SEH handler frame write failed: {error}"));
     }
-    Outcome::call_on_stack(handler, args, search.scratch, move |env, result| {
-        drop(active);
-        if search.nested == Some(frame) {
-            search.nested = None;
-            if let Err(error) = nested_flag(env, &mut search, false) {
-                return Outcome::Fail(format!("nested exception record write failed: {error}"));
+    Outcome::call_on_stack(
+        handler,
+        args,
+        search.scratch.min(env.cpu.reg(Reg::Esp)),
+        move |env, result| {
+            drop(active);
+            if search.nested == Some(frame) {
+                search.nested = None;
+                if let Err(error) = nested_flag(env, &mut search, false) {
+                    return Outcome::Fail(format!("nested exception record write failed: {error}"));
+                }
             }
-        }
-        match result.value() {
-            0 => resume(env, search),
-            1 => self::search(env, search),
-            value => Outcome::Fail(format!("unsupported SEH disposition {value:#x}")),
-        }
-    })
+            match result.value() {
+                0 => resume(env, search),
+                1 => self::search(env, search),
+                value => Outcome::Fail(format!("unsupported SEH disposition {value:#x}")),
+            }
+        },
+    )
     // An `__except` or catch target resumes on the establisher's stack and
     // never returns here; dropping this continuation also ends the phase.
     .unwindable()
 }
 
-fn resume(env: &mut Env<'_>, mut search: Search) -> Outcome {
+fn resume(env: &mut Env<'_>, search: Search) -> Outcome {
     if search.record.flags & 1 != 0 {
         return Outcome::Fail("cannot continue a noncontinuable Windows exception".into());
     }
-    let address = search.scratch + CONTEXT;
+    native::continue_execution(
+        env,
+        search.checkpoint,
+        search.scratch + CONTEXT,
+        search.scratch,
+    )
+}
+
+fn restore_context(env: &mut Env<'_>, mut checkpoint: Checkpoint, address: u32) -> Outcome {
     if !env
         .cpu
         .accessible(address, context::SIZE as u32, Prot::READ)
@@ -455,10 +494,10 @@ fn resume(env: &mut Env<'_>, mut search: Search) -> Outcome {
     if let Err(error) = env.cpu.read(address, &mut bytes) {
         return Outcome::Fail(error.to_string());
     }
-    if let Err(error) = context::decode(&bytes, &mut search.checkpoint.state) {
+    if let Err(error) = context::decode(&bytes, &mut checkpoint.state) {
         return Outcome::Fail(error);
     }
-    Outcome::ResumeExecution(search.checkpoint)
+    Outcome::ResumeExecution(checkpoint.unwind_callbacks())
 }
 
 #[cfg(test)]

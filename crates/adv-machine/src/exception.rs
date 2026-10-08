@@ -99,6 +99,7 @@ pub struct Checkpoint {
     context: CtxId,
     depth: usize,
     frame: Option<u64>,
+    unwind_descendants: bool,
 }
 
 impl Env<'_> {
@@ -108,6 +109,13 @@ impl Env<'_> {
 }
 
 impl Checkpoint {
+    /// Permit retirement of explicitly unwindable callbacks created after capture.
+    /// The captured ancestor and owning machine/context must still be live.
+    pub fn unwind_callbacks(mut self) -> Self {
+        self.unwind_descendants = true;
+        self
+    }
+
     pub(crate) fn capture(cpu: &mut dyn Guest, sys: &Sys) -> Result<Self, StateError> {
         let context = sys.current_context();
         Ok(Self {
@@ -116,28 +124,42 @@ impl Checkpoint {
             context: context.id,
             depth: context.frames.len(),
             frame: context.frames.last().map(|frame| frame.id),
+            unwind_descendants: false,
         })
     }
 
-    pub(crate) fn restore(self, cpu: &mut dyn Guest, sys: &Sys) -> Result<(), String> {
+    pub(crate) fn restore(self, cpu: &mut dyn Guest, sys: &mut Sys) -> Result<(), String> {
         let context = sys.current_context();
         if !std::sync::Arc::ptr_eq(&self.machine, &sys.checkpoint_identity)
             || self.context != context.id
-            || self.depth != context.frames.len()
-            || self.frame != context.frames.last().map(|frame| frame.id)
+            || self.depth > context.frames.len()
+            || self.frame
+                != self
+                    .depth
+                    .checked_sub(1)
+                    .and_then(|i| context.frames.get(i))
+                    .map(|frame| frame.id)
+            || (!self.unwind_descendants && self.depth != context.frames.len())
+            || context.frames[self.depth..]
+                .iter()
+                .any(|frame| !frame.unwindable)
         {
             return Err("architectural resume crossed its live continuation boundary".into());
         }
         // Crossing a host callback requires an explicit unwind/cancellation protocol.
         if context
             .frames
-            .last()
+            .get(self.depth.wrapping_sub(1))
             .is_some_and(|frame| self.state.regs[4] >= frame.stack)
         {
             return Err("architectural resume requires unsupported continuation unwind".into());
         }
         cpu.restore_architecture(&self.state)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        sys.contexts[sys.current as usize]
+            .frames
+            .truncate(self.depth);
+        Ok(())
     }
 }
 
@@ -187,6 +209,46 @@ mod tests {
         }
     }
     #[test]
+    fn explicit_unwind_retires_only_descendants_of_the_captured_live_ancestor() {
+        let mut machine = machine();
+        machine.sys.contexts[0].frames.push(frame(1));
+        machine.cpu.set_reg(Reg::Esp, 0x800);
+        let mut checkpoint = Checkpoint::capture(&mut machine.cpu, &machine.sys).unwrap();
+        checkpoint.state.regs[0] = 0x1234;
+        let mut child = frame(2);
+        child.unwindable = true;
+        machine.sys.contexts[0].frames.push(child);
+        checkpoint
+            .unwind_callbacks()
+            .restore(&mut machine.cpu, &mut machine.sys)
+            .unwrap();
+        assert_eq!(machine.cpu.reg(Reg::Eax), 0x1234);
+        assert_eq!(machine.sys.contexts[0].frames.len(), 1);
+        assert_eq!(machine.sys.contexts[0].frames[0].id, 1);
+
+        let checkpoint = Checkpoint::capture(&mut machine.cpu, &machine.sys).unwrap();
+        machine.sys.contexts[0].frames.push(frame(3));
+        assert!(
+            checkpoint
+                .unwind_callbacks()
+                .restore(&mut machine.cpu, &mut machine.sys)
+                .is_err()
+        );
+        assert_eq!(machine.sys.contexts[0].frames.len(), 2);
+        machine.sys.contexts[0].frames.pop();
+
+        let checkpoint = Checkpoint::capture(&mut machine.cpu, &machine.sys).unwrap();
+        machine.sys.contexts[0].frames[0] = frame(4);
+        assert!(
+            checkpoint
+                .unwind_callbacks()
+                .restore(&mut machine.cpu, &mut machine.sys)
+                .is_err()
+        );
+        assert_eq!(machine.sys.contexts[0].frames[0].id, 4);
+    }
+
+    #[test]
     fn different_context_or_replaced_ancestor_cannot_reuse_a_checkpoint() {
         let mut machine = machine();
         machine.cpu.set_reg(Reg::Eax, 0x1234);
@@ -195,7 +257,7 @@ mod tests {
         machine.sys.current = 1;
         assert!(
             checkpoint
-                .restore(&mut machine.cpu, &machine.sys)
+                .restore(&mut machine.cpu, &mut machine.sys)
                 .unwrap_err()
                 .contains("boundary")
         );
@@ -206,7 +268,7 @@ mod tests {
         machine.sys.contexts[0].frames[0] = frame(2);
         assert!(
             checkpoint
-                .restore(&mut machine.cpu, &machine.sys)
+                .restore(&mut machine.cpu, &mut machine.sys)
                 .unwrap_err()
                 .contains("boundary")
         );
@@ -221,7 +283,7 @@ mod tests {
         let before = machine.cpu.capture_architecture().unwrap();
         assert!(
             checkpoint
-                .restore(&mut machine.cpu, &machine.sys)
+                .restore(&mut machine.cpu, &mut machine.sys)
                 .unwrap_err()
                 .contains("unwind")
         );
@@ -235,7 +297,7 @@ mod tests {
         let before = other.cpu.capture_architecture().unwrap();
         assert!(
             checkpoint
-                .restore(&mut other.cpu, &other.sys)
+                .restore(&mut other.cpu, &mut other.sys)
                 .unwrap_err()
                 .contains("boundary")
         );

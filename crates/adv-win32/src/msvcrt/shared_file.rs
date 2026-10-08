@@ -48,21 +48,6 @@ fn invalid(env: &mut Env<'_>, clear_dos: bool) -> Outcome {
     invalid_parameter_result(env, &name, 22, 0)
 }
 
-pub(super) fn io_code(error: &std::io::Error) -> u32 {
-    #[cfg(windows)]
-    if let Some(code) = error.raw_os_error() {
-        return code as u32;
-    }
-    match error.kind() {
-        std::io::ErrorKind::NotFound => 2,
-        std::io::ErrorKind::PermissionDenied => 5,
-        std::io::ErrorKind::AlreadyExists => 80,
-        std::io::ErrorKind::OutOfMemory => 8,
-        std::io::ErrorKind::InvalidInput => 87,
-        _ => 5,
-    }
-}
-
 pub(super) fn dos_errno(dos: u32) -> i32 {
     match dos {
         2 | 3 | 15 | 18 | 123 | 206 => 2,
@@ -147,42 +132,22 @@ fn open(env: &mut Env<'_>, filename: u32, mode: u32, share: i32, wide: bool) -> 
             "shared CRT text/update/append modes are unavailable; only binary rb/wb are supported",
         );
     }
-    let guest = env
-        .ext
-        .get::<crate::Win32>()
-        .vfs
-        .normalize(&name)
-        .to_lowercase();
-    let required_share = if mode == "wb" { 2 } else { 1 };
-    if env
-        .sys
-        .objects
-        .all_hosts::<crate::FileObj>()
-        .any(|(_, file)| {
-            file.guest_path.to_lowercase() == guest
-                && (file.share & required_share == 0 || file.access & (0x10000 | 0x10000000) != 0)
-        })
-    {
-        return fail(env, errno, 13, 32);
-    }
-    // Refuse conflicts before VFS write-path creation or OpenOptions truncation.
-    let mut options = file_open_options(&mode).expect("validated binary rb/wb mode");
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(3); // Native SH_DENYNO shares read/write, not delete.
-    }
-    match crt_open_file_options(env, &name, &mode, options) {
-        Ok(stream) => {
-            // Measured VC80 success preserves errno/DOS errno and sets LastError0.
-            crate::util::set_last_error(env, 0);
-            Outcome::Return(stream)
-        }
-        Err(error) => {
-            let dos = io_code(&error);
-            fail(env, errno, dos_errno(dos), dos)
-        }
-    }
+    file::open(
+        env,
+        &name,
+        &mode,
+        3,
+        Box::new(move |env, result| match result {
+            Ok(stream) => {
+                crate::util::set_last_error(env, 0);
+                Outcome::Return(stream)
+            }
+            Err(status) => {
+                let dos = crate::kernel32::file::native::win32_error(status);
+                fail(env, errno, dos_errno(dos), dos)
+            }
+        }),
+    )
 }
 
 #[win32(msvcrt, name = "_fsopen", level = implement)]

@@ -243,7 +243,7 @@ fn signed(value: u64, width: Width) -> i64 {
     let shift = 64 - width.bits();
     ((value << shift) as i64) >> shift
 }
-fn value(r: &Region, id: ValueId, values: &[u64]) -> u64 {
+pub(super) fn value(r: &Region, id: ValueId, values: &[u64]) -> u64 {
     let v = &r.values[id.0];
     let get = |id: ValueId| values[id.0];
     let result = match &v.kind {
@@ -265,6 +265,15 @@ fn value(r: &Region, id: ValueId, values: &[u64]) -> u64 {
             Pure::Select { condition, yes, no } => get(if get(condition) != 0 { yes } else { no }),
             Pure::Condition { flags, code } => u64::from(condition(code, get(flags) as u32)),
             Pure::Nonzero(a) => u64::from(get(a) != 0),
+            Pure::FlagBit { flags, bit } => u64::from(get(flags) & u64::from(bit) != 0),
+            Pure::FlagPack { bits, rest } => {
+                (get(rest) & u64::from(!ARITHMETIC))
+                    | bits
+                        .into_iter()
+                        .zip(FLAG_BITS)
+                        .map(|(v, bit)| get(v) * u64::from(bit))
+                        .fold(0, |a, b| a | b)
+            }
             Pure::Binary(op, a, b) => {
                 let (a, b) = (get(a), get(b));
                 let bits = v.width.bits();
@@ -296,7 +305,7 @@ fn value(r: &Region, id: ValueId, values: &[u64]) -> u64 {
     };
     result & v.width.mask()
 }
-fn flags(f: &Flags, values: &[u64]) -> u32 {
+pub(super) fn flags(f: &Flags, values: &[u64]) -> u32 {
     let get = |id: ValueId| values[id.0];
     let old = get(f.preserved) as u32;
     let (a, b, carry, result) = (get(f.lhs), get(f.rhs), get(f.carry), get(f.result));
@@ -392,7 +401,7 @@ fn flags(f: &Flags, values: &[u64]) -> u32 {
     }
     (old & !mask) | (out & mask)
 }
-fn condition(code: iced_x86::ConditionCode, flags: u32) -> bool {
+pub(super) fn condition(code: iced_x86::ConditionCode, flags: u32) -> bool {
     use iced_x86::ConditionCode::*;
     let carry = flags & CF != 0;
     let zero = flags & ZF != 0;

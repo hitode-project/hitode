@@ -633,6 +633,12 @@ impl Objects {
             .kernel_identity
     }
 
+    /// Borrow the process-local, never-reused owner ID behind a kernel alias.
+    /// Looking it up neither retains the object nor creates a handle alias.
+    pub fn object_id(&self, handle: Handle) -> Option<u64> {
+        self.targets.get(&(0, handle)).copied()
+    }
+
     pub fn has_identity(&self, identity: Handle) -> bool {
         self.kernel_identities.contains_key(&identity)
     }
@@ -656,6 +662,33 @@ impl Objects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_owner_ids_share_aliases_without_retention_and_survive_numeric_reuse() {
+        let mut objects = Objects::default();
+        let handle = objects.insert_host(7u32);
+        let owner = objects.object_id(handle).unwrap();
+        let token = objects
+            .lookup_alias::<u32>(Namespace::DEFAULT, handle)
+            .unwrap();
+        assert_eq!(objects.strong_count(token), Some(1));
+        assert_eq!(objects.object_id(handle), Some(owner));
+        assert_eq!(objects.strong_count(token), Some(1));
+        let alias = objects.duplicate(handle).unwrap();
+        assert_eq!(objects.object_id(alias), Some(owner));
+        assert_eq!(objects.strong_count(token), Some(2));
+        objects.close(handle);
+        assert_eq!(objects.object_id(handle), None);
+        assert_eq!(objects.object_id(alias), Some(owner));
+        objects.close(alias);
+        assert!(
+            objects.owned(token).is_none(),
+            "borrowed ID does not retain ownership"
+        );
+        assert!(objects.insert_host_at(Namespace::DEFAULT, handle, 8u32));
+        assert_ne!(objects.object_id(handle), Some(owner));
+        assert_eq!(objects.object_id(0), None);
+    }
 
     #[test]
     fn kernel_payload_iteration_tracks_retained_identity_not_closed_original_alias() {

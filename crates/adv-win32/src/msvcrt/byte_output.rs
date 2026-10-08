@@ -1,14 +1,13 @@
 //! Single-byte I/O through the existing process-owned CRT FILE/VFS owner.
 //! Only explicit binary streams are supported; no CRLF/orientation state,
 //! pseudo standard FILE or independently owned output handle is introduced.
-use super::{CrtState, Env, Outcome, Registry, floating, invalid_parameter_result};
+use super::{CrtState, Env, Outcome, Registry, file, floating, invalid_parameter_result};
 use adv_abi::{
     Api, GuestPtr,
     guest::{check_range, memory_failure},
     win32,
 };
-use adv_cpu::backend::Prot;
-use std::io::{Read, Write};
+use adv_cpu::backend::{GuestExt, Prot};
 
 const MODULES: [&str; 3] = ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"];
 
@@ -19,52 +18,14 @@ fn unsupported(env: &mut Env<'_>, reason: &'static str) -> Outcome {
     Outcome::Fail(format!("{api}: {reason}"))
 }
 
-fn io_failure(env: &mut Env<'_>, error: std::io::Error) -> Outcome {
-    // Native rb fputc fails with EBADF, preserving DOS errno/LastError and
-    // invoking no invalid handler. The owned File rejects that byte write
-    // with access denied (Windows) or EBADF (portable hosts).
-    let access = error.kind() == std::io::ErrorKind::PermissionDenied;
-    #[cfg(not(windows))]
-    let access = access || error.raw_os_error() == Some(9);
-    let cell = floating::errno_address(env);
-    if access {
-        return match cell.write(env.cpu, 9) {
+fn io_failure(env: &mut Env<'_>, status: u32) -> Outcome {
+    if status == 0xc000_0022 {
+        return match floating::errno_address(env).write(env.cpu, 9) {
             Ok(()) => Outcome::Return(u32::MAX),
-            Err(error) => memory_failure(error),
+            Err(fault) => memory_failure(fault),
         };
     }
-    #[cfg(windows)]
-    let dos = error.raw_os_error().map(|code| code as u32);
-    #[cfg(not(windows))]
-    let dos = None;
-    let dos: u32 = dos.unwrap_or(match error.kind() {
-        std::io::ErrorKind::OutOfMemory => 8,
-        std::io::ErrorKind::StorageFull => 112,
-        std::io::ErrorKind::BrokenPipe => 109,
-        std::io::ErrorKind::InvalidInput => 87,
-        _ => 1117,
-    });
-    let errno: i32 = match dos {
-        6 => 9,
-        8 | 14 => 12,
-        112 => 28,
-        109 => 32,
-        87 => 22,
-        _ => 5,
-    };
-    if let Err(error) = check_range(env.cpu, cell.addr(), 8, Prot::WRITE) {
-        return memory_failure(error);
-    }
-    let mut pair = [0; 8];
-    pair[..4].copy_from_slice(&errno.to_le_bytes());
-    pair[4..].copy_from_slice(&dos.to_le_bytes());
-    match env.cpu.write(cell.addr(), &pair) {
-        Ok(()) => {
-            crate::util::set_last_error(env, dos);
-            Outcome::Return(u32::MAX)
-        }
-        Err(error) => memory_failure(error),
-    }
+    file::error(env, status, u32::MAX)
 }
 
 fn output(env: &mut Env<'_>, character: i32, stream: GuestPtr<u8>) -> Outcome {
@@ -105,16 +66,22 @@ fn output(env: &mut Env<'_>, character: i32, stream: GuestPtr<u8>) -> Outcome {
         return memory_failure(error);
     }
     let byte = character as u8;
-    let file = env
-        .ext
-        .get_mut::<CrtState>()
-        .files
-        .get_mut(&stream.addr())
-        .expect("validated existing FILE owner, without an intervening guest call");
-    match file.write_all(&[byte]) {
-        Ok(()) => Outcome::Return(u32::from(byte)),
-        Err(error) => io_failure(env, error),
+    // The unbuffered FILE has no pending bytes; use its existing guest storage.
+    if let Err(fault) = env.cpu.write(stream.addr(), &[byte]) {
+        return memory_failure(fault);
     }
+    file::transfer(
+        env,
+        stream.addr(),
+        stream.addr(),
+        1,
+        true,
+        Box::new(move |env, result| match result {
+            Ok(1) => Outcome::Return(u32::from(byte)),
+            Ok(_) => Outcome::Return(u32::MAX),
+            Err(status) => io_failure(env, status),
+        }),
+    )
 }
 
 #[win32(msvcrt, name = "fputc", level = implement)]
@@ -151,19 +118,21 @@ fn input(env: &mut Env<'_>) -> Outcome {
     if let Err(error) = check_range(env.cpu, stream, 32, Prot::RW) {
         return memory_failure(error);
     }
-    let mut byte = [0u8];
-    let result = env
-        .ext
-        .get_mut::<CrtState>()
-        .files
-        .get_mut(&stream)
-        .unwrap()
-        .read(&mut byte);
-    match result {
-        Ok(0) => Outcome::Return(u32::MAX),
-        Ok(_) => Outcome::Return(u32::from(byte[0])),
-        Err(error) => io_failure(env, error),
-    }
+    file::transfer(
+        env,
+        stream,
+        stream,
+        1,
+        false,
+        Box::new(move |env, result| match result {
+            Ok(0) => Outcome::Return(u32::MAX),
+            Ok(_) => match env.cpu.read_u8(stream) {
+                Ok(byte) => Outcome::Return(u32::from(byte)),
+                Err(fault) => memory_failure(fault),
+            },
+            Err(status) => io_failure(env, status),
+        }),
+    )
 }
 
 pub(super) fn register(registry: &mut Registry) {

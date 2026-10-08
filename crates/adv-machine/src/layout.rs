@@ -47,8 +47,9 @@ pub const RESERVED: &[(u32, u32)] = &[
 ];
 
 pub const PEB_ADDR: u32 = 0x7ffd_f000;
-/// TEB of context `i` is at `TEB_TOP - i * PAGE`.
+/// TEB of execution storage slot `i` is at `TEB_TOP - i * PAGE`.
 pub const TEB_TOP: u32 = 0x7ffd_e000;
+/// Concurrent execution storage limit, independent of retained thread identities.
 pub const MAX_CONTEXTS: u32 = 64;
 
 pub const DEFAULT_STACK: u32 = 0x10_0000;

@@ -33,6 +33,16 @@ pub(crate) struct WakeQueue {
 }
 
 impl WakeQueue {
+    pub fn retire(&mut self, id: u32) {
+        if let Some(stamp) = self.pending.get_mut(id as usize) {
+            *stamp = None;
+        }
+        if self.last_promoted == Some(id) {
+            self.last_promoted = None;
+            self.urgent_run = 0;
+        }
+    }
+
     pub fn wake(&mut self, id: u32, observed_us: u64, deadline_us: Option<u64>) {
         self.wake_as(id, observed_us, deadline_us, WakePriority::Normal);
     }

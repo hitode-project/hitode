@@ -517,17 +517,20 @@ fn api_report(runtime: &Runtime) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
-    let processes = runtime.process_statuses().iter().map(|process| format!(
-        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}, \"first_cpu_fault\": {}, \"latest_cpu_fault\": {}}}",
+    let processes = runtime.process_statuses().iter().map(|process| {
+        let (mismatches, reasons) = runtime.process_structural_diagnostics(process.pid);
+        let warnings = reasons.iter().map(|(api, reason, count)| format!("{{\"api\": {}, \"reason\": {}, \"count\": {count}}}", json(api), json(reason))).collect::<Vec<_>>().join(", ");
+        format!(
+        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}, \"first_cpu_fault\": {}, \"latest_cpu_fault\": {}, \"structural_mismatches\": {}, \"structural_warnings\": [{}]}}",
         process.pid, process.parent.map_or_else(|| "null".into(), |v| v.to_string()), json(&process.image),
         process.exit_code.map_or_else(|| "null".into(), |v| v.to_string()),
         process.failure.as_deref().map_or_else(|| "null".into(), json),
         cpu_fault_json(process.first_cpu_fault.as_ref()),
-        cpu_fault_json(process.latest_cpu_fault.as_ref())
-    )).collect::<Vec<_>>().join(", ");
+        cpu_fault_json(process.latest_cpu_fault.as_ref()), mismatches, warnings
+    )}).collect::<Vec<_>>().join(", ");
     format!(
         concat!(
-            "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
+            "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, \"structural_mismatches\": {}, ",
             "\"called_gaps\": {{{}}}, \"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
             "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}, ",
             "\"warnings\": [{}], \"unrecorded_warnings\": {}, ",
@@ -540,6 +543,7 @@ fn api_report(runtime: &Runtime) -> String {
         json(mode),
         runtime.api_acceptance_eligible(),
         diagnostics.map_or(0, |d| d.stub_calls),
+        diagnostics.map_or(0, |d| d.structural_mismatches),
         gaps,
         recent,
         conflicts,
