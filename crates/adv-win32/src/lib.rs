@@ -38,7 +38,7 @@ use adv_cpu::backend::{Backend, Guest, GuestExt, MemFault};
 use adv_machine::layout::{PEB_ADDR, peb};
 use adv_machine::{Conv, Handler, Machine, Sys};
 
-use adv_os::{Codec, Heaps, OsConfig, Vfs, vfs};
+use adv_os::{Codec, Heaps, OsConfig, Vfs};
 
 /// The OS layer's configuration plus what only the Win32 personality uses.
 #[derive(Clone, Debug)]
@@ -65,13 +65,6 @@ impl Win32Config {
 }
 
 pub use adv_os::vfs::FileObj;
-
-/// FindFirstFile enumeration; a host object in the machine's handle table, like the others
-/// below.
-pub struct FindObj {
-    pub entries: Vec<vfs::DirEntry>,
-    pub next: usize,
-}
 
 /// One Toolhelp handle owner, with independently frozen process/thread/module/heap rows and
 /// cursors. The existing public thread fields retain their meaning.

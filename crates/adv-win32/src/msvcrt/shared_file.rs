@@ -48,21 +48,6 @@ fn invalid(env: &mut Env<'_>, clear_dos: bool) -> Outcome {
     invalid_parameter_result(env, &name, 22, 0)
 }
 
-pub(super) fn io_code(error: &std::io::Error) -> u32 {
-    #[cfg(windows)]
-    if let Some(code) = error.raw_os_error() {
-        return code as u32;
-    }
-    match error.kind() {
-        std::io::ErrorKind::NotFound => 2,
-        std::io::ErrorKind::PermissionDenied => 5,
-        std::io::ErrorKind::AlreadyExists => 80,
-        std::io::ErrorKind::OutOfMemory => 8,
-        std::io::ErrorKind::InvalidInput => 87,
-        _ => 5,
-    }
-}
-
 pub(super) fn dos_errno(dos: u32) -> i32 {
     match dos {
         2 | 3 | 15 | 18 | 123 | 206 => 2,

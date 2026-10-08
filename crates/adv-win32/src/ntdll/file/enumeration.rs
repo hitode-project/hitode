@@ -9,6 +9,16 @@ struct DirectoryObj {
     next: usize,
 }
 
+const MAX_ROWS: usize = 32768;
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+fn snapshot_bytes(entries: &[DirEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| std::mem::size_of::<DirEntry>() + entry.name.len())
+        .sum()
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(query_ABI);
     registry.register(adv_abi::Api {
@@ -169,13 +179,28 @@ pub(crate) fn query(
             Err(status) => return status,
         };
         let path = directory.path.clone();
-        let entries = match env.ext.get::<Win32>().vfs.list(&path) {
+        let entries: Vec<_> = match env.ext.get::<Win32>().vfs.list(&path) {
             Some(entries) => entries
                 .into_iter()
                 .filter(|entry| wildcard(&pattern, &entry.name))
                 .collect(),
             None => return ACCESS_DENIED,
         };
+        let existing: usize = env
+            .sys
+            .objects
+            .all_hosts::<DirectoryObj>()
+            .filter_map(|(_, directory)| directory.entries.as_deref())
+            .map(snapshot_bytes)
+            .sum();
+        if entries.len() > MAX_ROWS || existing + snapshot_bytes(&entries) > MAX_SNAPSHOT_BYTES {
+            adv_abi::warn_unavailable(
+                env,
+                "ntdll.dll!NtQueryDirectoryFile",
+                "directory snapshots are bounded to 32768 rows per cursor and 64MiB per process",
+            );
+            return INSUFFICIENT_RESOURCES;
+        }
         let directory = env.sys.objects.host_mut::<DirectoryObj>(handle.0).unwrap();
         directory.entries = Some(entries);
     }

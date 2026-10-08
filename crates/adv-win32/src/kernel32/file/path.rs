@@ -5,6 +5,9 @@ use adv_cpu::backend::{MemFault, Prot};
 
 mod name;
 
+#[cfg(test)]
+mod tests;
+
 fn ansi(env: &Env<'_>, path: AnsiStr) -> Result<String, MemFault> {
     Ok(env
         .ext
@@ -313,12 +316,13 @@ fn get_temp_file_name(
     } else {
         format!("{norm_dir}\\{filename}")
     };
+    let mut created = false;
     if create_file {
         if let Some(host) = w.vfs.write_path(&full) {
             if let Some(parent) = host.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(host, b"");
+            created = std::fs::write(host, b"").is_ok();
         }
     }
     if wide {
@@ -327,6 +331,17 @@ fn get_temp_file_name(
     } else {
         let b = w.codec.encode(&full);
         crate::util::put_cstr(env.cpu, output, 260, &b);
+    }
+    if created {
+        crate::native::diagnose_bypass(
+            env,
+            if wide {
+                "kernel32.dll!GetTempFileNameW"
+            } else {
+                "kernel32.dll!GetTempFileNameA"
+            },
+            &["NtCreateFile", "NtClose"],
+        );
     }
     Ok(num)
 }
@@ -393,7 +408,19 @@ fn remove(env: &mut Env<'_>, path: String) -> i32 {
         return 0;
     };
     match std::fs::remove_dir(host) {
-        Ok(()) => 1,
+        Ok(()) => {
+            crate::native::diagnose_bypass(
+                env,
+                "kernel32.dll!RemoveDirectory",
+                &[
+                    "NtCreateFile",
+                    "NtOpenFile",
+                    "NtSetInformationFile",
+                    "NtClose",
+                ],
+            );
+            1
+        }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
                 set_last_error(env, 145);

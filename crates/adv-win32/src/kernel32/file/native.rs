@@ -18,7 +18,7 @@ fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
 }
 pub(in crate::kernel32) mod bridge;
 pub(in crate::kernel32) mod copy;
-pub(in crate::kernel32) mod find;
+pub(crate) mod find;
 pub(in crate::kernel32) mod metadata;
 pub(crate) mod operations;
 
@@ -131,7 +131,7 @@ pub(in crate::kernel32) fn overridden(
 }
 
 pub(in crate::kernel32) fn active(env: &mut Env<'_>) -> Result<bool, LoadError> {
-    for name in ["NtCreateFile", "NtOpenFile", "NtReadFile"] {
+    for name in ["NtCreateFile", "NtOpenFile", "NtReadFile", "NtClose"] {
         if overridden(env, name)?.is_some() {
             return Ok(true);
         }
@@ -172,15 +172,20 @@ impl Read {
         };
         Outcome::call(target, [self.handle], move |env, resumed| {
             trace(env, "native_close", &[self.handle], resumed.value());
-            if resumed.value() == 0 {
+            if resumed.value() == 0x103 {
+                return Outcome::Fail(
+                    "native file: pending close requires native asynchronous completion support"
+                        .into(),
+                );
+            }
+            if (resumed.value() as i32) >= 0 {
                 self.finish(env, result)
             } else {
-                warn_unavailable(
-                    env,
-                    "kernel32.dll!<native file reader>",
-                    "guest native file close failed",
-                );
-                self.finish(env, Err(resumed.value()))
+                let result = match result {
+                    Err(status) => Err(status),
+                    Ok(_) => Err(resumed.value()),
+                };
+                self.finish(env, result)
             }
         })
     }

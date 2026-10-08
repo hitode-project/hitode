@@ -1,5 +1,5 @@
-//! Legacy time64/size32 searches borrow the shared VFS rows and Objects payload.
-//! A typed CRT alias keeps these intptr_t values separate from Kernel32 handles.
+//! Legacy time64/size32 searches consume the shared native directory cursor.
+//! A typed CRT alias owns its original native handle, without storing another row.
 use adv_abi::{
     GuestPtr, Registry, WideStr,
     guest::{check_range, memory_failure},
@@ -7,61 +7,56 @@ use adv_abi::{
 };
 use adv_cpu::backend::{MemFault, Prot};
 use adv_machine::{Env, Namespace, Objects, Outcome};
-use adv_os::vfs::{DirEntry, wildcard};
+use adv_os::vfs::wildcard;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{floating, invalid_parameter_result};
-use crate::{FindObj, Win32, util::set_last_error};
+use super::{floating, invalid_parameter_result, shared_file};
+use crate::{
+    kernel32::file::native::{find, operations, win32_error},
+    util::set_last_error,
+};
 
 const MODULES: [&str; 3] = ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"];
 const DATA_BYTES: u32 = 560;
-const MAX_ROWS: usize = 32768;
 const MAX_SEARCHES: usize = 256;
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct Search {
+    native: u32,
+    owner: Option<u64>,
+}
 
 #[derive(Default)]
 struct Searches {
-    // No second cursor/handle registry: all frozen rows live in FindObj payloads.
     namespace: Option<Namespace>,
 }
 
-fn snapshot_bytes(entries: &[DirEntry]) -> usize {
-    entries
-        .iter()
-        .map(|row| std::mem::size_of::<DirEntry>() + row.name.len())
-        .sum()
-}
-
 impl Searches {
-    fn get<'a>(&self, objects: &'a Objects, handle: u32) -> Option<&'a FindObj> {
-        let id = objects.lookup_alias::<FindObj>(self.namespace?, handle)?;
-        objects.owned(id)
+    fn raw(&self, objects: &Objects, handle: u32) -> Option<Search> {
+        let id = objects.lookup_alias::<Search>(self.namespace?, handle)?;
+        objects.owned(id).copied()
     }
 
-    fn get_mut<'a>(&self, objects: &'a mut Objects, handle: u32) -> Option<&'a mut FindObj> {
-        let id = objects.lookup_alias::<FindObj>(self.namespace?, handle)?;
-        objects.owned_mut(id)
+    fn get(&self, objects: &Objects, handle: u32) -> Option<Search> {
+        let search = self.raw(objects, handle)?;
+        (objects.object_id(search.native) == search.owner).then_some(search)
     }
 
-    fn insert(&mut self, objects: &mut Objects, entries: Vec<DirEntry>) -> Option<u32> {
+    fn insert(&mut self, objects: &mut Objects, native: u32) -> Option<u32> {
         if self.namespace.is_none() {
             self.namespace = objects.new_namespace_in(0x0b00_0004, 0x0bff_fffc);
         }
         let namespace = self.namespace?;
-        let bytes: usize = objects
-            .hosts_in::<FindObj>(namespace)
-            .map(|(_, search)| snapshot_bytes(&search.entries))
-            .sum();
-        if objects.alias_count(namespace) >= MAX_SEARCHES
-            || bytes + snapshot_bytes(&entries) > MAX_SNAPSHOT_BYTES
-        {
+        if objects.alias_count(namespace) >= MAX_SEARCHES {
             return None;
         }
-        objects.insert_host_in(namespace, FindObj { entries, next: 0 })
+        let owner = objects.object_id(native);
+        objects.insert_host_in(namespace, Search { native, owner })
     }
 
     fn close(&self, objects: &mut Objects, handle: u32) -> bool {
-        if self.get(objects, handle).is_none() {
+        if self.raw(objects, handle).is_none() {
             return false;
         }
         objects
@@ -112,6 +107,7 @@ fn invalid(env: &mut Env<'_>, name: &str) -> Outcome {
     invalid_parameter_result(env, name, 22, u32::MAX)
 }
 
+#[cfg(test)]
 fn unix_seconds(time: Option<SystemTime>) -> Result<i64, ()> {
     let Some(time) = time else { return Ok(-1) };
     match time.duration_since(UNIX_EPOCH) {
@@ -132,8 +128,22 @@ struct Packet {
     body: Vec<u8>,
 }
 
-fn packet(row: &DirEntry) -> Result<Packet, (&'static str, i32, u32)> {
-    let name: Vec<_> = row.name.encode_utf16().collect();
+fn packet(bytes: &[u8]) -> Result<Packet, (&'static str, i32, u32)> {
+    let invalid = ("native directory record is malformed", 22, 87);
+    if bytes.len() < 94 {
+        return Err(invalid);
+    }
+    let length = u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
+    if length & 1 != 0 || length > bytes.len() - 94 {
+        return Err(invalid);
+    }
+    let name: Vec<_> = bytes[94..94 + length]
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes(unit.try_into().unwrap()))
+        .collect();
+    if String::from_utf16(&name).is_err() {
+        return Err(("native directory name contains unpaired UTF-16", 42, 1113));
+    }
     if name.len() >= 260 {
         return Err((
             "search names exceeding 259 UTF-16 units are unavailable",
@@ -141,7 +151,10 @@ fn packet(row: &DirEntry) -> Result<Packet, (&'static str, i32, u32)> {
             206,
         ));
     }
-    if !row.is_dir && row.size > u32::MAX as u64 {
+    let attributes = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+    let size = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let directory = attributes & 0x10 != 0;
+    if !directory && size > u32::MAX as u64 {
         return Err((
             "time64/size32 searches cannot represent files larger than UINT32_MAX",
             40,
@@ -149,24 +162,23 @@ fn packet(row: &DirEntry) -> Result<Packet, (&'static str, i32, u32)> {
         ));
     }
     let mut body = Vec::with_capacity(28 + (name.len() + 1) * 2);
-    for time in [row.created, row.accessed, row.modified] {
-        let seconds = unix_seconds(time).map_err(|_| {
-            (
-                "filesystem timestamps exceed the signed time64 profile",
-                40,
-                50,
-            )
-        })?;
+    for offset in [8, 16, 24] {
+        let ticks = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let seconds = if ticks == 0 {
+            -1
+        } else {
+            ((i128::from(ticks) - 116_444_736_000_000_000).div_euclid(10_000_000)) as i64
+        };
         body.extend_from_slice(&seconds.to_le_bytes());
     }
-    body.extend_from_slice(&(if row.is_dir { 0 } else { row.size as u32 }).to_le_bytes());
+    body.extend_from_slice(&(if directory { 0 } else { size as u32 }).to_le_bytes());
     for unit in name.into_iter().chain([0]) {
         body.extend_from_slice(&unit.to_le_bytes());
     }
     Ok(Packet {
         // CRT _A_NORMAL is zero; other supported bits use the shared virtual
         // READONLY/HIDDEN/SYSTEM/SUBDIR/ARCHIVE attribute view, not host flags.
-        attrib: (row.attributes & 0x37).to_le_bytes(),
+        attrib: (attributes & 0x37).to_le_bytes(),
         body,
     })
 }
@@ -177,6 +189,29 @@ fn publish(env: &mut Env<'_>, data: u32, packet: &Packet) -> Result<(), MemFault
     check_range(env.cpu, data, DATA_BYTES, Prot::WRITE)?;
     env.cpu.write(data, &packet.attrib)?;
     env.cpu.write(data + 8, &packet.body)
+}
+
+fn native_failure(env: &mut Env<'_>, errno: GuestPtr<i32>, status: u32, first: bool) -> Outcome {
+    let dos = match status {
+        0x8000_0006 => {
+            if first {
+                2
+            } else {
+                18
+            }
+        }
+        _ => win32_error(status),
+    };
+    let value = if dos == 18 {
+        2
+    } else {
+        shared_file::dos_errno(dos)
+    };
+    fail(env, errno, value, dos)
+}
+
+fn discard(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
+    operations::close(env, handle, Box::new(move |_, _| outcome))
 }
 
 #[win32(msvcrt, name = "_wfindfirst64i32", level = implement)]
@@ -208,97 +243,75 @@ fn first(env: &mut Env<'_>, pattern: WideStr, data: GuestPtr<u8>) -> Outcome {
     if pattern.is_empty() {
         return fail(env, errno, 2, 3);
     }
-    let w = env.ext.get::<Win32>();
-    let full = w.vfs.normalize(&pattern);
-    let (directory, mask) = full.rsplit_once('\\').unwrap_or(("", &full));
-    let directory = if directory.len() == 2 {
-        format!("{directory}\\")
-    } else {
-        directory.to_owned()
-    };
-    if !w.vfs.is_dir(&directory) {
-        return fail(env, errno, 2, 3);
-    }
-    let Some(entries) = w.vfs.list(&directory) else {
-        return fail(env, errno, 13, 5);
-    };
-    let entries: Vec<_> = entries
-        .into_iter()
-        .filter(|row| wildcard(mask, &row.name))
-        .collect();
-    if entries.len() > MAX_ROWS {
-        return unsupported(
-            env,
-            errno,
-            "_wfindfirst64i32",
-            "directory snapshots are bounded to 32768 rows",
-            12,
-            8,
-        );
-    }
-    let Some(row) = entries.first() else {
-        return fail(env, errno, 2, 2);
-    };
-    let packet = match packet(row) {
-        Ok(packet) => packet,
-        Err((reason, value, dos)) => {
-            return unsupported(env, errno, "_wfindfirst64i32", reason, value, dos);
-        }
-    };
     if let Err(error) = check_range(env.cpu, data.addr(), DATA_BYTES, Prot::WRITE) {
         return memory_failure(error);
     }
-    if entries
-        .iter()
-        .any(|row| row.created.is_none() || row.accessed.is_none() || row.modified.is_none())
+    // The pristine VFS directory profile omits synthetic dot entries. Providers
+    // remain authoritative and may return those entries themselves.
+    if matches!(
+        crate::native::overridden(env, "NtQueryDirectoryFile"),
+        Ok(None)
+    ) && pattern
+        .rsplit('\\')
+        .next()
+        .is_some_and(|mask| wildcard(mask, ".") || wildcard(mask, ".."))
     {
-        adv_abi::warn_unavailable(
-            env,
-            &api(env, "_wfindfirst64i32"),
-            "filesystem timestamps missing from the shared VFS snapshot are reported as -1",
-        );
-    }
-    // The shared VFS currently supplies real directory children, without . and
-    // .. synthetic entries. Keep this existing profile observable to callers.
-    if wildcard(mask, ".") || wildcard(mask, "..") {
         adv_abi::warn_unavailable(
             env,
             &api(env, "_wfindfirst64i32"),
             "shared VFS enumeration omits dot directory entries",
         );
     }
-    let Some(handle) = env
-        .ext
-        .get_or_default::<Searches>()
-        .insert(&mut env.sys.objects, entries)
-    else {
-        return unsupported(
-            env,
-            errno,
-            "_wfindfirst64i32",
-            "search owner capacity is exhausted (256 searches/64MiB snapshots)",
-            12,
-            8,
-        );
-    };
-    if let Err(error) = publish(env, data.addr(), &packet) {
-        env.ext
-            .get::<Searches>()
-            .close(&mut env.sys.objects, handle);
-        return memory_failure(error);
-    }
-    env.ext
-        .get::<Searches>()
-        .get_mut(&mut env.sys.objects, handle)
-        .unwrap()
-        .next = 1;
-    set_last_error(env, 0);
-    crate::native::diagnose_bypass(
+    find::open_then(
         env,
-        &api(env, "_wfindfirst64i32"),
-        &["NtOpenFile", "NtCreateFile", "NtQueryDirectoryFile"],
-    );
-    Outcome::Return(handle)
+        pattern,
+        Box::new(move |env, result| {
+            let (native, bytes) = match result {
+                Ok(result) => result,
+                Err(status) => return native_failure(env, errno, status, true),
+            };
+            let packet = match packet(&bytes) {
+                Ok(packet) => packet,
+                Err((reason, value, dos)) => {
+                    let outcome = unsupported(env, errno, "_wfindfirst64i32", reason, value, dos);
+                    return discard(env, native, outcome);
+                }
+            };
+            if [8, 16, 24]
+                .into_iter()
+                .any(|offset| bytes[offset..offset + 8] == [0; 8])
+            {
+                adv_abi::warn_unavailable(
+                    env,
+                    &api(env, "_wfindfirst64i32"),
+                    "missing native directory timestamps are reported as -1",
+                );
+            }
+            let Some(handle) = env
+                .ext
+                .get_or_default::<Searches>()
+                .insert(&mut env.sys.objects, native)
+            else {
+                let outcome = unsupported(
+                    env,
+                    errno,
+                    "_wfindfirst64i32",
+                    "search owner capacity is exhausted (256 searches)",
+                    12,
+                    8,
+                );
+                return discard(env, native, outcome);
+            };
+            if let Err(error) = publish(env, data.addr(), &packet) {
+                env.ext
+                    .get::<Searches>()
+                    .close(&mut env.sys.objects, handle);
+                return discard(env, native, memory_failure(error));
+            }
+            set_last_error(env, 0);
+            Outcome::Return(handle)
+        }),
+    )
 }
 
 #[win32(msvcrt, name = "_wfindnext64i32", level = implement)]
@@ -317,25 +330,30 @@ fn next(env: &mut Env<'_>, handle: i32, data: GuestPtr<u8>) -> Outcome {
     else {
         return fail(env, errno, 22, 6);
     };
-    let Some(row) = search.entries.get(search.next) else {
-        return fail(env, errno, 2, 18);
-    };
-    let packet = match packet(row) {
-        Ok(packet) => packet,
-        Err((reason, value, dos)) => {
-            return unsupported(env, errno, "_wfindnext64i32", reason, value, dos);
-        }
-    };
-    if let Err(error) = publish(env, data.addr(), &packet) {
+    if let Err(error) = check_range(env.cpu, data.addr(), DATA_BYTES, Prot::WRITE) {
         return memory_failure(error);
     }
-    env.ext
-        .get::<Searches>()
-        .get_mut(&mut env.sys.objects, handle as u32)
-        .unwrap()
-        .next += 1;
-    crate::native::diagnose_bypass(env, &api(env, "_wfindnext64i32"), &["NtQueryDirectoryFile"]);
-    Outcome::Return(0)
+    find::query_then(
+        env,
+        search.native,
+        None,
+        Box::new(move |env, result| {
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(status) => return native_failure(env, errno, status, false),
+            };
+            let packet = match packet(&bytes) {
+                Ok(packet) => packet,
+                Err((reason, value, dos)) => {
+                    return unsupported(env, errno, "_wfindnext64i32", reason, value, dos);
+                }
+            };
+            match publish(env, data.addr(), &packet) {
+                Ok(()) => Outcome::Return(0),
+                Err(error) => memory_failure(error),
+            }
+        }),
+    )
 }
 
 #[win32(msvcrt, name = "_findclose", level = state)]
@@ -344,16 +362,29 @@ fn close(env: &mut Env<'_>, handle: i32) -> Outcome {
         Ok(errno) => errno,
         Err(outcome) => return outcome,
     };
-    let closed = env
+    let search = env
         .ext
         .try_get::<Searches>()
-        .is_some_and(|s| s.close(&mut env.sys.objects, handle as u32));
-    if closed {
-        crate::native::diagnose_bypass(env, &api(env, "_findclose"), &["NtClose"]);
-        Outcome::Return(0)
-    } else {
-        fail(env, errno, 22, if handle == -1 { 6 } else { 998 })
-    }
+        .and_then(|s| s.get(&env.sys.objects, handle as u32));
+    let Some(search) = search else {
+        if let Some(searches) = env.ext.try_get::<Searches>() {
+            searches.close(&mut env.sys.objects, handle as u32);
+        }
+        return fail(env, errno, 22, if handle == -1 { 6 } else { 998 });
+    };
+    operations::close(
+        env,
+        search.native,
+        Box::new(move |env, result| match result {
+            Ok(()) => {
+                env.ext
+                    .get::<Searches>()
+                    .close(&mut env.sys.objects, handle as u32);
+                Outcome::Return(0)
+            }
+            Err(status) => native_failure(env, errno, status, false),
+        }),
+    )
 }
 
 pub(super) fn register(registry: &mut Registry) {
@@ -366,3 +397,6 @@ pub(super) fn register(registry: &mut Registry) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod native_tests;

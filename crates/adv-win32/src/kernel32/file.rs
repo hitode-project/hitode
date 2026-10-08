@@ -15,7 +15,7 @@ pub(crate) mod native;
 
 pub(crate) mod information;
 mod locking;
-pub(crate) use attributes::file_attributes_path;
+pub(crate) use attributes::{file_attributes_path, file_attributes_path_then};
 mod path;
 mod profile;
 #[cfg(test)]

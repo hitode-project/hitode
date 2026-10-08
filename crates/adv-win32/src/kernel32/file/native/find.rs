@@ -90,17 +90,22 @@ fn publish(env: &mut Env<'_>, output: u32, wide: bool, bytes: &[u8]) -> Result<(
     env.cpu.write(output, &data).map_err(|_| ACCESS_VIOLATION)
 }
 
-fn query(env: &mut Env<'_>, handle: u32, mask: Option<String>, output: u32, wide: bool) -> Outcome {
+pub(crate) fn query_then(
+    env: &mut Env<'_>,
+    handle: u32,
+    mask: Option<String>,
+    then: operations::Done<Vec<u8>>,
+) -> Outcome {
     let first = mask.is_some();
     let units: Vec<_> = mask.as_deref().unwrap_or("").encode_utf16().collect();
     if units.len() > 32767 {
-        return failure(env, INVALID_PARAMETER, first);
+        return then(env, Err(INVALID_PARAMETER));
     }
     const BUFFER: u32 = 16;
     const CAPACITY: u32 = 64 * 1024;
     let scratch = match attributes(env, r"C:\", BUFFER + CAPACITY + units.len() as u32 * 2) {
         Ok(scratch) => scratch,
-        Err(status) => return failure(env, status, first),
+        Err(status) => return then(env, Err(status)),
     };
     let iosb = scratch.extra;
     let descriptor = iosb + 8;
@@ -129,7 +134,7 @@ fn query(env: &mut Env<'_>, handle: u32, mask: Option<String>, output: u32, wide
             });
         if initialized.is_err() {
             scratch.free(env);
-            return failure(env, ACCESS_VIOLATION, first);
+            return then(env, Err(ACCESS_VIOLATION));
         }
     }
     let filename = if first { descriptor } else { 0 };
@@ -151,25 +156,11 @@ fn query(env: &mut Env<'_>, handle: u32, mask: Option<String>, output: u32, wide
                 env.cpu
                     .read(buffer, &mut bytes)
                     .map_err(|_| ACCESS_VIOLATION)?;
-                publish(env, output, wide, &bytes)
+                Ok(bytes)
             })
         };
         scratch.free(env);
-        match result {
-            Ok(()) => {
-                if first {
-                    let identity = env.sys.objects.object_id(handle);
-                    env.ext.get_or_default::<Finds>().0.insert(handle, identity);
-                }
-                Outcome::Return(if first { handle } else { 1 })
-            }
-            Err(status) if first => operations::close(
-                env,
-                handle,
-                Box::new(move |env, _| failure(env, status, true)),
-            ),
-            Err(status) => failure(env, status, false),
-        }
+        then(env, result)
     };
     match overridden(env, "NtQueryDirectoryFile") {
         Ok(Some(target)) => Outcome::call(
@@ -210,18 +201,28 @@ fn query(env: &mut Env<'_>, handle: u32, mask: Option<String>, output: u32, wide
     }
 }
 
-pub(in crate::kernel32) fn first(
+fn query(env: &mut Env<'_>, handle: u32, output: u32, wide: bool) -> Outcome {
+    query_then(
+        env,
+        handle,
+        None,
+        Box::new(move |env, result| {
+            match result.and_then(|bytes| publish(env, output, wide, &bytes)) {
+                Ok(()) => Outcome::Return(1),
+                Err(status) => failure(env, status, false),
+            }
+        }),
+    )
+}
+
+pub(crate) fn open_then(
     env: &mut Env<'_>,
     pattern: String,
-    output: u32,
-    wide: bool,
+    then: operations::Done<(u32, Vec<u8>)>,
 ) -> Outcome {
-    if check_range(env.cpu, output, if wide { 592 } else { 320 }, Prot::WRITE).is_err() {
-        return failure(env, ACCESS_VIOLATION, true);
-    }
     let full = env.ext.get::<Win32>().vfs.normalize(&pattern);
     let Some((directory, mask)) = full.rsplit_once('\\') else {
-        return failure(env, INVALID_PARAMETER, true);
+        return then(env, Err(INVALID_PARAMETER));
     };
     let directory = if directory.len() == 2 {
         format!("{directory}\\")
@@ -237,7 +238,49 @@ pub(in crate::kernel32) fn first(
         1,
         0x21,
         Box::new(move |env, result| match result {
-            Ok(handle) => query(env, handle, Some(mask), output, wide),
+            Ok(handle) => query_then(
+                env,
+                handle,
+                Some(mask),
+                Box::new(move |env, result| match result {
+                    Ok(bytes) => then(env, Ok((handle, bytes))),
+                    Err(status) => operations::close(
+                        env,
+                        handle,
+                        Box::new(move |env, _| then(env, Err(status))),
+                    ),
+                }),
+            ),
+            Err(status) => then(env, Err(status)),
+        }),
+    )
+}
+
+pub(in crate::kernel32) fn first(
+    env: &mut Env<'_>,
+    pattern: String,
+    output: u32,
+    wide: bool,
+) -> Outcome {
+    if check_range(env.cpu, output, if wide { 592 } else { 320 }, Prot::WRITE).is_err() {
+        return failure(env, ACCESS_VIOLATION, true);
+    }
+    open_then(
+        env,
+        pattern,
+        Box::new(move |env, result| match result {
+            Ok((handle, bytes)) => match publish(env, output, wide, &bytes) {
+                Ok(()) => {
+                    let identity = env.sys.objects.object_id(handle);
+                    env.ext.get_or_default::<Finds>().0.insert(handle, identity);
+                    Outcome::Return(handle)
+                }
+                Err(status) => operations::close(
+                    env,
+                    handle,
+                    Box::new(move |env, _| failure(env, status, true)),
+                ),
+            },
             Err(status) => failure(env, status, true),
         }),
     )
@@ -251,7 +294,7 @@ pub(in crate::kernel32) fn next(env: &mut Env<'_>, wide: bool) -> Outcome {
     if check_range(env.cpu, output, if wide { 592 } else { 320 }, Prot::WRITE).is_err() {
         return failure(env, ACCESS_VIOLATION, false);
     }
-    query(env, handle, None, output, wide)
+    query(env, handle, output, wide)
 }
 
 pub(in crate::kernel32) fn close(env: &mut Env<'_>, handle: u32) -> Outcome {
