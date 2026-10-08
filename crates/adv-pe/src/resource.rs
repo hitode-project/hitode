@@ -1,6 +1,6 @@
 //! `.rsrc` tree: `IMAGE_RESOURCE_DIRECTORY` levels (type → name → language) and data entries.
 
-use crate::{Pe, PeError, Result};
+use crate::{DataDir, Pe, PeError, Result, add, reserve};
 
 /// A resource type, name, or language key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -118,8 +118,9 @@ impl ResourceDir {
     }
 }
 
-pub(crate) fn parse(pe: &Pe, root: u32) -> Result<ResourceDir> {
-    ResourceDir::read(root, |rva, output| {
+pub(crate) fn parse(pe: &Pe, dir: DataDir) -> Result<ResourceDir> {
+    ResourceDir::read(dir.rva, |rva, output| {
+        // Resource offsets are checked against the image, not advisory Size.
         output.copy_from_slice(pe.slice(rva, output.len() as u32)?);
         Ok(())
     })
@@ -144,11 +145,6 @@ struct Reader<F> {
     bytes: usize,
 }
 
-fn add(rva: u32, offset: u32) -> Result<u32> {
-    rva.checked_add(offset)
-        .ok_or(PeError::OutOfImage { rva, len: offset })
-}
-
 impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
     fn read_bytes(&mut self, rva: u32, output: &mut [u8]) -> Result<()> {
         self.bytes = self
@@ -164,12 +160,6 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
         Ok(u16::from_le_bytes(bytes))
     }
 
-    fn word(&mut self, rva: u32) -> Result<u32> {
-        let mut bytes = [0; 4];
-        self.read_bytes(rva, &mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
     fn directory(&mut self, root: u32, offset: u32, depth: u32) -> Result<ResourceDir> {
         if depth > 8 {
             return Err(PeError::Malformed("resource tree too deep".into()));
@@ -181,21 +171,32 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
             .nodes
             .checked_sub(count)
             .ok_or_else(|| PeError::Malformed("resource node budget exceeded".into()))?;
-        let mut entries = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let entry = add(directory, 16 + 8 * index)?;
-            let (name, target) = (self.word(entry)?, self.word(add(entry, 4)?)?);
+        let mut entries = Vec::new();
+        // Read the complete bounded entry array before allocating decoded nodes.
+        let mut encoded_entries = Vec::new();
+        reserve(&mut encoded_entries, count as usize * 8)?;
+        encoded_entries.resize(count as usize * 8, 0);
+        self.read_bytes(add(directory, 16)?, &mut encoded_entries)?;
+        reserve(&mut entries, count as usize)?;
+        for entry in encoded_entries.chunks_exact(8) {
+            let name = u32::from_le_bytes(entry[..4].try_into().unwrap());
+            let target = u32::from_le_bytes(entry[4..].try_into().unwrap());
             let id = if name & 0x8000_0000 != 0 {
                 let string = add(root, name & 0x7fff_ffff)?;
                 let length = usize::from(self.short(string)?) * 2;
-                let mut encoded = vec![0; length];
+                let mut encoded = Vec::new();
+                reserve(&mut encoded, length)?;
+                encoded.resize(length, 0);
                 self.read_bytes(add(string, 2)?, &mut encoded)?;
-                let units: Vec<_> = encoded
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|bytes| u16::from_le_bytes(*bytes))
-                    .collect();
+                let mut units = Vec::new();
+                reserve(&mut units, length / 2)?;
+                units.extend(
+                    encoded
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|bytes| u16::from_le_bytes(*bytes)),
+                );
                 ResId::Name(String::from_utf16_lossy(&units))
             } else {
                 ResId::Id(name as u16)
@@ -204,11 +205,14 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
                 ResourceNode::Dir(self.directory(root, target & 0x7fff_ffff, depth + 1)?)
             } else {
                 let data = add(root, target)?;
+                // The reserved final word is not consumed by resource lookup.
+                let mut bytes = [0; 12];
+                self.read_bytes(data, &mut bytes)?;
                 ResourceNode::Data(ResourceData {
                     entry_rva: data,
-                    rva: self.word(data)?,
-                    size: self.word(add(data, 4)?)?,
-                    codepage: self.word(add(data, 8)?)?,
+                    rva: u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                    size: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                    codepage: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 })
             };
             entries.push(ResourceEntry { id, node });
@@ -234,7 +238,7 @@ mod tests {
             Ok(())
         });
         assert!(matches!(result, Err(PeError::Malformed(_))));
-        assert_eq!(reads, 36);
+        assert_eq!(reads, 27);
     }
 
     #[test]
