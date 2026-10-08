@@ -79,6 +79,7 @@ pub fn classify(i: &Instruction) -> Result<(), Reject> {
         | M::Cbw => Ok(()),
         M::Imul if i.op_count() > 1 || operand_width(i, 0) == Width::B32 => Ok(()),
         M::Mul if operand_width(i, 0) == Width::B32 => Ok(()),
+        M::Pushf | M::Pushfd => Ok(()),
         M::Push | M::Pop if i.stack_pointer_increment().unsigned_abs() <= 4 => Ok(()),
         M::Call if matches!(i.code(), Code::Call_rel32_32 | Code::Call_rm32) => Ok(()),
         M::Jmp
@@ -132,35 +133,39 @@ pub struct Lifted {
     pub region: Region,
     pub supported: usize,
     pub rejected: BTreeMap<Reject, usize>,
+    pub inlined_calls: usize,
+    pub call_boundaries: BTreeMap<super::cfg::Boundary, usize>,
 }
 
-/// All blocks have nine architectural parameters followed by the effect token.
-/// One instruction per block deliberately keeps G1.1 commits easy to audit.
+/// Discover bounded call contexts, then build guest basic blocks with explicit
+/// instruction commits. State is threaded directly within each basic block.
 pub fn lift(
     instructions: &BTreeMap<u32, Instruction>,
     start: u32,
 ) -> Result<Lifted, super::verify::Error> {
+    lift_with_limits(instructions, start, super::cfg::Limits::default())
+}
+pub fn lift_with_limits(
+    instructions: &BTreeMap<u32, Instruction>,
+    start: u32,
+    limits: super::cfg::Limits,
+) -> Result<Lifted, super::verify::Error> {
+    let plan = super::cfg::discover(instructions, start, limits)?;
     let mut region = Region {
-        entry: BlockId(0),
+        entry: plan.entry,
         blocks: vec![],
         values: vec![],
         memory: vec![],
         commits: vec![],
         snapshots: vec![],
+        recovery: vec![],
         dependencies: vec![],
         semantic_version: 1,
+        inline_limit: limits.depth,
+        inline_budget: limits.instructions.saturating_sub(instructions.len()),
     };
-    let map: BTreeMap<_, _> = instructions
-        .keys()
-        .enumerate()
-        .map(|(n, &pc)| (pc, BlockId(n)))
-        .collect();
-    let Some(&entry) = map.get(&start) else {
-        return Err(super::verify::Error::region("missing entry instruction"));
-    };
-    region.entry = entry;
-    for (&pc, i) in instructions {
-        let block = map[&pc];
+    for (n, planned) in plan.blocks.iter().enumerate() {
+        let block = BlockId(n);
         let parameters: Vec<_> = (0..10)
             .map(|index| {
                 let id = ValueId(region.values.len());
@@ -176,6 +181,9 @@ pub fn lift(
             flags: parameters[8],
         };
         region.blocks.push(Block {
+            entry_state: state.clone(),
+            entry_token: parameters[9],
+            inline_depth: planned.depth,
             parameters: parameters.clone(),
             operations: vec![],
             terminator: Terminator::Exit(Exit {
@@ -185,67 +193,77 @@ pub fn lift(
                 reason: ExitReason::Complete,
             }),
         });
-        region.dependencies.push(Dependency {
-            start: pc,
-            length: i.len() as u32,
-            version: None,
-        });
     }
-    let mut supported = 0;
-    let mut rejected = BTreeMap::new();
-    for (&pc, i) in instructions {
-        let block = map[&pc];
-        let params = &region.blocks[block.0].parameters;
-        let state = StateMap {
-            gpr: std::array::from_fn(|n| params[n]),
-            flags: params[8],
+    for (n, planned) in plan.blocks.iter().enumerate() {
+        let block = BlockId(n);
+        let state = region.blocks[n].entry_state.clone();
+        let token = region.blocks[n].entry_token;
+        let mut b = Builder {
+            region: &mut region,
+            map: &planned.targets,
+            block,
+            state,
+            token,
+            point: CommitId(0),
+            snapshot: SnapshotId(0),
+            expected_return: planned.expected_return,
         };
-        let token = params[9];
-        let admission = classify(i);
-        let point = CommitId(region.commits.len());
-        let snapshot = SnapshotId(region.snapshots.len());
-        if admission.is_ok() {
-            region.commits.push(CommitPoint {
-                instruction: block.0 as u32,
+        for &pc in &planned.instructions {
+            let i = &instructions[&pc];
+            if let Err(reason) = classify(i) {
+                let value = b.constant(Width::B32, u64::from(pc));
+                b.finish(Terminator::Exit(
+                    b.exit(value, ExitReason::Unsupported(reason)),
+                ));
+                break;
+            }
+            b.point = CommitId(b.region.commits.len());
+            b.snapshot = SnapshotId(b.region.snapshots.len());
+            let dep = DependencyId(b.region.dependencies.len());
+            b.region.dependencies.push(Dependency {
+                start: pc,
+                length: i.len() as u32,
+                version: None,
+            });
+            b.region.commits.push(CommitPoint {
+                instruction: b.point.0 as u32,
                 pc,
                 next_pc: i.next_ip32(),
                 units: 1,
                 subprogress: 0,
             });
-            region.snapshots.push(Snapshot {
-                state: state.clone(),
-                commit: point,
+            b.region.snapshots.push(Snapshot {
+                state: b.state.clone(),
+                commit: b.point,
                 recipes: vec![],
                 private_slots: vec![],
-                dependencies: vec![DependencyId(block.0)],
+                dependencies: vec![dep],
                 lease: None,
             });
-        }
-        let mut b = Builder {
-            region: &mut region,
-            map: &map,
-            block,
-            state,
-            token,
-            point,
-            snapshot,
-        };
-        if let Err(reason) = admission {
-            *rejected.entry(reason).or_default() += 1;
-            let pc = b.constant(Width::B32, u64::from(pc));
-            b.finish(Terminator::Exit(
-                b.exit(pc, ExitReason::Unsupported(reason)),
-            ));
-        } else {
-            supported += 1;
             b.instruction(i);
         }
     }
+    let mut supported = 0;
+    let mut rejected = BTreeMap::new();
+    for i in instructions.values() {
+        match classify(i) {
+            Ok(()) => supported += 1,
+            Err(reason) => *rejected.entry(reason).or_default() += 1,
+        }
+    }
+    super::state_ssa::compact(&mut region);
+    region.recovery = region
+        .snapshots
+        .iter()
+        .map(|s| super::recovery::Dag::build(&region, &s.state))
+        .collect();
     super::verify::verify(&region)?;
     Ok(Lifted {
         region,
         supported,
         rejected,
+        inlined_calls: plan.inlined_calls,
+        call_boundaries: plan.call_boundaries,
     })
 }
 
@@ -257,6 +275,7 @@ struct Builder<'a> {
     token: ValueId,
     point: CommitId,
     snapshot: SnapshotId,
+    expected_return: Option<u32>,
 }
 impl Builder<'_> {
     fn value(&mut self, width: Width, kind: ValueKind) -> ValueId {
@@ -592,9 +611,15 @@ impl Builder<'_> {
                     self.write(i, 0, low, None);
                 }
             }
-            M::Push => {
+            M::Push | M::Pushf | M::Pushfd => {
                 let sw = width(i.stack_pointer_increment().unsigned_abs() as usize);
-                let value = self.read(i, 0, sw);
+                let value = if i.mnemonic() == M::Push {
+                    self.read(i, 0, sw)
+                } else {
+                    let mask = self.constant(Width::B32, 0xfffc_ffff);
+                    let flags = self.binary(Width::B32, Binary::And, self.state.flags, mask);
+                    self.cast(flags, sw, false)
+                };
                 let size = self.constant(Width::B32, u64::from(sw.bits() / 8));
                 let address = self.binary(Width::B32, Binary::Sub, self.state.gpr[4], size);
                 self.memory(
@@ -706,11 +731,20 @@ impl Builder<'_> {
                 taken: self.target(i.near_branch32()),
                 fallthrough: self.target(i.next_ip32()),
             }
+        } else if i.mnemonic() == M::Ret && self.expected_return.is_some() {
+            let expected = self.expected_return.unwrap();
+            match self.target(expected) {
+                Target::Block(matched) => Terminator::Return {
+                    actual: next,
+                    expected,
+                    matched,
+                    mismatch: self.exit(next, ExitReason::Indirect),
+                },
+                Target::Exit(_) => Terminator::Exit(self.exit(next, ExitReason::Indirect)),
+            }
         } else if indirect {
             Terminator::Exit(self.exit(next, ExitReason::Indirect))
         } else if let Some(pc) = direct {
-            // Call discovery/recursion policy belongs to G1.2. Explicit supplied
-            // direct edges retain the real guest stack write above.
             let target = self.target(pc);
             if i.mnemonic() == M::Call {
                 Terminator::Call {

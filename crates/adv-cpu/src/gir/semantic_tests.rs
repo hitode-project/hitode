@@ -430,13 +430,20 @@ fn every_budget_boundary_preserves_exact_memory_prefix() {
 
 #[test]
 fn guard_snapshots_observe_the_committed_prefix() {
-    let bytes = [0x40, 0x43];
+    let bytes = [0x40, 0xeb, 0, 0x43];
     for passes in [false, true] {
         let mut r = graph(&bytes);
         let Terminator::Jump(Target::Block(passed)) = r.blocks[0].terminator.clone() else {
             panic!()
         };
-        let Operation::Commit { state, .. } = r.blocks[0].operations.last().unwrap().clone() else {
+        let Operation::Commit { state, .. } = r.blocks[0]
+            .operations
+            .iter()
+            .rev()
+            .find(|op| matches!(op, Operation::Commit { .. }))
+            .unwrap()
+            .clone()
+        else {
             panic!()
         };
         let condition = ValueId(r.values.len());
@@ -448,13 +455,17 @@ fn guard_snapshots_observe_the_committed_prefix() {
         let failed = SnapshotId(r.snapshots.len());
         r.snapshots.push(Snapshot {
             state,
-            commit: CommitId(1),
+            commit: CommitId(2),
             recipes: vec![],
             private_slots: vec![],
             dependencies: vec![DependencyId(1)],
             lease: None,
         });
-        let token = passed.arguments[9];
+        r.recovery.push(super::recovery::Dag::build(
+            &r,
+            &r.snapshots[failed.0].state,
+        ));
+        let token = r.blocks[0].entry_token;
         r.blocks[0].terminator = Terminator::Guard {
             condition,
             passed,
@@ -462,7 +473,12 @@ fn guard_snapshots_observe_the_committed_prefix() {
             token,
         };
         let outcome = compare_graph(&r, &bytes, initial(), READ | WRITE, 10);
-        assert_eq!(outcome.frame.committed, if passes { 2 } else { 1 });
+        assert_eq!(outcome.frame.committed, if passes { 3 } else { 2 });
+        let native = super::lower_cl::compile(&r, BASE, LENGTH, false).unwrap();
+        assert_eq!(
+            native_prefix(&native, &bytes, &initial(), READ | WRITE, 10),
+            outcome.frame.committed
+        );
         if !passes {
             assert_eq!(outcome.stop, eval::Stop::Guard(failed));
         }
@@ -481,21 +497,11 @@ fn explicit_call_and_validated_return_edges() {
         a.ret().unwrap();
     });
     let mut r = graph(&bytes);
-    let return_pc = decoded(&bytes)[&BASE].next_ip32();
-    let ret = r.blocks.len() - 1;
-    let Terminator::Exit(exit) = r.blocks[ret].terminator.clone() else {
-        panic!()
-    };
-    let matched = Edge {
-        block: BlockId(1),
-        arguments: exit.state.values().chain([exit.token]).collect(),
-    };
-    r.blocks[ret].terminator = Terminator::Return {
-        actual: exit.pc,
-        expected: return_pc,
-        matched,
-        mismatch: exit,
-    };
+    let ret = r
+        .blocks
+        .iter()
+        .position(|b| matches!(b.terminator, Terminator::Return { .. }))
+        .unwrap();
     compare_graph(&r, &bytes, initial(), READ | WRITE, 100);
     if let Terminator::Return { expected, .. } = &mut r.blocks[ret].terminator {
         *expected += 1;
@@ -701,7 +707,7 @@ fn verifier_rejects_corrupted_graphs_without_panicking() {
     r.memory[0].snapshot = SnapshotId(99999);
     reject(r);
     let mut r = base.clone();
-    r.memory[1].input = r.blocks[0].parameters[9];
+    r.memory[1].input = r.blocks[r.entry.0].parameters[9];
     reject(r);
     let mut r = base.clone();
     r.memory[0].address = r.memory[0].result.unwrap();
@@ -713,7 +719,7 @@ fn verifier_rejects_corrupted_graphs_without_panicking() {
     r.snapshots[0].state.gpr[0] = r.memory[0].result.unwrap();
     reject(r);
     let mut r = base.clone();
-    r.snapshots[0].state.flags = r.blocks[0].parameters[9];
+    r.snapshots[0].state.flags = r.blocks[r.entry.0].parameters[9];
     reject(r);
     let mut r = base.clone();
     r.commits[0].units = 2;
@@ -725,25 +731,25 @@ fn verifier_rejects_corrupted_graphs_without_panicking() {
     r.memory[1].commit = CommitId(0);
     reject(r);
     let mut r = base.clone();
-    r.blocks[0].parameters.pop();
+    r.blocks[r.entry.0].parameters.pop();
     reject(r);
     let mut r = base.clone();
-    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[0].terminator {
-        e.arguments.pop();
+    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[r.entry.0].terminator {
+        e.arguments.push(ValueId(99999));
     }
     reject(r);
     let mut r = base.clone();
-    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[0].terminator {
+    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[r.entry.0].terminator {
         e.block = BlockId(99999);
     }
     reject(r);
     let mut r = base.clone();
-    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[0].terminator {
-        e.arguments[0] = e.arguments[9];
+    if let Terminator::Jump(Target::Block(e)) = &mut r.blocks[r.entry.0].terminator {
+        e.arguments.push(ValueId(99999));
     }
     reject(r);
     let mut r = base.clone();
-    r.values[r.blocks[0].parameters[0].0].width = Width::B8;
+    r.values[r.blocks[r.entry.0].parameters[0].0].width = Width::B8;
     reject(r);
     let mut r = base.clone();
     let op = r.blocks[0].operations[0].clone();
@@ -756,11 +762,21 @@ fn verifier_rejects_corrupted_graphs_without_panicking() {
     let Operation::Define(id) = r.blocks[0].operations[0] else {
         panic!()
     };
-    r.values[id.0].kind = ValueKind::Pure(Pure::Binary(Binary::Add, id, r.blocks[0].parameters[0]));
+    r.values[id.0].kind = ValueKind::Pure(Pure::Binary(
+        Binary::Add,
+        id,
+        r.blocks[r.entry.0].parameters[0],
+    ));
     reject(r);
 
     let mut r = base.clone();
-    let Operation::Commit { state, next_pc, .. } = r.blocks[0].operations.last().unwrap().clone()
+    let Operation::Commit { state, next_pc, .. } = r.blocks[0]
+        .operations
+        .iter()
+        .rev()
+        .find(|op| matches!(op, Operation::Commit { .. }))
+        .unwrap()
+        .clone()
     else {
         panic!()
     };
@@ -821,4 +837,268 @@ fn lift_private_captures() {
     eprintln!("{}", census.line());
     assert!(census.regions > 0);
     assert_eq!(census.verify_failures, 0);
+}
+
+fn cfg_fixture(seed: u64, corrupt_return: bool) -> Vec<u8> {
+    let mut rng = seed;
+    assemble(|a| {
+        let mut top = a.create_label();
+        let mut odd = a.create_label();
+        let mut join = a.create_label();
+        let mut callee = a.create_label();
+        let mut end = a.create_label();
+        a.mov(ecx, 3 + (random(&mut rng) % 4) as i32).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, random(&mut rng) as i32).unwrap();
+        a.test(cl, 1).unwrap();
+        a.jne(odd).unwrap();
+        a.sbb(edx, ebx).unwrap();
+        a.jmp(join).unwrap();
+        a.set_label(&mut odd).unwrap();
+        a.adc(ebx, eax).unwrap();
+        a.set_label(&mut join).unwrap();
+        a.call(callee).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.jmp(end).unwrap();
+        a.set_label(&mut callee).unwrap();
+        a.push(eax).unwrap();
+        a.ror(ax, cl).unwrap();
+        a.setb(ah).unwrap();
+        a.mov(word_ptr(esi), ax).unwrap();
+        a.pop(eax).unwrap();
+        if corrupt_return {
+            a.mov(dword_ptr(esp), BASE + 0x1000).unwrap();
+        }
+        a.ret().unwrap();
+        a.set_label(&mut end).unwrap();
+        a.pushfd().unwrap();
+        a.pop(edx).unwrap();
+        a.mov(eax, dword_ptr(edi)).unwrap();
+    })
+}
+fn native_prefix(
+    code: &super::lower_cl::Code,
+    bytes: &[u8],
+    cpu: &CpuState,
+    permission: u8,
+    budget: u64,
+) -> u64 {
+    use super::lower_cl as cl;
+    let mut m = memory(bytes, permission);
+    let mut reference = memory(bytes, permission);
+    let mut frame = cl::Frame::from_cpu(cpu);
+    let status = code.run(&mut frame, &mut m, budget).unwrap();
+    let mut expected = cpu.clone();
+    let mut oracle = Interpreter::new();
+    for _ in 0..frame.committed {
+        assert_eq!(oracle.step(&mut expected, &mut reference), Step::Executed);
+    }
+    assert_eq!(frame.gpr, expected.regs, "native GPR budget {budget}");
+    assert_eq!(frame.flags, expected.eflags, "native flags budget {budget}");
+    assert_eq!(frame.pc, expected.eip, "native PC budget {budget}");
+    assert_eq!(
+        m.read_data(BASE, LENGTH).unwrap(),
+        reference.read_data(BASE, LENGTH).unwrap(),
+        "native memory budget {budget}"
+    );
+    assert!(frame.committed <= budget);
+    if matches!(status, cl::READ_CHECK | cl::WRITE_CHECK) {
+        let mut resumed = cpu.clone();
+        frame.restore(&mut resumed);
+        let actual = Interpreter::new().step(&mut resumed, &mut m);
+        let expected = oracle.step(&mut expected, &mut reference);
+        assert_eq!(actual, expected, "native cold continuation");
+        match actual {
+            Step::ReadFault { pc, address } | Step::WriteFault { pc, address } => {
+                assert_eq!(pc, frame.pc);
+                assert_eq!(address, frame.address);
+                assert_eq!(resumed.regs, frame.gpr);
+                assert_eq!(resumed.eflags, frame.flags);
+            }
+            Step::Executed => {}
+            other => panic!("unexpected continuation {other:?}"),
+        }
+        assert_eq!(
+            m.read_data(BASE, LENGTH).unwrap(),
+            reference.read_data(BASE, LENGTH).unwrap()
+        );
+    }
+    frame.committed
+}
+#[test]
+fn native_cfg_loops_inline_calls_flags_and_return_mismatch() {
+    use super::lower_cl;
+    let mut checks = 0;
+    let mut commits = 0;
+    for seed in 1..=8 {
+        for mismatch in [false, true] {
+            let bytes = cfg_fixture(seed, mismatch);
+            let r = graph(&bytes);
+            assert!(
+                r.blocks
+                    .iter()
+                    .any(|b| matches!(b.terminator, Terminator::Return { .. }))
+            );
+            assert!(r.blocks.iter().any(|b| {
+                b.operations
+                    .iter()
+                    .filter(|o| matches!(o, Operation::Commit { .. }))
+                    .count()
+                    >= 3
+            }));
+            let code = lower_cl::compile(&r, BASE, LENGTH, false).unwrap();
+            for permission in [0, READ | WRITE] {
+                for budget in 0..=85 {
+                    commits += native_prefix(&code, &bytes, &initial(), permission, budget);
+                    checks += 1;
+                }
+            }
+            compare(&bytes, initial(), 0, 1000);
+        }
+    }
+    eprintln!("gir_native_cfg cases=16 prefixes={checks} cumulative_commits={commits}");
+}
+#[test]
+fn native_random_integer_and_fault_prefixes() {
+    let mut checks = 0;
+    for index in 0..32u64 {
+        let (sequence, cpu, permission) =
+            random_sequence(0x6a09_e667_f3bc_c909u64.wrapping_add(index.wrapping_mul(0x9e37_79bb)));
+        let bytes = sequence.concat();
+        let code = super::lower_cl::compile(&graph(&bytes), BASE, LENGTH, false).unwrap();
+        for budget in 0..=34 {
+            native_prefix(&code, &bytes, &cpu, permission, budget);
+            checks += 1;
+        }
+    }
+    for (bytes, write, stack) in [
+        (vec![0x01, 0x07], true, false),
+        (vec![0x50], true, true),
+        (vec![0xe8, 0, 0, 0, 0], true, true),
+        (vec![0x58], false, true),
+        (vec![0xc3], false, true),
+        (vec![0xc1, 0x27, 0], true, false),
+    ] {
+        let mut prefix = vec![0x83, 0xc3, 7];
+        prefix.extend(bytes);
+        let code = super::lower_cl::compile(&graph(&prefix), BASE, LENGTH, false).unwrap();
+        let mut cpu = initial();
+        if stack {
+            cpu.regs[4] = DATA + 0x1000 + if write { 4 } else { 0 };
+        }
+        for budget in 0..=4 {
+            native_prefix(&code, &prefix, &cpu, if write { READ } else { 0 }, budget);
+            checks += 1;
+        }
+    }
+    let bytes = [0x01, 0x07];
+    let code = super::lower_cl::compile(&graph(&bytes), BASE, LENGTH, false).unwrap();
+    for address in [
+        DATA + 0xffd,
+        DATA + 0xffe,
+        DATA + 0xfff,
+        0,
+        BASE - 1,
+        u32::MAX - 1,
+    ] {
+        let mut cpu = initial();
+        cpu.regs[7] = address;
+        native_prefix(&code, &bytes, &cpu, READ, 10);
+        checks += 1;
+    }
+    eprintln!("gir_native_random sequences=32 prefixes={checks}");
+}
+#[test]
+fn recovery_dag_sharing_and_new_verifier_invariants() {
+    use super::recovery::{Dag, MAX_DEPTH, MAX_NODES, Plan, Sharing, Source};
+    let bytes = cfg_fixture(1, false);
+    let r = graph(&bytes);
+    let plan = Plan::build(&r, Sharing::Compatible);
+    plan.verify(&r).unwrap();
+    assert!(plan.groups < plan.sites.len());
+    let mut missing = Plan::build(&r, Sharing::Compatible);
+    missing.sites[0].arguments.pop();
+    assert!(missing.verify(&r).is_err());
+    let mut depth = r.clone();
+    depth.blocks[0].inline_depth = depth.inline_limit + 1;
+    assert!(verify::verify(&depth).is_err());
+    let mut broken = r.clone();
+    let pack = broken
+        .values
+        .iter()
+        .position(|v| matches!(v.kind, ValueKind::Pure(Pure::FlagPack { .. })))
+        .unwrap();
+    if let ValueKind::Pure(Pure::FlagPack { bits, .. }) = &mut broken.values[pack].kind {
+        bits[0] = ValueId(usize::MAX);
+    }
+    assert!(verify::verify(&broken).is_err());
+    let mut dag = Dag::build(&r, &r.snapshots[0].state);
+    dag.nodes.resize(MAX_NODES + 1, dag.nodes[0].clone());
+    assert!(dag.verify(&r, &r.snapshots[0].state).is_err());
+    let mut dag = Dag::build(&r, &r.snapshots[0].state);
+    dag.nodes[0].source = Source::Pure(ValueKind::Load(MemoryId(0)));
+    assert!(dag.verify(&r, &r.snapshots[0].state).is_err());
+    let mut deep = r.clone();
+    let start = deep.snapshots[0].state.gpr[0];
+    let mut previous = start;
+    for _ in 0..=MAX_DEPTH {
+        let id = ValueId(deep.values.len());
+        deep.values.push(Value {
+            width: Width::B32,
+            kind: ValueKind::Pure(Pure::Binary(Binary::Add, previous, previous)),
+        });
+        previous = id;
+    }
+    let mut dag = Dag {
+        nodes: vec![super::recovery::Node {
+            value: start,
+            source: Source::Capture,
+        }],
+        roots: vec![MAX_DEPTH + 1; 9],
+    };
+    for n in 0..=MAX_DEPTH {
+        dag.nodes.push(super::recovery::Node {
+            value: ValueId(r.values.len() + n),
+            source: Source::Pure(ValueKind::Pure(Pure::Binary(
+                Binary::Add,
+                ValueId(n),
+                ValueId(n),
+            ))),
+        });
+    }
+    assert!(dag.verify(&deep, &deep.snapshots[0].state).is_err());
+}
+#[test]
+fn bounded_call_discovery_and_recursive_boundary() {
+    let bytes = cfg_fixture(2, false);
+    let map = decoded(&bytes);
+    for limits in [
+        super::cfg::Limits {
+            depth: 0,
+            instructions: 2048,
+        },
+        super::cfg::Limits {
+            depth: 4,
+            instructions: map.len(),
+        },
+    ] {
+        let l = lift::lift_with_limits(&map, BASE, limits).unwrap();
+        assert_eq!(l.inlined_calls, 0);
+        assert!(!l.call_boundaries.is_empty());
+        compare_graph(&l.region, &bytes, initial(), READ | WRITE, 100);
+    }
+    let bytes = assemble(|a| {
+        let mut f = a.create_label();
+        a.set_label(&mut f).unwrap();
+        a.call(f).unwrap();
+        a.ret().unwrap();
+    });
+    let l = lift::lift(&decoded(&bytes), BASE).unwrap();
+    assert_eq!(l.inlined_calls, 0);
+    assert!(
+        l.call_boundaries
+            .contains_key(&super::cfg::Boundary::Recursive)
+    );
+    compare_graph(&l.region, &bytes, initial(), READ | WRITE, 100);
 }
