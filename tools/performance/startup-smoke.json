@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Startup smoke list for personality-layer changes (docs/personality-contracts.md).",
+    "One sample per engine; exe is relative to $ADV_SAMPLES. Run with sample_matrix.py --quick",
+    "and gate with matrix_gate.py --require-frames --frame-tolerance 1; never part of CI."
+  ],
+  "samples": [
+    {
+      "id": "bgi",
+      "engine": "BGI",
+      "exe": "sakura_no_uta/BGI.exe",
+      "codepage": 932,
+      "quick": true
+    },
+    {
+      "id": "himawari",
+      "engine": "Himawari",
+      "exe": "Himawari - The Sunflower -/Himawari.exe",
+      "codepage": 932,
+      "quick": true
+    },
+    {
+      "id": "kirikiri",
+      "engine": "Kirikiri 2",
+      "exe": "AQUA/AQUA.exe",
+      "codepage": 932,
+      "quick": true,
+      "min_seconds": 30,
+      "min_seconds_reason": "first frame varies between 17 and 23 s on 2026-10-08 runners; 10 s ends before it"
+    },
+    {
+      "id": "majiro",
+      "engine": "Majiro",
+      "exe": "片羽（カタハネ）/カタハネ.exe",
+      "codepage": 932,
+      "quick": true
+    },
+    {
+      "id": "softpal",
+      "engine": "SoftPAL",
+      "exe": "七色★星露/nana_chs.exe",
+      "codepage": 936,
+      "quick": true
+    }
+  ]
+}

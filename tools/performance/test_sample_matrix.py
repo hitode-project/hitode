@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from sample_matrix import (analyze_report, diagnostic_completeness, milestones, quick_samples, run,
-                           validate_native_baseline, sample_path, import_warm_archives)
+                           sample_exe, validate_native_baseline, import_warm_archives)
 
 
 class CampaignTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class CampaignTests(unittest.TestCase):
             root = Path(directory)
             (root / "fixture.exe").write_bytes(b"fixture")
             with patch.dict(os.environ, {"ADV_SAMPLES": str(root)}):
-                self.assertEqual(sample_path({"exe": "fixture.exe"}), root / "fixture.exe")
+                self.assertEqual(sample_exe({"exe": "fixture.exe"}), root / "fixture.exe")
 
     def test_warm_archives_require_matching_inputs_and_copy_only_cache_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -47,6 +47,32 @@ class CampaignTests(unittest.TestCase):
         samples[1]["quick"] = True
         self.assertEqual(quick_samples(samples), {"a2"})
 
+    def test_min_seconds_requires_a_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "samples.json"
+            manifest.write_text(json.dumps({"samples": [
+                {"id": "one", "exe": str(root / "x.exe"), "min_seconds": 5}]}), encoding="utf-8")
+            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, quick=False)
+            with self.assertRaisesRegex(ValueError, "min_seconds_reason"):
+                run(args)
+
+    def test_relative_exes_resolve_only_inside_adv_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            game = root / "samples" / "game" / "fixture.exe"
+            game.parent.mkdir(parents=True)
+            game.write_bytes(b"")
+            sample = {"id": "one", "exe": "game/fixture.exe"}
+            with patch.dict("os.environ", {"ADV_SAMPLES": str(root / "samples")}):
+                self.assertEqual(sample_exe(sample), game)
+                with self.assertRaisesRegex(ValueError, "escapes ADV_SAMPLES"):
+                    sample_exe({"id": "two", "exe": "../outside.exe"}, strict=False)
+            with patch.dict("os.environ", {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "needs ADV_SAMPLES"):
+                    sample_exe(sample)
+                self.assertEqual(sample_exe({"id": "abs", "exe": str(game)}), game)
+
     def test_quick_run_launches_only_the_gate_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -55,13 +81,15 @@ class CampaignTests(unittest.TestCase):
             game.write_bytes(b"Not executed: subprocess is mocked")
             manifest = root / "samples.json"
             manifest.write_text(json.dumps({"samples": [
-                {"id": name, "exe": str(game), "engine": engine, "min_seconds": 25}
+                {"id": name, "exe": str(game), "engine": engine}
                 for name, engine in (("one", "A"), ("two", "A"), ("three", "B"))
             ]}), encoding="utf-8")
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["samples"][2].update(min_seconds=5, min_seconds_reason="late first frame")
+            manifest.write_text(json.dumps(data), encoding="utf-8")
             launched = []
 
             def launch(command, **kwargs):
-                self.assertEqual(command[command.index("--seconds") + 1], "25")
                 launched.append(Path(command[command.index("--report") + 1]).parent.name)
                 return SimpleNamespace(wait=lambda timeout: 0)
 
@@ -71,6 +99,8 @@ class CampaignTests(unittest.TestCase):
             with patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
             self.assertEqual(launched, ["one", "three"])
+            results = json.loads((root / "output" / "results.json").read_text())["samples"]
+            self.assertEqual([result["seconds"] for result in results], [1, 5])
             self.assertTrue(json.loads((root / "output" / "results.json").read_text())["quick_gate"])
             args.output, args.only = root / "other", ["two"]
             with self.assertRaisesRegex(ValueError, "no quick-gate samples"):
