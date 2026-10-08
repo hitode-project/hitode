@@ -29,6 +29,7 @@ Assert ($defaults.runs.Count -eq 4) 'Default run count changed.'
 Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lockfile.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
 Assert ($defaults.runs[0].shell.Contains('ADV_GIR=off')) 'GIR must not inherit the host selector.'
+Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Device temporary files must stay in the owned directory.'
 $gir = & $runner -WhatIf -TestName gir_execution -Gir state-ssa -Features gir-execute -JitVerify strict -Output $output | ConvertFrom-Json
 Assert ($gir.features.Count -eq 1 -and $gir.features[0] -eq 'gir-execute') 'GIR feature must be present exactly once.'
 Assert ($gir.runs[0].shell.Contains('ADV_GIR=state-ssa')) 'GIR selector did not reach the device.'

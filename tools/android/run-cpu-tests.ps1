@@ -90,7 +90,7 @@ function Get-DeviceCommand($remote, $run) {
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && CARGO_TARGET_DIR='$remote/target' ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
