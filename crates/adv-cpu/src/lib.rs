@@ -9,7 +9,11 @@ mod compile_budget;
 mod compiler;
 mod cpu_profile;
 #[cfg(all(
-    any(target_os = "linux", target_os = "android"),
+    any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod direct_memory;
@@ -20,7 +24,11 @@ mod executor;
 #[allow(dead_code)]
 mod fault_recipe;
 #[cfg(all(
-    any(target_os = "linux", target_os = "android"),
+    any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub mod fault_recovery;
@@ -51,6 +59,8 @@ pub mod interpreter;
 mod jit_memory;
 #[cfg(all(target_os = "android", target_arch = "aarch64"))]
 mod jit_memory_android;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod jit_memory_macos;
 mod linking;
 mod memory;
 mod parallel;

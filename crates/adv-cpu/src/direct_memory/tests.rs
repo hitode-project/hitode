@@ -14,7 +14,15 @@ fn owner(code: &[u8], mixed: bool) -> Executor {
         .unwrap();
     executor
         .memory
-        .protect(0x20000, 4096, READ | WRITE)
+        .protect(
+            0x20000,
+            if mixed {
+                4096
+            } else {
+                (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) as usize
+            },
+            READ | WRITE,
+        )
         .unwrap();
     executor.memory.write(0x10000, code).unwrap();
     executor

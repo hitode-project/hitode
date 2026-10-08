@@ -1,4 +1,4 @@
-//! Authored bridge fixtures; native evidence requires Linux/Android ARM64.
+//! Authored bridge fixtures; native evidence requires Linux/Android/macOS ARM64.
 use adv_cpu::{Executor, Tier1Mode};
 
 #[test]
@@ -15,7 +15,11 @@ fn mode_names_and_unsupported_platform_are_explicit() {
     assert_eq!(m.tier1_mode(), Tier1Mode::Off);
     if !cfg!(all(
         target_arch = "aarch64",
-        any(target_os = "linux", target_os = "android")
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos"
+        )
     )) {
         for mode in [Tier1Mode::Exclusive, Tier1Mode::Bridge] {
             assert!(m.set_tier1_mode(mode).is_err());
@@ -26,7 +30,7 @@ fn mode_names_and_unsupported_platform_are_explicit() {
 
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod native {
     use super::*;

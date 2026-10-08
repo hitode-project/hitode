@@ -108,7 +108,11 @@ impl WorkerLayout {
     pub(crate) unsafe fn into_memory(self) -> Memory {
         Memory {
             #[cfg(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             direct_engine: None,
@@ -138,7 +142,11 @@ impl WorkerLayout {
 
 pub struct Memory {
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     pub(crate) direct_engine: Option<crate::direct_memory::Engine>,
@@ -484,7 +492,11 @@ impl Memory {
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
         Ok(Self {
             #[cfg(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             direct_engine: None,
@@ -532,7 +544,11 @@ impl Memory {
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         Ok(Self {
             #[cfg(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             direct_engine: None,

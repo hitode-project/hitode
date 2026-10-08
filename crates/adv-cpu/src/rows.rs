@@ -656,6 +656,8 @@ fn execute(batch: &Batch) {
             rows: std::ptr::null(),
             written: 0,
         };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::jit_memory_macos::synchronize_execution();
         let reason = unsafe { kernel(&mut context, batch.memory as *mut u8, descriptor.target) };
         let counter = state.regs[descriptor.inner_counter];
         let exhausted = if descriptor.counter_size == 2 {

@@ -44,12 +44,20 @@ impl Drop for Engine {
 
 impl Engine {
     pub fn new() -> Result<Self, String> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let _write = crate::jit_memory_macos::WriteScope::new();
         let builder = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())
             .map_err(|e| e.to_string())?;
         #[cfg(all(target_os = "android", target_arch = "aarch64"))]
         let builder = {
             let mut builder = builder;
             builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
+            builder
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let builder = {
+            let mut builder = builder;
+            builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
             builder
         };
         let mut module = JITModule::new(builder);

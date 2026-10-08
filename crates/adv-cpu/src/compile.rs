@@ -18,7 +18,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(
-    any(target_os = "linux", target_os = "android"),
+    any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod direct;
@@ -162,6 +166,8 @@ impl Compiled {
         if self.input.direct_memory != memory.direct_memory_enabled() {
             return (Exit::Fallback as u32, 0);
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::jit_memory_macos::synchronize_execution();
         #[cfg(target_arch = "aarch64")]
         let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
@@ -744,6 +750,8 @@ pub(crate) fn compile(
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let _write = crate::jit_memory_macos::WriteScope::new();
     let ir_counts =
         ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
@@ -1022,8 +1030,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
     builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     builder.symbol(
@@ -1031,7 +1045,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         crate::direct_memory::access as *const u8,
     );
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     builder.symbol(
@@ -1089,7 +1107,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         })
         .transpose()?;
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     let direct_ids = if snapshot.direct_memory {
@@ -1529,7 +1551,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     })
         });
         #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         let direct_refs = direct_ids
@@ -1640,7 +1666,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepared_ref,
             timestamp_ref,
             #[cfg(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             direct_refs,
@@ -2340,7 +2370,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         excluded_entries,
         direct_sites: {
             #[cfg(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             {
@@ -2354,7 +2388,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 }
             }
             #[cfg(not(all(
-                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
                 any(target_arch = "x86_64", target_arch = "aarch64")
             )))]
             {
@@ -3054,7 +3092,11 @@ struct Emitter<'a> {
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
@@ -5793,7 +5835,11 @@ impl Emitter<'_> {
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
         #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         if self.direct_refs.is_some() {

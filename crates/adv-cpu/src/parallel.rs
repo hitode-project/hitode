@@ -438,6 +438,8 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
             let result = {
                 #[cfg(target_arch = "aarch64")]
                 let _fp_environment = crate::compile::fp_environment::Guard::enter();
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                crate::jit_memory_macos::synchronize_execution();
                 unsafe { entry(&mut context, memory.ptr.as_ptr()) }
             };
             entries += 1 + context.linked_entries;

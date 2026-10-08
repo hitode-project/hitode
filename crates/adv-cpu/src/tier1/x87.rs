@@ -81,7 +81,7 @@ fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> u32 {
 
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 pub(super) extern "C" fn call(entry: *mut super::native::Entry, op: *const NativeX87) -> u32 {
     // SAFETY: run_block exclusively owns CPU/memory and pins the immutable
