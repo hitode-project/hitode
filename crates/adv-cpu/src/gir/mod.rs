@@ -28,3 +28,8 @@ pub(crate) mod recovery;
 
 #[cfg(any(test, feature = "gir-lower"))]
 pub(crate) mod lower_cl;
+
+#[cfg(any(test, feature = "gir-execute"))]
+pub(crate) mod execution;
+#[cfg(test)]
+mod execution_tests;
