@@ -3,7 +3,7 @@
 use adv_abi::Registry;
 use adv_cpu::{
     JitCpu,
-    backend::{Guest, GuestExt, Prot, asm::Asm},
+    backend::{Guest, GuestExt, Prot, Reg, asm::Asm},
 };
 use adv_machine::{Clock, Machine, Object, RunResult, layout::PARK_ADDR};
 use adv_os::processes::{Error, Request, Services};
@@ -156,7 +156,7 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
             &[M(DATA), I(CONTEXT)],
             DATA + 24,
         );
-        code.mov_mem_imm(CONTEXT + 0xb0, 0x1234abcd);
+        code.mov_mem_imm(CONTEXT + 0x9c, 0x1234abcd);
         call(
             &mut machine,
             &mut code,
@@ -164,7 +164,7 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
             &[M(DATA), I(CONTEXT)],
             DATA + 28,
         );
-        code.mov_mem_imm(CONTEXT + 0xb0, 0);
+        code.mov_mem_imm(CONTEXT + 0x9c, 0);
         call(
             &mut machine,
             &mut code,
@@ -172,7 +172,7 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
             &[M(DATA), I(CONTEXT)],
             DATA + 32,
         );
-        code.mov_eax_mem(CONTEXT + 0xb0).mov_mem_eax(DATA + 36);
+        code.mov_eax_mem(CONTEXT + 0x9c).mov_mem_eax(DATA + 36);
         call(
             &mut machine,
             &mut code,
@@ -240,6 +240,246 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
         );
         assert_eq!((word(&machine, 64), word(&machine, 68)), (u32::MAX, 6));
         assert_eq!(word(&machine, 0x100), 1);
+    }
+}
+
+#[test]
+fn initial_thread_image_entry_consumes_modified_routine_and_parameter() {
+    for jit in [false, true] {
+        let services = Services::default();
+        let mut machine = machine(jit, 0x1000, &services);
+        let replacement = WORKER + 0x100;
+        let mut worker = Asm::new(WORKER);
+        worker.mov_mem_imm(DATA + 0x100, 1).ret_n(4);
+        machine.cpu.write(WORKER, &worker.bytes).unwrap();
+        let mut alternate = Asm::new(replacement);
+        alternate.mov_eax_esp(0).mov_mem_eax(DATA + 0x104);
+        alternate.mov_eax_fs(0).mov_mem_eax(DATA + 0x108);
+        alternate.mov_eax_ptr_eax().mov_mem_eax(DATA + 0x10c);
+        alternate
+            .mov_eax_mem(DATA + 0x108)
+            .add_eax_imm(4)
+            .mov_eax_ptr_eax()
+            .mov_mem_eax(DATA + 0x110);
+        alternate.mov_eax_esp(4).add_eax_imm(37).ret_n(4);
+        machine.cpu.write(replacement, &alternate.bytes).unwrap();
+        machine.cpu.write_u32(CONTEXT, 0x10007).unwrap();
+        let mut code = Asm::new(CODE);
+        call(
+            &mut machine,
+            &mut code,
+            "CreateThread",
+            &[I(0), I(0), I(WORKER), I(0x1234), I(4), I(0)],
+            DATA,
+        );
+        call(
+            &mut machine,
+            &mut code,
+            "GetThreadContext",
+            &[M(DATA), I(CONTEXT)],
+            DATA + 4,
+        );
+        for (offset, output) in [(0xb8, 8), (0xb0, 12), (0xa4, 16)] {
+            code.mov_eax_mem(CONTEXT + offset)
+                .mov_mem_eax(DATA + output);
+        }
+        code.mov_mem_imm(CONTEXT + 0xb0, replacement);
+        code.mov_mem_imm(CONTEXT + 0xa4, 41);
+        call(
+            &mut machine,
+            &mut code,
+            "SetThreadContext",
+            &[M(DATA), I(CONTEXT)],
+            DATA + 20,
+        );
+        call(
+            &mut machine,
+            &mut code,
+            "ResumeThread",
+            &[M(DATA)],
+            DATA + 24,
+        );
+        call(
+            &mut machine,
+            &mut code,
+            "WaitForSingleObject",
+            &[M(DATA), I(u32::MAX)],
+            DATA + 28,
+        );
+        call(
+            &mut machine,
+            &mut code,
+            "GetExitCodeThread",
+            &[M(DATA), I(DATA + 32)],
+            DATA + 36,
+        );
+        call(&mut machine, &mut code, "ExitProcess", &[I(0)], 0);
+        run(&mut machine, None, &services, code);
+        assert_eq!(word(&machine, 4), 1);
+        assert_eq!((word(&machine, 12), word(&machine, 16)), (WORKER, 0x1234));
+        assert_eq!(
+            (word(&machine, 20), word(&machine, 24), word(&machine, 28)),
+            (1, 1, 0)
+        );
+        assert_eq!((word(&machine, 32), word(&machine, 36)), (78, 1));
+        assert_eq!(word(&machine, 0x100), 0, "original routine never executes");
+        let modules = adv_os::modules(&machine.ext);
+        let ntdll = modules.by_name("ntdll.dll").unwrap();
+        assert_eq!(modules.containing(word(&machine, 8)), Some(ntdll));
+        assert_eq!(modules.containing(word(&machine, 0x104)), Some(ntdll));
+        let registration = word(&machine, 0x108);
+        let context = &machine.sys.contexts[1];
+        assert!((context.stack_lo..context.stack_hi - 7).contains(&registration));
+        assert_eq!(word(&machine, 0x10c), u32::MAX);
+        assert_eq!(modules.containing(word(&machine, 0x110)), Some(ntdll));
+    }
+}
+
+#[test]
+fn two_hundred_and_one_thousand_sequential_thread_calls_preserve_old_exit_codes() {
+    for jit in [false, true] {
+        for count in [200u32, 1000] {
+            let services = Services::default();
+            let mut machine = machine(jit, 0x1000, &services);
+            let mut worker = Asm::new(WORKER);
+            worker.mov_eax_esp(4).ret_n(4);
+            machine.cpu.write(WORKER, &worker.bytes).unwrap();
+            let failure = CODE + 0x7000;
+            let mut failed = Asm::new(failure);
+            call(&mut machine, &mut failed, "ExitProcess", &[I(99)], 0);
+            machine.cpu.write(failure, &failed.bytes).unwrap();
+            let mut code = Asm::new(CODE);
+            code.mov_mem_imm(DATA + 0x100, 0);
+            let start = code.here();
+            code.mov_eax_mem(DATA + 0x100)
+                .add_eax_imm(1)
+                .mov_mem_eax(DATA + 0x104);
+            call(
+                &mut machine,
+                &mut code,
+                "CreateThread",
+                &[I(0), I(0x10000), I(WORKER), M(DATA + 0x104), I(0), I(0)],
+                DATA,
+            );
+            code.bytes.extend_from_slice(&[0x85, 0xc0]); // test eax,eax
+            code.jz(failure);
+            call(
+                &mut machine,
+                &mut code,
+                "WaitForSingleObject",
+                &[M(DATA), I(u32::MAX)],
+                0,
+            );
+            code.bytes.extend_from_slice(&[0x85, 0xc0]);
+            code.jnz(failure);
+            call(
+                &mut machine,
+                &mut code,
+                "GetExitCodeThread",
+                &[M(DATA), I(DATA + 4)],
+                0,
+            );
+            code.bytes.extend_from_slice(&[0x83, 0xf8, 1]); // cmp eax,1
+            code.jnz(failure);
+            code.mov_eax_mem(DATA + 4);
+            code.bytes.extend_from_slice(&[0x3b, 0x05]); // cmp eax,[sequence]
+            code.bytes.extend_from_slice(&(DATA + 0x104).to_le_bytes());
+            code.jnz(failure);
+            code.mov_mem_eax(DATA + 0x100);
+            code.bytes.push(0x3d); // cmp eax,count
+            code.bytes.extend_from_slice(&count.to_le_bytes());
+            code.jnz(start);
+            call(&mut machine, &mut code, "ExitProcess", &[I(0)], 0);
+            run(&mut machine, None, &services, code);
+            assert_eq!(word(&machine, 0x100), count);
+            for sequence in 1..=count {
+                let context = &machine.sys.contexts[sequence as usize];
+                assert_eq!(context.exit_code(), Some(sequence));
+                assert!(
+                    matches!(machine.sys.objects.get(context.thread_handle), Some(Object::Thread { ctx }) if *ctx == context.id)
+                );
+                assert_eq!(context.completion.exit_code(), Some(sequence));
+            }
+        }
+    }
+}
+
+#[test]
+fn main_entry_and_callback_returns_belong_to_the_resident_system_image() {
+    for jit in [false, true] {
+        let services = Services::default();
+        let mut machine = machine(jit, 0x1000, &services);
+        let mut code = Asm::new(CODE);
+        code.mov_eax_esp(0).mov_mem_eax(DATA);
+        code.mov_eax_fs(0).mov_mem_eax(DATA + 4);
+        code.mov_eax_ptr_eax().mov_mem_eax(DATA + 8);
+        code.mov_eax_mem(DATA + 4)
+            .add_eax_imm(4)
+            .mov_eax_ptr_eax()
+            .mov_mem_eax(DATA + 12);
+        call(&mut machine, &mut code, "ExitProcess", &[I(0)], 0);
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        let main = machine
+            .start_main(CODE, CODE, 0x10000, "authored main")
+            .unwrap();
+        let ntdll = adv_os::modules(&machine.ext).by_name("ntdll.dll").unwrap();
+        machine
+            .visit_context(Some(main), |env| {
+                assert_eq!(env.cpu.reg(Reg::Eax), CODE);
+                assert_eq!(env.cpu.reg(Reg::Ebx), 0);
+                assert_eq!(
+                    adv_os::modules(env.ext).containing(env.cpu.reg(Reg::Eip)),
+                    Some(ntdll)
+                );
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
+        let modules = adv_os::modules(&machine.ext);
+        assert_eq!(modules.containing(word(&machine, 0)), Some(ntdll));
+        assert_ne!(word(&machine, 4), u32::MAX);
+        assert_eq!(word(&machine, 8), u32::MAX);
+        assert_eq!(modules.containing(word(&machine, 12)), Some(ntdll));
+    }
+}
+
+#[test]
+fn terminal_registration_declines_unhandled_exceptions_and_unwind_notifications() {
+    for jit in [false, true] {
+        let services = Services::default();
+        let mut machine = machine(jit, 0x1000, &services);
+        let handler = machine.sys.thread_exception_entry().unwrap();
+        let mut code = Asm::new(CODE);
+        // Both ordinary dispatch and unwind flags keep searching; this frame
+        // must never claim it handled an exception or fabricate a recovery PC.
+        for flags in [0, 2] {
+            code.mov_mem_imm(DATA + 0x204, flags);
+            for value in [0, 0, 0, DATA + 0x200] {
+                code.push_imm(value);
+            }
+            code.call(handler).mov_mem_eax(DATA + flags * 4);
+        }
+        call(
+            &mut machine,
+            &mut code,
+            "RaiseException",
+            &[I(0xe1234567), I(0), I(0), I(0)],
+            0,
+        );
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        machine
+            .start_main(CODE, CODE, 0x10000, "uncaught authored main")
+            .unwrap();
+        let result = machine.run_virtual(1_000_000);
+        assert!(
+            matches!(result, RunResult::Failed(ref error) if error.message.contains("unhandled Windows exception")),
+            "{result:?}"
+        );
+        assert_eq!(word(&machine, 0), 1);
+        assert_eq!(word(&machine, 8), 1);
+        assert_eq!(machine.sys.guest_failure_code, Some(0xe1234567));
     }
 }
 

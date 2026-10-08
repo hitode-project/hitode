@@ -1,7 +1,7 @@
 //! Win32 module notification policy, composed exclusively with Machine outcomes.
 use super::*;
 use adv_cpu::backend::Backend;
-use adv_cpu::backend::MemFault;
+use adv_cpu::backend::{MemFault, Reg};
 use adv_machine::CtxId;
 use adv_machine::Machine;
 use adv_machine::outcome::DeferredContinuation;
@@ -16,6 +16,8 @@ pub(crate) use shutdown::shutdown_process;
 
 pub(crate) fn install_startup<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFault> {
     machine.sys.process_return = Some(exit_process);
+    // Initial suspended contexts already belong to resident system images.
+    prepare_system_modules(machine).map_err(|_| MemFault { addr: 0, len: 0 })?;
     if machine
         .sys
         .thunks
@@ -105,7 +107,70 @@ fn resident_system_modules(
         // Synthetic system images have no guest TLS/DllMain callbacks.
         debug_assert!(loader.inits.is_empty());
     }
+    let id = modules.by_name("ntdll.dll").expect("resident ntdll");
+    let module = modules.get(id);
+    if let Some(adv_pe::ExportTarget::Rva(rva)) = module.exports_by_name.get("LdrInitializeThunk") {
+        sys.set_process_start_entry(module.base + rva);
+    }
     Ok(())
+}
+
+fn system_entry(env: &Env<'_>, module: &str, name: &str) -> Result<u32, MemFault> {
+    let modules = adv_os::modules(env.ext);
+    let id = modules
+        .by_name(module)
+        .ok_or(MemFault { addr: 0, len: 0 })?;
+    let image = modules.get(id);
+    match image.exports_by_name.get(name) {
+        Some(adv_pe::ExportTarget::Rva(rva)) => Ok(image.base + rva),
+        _ => Err(MemFault {
+            addr: image.base,
+            len: image.size,
+        }),
+    }
+}
+
+pub(super) fn register_start_entries(registry: &mut Registry) {
+    stdcall(registry, "ntdll.dll", "LdrInitializeThunk", 0, |env| {
+        let entry = env.cpu.reg(Reg::Eax);
+        adv_machine::process_entry_at(env, entry)
+    });
+    stdcall(
+        registry,
+        "ntdll.dll",
+        "RtlUserThreadStart",
+        2,
+        user_thread_start,
+    );
+    stdcall(
+        registry,
+        "kernel32.dll",
+        "BaseThreadInitThunk",
+        3,
+        base_thread_start,
+    );
+    stdcall(registry, INTERNAL, "thread_exception_handler", 4, |_| {
+        // A real terminal registration participates in dispatch and unwind.
+        // Existing personality policy decides uncaught exceptions at chain end.
+        Outcome::Return(1) // ExceptionContinueSearch
+    });
+}
+
+fn user_thread_start(env: &mut Env<'_>) -> Outcome {
+    // The suspended x86 initial image exposes the actual routine and argument.
+    // Consume the requested registers, including a caller's SetThreadContext edits.
+    let (start, param) = (env.cpu.reg(Reg::Eax), env.cpu.reg(Reg::Ebx));
+    let target = match system_entry(env, "kernel32.dll", "BaseThreadInitThunk") {
+        Ok(target) => target,
+        Err(error) => return Outcome::Fail(format!("thread startup image entry: {error}")),
+    };
+    Outcome::call(target, [0, start, param], |env, returned| {
+        exit_thread(env, returned.value())
+    })
+}
+
+fn base_thread_start(env: &mut Env<'_>) -> Outcome {
+    thread_start_at(env, env.arg(1), env.arg(2))
 }
 
 pub(super) fn startup_leave(env: &mut Env<'_>) -> Outcome {
@@ -204,13 +269,21 @@ pub(crate) fn spawn_thread(
     param: u32,
     stack: u32,
 ) -> Result<CtxId, MemFault> {
-    let wrapper = env.sys.thunks.resolve(env.cpu, INTERNAL, THREAD_START)?;
+    let wrapper = system_entry(env, "ntdll.dll", "RtlUserThreadStart")?;
+    let id = env
+        .sys
+        .spawn(env.cpu, name, wrapper, &[start, param], stack)?;
     env.sys
-        .spawn(env.cpu, name, wrapper, &[start, param], stack)
+        .set_initial_registers(id, &[(Reg::Eax, start), (Reg::Ebx, param)]);
+    Ok(id)
 }
 
 pub(super) fn thread_start(env: &mut Env<'_>) -> Outcome {
     let (start, param) = (env.arg(0), env.arg(1));
+    thread_start_at(env, start, param)
+}
+
+fn thread_start_at(env: &mut Env<'_>, start: u32, param: u32) -> Outcome {
     // Acquire only around notifications; the thread procedure itself must run
     // after releasing the loader lock or thread joins would deadlock.
     let locked_start = locked(env, |env| {
@@ -291,6 +364,10 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
                         }
                         crate::user32::message::sent::exit_thread(env);
                         crate::user32::hooks::exit_thread(env);
+                        env.ext
+                            .get_mut::<Win32>()
+                            .exiting_threads
+                            .remove(&env.context);
                         if env
                             .sys
                             .contexts

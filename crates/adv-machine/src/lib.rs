@@ -45,7 +45,7 @@ pub use objects::{Identity, Namespace, ObjectLimits};
 pub use outcome::{Continuation, Outcome, Resume, WakeReason};
 pub use patch::Detour;
 pub use process::{Image, Images, InitCall, TlsImage};
-use sched::{Context, Frame, Origin, ReadyResume, State};
+use sched::{Context, ContextStorage, Frame, Origin, ReadyResume, State};
 pub use sched::{CtxId, Handle, Object, Objects, Wait};
 pub use stats::{FrameRow, Stats};
 pub use thunk::{Conv, GuestCode, Handler, HostFn, Resolver, ThunkTable};
@@ -99,6 +99,9 @@ pub struct Sys {
     pub process_ready: Vec<InitCall>,
     /// Application code is separate from the one-shot process initialization queue.
     process_entry: Option<u32>,
+    process_start_entry: Option<u32>,
+    guest_return_entry: u32,
+    thread_exception_entry: Option<u32>,
     /// Frontend termination policy when the process entry point returns.
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// Personality-supplied interpretation of precise CPU stops.
@@ -229,18 +232,30 @@ impl Sys {
         args: &[u32],
         stack_size: u32,
     ) -> Result<CtxId, MemFault> {
-        let id = self.contexts.len() as CtxId;
-        if id >= MAX_CONTEXTS || !self.objects.can_insert() {
+        self.reclaim_finished_storage(cpu)?;
+        let id = u32::try_from(self.contexts.len()).map_err(|_| MemFault {
+            addr: 0,
+            len: stack_size,
+        })?;
+        let slot = (0..MAX_CONTEXTS).find(|slot| {
+            self.contexts.iter().all(|context| {
+                context
+                    .storage
+                    .as_ref()
+                    .is_none_or(|storage| storage.slot != *slot)
+            })
+        });
+        let Some(slot) = slot.filter(|_| self.objects.can_insert()) else {
             return Err(MemFault {
                 addr: 0,
                 len: stack_size,
             });
-        }
+        };
         let stack_size = stack_size.max(0x1_0000);
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);
         let tid = self.next_tid;
-        let teb = teb_addr(id);
+        let teb = teb_addr(slot);
         let mut mapped_teb = false;
         let result = (|| {
             cpu.map(teb, PAGE, Prot::RW)?;
@@ -257,6 +272,13 @@ impl Sys {
                 cpu.write_u32(teb + off, v)?;
             }
 
+            if let Some(handler) = self.thread_exception_entry {
+                let frame = hi - 0x10;
+                cpu.write_u32(frame, u32::MAX)?;
+                cpu.write_u32(frame + 4, handler)?;
+                cpu.write_u32(teb + teb::EXCEPTION_LIST, frame)?;
+            }
+
             // Finish fallible stack writes before TLS acquires its storage.
             let mut sp = hi - 0x10;
             for &a in args.iter().rev() {
@@ -264,11 +286,11 @@ impl Sys {
                 cpu.write_u32(sp, a)?;
             }
             sp -= 4;
-            cpu.write_u32(sp, thunk_addr(thunk::RETURN_PAD))?;
-            self.setup_static_tls(cpu, teb)?;
-            Ok(sp)
+            cpu.write_u32(sp, self.guest_return_entry)?;
+            let (tls_directory, tls_blocks) = self.setup_static_tls(cpu, teb)?;
+            Ok((sp, tls_directory, tls_blocks))
         })();
-        let sp = match result {
+        let (sp, tls_directory, tls_blocks) = match result {
             Ok(sp) => sp,
             Err(error) => {
                 if mapped_teb {
@@ -290,6 +312,13 @@ impl Sys {
             stack_lo: lo,
             stack_hi: hi,
             start: Some((sp, entry)),
+            initial_registers: Vec::new(),
+            storage: Some(ContextStorage {
+                slot,
+                stack: base,
+                tls_directory,
+                tls_blocks,
+            }),
             bootstrap_pending: None,
             frames: Vec::new(),
             state: State::Ready { resume: None },
@@ -302,15 +331,21 @@ impl Sys {
 
     /// Allocate this thread's static TLS blocks and point TEB.ThreadLocalStoragePointer at
     /// the per-image block array.
-    fn setup_static_tls(&mut self, cpu: &mut dyn Guest, teb: u32) -> Result<(), MemFault> {
+    fn setup_static_tls(
+        &mut self,
+        cpu: &mut dyn Guest,
+        teb: u32,
+    ) -> Result<(u32, Vec<(u32, u32)>), MemFault> {
         // The directory stays fixed across later image loads; individual blocks
         // likewise keep their addresses while other modules arrive or retire.
         let directory = self.vm.alloc(cpu, PAGE, Prot::RW)?;
         let mut allocated = vec![directory];
+        let mut blocks = Vec::new();
         let result = (|| {
             for image in self.tls_images.iter().filter(|image| image.active) {
                 let block = allocate_tls_block(&mut self.vm, cpu, image)?;
                 allocated.push(block);
+                blocks.push((image.index, block));
                 cpu.write_u32(directory + 4 * image.index, block)?;
             }
             cpu.write_u32(teb + teb::TLS_POINTER, directory)
@@ -320,7 +355,73 @@ impl Sys {
                 let _ = self.vm.free(cpu, block);
             }
         }
-        result
+        result.map(|()| (directory, blocks))
+    }
+
+    /// Retire stopped execution storage without changing retained thread handles.
+    /// Native leases are quiesced before any address can be allocated again.
+    fn reclaim_finished_storage(&mut self, cpu: &mut dyn Guest) -> Result<(), MemFault> {
+        if !self
+            .contexts
+            .iter()
+            .any(|context| context.is_done() && context.storage.is_some())
+        {
+            return Ok(());
+        }
+        cpu.quiesce_memory();
+        for context in self.contexts.iter_mut().filter(|context| context.is_done()) {
+            let Some(storage) = context.storage.as_mut() else {
+                continue;
+            };
+            while let Some(&(_, block)) = storage.tls_blocks.last() {
+                self.vm.free(cpu, block)?;
+                storage.tls_blocks.pop();
+            }
+            if storage.tls_directory != 0 {
+                self.vm.free(cpu, storage.tls_directory)?;
+                storage.tls_directory = 0;
+            }
+            if storage.stack != 0 {
+                self.vm.free(cpu, storage.stack)?;
+                storage.stack = 0;
+            }
+            cpu.unmap(context.teb, PAGE)?;
+            context.storage = None;
+            context.initial_registers.clear();
+            context.bootstrap_pending = None;
+            context.start = None;
+            self.wakes.retire(context.id);
+        }
+        Ok(())
+    }
+
+    /// Personality-owned image entry for callback returns.
+    pub fn set_guest_return_entry(&mut self, entry: u32) {
+        self.guest_return_entry = entry;
+    }
+    pub fn guest_return_entry(&self) -> u32 {
+        self.guest_return_entry
+    }
+    /// Personality-owned image entry for the ordinary main-thread wrapper.
+    pub fn set_process_start_entry(&mut self, entry: u32) {
+        self.process_start_entry = Some(entry);
+    }
+    pub fn set_thread_exception_entry(&mut self, entry: u32) {
+        self.thread_exception_entry = Some(entry);
+    }
+    pub fn thread_exception_entry(&self) -> Option<u32> {
+        self.thread_exception_entry
+    }
+    /// Seed an unmaterialized context's architecture without selecting it.
+    pub fn set_initial_registers(&mut self, id: CtxId, registers: &[(Reg, u32)]) -> bool {
+        let Some(context) = self.contexts.get_mut(id as usize) else {
+            return false;
+        };
+        if context.start.is_none() || context.is_done() {
+            return false;
+        }
+        context.initial_registers.extend_from_slice(registers);
+        true
     }
 
     /// Publish a static TLS template to all existing contexts transactionally.
@@ -341,7 +442,7 @@ impl Sys {
         image.index = index;
         let mut allocated = Vec::new();
         let result = (|| {
-            for context in &self.contexts {
+            for context in self.contexts.iter().filter(|context| !context.is_done()) {
                 let directory = cpu.read_u32(context.teb + teb::TLS_POINTER)?;
                 if directory == 0 {
                     return Err(MemFault {
@@ -350,19 +451,27 @@ impl Sys {
                     });
                 }
                 let block = allocate_tls_block(&mut self.vm, cpu, &image)?;
-                allocated.push((directory + 4 * index, block));
+                allocated.push((context.id, directory + 4 * index, block));
             }
-            for &(slot, block) in &allocated {
+            for &(_, slot, block) in &allocated {
                 cpu.write_u32(slot, block)?;
             }
             Ok(())
         })();
         if let Err(error) = result {
-            for (slot, block) in allocated {
+            for (_, slot, block) in allocated {
                 let _ = cpu.write_u32(slot, 0);
                 let _ = self.vm.free(cpu, block);
             }
             return Err(error);
+        }
+        for (id, _, block) in allocated {
+            self.contexts[id as usize]
+                .storage
+                .as_mut()
+                .expect("live context owns its execution storage")
+                .tls_blocks
+                .push((index, block));
         }
         if index as usize == self.tls_images.len() {
             self.tls_images.push(image);
@@ -373,13 +482,20 @@ impl Sys {
     }
 
     pub fn remove_static_tls(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), MemFault> {
-        for context in &self.contexts {
+        for context in self
+            .contexts
+            .iter_mut()
+            .filter(|context| !context.is_done())
+        {
             let directory = cpu.read_u32(context.teb + teb::TLS_POINTER)?;
             let slot = directory + index * 4;
             let block = cpu.read_u32(slot)?;
             cpu.write_u32(slot, 0)?;
             if block != 0 {
                 self.vm.free(cpu, block)?;
+                if let Some(storage) = &mut context.storage {
+                    storage.tls_blocks.retain(|&(_, owned)| owned != block);
+                }
             }
         }
         if let Some(image) = self.tls_images.get_mut(index as usize) {
@@ -418,6 +534,9 @@ impl Sys {
                 context.state = State::Done { exit_code };
                 context.frames.clear();
                 context.start = None;
+                context.bootstrap_pending = None;
+                context.initial_registers.clear();
+                self.wakes.retire(context.id);
             }
         }
     }
@@ -445,6 +564,9 @@ impl Sys {
         context.state = State::Done { exit_code };
         context.frames.clear();
         context.start = None;
+        context.bootstrap_pending = None;
+        context.initial_registers.clear();
+        self.wakes.retire(id);
         if self.contexts.iter().all(Context::is_done) {
             self.process_identity.completion.complete(exit_code);
         }
@@ -778,10 +900,18 @@ fn process_bootstrap(env: &mut Env<'_>, checkpoint: exception::Checkpoint) -> Ou
 }
 
 /// The ordinary application entry wrapper; redirected contexts do not enter it.
-fn process_entry(env: &mut Env<'_>) -> Outcome {
-    let Some(entry) = env.sys.process_entry.take() else {
+pub fn process_entry(env: &mut Env<'_>) -> Outcome {
+    let Some(entry) = env.sys.process_entry else {
         return Outcome::Fail("application entry was already consumed".into());
     };
+    process_entry_at(env, entry)
+}
+
+/// Enter the main application at the personality's requested target after bootstrap.
+pub fn process_entry_at(env: &mut Env<'_>, entry: u32) -> Outcome {
+    if env.sys.process_entry.take().is_none() {
+        return Outcome::Fail("application entry was already consumed".into());
+    }
     Outcome::call(entry, [], |env, result| match env.sys.process_return {
         Some(finish) => finish(env, result.value()),
         None => Outcome::ExitProcess(result.value()),
@@ -910,7 +1040,7 @@ fn apply(
                 .iter()
                 .rev()
                 .try_for_each(|&a| push(cpu, &mut sp, a))
-                .and_then(|()| push(cpu, &mut sp, thunk_addr(thunk::RETURN_PAD)));
+                .and_then(|()| push(cpu, &mut sp, sys.guest_return_entry));
             if let Err(e) = pushed {
                 return Err(Parked::Fail(format!(
                     "guest call to {target:#x}: stack write failed: {e}"
@@ -1269,7 +1399,8 @@ impl TrapHandler for Dispatch<'_> {
                 .trace
                 .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu, None);
             self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
-        } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
+        } else if eip == self.sys.guest_return_entry + 2 || eip == thunk_addr(thunk::RETURN_PAD) + 2
+        {
             self.guest_return(cpu)
         } else {
             // Hooks may reconstruct the opaque token and move the INT away from
@@ -1449,6 +1580,9 @@ impl<B: Backend> Machine<B> {
             process_init: VecDeque::new(),
             process_ready: Vec::new(),
             process_entry: None,
+            process_start_entry: None,
+            guest_return_entry: thunk_addr(thunk::RETURN_PAD),
+            thread_exception_entry: None,
             process_return: None,
             exception_handler: None,
             first_cpu_fault: None,
@@ -1621,7 +1755,14 @@ impl<B: Backend> Machine<B> {
             .sys
             .thunks
             .resolve(&mut self.cpu, INTERNAL_MODULE, "process_entry")?;
-        let main = self.spawn("main", start, &[], stack.max(DEFAULT_STACK))?;
+        let main = self.spawn(
+            "main",
+            self.sys.process_start_entry.unwrap_or(start),
+            &[],
+            stack.max(DEFAULT_STACK),
+        )?;
+        self.sys
+            .set_initial_registers(main, &[(Reg::Eax, entry), (Reg::Ebx, 0)]);
         self.sys.process_entry = Some(entry);
         self.sys.contexts[main as usize].bootstrap_pending =
             Some((start - THUNK_BASE) / THUNK_STRIDE);
@@ -1661,7 +1802,7 @@ impl<B: Backend> Machine<B> {
             ext: &mut self.ext,
             thunk: 0,
         });
-        if let Some(prior) = prior {
+        if let Some(prior) = prior.filter(|&id| !self.sys.contexts[id as usize].is_done()) {
             self.switch_to(prior).map_err(|e| e.to_string())?;
         }
         Ok(result)
@@ -1672,12 +1813,19 @@ impl<B: Backend> Machine<B> {
         if self.loaded == Some(id) {
             return Ok(());
         }
-        if let Some(prev) = self.loaded {
+        if let Some(prev) = self
+            .loaded
+            .filter(|&prev| !self.sys.contexts[prev as usize].is_done())
+        {
             let mut slot = self.regs[prev as usize]
                 .take()
                 .unwrap_or_else(|| self.cpu.new_context());
             self.cpu.save(&mut slot);
             self.regs[prev as usize] = Some(slot);
+        } else if let Some(prev) = self.loaded
+            && let Some(slot) = self.regs.get_mut(prev as usize)
+        {
+            *slot = None;
         }
         self.regs.resize_with(self.sys.contexts.len(), || None);
         let ctx = &mut self.sys.contexts[id as usize];
@@ -1687,6 +1835,9 @@ impl<B: Backend> Machine<B> {
                 self.cpu.set_fs_base(ctx.teb)?;
                 self.cpu.set_reg(Reg::Esp, esp);
                 self.cpu.set_reg(Reg::Eip, eip);
+                for (register, value) in ctx.initial_registers.drain(..) {
+                    self.cpu.set_reg(register, value);
+                }
             }
             (None, Some(r)) => self.cpu.restore(r),
             (None, None) => {
@@ -1792,6 +1943,9 @@ impl<B: Backend> Machine<B> {
                 ctx.completion.complete(code);
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
+                ctx.bootstrap_pending = None;
+                ctx.start = None;
+                self.sys.wakes.retire(id);
                 if self.sys.contexts.iter().all(Context::is_done) {
                     self.sys.process_identity.completion.complete(code);
                     return Some(self.complete_process_exit(code));
@@ -1803,6 +1957,9 @@ impl<B: Backend> Machine<B> {
                 ctx.completion.complete(code);
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
+                ctx.bootstrap_pending = None;
+                ctx.start = None;
+                self.sys.wakes.retire(id);
                 self.sys.terminate_other_contexts(code);
                 return Some(self.complete_process_exit(code));
             }
