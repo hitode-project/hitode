@@ -20,9 +20,19 @@ $plan = & $runner @arguments -SkipBuild -CpuMask 40 -Corpus 'local-corpus' | Con
 Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))
 Assert ($plan.shell.Contains('ADV_GIR_LIFT_CORPUS='))
-Assert ($plan.shell.Contains('unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_HOST_FEATURES'))
+Assert ($plan.shell.Contains('unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES'))
 Assert ($plan.shell.Contains('ADV_PERF_MAP_DIR;'))
 Assert ($plan.cooldown_seconds -eq 60 -and $plan.cleanup)
+$plan = & $runner @arguments -SkipBuild -DirectMemory off,legacy,inline -LockOwner dmem | ConvertFrom-Json
+Assert ($plan.lock_owner -eq 'dmem')
+Assert (($plan.direct_memory -join ',') -eq 'off,legacy,inline')
+Assert ($plan.commands.Count -eq 3)
+foreach ($mode in @('off', 'legacy', 'inline')) {
+    Assert (@($plan.commands | Where-Object { $_.Contains("ADV_REGION_BENCH_DIRECT=$mode ") }).Count -eq 1)
+}
+$rejected = $false
+try { & $runner @arguments -LockOwner 'bad;owner' | Out-Null } catch { $rejected = $true }
+Assert $rejected
 $rejected = $false
 try { & $runner @arguments -BuildOnly -SkipBuild | Out-Null } catch { $rejected = $true }
 Assert $rejected

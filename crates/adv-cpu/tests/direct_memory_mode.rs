@@ -118,8 +118,15 @@ fn native_16k_subpages_boundaries_and_partial_recommit_keep_guest_permissions() 
                 assert_eq!(outcome, RunOutcome::ReadFault { pc: CODE, address });
             }
         }
-        assert_eq!(e.stats.direct_memory.recoveries, 2);
-        assert_eq!(e.stats.direct_memory.violations, 2);
+        // Mixed 16 KiB pages use checked aliases in the inline configuration.
+        // The legacy opt-out retains its explicit recovery sessions.
+        if std::env::var("ADV_DIRECT_MEMORY_INLINE").as_deref() == Ok("0") {
+            assert_eq!(e.stats.direct_memory.recoveries, 2);
+            assert_eq!(e.stats.direct_memory.violations, 2);
+        } else {
+            assert_eq!(e.stats.direct_memory.accesses, 0);
+            assert!(e.stats.direct_memory.checked_fallbacks >= 4);
+        }
         // Cross both a guest boundary and a real host boundary. A denied
         // suffix must not commit even the writable prefix of a store.
         e.protect(DATA, 32768, READ | WRITE).unwrap();

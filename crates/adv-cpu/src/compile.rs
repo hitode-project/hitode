@@ -88,6 +88,15 @@ pub(crate) struct Compiled {
     pub decoded_bytes: usize,
     ir_counts: Option<ir_counts::Summary>,
     pub direct_sites: usize,
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    inline_registration: Option<crate::fault_recovery::inline::Registration>,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     _nests: Box<[crate::rows::Descriptor]>,
@@ -107,6 +116,15 @@ pub(crate) struct Compiled {
 impl Drop for Compiled {
     fn drop(&mut self) {
         self.perf_ranges.clear();
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        self.inline_registration.take();
         // SAFETY: the entry pointer is private, run borrows self, and no generated
         // code can still be executing while this exclusive drop runs.
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -139,6 +157,7 @@ impl Compiled {
     }
     pub fn valid(&self, memory: &Memory) -> bool {
         self.input.direct_memory == memory.direct_memory_enabled()
+            && self.input.direct_inline == memory.direct_memory_inline()
             && memory.base == self.window_base
             && memory.len == self.window_len
             && self
@@ -167,7 +186,9 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
-        if self.input.direct_memory != memory.direct_memory_enabled() {
+        if self.input.direct_memory != memory.direct_memory_enabled()
+            || self.input.direct_inline != memory.direct_memory_inline()
+        {
             return (Exit::Fallback as u32, 0);
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -210,6 +231,7 @@ impl Compiled {
             fault_reads: 0,
             linked_entries: 0,
             shadow,
+            direct: memory.direct_engine_pointer(),
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Checked accesses retain their guards; verified ordinary reads
@@ -232,7 +254,30 @@ impl Compiled {
             }
             return (result, context.linked_entries);
         }
-        let result = unsafe { (self.entry)(&mut context, memory.ptr.as_ptr()) };
+        let memory_pointer = memory.ptr.as_ptr();
+        let mut run = || unsafe { (self.entry)(&mut context, memory_pointer) };
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let result = if self.input.direct_memory {
+            unsafe { crate::direct_memory::run_inline(state, memory, bridge, &permissions, run) }
+        } else {
+            run()
+        };
+        #[cfg(not(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let result = run();
         if let Some(stack) = controls.shadow {
             stack.clear();
         }
@@ -313,6 +358,7 @@ impl Profile {
 pub(crate) struct Snapshot {
     parallel: bool,
     direct_memory: bool,
+    direct_inline: bool,
     pub region: Box<Region>,
     base: u32,
     len: usize,
@@ -364,6 +410,7 @@ impl Snapshot {
         Ok(Self {
             parallel: self.parallel,
             direct_memory: self.direct_memory,
+            direct_inline: self.direct_inline,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -430,6 +477,7 @@ impl Snapshot {
         Ok(Self {
             parallel: memory.is_parallel(),
             direct_memory: memory.direct_memory_enabled(),
+            direct_inline: memory.direct_memory_inline(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -454,6 +502,7 @@ impl Snapshot {
 
     pub fn valid(&self, memory: &Memory) -> bool {
         self.direct_memory == memory.direct_memory_enabled()
+            && self.direct_inline == memory.direct_memory_inline()
             && self.parallel == memory.is_parallel()
             && memory.base == self.base
             && memory.len == self.len
@@ -1123,6 +1172,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         None
     };
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let mut inline_drafts = Vec::new();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -1678,6 +1736,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             direct_refs,
+            #[cfg(all(
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            inline: direct_refs
+                .filter(|_| snapshot.direct_inline)
+                .map(|_| direct::Inline::new()),
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1970,6 +2039,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             e.b.set_srcloc(ir::SourceLoc::default());
             fault_draft = e.fault_draft.take();
         }
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(inline) = e.finish_inline() {
+            inline_drafts = inline;
+        }
         e.b.seal_all_blocks();
         e.b.finalize();
         ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
@@ -2171,6 +2251,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let tail_entry = module.get_finalized_function(id) as usize;
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let inline_registration =
+        direct::publish(ctx.compiled_code().unwrap(), tail_entry, &inline_drafts)?;
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
@@ -2390,6 +2480,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         window_len: snapshot.len,
         entries,
         excluded_entries,
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        inline_registration,
         direct_sites: {
             #[cfg(all(
                 any(
@@ -3122,6 +3221,15 @@ struct Emitter<'a> {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    inline: Option<direct::Inline>,
     source_map: bool,
     source_origin: u32,
     source: ir::SourceLoc,

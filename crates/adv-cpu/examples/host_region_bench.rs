@@ -3,6 +3,12 @@
 //! captures), ADV_REGION_BENCH_SAMPLES/LOOPS/REPEATS/PRIVATE_LIMIT. Output: anonymous
 //! CSV statistics, OS capabilities and current CPU; never code, PCs or file names.
 //! Compilation and one full-state differential warmup are outside measurement.
+//! ADV_REGION_BENCH_DIRECT=off|legacy|inline selects the memory lane. With no
+//! benchmark selector, ADV_DIRECT_MEMORY=1 selects direct mode and
+//! ADV_DIRECT_MEMORY_INLINE=0 selects legacy; otherwise the default is off.
+//! Selection is fixed at process startup, before any executor or worker exists.
+//! Short synthetic comparisons can use ADV_REGION_BENCH_SAMPLES=3,
+//! ADV_REGION_BENCH_LOOPS=1000 and ADV_REGION_BENCH_REPEATS=1.
 use adv_cpu::{
     ArchitecturalState, CpuState, EXEC, Executor, HostFeatures, READ, Region, RunOutcome, WRITE,
 };
@@ -27,6 +33,7 @@ struct Case {
     bytes: Vec<u8>,
     stop: u32,
     repeats: usize,
+    memory_movs: u64,
 }
 
 struct Ready {
@@ -44,10 +51,80 @@ fn option(name: &str, default: usize, max: usize) -> usize {
     n
 }
 
-fn data_seed() -> Vec<u8> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectMode {
+    Off,
+    Legacy,
+    Inline,
+}
+
+impl DirectMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Legacy => "legacy",
+            Self::Inline => "inline",
+        }
+    }
+
+    fn from_env() -> Self {
+        match std::env::var("ADV_REGION_BENCH_DIRECT").as_deref() {
+            Ok("off") => Self::Off,
+            Ok("legacy") => Self::Legacy,
+            Ok("inline") => Self::Inline,
+            Err(std::env::VarError::NotPresent) => {
+                if std::env::var("ADV_DIRECT_MEMORY").as_deref() != Ok("1") {
+                    Self::Off
+                } else if std::env::var("ADV_DIRECT_MEMORY_INLINE").as_deref() == Ok("0") {
+                    Self::Legacy
+                } else {
+                    Self::Inline
+                }
+            }
+            _ => panic!("ADV_REGION_BENCH_DIRECT expects off, legacy or inline"),
+        }
+    }
+}
+
+fn select_direct_mode() -> DirectMode {
+    let mode = DirectMode::from_env();
+    // SAFETY: main calls this before starting workers or creating executors.
+    // Keep automatic selection off so the interpreter oracle uses checked
+    // storage; measured executors opt in explicitly after construction.
+    unsafe {
+        std::env::set_var("ADV_DIRECT_MEMORY", "0");
+        if mode != DirectMode::Off {
+            std::env::set_var(
+                "ADV_DIRECT_MEMORY_INLINE",
+                if mode == DirectMode::Legacy { "0" } else { "1" },
+            );
+        }
+    }
+    mode
+}
+
+#[cfg(unix)]
+fn host_page_bytes() -> i64 {
+    // SAFETY: sysconf reads the page size without pointer arguments.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as i64 }
+}
+
+#[cfg(not(unix))]
+fn host_page_bytes() -> i64 {
+    -1
+}
+
+fn data_seed(category: &str) -> Vec<u8> {
     let mut data = vec![0; 4096];
     data[0..8].copy_from_slice(&1.0f64.to_le_bytes());
     data[8..16].copy_from_slice(&0.25f64.to_le_bytes());
+    if category == "synthetic_memory_scalar" {
+        for start in [512, 1024, 1536] {
+            for (index, byte) in data[start..start + 256].iter_mut().enumerate() {
+                *byte = (index * 37 + 13) as u8;
+            }
+        }
+    }
     data
 }
 
@@ -73,6 +150,7 @@ fn synthetic(loops: u32, repeats: usize) -> Vec<Case> {
         "sse_scalar",
         "sse_packed",
         "memory",
+        "memory_scalar",
         "x87",
     ] {
         let mut a = CodeAssembler::new(32).unwrap();
@@ -109,6 +187,20 @@ fn synthetic(loops: u32, repeats: usize) -> Vec<Case> {
                     a.mov(dword_ptr(esi + 64), eax).unwrap();
                     a.xor(edx, eax).unwrap();
                 }
+                "memory_scalar" => {
+                    // Separate source/destination ranges and a changing base
+                    // retain all six scalar accesses through slot forwarding.
+                    a.movzx(eax, byte_ptr(esi + 512)).unwrap();
+                    a.mov(byte_ptr(esi + 2048), al).unwrap();
+                    a.movzx(eax, word_ptr(esi + 1024)).unwrap();
+                    a.mov(word_ptr(esi + 2560), ax).unwrap();
+                    a.mov(eax, dword_ptr(esi + 1536)).unwrap();
+                    a.add(eax, 1).unwrap();
+                    a.mov(dword_ptr(esi + 3072), eax).unwrap();
+                    a.add(esi, 16).unwrap();
+                    a.and(esi, 255).unwrap();
+                    a.or(esi, DATA).unwrap();
+                }
                 "x87" => {
                     a.fld(qword_ptr(esi)).unwrap();
                     a.fadd(qword_ptr(esi + 8)).unwrap();
@@ -126,6 +218,11 @@ fn synthetic(loops: u32, repeats: usize) -> Vec<Case> {
             bytes: a.assemble(u64::from(CODE)).unwrap(),
             stop: STOP,
             repeats,
+            memory_movs: match category {
+                "memory" => 8 * u64::from(loops),
+                "memory_scalar" => 24 * u64::from(loops),
+                _ => 0,
+            },
         });
     }
     cases
@@ -321,6 +418,7 @@ fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
                     stop: CODE + bytes.len() as u32,
                     bytes,
                     repeats,
+                    memory_movs: 0,
                 });
             }
             if selected == limit {
@@ -332,13 +430,16 @@ fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
     cases
 }
 
-fn setup(case: &Case, tier: u8) -> Result<Executor, String> {
+fn setup(case: &Case, tier: u8, direct: DirectMode) -> Result<Executor, String> {
     let mut m = Executor::new(CODE, 0x21000)?;
+    if tier != 0 && direct != DirectMode::Off {
+        m.set_direct_memory(true)?;
+    }
     m.disable_row_batching();
     m.set_tier_verification(None);
     m.protect(CODE, 0x21000, READ | WRITE)?;
     m.write(CODE, &case.bytes)?;
-    m.write(DATA, &data_seed())?;
+    m.write(DATA, &data_seed(&case.category))?;
     m.write(STACK, &STOP.to_le_bytes())?;
     m.protect(CODE, 4096, READ | EXEC)?;
     m.protect(STOP, 4096, READ | EXEC)?;
@@ -363,9 +464,9 @@ fn run(m: &mut Executor, initial: &CpuState, stop: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare(case: Case, tiers: &[u8]) -> Result<Ready, &'static str> {
+fn prepare(case: Case, tiers: &[u8], direct: DirectMode) -> Result<Ready, &'static str> {
     let initial = seed();
-    let mut oracle = setup(&case, 0).map_err(|_| "setup")?;
+    let mut oracle = setup(&case, 0, DirectMode::Off).map_err(|_| "setup")?;
     run(&mut oracle, &initial, case.stop).map_err(|_| "oracle_execution")?;
     let units = oracle.stats.interpreter_instructions;
     if units == 0 {
@@ -379,7 +480,7 @@ fn prepare(case: Case, tiers: &[u8]) -> Result<Ready, &'static str> {
         .to_vec();
     let mut executors = Vec::new();
     for &tier in tiers {
-        let mut m = setup(&case, tier).map_err(|_| "setup_or_compile")?;
+        let mut m = setup(&case, tier, direct).map_err(|_| "setup_or_compile")?;
         run(&mut m, &initial, case.stop).map_err(|_| "execution")?;
         if m.state.capture_architecture() != expected
             || m.memory().read(DATA, 4096).map_err(|_| "data")?.as_ref() != data
@@ -418,6 +519,19 @@ fn cpu() -> i32 {
 }
 
 fn main() {
+    let direct = select_direct_mode();
+    assert!(
+        direct == DirectMode::Off
+            || cfg!(all(
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "macos", target_arch = "aarch64")
+                ),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+        "direct memory requires a supported POSIX host"
+    );
     let samples = option("ADV_REGION_BENCH_SAMPLES", 7, 31);
     let loops = option("ADV_REGION_BENCH_LOOPS", 10_000, 100_000) as u32;
     let repeats = option("ADV_REGION_BENCH_REPEATS", 4, 1000);
@@ -427,6 +541,11 @@ fn main() {
         HostFeatures::detected(),
         HostFeatures::get(),
         cpu()
+    );
+    println!(
+        "# direct_memory mode={} host_page_bytes={} inline_page_limit=4096 oracle=interpreter",
+        direct.name(),
+        host_page_bytes()
     );
     let tiers: &[u8] = if cfg!(all(
         target_arch = "aarch64",
@@ -452,7 +571,7 @@ fn main() {
     let mut skipped = 0;
     for case in cases {
         let label = (case.category.clone(), case.ordinal);
-        let mut ready = match prepare(case, tiers) {
+        let mut ready = match prepare(case, tiers, direct) {
             Ok(ready) => ready,
             Err(reason) => {
                 assert!(
@@ -470,6 +589,21 @@ fn main() {
         accepted += 1;
         let mut timings = vec![vec![0.; samples]; tiers.len()];
         let mut fallback = vec![0; tiers.len()];
+        let native_before: Vec<_> = ready
+            .executors
+            .iter()
+            .map(|(_, m)| m.stats.native_entries)
+            .collect();
+        let direct_before: Vec<_> = ready
+            .executors
+            .iter()
+            .map(|(_, m)| {
+                (
+                    m.stats.direct_memory.accesses,
+                    m.stats.direct_memory.checked_fallbacks,
+                )
+            })
+            .collect();
         let cpu_start = cpu();
         // Rotate the tier order to distribute gradual thermal/frequency drift.
         for sample in 0..samples {
@@ -477,8 +611,11 @@ fn main() {
                 let index = (sample + offset) % tiers.len();
                 let (_, m) = &mut ready.executors[index];
                 let before = m.stats.interpreter_instructions;
-                assert!(m.write(DATA, &data_seed()).is_ok(), "data reset failed");
-                // CPU reset and dispatch are included. Only the memory workload
+                assert!(
+                    m.write(DATA, &data_seed(&ready.case.category)).is_ok(),
+                    "data reset failed"
+                );
+                // CPU reset and dispatch are included. The original memory workload
                 // needs a four-byte data reset per run; other data is immutable
                 // or overwritten with the same result on every invocation.
                 let start = Instant::now();
@@ -527,6 +664,24 @@ fn main() {
                 ns[0],
                 ns[samples - 1],
                 fallback[index] as f64 * 100. / (units * samples as u64) as f64
+            );
+            let m = &ready.executors[index].1;
+            println!(
+                "# execution category={} ordinal={} tier={tier} direct_mode={} native_code_bytes={} tier1_code_bytes={} native_entries_measured={} direct_accesses_measured={} checked_fallbacks_measured={} memory_movs_per_run={} measured_runs={}",
+                ready.case.category,
+                ready.case.ordinal,
+                if tier == 0 {
+                    DirectMode::Off.name()
+                } else {
+                    direct.name()
+                },
+                m.stats.native_code_bytes,
+                m.tier1_stats().code_bytes,
+                m.stats.native_entries - native_before[index],
+                m.stats.direct_memory.accesses - direct_before[index].0,
+                m.stats.direct_memory.checked_fallbacks - direct_before[index].1,
+                ready.case.memory_movs,
+                samples * ready.case.repeats
             );
         }
     }
