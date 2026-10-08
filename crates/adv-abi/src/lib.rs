@@ -79,6 +79,22 @@ pub struct Registry {
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
+    /// Development probe: discovery exposes the whole fixed core catalog.
+    expose_fixed_exports: bool,
+}
+
+/// Reviewed exceptions: partial behavior whose failures match native results.
+fn reviewed_dynamic_export(module: &str, name: &str) -> bool {
+    include_str!("../../../data/abi/dynamic_exports.tsv")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .any(|line| {
+            let mut fields = line.split('\t');
+            fields
+                .next()
+                .is_some_and(|dll| dll.eq_ignore_ascii_case(module))
+                && fields.next() == Some(name)
+        })
 }
 
 impl Default for Registry {
@@ -90,6 +106,8 @@ impl Default for Registry {
             data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
+            expose_fixed_exports: std::env::var_os("ADV_PERSONALITY_STRICT")
+                .is_some_and(|value| value == "1"),
         }
     }
 }
@@ -259,6 +277,14 @@ impl Registry {
     pub fn set_mode(&mut self, mode: RunMode) {
         self.mode = mode;
     }
+    /// ADV_PERSONALITY_STRICT=1 restores whole-catalog discovery for probing
+    /// which names a title asks for; calls to missing behavior still fail.
+    pub fn set_expose_fixed_exports(&mut self, expose: bool) {
+        self.expose_fixed_exports = expose;
+    }
+    pub fn exposes_fixed_exports(&self) -> bool {
+        self.expose_fixed_exports
+    }
 
     pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
         let canonical = self.canonical_name(module, name);
@@ -311,6 +337,15 @@ impl Registry {
                 .then(|| self.fns.get(&("kernel32.dll".to_owned(), name.to_owned())))
                 .flatten()
             })
+            .or_else(|| {
+                // A fixed forwarder shares its target's ABI, so a frontend
+                // registered under the forwarding name implements the target.
+                system_exports::forwarded_from(&module, name)
+                    .iter()
+                    .find_map(|(source, alias)| {
+                        self.fns.get(&((*source).to_owned(), (*alias).to_owned()))
+                    })
+            })
     }
 
     /// An explicit implementation wins over a named or SDK ordinal alias.
@@ -344,28 +379,30 @@ impl Registry {
         self.registered_entry(module, name).is_some() || self.data(module, name).is_some()
     }
 
-    /// Fixed personality exports expose existence, independently of behavior.
-    /// Other DLLs advertise registered behavior or reviewed proxy exceptions;
-    /// signature metadata alone never promises their dynamic capability.
+    /// Discovery exposes only callable capability. Fixed catalog names keep
+    /// their structure (export directory, static bindings), but a dynamic probe
+    /// finds them only when implemented or reviewed, so a title's own fallback
+    /// for an older Windows still runs. Data exports also need a provider.
     pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
         let name = self.canonical_name(module, name).unwrap_or(name);
         if system_exports::has_module(module) {
-            return system_exports::lookup(module, name).is_some_and(|export| {
-                !matches!(export.kind, system_exports::Kind::DataUnsupported)
-                    || self.data(module, name).is_some()
-            });
+            let Some(export) = system_exports::lookup(module, name) else {
+                return false;
+            };
+            if export.kind == system_exports::Kind::DataUnsupported {
+                return self.data(module, name).is_some();
+            }
+            if self.expose_fixed_exports {
+                return true;
+            }
+            let (target, target_name) =
+                system_exports::final_target(module, export.name).unwrap_or((module, name));
+            return self.is_implemented(module, name)
+                || self.is_implemented(target, target_name)
+                || reviewed_dynamic_export(module, name)
+                || reviewed_dynamic_export(target, target_name);
         }
-        self.is_implemented(module, name)
-            || include_str!("../../../data/abi/dynamic_exports.tsv")
-                .lines()
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .any(|line| {
-                    let mut fields = line.split('\t');
-                    fields
-                        .next()
-                        .is_some_and(|dll| dll.eq_ignore_ascii_case(module))
-                        && fields.next() == Some(name)
-                })
+        self.is_implemented(module, name) || reviewed_dynamic_export(module, name)
     }
     pub fn len(&self) -> usize {
         self.fns.len() + self.data.len()

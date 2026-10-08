@@ -134,24 +134,21 @@ fn optional_probe_reaches_real_tls_fallback_on_all_backends_and_modes() {
     }
 }
 #[test]
-fn fixed_unimplemented_export_is_addressable_but_call_fails_by_name() {
+fn fixed_unimplemented_export_is_hidden_from_discovery_but_static_binding_fails_by_name() {
     let mut machine = machine(JitCpu::new(PARK_ADDR, true).unwrap(), RunMode::Strict);
     let kernel = machine.load(&Empty, "ntdll.dll").unwrap();
-    let entry = Loader::new(
+    let symbol = ImportName::Name {
+        hint: 0,
+        name: "NtQueryWnfStateData".into(),
+    };
+    let mut loader = Loader::new(
         &mut machine.cpu,
         &mut machine.sys,
         machine.ext.get_mut::<Modules>(),
         &Empty,
-    )
-    .resolve_dynamic(
-        kernel,
-        &ImportName::Name {
-            hint: 0,
-            name: "NtQueryWnfStateData".into(),
-        },
-    )
-    .unwrap()
-    .0;
+    );
+    assert!(loader.resolve_dynamic(kernel, &symbol).is_err());
+    let entry = loader.resolve(kernel, &symbol).unwrap();
     let mut code = Asm::new(CODE);
     code.push_imm(0).call(entry).ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();

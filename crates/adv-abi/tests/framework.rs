@@ -68,22 +68,33 @@ fn data_declarations_have_width_and_cannot_be_function_bindings() {
 }
 
 #[test]
-fn dynamic_availability_keeps_fixed_existence_separate_from_implementation() {
+fn dynamic_availability_exposes_fixed_names_only_with_capability() {
     let mut registry = Registry::default();
+    registry.set_expose_fixed_exports(false);
     for mode in [RunMode::Strict, RunMode::Discovery] {
         registry.set_mode(mode);
         assert!(
             registry.get("kernel32.dll", "FlsAlloc").is_some(),
             "metadata retains a static diagnostic handler"
         );
-        assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+        // Structure keeps the name; discovery hides it until it is callable.
+        assert!(adv_abi::system_exports::is_core_export(
+            "kernel32.dll",
+            "FlsAlloc"
+        ));
+        assert!(!registry.dynamic_available("kernel32.dll", "FlsAlloc"));
         assert!(!registry.is_implemented("kernel32.dll", "FlsAlloc"));
         assert!(!registry.dynamic_available("kernel32.dll", "UnknownOptionalExport"));
         assert!(registry.dynamic_available("DWRITE.DLL", "DWriteCreateFactory"));
         assert!(registry.dynamic_available("d2d1.dll", "#1"));
-        assert!(registry.dynamic_available("kernel32.dll", "CreateFileW"));
+        assert!(!registry.dynamic_available("kernel32.dll", "CreateFileW"));
         assert!(!registry.dynamic_available("d3d11.dll", "D3D11CreateDeviceAndSwapChain"));
     }
+    // ADV_PERSONALITY_STRICT restores whole-catalog discovery, never data stubs.
+    registry.set_expose_fixed_exports(true);
+    assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+    assert!(!registry.dynamic_available("kernel32.dll", "UnknownOptionalExport"));
+    registry.set_expose_fixed_exports(false);
     registry.register(adv_abi::Api {
         module: "kernel32.dll",
         name: "FlsAlloc",
@@ -96,6 +107,28 @@ fn dynamic_availability_keeps_fixed_existence_separate_from_implementation() {
         registry.level("kernel32.dll", "FlsAlloc"),
         Some(ImplementationLevel::SafeFail)
     );
+}
+
+#[test]
+fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
+    let mut registry = Registry::default();
+    registry.set_expose_fixed_exports(false);
+    assert_eq!(
+        adv_abi::system_exports::final_target("kernel32.dll", "SetThreadpoolTimer"),
+        Some(("ntdll.dll", "TpSetTimer"))
+    );
+    assert!(!registry.dynamic_available("ntdll.dll", "TpSetTimer"));
+    registry.register(adv_abi::Api {
+        module: "kernel32.dll",
+        name: "SetThreadpoolTimer",
+        conv: Conv::Stdcall { argc: 4 },
+        handler: |_| Outcome::Return(0),
+        level: ImplementationLevel::Implement,
+    });
+    // The loader binds kernel32's forwarder to ntdll; both names are callable.
+    assert!(registry.is_implemented("ntdll.dll", "TpSetTimer"));
+    assert!(registry.dynamic_available("ntdll.dll", "TpSetTimer"));
+    assert!(registry.dynamic_available("kernel32.dll", "SetThreadpoolTimer"));
 }
 
 #[test]
