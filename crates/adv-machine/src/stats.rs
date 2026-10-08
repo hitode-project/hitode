@@ -96,6 +96,7 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 #[derive(Default)]
 pub struct Stats {
     pub frame_budget: Option<crate::frame_budget::FrameBudget>,
+    pub wait_diagnostics: Option<crate::wait_diagnostics::WaitDiagnostics>,
     /// Take wall-clock timings and keep per-frame rows.
     pub enabled: bool,
     /// API timings without per-frame rows or forcing a frame handoff.

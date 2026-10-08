@@ -89,9 +89,15 @@ fn held_input_skips_sleep_and_explicit_timer_waits_on_both_clocks() {
         for real in [false, true] {
             for object in [false, true] {
                 let (mut machine, _) = fixture(jit, real, false, object, object);
+                machine.sys.stats.wait_diagnostics =
+                    Some(adv_machine::wait_diagnostics::WaitDiagnostics::default());
                 assert!(matches!(machine.run(), RunResult::Exited(0)));
                 assert_eq!(machine.sys.scheduling.active_time_skips, 1);
                 assert!(machine.sys.scheduling.active_time_skip_us >= 9_000_000);
+                let report = machine.sys.stats.wait_diagnostics.as_ref().unwrap().json();
+                assert!(report.contains("\"skipped_segments\":1"));
+                assert!(report.contains("\"guest_us\":{\"count\":1"));
+                assert!(report.contains("\"dispatch_queue_us\":{\"count\":1"));
             }
         }
     }
