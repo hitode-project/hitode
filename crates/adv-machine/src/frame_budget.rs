@@ -169,7 +169,10 @@ impl FrameBudget {
             frequency_khz: None,
         };
         self.last = at;
-        self.previous = total;
+        self.previous = FrameRow {
+            frame: serial as u32,
+            ..total
+        };
         self.previous_cpu = cpu;
         self.hle_ns = [0; 4];
         self.present_call_ns = 0;
@@ -369,5 +372,20 @@ mod tests {
         assert_eq!(classify("kernel32.dll", "ReadFile"), 1);
         assert_eq!(classify("dsound.dll", "Unlock"), 2);
         assert_eq!(classify("user32.dll", "PeekMessageW"), 3);
+    }
+
+    #[test]
+    fn first_run_presenting_immediately_marks_startup_only_once() {
+        let total = FrameRow {
+            frame: u32::MAX,
+            ..Default::default()
+        };
+        let mut b = FrameBudget::new(total, None);
+        b.mark_frame(1);
+        b.finish(total, None);
+        b.mark_frame(2);
+        b.finish(FrameRow { frame: 1, ..total }, None);
+        assert!(b.normal[0].startup);
+        assert!(!b.normal[1].startup);
     }
 }
