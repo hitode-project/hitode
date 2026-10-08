@@ -318,7 +318,11 @@ impl Executor {
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
         #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         if let Some(engine) = &self.memory.direct_engine {

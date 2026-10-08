@@ -36,8 +36,8 @@ fn io_failure(env: &mut Env<'_>, error: std::io::Error) -> Outcome {
     #[cfg(windows)]
     let dos = error.raw_os_error().map(|code| code as u32);
     #[cfg(not(windows))]
-    let dos: Option<u32> = None;
-    let dos = dos.unwrap_or(match error.kind() {
+    let dos = None;
+    let dos: u32 = dos.unwrap_or(match error.kind() {
         std::io::ErrorKind::OutOfMemory => 8,
         std::io::ErrorKind::StorageFull => 112,
         std::io::ErrorKind::BrokenPipe => 109,

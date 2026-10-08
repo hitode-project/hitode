@@ -20,6 +20,7 @@ unsafe extern "C" {
     static adv_posix_probe_recovery: u8;
     static adv_posix_probe_chain_recovery: u8;
     static adv_posix_probe_end: u8;
+    fn adv_posix_fault_pc(context: *const c_void) -> usize;
     fn adv_posix_fault_set_pc(context: *mut c_void, pc: usize);
     fn adv_posix_fault_synchronous(signal: i32, code: i32) -> i32;
 }
@@ -29,7 +30,12 @@ static CHAIN_SIGNAL: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" fn host_chain(signal: i32, _info: *mut libc::siginfo_t, context: *mut c_void) {
     CHAIN_COUNT.fetch_add(1, Ordering::Relaxed);
     CHAIN_SIGNAL.store(signal as usize, Ordering::Relaxed);
-    if unsafe { (*_info).si_code } <= 0 {
+    // Darwin pthread_kill can report a memory-fault si_code for raise().
+    // This fixture handler owns only its probe PCs, never the raise frame.
+    let pc = unsafe { adv_posix_fault_pc(context) };
+    if pc != std::ptr::addr_of!(adv_posix_probe_load) as usize
+        && pc != std::ptr::addr_of!(adv_posix_probe_store) as usize
+    {
         return;
     }
     unsafe {
@@ -176,6 +182,8 @@ fn controlled_faults_preserve_prefix_and_continue() {
         "outside_guest_bus",
         "unaligned_store",
         "async_signal",
+        "async_ignore",
+        "async_default",
     ] {
         let executable = std::env::current_exe().unwrap();
         #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -197,6 +205,11 @@ fn controlled_faults_preserve_prefix_and_continue() {
             .env("ADV_CONTROLLED_FAULT_CASE", case)
             .output()
             .unwrap();
+        if case == "async_default" {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(result.status.signal(), Some(libc::SIGSEGV));
+            continue;
+        }
         assert!(
             result.status.success(),
             "controlled fault case {case} failed: {} {}",
@@ -232,7 +245,19 @@ fn run_case(case: &str) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = host_chain as *const () as usize;
     // Linux SA_EXPOSE_TAGBITS (0x800) may be absent from libc bindings.
-    action.sa_flags = libc::SA_SIGINFO | 0x800;
+    action.sa_flags = libc::SA_SIGINFO;
+    #[cfg(not(target_os = "macos"))]
+    {
+        action.sa_flags |= 0x800;
+    }
+    if case == "async_default" || case == "async_ignore" {
+        action.sa_sigaction = if case == "async_default" {
+            libc::SIG_DFL
+        } else {
+            libc::SIG_IGN
+        };
+        action.sa_flags = 0;
+    }
     unsafe {
         libc::sigemptyset(&mut action.sa_mask);
         assert_eq!(
@@ -299,6 +324,12 @@ fn run_case(case: &str) {
             .unwrap();
     }
     if case == "accessible_fault" {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        if page > 4096 {
+            direct
+                .commit_direct(4096, page - 4096, GuestPageProtection::READ_WRITE)
+                .unwrap();
+        }
         // Deliberately create a host fault not explained by frozen guest
         // metadata. It must remain a host fault, even at a registered PC.
         assert_eq!(
@@ -320,6 +351,20 @@ fn run_case(case: &str) {
         };
         #[cfg(target_os = "linux")]
         let fd = unsafe { libc::memfd_create(c"adv-fault-probe".as_ptr(), libc::MFD_CLOEXEC) };
+        #[cfg(target_os = "macos")]
+        let fd = unsafe {
+            let mut name = std::ffi::CString::new(
+                std::env::temp_dir()
+                    .join("adv-fault-XXXXXX")
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+            .unwrap()
+            .into_bytes_with_nul();
+            let fd = libc::mkstemp(name.as_mut_ptr().cast());
+            libc::unlink(name.as_ptr().cast());
+            fd
+        };
         assert!(fd >= 0);
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         assert_eq!(unsafe { libc::ftruncate(fd, 16384) }, 0);
@@ -354,7 +399,7 @@ fn run_case(case: &str) {
     let original = state.clone();
     let mut prefix = 0;
     let host_environment = fp_environment();
-    if case == "async_signal" {
+    if case.starts_with("async_") {
         let result = unsafe {
             with_session(&mut state, &[region], &direct, 0, |_state| {
                 libc::raise(libc::SIGSEGV)
@@ -364,8 +409,17 @@ fn run_case(case: &str) {
         assert_eq!(result.result, 0);
         assert_eq!(result.recoveries, 0);
         assert_eq!(state, original);
-        assert_eq!(CHAIN_COUNT.load(Ordering::Relaxed), 1);
-        assert_eq!(CHAIN_SIGNAL.load(Ordering::Relaxed), libc::SIGSEGV as usize);
+        assert_ne!(
+            case, "async_default",
+            "default signal disposition was swallowed"
+        );
+        assert_eq!(
+            CHAIN_COUNT.load(Ordering::Relaxed),
+            usize::from(case == "async_signal")
+        );
+        if case == "async_signal" {
+            assert_eq!(CHAIN_SIGNAL.load(Ordering::Relaxed), libc::SIGSEGV as usize);
+        }
         return;
     }
     let result = unsafe {
@@ -402,6 +456,7 @@ fn run_case(case: &str) {
     );
     if unclaimed {
         assert_eq!(CHAIN_COUNT.load(Ordering::Relaxed), 1);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             CHAIN_SIGNAL.load(Ordering::Relaxed),
             if case == "outside_guest_bus" {
@@ -410,6 +465,11 @@ fn run_case(case: &str) {
                 libc::SIGSEGV
             } as usize
         );
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            CHAIN_SIGNAL.load(Ordering::Relaxed) as i32,
+            libc::SIGBUS | libc::SIGSEGV
+        ));
         assert_eq!(result.result, 0xface);
         assert_eq!(result.recoveries, 0);
         assert_eq!(state, original);
@@ -517,7 +577,7 @@ fn run_case(case: &str) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[test]
 fn inactive_sme_records_preserve_fpsimd_capture() {
     unsafe extern "C" {

@@ -2,7 +2,7 @@
 //! Inputs are authored with the repository's assembler; no game data is used.
 #![cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod support;
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
