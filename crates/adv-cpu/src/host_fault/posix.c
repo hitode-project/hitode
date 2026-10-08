@@ -6,12 +6,20 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 
-#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+#if (defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))) || (defined(__APPLE__) && defined(__aarch64__))
 /* Linux UAPI flag, absent from some libc signal.h versions. */
 #ifndef SA_EXPOSE_TAGBITS
+#ifdef __APPLE__
+#define SA_EXPOSE_TAGBITS 0
+#else
 #define SA_EXPOSE_TAGBITS 0x00000800
+#endif
 #endif
 typedef uintptr_t (*adv_posix_dispatch_t)(int, uintptr_t, uintptr_t,
                                         uintptr_t, void *);
@@ -20,7 +28,7 @@ static struct sigaction adv_previous[2];
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal chaining requires lock-free atomics");
 static _Atomic unsigned adv_reset[2];
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__)
 struct adv_context_header { uint32_t magic, size; };
 struct adv_fpsimd_context {
     struct adv_context_header head;
@@ -66,6 +74,8 @@ uintptr_t adv_posix_fault_pc(const void *raw) {
     const ucontext_t *context = raw;
 #if defined(__x86_64__)
     return context->uc_mcontext.gregs[REG_RIP];
+#elif defined(__APPLE__)
+    return context->uc_mcontext->__ss.__pc;
 #else
     return context->uc_mcontext.pc;
 #endif
@@ -75,6 +85,8 @@ void adv_posix_fault_set_pc(void *raw, uintptr_t pc) {
     ucontext_t *context = raw;
 #if defined(__x86_64__)
     context->uc_mcontext.gregs[REG_RIP] = pc;
+#elif defined(__APPLE__)
+    context->uc_mcontext->__ss.__pc = pc;
 #else
     context->uc_mcontext.pc = pc;
 #endif
@@ -88,6 +100,11 @@ uint64_t adv_posix_fault_gpr(const void *raw, unsigned index) {
         REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15
     };
     return index < 16 ? (uint64_t)context->uc_mcontext.gregs[registers[index]] : 0;
+#elif defined(__APPLE__)
+    if (index < 29) return context->uc_mcontext->__ss.__x[index];
+    if (index == 29) return context->uc_mcontext->__ss.__fp;
+    if (index == 30) return context->uc_mcontext->__ss.__lr;
+    return context->uc_mcontext->__ss.__sp;
 #else
     return index < 31 ? context->uc_mcontext.regs[index] : context->uc_mcontext.sp;
 #endif
@@ -97,6 +114,8 @@ uint64_t adv_posix_fault_flags(const void *raw) {
     const ucontext_t *context = raw;
 #if defined(__x86_64__)
     return context->uc_mcontext.gregs[REG_EFL];
+#elif defined(__APPLE__)
+    return context->uc_mcontext->__ss.__cpsr;
 #else
     return context->uc_mcontext.pstate;
 #endif
@@ -113,6 +132,12 @@ int adv_posix_fault_fp(const void *raw, uint32_t *control, uint32_t *status,
     const unsigned char *source = (const unsigned char *)fp->_xmm;
     for (unsigned index = 0; index < 16 * 16; ++index) vectors[index] = source[index];
     for (unsigned index = 16 * 16; index < 32 * 16; ++index) vectors[index] = 0;
+#elif defined(__APPLE__)
+    if (!context->uc_mcontext) return 0;
+    *control = context->uc_mcontext->__ns.__fpcr;
+    *status = context->uc_mcontext->__ns.__fpsr;
+    const unsigned char *source = (const unsigned char *)context->uc_mcontext->__ns.__v;
+    for (unsigned index = 0; index < 32 * 16; ++index) vectors[index] = source[index];
 #else
     const struct adv_fpsimd_context *fp = adv_fpsimd(context);
     if (!fp) return 0;
@@ -128,6 +153,10 @@ static uintptr_t adv_access(const ucontext_t *context) {
 #if defined(__x86_64__)
     uint64_t error = context->uc_mcontext.gregs[REG_ERR];
     return error & 16 ? 2 : ((error >> 1) & 1);
+#elif defined(__APPLE__)
+    /* ESR WnR identifies data aborts; other exceptions stay unclaimed. */
+    uint64_t esr = context->uc_mcontext->__es.__esr;
+    return (esr >> 26) == 0x24 || (esr >> 26) == 0x25 ? (esr >> 6) & 1 : 2;
 #else
     const unsigned char *records = context->uc_mcontext.__reserved;
     size_t offset = 0;
@@ -154,6 +183,18 @@ int adv_posix_fault_synchronous(int signal, int code) {
         (signal == SIGBUS && (code == BUS_ADRALN || code == BUS_ADRERR || code == BUS_OBJERR));
 }
 
+/* Darwin pthread_kill may label raise(SIGSEGV) as SEGV_ACCERR. Its saved
+ * ESR describes SVC, not a data abort; do not consume an asynchronous signal
+ * or retry it as a synchronous fault when restoring the old disposition. */
+static int adv_synchronous(int signal, const siginfo_t *info, const void *raw) {
+#ifdef __APPLE__
+    if (adv_access(raw) > 1) return 0;
+#else
+    (void)raw;
+#endif
+    return adv_posix_fault_synchronous(signal, info->si_code);
+}
+
 static void adv_chain(int signal, siginfo_t *info, void *raw) {
     unsigned index = signal == SIGBUS;
     struct sigaction previous = adv_previous[index];
@@ -161,14 +202,14 @@ static void adv_chain(int signal, siginfo_t *info, void *raw) {
         if (atomic_exchange_explicit(&adv_reset[index], 1, memory_order_relaxed))
             previous.sa_handler = SIG_DFL;
     }
-    if (previous.sa_handler == SIG_IGN && !adv_posix_fault_synchronous(signal, info->si_code)) return;
+    if (previous.sa_handler == SIG_IGN && !adv_synchronous(signal, info, raw)) return;
     if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
         /* Retry a synchronous fault under the original disposition. Ignoring
          * a synchronous memory fault has no defined useful continuation. */
         previous.sa_handler = SIG_DFL;
         previous.sa_flags = 0;
         sigaction(signal, &previous, NULL);
-        if (!adv_posix_fault_synchronous(signal, info->si_code)) kill(getpid(), signal);
+        if (!adv_synchronous(signal, info, raw)) kill(getpid(), signal);
         return;
     }
     if (previous.sa_flags & SA_SIGINFO) previous.sa_sigaction(signal, info, raw);
@@ -176,7 +217,7 @@ static void adv_chain(int signal, siginfo_t *info, void *raw) {
 }
 
 static void adv_handler(int signal, siginfo_t *info, void *raw) {
-    if (adv_posix_fault_synchronous(signal, info->si_code) && adv_dispatch) {
+    if (adv_synchronous(signal, info, raw) && adv_dispatch) {
         uintptr_t target = adv_dispatch(signal, adv_posix_fault_pc(raw),
             (uintptr_t)info->si_addr, adv_access(raw), raw);
         if (target) {

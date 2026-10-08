@@ -1,3 +1,12 @@
+
+#if defined(__APPLE__)
+#define adv_posix_probe_start _adv_posix_probe_start
+#define adv_posix_probe_load _adv_posix_probe_load
+#define adv_posix_probe_store _adv_posix_probe_store
+#define adv_posix_probe_recovery _adv_posix_probe_recovery
+#define adv_posix_probe_chain_recovery _adv_posix_probe_chain_recovery
+#define adv_posix_probe_end _adv_posix_probe_end
+#endif
 /* Synthetic native fixture: a visible prefix, live registers/flags/FP state,
  * then one scalar operation. Recovery calls Rust in the same native frame. */
 #if defined(__x86_64__)
@@ -9,7 +18,9 @@
 .globl adv_posix_probe_recovery
 .globl adv_posix_probe_chain_recovery
 .globl adv_posix_probe_end
+#if !defined(__APPLE__)
 .type adv_posix_probe_start, @function
+#endif
 adv_posix_probe_start:
     movl %esi, %esi
     pushq %rbx
@@ -67,7 +78,9 @@ adv_posix_probe_chain_recovery:
     popq %rbx
     ret
 adv_posix_probe_end:
+#if !defined(__APPLE__)
 .size adv_posix_probe_start, adv_posix_probe_end-adv_posix_probe_start
+#endif
 .section .rodata
 .p2align 4
 adv_posix_probe_pattern:
@@ -81,7 +94,9 @@ adv_posix_probe_pattern:
 .globl adv_posix_probe_recovery
 .globl adv_posix_probe_chain_recovery
 .globl adv_posix_probe_end
+#if !defined(__APPLE__)
 .type adv_posix_probe_start, %function
+#endif
 adv_posix_probe_start:
     stp x19,x20,[sp,#-128]!
     stp x21,x22,[sp,#16]
@@ -148,6 +163,10 @@ adv_posix_probe_chain_recovery:
     ldp x19,x20,[sp],#128
     ret
 adv_posix_probe_end:
+#if !defined(__APPLE__)
 .size adv_posix_probe_start, adv_posix_probe_end-adv_posix_probe_start
 #endif
+#endif
+#if !defined(__APPLE__)
 .section .note.GNU-stack,"",@progbits
+#endif

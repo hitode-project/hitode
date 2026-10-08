@@ -1005,7 +1005,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn protected_window_faults_only_in_child_process() {
         use std::os::unix::process::ExitStatusExt;
@@ -1041,9 +1041,9 @@ mod tests {
                 .env("ADV_CPU_DIRECT_PROBE", scenario)
                 .output()
                 .unwrap();
-            assert_eq!(
-                output.status.signal(),
-                Some(libc::SIGSEGV),
+            assert!(
+                output.status.signal() == Some(libc::SIGSEGV)
+                    || (cfg!(target_os = "macos") && output.status.signal() == Some(libc::SIGBUS)),
                 "probe {scenario} ({}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
@@ -1051,7 +1051,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     #[ignore = "expected SIGSEGV; executed only by protected_window_faults_only_in_child_process"]
     fn fault_child() {

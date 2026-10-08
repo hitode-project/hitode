@@ -4,7 +4,11 @@ use super::*;
 impl Memory {
     #[cfg(all(
         test,
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     pub(crate) fn direct_test_pages(&mut self, size: usize) -> Result<(), String> {
@@ -18,12 +22,20 @@ impl Memory {
     }
     pub(crate) fn direct_memory_enabled(&self) -> bool {
         #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         return self.direct_engine.is_some();
         #[cfg(not(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
         false
@@ -31,7 +43,11 @@ impl Memory {
 
     pub(crate) fn enable_direct_memory(&mut self) -> Result<(), String> {
         #[cfg(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         {
@@ -47,14 +63,22 @@ impl Memory {
             self.install_direct_window(window, engine)
         }
         #[cfg(not(all(
-            any(target_os = "linux", target_os = "android"),
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
-        Err("direct memory requires Linux/Android x64 or ARM64".into())
+        Err("direct memory requires Linux/Android x64 or ARM64, or macOS ARM64".into())
     }
 
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     fn install_direct_window(
@@ -167,7 +191,11 @@ impl Memory {
     }
 
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     pub(crate) fn direct_window(&self) -> &crate::virtual_memory::Reservation {
