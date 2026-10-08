@@ -520,17 +520,20 @@ fn run_case(case: &str) {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn inactive_sme_records_preserve_fpsimd_capture() {
-    let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
-    // Linux/Android's AArch64 UAPI places the 16-byte-aligned, 4096-byte
-    // extension area immediately after pstate. libc keeps that area private.
-    let offset = (std::mem::offset_of!(libc::mcontext_t, pstate) + 8).next_multiple_of(16);
+    unsafe extern "C" {
+        fn adv_posix_fault_test_context_layout(layout: *mut usize);
+    }
+    let mut layout = [0; 3];
+    unsafe { adv_posix_fault_test_context_layout(layout.as_mut_ptr()) };
+    let [size, offset, record_bytes] = layout;
+    assert_eq!(record_bytes, 4096);
+    assert!(offset + record_bytes <= size);
+    // AArch64 u128 storage supplies the C context's 16-byte alignment. Query
+    // Bionic/glibc for both offsets instead of trusting Rust libc's opaque tail
+    // or its Android signal-mask layout to match the C signal boundary.
+    let mut context = vec![0u128; size.div_ceil(16)];
     let records = unsafe {
-        std::slice::from_raw_parts_mut(
-            (&mut context.uc_mcontext as *mut libc::mcontext_t)
-                .cast::<u8>()
-                .add(offset),
-            4096,
-        )
+        std::slice::from_raw_parts_mut(context.as_mut_ptr().cast::<u8>().add(offset), record_bytes)
     };
     records[..4].copy_from_slice(&0x4650_8001u32.to_ne_bytes());
     records[4..8].copy_from_slice(&528u32.to_ne_bytes());
@@ -558,7 +561,7 @@ fn inactive_sme_records_preserve_fpsimd_capture() {
         assert_eq!(
             unsafe {
                 adv_posix_fault_fp(
-                    std::ptr::addr_of!(context).cast(),
+                    context.as_ptr().cast(),
                     &mut control,
                     &mut status,
                     vectors.as_mut_ptr(),
@@ -575,7 +578,7 @@ fn inactive_sme_records_preserve_fpsimd_capture() {
     assert_eq!(
         unsafe {
             adv_posix_fault_fp(
-                std::ptr::addr_of!(context).cast(),
+                context.as_ptr().cast(),
                 &mut control,
                 &mut status,
                 vectors.as_mut_ptr(),

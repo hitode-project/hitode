@@ -27,6 +27,14 @@ struct adv_fpsimd_context {
     uint32_t fpsr, fpcr;
     unsigned char vregs[32][16];
 };
+/* Synthetic tests must use the same platform headers as signal capture. Rust
+ * libc's Android ucontext_t can omit Bionic's signal-mask padding; it is not
+ * a sound owner for a C ucontext_t. The production handler uses raw C context. */
+void adv_posix_fault_test_context_layout(size_t layout[3]) {
+    layout[0] = sizeof(ucontext_t);
+    layout[1] = offsetof(ucontext_t, uc_mcontext.__reserved);
+    layout[2] = sizeof(((ucontext_t *)0)->uc_mcontext.__reserved);
+}
 static const struct adv_fpsimd_context *adv_fpsimd(const ucontext_t *context) {
     const unsigned char *records = context->uc_mcontext.__reserved;
     size_t offset = 0;
