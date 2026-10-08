@@ -50,13 +50,11 @@ class ReplayTests(unittest.TestCase):
         args = argparse.Namespace(exe_relative="synthetic.exe", codepage=932,
             codec="native", codec_kernels="native", no_tiering=False,
             schedule_profile=False, auto_dialog_ms=None, font_diagnostics=False,
-            precise_waits=True, no_time_skip=True)
+            no_time_skip=True)
         command = replay.runner_command(args, "/fixture", "/game", 10)
-        self.assertIn("--precise-waits", command)
         self.assertIn("--no-time-skip", command)
-        args.precise_waits = args.no_time_skip = False
+        args.no_time_skip = False
         command = replay.runner_command(args, "/fixture", "/game", 10)
-        self.assertNotIn("--precise-waits", command)
         self.assertNotIn("--no-time-skip", command)
 
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):

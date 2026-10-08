@@ -11,8 +11,7 @@ after failures and records empty platform targets. DirectMemory and JitVerify
 configure the CPU; Tier1 records the shell selector (fixtures select their modes).
 Safepoint selects off/poll independently of verification and direct memory.
 CodeValidity selects legacy/event code-cache validation on the device.
-Features adds explicit Cargo features; Gir selects the opt-in state-SSA lane and
-includes gir-execute. Build with that feature and Gir=off to reuse one ELF set.
+Features adds explicit Cargo features. Tier 2 uses the default GIR frontend.
 .EXAMPLE
 ./tools/android/run-cpu-tests.ps1 -ExecutionExperiments -WhatIf
 .EXAMPLE
@@ -40,13 +39,11 @@ param(
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
     [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
     [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
-    [string[]]$Features = @(),
-    [ValidateSet('off', 'state-ssa')][string]$Gir = 'off'
+    [string[]]$Features = @()
 )
 $ErrorActionPreference = 'Stop'
 if ($BuildOnly -and $SkipBuild) { throw '-BuildOnly and -SkipBuild are mutually exclusive.' }
 if ($Features | Where-Object { $_ -notmatch '^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)?$' }) { throw 'Invalid Cargo feature.' }
-if ($Gir -eq 'state-ssa') { $Features = @($Features + @('gir-execute') | Select-Object -Unique) }
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($AllTests) {
     if ($ExecutionExperiments -or $PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
@@ -94,14 +91,14 @@ function Get-DeviceCommand($remote, $run) {
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
         mode = 'dry-run'; build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs; targets = $targets
         build_environment = @{ ANDROID_NDK_HOME = $Ndk; CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake'); CARGO_BUILD_JOBS = '2' }
         serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; direct_memory = [bool]$DirectMemory; tier1 = $Tier1; all_tests = [bool]$AllTests
-        features = $Features; gir = $Gir
+        features = $Features
         runs = @($runs | ForEach-Object { [ordered]@{ id = $_.id; target = $_.target; filter = $_.filter; shell = (Get-DeviceCommand '/data/local/tmp/adv-host-cpu-DRYRUN' $_) } })
     } | ConvertTo-Json -Depth 6
     return
@@ -188,7 +185,6 @@ try {
         "ADV_DIRECT_MEMORY=$([int][bool]$DirectMemory) (device only)"
         "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
         "ADV_SAFEPOINT=$Safepoint (device only)"
-        "ADV_GIR=$Gir (device only)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
         $manifest | ForEach-Object { "$($_.target)_sha256=$($_.sha256)" }

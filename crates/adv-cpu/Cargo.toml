@@ -25,10 +25,6 @@ jit-verifier = []
 gir-capture = []
 # Independent lift/verify census only; never selects an execution backend.
 gir-lift = []
-# Explicit formal GIR lowering diagnostics; never selects an executor.
-gir-lower = ["gir-lift"]
-# Serial opt-in execution; ADV_GIR=state-ssa selects it at runtime.
-gir-execute = ["gir-lower"]
 # ADV_JIT_DUMP_DIR also writes AArch64 vcode for each dumped region.
 cross-dump = ["cranelift-codegen/arm64"]
 

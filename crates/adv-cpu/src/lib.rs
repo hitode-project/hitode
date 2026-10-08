@@ -36,8 +36,7 @@ pub mod fault_recovery;
 mod file_memory;
 mod floating;
 pub mod frame_counters;
-// Independent semantics and diagnostics; no GIR code in default library builds.
-#[cfg(any(test, feature = "gir-lift"))]
+// Tier 2 front-end semantics; optional features add research diagnostics.
 mod gir;
 #[cfg(feature = "gir-capture")]
 #[path = "gir/capture.rs"]
