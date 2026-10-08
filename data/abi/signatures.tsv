@@ -3784,6 +3784,7 @@ ntdll.dll	NtReadFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Wi
 ntdll.dll	NtReadVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToRead:usize:u32:1|NumberOfBytesRead:usize*:ptr:1
 ntdll.dll	NtResumeThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|PreviousSuspendCount:u32*:ptr:1
 ntdll.dll	NtSetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1
+ntdll.dll	NtSetInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
 ntdll.dll	NtSetInformationProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ProcessInformationClass:PROCESSINFOCLASS:i32:1|ProcessInformation:void*:ptr:1|ProcessInformationLength:u32:u32:1
 ntdll.dll	NtTerminateProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ExitStatus:Windows.Win32.Foundation.NTSTATUS:i32:1
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1

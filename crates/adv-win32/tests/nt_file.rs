@@ -448,7 +448,12 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
         Conv::Stdcall { argc: 1 }
     );
     assert!(registry.dynamic_available("ntdll.dll", "NtClose"));
-    for (name, argc) in [("NtCreateFile", 11), ("NtReadFile", 9)] {
+    for (name, argc) in [
+        ("NtCreateFile", 11),
+        ("NtReadFile", 9),
+        ("NtQueryInformationFile", 5),
+        ("NtSetInformationFile", 5),
+    ] {
         assert_eq!(
             registry.get("ntdll.dll", name).unwrap().conv,
             Conv::Stdcall { argc }
@@ -631,7 +636,7 @@ fn query_failures<B: Backend>(cpu: B) {
             "process" => args[0] = 0xffffffff,
             "closed" => args[0] = closed,
             "class zero" => args[4] = 0,
-            "other class" => args[4] = 5,
+            "other class" => args[4] = 6,
             "null IOSB" => args[1] = 0,
             "null output" => args[2] = 0,
             "read-only IOSB" => args[1] = READ_ONLY,
@@ -689,6 +694,204 @@ fn failed_queries_preserve_all_outputs_last_error_and_the_shared_file_cursor() {
     query_failures(UnicornCpu::new(PARK_ADDR).unwrap());
 }
 
+fn query_standard<B: Backend>(cpu: B) {
+    use adv_os::vfs::{FileStream, StandardInformation};
+    use std::io::{Seek, SeekFrom};
+    let (mut m, root) = fixture(cpu);
+    let path = root.join("resources/present.txt");
+    std::fs::hard_link(&path, root.join("linked.txt")).unwrap();
+    let mut physical = FileStream::from(std::fs::File::open(&path).unwrap());
+    physical.seek(SeekFrom::Start(5)).unwrap();
+    let physical_expected = physical.standard_information().unwrap();
+    let file = m.sys.objects.insert_host(FileObj {
+        file: physical,
+        guest_path: r"C:\Game\present.txt".into(),
+        access: 0x80,
+        share: 7,
+    });
+    let alias = m.sys.objects.duplicate(file).unwrap();
+    let memory = m.sys.objects.insert_host(FileObj {
+        file: FileStream::read_only(std::sync::Arc::from(*b"memory")),
+        guest_path: r"C:\Windows\fixture.dll".into(),
+        access: 0x80,
+        share: 7,
+    });
+    let image = root.join("fixture.iso");
+    std::fs::write(
+        &image,
+        include_bytes!("../../adv-os/tests/fixtures/optical.iso"),
+    )
+    .unwrap();
+    let optical = {
+        let vfs = &mut m.ext.get_mut::<Win32>().vfs;
+        vfs.mount_iso('d', &image).unwrap();
+        vfs.open_optical_file("D:/ReadMe.txt").unwrap() // privacy: allow authored guest optical path
+    };
+    let optical_length = optical.metadata().unwrap().len();
+    let disc = m.sys.objects.insert_host(FileObj {
+        file: optical,
+        guest_path: "D:/ReadMe.txt".into(), // privacy: allow authored guest optical path
+        access: 0x80,
+        share: 7,
+    });
+    let virtual_expected = |length| StandardInformation {
+        allocation_size: length,
+        end_of_file: length,
+        number_of_links: 1,
+        delete_pending: false,
+        directory: false,
+    };
+    let cases = [
+        (file, physical_expected),
+        (alias, physical_expected),
+        (memory, virtual_expected(6)),
+        (disc, virtual_expected(optical_length)),
+    ];
+    let mut code = Asm::new(CODE);
+    for (index, (handle, _)) in cases.iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        m.cpu.write(base, &[0xcd; 64]).unwrap();
+        query(
+            &mut m,
+            &mut code,
+            [*handle, base, base + 8, 28, 5],
+            base + 48,
+        );
+    }
+    run(&mut m, code);
+    for (index, (handle, expected)) in cases.into_iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        let mut information = [0; 24];
+        m.cpu.read(base + 8, &mut information).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(information[..8].try_into().unwrap()),
+            expected.allocation_size
+        );
+        assert_eq!(
+            u64::from_le_bytes(information[8..16].try_into().unwrap()),
+            expected.end_of_file
+        );
+        assert_eq!(
+            u32::from_le_bytes(information[16..20].try_into().unwrap()),
+            expected.number_of_links
+        );
+        assert_eq!(information[20], u8::from(expected.delete_pending));
+        assert_eq!(information[21], u8::from(expected.directory));
+        assert_eq!(m.cpu.read_u32(base).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(base + 4).unwrap(), 24);
+        assert_eq!(m.cpu.read_u32(base + 32).unwrap(), 0xcdcdcdcd);
+        assert_eq!(m.cpu.read_u32(base + 48).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(base + 52).unwrap(), MARKER);
+        assert_eq!(
+            m.sys
+                .objects
+                .host::<FileObj>(handle)
+                .unwrap()
+                .file
+                .stream_position()
+                .unwrap(),
+            if index < 2 { 5 } else { 0 }
+        );
+        m.sys.objects.close(handle);
+    }
+}
+
+#[test]
+fn standard_queries_report_opened_instances_and_defined_virtual_metadata() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        query_standard(cpu);
+    }
+    query_standard(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn query_standard_failures<B: Backend>(cpu: B) {
+    let (mut m, _) = fixture(cpu);
+    let file = m.sys.objects.insert_host(FileObj {
+        file: adv_os::vfs::FileStream::read_only(std::sync::Arc::from(*b"memory")),
+        guest_path: r"C:\Windows\fixture.dll".into(),
+        access: 0x80,
+        share: 7,
+    });
+    let other = m.sys.objects.insert_host(String::from("non-file object"));
+    let cases = [
+        ("short invalid handle", 0xc0000004),
+        ("invalid handle", 0xc0000008),
+        ("wrong type", 0xc0000024),
+        ("null IOSB", 0xc0000005),
+        ("null output", 0xc0000005),
+        ("readonly IOSB", 0xc0000005),
+        ("readonly output", 0xc0000005),
+        ("output tail overrun", 0xc0000005),
+        ("length overflow", 0xc0000005),
+    ];
+    m.cpu.write(READ_ONLY, &[0x77; 32]).unwrap();
+    m.cpu.write(SOURCE + 0xffe8, &[0x77; 24]).unwrap();
+    let mut code = Asm::new(CODE);
+    for (index, (label, _)) in cases.iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        m.cpu.write(base, &[0xcd; 64]).unwrap();
+        let mut args = [file, base, base + 8, 24, 5];
+        match *label {
+            "short invalid handle" => {
+                args[0] = 0x13572468;
+                args[3] = 23;
+            }
+            "invalid handle" => args[0] = 0x13572468,
+            "wrong type" => args[0] = other,
+            "null IOSB" => args[1] = 0,
+            "null output" => args[2] = 0,
+            "readonly IOSB" => args[1] = READ_ONLY,
+            "readonly output" => args[2] = READ_ONLY,
+            "output tail overrun" => {
+                args[2] = SOURCE + 0xffe8;
+                args[3] = 28;
+            }
+            "length overflow" => args[3] = u32::MAX,
+            _ => unreachable!(),
+        }
+        query(&mut m, &mut code, args, base + 48);
+    }
+    run(&mut m, code);
+    for (index, (label, expected)) in cases.into_iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        assert_eq!(m.cpu.read_u32(base + 48).unwrap(), expected, "{label}");
+        assert_eq!(m.cpu.read_u32(base + 52).unwrap(), MARKER, "{label}");
+        let mut bytes = [0; 32];
+        m.cpu.read(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xcd; 32], "{label}");
+    }
+    let mut bytes = [0; 32];
+    m.cpu.read(READ_ONLY, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x77; 32]);
+    let mut tail = [0; 24];
+    m.cpu.read(SOURCE + 0xffe8, &mut tail).unwrap();
+    assert_eq!(tail, [0x77; 24]);
+    assert_eq!(
+        m.sys
+            .objects
+            .host::<FileObj>(file)
+            .unwrap()
+            .file
+            .stream_position()
+            .unwrap(),
+        0
+    );
+    m.sys.objects.close(file);
+    m.sys.objects.close(other);
+}
+
+#[test]
+fn standard_query_failures_probe_complete_outputs_before_handle_lookup() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        query_standard_failures(cpu);
+    }
+    query_standard_failures(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
 fn set_position<B: Backend>(cpu: B) {
     let (mut m, root) = fixture(cpu);
     input(&mut m, DATA, SOURCE, r"\??\C:\Game\present.txt");
@@ -700,6 +903,9 @@ fn set_position<B: Backend>(cpu: B) {
     let alias = m.sys.objects.duplicate(handle).unwrap();
     let setter = m
         .resolve_import("ntdll.dll", "ZwSetInformationFile")
+        .unwrap();
+    let nt_setter = m
+        .resolve_import("ntdll.dll", "NtSetInformationFile")
         .unwrap();
     let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
     let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
@@ -741,7 +947,8 @@ fn set_position<B: Backend>(cpu: B) {
         for value in args.into_iter().rev() {
             code.push_imm(value);
         }
-        code.call(setter).mov_mem_eax(base + 24);
+        code.call(if index % 2 == 0 { nt_setter } else { setter })
+            .mov_mem_eax(base + 24);
         code.call(get_error).mov_mem_eax(base + 28);
         // Query through the original alias observes the setter's shared seek,
         // including native completion failure after a mapped readonly IOSB.

@@ -17,6 +17,8 @@ fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
         ret: u64::from(status),
     });
 }
+pub(in crate::kernel32) mod bridge;
+
 const CHUNK: u32 = 64 * 1024;
 const HANDLE: u32 = 0;
 const IOSB: u32 = 8;

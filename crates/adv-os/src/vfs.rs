@@ -21,7 +21,7 @@ mod stream;
 mod wildcard;
 pub use optical::{OpticalDriveInfo, OpticalFile};
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
-pub use stream::FileStream;
+pub use stream::{FileStream, StandardInformation};
 pub use wildcard::wildcard;
 
 #[derive(Clone, Debug)]

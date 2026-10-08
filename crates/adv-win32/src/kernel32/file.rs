@@ -156,6 +156,9 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
             return Outcome::Return(INVALID_HANDLE_VALUE);
         }
     };
+    if let Some(outcome) = native::bridge::create(env, &path, access, share, inherit) {
+        return outcome;
+    }
     let handle = open_with_share(env, &path, access, disposition, share);
     if handle != INVALID_HANDLE_VALUE {
         super::handle::set_inherit(env, handle, inherit);
@@ -469,6 +472,9 @@ pub(crate) fn read_coherent(
 }
 
 fn read_file(env: &mut Env<'_>) -> Outcome {
+    if let Some(outcome) = native::bridge::read(env) {
+        return outcome;
+    }
     let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
@@ -604,6 +610,43 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
         0
     };
     let dist = ((u64::from(hi) << 32) | u64::from(lo)) as i64;
+    if hi_p != 0
+        && adv_abi::guest::check_range(env.cpu, hi_p, 4, adv_cpu::backend::Prot::WRITE).is_err()
+    {
+        set_last_error(env, 998);
+        return Outcome::Return(u32::MAX);
+    }
+    if let Some(outcome) = native::bridge::seek(
+        env,
+        h,
+        dist,
+        method,
+        Box::new(move |env, result| match result {
+            Ok(position) => {
+                if hi_p != 0
+                    && (adv_abi::guest::check_range(
+                        env.cpu,
+                        hi_p,
+                        4,
+                        adv_cpu::backend::Prot::WRITE,
+                    )
+                    .is_err()
+                        || env.cpu.write_u32(hi_p, (position >> 32) as u32).is_err())
+                {
+                    set_last_error(env, 998);
+                    return Outcome::Return(u32::MAX);
+                }
+                set_last_error(env, 0);
+                Outcome::Return(position as u32)
+            }
+            Err(error) => {
+                set_last_error(env, error);
+                Outcome::Return(u32::MAX)
+            }
+        }),
+    ) {
+        return outcome;
+    }
     match seek(env, h, dist, method) {
         Some(p) => {
             out_u32(env.cpu, hi_p, (p >> 32) as u32);
@@ -617,6 +660,38 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
 fn set_file_pointer_ex(env: &mut Env<'_>) -> Outcome {
     let (h, lo, hi, out, method) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let dist = ((u64::from(hi) << 32) | u64::from(lo)) as i64;
+    if out != 0
+        && adv_abi::guest::check_range(env.cpu, out, 8, adv_cpu::backend::Prot::WRITE).is_err()
+    {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    if let Some(outcome) = native::bridge::seek(
+        env,
+        h,
+        dist,
+        method,
+        Box::new(move |env, result| match result {
+            Ok(position) => {
+                if out != 0
+                    && (adv_abi::guest::check_range(env.cpu, out, 8, adv_cpu::backend::Prot::WRITE)
+                        .is_err()
+                        || env.cpu.write(out, &position.to_le_bytes()).is_err())
+                {
+                    set_last_error(env, 998);
+                    return Outcome::Return(0);
+                }
+                set_last_error(env, 0);
+                Outcome::Return(1)
+            }
+            Err(error) => {
+                set_last_error(env, error);
+                Outcome::Return(0)
+            }
+        }),
+    ) {
+        return outcome;
+    }
     match seek(env, h, dist, method) {
         Some(p) => {
             out_u32(env.cpu, out, p as u32);
@@ -639,6 +714,42 @@ fn file_size(env: &mut Env<'_>, h: u32) -> Option<u64> {
 
 fn get_file_size(env: &mut Env<'_>) -> Outcome {
     let (h, hi_p) = (env.arg(0), env.arg(1));
+    if hi_p != 0
+        && adv_abi::guest::check_range(env.cpu, hi_p, 4, adv_cpu::backend::Prot::WRITE).is_err()
+    {
+        set_last_error(env, 998);
+        return Outcome::Return(u32::MAX);
+    }
+    let previous = crate::util::last_error(env);
+    if let Some(outcome) = native::bridge::size(
+        env,
+        h,
+        Box::new(move |env, result| match result {
+            Ok(size) => {
+                if hi_p != 0
+                    && (adv_abi::guest::check_range(
+                        env.cpu,
+                        hi_p,
+                        4,
+                        adv_cpu::backend::Prot::WRITE,
+                    )
+                    .is_err()
+                        || env.cpu.write_u32(hi_p, (size >> 32) as u32).is_err())
+                {
+                    set_last_error(env, 998);
+                    return Outcome::Return(u32::MAX);
+                }
+                set_last_error(env, if size as u32 == u32::MAX { 0 } else { previous });
+                Outcome::Return(size as u32)
+            }
+            Err(error) => {
+                set_last_error(env, error);
+                Outcome::Return(u32::MAX)
+            }
+        }),
+    ) {
+        return outcome;
+    }
     match file_size(env, h) {
         Some(s) => {
             out_u32(env.cpu, hi_p, (s >> 32) as u32);
@@ -653,6 +764,34 @@ fn get_file_size(env: &mut Env<'_>) -> Outcome {
 
 fn get_file_size_ex(env: &mut Env<'_>) -> Outcome {
     let (h, p) = (env.arg(0), env.arg(1));
+    if adv_abi::guest::check_range(env.cpu, p, 8, adv_cpu::backend::Prot::WRITE).is_err() {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    let previous = crate::util::last_error(env);
+    if let Some(outcome) = native::bridge::size(
+        env,
+        h,
+        Box::new(move |env, result| match result {
+            Ok(size) => {
+                if adv_abi::guest::check_range(env.cpu, p, 8, adv_cpu::backend::Prot::WRITE)
+                    .is_err()
+                    || env.cpu.write(p, &size.to_le_bytes()).is_err()
+                {
+                    set_last_error(env, 998);
+                    return Outcome::Return(0);
+                }
+                set_last_error(env, previous);
+                Outcome::Return(1)
+            }
+            Err(error) => {
+                set_last_error(env, error);
+                Outcome::Return(0)
+            }
+        }),
+    ) {
+        return outcome;
+    }
     match file_size(env, h) {
         Some(s) => {
             let _ = env.cpu.write(p, &s.to_le_bytes());
