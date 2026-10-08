@@ -240,22 +240,17 @@ impl Pe {
             .checked_add(opt_size)
             .ok_or_else(|| PeError::Malformed("optional header range overflows".into()))?;
         let oh = file
-            .get(nt_end..opt_end)
+            .get(nt_end..)
             .filter(|header| header.len() >= 96)
             .ok_or_else(|| PeError::Malformed("optional header truncated".into()))?;
         if le16(oh, 0)? != 0x10b {
             return Err(PeError::Malformed("optional header is not PE32".into()));
         }
-        let ndirs = le32(oh, 92)?;
-        let dir_size = ndirs
-            .checked_mul(8)
-            .and_then(|size| size.checked_add(96))
-            .ok_or_else(|| PeError::Malformed("data directory count overflows".into()))?;
-        if dir_size as usize > oh.len() {
-            return Err(PeError::Malformed("data directory table truncated".into()));
-        }
+        // Windows clamps the advertised count to complete entries in the header.
+        let available_dirs = opt_size.saturating_sub(96).min(oh.len() - 96) / 8;
+        let ndirs = (le32(oh, 92)? as usize).min(available_dirs).min(16);
         let mut dirs = [DataDir::default(); 16];
-        for (i, d) in dirs.iter_mut().enumerate().take(ndirs as usize) {
+        for (i, d) in dirs.iter_mut().enumerate().take(ndirs) {
             *d = DataDir {
                 rva: le32(oh, 96 + 8 * i)?,
                 size: le32(oh, 100 + 8 * i)?,
@@ -288,28 +283,18 @@ impl Pe {
             )));
         }
 
-        let mapped_size = pe.mapped_size()?;
-        for (index, d) in pe.dirs.iter().enumerate().filter(|(_, d)| d.is_present()) {
-            // SECURITY contains a file offset, not an RVA in the mapped image.
-            let limit = if index == dir::SECURITY {
-                file.len()
-            } else {
-                mapped_size as usize
-            };
-            if add(d.rva, d.size)? as usize > limit {
-                return Err(PeError::OutOfImage {
-                    rva: d.rva,
-                    len: d.size,
-                });
-            }
-        }
+        // Unused directories and advisory sizes do not prevent image mapping.
+        // Each consumer checks the actual records it dereferences instead.
         let sections_end = nsections
             .checked_mul(40)
             .and_then(|size| opt_end.checked_add(size))
             .ok_or_else(|| PeError::Malformed("section table range overflows".into()))?;
-        let sections = file
-            .get(opt_end..sections_end)
-            .ok_or_else(|| PeError::Malformed("section table truncated".into()))?;
+        let sections = if nsections == 0 {
+            &[][..]
+        } else {
+            file.get(opt_end..sections_end)
+                .ok_or_else(|| PeError::Malformed("section table truncated".into()))?
+        };
         reserve(&mut pe.sections, nsections)?;
         for s in sections.chunks_exact(40) {
             let raw_name = &s[..8];
@@ -473,13 +458,16 @@ impl Pe {
             return Ok(out);
         }
         let mut blocks = self.slice(d.rva, d.size)?;
-        while !blocks.is_empty() {
+        while blocks.len() >= 8 {
             let page = le32(blocks, 0)?;
             let size = le32(blocks, 4)?;
+            if size == 0 {
+                break;
+            }
             if size < 8 {
                 return Err(PeError::Malformed("relocation block is too short".into()));
             }
-            if size % 2 != 0 || size as usize > blocks.len() {
+            if size as usize > blocks.len() {
                 return Err(PeError::Malformed("relocation block truncated".into()));
             }
             let (block, remaining) = blocks.split_at(size as usize);
@@ -539,7 +527,9 @@ impl Pe {
             .and_then(|count| count.checked_mul(4))
             .ok_or_else(|| PeError::Malformed("import thunk array size overflows".into()))?;
         let names = self.slice(names_rva, len)?;
-        self.slice(iat_rva, add(len, 4)?)?;
+        if len != 0 {
+            self.slice(iat_rva, len)?;
+        }
         reserve(&mut out, count)?;
         let mut iat_rva = iat_rva;
         for word in names.chunks_exact(4) {
@@ -568,7 +558,14 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        let descriptors = self.slice(d.rva, d.size)?;
+        // The loader follows the terminator, even when Size excludes it.
+        let descriptors = self
+            .image
+            .get(d.rva as usize..)
+            .ok_or(PeError::OutOfImage {
+                rva: d.rva,
+                len: 20,
+            })?;
         for desc in descriptors.chunks_exact(20) {
             let (int, name, iat) = (le32(desc, 0)?, le32(desc, 12)?, le32(desc, 16)?);
             if name == 0 && iat == 0 {
@@ -595,17 +592,14 @@ impl Pe {
         let Some(s) = self.sections.iter().find(|s| s.name == ".detour") else {
             return Ok(None);
         };
-        let header = self.slice(s.virtual_address, 0x18)?;
-        if le32(header, 4)? != SIGNATURE {
+        if self.u32_at(add(s.virtual_address, 4)?)? != SIGNATURE {
             return Ok(None);
         }
+        let header = self.slice(s.virtual_address, 0x18)?;
         let d = DataDir {
             rva: le32(header, 0x10)?,
             size: le32(header, 0x14)?,
         };
-        if d.is_present() {
-            self.slice(d.rva, d.size)?;
-        }
         Ok(Some(d))
     }
 
@@ -621,7 +615,13 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        let descriptors = self.slice(d.rva, d.size)?;
+        let descriptors = self
+            .image
+            .get(d.rva as usize..)
+            .ok_or(PeError::OutOfImage {
+                rva: d.rva,
+                len: 32,
+            })?;
         for desc in descriptors.chunks_exact(32) {
             let attrs = le32(desc, 0)?;
             let name = le32(desc, 4)?;
@@ -666,10 +666,7 @@ impl Pe {
         if !d.is_present() {
             return Ok(None);
         }
-        let header = self.slice(d.rva, d.size)?;
-        if header.len() < 24 {
-            return Err(PeError::Malformed("TLS directory truncated".into()));
-        }
+        let header = self.slice(d.rva, 20)?;
         Ok(Some(Tls {
             raw_start_va: le32(header, 0)?,
             raw_end_va: le32(header, 4)?,
@@ -686,7 +683,9 @@ impl Pe {
         if tls.callbacks_va == 0 {
             return Ok(out);
         }
-        let mut rva = self.va_to_rva_at(tls.callbacks_va, base)?;
+        // VA rebasing wraps as before; reads are bounded by the mapped image,
+        // which can include padding beyond the logical SizeOfImage.
+        let mut rva = tls.callbacks_va.wrapping_sub(base);
         loop {
             let cb = self.u32_at(rva)?;
             if cb == 0 {
@@ -705,7 +704,11 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        let header = self.slice(d.rva, d.size)?;
+        // Export metadata is consulted lazily by Windows; unusable entries are
+        // absent lookups rather than a reason to reject the entire image.
+        let Ok(header) = self.slice(d.rva, 40) else {
+            return Ok(out);
+        };
         let ordinal_base = le32(header, 16)?;
         let nfuncs = le32(header, 20)?;
         let nnames = le32(header, 24)?;
@@ -716,41 +719,44 @@ impl Pe {
                 .ok_or_else(|| PeError::Malformed("export array size overflows".into()))?;
             self.slice(rva, len)
         };
-        // Validate complete arrays and the public ordinal range before allocation.
-        let funcs = array(funcs, nfuncs, 4)?;
-        let names = array(names, nnames, 4)?;
-        let ords = array(ords, nnames, 2)?;
-        if nfuncs != 0
-            && ordinal_base
-                .checked_add(nfuncs - 1)
-                .is_none_or(|last| last > u32::from(u16::MAX))
-        {
-            return Err(PeError::Malformed("export ordinal exceeds u16".into()));
-        }
+        // Validate the EAT before allocation, then keep only ordinals exposed
+        // by the existing u16 interface. Never truncate them into aliases.
+        let Ok(funcs) = array(funcs, nfuncs, 4) else {
+            return Ok(out);
+        };
+        let count = (u32::from(u16::MAX) + 1)
+            .saturating_sub(ordinal_base)
+            .min(nfuncs) as usize;
         let mut name_of = Vec::new();
-        reserve(&mut name_of, nfuncs as usize)?;
-        name_of.resize_with(nfuncs as usize, || None);
-        for (name, ord) in names.chunks_exact(4).zip(ords.chunks_exact(2)) {
+        reserve(&mut name_of, count)?;
+        name_of.resize_with(count, || None);
+        let ords = self.image.get(ords as usize..).unwrap_or_default();
+        for (i, ord) in ords.chunks_exact(2).take(nnames as usize).enumerate() {
             let idx = le16(ord, 0)? as usize;
-            let slot = name_of
-                .get_mut(idx)
-                .ok_or_else(|| PeError::Malformed("export name index outside EAT".into()))?;
-            *slot = Some(self.string_at(le32(name, 0)?)?);
+            let Some(slot) = name_of.get_mut(idx) else {
+                continue;
+            };
+            let Some(name_rva) = (i as u32)
+                .checked_mul(4)
+                .and_then(|offset| names.checked_add(offset))
+            else {
+                continue;
+            };
+            if let Ok(name) = self.u32_at(name_rva).and_then(|rva| self.string_at(rva)) {
+                *slot = Some(name);
+            }
         }
-        reserve(&mut out, nfuncs as usize)?;
-        let end = add(d.rva, d.size)?;
+        reserve(&mut out, count)?;
         for (i, (name, func)) in name_of.into_iter().zip(funcs.chunks_exact(4)).enumerate() {
             let rva = le32(func, 0)?;
             if rva == 0 {
                 continue;
             }
-            let target = if rva >= d.rva && rva < end {
-                let bytes = self.slice(rva, end - rva)?;
-                let len = bytes
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .ok_or_else(|| PeError::Malformed("export forwarder is unterminated".into()))?;
-                ExportTarget::Forwarder(String::from_utf8_lossy(&bytes[..len]).into_owned())
+            let target = if rva.checked_sub(d.rva).is_some_and(|offset| offset < d.size) {
+                let Ok(name) = self.string_at(rva) else {
+                    continue;
+                };
+                ExportTarget::Forwarder(name)
             } else {
                 ExportTarget::Rva(rva)
             };

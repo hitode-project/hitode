@@ -119,20 +119,9 @@ impl ResourceDir {
 }
 
 pub(crate) fn parse(pe: &Pe, dir: DataDir) -> Result<ResourceDir> {
-    let bytes = pe.slice(dir.rva, dir.size)?;
     ResourceDir::read(dir.rva, |rva, output| {
-        let offset = rva.checked_sub(dir.rva).ok_or(PeError::OutOfImage {
-            rva,
-            len: output.len() as u32,
-        })?;
-        let end = add(offset, output.len() as u32)?;
-        let source = bytes
-            .get(offset as usize..end as usize)
-            .ok_or(PeError::OutOfImage {
-                rva,
-                len: output.len() as u32,
-            })?;
-        output.copy_from_slice(source);
+        // Resource offsets are checked against the image, not advisory Size.
+        output.copy_from_slice(pe.slice(rva, output.len() as u32)?);
         Ok(())
     })
 }
@@ -216,7 +205,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
                 ResourceNode::Dir(self.directory(root, target & 0x7fff_ffff, depth + 1)?)
             } else {
                 let data = add(root, target)?;
-                let mut bytes = [0; 16];
+                // The reserved final word is not consumed by resource lookup.
+                let mut bytes = [0; 12];
                 self.read_bytes(data, &mut bytes)?;
                 ResourceNode::Data(ResourceData {
                     entry_rva: data,
