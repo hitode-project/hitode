@@ -903,25 +903,22 @@ impl<'a> Loader<'a> {
         let Some(original) = image.exports_by_name.get(name) else {
             return Ok(None);
         };
-        if self
-            .sys
-            .thunks
-            .resolver()
-            .data_size(&image.name, name)
-            .is_some()
+        let published = self.sys.thunks.published_index(&image.name, name);
+        if published.is_none()
+            && self
+                .sys
+                .thunks
+                .resolver()
+                .data_size(&image.name, name)
+                .is_some()
         {
             return Ok(None);
         }
-        let symbol = ImportName::Name {
-            hint: 0,
-            name: name.to_owned(),
-        };
-        let live = mapped_export(self.cpu, image.base, image.size, &symbol).ok_or_else(|| {
-            LoadError::MissingExport {
+        let live = mapped_export_inner(self.cpu, image.base, image.size, MappedName::Name(name))
+            .ok_or_else(|| LoadError::MissingExport {
                 module: image.name.clone(),
                 name: name.to_owned(),
-            }
-        })?;
+            })?;
         let rva = match live {
             ExportTarget::Rva(rva) => rva,
             ExportTarget::Forwarder(_) if &live == original => return Ok(None),
@@ -938,13 +935,20 @@ impl<'a> Loader<'a> {
         if original != &ExportTarget::Rva(rva) {
             return Ok(Some(address));
         }
-        let thunk = self.sys.thunks.publish(self.cpu, &image.name, name)?;
-        let index = (thunk - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
-        let expected = self.sys.thunks.pristine_entry(index);
-        adv_abi::guest::check_range(self.cpu, address, expected.len() as u32, Prot::READ)?;
-        let mut bytes = vec![0; expected.len()];
-        self.cpu.read(address, &mut bytes)?;
-        Ok((bytes != expected).then_some(address))
+        let index = match published {
+            Some(index) => index,
+            None => {
+                let thunk = self.sys.thunks.publish(self.cpu, &image.name, name)?;
+                (thunk - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE
+            }
+        };
+        let size = self.sys.thunks.pristine_entry_bytes(index).len() as u32;
+        adv_abi::guest::check_range(self.cpu, address, size, Prot::READ)?;
+        Ok((!self
+            .sys
+            .thunks
+            .pristine_entry_matches(self.cpu, index, address)?)
+        .then_some(address))
     }
 
     fn resolve_transaction(
@@ -1071,9 +1075,12 @@ impl<'a> Loader<'a> {
                             let thunk = self.sys.thunks.publish(self.cpu, &key, &binding)?;
                             let index = (thunk - adv_machine::layout::THUNK_BASE)
                                 / adv_machine::layout::THUNK_STRIDE;
-                            let expected = self.sys.thunks.pristine_entry(index);
-                            let mut live = vec![0; expected.len()];
-                            if self.cpu.read(address, &mut live).is_err() || live == expected {
+                            if self
+                                .sys
+                                .thunks
+                                .pristine_entry_matches(self.cpu, index, address)
+                                .unwrap_or(true)
+                            {
                                 return Err(LoadError::MissingExport { module: key, name });
                             }
                             // Inline hooks, including a changed original thunk,
@@ -1134,6 +1141,76 @@ fn mapped_export(
     size: u32,
     symbol: &ImportName,
 ) -> Option<ExportTarget> {
+    let symbol = match symbol {
+        ImportName::Name { name, .. } => MappedName::Name(name),
+        ImportName::Ordinal(ordinal) => MappedName::Ordinal(*ordinal),
+    };
+    mapped_export_inner(cpu, base, size, symbol)
+}
+
+enum MappedName<'a> {
+    Name(&'a str),
+    Ordinal(u16),
+}
+
+// Preserve the bounded live-name search, including changed name pointers and
+// malformed unterminated strings. Ordinary ASCII PE names need no allocation.
+fn mapped_name_order(
+    cpu: &dyn Guest,
+    base: u32,
+    size: u32,
+    rva: u32,
+    name: &str,
+) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let limit = size.checked_sub(rva)?.min(65536) as usize;
+    let address = base.checked_add(rva)?;
+    let mut used = 0;
+    let mut order = Ordering::Equal;
+    let mut chunk = [0; 64];
+    while used < limit {
+        let at = address.checked_add(used as u32)?;
+        let count = chunk
+            .len()
+            .min(limit - used)
+            .min(4096 - (at as usize & 4095));
+        cpu.read(at, &mut chunk[..count]).ok()?;
+        let end = chunk[..count].iter().position(|&byte| byte == 0);
+        let bytes = &chunk[..end.unwrap_or(count)];
+        if !bytes.is_ascii() {
+            // Retain the existing UTF-8 parser policy for rare non-ASCII names.
+            let bytes = cpu.read_cstr(address, limit).ok()?;
+            if bytes.len() == limit {
+                return None;
+            }
+            return Some(name.cmp(std::str::from_utf8(&bytes).ok()?));
+        }
+        if order == Ordering::Equal {
+            let remaining = &name.as_bytes()[used.min(name.len())..];
+            let shared = remaining.len().min(bytes.len());
+            order = remaining[..shared].cmp(&bytes[..shared]);
+            if order == Ordering::Equal && remaining.len() < bytes.len() {
+                order = Ordering::Less;
+            }
+        }
+        if let Some(end) = end {
+            return Some(if order == Ordering::Equal {
+                name.len().cmp(&(used + end))
+            } else {
+                order
+            });
+        }
+        used += count;
+    }
+    None
+}
+
+fn mapped_export_inner(
+    cpu: &dyn Guest,
+    base: u32,
+    size: u32,
+    symbol: MappedName<'_>,
+) -> Option<ExportTarget> {
     let range =
         |rva: u32, len: u32| (rva.checked_add(len)? <= size).then_some(base.checked_add(rva)?);
     let word = |rva| cpu.read_u32(range(rva, 4)?).ok();
@@ -1169,14 +1246,13 @@ fn mapped_export(
     range(names, named.checked_mul(4)?)?;
     range(ordinals, named.checked_mul(2)?)?;
     let index = match symbol {
-        ImportName::Ordinal(ordinal) => u32::from(*ordinal).checked_sub(ordinal_base)?,
-        ImportName::Name { name, .. } => {
+        MappedName::Ordinal(ordinal) => u32::from(ordinal).checked_sub(ordinal_base)?,
+        MappedName::Name(name) => {
             let (mut low, mut high) = (0, named);
             let mut found = None;
             while low < high {
                 let middle = low + (high - low) / 2;
-                let candidate = string(word(names + middle * 4)?, 65536)?;
-                match name.cmp(&candidate) {
+                match mapped_name_order(cpu, base, size, word(names + middle * 4)?, name)? {
                     std::cmp::Ordering::Less => high = middle,
                     std::cmp::Ordering::Greater => low = middle + 1,
                     std::cmp::Ordering::Equal => {
