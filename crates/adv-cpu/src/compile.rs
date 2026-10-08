@@ -1558,15 +1558,13 @@ fn compile_snapshot_with_inline(
                 .extractlane(params[contract::GPRS + i / 4], (i % 4) as u8);
             b.def_var(*reg, value);
         }
-        let f = b.ins().extractlane(params[contract::FLAGS], 0);
+        let f = params[contract::FLAGS];
         b.def_var(flags, f);
-        for (i, var) in lazy.iter().enumerate() {
-            let lane = i + 1;
-            let value = b
-                .ins()
-                .extractlane(params[contract::FLAGS + lane / 4], (lane % 4) as u8);
-            b.def_var(*var, value);
+        for var in lazy {
+            b.def_var(var, zero);
         }
+        let carry = b.ins().band_imm(f, 1);
+        b.def_var(lazy[4], carry);
         b.def_var(fuel, params[contract::FUEL]);
         let pc = params[contract::PC];
         let blocks: BTreeMap<_, _> = entries
@@ -1708,7 +1706,7 @@ fn compile_snapshot_with_inline(
             fuel,
             state,
             mem: params[1],
-            abi_state: params[contract::GPRS..contract::GPRS + 4]
+            abi_state: params[contract::GPRS..contract::GPRS + 2]
                 .try_into()
                 .unwrap(),
             perms,
@@ -1828,9 +1826,9 @@ fn compile_snapshot_with_inline(
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_return: None,
         };
-        // External and local transfers share the lazy state contract. Keep the
-        // entry switch separate from dynamic local predecessors so a known
-        // local recipe is not widened before a normal exit.
+        // Incoming flags are canonical; local transfers retain lazy recipes.
+        // Keep their dispatches separate so a known local recipe is not widened
+        // before a normal exit.
         if hot_exits {
             e.interrupt_at(pc, true);
             let entry_miss = e.b.create_block();
@@ -3277,7 +3275,7 @@ struct Emitter<'a> {
     lazy: [Variable; 7],
     state: Value,
     mem: Value,
-    abi_state: [Value; 4],
+    abi_state: [Value; 2],
     perms: Value,
     interrupt: Value,
     context: Value,
@@ -3847,11 +3845,10 @@ impl Emitter<'_> {
     }
     fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
         self.save_extended_state();
-        for (i, reg) in self.regs.iter().enumerate() {
-            let v = self.b.use_var(*reg);
+        for (i, value) in self.gpr_arguments().into_iter().enumerate() {
             self.b
                 .ins()
-                .store(MemFlags::trusted(), v, self.state, (i * 4) as i32);
+                .store(MemFlags::trusted(), value, self.state, (i * 16) as i32);
         }
         let flags = flags.unwrap_or_else(|| self.materialize_flags());
         self.b.ins().store(

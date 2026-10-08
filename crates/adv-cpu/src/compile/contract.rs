@@ -1,8 +1,8 @@
 //! One register-passed state contract for native regions and loop kernels.
 //!
 //! Cranelift Tail has six integer argument registers on both supported hosts.
-//! Four vector arguments carry all guest GPRs and the lazy flag recipe without
-//! stack arguments. CpuState is canonical only at a Rust/helper boundary.
+//! Two vector arguments carry all guest GPRs; EFLAGS occupies the fifth integer
+//! register. CpuState is canonical only at a Rust/helper boundary.
 use super::*;
 
 pub(super) const PC: usize = 2;
@@ -17,7 +17,8 @@ pub(super) fn signature(module: &JITModule) -> ir::Signature {
     signature.params.extend([AbiParam::new(ptr); 2]);
     signature.params.push(AbiParam::new(types::I32));
     signature.params.push(AbiParam::new(types::I64));
-    signature.params.extend([AbiParam::new(types::I32X4); 4]);
+    signature.params.extend([AbiParam::new(types::I32X4); 2]);
+    signature.params.push(AbiParam::new(types::I32));
     signature.returns.push(AbiParam::new(types::I32));
     signature
 }
@@ -55,17 +56,11 @@ pub(super) fn load(
         state,
         offset_of!(CpuState, eflags) as i32,
     );
-    let zero = b.ins().iconst(types::I32, 0);
-    let empty = b.ins().splat(types::I32X4, zero);
-    let recipe = b.ins().insertlane(empty, flags, 0);
-    let carry = b.ins().band_imm(flags, 1);
-    let kinds = b.ins().insertlane(empty, carry, 1);
-    vec![context, memory, pc, fuel, low, high, recipe, kinds]
+    vec![context, memory, pc, fuel, low, high, flags]
 }
 
 impl Emitter<'_> {
-    pub(super) fn tail_arguments(&mut self, pc: Value) -> Vec<Value> {
-        let fuel = self.b.use_var(self.fuel);
+    pub(super) fn gpr_arguments(&mut self) -> [Value; 2] {
         let mut vectors = self.abi_state;
         let written = self.write_summary.map_or(0xff, |summary| summary.gpr);
         for index in 0..8 {
@@ -77,21 +72,13 @@ impl Emitter<'_> {
                         .insertlane(vectors[index / 4], value, (index % 4) as u8);
             }
         }
-        if self.write_summary.is_none_or(|summary| summary.flags) {
-            for index in 0..8 {
-                let var = if index == 0 {
-                    self.flags
-                } else {
-                    self.lazy[index - 1]
-                };
-                let value = self.b.use_var(var);
-                let vector = 2 + index / 4;
-                vectors[vector] =
-                    self.b
-                        .ins()
-                        .insertlane(vectors[vector], value, (index % 4) as u8);
-            }
-        }
+        vectors
+    }
+
+    pub(super) fn tail_arguments(&mut self, pc: Value) -> Vec<Value> {
+        let fuel = self.b.use_var(self.fuel);
+        let vectors = self.gpr_arguments();
+        let flags = self.materialize_flags();
         vec![
             self.context,
             self.mem,
@@ -99,8 +86,7 @@ impl Emitter<'_> {
             fuel,
             vectors[0],
             vectors[1],
-            vectors[2],
-            vectors[3],
+            flags,
         ]
     }
 
