@@ -28,6 +28,8 @@ pub struct ProcessStatus {
     pub failure: Option<String>,
     pub missing_apis: Vec<String>,
     pub acceptance_eligible: bool,
+    pub structural_mismatches: u64,
+    pub structural_warnings: Vec<(String, String, u64)>,
     /// Owned backend evidence survives process selection and child retirement.
     pub first_cpu_fault: Option<adv_machine::exception::CpuFaultSnapshot>,
     pub latest_cpu_fault: Option<adv_machine::exception::CpuFaultSnapshot>,
@@ -72,6 +74,8 @@ impl<B: Backend> Family<B> {
                 failure: None,
                 missing_apis: Vec::new(),
                 acceptance_eligible: true,
+                structural_mismatches: 0,
+                structural_warnings: Vec::new(),
                 first_cpu_fault: None,
                 latest_cpu_fault: None,
             }],
@@ -88,6 +92,36 @@ impl<B: Backend> Family<B> {
 impl<B: Backend> Runtime<B> {
     pub fn process_statuses(&self) -> &[ProcessStatus] {
         &self.family.records
+    }
+    /// Live or retained structural evidence follows its process owner.
+    pub fn process_structural_diagnostics(&self, pid: u32) -> (u64, Vec<(String, String, u64)>) {
+        let machine = if self.machine.sys.pid == pid {
+            Some(&self.machine)
+        } else {
+            self.family.parked.get(&pid)
+        };
+        if let Some(machine) = machine {
+            return machine
+                .ext
+                .try_get::<adv_abi::ApiDiagnostics>()
+                .map_or_else(Default::default, |d| {
+                    let warnings = if d.structural_mismatches == 0 {
+                        Vec::new()
+                    } else {
+                        d.warnings
+                            .iter()
+                            .map(|((api, reason), count)| (api.clone(), reason.clone(), *count))
+                            .collect()
+                    };
+                    (d.structural_mismatches, warnings)
+                });
+        }
+        self.family
+            .records
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| (p.structural_mismatches, p.structural_warnings.clone()))
+            .unwrap_or_default()
     }
     pub fn foreground_pid(&self) -> u32 {
         self.family.foreground
@@ -301,6 +335,8 @@ impl<B: Backend> Runtime<B> {
             failure: None,
             missing_apis: Vec::new(),
             acceptance_eligible: true,
+            structural_mismatches: 0,
+            structural_warnings: Vec::new(),
             first_cpu_fault: None,
             latest_cpu_fault: None,
         });
@@ -386,6 +422,7 @@ impl<B: Backend> Runtime<B> {
         self.family.publication.remove(&pid);
         let missing = self.selected_missing_apis();
         let eligible = self.selected_api_acceptance_eligible();
+        let (structural_mismatches, structural_warnings) = self.process_structural_diagnostics(pid);
         let record = self
             .family
             .records
@@ -396,6 +433,8 @@ impl<B: Backend> Runtime<B> {
         record.failure = failure;
         record.missing_apis = missing;
         record.acceptance_eligible = eligible;
+        record.structural_mismatches = structural_mismatches;
+        record.structural_warnings = structural_warnings;
         record.first_cpu_fault = self.machine.sys.first_cpu_fault.clone();
         record.latest_cpu_fault = self.machine.sys.latest_cpu_fault.clone();
         #[cfg(feature = "gpu")]

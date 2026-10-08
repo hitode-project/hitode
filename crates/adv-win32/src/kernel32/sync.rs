@@ -11,7 +11,9 @@ use super::K32;
 use crate::util::{err, out_u32, set_last_error};
 use crate::{Win32, stdcall};
 
+mod event;
 mod local;
+pub(crate) mod native;
 pub(crate) use local::detach_fls;
 #[cfg(test)]
 mod event_tests;
@@ -309,66 +311,7 @@ fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
 }
 
 fn wait_multiple(env: &mut Env<'_>) -> Outcome {
-    let (n, handles, all, ms) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    if n == 0 || n > 64 {
-        set_last_error(env, err::INVALID_PARAMETER);
-        return Outcome::Return(WAIT_FAILED);
-    }
-    let mut hs = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let Ok(h) = env.cpu.read_u32(handles.wrapping_add(4 * i)) else {
-            set_last_error(env, err::INVALID_PARAMETER);
-            return Outcome::Return(WAIT_FAILED);
-        };
-        if hs.contains(&h)
-            || (all != 0
-                && hs
-                    .iter()
-                    .any(|&other| env.sys.objects.same_object(other, h)))
-        {
-            set_last_error(env, err::INVALID_PARAMETER);
-            return Outcome::Return(WAIT_FAILED);
-        }
-        if let Some(Object::Process { access, .. } | Object::RemoteThread { access, .. }) =
-            env.sys.objects.get(h)
-            && access & 0x10_0000 == 0
-        {
-            set_last_error(env, err::ACCESS_DENIED);
-            return Outcome::Return(WAIT_FAILED);
-        }
-        if !matches!(
-            env.sys.objects.get(h),
-            Some(
-                Object::Event { .. }
-                    | Object::Timer { .. }
-                    | Object::Mutex { .. }
-                    | Object::Semaphore { .. }
-                    | Object::Thread { .. }
-                    | Object::Process { .. }
-                    | Object::RemoteThread { .. }
-            )
-        ) {
-            set_last_error(env, err::INVALID_HANDLE);
-            return Outcome::Return(WAIT_FAILED);
-        }
-        hs.push(h);
-    }
-    if let Some(reason) = env.sys.try_acquire_objects(&hs, all != 0) {
-        return wait_result(Resume::Woke(reason));
-    }
-    if ms == 0 {
-        return Outcome::Return(WAIT_TIMEOUT);
-    }
-    let deadline = (ms != INFINITE).then(|| env.sys.clock.now_us() + u64::from(ms) * 1000);
-    Outcome::block(
-        Wait::Objects {
-            handles: hs,
-            all: all != 0,
-            deadline,
-            notification: None,
-        },
-        |_, r| wait_result(r),
-    )
+    native::multiple_front(env, false)
 }
 
 fn created(env: &mut Env<'_>, o: Object) -> Outcome {
@@ -393,24 +336,17 @@ fn created(env: &mut Env<'_>, o: Object) -> Outcome {
 }
 
 fn create_event(env: &mut Env<'_>) -> Outcome {
-    let (manual, initial) = (env.arg(1) != 0, env.arg(2) != 0);
-    created(
-        env,
-        Object::Event {
-            manual_reset: manual,
-            signaled: initial,
-        },
-    )
+    event::create_front(env)
 }
 
 #[win32(kernel32, name = "OpenEventA", level = implement)]
 fn open_event_a(env: &mut Env<'_>, _access: u32, _inherit: i32, name: AnsiStr) -> Outcome {
-    super::file_mapping::open_sync(env, name.0.addr(), false, 1, 0x001f0003)
+    event::open_front(env, name.0.addr(), false)
 }
 
 #[win32(kernel32, name = "OpenEventW", level = implement)]
 fn open_event_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -> Outcome {
-    super::file_mapping::open_sync(env, name.0.addr(), true, 1, 0x001f0003)
+    event::open_front(env, name.0.addr(), true)
 }
 
 fn create_semaphore(env: &mut Env<'_>) -> Outcome {
@@ -616,6 +552,8 @@ mod critical_tests {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    native::register(reg);
+    event::register(reg);
     local::register(reg);
     stdcall(reg, K32, "InitializeSListHead", 1, |e| {
         let _ = e.cpu.write(e.arg(0), &[0; 8]);
@@ -680,6 +618,40 @@ pub(super) fn register(reg: &mut Registry) {
         let cs = e.arg(0);
         leave_cs(e, cs)
     });
+    // Native Kernel32 exports forward to these RTL entries. Keep the shared
+    // lock state but respect RTL's NTSTATUS/BOOLEAN result contracts.
+    stdcall(reg, "ntdll.dll", "RtlInitializeCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        if let Err(error) = release_cs_wait(e, cs) {
+            return Outcome::Fail(error);
+        }
+        match initialize_cs(e.cpu, cs) {
+            Ok(()) => Outcome::Return(0),
+            Err(fault) => adv_abi::guest::memory_failure(fault),
+        }
+    });
+    stdcall(
+        reg,
+        "ntdll.dll",
+        "RtlDeleteCriticalSection",
+        1,
+        |e| match release_cs_wait(e, e.arg(0)) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error),
+        },
+    );
+    stdcall(reg, "ntdll.dll", "RtlEnterCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        enter_cs(e, cs)
+    });
+    stdcall(reg, "ntdll.dll", "RtlTryEnterCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        Outcome::Return(u32::from(try_enter_cs(e, cs)))
+    });
+    stdcall(reg, "ntdll.dll", "RtlLeaveCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        leave_cs(e, cs)
+    });
     stdcall(reg, K32, CS_WAIT, 1, |e| {
         let cs = e.arg(0);
         wait_cs(e, cs)
@@ -707,14 +679,8 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "CreateEventW", 4, create_event);
     reg.register(open_event_a_ABI);
     reg.register(open_event_w_ABI);
-    stdcall(reg, K32, "SetEvent", 1, |e| {
-        let h = e.arg(0);
-        Outcome::Return(u32::from(e.sys.set_event(h)))
-    });
-    stdcall(reg, K32, "ResetEvent", 1, |e| {
-        let h = e.arg(0);
-        Outcome::Return(u32::from(e.sys.reset_event(h)))
-    });
+    stdcall(reg, K32, "SetEvent", 1, |e| event::state_front(e, true));
+    stdcall(reg, K32, "ResetEvent", 1, |e| event::state_front(e, false));
     stdcall(reg, K32, "CreateSemaphoreA", 4, create_semaphore);
     stdcall(reg, K32, "CreateSemaphoreW", 4, create_semaphore);
     stdcall(reg, K32, "ReleaseSemaphore", 3, release_semaphore);
@@ -725,13 +691,17 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ReleaseMutex", 1, release_mutex);
     stdcall(reg, K32, "WaitForSingleObject", 2, |e| {
         let (h, ms) = (e.arg(0), e.arg(1));
-        wait_one(e, h, ms)
+        native::wait_front(e, h, ms, false)
     });
     stdcall(reg, K32, "WaitForSingleObjectEx", 3, |e| {
-        let (h, ms) = (e.arg(0), e.arg(1));
-        wait_one(e, h, ms)
+        let (h, ms, alertable) = (e.arg(0), e.arg(1), e.arg(2));
+        native::wait_front(e, h, ms, alertable != 0)
     });
     stdcall(reg, K32, "WaitForMultipleObjects", 4, wait_multiple);
+    stdcall(reg, K32, "WaitForMultipleObjectsEx", 5, |env| {
+        let alertable = env.arg(4) != 0;
+        native::multiple_front(env, alertable)
+    });
     stdcall(reg, K32, "TlsAlloc", 0, |e| {
         let w = e.ext.get_mut::<Win32>();
         match w.tls_used.iter().position(|u| !u) {

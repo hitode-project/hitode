@@ -114,6 +114,9 @@ pub struct Context {
     pub stack_hi: u32,
     /// Initial ESP/EIP, consumed when the register image is first materialized.
     pub(crate) start: Option<(u32, u32)>,
+    pub(crate) initial_registers: Vec<(adv_cpu::backend::Reg, u32)>,
+    /// Execution storage is reclaimable independently of the thread identity.
+    pub(crate) storage: Option<ContextStorage>,
     /// One-shot process bootstrap, consumed only by an actual scheduler selection.
     /// The binding identifies its continuation origin, independently of mutable EIP.
     pub(crate) bootstrap_pending: Option<u32>,
@@ -123,6 +126,13 @@ pub struct Context {
     pub(crate) yielded: bool,
     /// Kernel object signaled when this context ends.
     pub thread_handle: Handle,
+}
+
+pub(crate) struct ContextStorage {
+    pub slot: u32,
+    pub stack: u32,
+    pub tls_directory: u32,
+    pub tls_blocks: Vec<(u32, u32)>,
 }
 
 impl Context {

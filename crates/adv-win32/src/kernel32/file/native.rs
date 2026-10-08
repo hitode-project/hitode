@@ -4,8 +4,7 @@ use crate::Win32;
 use adv_abi::{guest::check_range, warn_unavailable};
 use adv_cpu::backend::{GuestExt, MemFault, Prot};
 use adv_machine::{Env, Outcome};
-use adv_os::{Heaps, LoadError, Loader, Modules};
-use adv_pe::ImportName;
+use adv_os::{Heaps, LoadError};
 
 fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
     env.sys.trace.record(&adv_machine::trace::TraceRecord {
@@ -18,6 +17,10 @@ fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
     });
 }
 pub(in crate::kernel32) mod bridge;
+pub(in crate::kernel32) mod copy;
+pub(crate) mod find;
+pub(in crate::kernel32) mod metadata;
+pub(crate) mod operations;
 
 const CHUNK: u32 = 64 * 1024;
 const HANDLE: u32 = 0;
@@ -31,7 +34,7 @@ const NOT_SUPPORTED: u32 = 0xc00000bb;
 const END_OF_FILE: u32 = 0xc0000011;
 pub(in crate::kernel32) const FILE_TOO_LARGE: u32 = 0xc0000904;
 
-pub(in crate::kernel32) fn win32_error(status: u32) -> u32 {
+pub(crate) fn win32_error(status: u32) -> u32 {
     match status {
         0 => 0,
         ACCESS_VIOLATION => 998,
@@ -124,15 +127,11 @@ pub(in crate::kernel32) fn overridden(
     env: &mut Env<'_>,
     name: &str,
 ) -> Result<Option<u32>, LoadError> {
-    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let Some(module) = modules.by_name("ntdll.dll") else {
-        return Ok(None);
-    };
-    Loader::new(env.cpu, env.sys, modules, &win32.vfs).guest_override(module, name)
+    crate::native::overridden(env, name)
 }
 
 pub(in crate::kernel32) fn active(env: &mut Env<'_>) -> Result<bool, LoadError> {
-    for name in ["NtCreateFile", "NtOpenFile", "NtReadFile"] {
+    for name in ["NtCreateFile", "NtOpenFile", "NtReadFile", "NtClose"] {
         if overridden(env, name)?.is_some() {
             return Ok(true);
         }
@@ -141,26 +140,7 @@ pub(in crate::kernel32) fn active(env: &mut Env<'_>) -> Result<bool, LoadError> 
 }
 
 pub(in crate::kernel32) fn entry(env: &mut Env<'_>, name: &str) -> Result<u32, u32> {
-    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let module = modules.by_name("ntdll.dll").ok_or(NOT_SUPPORTED)?;
-    let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
-    // Reject changed forwarders before resolution can queue initializers.
-    if let Some(target) = loader
-        .guest_override(module, name)
-        .map_err(|_| NOT_SUPPORTED)?
-    {
-        return Ok(target);
-    }
-    loader
-        .resolve_dynamic(
-            module,
-            &ImportName::Name {
-                hint: 0,
-                name: name.into(),
-            },
-        )
-        .map(|(target, _)| target)
-        .map_err(|_| NOT_SUPPORTED)
+    crate::native::entry(env, name)
 }
 
 pub(in crate::kernel32) type Completion =
@@ -192,15 +172,20 @@ impl Read {
         };
         Outcome::call(target, [self.handle], move |env, resumed| {
             trace(env, "native_close", &[self.handle], resumed.value());
-            if resumed.value() == 0 {
+            if resumed.value() == 0x103 {
+                return Outcome::Fail(
+                    "native file: pending close requires native asynchronous completion support"
+                        .into(),
+                );
+            }
+            if (resumed.value() as i32) >= 0 {
                 self.finish(env, result)
             } else {
-                warn_unavailable(
-                    env,
-                    "kernel32.dll!<native file reader>",
-                    "guest native file close failed",
-                );
-                self.finish(env, Err(resumed.value()))
+                let result = match result {
+                    Err(status) => Err(status),
+                    Ok(_) => Err(resumed.value()),
+                };
+                self.finish(env, result)
             }
         })
     }

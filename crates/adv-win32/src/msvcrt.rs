@@ -13,6 +13,7 @@ mod cpp_alloc;
 mod data;
 mod directory;
 mod exceptions;
+mod file;
 mod find;
 mod formatting;
 pub(crate) use data::initialize as initialize_data;
@@ -54,22 +55,12 @@ struct CrtState {
     locales: HashMap<String, locale::LocaleState>,
 }
 
-// Stream metadata remains with the existing FILE allocation/file owner.
-// Deref preserves the established read/write/seek/close implementations.
+// The original NT handle owns bytes and cursor; FILE holds only CRT metadata.
 struct CrtFile {
-    file: std::fs::File,
+    handle: u32,
     binary: bool,
-}
-impl std::ops::Deref for CrtFile {
-    type Target = std::fs::File;
-    fn deref(&self) -> &Self::Target {
-        &self.file
-    }
-}
-impl std::ops::DerefMut for CrtFile {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.file
-    }
+    append: bool,
+    eof: bool,
 }
 
 // API-set imports and their UCRT exports share the same CRT state owner.
@@ -427,72 +418,6 @@ fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
         .unwrap_or(0)
 }
 
-fn file_open_options(mode: &str) -> Option<std::fs::OpenOptions> {
-    let mut opts = std::fs::OpenOptions::new();
-    let m = mode.trim_matches(['b', 't']);
-    if m.starts_with("r+") || mode.contains('+') && mode.starts_with('r') {
-        opts.read(true).write(true);
-    } else if m.starts_with("w+") || mode.contains('+') && mode.starts_with('w') {
-        opts.read(true).write(true).create(true).truncate(true);
-    } else if m.starts_with("a+") || mode.contains('+') && mode.starts_with('a') {
-        opts.read(true).append(true).create(true);
-    } else if m.starts_with('r') {
-        opts.read(true);
-    } else if m.starts_with('w') {
-        opts.write(true).create(true).truncate(true);
-    } else if m.starts_with('a') {
-        opts.append(true).create(true);
-    } else {
-        return None;
-    }
-    Some(opts)
-}
-
-fn crt_open_file(e: &mut Env<'_>, name: &str, mode: &str) -> Option<u32> {
-    let opts = file_open_options(mode)?;
-    crt_open_file_options(e, name, mode, opts).ok()
-}
-
-fn crt_open_file_options(
-    e: &mut Env<'_>,
-    name: &str,
-    mode: &str,
-    opts: std::fs::OpenOptions,
-) -> std::io::Result<u32> {
-    let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
-    let host_path = if mode.starts_with('w') || mode.starts_with('a') {
-        e.ext
-            .try_get::<crate::Win32>()
-            .ok_or_else(missing)?
-            .vfs
-            .write_path(name)
-            .ok_or_else(missing)?
-    } else {
-        e.ext
-            .try_get::<crate::Win32>()
-            .ok_or_else(missing)?
-            .vfs
-            .lookup(name)
-            .ok_or_else(missing)?
-    };
-    let file = opts.open(&host_path)?;
-    let ptr = allocate(e, 32, true);
-    if ptr == 0 {
-        return Err(std::io::ErrorKind::OutOfMemory.into());
-    }
-    if e.ext.try_get::<CrtState>().is_none() {
-        e.ext.insert(CrtState::default());
-    }
-    e.ext.get_mut::<CrtState>().files.insert(
-        ptr,
-        CrtFile {
-            file,
-            binary: mode.contains('b') && !mode.contains("ccs="),
-        },
-    );
-    Ok(ptr)
-}
-
 fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> Outcome {
     while p < end {
         let Ok(target) = e.cpu.read_u32(p) else {
@@ -668,9 +593,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             if a > CRT_ALLOCATION_LIMIT {
                 return Outcome::Return(0);
             }
-            return crate::heap_lock::with_process_heap(e, move |e| {
-                Outcome::Return(allocate(e, a, false))
-            });
+            return crate::native_heap::allocate(e, a, false);
         }
         "_encode_pointer" | "_decode_pointer" | "_encoded_null" => {
             let kernel = if name == "_decode_pointer" {
@@ -695,39 +618,19 @@ fn call(e: &mut Env<'_>) -> Outcome {
             else {
                 return Outcome::Return(0);
             };
-            return crate::heap_lock::with_process_heap(e, move |e| {
-                Outcome::Return(allocate(e, size, true))
-            });
+            return crate::native_heap::allocate(e, size, true);
         }
         "free" | "??_V@YAXPAX@Z" => {
             if a == 0 {
                 return Outcome::Return(0);
             }
-            return crate::heap_lock::with_process_heap(e, move |e| {
-                let heaps = e.ext.get_mut::<Heaps>();
-                heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
-                Outcome::Return(0)
-            });
+            return crate::native_heap::free(e, a);
         }
         "realloc" => {
             if a == 0 && b > CRT_ALLOCATION_LIMIT {
                 return Outcome::Return(0);
             }
-            return crate::heap_lock::with_process_heap(e, move |e| {
-                let address = if a == 0 {
-                    allocate(e, b, false)
-                } else if b == 0 {
-                    let heaps = e.ext.get_mut::<Heaps>();
-                    heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
-                    0
-                } else {
-                    let heaps = e.ext.get_mut::<Heaps>();
-                    heaps
-                        .realloc(e.cpu, &mut e.sys.vm, heaps.process_heap, a, b, false, false)
-                        .unwrap_or(0)
-                };
-                Outcome::Return(address)
-            });
+            return crate::native_heap::realloc(e, a, b);
         }
         "memcpy" | "memmove" => match memory_ops::copy(e, a, b, c) {
             Ok(pointer) => pointer,
@@ -1194,216 +1097,8 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             0
         }
-        "_wfopen_s" => {
-            let pfile = a;
-            let filename_ptr = b;
-            let mode_ptr = c;
-            let mut name_u16 = Vec::new();
-            let mut p = filename_ptr;
-            while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 {
-                    break;
-                }
-                name_u16.push(u);
-                p += 2;
-            }
-            let name_str = String::from_utf16_lossy(&name_u16);
-            let mut mode_u16 = Vec::new();
-            let mut p = mode_ptr;
-            while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 {
-                    break;
-                }
-                mode_u16.push(u);
-                p += 2;
-            }
-            let mode_str = String::from_utf16_lossy(&mode_u16);
-            if let Some(stream) = crt_open_file(e, &name_str, &mode_str) {
-                if pfile != 0 {
-                    let _ = e.cpu.write(pfile, &stream.to_le_bytes());
-                }
-                0
-            } else {
-                if pfile != 0 {
-                    let _ = e.cpu.write(pfile, &[0, 0, 0, 0]);
-                }
-                2 // ENOENT
-            }
-        }
-        "_wfopen" => {
-            let filename_ptr = a;
-            let mode_ptr = b;
-            let mut name_u16 = Vec::new();
-            let mut p = filename_ptr;
-            while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 {
-                    break;
-                }
-                name_u16.push(u);
-                p += 2;
-            }
-            let name_str = String::from_utf16_lossy(&name_u16);
-            let mut mode_u16 = Vec::new();
-            let mut p = mode_ptr;
-            while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 {
-                    break;
-                }
-                mode_u16.push(u);
-                p += 2;
-            }
-            let mode_str = String::from_utf16_lossy(&mode_u16);
-            crt_open_file(e, &name_str, &mode_str).unwrap_or(0)
-        }
-        "fopen_s" => {
-            let pfile = a;
-            let (Ok(name_bytes), Ok(mode_bytes)) =
-                (e.cpu.read_cstr(b, 4096), e.cpu.read_cstr(c, 32))
-            else {
-                return Outcome::Fail("CRT fopen_s string unmapped".into());
-            };
-            let name_str = String::from_utf8_lossy(&name_bytes);
-            let mode_str = String::from_utf8_lossy(&mode_bytes);
-            if let Some(stream) = crt_open_file(e, &name_str, &mode_str) {
-                if pfile != 0 {
-                    let _ = e.cpu.write(pfile, &stream.to_le_bytes());
-                }
-                0
-            } else {
-                if pfile != 0 {
-                    let _ = e.cpu.write(pfile, &[0, 0, 0, 0]);
-                }
-                2 // ENOENT
-            }
-        }
-        "fopen" => {
-            let (Ok(name_bytes), Ok(mode_bytes)) =
-                (e.cpu.read_cstr(a, 4096), e.cpu.read_cstr(b, 32))
-            else {
-                return Outcome::Fail("CRT fopen string unmapped".into());
-            };
-            let name_str = String::from_utf8_lossy(&name_bytes);
-            let mode_str = String::from_utf8_lossy(&mode_bytes);
-            crt_open_file(e, &name_str, &mode_str).unwrap_or(0)
-        }
-        "fread" => {
-            let buffer = a;
-            let size = b as usize;
-            let count = c as usize;
-            let stream = e.arg(3);
-            let total = size.saturating_mul(count);
-            if total == 0 || size == 0 {
-                return Outcome::Return(0);
-            }
-            let Some(state) = e.ext.try_get_mut::<CrtState>() else {
-                return Outcome::Return(0);
-            };
-            let Some(file) = state.files.get_mut(&stream) else {
-                return Outcome::Return(0);
-            };
-            use std::io::Read;
-            let mut chunk = vec![0u8; total.min(16 * 1024 * 1024)];
-            let bytes_read = file.read(&mut chunk).unwrap_or(0);
-            if bytes_read > 0 {
-                let _ = e.cpu.write(buffer, &chunk[..bytes_read]);
-            }
-            (bytes_read / size) as u32
-        }
-        "fwrite" => {
-            let buffer = a;
-            let size = b as usize;
-            let count = c as usize;
-            let stream = e.arg(3);
-            let total = size.saturating_mul(count);
-            if total == 0 || size == 0 {
-                return Outcome::Return(0);
-            }
-            let mut chunk = vec![0u8; total];
-            if e.cpu.read(buffer, &mut chunk).is_err() {
-                return Outcome::Return(0);
-            }
-            let Some(state) = e.ext.try_get_mut::<CrtState>() else {
-                return Outcome::Return(0);
-            };
-            let Some(file) = state.files.get_mut(&stream) else {
-                return Outcome::Return(0);
-            };
-            use std::io::Write;
-            let written = file.write(&chunk).unwrap_or(0);
-            (written / size) as u32
-        }
-        "fseek" => {
-            let stream = a;
-            let offset = b as i32;
-            let origin = c;
-            let Some(state) = e.ext.try_get_mut::<CrtState>() else {
-                return Outcome::Return(u32::MAX);
-            };
-            let Some(file) = state.files.get_mut(&stream) else {
-                return Outcome::Return(u32::MAX);
-            };
-            use std::io::Seek;
-            let seek_from = match origin {
-                0 => std::io::SeekFrom::Start(offset as u64),
-                1 => std::io::SeekFrom::Current(offset as i64),
-                2 => std::io::SeekFrom::End(offset as i64),
-                _ => return Outcome::Return(u32::MAX),
-            };
-            match file.seek(seek_from) {
-                Ok(_) => 0,
-                Err(_) => u32::MAX,
-            }
-        }
-        "ftell" => {
-            let stream = a;
-            let Some(state) = e.ext.try_get_mut::<CrtState>() else {
-                return Outcome::Return(u32::MAX);
-            };
-            let Some(file) = state.files.get_mut(&stream) else {
-                return Outcome::Return(u32::MAX);
-            };
-            use std::io::Seek;
-            match file.stream_position() {
-                Ok(pos) => pos as u32,
-                Err(_) => u32::MAX,
-            }
-        }
-        "fclose" => {
-            let stream = a;
-            if stream != 0 {
-                if let Some(state) = e.ext.try_get_mut::<CrtState>() {
-                    state.files.remove(&stream);
-                }
-                let heaps = e.ext.get_mut::<Heaps>();
-                heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, stream);
-            }
-            0
-        }
-        "fflush" => {
-            let stream = a;
-            if let Some(state) = e.ext.try_get_mut::<CrtState>() {
-                if let Some(file) = state.files.get_mut(&stream) {
-                    use std::io::Write;
-                    let _ = file.flush();
-                }
-            }
-            0
-        }
-        "feof" => {
-            let stream = a;
-            let Some(state) = e.ext.try_get_mut::<CrtState>() else {
-                return Outcome::Return(1);
-            };
-            let Some(file) = state.files.get_mut(&stream) else {
-                return Outcome::Return(1);
-            };
-            use std::io::Seek;
-            if let (Ok(cur), Ok(len)) = (file.stream_position(), file.metadata().map(|m| m.len())) {
-                if cur >= len { 1 } else { 0 }
-            } else {
-                0
-            }
-        }
+        "fopen" | "_wfopen" | "fopen_s" | "_wfopen_s" | "fread" | "fwrite" | "fseek" | "ftell"
+        | "fclose" | "fflush" | "feof" => return file::front(e, &name),
         "strncpy_s" => {
             let dest = a;
             let dest_size = b as usize;

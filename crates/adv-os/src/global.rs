@@ -13,6 +13,8 @@ pub enum FreeError {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub handle: u32,
+    /// Pointer owned by the heap provider, independent of the public data view.
+    pub allocation: u32,
     pub pointer: u32,
     pub size: u32,
     pub movable: bool,
@@ -26,6 +28,7 @@ pub struct Globals {
     namespace: Option<Namespace>,
     /// Borrowed identities only; Objects remains the sole payload owner.
     pointers: BTreeMap<u32, Identity<Block>>,
+    allocations: BTreeMap<u32, Identity<Block>>,
 }
 impl Globals {
     /// Retire a unique application or clipboard owner through the same heap and
@@ -44,7 +47,7 @@ impl Globals {
         if block.clipboard != clipboard || objects.strong_count(id) != Some(1) {
             return Err(FreeError::Owned);
         }
-        if block.pointer != 0 && !heaps.free(cpu, vm, 0, block.pointer) {
+        if block.allocation != 0 && !heaps.free(cpu, vm, 0, block.allocation) {
             return Err(FreeError::Invalid);
         }
         self.remove(objects, handle)
@@ -59,6 +62,7 @@ impl Globals {
     }
     pub fn insert(&mut self, objects: &mut Objects, mut block: Block) -> Option<u32> {
         let pointer = block.pointer;
+        let allocation = block.allocation;
         let ns = self.namespace(objects)?;
         let handle = if block.movable {
             objects.insert_host_in(ns, block)?
@@ -75,6 +79,10 @@ impl Globals {
             self.pointers
                 .insert(pointer, self.identity(objects, handle).unwrap());
         }
+        if allocation != 0 {
+            self.allocations
+                .insert(allocation, self.identity(objects, handle).unwrap());
+        }
         Some(handle)
     }
     pub fn identity(&self, objects: &Objects, handle: u32) -> Option<Identity<Block>> {
@@ -89,9 +97,21 @@ impl Globals {
     /// Commit a successful heap move/discard together with the borrowed index.
     /// Other metadata mutations must not change pointer or handle directly.
     pub fn set_storage(&mut self, objects: &mut Objects, handle: u32, pointer: u32, size: u32) {
+        self.set_allocation(objects, handle, pointer, pointer, size);
+    }
+    pub fn set_allocation(
+        &mut self,
+        objects: &mut Objects,
+        handle: u32,
+        allocation: u32,
+        pointer: u32,
+        size: u32,
+    ) {
         let id = self.identity(objects, handle).expect("live allocation");
         let block = objects.owned_mut(id).unwrap();
         let previous = block.pointer;
+        let previous_allocation = block.allocation;
+        block.allocation = allocation;
         block.pointer = pointer;
         block.size = size;
         if self.pointers.get(&previous) == Some(&id) {
@@ -99,6 +119,12 @@ impl Globals {
         }
         if pointer != 0 {
             self.pointers.insert(pointer, id);
+        }
+        if self.allocations.get(&previous_allocation) == Some(&id) {
+            self.allocations.remove(&previous_allocation);
+        }
+        if allocation != 0 {
+            self.allocations.insert(allocation, id);
         }
     }
     pub fn from_pointer(&self, objects: &Objects, pointer: u32) -> Option<u32> {
@@ -110,16 +136,26 @@ impl Globals {
         (block.pointer == pointer && self.identity(objects, block.handle) == Some(id))
             .then_some(block.handle)
     }
+    pub fn from_allocation(&self, objects: &Objects, allocation: u32) -> Option<u32> {
+        let id = *self.allocations.get(&allocation)?;
+        let block = objects.owned(id)?;
+        (block.allocation == allocation && self.identity(objects, block.handle) == Some(id))
+            .then_some(block.handle)
+    }
     pub fn remove(&mut self, objects: &mut Objects, handle: u32) -> Option<Block> {
         let id = self.identity(objects, handle)?;
         if objects.strong_count(id) != Some(1) {
             return None;
         }
         let pointer = objects.owned(id)?.pointer;
+        let allocation = objects.owned(id)?.allocation;
         // Fixed -> movable publishes a new identity at the same pointer first.
         // Retiring the old alias must preserve that replacement's index.
         if self.pointers.get(&pointer) == Some(&id) {
             self.pointers.remove(&pointer);
+        }
+        if self.allocations.get(&allocation) == Some(&id) {
+            self.allocations.remove(&allocation);
         }
         match objects.close_alias(self.namespace?, handle)?? {
             Object::Host(value) => value.downcast::<Block>().ok().map(|v| *v),
@@ -135,6 +171,7 @@ mod tests {
     fn block(pointer: u32, movable: bool) -> Block {
         Block {
             handle: 0,
+            allocation: pointer,
             pointer,
             size: 16,
             movable,

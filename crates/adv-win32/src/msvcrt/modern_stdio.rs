@@ -6,7 +6,6 @@ use adv_abi::{
     win32,
 };
 use adv_cpu::backend::{MemFault, Prot};
-use std::io::Seek;
 
 pub(super) fn register(registry: &mut Registry) {
     for module in ["ucrtbase.dll", "api-ms-win-crt-stdio-l1-1-0.dll"] {
@@ -36,22 +35,6 @@ fn owned(env: &mut Env<'_>, stream: u32, binary: bool) -> Result<(), Outcome> {
         )),
         Some(_) => Ok(()),
     }
-}
-
-fn io_failure(env: &mut Env<'_>, error: std::io::Error) -> Outcome {
-    let dos = shared_file::io_code(&error);
-    let value = shared_file::dos_errno(dos);
-    let errno = floating::errno_address(env);
-    if let Err(error) = check_range(env.cpu, errno.addr(), 8, Prot::WRITE).and_then(|_| {
-        env.cpu.write(
-            errno.addr(),
-            &[value.to_le_bytes(), dos.to_le_bytes()].concat(),
-        )
-    }) {
-        return memory_failure(error);
-    }
-    crate::util::set_last_error(env, dos);
-    Outcome::Return(value as u32)
 }
 
 #[win32(ucrtbase, name = "_wfopen_s", level = implement)]
@@ -87,19 +70,23 @@ fn open(env: &mut Env<'_>, output: GuestPtr<u32>, filename: WideStr, mode: WideS
             "only ordinary rb opening is supported by this binary reader profile",
         );
     }
-    let options = file_open_options(&mode).expect("validated rb mode");
-    let stream = match crt_open_file_options(env, &name, &mode, options) {
-        Ok(stream) => stream,
-        Err(error) => return io_failure(env, error),
-    };
-    if let Err(error) = output.write(env.cpu, stream) {
-        // Roll back the same FILE/heap owner if a backend output write fails.
-        env.ext.get_mut::<CrtState>().files.remove(&stream);
-        let heaps = env.ext.get_mut::<Heaps>();
-        heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, stream);
-        return memory_failure(error);
-    }
-    Outcome::Return(0)
+    file::open(
+        env,
+        &name,
+        &mode,
+        3,
+        Box::new(move |env, result| match result {
+            Ok(stream) => match output.write(env.cpu, stream) {
+                Ok(()) => Outcome::Return(0),
+                Err(error) => file::close(env, stream, Box::new(move |_, _| memory_failure(error))),
+            },
+            Err(status) => file::error(
+                env,
+                status,
+                shared_file::dos_errno(crate::kernel32::file::native::win32_error(status)) as u32,
+            ),
+        }),
+    )
 }
 
 #[win32(ucrtbase, name = "fseek", level = implement)]
@@ -115,18 +102,15 @@ fn tell(env: &mut Env<'_>, stream: GuestPtr<u8>) -> Outcome {
     if let Err(outcome) = owned(env, stream.addr(), true) {
         return outcome;
     }
-    if env
-        .ext
-        .get_mut::<CrtState>()
-        .files
-        .get_mut(&stream.addr())
-        .expect("validated live FILE")
-        .stream_position()
-        .is_ok_and(|position| position > i32::MAX as u64)
-    {
-        return unavailable(env, "FILE byte position exceeds the signed32 ftell profile");
-    }
-    call(env)
+    file::position(
+        env,
+        stream.addr(),
+        Box::new(|env, result| match result {
+            Ok(position) if position <= i32::MAX as u64 => Outcome::Return(position as u32),
+            Ok(_) => unavailable(env, "FILE byte position exceeds the signed32 ftell profile"),
+            Err(status) => file::error(env, status, u32::MAX),
+        }),
+    )
 }
 
 #[win32(ucrtbase, name = "fread", level = implement)]

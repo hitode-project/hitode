@@ -491,11 +491,17 @@ fn protect(env: &mut Env<'_>, addr: u32, size: u32, protection: u32) -> Result<u
 
 fn virtual_alloc(env: &mut Env<'_>) -> Outcome {
     let (a, s, t, p) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if let Some(outcome) = super::native::allocate(env, u32::MAX, a, s, t, p) {
+        return outcome;
+    }
     let result = allocate(env, a, s, t, p);
     finish(env, result)
 }
 fn virtual_alloc_ex(env: &mut Env<'_>) -> Outcome {
     let (h, a, s, t, p) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    if let Some(outcome) = super::native::allocate(env, h, a, s, t, p) {
+        return outcome;
+    }
     let target = match child_process::process_target(env, h, VM_OPERATION) {
         Ok(t) => t,
         Err(e) => return finish(env, Err(e)),
@@ -510,11 +516,17 @@ fn virtual_alloc_ex(env: &mut Env<'_>) -> Outcome {
 }
 fn virtual_free(env: &mut Env<'_>) -> Outcome {
     let (a, s, t) = (env.arg(0), env.arg(1), env.arg(2));
+    if let Some(outcome) = super::native::free(env, u32::MAX, a, s, t) {
+        return outcome;
+    }
     let result = release(env, a, s, t);
     finish(env, result)
 }
 fn virtual_free_ex(env: &mut Env<'_>) -> Outcome {
     let (h, a, s, t) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if let Some(outcome) = super::native::free(env, h, a, s, t) {
+        return outcome;
+    }
     let target = match child_process::process_target(env, h, VM_OPERATION) {
         Ok(t) => t,
         Err(e) => return finish(env, Err(e)),
@@ -534,10 +546,23 @@ pub(crate) fn protect_memory(env: &mut Env<'_>, a: u32, s: u32, p: u32, out: u32
     finish(env, result)
 }
 fn virtual_protect(env: &mut Env<'_>) -> Outcome {
+    if let Some(outcome) = super::native::protect(
+        env,
+        u32::MAX,
+        env.arg(0),
+        env.arg(1),
+        env.arg(2),
+        env.arg(3),
+    ) {
+        return outcome;
+    }
     protect_memory(env, env.arg(0), env.arg(1), env.arg(2), env.arg(3))
 }
 fn virtual_protect_ex(env: &mut Env<'_>) -> Outcome {
     let (h, a, s, p, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    if let Some(outcome) = super::native::protect(env, h, a, s, p, out) {
+        return outcome;
+    }
     let target = match child_process::process_target(env, h, VM_OPERATION).and_then(|t| {
         output(env, out, 4)?;
         Ok(t)
@@ -576,6 +601,9 @@ fn query_output(env: &Env<'_>, out: u32, len: u32) -> Result<(), Error> {
 }
 fn virtual_query(env: &mut Env<'_>) -> Outcome {
     let (a, out, len) = (env.arg(0), env.arg(1), env.arg(2));
+    if let Some(outcome) = super::native::query(env, u32::MAX, a, out, len) {
+        return outcome;
+    }
     let result = query_output(env, out, len)
         .and_then(|()| query(env, a))
         .and_then(|info| write_info(env, out, info));
@@ -583,6 +611,9 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
 }
 fn virtual_query_ex(env: &mut Env<'_>) -> Outcome {
     let (h, a, out, len) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if let Some(outcome) = super::native::query(env, h, a, out, len) {
+        return outcome;
+    }
     let target = match child_process::process_target(env, h, QUERY_INFORMATION).and_then(|t| {
         query_output(env, out, len)?;
         Ok(t)
@@ -632,6 +663,11 @@ fn read_target(cpu: &dyn Guest, address: u32, size: u32) -> Result<Vec<u8>, Erro
 }
 fn read_process_memory(env: &mut Env<'_>) -> Outcome {
     let (h, a, buf, size, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    if let Some(outcome) =
+        super::native::transfer(env, "NtReadVirtualMemory", [h, a, buf, size, out])
+    {
+        return outcome;
+    }
     let prepare = child_process::process_target(env, h, VM_READ).and_then(|target| {
         optional_output(env, out)?;
         let prepared = (|| {
@@ -910,6 +946,11 @@ pub(crate) fn native_read_memory(
 
 fn write_process_memory(env: &mut Env<'_>) -> Outcome {
     let (h, a, buf, size, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    if let Some(outcome) =
+        super::native::transfer(env, "NtWriteVirtualMemory", [h, a, buf, size, out])
+    {
+        return outcome;
+    }
     let prepare =
         child_process::process_target(env, h, VM_WRITE | VM_OPERATION).and_then(|target| {
             optional_output(env, out)?;

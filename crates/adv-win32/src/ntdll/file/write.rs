@@ -26,7 +26,7 @@ impl Write for CountedWriter<'_> {
 }
 
 #[win32(ntdll, name = "ZwWriteFile", level = implement)]
-fn write(
+pub(crate) fn write(
     env: &mut Env<'_>,
     handle: Handle,
     event: Handle,

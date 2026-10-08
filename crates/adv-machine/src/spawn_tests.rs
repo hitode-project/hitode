@@ -192,3 +192,119 @@ fn failed_spawn_preserves_foreign_teb_releases_owned_storage_and_retries_same_id
         assert_eq!(machine.sys.next_tid, tid + 4);
     }
 }
+
+#[test]
+fn sequential_threads_reuse_execution_storage_and_keep_completed_handle_identities() {
+    for count in [200, 1000] {
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            Empty,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.sys.tls_images.push(TlsImage {
+            index: 0,
+            template: TEMPLATE.to_vec(),
+            zero_fill: 8,
+            active: true,
+        });
+        let keeper = machine.spawn("keeper", 0x400000, &[], 0x10000).unwrap();
+        let mut retired = Vec::new();
+        let mut addresses = None;
+        for sequence in 1..=count {
+            let id = machine
+                .spawn("short", 0x400000, &[sequence], 0x10000)
+                .unwrap();
+            let context = machine.sys.context(id);
+            let handle = context.thread_handle;
+            let tid = context.tid;
+            let teb = context.teb;
+            let stack = context.stack_lo;
+            let directory = machine.cpu.read_u32(teb + teb::TLS_POINTER).unwrap();
+            let tls = machine.cpu.read_u32(directory).unwrap();
+            let actual = (teb, stack, directory, tls);
+            assert_eq!(
+                *addresses.get_or_insert(actual),
+                actual,
+                "storage is reused"
+            );
+            assert_eq!(machine.cpu.read_u32(stack).unwrap(), 0);
+            assert_eq!(machine.cpu.read_u32(teb + teb::LAST_ERROR).unwrap(), 0);
+            assert_eq!(machine.cpu.read_u32(teb + teb::TLS_SLOTS).unwrap(), 0);
+            assert_eq!(machine.cpu.read_u32(directory + 4).unwrap(), 0);
+            let mut bytes = [0xff; 12];
+            machine.cpu.read(tls, &mut bytes).unwrap();
+            assert_eq!(&bytes[..4], &TEMPLATE);
+            assert_eq!(&bytes[4..], &[0; 8]);
+            assert_eq!(machine.cpu.read_u32(teb + teb::THREAD_ID).unwrap(), tid);
+            assert_eq!(
+                machine
+                    .sys
+                    .contexts
+                    .iter()
+                    .filter(|c| c.storage.is_some())
+                    .count(),
+                2
+            );
+            machine.cpu.write_u32(stack, 0xfeedcafe).unwrap();
+            machine.cpu.write_u32(teb + teb::LAST_ERROR, 777).unwrap();
+            machine.cpu.write_u32(teb + teb::TLS_SLOTS, 888).unwrap();
+            machine.cpu.write_u32(directory + 4, 999).unwrap();
+            machine.cpu.write_u32(tls + 4, 0xfeedcafe).unwrap();
+            machine.sys.wakes.wake(id, 0, None);
+            assert!(machine.sys.terminate_context_stopped(id, sequence));
+            assert!(machine.sys.try_acquire(handle));
+            retired.push((id, handle, tid, sequence));
+        }
+        for (id, handle, tid, code) in retired {
+            assert!(
+                matches!(machine.sys.objects.get(handle), Some(Object::Thread { ctx }) if *ctx == id)
+            );
+            assert_eq!(machine.sys.context(id).tid, tid);
+            assert_eq!(machine.sys.context(id).exit_code(), Some(code));
+            assert_eq!(
+                machine
+                    .sys
+                    .thread_identity(id)
+                    .unwrap()
+                    .completion
+                    .exit_code(),
+                Some(code)
+            );
+            assert!(machine.sys.try_acquire(handle));
+        }
+        let pick = machine
+            .sys
+            .wakes
+            .pick(&mut None, machine.sys.contexts.len(), |_| true, true)
+            .unwrap();
+        assert_eq!(pick.id, keeper);
+        assert!(
+            pick.wake.is_none(),
+            "terminated contexts leave no wake preference"
+        );
+    }
+}
+
+#[test]
+fn concurrent_storage_limit_is_preserved_and_one_finished_slot_can_be_reused() {
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        Empty,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    for _ in 0..MAX_CONTEXTS {
+        machine.spawn("live", 0x400000, &[], 0x10000).unwrap();
+    }
+    assert!(machine.spawn("overflow", 0x400000, &[], 0x10000).is_err());
+    let retired = 17;
+    let teb = machine.sys.context(retired).teb;
+    assert!(machine.sys.terminate_context_stopped(retired, 37));
+    let replacement = machine
+        .spawn("replacement", 0x400000, &[], 0x10000)
+        .unwrap();
+    assert_eq!(replacement, MAX_CONTEXTS);
+    assert_eq!(machine.sys.context(replacement).teb, teb);
+    assert_eq!(machine.sys.context(retired).exit_code(), Some(37));
+}

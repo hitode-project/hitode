@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "source": {
+    "apisetschema.dll": {
+      "file_version": "10.0.26100.9549",
+      "sha256": "568c72f6216d83a716d6fa9bec59ae8d93e6728062d969ac362013f3910c0007"
+    },
+    "kernel32.dll": {
+      "file_version": "10.0.26100.9549",
+      "named_exports": 1670,
+      "sha256": "06fb2f11afa278cbf0a013493abf05dc215fe37b5928fe90456618ee7aa2495f"
+    },
+    "kernelbase.dll": {
+      "file_version": "10.0.26100.9549",
+      "named_exports": 2037,
+      "sha256": "206b065e2c8a40ffc529619bf32adb29226308bfee415ffcfb5f086794800c38"
+    },
+    "ntdll.dll": {
+      "file_version": "10.0.26100.9549",
+      "named_exports": 2523,
+      "sha256": "56770f0c0b47f313662444f3ecf77257be36f1b82ddb36be14555790fca2f430"
+    }
+  }
+}

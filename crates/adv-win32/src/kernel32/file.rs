@@ -8,17 +8,14 @@ use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome};
 
 use super::K32;
-use crate::util::{
-    INVALID_HANDLE_VALUE, cstr, err, out_u32, put_cstr, put_wstr, set_last_error, wstr, zero,
-};
-use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
-use adv_os::vfs::{DirEntry, wildcard};
+use crate::util::{INVALID_HANDLE_VALUE, cstr, err, out_u32, set_last_error, wstr};
+use crate::{FileObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod attributes;
-pub(in crate::kernel32) mod native;
+pub(crate) mod native;
 
-mod information;
+pub(crate) mod information;
 mod locking;
-pub(crate) use attributes::file_attributes_path;
+pub(crate) use attributes::{file_attributes_path, file_attributes_path_then};
 mod path;
 mod profile;
 #[cfg(test)]
@@ -558,6 +555,9 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
 }
 
 fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
+    if native::metadata::active(env, &["NtSetInformationFile", "NtQueryInformationFile"]) {
+        return native::metadata::end(env, env.arg(0));
+    }
     let Some(file) = env.sys.objects.host_mut::<FileObj>(env.arg(0)) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -582,7 +582,14 @@ fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     match file.file.set_len(position) {
-        Ok(()) => Outcome::Return(1),
+        Ok(()) => {
+            crate::native::diagnose_bypass(
+                env,
+                "kernel32.dll!SetEndOfFile",
+                &["NtSetInformationFile"],
+            );
+            Outcome::Return(1)
+        }
         Err(error) => {
             io_error(env, &error);
             Outcome::Return(0)
@@ -838,6 +845,9 @@ fn write_filetime(cpu: &mut dyn Guest, p: u32, ft: u64) {
 
 fn get_file_time(env: &mut Env<'_>) -> Outcome {
     let (h, c, a, m) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if native::metadata::active(env, &["NtQueryInformationFile"]) {
+        return native::metadata::times(env, h, [c, a, m]);
+    }
     let Some(md) = env
         .sys
         .objects
@@ -854,6 +864,7 @@ fn get_file_time(env: &mut Env<'_>) -> Outcome {
     );
     write_filetime(env.cpu, a, filetime(md.accessed().ok()));
     write_filetime(env.cpu, m, filetime(md.modified().ok()));
+    crate::native::diagnose_bypass(env, "kernel32.dll!GetFileTime", &["NtQueryInformationFile"]);
     Outcome::Return(1)
 }
 
@@ -870,7 +881,14 @@ pub(super) fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
         return Outcome::Return(0);
     }
     match w.vfs.lookup(&path).map(std::fs::remove_file) {
-        Some(Ok(())) => Outcome::Return(1),
+        Some(Ok(())) => {
+            crate::native::diagnose_bypass(
+                env,
+                "kernel32.dll!DeleteFile",
+                &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
+            );
+            Outcome::Return(1)
+        }
         Some(Err(e)) => {
             io_error(env, &e);
             Outcome::Return(0)
@@ -889,6 +907,23 @@ pub(super) fn copy_file(
     fail_if_exists: bool,
     remove_src: bool,
 ) -> Outcome {
+    if !remove_src
+        && native::metadata::active(
+            env,
+            &[
+                "NtCreateFile",
+                "NtOpenFile",
+                "NtReadFile",
+                "NtWriteFile",
+                "NtSetInformationFile",
+                "NtQueryInformationFile",
+                "NtQueryVolumeInformationFile",
+                "NtClose",
+            ],
+        )
+    {
+        return native::copy::copy(env, src, dst, fail_if_exists);
+    }
     let w = env.ext.get::<Win32>();
     let optical = w.vfs.is_optical_path(&src);
     if w.vfs.is_optical_path(&dst) || (remove_src && optical) {
@@ -927,7 +962,14 @@ pub(super) fn copy_file(
             return Outcome::Return(0);
         };
         return match std::fs::rename(from.as_ref().unwrap(), &to) {
-            Ok(()) => Outcome::Return(1),
+            Ok(()) => {
+                crate::native::diagnose_bypass(
+                    env,
+                    "kernel32.dll!MoveFile",
+                    &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
+                );
+                Outcome::Return(1)
+            }
             Err(e) => {
                 io_error(env, &e);
                 Outcome::Return(0)
@@ -1001,7 +1043,20 @@ pub(super) fn copy_file(
         Ok(())
     });
     match result {
-        Ok(()) => Outcome::Return(1),
+        Ok(()) => {
+            crate::native::diagnose_bypass(
+                env,
+                "kernel32.dll!CopyFile",
+                &[
+                    "NtOpenFile",
+                    "NtCreateFile",
+                    "NtReadFile",
+                    "NtWriteFile",
+                    "NtQueryInformationFile",
+                ],
+            );
+            Outcome::Return(1)
+        }
         Err(code) => {
             set_last_error(env, code);
             Outcome::Return(0)
@@ -1011,7 +1066,10 @@ pub(super) fn copy_file(
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
     match create_directory_path(env, &path) {
-        Ok(()) => Outcome::Return(1),
+        Ok(()) => {
+            crate::native::diagnose_bypass(env, "kernel32.dll!CreateDirectory", &["NtCreateFile"]);
+            Outcome::Return(1)
+        }
         Err(code) => {
             set_last_error(env, code);
             Outcome::Return(0)
@@ -1053,75 +1111,12 @@ pub(crate) fn create_directory_path(env: &Env<'_>, path: &str) -> Result<(), u32
     })
 }
 
-/// WIN32_FIND_DATAA/W: attrs, 3 FILETIMEs, size hi/lo, 2 reserved, name[260], alt[14]
-/// (in bytes for A, UTF-16 units for W).
-fn fill_find_data(env: &mut Env<'_>, p: u32, e: &DirEntry, wide: bool) {
-    zero(env.cpu, p, if wide { 592 } else { 320 });
-    let _ = env.cpu.write_u32(p, e.attributes);
-    let ft = filetime(e.modified);
-    for off in [4, 12, 20] {
-        write_filetime(env.cpu, p + off, ft);
-    }
-    let _ = env.cpu.write_u32(p + 28, (e.size >> 32) as u32);
-    let _ = env.cpu.write_u32(p + 32, e.size as u32);
-    if wide {
-        put_wstr(
-            env.cpu,
-            p + 44,
-            260,
-            &e.name.encode_utf16().collect::<Vec<_>>(),
-        );
-    } else {
-        let name = env.ext.get::<Win32>().codec.encode(&e.name);
-        put_cstr(env.cpu, p + 44, 260, &name);
-    }
-}
-
-/// FindFirstFile{A,W} and FindFirstFileEx{A,W} (whose info level and search filters change
-/// nothing here: the short name is always empty and every entry matches).
 fn find_first_file(env: &mut Env<'_>, pat: String, data: u32, wide: bool) -> Outcome {
-    let w = env.ext.get::<Win32>();
-    let full = w.vfs.normalize(&pat);
-    let (dir, mask) = full.rsplit_once('\\').unwrap_or(("", &full));
-    let dir = if dir.len() == 2 {
-        format!("{dir}\\")
-    } else {
-        dir.to_owned()
-    };
-    let entries: Vec<DirEntry> = w
-        .vfs
-        .list(&dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| wildcard(mask, &e.name))
-        .collect();
-    if entries.is_empty() {
-        log::debug!("FindFirstFile({full}): no match");
-        set_last_error(env, err::FILE_NOT_FOUND);
-        return Outcome::Return(INVALID_HANDLE_VALUE);
-    }
-    fill_find_data(env, data, &entries[0], wide);
-    let handle = env.sys.objects.insert_host(FindObj { entries, next: 1 });
-    if handle == 0 {
-        set_last_error(env, err::NOT_ENOUGH_MEMORY);
-        return Outcome::Return(INVALID_HANDLE_VALUE);
-    }
-    Outcome::Return(handle)
+    native::find::first(env, pat, data, wide)
 }
 
 fn find_next_file(env: &mut Env<'_>, wide: bool) -> Outcome {
-    let (h, data) = (env.arg(0), env.arg(1));
-    let Some(f) = env.sys.objects.host_mut::<FindObj>(h) else {
-        set_last_error(env, err::INVALID_HANDLE);
-        return Outcome::Return(0);
-    };
-    let Some(e) = f.entries.get(f.next).cloned() else {
-        set_last_error(env, err::NO_MORE_FILES);
-        return Outcome::Return(0);
-    };
-    f.next += 1;
-    fill_find_data(env, data, &e, wide);
-    Outcome::Return(1)
+    native::find::next(env, wide)
 }
 
 // ---- .ini profiles -------------------------------------------------------------------------
@@ -1681,10 +1676,14 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetFileSize", 2, get_file_size);
     stdcall(reg, K32, "GetFileSizeEx", 2, get_file_size_ex);
     stdcall(reg, K32, "GetFileType", 1, get_file_type);
-    stdcall(reg, K32, "FlushFileBuffers", 1, |_| Outcome::Return(1));
+    stdcall(reg, K32, "FlushFileBuffers", 1, |env| {
+        native::metadata::flush(env, env.arg(0))
+    });
     stdcall(reg, K32, "SetEndOfFile", 1, set_end_of_file);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
-    stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
+    stdcall(reg, K32, "SetFileTime", 4, |env| {
+        native::metadata::set_times(env, env.arg(0), [env.arg(1), env.arg(2), env.arg(3)])
+    });
     attributes::register(reg);
     information::register(reg);
     locking::register(reg);
@@ -1707,12 +1706,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "FindNextFileA", 2, |e| find_next_file(e, false));
     stdcall(reg, K32, "FindNextFileW", 2, |e| find_next_file(e, true));
     stdcall(reg, K32, "FindClose", 1, |e| {
-        let h = e.arg(0);
-        let find = e.sys.objects.host::<FindObj>(h).is_some();
-        if find {
-            e.sys.objects.close(h);
-        }
-        Outcome::Return(u32::from(find))
+        native::find::close(e, e.arg(0))
     });
     path::register(reg);
     profile::register(reg);

@@ -307,6 +307,7 @@ fn allocate(env: &mut Env<'_>, bytes: &[u8], size: u32) -> Result<u32, Failure> 
         .alloc(env.cpu, &mut env.sys.vm, 0, size, false)
         .ok_or(Failure::Error(8))?;
     let block = Block {
+        allocation: pointer,
         handle: 0,
         pointer,
         size,

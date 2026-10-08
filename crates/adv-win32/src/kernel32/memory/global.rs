@@ -41,6 +41,7 @@ fn with_handle_heap(
     handle: u32,
     body: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
+    env.ext.get_or_default::<Globals>();
     let globals = env.ext.get::<Globals>();
     let heaps = env.ext.get::<Heaps>();
     let heap = if globals.get(&env.sys.objects, handle).is_some()
@@ -56,12 +57,55 @@ fn with_handle_heap(
     }
 }
 fn allocate_front(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
+    env.ext.get_or_default::<Globals>();
     if flags & !0x7f72 != 0
         || !env.sys.objects.can_insert()
         || rounded(size).is_none()
         || (flags & 2 != 0 && size == 0)
     {
         return Outcome::Return(allocate(env, flags, size));
+    }
+    match crate::native::overridden(env, "RtlAllocateHeap") {
+        Ok(Some(target)) => {
+            let heap = env.ext.get::<Heaps>().process_heap;
+            let size = rounded(size).unwrap();
+            return Outcome::call(
+                target,
+                [heap, if flags & 0x40 != 0 { 8 } else { 0 }, size],
+                move |env, result| {
+                    let pointer = result.value();
+                    if pointer == 0 {
+                        return Outcome::Return(error(env, 8, 0));
+                    }
+                    let block = Block {
+                        handle: 0,
+                        allocation: pointer,
+                        pointer,
+                        size,
+                        movable: flags & 2 != 0,
+                        locks: 0,
+                        attributes: 0,
+                        clipboard: false,
+                    };
+                    if let Some(handle) = env
+                        .ext
+                        .get_mut::<Globals>()
+                        .insert(&mut env.sys.objects, block)
+                    {
+                        return Outcome::Return(handle);
+                    }
+                    let target = match crate::native::entry(env, "RtlFreeHeap") {
+                        Ok(target) => target,
+                        Err(_) => return crate::native::unavailable(env, "RtlFreeHeap"),
+                    };
+                    Outcome::call(target, [heap, 0, pointer], |env, _| {
+                        Outcome::Return(error(env, 8, 0))
+                    })
+                },
+            );
+        }
+        Err(_) => return crate::native::unavailable(env, "RtlAllocateHeap"),
+        Ok(None) => {}
     }
     crate::heap_lock::with_process_heap(env, move |env| Outcome::Return(allocate(env, flags, size)))
 }
@@ -98,6 +142,7 @@ pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
     };
     let block = Block {
         handle: 0,
+        allocation: pointer,
         pointer,
         size,
         movable,
@@ -117,6 +162,55 @@ pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
 }
 #[win32(kernel32,name="GlobalFree",level=implement)]
 fn global_free(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    env.ext.get_or_default::<Globals>();
+    if handle.0 != 0 {
+        match crate::native::overridden(env, "RtlFreeHeap") {
+            Ok(Some(target)) => {
+                let block = env
+                    .ext
+                    .get::<Globals>()
+                    .get(&env.sys.objects, handle.0)
+                    .cloned();
+                let identity = env
+                    .ext
+                    .get::<Globals>()
+                    .identity(&env.sys.objects, handle.0);
+                if let Some(block) = &block {
+                    if block.clipboard {
+                        return Outcome::Return(error(env, 5, handle.0));
+                    }
+                    if block.pointer == 0 {
+                        return Outcome::Return(release(env, handle.0, false));
+                    }
+                }
+                let pointer = block.as_ref().map_or(handle.0, |block| block.allocation);
+                let heap = env
+                    .ext
+                    .get::<Heaps>()
+                    .owner(pointer)
+                    .unwrap_or(env.ext.get::<Heaps>().process_heap);
+                return Outcome::call(target, [heap, 0, pointer], move |env, result| {
+                    if result.value() == 0 {
+                        return Outcome::Return(error(env, 6, handle.0));
+                    }
+                    if block.is_some()
+                        && env
+                            .ext
+                            .get::<Globals>()
+                            .identity(&env.sys.objects, handle.0)
+                            == identity
+                    {
+                        env.ext
+                            .get_mut::<Globals>()
+                            .remove(&mut env.sys.objects, handle.0);
+                    }
+                    Outcome::Return(0)
+                });
+            }
+            Err(_) => return crate::native::unavailable(env, "RtlFreeHeap"),
+            Ok(None) => {}
+        }
+    }
     with_handle_heap(env, handle.0, move |env| {
         Outcome::Return(release(env, handle.0, false))
     })
@@ -223,9 +317,7 @@ fn unlock(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
 }
 #[win32(kernel32,name="GlobalSize",level=implement)]
 fn global_size(env: &mut Env<'_>, handle: Handle) -> Outcome {
-    with_handle_heap(env, handle.0, move |env| {
-        Outcome::Return(size(env, handle.0))
-    })
+    size_front(env, handle.0)
 }
 #[win32(kernel32,name="LocalSize",level=implement)]
 fn local_size(env: &mut Env<'_>, handle: Handle) -> Outcome {
@@ -233,13 +325,57 @@ fn local_size(env: &mut Env<'_>, handle: Handle) -> Outcome {
 }
 fn size(env: &mut Env<'_>, handle: u32) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
-    if let Some(block) = globals.get(&env.sys.objects, handle) {
-        block.size
+    if let Some(block) = globals.get(&env.sys.objects, handle).cloned() {
+        if block.allocation == 0 {
+            return 0;
+        }
+        let result = heaps
+            .owner(block.allocation)
+            .and_then(|heap| heaps.size(heap, block.allocation))
+            .and_then(|size| size.checked_sub(block.pointer.saturating_sub(block.allocation)));
+        result.unwrap_or_else(|| error(env, 6, 0))
     } else if let Some(heap) = heaps.owner(handle) {
         heaps.size(heap, handle).unwrap_or(0)
     } else {
         error(env, 6, 0)
     }
+}
+fn size_front(env: &mut Env<'_>, handle: u32) -> Outcome {
+    env.ext.get_or_default::<Globals>();
+    let block = env
+        .ext
+        .get::<Globals>()
+        .get(&env.sys.objects, handle)
+        .cloned();
+    let allocation = block.as_ref().map_or(handle, |block| block.allocation);
+    if allocation == 0 {
+        return Outcome::Return(size(env, handle));
+    }
+    let heap = env
+        .ext
+        .get::<Heaps>()
+        .owner(allocation)
+        .or_else(|| block.as_ref().map(|_| env.ext.get::<Heaps>().process_heap));
+    if let Some(heap) = heap {
+        match crate::native::overridden(env, "RtlSizeHeap") {
+            Ok(Some(target)) => {
+                let bias = block
+                    .as_ref()
+                    .map_or(0, |block| block.pointer - block.allocation);
+                return Outcome::call(target, [heap, 0, allocation], move |env, value| {
+                    let size = value.value();
+                    Outcome::Return(if size == u32::MAX || size < bias {
+                        error(env, 6, 0)
+                    } else {
+                        size - bias
+                    })
+                });
+            }
+            Err(_) => return crate::native::unavailable(env, "RtlSizeHeap"),
+            Ok(None) => {}
+        }
+    }
+    with_handle_heap(env, handle, move |env| Outcome::Return(size(env, handle)))
 }
 #[win32(kernel32,name="GlobalHandle",level=implement)]
 fn global_handle(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Outcome {
@@ -284,20 +420,178 @@ fn flags(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
 }
 #[win32(kernel32,name="GlobalReAlloc",level=implement)]
 fn global_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Outcome {
-    if flags & !0x7ff2 != 0 {
-        return Outcome::Return(resize(env, handle.0, size, flags, false));
-    }
-    with_handle_heap(env, handle.0, move |env| {
-        Outcome::Return(resize(env, handle.0, size, flags, false))
-    })
+    resize_front(env, handle.0, size, flags, false)
 }
 #[win32(kernel32,name="LocalReAlloc",level=implement)]
 fn local_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Outcome {
-    if flags & !0x7ff2 != 0 {
-        return Outcome::Return(resize(env, handle.0, size, flags, true));
+    resize_front(env, handle.0, size, flags, true)
+}
+fn commit_native_resize(
+    env: &mut Env<'_>,
+    old: Block,
+    identity: Option<adv_machine::Identity<Block>>,
+    allocation: u32,
+    size: u32,
+) -> Outcome {
+    if allocation == 0 {
+        return Outcome::Return(error(env, 8, 0));
     }
-    with_handle_heap(env, handle.0, move |env| {
-        Outcome::Return(resize(env, handle.0, size, flags, true))
+    let bias = old.pointer.saturating_sub(old.allocation);
+    let Some(pointer) = allocation.checked_add(bias) else {
+        return Outcome::Fail("Global/Local native allocation view overflow".into());
+    };
+    let globals = env.ext.get_mut::<Globals>();
+    if old.movable {
+        if globals.identity(&env.sys.objects, old.handle) != identity {
+            return Outcome::Fail("Global/Local owner retired during native reallocation".into());
+        }
+        globals.set_allocation(&mut env.sys.objects, old.handle, allocation, pointer, size);
+        return Outcome::Return(old.handle);
+    }
+    if globals
+        .get(&env.sys.objects, pointer)
+        .is_some_and(|block| block.allocation == allocation)
+    {
+        return Outcome::Return(pointer);
+    }
+    if globals.identity(&env.sys.objects, old.handle) == identity {
+        if old.handle == pointer {
+            globals.set_allocation(&mut env.sys.objects, old.handle, allocation, pointer, size);
+            return Outcome::Return(old.handle);
+        }
+        if globals.remove(&mut env.sys.objects, old.handle).is_none() {
+            return Outcome::Fail("Global/Local reallocation owner is borrowed".into());
+        }
+    } else {
+        return Outcome::Fail("Global/Local owner retired during native reallocation".into());
+    }
+    let block = Block {
+        handle: pointer,
+        allocation,
+        pointer,
+        size,
+        ..old
+    };
+    match globals.insert(&mut env.sys.objects, block) {
+        Some(handle) => Outcome::Return(handle),
+        None => Outcome::Fail("Global/Local native reallocation could not commit its owner".into()),
+    }
+}
+fn resize_front(
+    env: &mut Env<'_>,
+    handle: u32,
+    requested: u32,
+    flags: u32,
+    local: bool,
+) -> Outcome {
+    env.ext.get_or_default::<Globals>();
+    if flags & !0x7ff2 != 0 {
+        return Outcome::Return(resize(env, handle, requested, flags, local));
+    }
+    if flags & 0x80 != 0 {
+        return with_handle_heap(env, handle, move |env| {
+            Outcome::Return(resize(env, handle, requested, flags, local))
+        });
+    }
+    let old = env
+        .ext
+        .get::<Globals>()
+        .get(&env.sys.objects, handle)
+        .cloned();
+    if let Some(old) = old {
+        let identity = env.ext.get::<Globals>().identity(&env.sys.objects, handle);
+        if old.clipboard || old.movable && requested == 0 && old.locks != 0 {
+            return Outcome::Return(resize(env, handle, requested, flags, local));
+        }
+        let heap = env
+            .ext
+            .get::<Heaps>()
+            .owner(old.allocation)
+            .unwrap_or(env.ext.get::<Heaps>().process_heap);
+        if old.movable && requested == 0 {
+            if old.allocation == 0 {
+                return Outcome::Return(handle);
+            }
+            match crate::native::overridden(env, "RtlFreeHeap") {
+                Ok(Some(target)) => {
+                    return Outcome::call(target, [heap, 0, old.allocation], move |env, result| {
+                        if result.value() == 0 {
+                            return Outcome::Return(error(env, 6, 0));
+                        }
+                        let globals = env.ext.get_mut::<Globals>();
+                        if globals.identity(&env.sys.objects, handle) != identity {
+                            return Outcome::Fail(
+                                "Global/Local owner retired during native discard".into(),
+                            );
+                        }
+                        globals.set_allocation(&mut env.sys.objects, handle, 0, 0, 0);
+                        Outcome::Return(handle)
+                    });
+                }
+                Err(_) => return crate::native::unavailable(env, "RtlFreeHeap"),
+                Ok(None) => {}
+            }
+        } else if let Some(size) = rounded(requested) {
+            let bias = old.pointer.saturating_sub(old.allocation);
+            let Some(raw_size) = size.checked_add(bias) else {
+                return Outcome::Return(error(env, 8, 0));
+            };
+            let name = if old.allocation == 0 {
+                "RtlAllocateHeap"
+            } else {
+                "RtlReAllocateHeap"
+            };
+            match crate::native::overridden(env, name) {
+                Ok(Some(target)) => {
+                    let native_flags = if flags & 0x40 != 0 { 8 } else { 0 }
+                        | if old.allocation != 0
+                            && (old.movable && old.locks != 0 && flags & 2 == 0
+                                || !old.movable && flags & 2 == 0)
+                        {
+                            0x10
+                        } else {
+                            0
+                        };
+                    let args = if old.allocation == 0 {
+                        vec![heap, native_flags, raw_size]
+                    } else {
+                        vec![heap, native_flags, old.allocation, raw_size]
+                    };
+                    return Outcome::call(target, args, move |env, value| {
+                        commit_native_resize(env, old, identity, value.value(), size)
+                    });
+                }
+                Err(_) => return crate::native::unavailable(env, name),
+                Ok(None) => {}
+            }
+        }
+    } else if let Some(heap) = env.ext.get::<Heaps>().owner(handle) {
+        match crate::native::overridden(env, "RtlReAllocateHeap") {
+            Ok(Some(target)) => {
+                return Outcome::call(
+                    target,
+                    [
+                        heap,
+                        if flags & 0x40 != 0 { 8 } else { 0 }
+                            | if flags & 2 == 0 { 0x10 } else { 0 },
+                        handle,
+                        requested,
+                    ],
+                    |env, value| {
+                        Outcome::Return(if value.value() == 0 {
+                            error(env, 8, 0)
+                        } else {
+                            value.value()
+                        })
+                    },
+                );
+            }
+            Err(_) => return crate::native::unavailable(env, "RtlReAllocateHeap"),
+            Ok(None) => {}
+        }
+    }
+    with_handle_heap(env, handle, move |env| {
+        Outcome::Return(resize(env, handle, requested, flags, local))
     })
 }
 pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, local: bool) -> u32 {
@@ -348,7 +642,7 @@ pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
             return error(env, 212, 0);
         }
         if old.pointer != 0 {
-            heaps.free(env.cpu, &mut env.sys.vm, 0, old.pointer);
+            heaps.free(env.cpu, &mut env.sys.vm, 0, old.allocation);
         }
         globals.set_storage(&mut env.sys.objects, handle, 0, 0);
         return handle;
@@ -357,23 +651,33 @@ pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
         return error(env, 8, 0);
     };
     if old.movable {
-        let pointer = if old.pointer == 0 {
-            heaps.alloc(env.cpu, &mut env.sys.vm, 0, size, flags & 0x40 != 0)
+        let bias = old.pointer.saturating_sub(old.allocation);
+        let Some(raw_size) = size.checked_add(bias) else {
+            return error(env, 8, 0);
+        };
+        let allocation = if old.allocation == 0 {
+            heaps.alloc(env.cpu, &mut env.sys.vm, 0, raw_size, flags & 0x40 != 0)
         } else {
             heaps.realloc(
                 env.cpu,
                 &mut env.sys.vm,
                 0,
-                old.pointer,
-                size,
+                old.allocation,
+                raw_size,
                 flags & 0x40 != 0,
                 old.locks != 0 && flags & 2 == 0,
             )
         };
-        let Some(pointer) = pointer else {
+        let Some(allocation) = allocation else {
             return error(env, 8, 0);
         };
-        globals.set_storage(&mut env.sys.objects, handle, pointer, size);
+        globals.set_allocation(
+            &mut env.sys.objects,
+            handle,
+            allocation,
+            allocation + bias,
+            size,
+        );
         return handle;
     }
     if let Some(pointer) = heaps.realloc(
@@ -399,6 +703,7 @@ pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
     };
     let new = Block {
         handle: pointer,
+        allocation: pointer,
         pointer,
         size,
         ..old.clone()
@@ -561,6 +866,75 @@ mod tests {
         assert_eq!(lock(&mut env(&mut m), raw), raw);
         assert_eq!(super::handle(&mut env(&mut m), raw), raw);
         assert_eq!(release(&mut env(&mut m), raw, false), 0);
+    }
+
+    #[test]
+    fn raw_rtl_operations_use_the_allocation_owner_and_preserve_clipboard_ownership() {
+        let mut m = fixture();
+        let allocation = m
+            .ext
+            .get_mut::<Heaps>()
+            .alloc(&mut m.cpu, &mut m.sys.vm, 0, 40, false)
+            .unwrap();
+        let heap = m.ext.get::<Heaps>().process_heap;
+        let pointer = allocation + 8; // Authored distinct data view; no native layout claim.
+        let handle = m
+            .ext
+            .get_or_default::<Globals>()
+            .insert(
+                &mut m.sys.objects,
+                Block {
+                    handle: 0,
+                    allocation,
+                    pointer,
+                    size: 32,
+                    movable: true,
+                    locks: 0,
+                    attributes: 0,
+                    clipboard: false,
+                },
+            )
+            .unwrap();
+        assert!(!super::super::free(&mut env(&mut m), heap, pointer));
+        assert_eq!(
+            m.ext
+                .get::<Globals>()
+                .from_allocation(&m.sys.objects, allocation),
+            Some(handle)
+        );
+        assert!(m.ext.get_mut::<Heaps>().size(heap, allocation).is_some());
+        m.ext
+            .get_mut::<Globals>()
+            .get_mut(&mut m.sys.objects, handle)
+            .unwrap()
+            .clipboard = true;
+        assert!(!super::super::free(&mut env(&mut m), heap, allocation));
+        assert!(m.ext.get_mut::<Heaps>().size(heap, allocation).is_some());
+        m.ext
+            .get_mut::<Globals>()
+            .get_mut(&mut m.sys.objects, handle)
+            .unwrap()
+            .clipboard = false;
+        assert!(super::super::free(&mut env(&mut m), heap, allocation));
+        assert_eq!(
+            m.ext
+                .get::<Globals>()
+                .from_allocation(&m.sys.objects, allocation),
+            None
+        );
+        assert_eq!(
+            m.ext.get::<Globals>().from_pointer(&m.sys.objects, pointer),
+            None
+        );
+        assert_eq!(
+            m.ext
+                .get::<Globals>()
+                .get(&m.sys.objects, handle)
+                .unwrap()
+                .allocation,
+            0
+        );
+        assert_eq!(release(&mut env(&mut m), handle, false), 0);
     }
 
     fn contended(

@@ -347,11 +347,19 @@ fn guest<B: Backend>(cpu: impl Fn() -> B) {
         let stream = machine.cpu.read_u32(DATA).unwrap();
         assert_eq!(
             machine
-                .ext
-                .get_mut::<CrtState>()
-                .files
-                .get_mut(&stream)
+                .sys
+                .objects
+                .host::<crate::FileObj>(
+                    machine
+                        .ext
+                        .get::<CrtState>()
+                        .files
+                        .get(&stream)
+                        .unwrap()
+                        .handle
+                )
                 .unwrap()
+                .file
                 .stream_position()
                 .unwrap(),
             3
