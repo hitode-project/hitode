@@ -202,13 +202,20 @@ fn gir_lease_excludes_shared_lazy_cow_and_resident_file_backing() {
     for cow in [false, true] {
         let page = crate::backend::FilePage::lazy(|| Ok([3; 4096]));
         memory
-            .map_file_pages(DATA, &[page], READ | WRITE, cow)
+            .map_file_pages(DATA, &[page.clone()], READ | WRITE, cow)
             .unwrap();
         assert!(!cache.acquire(&mut memory).unwrap().allows(DATA, 4, true));
         // Initialize/promote through the ordinary accessor. A resident file
         // page still has external aliases and cannot enter a GIR lease.
         let mut value = [0; 4];
         memory.read_into(DATA, &mut value).unwrap();
+        memory.prepare_native_access(DATA, 4, false).unwrap();
+        if !cow {
+            assert!(
+                page.resident(),
+                "the rejection must cover a promoted file page"
+            );
+        }
         assert!(!cache.acquire(&mut memory).unwrap().allows(DATA, 4, false));
         memory.unmap(DATA, 4096).unwrap();
     }
@@ -317,6 +324,7 @@ fn executor(bytes: &[u8], gir: bool, strict: bool) -> Executor {
 }
 
 #[test]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 fn gir_selector_strict_budget_smc_and_fallback_match_interpreter() {
     let bytes = assemble(|a| {
         let mut top = a.create_label();
@@ -365,6 +373,14 @@ fn gir_selector_strict_budget_smc_and_fallback_match_interpreter() {
     assert!(m.gir_stats().cold > 0);
     assert!(m.gir_stats().invalidations > 0);
     assert_eq!(m.stats.verification.mismatches, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gir_selector_rejects_unvalidated_platform() {
+    let mut m = Executor::new(BASE, LEN).unwrap();
+    assert!(m.set_gir_state_ssa(true).is_err());
+    assert_eq!(m.gir_stats().entries, 0);
 }
 
 #[cfg(all(

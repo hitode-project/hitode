@@ -1,5 +1,8 @@
 //! Synthetic end-to-end selector checks; no external assets.
-#![cfg(feature = "gir-execute")]
+#![cfg(all(
+    feature = "gir-execute",
+    any(windows, target_os = "linux", target_os = "android")
+))]
 use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 
