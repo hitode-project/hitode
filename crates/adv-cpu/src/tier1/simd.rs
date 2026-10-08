@@ -157,16 +157,28 @@ impl Emitter {
         }
         let moves = matches!(
             m,
-            M::Movq | M::Movd | M::Movaps | M::Movups | M::Movdqa | M::Movdqu | M::Movss
+            M::Movq
+                | M::Movntps
+                | M::Movntpd
+                | M::Movntdq
+                | M::Movd
+                | M::Movaps
+                | M::Movups
+                | M::Movapd
+                | M::Movupd
+                | M::Movdqa
+                | M::Movdqu
+                | M::Movss
+                | M::Movsd
         );
         let width = match m {
             M::Movd | M::Movss => 4,
-            M::Movq => 8,
+            M::Movq | M::Movsd => 8,
             _ if is_mmx => 8,
             _ => 16,
         };
         let kind = width
-            | if width == 16 && !matches!(m, M::Movups | M::Movdqu) {
+            | if width == 16 && !matches!(m, M::Movups | M::Movupd | M::Movdqu) {
                 ALIGNED
             } else {
                 0
@@ -202,9 +214,12 @@ impl Emitter {
             self.vector_read(1, i.op1_register());
         }
         if moves {
-            if m == M::Movss && i.op1_kind() == OpKind::Register {
+            if matches!(m, M::Movss | M::Movsd) && i.op1_kind() == OpKind::Register {
                 self.vector_read(0, i.op0_register());
                 self.insert_s(0, 0, 1, 0);
+                if m == M::Movsd {
+                    self.insert_s(0, 1, 1, 1);
+                }
             } else if m == M::Movd {
                 self.word(0x5e04_0420); // dup s0,v1.s[0], clears upper bits
             } else if m == M::Movq {
@@ -238,8 +253,16 @@ impl Emitter {
             | M::Psrlw
             | M::Psllw
             | M::Psraw => 1,
-            M::Paddd | M::Psubd | M::Punpckldq | M::Punpckhdq | M::Psrld | M::Pslld | M::Psrad => 2,
-            M::Psrlq | M::Psllq => 3,
+            M::Paddd
+            | M::Psubd
+            | M::Punpckldq
+            | M::Punpckhdq
+            | M::Psrld
+            | M::Pslld
+            | M::Psrad
+            | M::Unpcklps
+            | M::Unpckhps => 2,
+            M::Psrlq | M::Psllq | M::Unpcklpd | M::Unpckhpd => 3,
             _ => 0,
         };
         let op = match m {
@@ -250,12 +273,12 @@ impl Emitter {
             M::Psubsb | M::Psubsw => 0x0e21_2c00,
             M::Psubusb | M::Psubusw => 0x2e21_2c00,
             M::Pmullw => 0x0e21_9c00,
-            M::Punpcklbw | M::Punpcklwd | M::Punpckldq => 0x0e01_3800,
-            M::Punpckhbw | M::Punpckhwd | M::Punpckhdq => 0x0e01_7800,
-            M::Pand => 0x0e21_1c00,
-            M::Por => 0x0ea1_1c00,
-            M::Pxor => 0x2e21_1c00,
-            M::Pandn => 0x0e60_1c20,
+            M::Punpcklbw | M::Punpcklwd | M::Punpckldq | M::Unpcklps | M::Unpcklpd => 0x0e01_3800,
+            M::Punpckhbw | M::Punpckhwd | M::Punpckhdq | M::Unpckhps | M::Unpckhpd => 0x0e01_7800,
+            M::Pand | M::Andps | M::Andpd => 0x0e21_1c00,
+            M::Por | M::Orps | M::Orpd => 0x0ea1_1c00,
+            M::Pxor | M::Xorps | M::Xorpd => 0x2e21_1c00,
+            M::Pandn | M::Andnps | M::Andnpd => 0x0e60_1c20,
             _ => 0,
         };
         if op != 0 {

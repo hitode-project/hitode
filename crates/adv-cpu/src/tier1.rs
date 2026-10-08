@@ -84,6 +84,12 @@ mod native;
 ))]
 mod simd;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
+mod sse;
+
 pub(crate) struct Execution {
     pub execution: crate::interpreter::Execution,
     pub interpreted_units: u32,

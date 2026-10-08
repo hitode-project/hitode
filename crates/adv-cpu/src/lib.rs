@@ -34,17 +34,8 @@ mod fault_recipe;
 pub mod fault_recovery;
 mod file_memory;
 mod floating;
-// Research only: no GIR code or entry points in normal library builds.
-#[cfg(all(
-    test,
-    any(
-        all(windows, target_arch = "x86_64", target_env = "msvc"),
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
-    )
-))]
+// Independent semantics and diagnostics; no GIR code in default library builds.
+#[cfg(any(test, feature = "gir-lift"))]
 mod gir;
 #[cfg(feature = "gir-capture")]
 #[path = "gir/capture.rs"]

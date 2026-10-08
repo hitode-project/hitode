@@ -21,6 +21,8 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 [features]
 # Local research capture only; does not select a GIR execution path.
 gir-capture = []
+# Independent lift/verify census only; never selects an execution backend.
+gir-lift = []
 # ADV_JIT_DUMP_DIR also writes AArch64 vcode for each dumped region.
 cross-dump = ["cranelift-codegen/arm64"]
 

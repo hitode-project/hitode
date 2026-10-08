@@ -7,6 +7,8 @@
 mod support;
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+#[path = "tier1/sse.rs"]
+mod sse;
 #[path = "tier1/x87.rs"]
 mod x87;
 const CODE: u32 = 0x10000;
