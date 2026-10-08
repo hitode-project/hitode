@@ -26,25 +26,21 @@
       "command": "key-up 17"
     },
     {
-      "at": 22,
+      "at": 35,
       "checkpoint": "title",
       "reset_metrics": true
     },
     {
-      "at": 23,
-      "command": "key-down 13"
+      "at": 36,
+      "command": "click 180 545"
     },
     {
-      "at": 23.3,
-      "command": "key-up 13"
-    },
-    {
-      "at": 33,
+      "at": 51,
       "checkpoint": "transition",
       "reset_metrics": true
     },
     {
-      "at": 34,
+      "at": 52,
       "command": "close"
     }
   ],
@@ -61,7 +57,7 @@
     },
     "transition": {
       "checkpoint": "transition",
-      "measurement": "post_enter_observation"
+      "measurement": "post_start_observation"
     }
   }
 }
