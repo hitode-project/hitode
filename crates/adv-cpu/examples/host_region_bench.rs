@@ -3,6 +3,7 @@
 //! captures), ADV_REGION_BENCH_SAMPLES/LOOPS/REPEATS/PRIVATE_LIMIT. Output: anonymous
 //! CSV statistics, OS capabilities and current CPU; never code, PCs or file names.
 //! Compilation and one full-state differential warmup are outside measurement.
+//! With gir-execute, tier 3 explicitly measures the opt-in state-SSA lane.
 use adv_cpu::{
     ArchitecturalState, CpuState, EXEC, Executor, HostFeatures, READ, Region, RunOutcome, WRITE,
 };
@@ -334,6 +335,8 @@ fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
 
 fn setup(case: &Case, tier: u8) -> Result<Executor, String> {
     let mut m = Executor::new(CODE, 0x21000)?;
+    #[cfg(feature = "gir-execute")]
+    m.set_gir_state_ssa(tier == 3)?;
     m.disable_row_batching();
     m.set_tier_verification(None);
     m.protect(CODE, 0x21000, READ | WRITE)?;
@@ -348,7 +351,7 @@ fn setup(case: &Case, tier: u8) -> Result<Executor, String> {
     if tier == 1 {
         m.set_arm64_tier1(true)?;
     }
-    if tier == 2 {
+    if tier >= 2 {
         m.add_region(Region::new(CODE, case.bytes.len()))?;
     }
     Ok(m)
@@ -428,7 +431,7 @@ fn main() {
         HostFeatures::get(),
         cpu()
     );
-    let tiers: &[u8] = if cfg!(all(
+    let mut tiers: Vec<u8> = if cfg!(all(
         target_arch = "aarch64",
         any(
             target_os = "linux",
@@ -436,10 +439,13 @@ fn main() {
             target_os = "macos"
         )
     )) {
-        &[0, 1, 2]
+        vec![0, 1, 2]
     } else {
-        &[0, 2]
+        vec![0, 2]
     };
+    if cfg!(all(feature = "gir-execute", not(target_os = "macos"))) {
+        tiers.push(3);
+    }
     let mut cases = synthetic(loops, repeats);
     if let Some(root) = std::env::var_os("ADV_GIR_LIFT_CORPUS") {
         cases.extend(load_private(Path::new(&root), private_limit, 1000));
@@ -452,7 +458,7 @@ fn main() {
     let mut skipped = 0;
     for case in cases {
         let label = (case.category.clone(), case.ordinal);
-        let mut ready = match prepare(case, tiers) {
+        let mut ready = match prepare(case, &tiers) {
             Ok(ready) => ready,
             Err(reason) => {
                 assert!(

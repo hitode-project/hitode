@@ -8,12 +8,13 @@ use adv_cpu::backend::{Guest, GuestExt, MemFault};
 use adv_machine::{Env, Object, Outcome, Resume, Wait, WakeReason};
 
 use super::K32;
-use crate::util::{err, out_u32, set_last_error};
+use crate::util::{err, set_last_error};
 use crate::{Win32, stdcall};
 
 mod event;
 mod local;
 pub(crate) mod native;
+mod owned;
 pub(crate) use local::detach_fls;
 #[cfg(test)]
 mod event_tests;
@@ -314,27 +315,6 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
     native::multiple_front(env, false)
 }
 
-fn created(env: &mut Env<'_>, o: Object) -> Outcome {
-    let inherit = match super::handle::security_inherit(env, env.arg(0)) {
-        Ok(inherit) => inherit,
-        Err(code) => {
-            set_last_error(env, code);
-            return Outcome::Return(0);
-        }
-    };
-    let index = if matches!(o, Object::Mutex { .. }) {
-        2
-    } else {
-        3
-    };
-    let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
-    let result = super::file_mapping::sync_created(env, o, env.arg(index), wide);
-    if let Outcome::Return(handle) = &result {
-        super::handle::set_inherit(env, *handle, inherit);
-    }
-    result
-}
-
 fn create_event(env: &mut Env<'_>) -> Outcome {
     event::create_front(env)
 }
@@ -350,80 +330,29 @@ fn open_event_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -
 }
 
 fn create_semaphore(env: &mut Env<'_>) -> Outcome {
-    crate::native::diagnose_bypass(env, "kernel32.dll!CreateSemaphore", &["NtCreateSemaphore"]);
-    let (count, max) = (env.arg(1), env.arg(2));
-    created(env, Object::Semaphore { count, max })
+    owned::create_front(env, owned::Kind::Semaphore)
 }
 
 fn release_semaphore(env: &mut Env<'_>) -> Outcome {
-    crate::native::diagnose_bypass(
-        env,
-        "kernel32.dll!ReleaseSemaphore",
-        &["NtReleaseSemaphore"],
-    );
-    let (h, n, prev) = (env.arg(0), env.arg(1), env.arg(2));
-    let Some(Object::Semaphore { count, max }) = env.sys.objects.get_mut(h) else {
-        set_last_error(env, err::INVALID_HANDLE);
-        return Outcome::Return(0);
-    };
-    let old = *count;
-    if old + n > *max {
-        set_last_error(env, 298); // ERROR_TOO_MANY_POSTS
-        return Outcome::Return(0);
-    }
-    *count += n;
-    out_u32(env.cpu, prev, old);
-    env.sys.signal_waiters(h);
-    Outcome::Return(1)
+    owned::release_front(env, owned::Kind::Semaphore)
 }
 
 fn create_mutex(env: &mut Env<'_>) -> Outcome {
-    crate::native::diagnose_bypass(env, "kernel32.dll!CreateMutex", &["NtCreateMutant"]);
-    let owned = env.arg(1) != 0;
-    let cur = env.context;
-    let owner = owned.then_some(cur);
-    created(
-        env,
-        Object::Mutex {
-            owner,
-            recursion: u32::from(owned),
-        },
-    )
+    owned::create_front(env, owned::Kind::Mutant)
 }
 
 #[win32(kernel32, name = "OpenMutexA", level = implement)]
-fn open_mutex_a(env: &mut Env<'_>, _access: u32, _inherit: i32, name: AnsiStr) -> Outcome {
-    crate::native::diagnose_bypass(env, "kernel32.dll!OpenMutex", &["NtOpenMutant"]);
-    super::file_mapping::open_mutex(env, name.0.addr(), false)
+fn open_mutex_a(env: &mut Env<'_>, _access: u32, _inherit: i32, _name: AnsiStr) -> Outcome {
+    owned::open_front(env, owned::Kind::Mutant)
 }
 
 #[win32(kernel32, name = "OpenMutexW", level = implement)]
-fn open_mutex_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -> Outcome {
-    crate::native::diagnose_bypass(env, "kernel32.dll!OpenMutex", &["NtOpenMutant"]);
-    super::file_mapping::open_mutex(env, name.0.addr(), true)
+fn open_mutex_w(env: &mut Env<'_>, _access: u32, _inherit: i32, _name: WideStr) -> Outcome {
+    owned::open_front(env, owned::Kind::Mutant)
 }
 
 fn release_mutex(env: &mut Env<'_>) -> Outcome {
-    crate::native::diagnose_bypass(env, "kernel32.dll!ReleaseMutex", &["NtReleaseMutant"]);
-    let h = env.arg(0);
-    let cur = env.context;
-    let result = match env.sys.objects.get_mut(h) {
-        Some(Object::Mutex { owner, recursion }) if *owner == Some(cur) => {
-            *recursion -= 1;
-            if *recursion == 0 {
-                *owner = None;
-            }
-            Outcome::Return(1)
-        }
-        _ => {
-            set_last_error(env, 288); // ERROR_NOT_OWNER
-            Outcome::Return(0)
-        }
-    };
-    if matches!(result, Outcome::Return(1)) {
-        env.sys.signal_waiters(h);
-    }
-    result
+    owned::release_front(env, owned::Kind::Mutant)
 }
 
 /// SLIST_HEADER (x86): `Next`, then `Depth` and `Sequence` u16s. The interlocked
@@ -578,6 +507,7 @@ mod critical_tests {
 pub(super) fn register(reg: &mut Registry) {
     native::register(reg);
     event::register(reg);
+    owned::register(reg);
     local::register(reg);
     stdcall(reg, K32, "InitializeSListHead", 1, |e| {
         let _ = e.cpu.write(e.arg(0), &[0; 8]);
@@ -707,6 +637,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ResetEvent", 1, |e| event::state_front(e, false));
     stdcall(reg, K32, "CreateSemaphoreA", 4, create_semaphore);
     stdcall(reg, K32, "CreateSemaphoreW", 4, create_semaphore);
+    stdcall(reg, K32, "OpenSemaphoreA", 3, |env| {
+        owned::open_front(env, owned::Kind::Semaphore)
+    });
+    stdcall(reg, K32, "OpenSemaphoreW", 3, |env| {
+        owned::open_front(env, owned::Kind::Semaphore)
+    });
     stdcall(reg, K32, "ReleaseSemaphore", 3, release_semaphore);
     stdcall(reg, K32, "CreateMutexA", 3, create_mutex);
     stdcall(reg, K32, "CreateMutexW", 3, create_mutex);

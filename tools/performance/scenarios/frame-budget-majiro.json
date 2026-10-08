@@ -1,0 +1,91 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "majiro",
+  "game_dir": "片羽（カタハネ）",
+  "exe": "カタハネ.exe",
+  "codepage": 932,
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "Majiro fresh new-game, first body text, and later narrative gate",
+    "timeout_seconds": 240,
+    "steps": [
+      {
+        "delay_ms": 4000
+      },
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "b96e2b73e9596d67",
+          "timeout_ms": 90000,
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "click 220 315"
+      },
+      {
+        "delay_ms": 300
+      },
+      {
+        "command": "key-down 13"
+      },
+      {
+        "delay_ms": 200
+      },
+      {
+        "command": "key-up 13"
+      },
+      {
+        "checkpoint": "body",
+        "await": {
+          "frame_fnv1a64": "4cc2475dee9f1b9f",
+          "timeout_ms": 90000
+        },
+        "reset_metrics": true
+      },
+      {
+        "checkpoint": "dialogue",
+        "await": {
+          "frame_fnv1a64": "31ddc370dd92526a",
+          "timeout_ms": 90000,
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "key 13"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "transition",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "gated"
+    },
+    "normal": {
+      "checkpoint": "body",
+      "measurement": "gated"
+    },
+    "ctrl": {
+      "checkpoint": "dialogue",
+      "measurement": "gated",
+      "start_checkpoint": "body"
+    },
+    "transition": {
+      "checkpoint": "transition",
+      "measurement": "timed_observation"
+    }
+  }
+}

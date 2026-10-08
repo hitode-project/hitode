@@ -34,6 +34,7 @@ pub(crate) use module::prepare_system_modules;
 pub(crate) use module::shutdown_process;
 pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
+pub(crate) use module::{native_add_ref_library, native_get_dll_handle, native_pc_to_file_header};
 mod nlsapi;
 mod osversion;
 mod process;

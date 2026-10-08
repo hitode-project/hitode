@@ -8,6 +8,28 @@ from pathlib import Path
 import re
 
 
+def valid_acknowledgement(command: str, reply: str | None) -> bool:
+    verb = command.split()[0]
+    expected = "control ok " + {"dialog-track": "dialog"}.get(verb, verb)
+    if reply is None or not (reply == expected or reply.startswith(expected + " ")):
+        return False
+    if verb == "await-frame":
+        fields = dict(token.split("=", 1) for token in reply.split()[3:] if "=" in token)
+        words = command.split()
+        try:
+            if (fields.get("hash") != words[1].lower() or fields.get("frozen") != "true"
+                    or int(fields["frame"]) <= 0 or int(fields["start_frame"]) < 0
+                    or ("current" not in words and int(fields["frame"]) <= int(fields["start_frame"]))):
+                return False
+            release = words[words.index("release") + 1] if "release" in words else (
+                words[words.index("hold") + 1] if "hold" in words else None)
+            return fields.get("release") == (release or "none") and (
+                release is None or fields.get("release_posted") == "true")
+        except (ValueError, KeyError, IndexError):
+            return False
+    return True
+
+
 def digest_json(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -128,13 +150,18 @@ def load_scene(path: Path) -> dict | None:
             if set(step) != {"delay_ms"} or type(step["delay_ms"]) is not int or not 1 <= step["delay_ms"] <= 60000:
                 raise ValueError("scene delay_ms must be in 1..60000")
         else:
-            if set(step) - {"checkpoint", "await", "assert", "reset_metrics"}:
+            if set(step) - {"checkpoint", "await", "observe", "assert", "reset_metrics"}:
                 raise ValueError("unknown scene checkpoint field")
             name = step["checkpoint"]
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in names:
                 raise ValueError("checkpoint names must be unique filename-safe names")
             names.add(name)
-            step["await"] = validate_await(step.get("await"))
+            if step.get("observe") is True and "await" not in step:
+                pass  # An explicitly ungated observation cannot verify fixed work.
+            elif "observe" in step:
+                raise ValueError("observe must be true and cannot accompany await")
+            else:
+                step["await"] = validate_await(step.get("await"))
             step["assert"] = validate_assertions(step.get("assert", {}))
             if "reset_metrics" in step and type(step["reset_metrics"]) is not bool:
                 raise ValueError("reset_metrics must be boolean")
@@ -144,6 +171,8 @@ def load_scene(path: Path) -> dict | None:
 
 
 def validate_reference(reference: dict, binding: dict, steps: list[dict]) -> None:
+    if any(step.get("observe") for step in steps):
+        raise ValueError("ungated observations cannot use a fixed-work reference")
     if not isinstance(reference, dict) or reference.get("schema") != "adv-scene-reference-v1":
         raise ValueError("reference must use schema adv-scene-reference-v1")
     if reference.get("status") != "approved":

@@ -52,6 +52,13 @@ pub(crate) mod x87;
 
 type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
+/// Integration tests enable the feature through the package's self dev-dependency:
+/// their release library dependency does not receive `cfg(test)`.
+fn verifier_enabled() -> bool {
+    cfg!(any(test, debug_assertions, feature = "jit-verifier"))
+        || std::env::var("ADV_JIT_VERIFY").is_ok_and(|mode| !matches!(mode.as_str(), "" | "0"))
+}
+
 /// Borrowed controls for one bounded native entry and its linked regions.
 pub(crate) struct NativeRun<'a> {
     pub rows: Option<&'a crate::rows::RowPool>,
@@ -1022,6 +1029,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let backend_flags = [
         ("opt_level", opt_level),
         ("preserve_frame_pointers", "true"),
+        (
+            "enable_verifier",
+            if verifier_enabled() { "true" } else { "false" },
+        ),
     ];
     #[cfg(feature = "gir-capture")]
     let backend_flags = {
@@ -2506,6 +2517,25 @@ mod snapshot_tests {
     use super::*;
 
     #[test]
+    fn test_backend_keeps_cranelift_verification() {
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &[0x90]).unwrap();
+        let compiled =
+            compile_snapshot(&Snapshot::capture(&Region::new(0x10000, 1), &mut memory).unwrap())
+                .unwrap();
+        assert!(
+            compiled
+                .module
+                .as_ref()
+                .unwrap()
+                .isa()
+                .flags()
+                .enable_verifier()
+        );
+    }
+
+    #[test]
     fn snapshots_copy_only_the_region_and_tail_and_keep_old_versions() {
         let mut memory = Memory::new(0x10000, 0x10000).unwrap();
         memory
@@ -2851,6 +2881,10 @@ fn aarch64_vcode(mut function: ir::Function, opt_level: &str) -> Result<String, 
         }
     }
     let mut flags = settings::builder();
+    // Cross dumps are an explicit diagnostic, so always verify their IR.
+    flags
+        .set("enable_verifier", "true")
+        .map_err(|e| e.to_string())?;
     flags
         .set("opt_level", opt_level)
         .map_err(|e| e.to_string())?;

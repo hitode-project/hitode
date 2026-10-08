@@ -10,6 +10,8 @@ AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. DirectMemory and JitVerify
 configure the CPU; Tier1 records the shell selector (fixtures select their modes).
 Safepoint selects off/poll independently of verification and direct memory.
+Features adds explicit Cargo features; Gir selects the opt-in state-SSA lane and
+includes gir-execute. Build with that feature and Gir=off to reuse one ELF set.
 .EXAMPLE
 ./tools/android/run-cpu-tests.ps1 -ExecutionExperiments -WhatIf
 .EXAMPLE
@@ -35,10 +37,14 @@ param(
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
     [switch]$DirectMemory,
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
-    [ValidateSet('off', 'poll')][string]$Safepoint = 'off'
+    [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
+    [string[]]$Features = @(),
+    [ValidateSet('off', 'state-ssa')][string]$Gir = 'off'
 )
 $ErrorActionPreference = 'Stop'
 if ($BuildOnly -and $SkipBuild) { throw '-BuildOnly and -SkipBuild are mutually exclusive.' }
+if ($Features | Where-Object { $_ -notmatch '^[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)?$' }) { throw 'Invalid Cargo feature.' }
+if ($Gir -eq 'state-ssa') { $Features = @($Features + @('gir-execute') | Select-Object -Unique) }
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($AllTests) {
     if ($ExecutionExperiments -or $PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
@@ -67,6 +73,7 @@ foreach ($test in $TestName) {
 }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 $cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'test', '--locked', '-p', 'adv-cpu', '--release', '--no-run', '--target-dir', $TargetDir)
+if ($Features.Count) { $cargoArgs += @('--features', ($Features -join ',')) }
 foreach ($test in $TestName) { $cargoArgs += @('--test', $test) }
 if ($UnitFilter.Count) { $cargoArgs += '--lib' }
 $targets = @($TestName)
@@ -81,17 +88,18 @@ $runs = @(
 function Get-DeviceCommand($remote, $run) {
     # Parent tests exec their own deployed ELF and validate each child's status.
     # Never carry a host runner or an individual fault case into the parent.
-    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_TIER1'
+    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_TIER1 ADV_GIR'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_SAFEPOINT=$Safepoint ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_SAFEPOINT=$Safepoint ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
         mode = 'dry-run'; build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs; targets = $targets
         build_environment = @{ ANDROID_NDK_HOME = $Ndk; CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake'); CARGO_BUILD_JOBS = '2' }
         serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; direct_memory = [bool]$DirectMemory; tier1 = $Tier1; all_tests = [bool]$AllTests
+        features = $Features; gir = $Gir
         runs = @($runs | ForEach-Object { [ordered]@{ id = $_.id; target = $_.target; filter = $_.filter; shell = (Get-DeviceCommand '/data/local/tmp/adv-host-cpu-DRYRUN' $_) } })
     } | ConvertTo-Json -Depth 6
     return
@@ -178,6 +186,7 @@ try {
         "ADV_DIRECT_MEMORY=$([int][bool]$DirectMemory) (device only)"
         "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
         "ADV_SAFEPOINT=$Safepoint (device only)"
+        "ADV_GIR=$Gir (device only)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
         $manifest | ForEach-Object { "$($_.target)_sha256=$($_.sha256)" }
