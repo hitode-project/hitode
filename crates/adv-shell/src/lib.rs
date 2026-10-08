@@ -455,6 +455,41 @@ fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> S
     )
 }
 
+/// The report's personality gaps (docs/personality-contracts.md): rejected
+/// discovery probes and reviewed exports answered with their failure.
+fn personality_json(diagnostics: Option<&adv_runtime::ApiDiagnostics>) -> String {
+    let Some(d) = diagnostics else {
+        return "{\"rejected_probes\": [], \"dropped_rejected_probes\": 0, \"reviewed_calls\": {}}"
+            .into();
+    };
+    let probes = d
+        .rejected_probes
+        .iter()
+        .map(|(api, probe)| {
+            format!(
+                "{{\"api\": {}, \"class\": {}, \"count\": {}, \"first_caller\": {}}}",
+                json(api),
+                probe
+                    .class
+                    .map_or_else(|| "null".into(), |class| json(class.as_str())),
+                probe.count,
+                probe.first_caller
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reviewed = d
+        .reviewed_calls
+        .iter()
+        .map(|(api, count)| format!("{}: {count}", json(api)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\"rejected_probes\": [{probes}], \"dropped_rejected_probes\": {}, \"reviewed_calls\": {{{reviewed}}}}}",
+        d.dropped_rejected_probes
+    )
+}
+
 fn api_report(runtime: &Runtime) -> String {
     let mode = match runtime.api_mode() {
         adv_runtime::RunMode::Strict => "strict",
@@ -546,7 +581,7 @@ fn api_report(runtime: &Runtime) -> String {
             "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
             "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
             "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
-            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}]}}"
+            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}], \"personality\": {}}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -571,6 +606,7 @@ fn api_report(runtime: &Runtime) -> String {
         diagnostics.map_or(0, |d| d.dropped_message_boxes),
         diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
         processes,
+        personality_json(diagnostics),
     )
 }
 

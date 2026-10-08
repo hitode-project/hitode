@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Bounded, sequential startup probes using the production ADV runner.
 
-The manifest contains a samples list of {id, exe, engine, codepage}. Guest files
+The manifest contains a samples list of {id, exe, engine, codepage}. A relative
+exe is resolved under $ADV_SAMPLES, so a checked-in manifest such as
+startup-smoke.json names no local path. Guest files
 are read through the runtime VFS; each run gets a fresh write overlay. Hardware
 audio is always muted. Reaching a frame is startup evidence, not playability.
 Imported but uncalled APIs are recorded separately from actual failure evidence.
 Optional manifest native_baseline evidence names exe_sha256, outcome, source,
 reviewer and note; codepage may be absent/unknown, otherwise it must match.
 --quick runs a regression gate of one sample per engine: the samples marked
-"quick": true, or else the first sample of each engine, 15 seconds each.
+"quick": true, or else the first sample of each engine, 10 seconds each.
+A sample's min_seconds (with a min_seconds_reason) raises its own limit for an
+engine whose first frame comes later; it never shortens a longer --seconds.
 """
 from __future__ import annotations
 
@@ -339,6 +343,21 @@ def milestones(report: dict, evidence: dict | None = None, report_hash: str | No
                              "note": "Frames alone do not establish a title screen, correct sound or chapter completion."}}
 
 
+def sample_exe(sample: dict, strict: bool = True) -> Path:
+    """The entry exe: absolute as given, else relative to $ADV_SAMPLES."""
+    exe = Path(sample["exe"])
+    if exe.is_absolute():
+        return exe.resolve(strict=strict)
+    root = os.environ.get("ADV_SAMPLES")
+    if not root:
+        raise ValueError(f"{sample['id']}: a relative exe needs ADV_SAMPLES")
+    root = Path(root).resolve(strict=True)
+    path = (root / exe).resolve(strict=strict)
+    if root not in path.parents:
+        raise ValueError(f"{sample['id']}: exe escapes ADV_SAMPLES")
+    return path
+
+
 def quick_samples(samples: list[dict]) -> set[str]:
     """Ids of the quick gate: the marked samples, else the first of each engine."""
     marked = {sample["id"] for sample in samples if sample.get("quick") is True}
@@ -363,6 +382,10 @@ def run(args: argparse.Namespace) -> None:
         ids.add(name)
         if sample.get("codepage", 932) not in (932, 936):
             raise ValueError(f"unsupported codepage for {name}")
+        if "min_seconds" in sample and (
+                not isinstance(sample["min_seconds"], (int, float)) or not 0 < sample["min_seconds"] <= 3600
+                or not str(sample.get("min_seconds_reason") or "").strip()):
+            raise ValueError(f"{name}: min_seconds needs a value within 0..3600 and a min_seconds_reason")
     if selected - ids:
         raise ValueError(f"unknown sample ids: {sorted(selected - ids)}")
     if getattr(args, "quick", False):
@@ -373,7 +396,7 @@ def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     # Never place diagnostic files or overlays in a source game's directory.
     for sample in samples:
-        game_dir = Path(sample["exe"]).resolve().parent
+        game_dir = sample_exe(sample, strict=False).parent
         if output == game_dir or game_dir in output.parents:
             raise ValueError("output must be outside all game directories")
     output.mkdir(parents=True, exist_ok=False)
@@ -392,9 +415,10 @@ def run(args: argparse.Namespace) -> None:
             continue
         folder = output / sample["id"]
         folder.mkdir()
-        game = Path(sample["exe"]).resolve(strict=True)
+        game = sample_exe(sample)
+        seconds = max(args.seconds, sample.get("min_seconds", 0))
         command = [str(binary), str(game), "--" + args.mode, "--audio",
-                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(args.seconds),
+                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(seconds),
                    "--codepage", str(sample.get("codepage", 932)),
                    "--auto-dialog-ms", "50", "--data-dir", str(folder / "overlay"),
                    "--report", str(folder / "report.json"),
@@ -402,7 +426,7 @@ def run(args: argparse.Namespace) -> None:
         if args.trace:
             command += ["--trace", str(folder / "api.log")]
         command += getattr(args, "runner_arg", [])
-        result = dict(sample, command=command, guest_exe_sha256=digest(game))
+        result = dict(sample, command=command, guest_exe_sha256=digest(game), seconds=seconds)
         validate_native_baseline(result)
         result["report_available"] = False
         result["milestones"] = milestones({})
@@ -414,7 +438,7 @@ def run(args: argparse.Namespace) -> None:
                                            stdin=subprocess.DEVNULL, env=environment,
                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 try:
-                    result["exit_code"] = process.wait(timeout=args.seconds + args.timeout_grace)
+                    result["exit_code"] = process.wait(timeout=seconds + args.timeout_grace)
                     result["external_timeout"] = False
                 except subprocess.TimeoutExpired:
                     process.kill()
@@ -471,7 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--only", nargs="+")
-    parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 15 with --quick)")
+    parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 10 with --quick)")
     parser.add_argument("--quick", action="store_true",
                         help="one sample per engine: those marked \"quick\": true, else each engine's first")
     parser.add_argument("--timeout-grace", type=float, default=15)
@@ -484,7 +508,7 @@ if __name__ == "__main__":
                         help="explicit candidate option, e.g. --runner-arg=--d3d9-sm2")
     options = parser.parse_args()
     if options.seconds is None:
-        options.seconds = 15 if options.quick else 20
+        options.seconds = 10 if options.quick else 20
     if not math.isfinite(options.seconds) or not 0 < options.seconds <= 3600:
         parser.error("seconds must be finite and within 0..3600")
     if not math.isfinite(options.timeout_grace) or not 1 <= options.timeout_grace <= 120:

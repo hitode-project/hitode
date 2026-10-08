@@ -25,6 +25,36 @@ class GateTests(unittest.TestCase):
         self.assertIn("new shader/declaration warning", verdict["reasons"][0])
         self.assertEqual(gate({"one": [candidate]}, {"one": [candidate]}, 0.25)["one"]["verdict"], "same")
 
+    def test_new_structural_warnings_regress_and_known_ones_do_not(self):
+        def broken(api):
+            run = result()
+            run["api"] = {"structural_mismatches": 1, "processes": [
+                {"structural_warnings": [{"api": api, "reason": "fixed export could not be resolved"}]}]}
+            return run
+        known = broken("kernel32.dll!A")
+        self.assertEqual(gate({"one": [known]}, {"one": [known]}, 0.25)["one"]["verdict"], "same")
+        verdict = gate({"one": [known]}, {"one": [broken("kernel32.dll!B")]}, 0.25)["one"]
+        self.assertEqual(verdict["reasons"],
+                         ["new structural warning: kernel32.dll!B: fixed export could not be resolved"])
+
+    def test_require_frames_regresses_any_frameless_candidate_run(self):
+        baseline = {"one": [result(frames=0)]}
+        candidate = {"one": [result(frames=5), result(frames=0)]}
+        self.assertEqual(gate(baseline, candidate, 0.25)["one"]["verdict"], "same")
+        self.assertEqual(gate(baseline, candidate, 0.25, require_frames=True)["one"]["reasons"],
+                         ["a candidate run produced no frame"])
+
+    def test_new_personality_gaps_are_changes_not_regressions(self):
+        candidate = result()
+        candidate["api"] = {"personality": {
+            "rejected_probes": [{"api": "kernel32.dll!Beep", "class": "hidden", "count": 2}],
+            "reviewed_calls": {"dwrite.dll!DWriteCreateFactory": 1}}}
+        verdict = gate({"one": [result()]}, {"one": [candidate]}, 0.25)["one"]
+        self.assertEqual(verdict["verdict"], "changed")
+        self.assertEqual(verdict["new_personality_gaps"],
+                         ["rejected kernel32.dll!Beep (hidden)", "reviewed dwrite.dll!DWriteCreateFactory"])
+        self.assertEqual(gate({"one": [candidate]}, {"one": [candidate]}, 0.25)["one"]["verdict"], "same")
+
     def test_outcome_names_the_failure_address_of_cpu_failures_only(self):
         self.assertEqual(outcome(result(status=SEH[0], kind=SEH[1], failure=SEH[2])),
                          ("blocked", "seh_dispatch", "0x00574916"))
