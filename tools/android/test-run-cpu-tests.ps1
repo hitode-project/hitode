@@ -27,10 +27,8 @@ $defaults = & $runner -WhatIf -Sdk '' -Ndk '' -Output $output | ConvertFrom-Json
 Assert (($defaults.targets -join ',') -eq 'execution_contract,host_interrupts,loop_versioning,address_space') 'Default integration targets changed.'
 Assert ($defaults.runs.Count -eq 4) 'Default run count changed.'
 Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lockfile.'
-Assert ($defaults.runs[0].shell.Contains('ADV_SAFEPOINT=off')) 'Safepoints must remain opt-in.'
+Assert (-not $defaults.runs[0].shell.Contains('ADV_SAFEPOINT')) 'Retired poll selector must not reach the device.'
 Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
-$poll = & $runner -WhatIf -Safepoint poll -Output $output | ConvertFrom-Json
-Assert ($poll.runs[0].shell.Contains('ADV_SAFEPOINT=poll')) 'Poll mode did not reach the device.'
 $event = & $runner -WhatIf -CodeValidity event -Output $output | ConvertFrom-Json
 Assert ($event.runs[0].shell.Contains('ADV_CODE_VALIDITY=event')) 'Event validity did not reach the device.'
 Assert ($defaults.runs[0].shell.Contains('ADV_CODE_VALIDITY=legacy')) 'Event validity must remain opt-in.'

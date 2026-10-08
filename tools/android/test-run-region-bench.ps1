@@ -16,9 +16,7 @@ Assert ($plan.adb_port -eq 5037)
 Assert ($plan.cargo_arguments -contains 'host_region_bench')
 Assert ($plan.cargo_arguments -contains '--locked')
 Assert ($plan.cpu_mask -eq 'auto')
-Assert ($plan.shell.Contains('ADV_SAFEPOINT=off'))
-$poll = & $runner @arguments -Safepoint poll -LockOwner spt | ConvertFrom-Json
-Assert ($poll.shell.Contains('ADV_SAFEPOINT=poll'))
+Assert (-not $plan.shell.Contains('ADV_SAFEPOINT'))
 $event = & $runner @arguments -CodeValidity event -CompileBench | ConvertFrom-Json
 Assert ($event.shell.Contains('ADV_CODE_VALIDITY=event'))
 Assert ($event.shell.Contains('ADV_REGION_BENCH_COMPILE=1'))

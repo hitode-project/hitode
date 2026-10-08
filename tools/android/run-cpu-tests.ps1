@@ -9,7 +9,6 @@ Device runs retain build/test logs, hashes and result counts in Output.
 AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. JitVerify
 configure the CPU; Tier1 records the shell selector (fixtures select their modes).
-Safepoint selects off/poll independently of verification and direct memory.
 CodeValidity selects legacy/event code-cache validation on the device.
 Features adds explicit Cargo features. Tier 2 uses the default GIR frontend.
 .EXAMPLE
@@ -36,7 +35,6 @@ param(
     [switch]$WhatIf,
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
-    [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
     [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [string[]]$Features = @()
 )
@@ -89,7 +87,7 @@ function Get-DeviceCommand($remote, $run) {
     $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_TIER1 ADV_GIR'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_TIER1=$Tier1 ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_TIER1=$Tier1 ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
@@ -181,7 +179,6 @@ try {
         "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
         "ADV_JIT_VERIFY=$JitVerify (device only)"
         "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
-        "ADV_SAFEPOINT=$Safepoint (device only)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
         $manifest | ForEach-Object { "$($_.target)_sha256=$($_.sha256)" }

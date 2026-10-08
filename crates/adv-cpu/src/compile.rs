@@ -14,7 +14,7 @@ use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-mod contract;
+pub(crate) mod contract;
 pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -32,7 +32,6 @@ mod nest_emit;
 // Retain the analysis tests; observable exits cannot discard guest state.
 #[cfg(test)]
 mod register_liveness;
-mod safepoints;
 mod scalar;
 mod shadow;
 mod simd;
@@ -61,9 +60,6 @@ pub(crate) struct NativeRun<'a> {
 }
 
 pub(crate) struct Compiled {
-    /// Immutable absolute checked entry, initialized before publication. Code
-    /// mappings need not be in ADRP/rel32 reach of the polling body.
-    _poll_target: Option<Box<usize>>,
     perf_ranges: Vec<crate::perf_map::Registration>,
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
@@ -952,30 +948,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
-    // Stateful helpers and existing loop kernels keep their established fuel
-    // and recovery contracts. Direct recovery metadata describes one body,
-    // so it cannot yet be shared by the checked and polling copies.
-    // Recompute the plan from the final region CFG.
-    let poll_plan = (crate::safepoint::enabled()
-        && !snapshot.parallel
-        && plans.is_empty()
-        && invariant_plan.is_none()
-        && versioned
-        && write_summary::Summary::for_region(&instructions).is_some())
-    .then(|| safepoints::Plan::new(&instructions, &entries))
-    .flatten();
-    let mut poll_target = poll_plan.as_ref().map(|_| Box::new(0usize));
-    let poll_cell = poll_target
-        .as_deref()
-        .map(|target| std::ptr::from_ref(target) as usize);
-    let poll_id = poll_plan
-        .as_ref()
-        .map(|_| {
-            module
-                .declare_function("guest_poll", Linkage::Local, &tail_signature)
-                .map_err(|e| e.to_string())
-        })
-        .transpose()?;
     let invariant_id = invariant_plan
         .as_ref()
         .map(|_| {
@@ -1094,14 +1066,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     kernels: &[usize],
                     track_writes: bool,
                     descriptors: &[usize],
-                    invariant_body: bool,
-                    polling_body: bool| {
-        let poll = polling_body.then(|| {
-            (
-                poll_plan.as_ref().expect("poll body has a bounded plan"),
-                poll_cell.expect("poll body owns an absolute target cell"),
-            )
-        });
+                    invariant_body: bool| {
         // Shadow returns always target the checked entry. An external callee
         // can change a base register, invalidating the old invocation's proof.
         let shadow_ref = (snapshot.shadow_returns && kernel.is_none())
@@ -1394,8 +1359,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     })
         });
         let mut e = Emitter {
-            poll,
-            poll_block: region.start,
             b,
             optimizing: opt_level == "speed",
             memory_scratch: None,
@@ -1520,7 +1483,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // Keep their dispatches separate so a known local recipe is not widened
         // before a normal exit.
         if hot_exits {
-            e.interrupt_at(pc, true);
             let entry_miss = e.b.create_block();
             e.b.set_cold_block(entry_miss);
             let mut switch = Switch::new();
@@ -1553,7 +1515,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             e.b.switch_to_block(block);
             e.pc = start;
-            e.poll_block = start;
             if kernel.is_some() && fast.is_none() {
                 e.begin_mmx_block();
                 e.exit_const(Exit::Dispatch, start);
@@ -1590,10 +1551,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             // A kernel charges its blocks when it leaves (`settle_fuel`).
             if fast.is_none() {
-                if e.poll.is_none() {
-                    let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
-                    e.guard(zero, Exit::Budget, None);
-                }
+                let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
+                e.guard(zero, Exit::Budget, None);
                 let remaining = e.b.ins().iadd_imm(budget, -1);
                 e.b.def_var(e.fuel, remaining);
                 if let Some(heat) = e.heat {
@@ -1823,7 +1782,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             row,
             &[],
             false,
-            false,
         );
         let kernel_id = module
             .declare_function(
@@ -1914,7 +1872,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             false,
             &addresses,
             true,
-            false,
         );
         #[cfg(feature = "cross-dump")]
         let cross = dump_dir.as_ref().map(|_| invariant_ctx.func.clone());
@@ -1945,27 +1902,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         false,
         &addresses,
         false,
-        false,
     );
-    if let Some(poll_id) = poll_id {
-        let mut poll_ctx = module.make_context();
-        poll_ctx.func.signature = tail_signature.clone();
-        emit(
-            &mut module,
-            &mut poll_ctx.func,
-            &mut fb_ctx,
-            None,
-            &kernels,
-            false,
-            &addresses,
-            false,
-            true,
-        );
-        module
-            .define_function(poll_id, &mut poll_ctx)
-            .map_err(|e| format!("{e:?}"))?;
-        kernel_functions.push((poll_id, poll_ctx));
-    }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     #[cfg(feature = "cross-dump")]
@@ -2013,10 +1950,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let body_entry = module.get_finalized_function(id) as usize;
-    if let Some(target) = poll_target.as_deref_mut() {
-        *target = body_entry;
-    }
-    let tail_entry = module.get_finalized_function(poll_id.unwrap_or(id)) as usize;
+    let tail_entry = body_entry;
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
@@ -2069,6 +2003,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.switch_to_block(entry);
         let params = b.block_params(entry).to_vec();
         let args = contract::load(&mut b, ptr_ty, params[0], params[1]);
+        contract::guard_entry(
+            &mut b,
+            ptr_ty,
+            params[0],
+            args[contract::PC],
+            args[contract::FUEL],
+        );
         let address = b.ins().iconst(ptr_ty, tail_entry as i64);
         let call = b.ins().call_indirect(callee, address, &args);
         let result = b.inst_results(call)[0];
@@ -2200,7 +2141,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     #[cfg(feature = "gir-lift")]
     crate::gir::diagnostics::record(&instructions, region.start);
     Ok(Compiled {
-        _poll_target: poll_target,
         perf_ranges,
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(
@@ -2862,8 +2802,6 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
-    poll: Option<(&'a safepoints::Plan, usize)>,
-    poll_block: u32,
     memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,
     invariant_body: bool,
@@ -2983,187 +2921,6 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn chain_or_return(
-        &mut self,
-        pc: Value,
-        target_hash: Option<Value>,
-        reason: Option<Value>,
-        prediction: Option<Value>,
-    ) {
-        let returned = self.b.create_block();
-        if let Some(reason) = reason {
-            let candidate = self.b.create_block();
-            let dispatch = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
-            self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
-            self.b.switch_to_block(candidate);
-        }
-        let slots = self.b.ins().load(
-            self.ptr_ty,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, slots) as i32,
-        );
-        let remaining = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let stop = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, stop) as i32,
-        );
-        let fuel = self.b.use_var(self.fuel);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
-        let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
-        let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
-        let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
-        let bad = self.b.ins().bor(none, limit);
-        let bad = self.b.ins().bor(bad, is_stop);
-        let bad = self.b.ins().bor(bad, empty);
-        let prepare = self.b.create_block();
-        self.b.ins().brif(bad, returned, &[], prepare, &[]);
-        self.b.switch_to_block(prepare);
-        // Only a Rust exit publishes the incoming architectural prefix. A
-        // successful link carries it directly through the native arguments.
-        let pending = self
-            .b
-            .ins()
-            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
-        let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let search_ready = self.b.create_block();
-        self.b
-            .ins()
-            .brif(pending, interrupted, &[], search_ready, &[]);
-        self.b.switch_to_block(interrupted);
-        self.save_state(pc);
-        let interrupted_reason = self.constant(Exit::Interrupted as u32);
-        self.b.ins().return_(&[interrupted_reason]);
-        self.b.switch_to_block(search_ready);
-        let hit = self.b.create_block();
-        self.b.append_block_param(hit, self.ptr_ty);
-        if let Some(prediction) = prediction {
-            let valid = self.b.ins().icmp_imm(IntCC::NotEqual, prediction, 0);
-            let predicted = self.b.create_block();
-            let search_only = self.b.create_block();
-            self.b.ins().brif(valid, predicted, &[], search_only, &[]);
-            self.b.switch_to_block(predicted);
-            self.shadow_hit();
-            self.b.ins().jump(hit, &[prediction.into()]);
-            self.b.switch_to_block(search_only);
-        }
-        let mask = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, mask) as i32,
-        );
-        let hashed = if let Some(hash) = target_hash {
-            hash
-        } else {
-            let high = self.b.ins().ushr_imm(pc, 16);
-            let mixed = self.b.ins().bxor(pc, high);
-            let mixed = self.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
-            let high = self.b.ins().ushr_imm(mixed, 16);
-            self.b.ins().bxor(mixed, high)
-        };
-        let index = self.b.ins().band(hashed, mask);
-        let search = self.b.create_block();
-        self.b.append_block_param(search, types::I32);
-        self.b.append_block_param(search, types::I32);
-        let zero = self.constant(0);
-        self.b.ins().jump(search, &[index.into(), zero.into()]);
-        self.b.switch_to_block(search);
-        let index = self.b.block_params(search)[0];
-        let probes = self.b.block_params(search)[1];
-        let offset = self.b.ins().uextend(self.ptr_ty, index);
-        let offset = self
-            .b
-            .ins()
-            .imul_imm(offset, std::mem::size_of::<Slot>() as i64);
-        let address = self.b.ins().iadd(slots, offset);
-        let entry_address = self
-            .b
-            .ins()
-            .iadd_imm(address, offset_of!(Slot, entry) as i64);
-        let entry = self
-            .b
-            .ins()
-            .atomic_load(self.ptr_ty, MemFlags::trusted(), entry_address);
-        let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
-        let occupied = self.b.create_block();
-        self.b.ins().brif(absent, returned, &[], occupied, &[]);
-        self.b.switch_to_block(occupied);
-        let key = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            address,
-            offset_of!(Slot, pc) as i32,
-        );
-        let found = self.b.ins().icmp(IntCC::Equal, pc, key);
-        let advance = self.b.create_block();
-        self.b.ins().brif(found, hit, &[entry.into()], advance, &[]);
-        self.b.switch_to_block(advance);
-        let next = self.b.ins().iadd_imm(index, 1);
-        let next = self.b.ins().band(next, mask);
-        let probes = self.b.ins().iadd_imm(probes, 1);
-        let exhausted = self.b.ins().icmp_imm(
-            IntCC::UnsignedGreaterThanOrEqual,
-            probes,
-            crate::linking::PROBES as i64,
-        );
-        self.b.ins().brif(
-            exhausted,
-            returned,
-            &[],
-            search,
-            &[next.into(), probes.into()],
-        );
-        self.b.switch_to_block(hit);
-        let entry = self.b.block_params(hit)[0];
-        let remaining = self.b.ins().iadd_imm(remaining, -1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            remaining,
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let linked = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        let linked = self.b.ins().iadd_imm(linked, 1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            linked,
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        if self.fault_mode.is_some() {
-            let disabled = self.b.ins().iconst(types::I8, 0);
-            self.b.ins().store(
-                MemFlags::trusted(),
-                disabled,
-                self.context,
-                offset_of!(NativeContext, fault_reads) as i32,
-            );
-        }
-        self.tail_to(entry, pc);
-        self.b.switch_to_block(returned);
-        self.save_state(pc);
-        let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
-        self.b.ins().return_(&[reason]);
-    }
     fn constant(&mut self, value: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(value))
     }
@@ -3639,11 +3396,7 @@ impl Emitter<'_> {
             .fast
             .and_then(|index| self.fast_blocks[index].get(&pc).copied());
         if let Some(block) = clone.or_else(|| self.blocks.get(&pc).copied()) {
-            if self
-                .poll
-                .is_some_and(|(plan, _)| plan.crosses(self.poll_block, pc))
-                || pc <= self.pc
-            {
+            if pc <= self.pc {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
                 if self.kernel.is_none()
@@ -4328,37 +4081,6 @@ impl Emitter<'_> {
                 .ins()
                 .store(MemFlags::trusted(), value, self.state, base + offset as i32);
         }
-    }
-    fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
-        self.poll_budget(pc);
-        let pending = self
-            .b
-            .ins()
-            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
-        let mut pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        // A clone checks interrupts after funding its next iteration.
-        if self.fast.is_none() {
-            let fuel = self.b.use_var(self.fuel);
-            let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-            pending = self.b.ins().band(pending, work);
-        }
-        if respect_stops {
-            let stop = self.b.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                self.context,
-                offset_of!(NativeContext, stop) as i32,
-            );
-            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
-            pending = self.b.ins().band(pending, ordinary);
-        }
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let continued = self.b.create_block();
-        self.b.ins().brif(pending, interrupted, &[], continued, &[]);
-        self.b.switch_to_block(interrupted);
-        self.exit(Exit::Interrupted, pc);
-        self.b.switch_to_block(continued);
     }
     fn address(&mut self, i: &Instruction) -> Value {
         if let Some((pc, addr, _)) = self.site
