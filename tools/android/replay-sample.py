@@ -5,7 +5,8 @@ Use an ignored target/ output directory. Local game and seed directories are rea
 only. --remote-game-dir reuses an already pushed game without deleting or changing
 that directory; every session has a fresh UUID directory and write overlay.
 This records virtual PCM and guest frame observations, not native Android output.
---code-cache/--aot enable native caching/static discovery. --warm-code-cache
+Native caching/static discovery are default; --no-code-cache is diagnostic.
+--warm-code-cache
 imports and hashes a prior native archive; --cold removes both cache files only
 from the fresh overlay, and enabled native cache output is pulled as evidence.
 """
@@ -292,10 +293,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
     if args.auto_dialog_ms is not None:
         command.extend(["--auto-dialog-ms", str(args.auto_dialog_ms)])
     environment = ["ADV_TIER1=" + getattr(args, "tier1", "off")]
-    if getattr(args, "code_cache", False):
-        environment.append("ADV_CODE_CACHE=1")
-    if getattr(args, "aot", False):
-        environment.append("ADV_AOT=1")
+    if getattr(args, "no_code_cache", False):
+        command.append("--no-code-cache")
     if getattr(args, "perf_map", False):
         environment.append("ADV_PERF_MAP_DIR=" + remote)
     if getattr(args, "compile_threads", None) is not None:
@@ -675,7 +674,7 @@ def run(args: argparse.Namespace) -> None:
                 if error is None:
                     error = caught
                     metadata["error"] = f"{type(caught).__name__}: {caught}"
-        if getattr(args, "code_cache", False):
+        if not getattr(args, "no_code_cache", False):
             try:
                 adb.pull(remote + "/data/jit-code.bin", output / "jit-code.bin")
                 metadata["code_cache_output_sha256"] = sha256(output / "jit-code.bin")
@@ -757,8 +756,7 @@ def parse_args() -> argparse.Namespace:
     warmth.add_argument("--cold", action="store_true", help="remove jit-warm.bin only from this run's new overlay")
     warmth.add_argument("--warm-profile", type=Path, help="override this run's jit-warm.bin with a captured warm archive")
     parser.add_argument("--warm-code-cache", type=Path, help="import jit-code.bin into this run's independent overlay")
-    parser.add_argument("--code-cache", action="store_true", help="enable ADV_CODE_CACHE=1")
-    parser.add_argument("--aot", action="store_true", help="enable ADV_AOT=1")
+    parser.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
     parser.add_argument("--capture-pcm", action="store_true", help="capture bounded Play snapshots; excludes performance comparisons")
     parser.add_argument("--codepage", required=True, type=int, choices=(932, 936))
     parser.add_argument("--output", required=True, type=Path, help="fresh directory below ignored target/")

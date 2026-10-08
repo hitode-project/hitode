@@ -22,6 +22,7 @@ struct Options {
     row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
+    no_code_cache: bool,
     cdroms: Vec<(char, PathBuf)>,
     jit: bool,
     compile_strategy: CompileStrategy,
@@ -87,6 +88,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --frames N              stop after N presented guest frames\n\
   --seconds N             stop after N seconds of host wall time\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
+  --no-code-cache         troubleshoot startup: bypass native cache and image precompilation\n\
   --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
@@ -115,6 +117,7 @@ impl Options {
             row_batching: true,
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
+            no_code_cache: false,
             cdroms: Vec::new(),
             jit: true,
             compile_strategy: CompileStrategy::Fast,
@@ -160,6 +163,7 @@ impl Options {
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--no-code-cache" => options.no_code_cache = true,
                 "--cdrom" => {
                     let mount = value()?;
                     let (drive, path) = mount.split_once('=').ok_or("--cdrom requires D=PATH")?;
@@ -1132,6 +1136,17 @@ fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
     assert_eq!(compile_thread_count(0, usize::MAX), 1);
 }
 
+#[test]
+fn native_cache_is_default_and_has_one_diagnostic_bypass() {
+    let parse = |values: &[&str]| {
+        Options::parse_args(values.iter().map(|s| s.to_string()))
+            .unwrap()
+            .unwrap()
+    };
+    assert!(!parse(&["fixture.exe"]).no_code_cache);
+    assert!(parse(&["fixture.exe", "--no-code-cache"]).no_code_cache);
+}
+
 fn run_execution(
     options: Options,
     mut window: Option<frontend::Worker>,
@@ -1242,7 +1257,12 @@ fn run_execution(
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
-    if options.jit && std::env::var("ADV_CODE_CACHE").as_deref() == Ok("1") {
+    runtime
+        .machine
+        .cpu
+        .executor_mut()
+        .set_aot_enabled(options.jit && !options.no_code_cache);
+    if options.jit && !options.no_code_cache {
         runtime
             .machine
             .cpu

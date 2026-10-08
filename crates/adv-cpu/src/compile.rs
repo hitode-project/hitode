@@ -387,7 +387,8 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
     pub(crate) cache_capture: bool,
-    pub(crate) cache_location: Option<(u32, u32)>,
+    pub(crate) cache_location: Option<(u32, u32, [u8; 32])>,
+    pub(crate) cache_guest: Option<[u8; 32]>,
     pub(crate) gir_frontend: bool,
     parallel: bool,
     direct_memory: bool,
@@ -448,7 +449,8 @@ impl Snapshot {
             cache_capture: self.cache_capture,
             cache_location: self
                 .cache_location
-                .map(|(base, _)| (base, region.start - base)),
+                .map(|(base, _, identity)| (base, region.start - base, identity)),
+            cache_guest: self.cache_guest,
             gir_frontend: self.gir_frontend,
             parallel: self.parallel,
             direct_memory: self.direct_memory,
@@ -519,6 +521,7 @@ impl Snapshot {
         Ok(Self {
             cache_capture: false,
             cache_location: None,
+            cache_guest: None,
             gir_frontend: gir::selected()?,
             parallel: memory.is_parallel(),
             direct_memory: memory.direct_memory_enabled(),

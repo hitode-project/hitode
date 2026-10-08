@@ -56,6 +56,9 @@ class ReplayTests(unittest.TestCase):
         args.no_time_skip = False
         command = replay.runner_command(args, "/fixture", "/game", 10)
         self.assertNotIn("--no-time-skip", command)
+        self.assertNotIn("--no-code-cache", command)
+        args.no_code_cache = True
+        self.assertIn("--no-code-cache", replay.runner_command(args, "/fixture", "/game", 10))
 
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):
         command = "await-frame 0000000000000001 1000 hold 17"
@@ -339,7 +342,7 @@ class ReplayTests(unittest.TestCase):
                 record_scene_reference=output / "reference.json" if record else None,
                 font_profile="/fonts/profile.json", font_manifest=font_manifest, cold=cold,
                 warm_profile=warm_archive if warm else None, capture_pcm=capture_pcm,
-                code_cache=code_cache, aot=code_cache, warm_code_cache=native_archive if code_cache and warm else None)
+                warm_code_cache=native_archive if code_cache and warm else None)
             operations = []
             report = {"frames": 4, "failure": None, "frame_fnv1a64": "bad hash" if wrong_hash else target_hash,
                       "api": {"mode": "strict", "stub_calls": 0, "acceptance_eligible": True},
@@ -451,8 +454,7 @@ class ReplayTests(unittest.TestCase):
         for mode in ("cold", "warm"):
             with self.subTest(mode=mode):
                 metadata, _, operations, _ = self.run_scene_mocked(**{mode: True}, code_cache=True)
-                self.assertIn("ADV_CODE_CACHE=1", metadata["command"])
-                self.assertIn("ADV_AOT=1", metadata["command"])
+                self.assertNotIn("--no-code-cache", metadata["command"])
                 self.assertIsNotNone(metadata["code_cache_output_sha256"])
                 self.assertTrue(any(row[0] == "pull" and row[1].endswith("/jit-code.bin") for row in operations))
                 imports = [row for row in operations if row[0] == "push" and row[2].endswith("/data/jit-code.bin")]

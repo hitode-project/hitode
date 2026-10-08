@@ -9,6 +9,8 @@ Optional manifest native_baseline evidence names exe_sha256, outcome, source,
 reviewer and note; codepage may be absent/unknown, otherwise it must match.
 --quick runs a regression gate of one sample per engine: the samples marked
 "quick": true, or else the first sample of each engine, 15 seconds each.
+Relative entries are resolved under ADV_SAMPLES; min_seconds can extend a known
+slow startup. --warm-from reuses only validated JIT archives in fresh overlays.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -350,6 +353,40 @@ def quick_samples(samples: list[dict]) -> set[str]:
     return set(first.values())
 
 
+def sample_path(sample: dict) -> Path:
+    path = Path(sample["exe"])
+    if path.is_absolute():
+        return path.resolve(strict=True)
+    root = Path(os.environ["ADV_SAMPLES"]).resolve(strict=True)
+    path = (root / path).resolve(strict=True)
+    if not path.is_relative_to(root):
+        raise ValueError("sample path escapes ADV_SAMPLES")
+    return path
+
+
+def import_warm_archives(source: Path, folder: Path, sample: dict, binary_hash: str, guest_hash: str) -> dict:
+    """Keep guest state fresh and reject archives from another measured input."""
+    previous = json.loads((source / "results.json").read_text(encoding="utf-8-sig"))
+    row = next((r for r in previous["samples"] if r["id"] == sample["id"]), None)
+    if (previous["binary_sha256"] != binary_hash or row is None
+            or row["guest_exe_sha256"] != guest_hash
+            or row.get("codepage", 932) != sample.get("codepage", 932)):
+        raise ValueError("warm input does not match the runner, guest image and codepage")
+    origin = (source / sample["id"] / "overlay").resolve(strict=True)
+    if not origin.is_relative_to(source.resolve(strict=True)):
+        raise ValueError("warm overlay escapes its run root")
+    overlay = folder / "overlay"
+    overlay.mkdir()
+    inputs = {}
+    for name in ("jit-warm.bin", "jit-code.bin"):
+        archive = origin / name
+        if not archive.is_file() or not archive.resolve().is_relative_to(origin):
+            raise ValueError("warm input is missing an owned JIT archive")
+        inputs[name] = digest(archive)
+        shutil.copy2(archive, overlay / name)
+    return inputs
+
+
 def run(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     samples = manifest["samples"] if isinstance(manifest, dict) else manifest
@@ -363,6 +400,9 @@ def run(args: argparse.Namespace) -> None:
         ids.add(name)
         if sample.get("codepage", 932) not in (932, 936):
             raise ValueError(f"unsupported codepage for {name}")
+        seconds = sample.get("min_seconds", 0)
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 <= seconds <= 3600:
+            raise ValueError(f"invalid minimum startup duration for {name}")
     if selected - ids:
         raise ValueError(f"unknown sample ids: {sorted(selected - ids)}")
     if getattr(args, "quick", False):
@@ -373,7 +413,7 @@ def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     # Never place diagnostic files or overlays in a source game's directory.
     for sample in samples:
-        game_dir = Path(sample["exe"]).resolve().parent
+        game_dir = sample_path(sample).parent
         if output == game_dir or game_dir in output.parents:
             raise ValueError("output must be outside all game directories")
     output.mkdir(parents=True, exist_ok=False)
@@ -392,9 +432,10 @@ def run(args: argparse.Namespace) -> None:
             continue
         folder = output / sample["id"]
         folder.mkdir()
-        game = Path(sample["exe"]).resolve(strict=True)
+        game = sample_path(sample)
+        seconds = max(args.seconds, sample.get("min_seconds", 0))
         command = [str(binary), str(game), "--" + args.mode, "--audio",
-                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(args.seconds),
+                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(seconds),
                    "--codepage", str(sample.get("codepage", 932)),
                    "--auto-dialog-ms", "50", "--data-dir", str(folder / "overlay"),
                    "--report", str(folder / "report.json"),
@@ -403,6 +444,15 @@ def run(args: argparse.Namespace) -> None:
             command += ["--trace", str(folder / "api.log")]
         command += getattr(args, "runner_arg", [])
         result = dict(sample, command=command, guest_exe_sha256=digest(game))
+        result["seconds"] = seconds
+        if getattr(args, "warm_from", None):
+            result["warm_inputs"] = import_warm_archives(args.warm_from, folder, sample,
+                                                        metadata["binary_sha256"], result["guest_exe_sha256"])
+        (folder / "cmd.txt").write_text(subprocess.list2cmdline(command) + "\n" +
+            f"binary_sha256={metadata['binary_sha256']}\nguest_exe_sha256={result['guest_exe_sha256']}\n" +
+            "environment=" + json.dumps({k: v for k, v in environment.items()
+                                          if k.startswith("ADV_") or k in ("TEMP", "TMP", "TMPDIR")}) + "\n",
+            encoding="utf-8")
         validate_native_baseline(result)
         result["report_available"] = False
         result["milestones"] = milestones({})
@@ -414,7 +464,7 @@ def run(args: argparse.Namespace) -> None:
                                            stdin=subprocess.DEVNULL, env=environment,
                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 try:
-                    result["exit_code"] = process.wait(timeout=args.seconds + args.timeout_grace)
+                    result["exit_code"] = process.wait(timeout=seconds + args.timeout_grace)
                     result["external_timeout"] = False
                 except subprocess.TimeoutExpired:
                     process.kill()
@@ -429,7 +479,8 @@ def run(args: argparse.Namespace) -> None:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds", "elapsed_seconds", "host_calls",
                             "width", "height", "frame_fnv1a64", "missing_apis", "failure",
-                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup", "gpu"):
+                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup", "gpu",
+                            "code_cache", "aot", "compile_requests", "compilations"):
                     result[key] = report.get(key)
                 result["report_available"] = True
                 result["report_sha256"] = digest(report_path)
@@ -474,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 15 with --quick)")
     parser.add_argument("--quick", action="store_true",
                         help="one sample per engine: those marked \"quick\": true, else each engine's first")
+    parser.add_argument("--warm-from", type=Path, help="previous cold run; copy only matching JIT archives into fresh overlays")
     parser.add_argument("--timeout-grace", type=float, default=15)
     parser.add_argument("--mode", choices=("hidden", "headless"), default="hidden")
     parser.add_argument("--codec", choices=("native", "guest"), default="native")

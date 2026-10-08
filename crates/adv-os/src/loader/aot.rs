@@ -1,4 +1,4 @@
-//! Optional image-compilation hints. Only mapped native images reach this path;
+//! Image-compilation hints. Only mapped native images reach this path;
 //! synthetic system modules retain their ordinary host dispatch policy.
 use std::collections::BTreeSet;
 
@@ -9,13 +9,15 @@ use adv_pe::{ExportTarget, Pe, scn};
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEEDS: usize = 2048;
 
-pub(super) fn register(cpu: &mut dyn Guest, pe: &mut Pe, base: u32, path: &str) {
-    let aot = std::env::var("ADV_AOT").is_ok_and(|value| value == "1");
-    let cache = std::env::var("ADV_CODE_CACHE").is_ok_and(|value| value == "1");
-    if !(aot || cache) {
-        return;
-    }
+pub(super) fn register(
+    cpu: &mut dyn Guest,
+    pe: &mut Pe,
+    base: u32,
+    path: &str,
+    identity: [u8; 32],
+) {
     let mut image = AotImage {
+        identity,
         base,
         size: pe.size_of_image,
         primary: !pe.is_dll(),
@@ -24,7 +26,7 @@ pub(super) fn register(cpu: &mut dyn Guest, pe: &mut Pe, base: u32, path: &str) 
         seeds: Vec::new(),
     };
     // Large or system-path images still supply persistent-cache module identity.
-    if aot && !super::is_system_path(path) && pe.image.len() <= MAX_IMAGE_BYTES {
+    if !super::is_system_path(path) && pe.image.len() <= MAX_IMAGE_BYTES {
         image.executable = executable(pe);
         image.seeds = seeds(pe, base, &image.executable);
         // The loader is finished with this mapped buffer; transfer ownership

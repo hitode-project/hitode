@@ -42,12 +42,17 @@ class PlaySessionTests(unittest.TestCase):
             root = Path(directory)
             native = root / "jit-code.bin"
             native.write_bytes(b"authored native cache")
-            args = self.args(root, code_cache=True, aot=True, compile_threads=4, warm_code_cache=native)
-            (_, kwargs), _ = self.launch(args)
-            self.assertEqual(kwargs["env"]["ADV_CODE_CACHE"], "1")
-            self.assertEqual(kwargs["env"]["ADV_AOT"], "1")
+            args = self.args(root, compile_threads=4, warm_code_cache=native)
+            (command, kwargs), _ = self.launch(args)
+            self.assertNotIn("--no-code-cache", command)
             self.assertEqual(kwargs["env"]["ADV_COMPILE_THREADS"], "4")
             self.assertEqual((args.output / "overlay/jit-code.bin").read_bytes(), native.read_bytes())
+
+    def test_native_cache_diagnostic_bypass_reaches_the_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(Path(directory), no_code_cache=True)
+            (command, _), _ = self.launch(args)
+            self.assertIn("--no-code-cache", command)
 
     def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,4 +1,4 @@
-//! Bounded, opt-in discovery from mapped image snapshots. Speculative native
+//! Bounded discovery from mapped image snapshots. Speculative native
 //! entries remain private until execution observes a real guest entry.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -25,6 +25,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Loader metadata uses module-relative offsets. An empty snapshot still
 /// registers the module for persistent-cache identity.
 pub struct AotImage {
+    /// Digest of the original PE bytes, before relocation or import binding.
+    pub identity: [u8; 32],
     pub base: u32,
     pub size: u32,
     pub primary: bool,
@@ -33,6 +35,13 @@ pub struct AotImage {
     pub executable: Vec<(u32, u32)>,
     /// Entry point and TLS first, followed by exports and relocated pointers.
     pub seeds: Vec<u32>,
+}
+
+impl AotImage {
+    pub fn identity(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes).into()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -114,7 +123,7 @@ struct Ready {
 }
 
 pub(super) struct State {
-    enabled: bool,
+    pub(super) enabled: bool,
     registration: bool,
     sink: CodeImageSink,
     images: Receiver<AotImage>,
@@ -134,11 +143,9 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         let (sink, images) = CodeImageSink::channel();
-        let enabled = std::env::var("ADV_AOT").is_ok_and(|v| v == "1");
-        let registration = enabled || std::env::var("ADV_CODE_CACHE").is_ok_and(|v| v == "1");
         Self {
-            enabled,
-            registration,
+            enabled: true,
+            registration: true,
             sink,
             images,
             discovery: None,
@@ -174,8 +181,11 @@ impl Executor {
     /// Enable bounded image discovery. Runtime-generated code keeps automatic JIT.
     pub fn set_aot_enabled(&mut self, enabled: bool) {
         self.aot.enabled = enabled;
-        self.aot.registration |= enabled;
+        self.aot.registration = enabled || self.persistent_cache.is_some();
         if !enabled {
+            while let Ok(image) = self.aot.images.try_recv() {
+                self.aot.sink.release(image.image.len());
+            }
             self.aot.candidates.clear();
             self.aot.discovery = None;
             self.aot.ready.clear();
@@ -224,7 +234,7 @@ impl Executor {
         self.stats.aot.image_rejections += self.aot.sink.take_rejections();
         // Registration is lightweight even when static discovery is disabled.
         while let Ok(image) = self.aot.images.try_recv() {
-            self.register_code_cache_module(image.base, image.size);
+            self.register_code_cache_module(image.base, image.size, image.identity, image.primary);
             if !self.aot.enabled || image.image.is_empty() {
                 self.aot.sink.release(image.image.len());
                 continue;
@@ -597,6 +607,7 @@ mod tests {
         code.ret().unwrap();
         let bytes = code.assemble(0).unwrap();
         AotImage {
+            identity: AotImage::identity(&bytes),
             base: 0,
             size: bytes.len() as u32,
             primary: true,
@@ -626,6 +637,7 @@ mod tests {
     #[test]
     fn discovery_has_a_finite_instruction_budget() {
         let image = AotImage {
+            identity: [0; 32],
             base: 0,
             size: MAX_INSTRUCTIONS as u32 + 1,
             primary: true,
@@ -644,6 +656,7 @@ mod tests {
         let (sink, images) = CodeImageSink::channel();
         for primary in [false, false, false, false, true] {
             sink.try_send(AotImage {
+                identity: [0; 32],
                 base: 0,
                 size: MAX_IMAGE_BYTES as u32,
                 primary,

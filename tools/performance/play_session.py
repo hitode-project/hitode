@@ -14,7 +14,8 @@ session.json records whether the hardware was requested to be muted.
 Tracing is off by default; --trace writes api.trace for compatibility diagnosis
 and marks the session unsuitable for performance comparison.
 --d3d9-sm2/--d3d9-sm3 explicitly opt into the runner's shader capability profiles.
---code-cache/--aot opt into native caching/static discovery; --warm-code-cache
+Native caching/static discovery are default; --no-code-cache diagnoses failures.
+--warm-code-cache
 imports a previous local archive into the new overlay. --cold clears both caches.
 """
 from __future__ import annotations
@@ -78,10 +79,6 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
         if environment.pop(name, None) is not None:
             removed.append(name)
     environment.pop("ADV_PERF_MAP_DIR", None)
-    if getattr(args, "code_cache", False):
-        environment["ADV_CODE_CACHE"] = "1"
-    if getattr(args, "aot", False):
-        environment["ADV_AOT"] = "1"
     if getattr(args, "compile_threads", None):
         environment["ADV_COMPILE_THREADS"] = str(args.compile_threads)
     if getattr(args, "perf_map", False):
@@ -118,6 +115,8 @@ def run(args: argparse.Namespace) -> None:
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
+    if getattr(args, "no_code_cache", False):
+        command.append("--no-code-cache")
     if getattr(args, "headless_gpu", False):
         command.append("--headless-gpu")
     if getattr(args, "no_time_skip", False):
@@ -302,8 +301,7 @@ if __name__ == "__main__":
     warmth.add_argument("--cold", action="store_true")
     warmth.add_argument("--warm-profile", type=Path)
     parser.add_argument("--warm-code-cache", type=Path)
-    parser.add_argument("--code-cache", action="store_true")
-    parser.add_argument("--aot", action="store_true")
+    parser.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
     parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
     parser.add_argument("--sync-compilation", action="store_true")
     parser.add_argument("--no-tiering", action="store_true",

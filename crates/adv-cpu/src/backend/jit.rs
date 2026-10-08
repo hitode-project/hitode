@@ -130,6 +130,9 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn wants_code_images(&self) -> bool {
+        self.code_images.is_some()
+    }
     fn register_code_image(&mut self, image: crate::AotImage) {
         if let Some(sink) = &self.code_images {
             sink.try_send(image);
@@ -282,6 +285,9 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn wants_code_images(&self) -> bool {
+        self.inner.code_image_sink().is_some()
+    }
     fn register_code_image(&mut self, image: crate::AotImage) {
         self.inner.register_code_image(image);
     }

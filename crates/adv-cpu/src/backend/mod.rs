@@ -213,6 +213,10 @@ impl FpuEnvironment {
 
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Whether the loader should retain native-cache identity and AOT metadata.
+    fn wants_code_images(&self) -> bool {
+        false
+    }
     /// Register mapped image metadata and optional static-discovery bytes.
     /// Backends without image compilation can ignore this loader hint.
     fn register_code_image(&mut self, _image: crate::AotImage) {}

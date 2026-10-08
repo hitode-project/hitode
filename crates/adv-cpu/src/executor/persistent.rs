@@ -30,6 +30,7 @@ mod tests {
         executor.enable_auto_jit(true);
         executor.set_async_compilation(true);
         executor.set_tiered_compilation(false);
+        executor.register_code_cache_module(0x1000, 4096, crate::AotImage::identity(&bytes), true);
         executor.state.eip = 0x1000;
         let mut region = Region::new(0x1000, bytes.len());
         region.compile_strategy = CompileStrategy::Fast;
@@ -47,7 +48,8 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("jit-code.bin");
         let (mut first, region) = fixture(7);
-        let input = compile::Snapshot::capture(&region, &mut first.memory).unwrap();
+        let mut input = compile::Snapshot::capture(&region, &mut first.memory).unwrap();
+        first.locate_cache_input(&mut input);
         let compiled = compile::compile_snapshot(&input).unwrap();
         let cache = crate::code_cache::Cache::open(&path);
         cache.store(&input, &compiled);
@@ -100,7 +102,7 @@ mod tests {
 
 impl Executor {
     /// Enable a local cache before compilation starts. No environment selector
-    /// is implicit in the CPU API; frontends opt in with ADV_CODE_CACHE=1.
+    /// is implicit in the CPU API; the frontend supplies its writable data root.
     pub fn set_persistent_code_cache(&mut self, path: &Path) -> Result<(), String> {
         if self.compiler.is_some()
             || self.stats.compilations != 0
@@ -133,11 +135,20 @@ impl Executor {
             .map_or_else(|| "{\"enabled\":false}".into(), |cache| cache.json())
     }
 
-    pub(crate) fn register_code_cache_module(&mut self, base: u32, size: u32) {
+    pub(crate) fn register_code_cache_module(
+        &mut self,
+        base: u32,
+        size: u32,
+        identity: [u8; 32],
+        primary: bool,
+    ) {
+        if primary {
+            self.cache_guest = Some(identity);
+        }
         if size != 0 && u64::from(base) + u64::from(size) <= 1 << 32 {
-            self.cache_images.retain(|&(old, _)| old != base);
+            self.cache_images.retain(|&(old, _, _)| old != base);
             if self.cache_images.len() < 1024 {
-                self.cache_images.push((base, size));
+                self.cache_images.push((base, size, identity));
             }
         }
     }
@@ -149,11 +160,15 @@ impl Executor {
     }
 
     pub(super) fn locate_cache_input(&self, input: &mut compile::Snapshot) {
-        input.cache_capture = self.persistent_cache.is_some();
-        input.cache_location = self.cache_images.iter().find_map(|&(base, size)| {
-            let relative = input.region.start.checked_sub(base)?;
-            (relative < size).then_some((base, relative))
-        });
+        input.cache_capture = self.persistent_cache.is_some() && self.cache_guest.is_some();
+        input.cache_guest = self.cache_guest;
+        input.cache_location = self
+            .cache_images
+            .iter()
+            .find_map(|&(base, size, identity)| {
+                let relative = input.region.start.checked_sub(base)?;
+                (relative < size).then_some((base, relative, identity))
+            });
     }
 
     /// Previously executed regions may be restored as soon as mapped. Unlike a

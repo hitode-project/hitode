@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -17,11 +17,33 @@ const LIMIT: usize = 128 * 1024 * 1024;
 const ENTRIES: usize = 4096;
 const RECORD_LIMIT: usize = 4 * 1024 * 1024;
 
+/// Bind native artifacts to the actual host executable, not just a source tag.
+/// Failure disables persistence; it never weakens the key or guest execution.
+pub(crate) fn host_build_identity() -> Result<[u8; 32], String> {
+    static ID: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
+    ID.get_or_init(|| {
+        let path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let len = file.read(&mut buffer).map_err(|e| e.to_string())?;
+            if len == 0 {
+                break;
+            }
+            hash.update(&buffer[..len]);
+        }
+        Ok(hash.finalize().into())
+    })
+    .clone()
+}
+
 struct Record {
     key: Vec<u8>,
     region: Region,
     native: Arc<[u8]>,
     witnessed: bool,
+    used: u64,
 }
 
 impl Record {
@@ -39,6 +61,47 @@ impl Record {
 struct Records {
     entries: BTreeMap<[u8; 32], Record>,
     bytes: usize,
+    clock: u64,
+}
+
+impl Records {
+    fn insert(&mut self, mut record: Record, byte_limit: usize, entry_limit: usize) -> u64 {
+        let size = record.size();
+        if size > byte_limit || entry_limit == 0 {
+            return 0;
+        }
+        let id = digest(&record.key);
+        if let Some(old) = self.entries.remove(&id) {
+            self.bytes -= old.size();
+            record.witnessed |= old.witnessed;
+        }
+        let mut evicted = 0;
+        while self.entries.len() >= entry_limit || self.bytes + size > byte_limit {
+            let oldest = *self
+                .entries
+                .iter()
+                .min_by_key(|(_, record)| record.used)
+                .unwrap()
+                .0;
+            self.bytes -= self.entries.remove(&oldest).unwrap().size();
+            evicted += 1;
+        }
+        self.clock = self.clock.saturating_add(1);
+        record.used = self.clock;
+        self.bytes += size;
+        self.entries.insert(id, record);
+        evicted
+    }
+
+    fn get(&mut self, key: &[u8]) -> Option<&mut Record> {
+        self.clock = self.clock.saturating_add(1);
+        let record = self
+            .entries
+            .get_mut(&digest(key))
+            .filter(|r| r.key == key)?;
+        record.used = self.clock;
+        Some(record)
+    }
 }
 
 #[derive(Default)]
@@ -50,6 +113,7 @@ struct Counters {
     stored: AtomicU64,
     unsupported: AtomicU64,
     restored_ns: AtomicU64,
+    evicted: AtomicU64,
 }
 
 pub(crate) struct Cache {
@@ -64,6 +128,16 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 
 impl Cache {
     pub(crate) fn open(path: &Path) -> Arc<Self> {
+        // Overlap executable hashing with guest image loading. A later key
+        // lookup still waits for the complete digest before accepting an image.
+        static PREPARE: Once = Once::new();
+        PREPARE.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("adv-cache-identity".into())
+                .spawn(|| {
+                    let _ = host_build_identity();
+                });
+        });
         let cache = Arc::new(Self {
             path: path.to_owned(),
             records: Mutex::default(),
@@ -104,15 +178,21 @@ impl Cache {
 
     pub(crate) fn witness(&self, input: &Snapshot) {
         if let Ok(key) = input.cache_key() {
-            if let Some(record) = self.records.lock().unwrap().entries.get_mut(&digest(&key)) {
-                if record.key == key {
-                    record.witnessed = true;
-                }
+            if let Some(record) = self.records.lock().unwrap().get(&key) {
+                record.witnessed = true;
             }
         }
     }
 
     pub(crate) fn restore(&self, input: &Snapshot) -> Option<Compiled> {
+        if !cfg!(test) && input.cache_guest.is_none() {
+            self.counters.unsupported.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if self.records.lock().unwrap().entries.is_empty() {
+            self.counters.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let key = match input.cache_key() {
             Ok(key) => key,
             Err(_) => {
@@ -121,12 +201,8 @@ impl Cache {
             }
         };
         let native = {
-            let records = self.records.lock().unwrap();
-            records
-                .entries
-                .get(&digest(&key))
-                .filter(|record| record.key == key)
-                .map(|record| record.native.clone())
+            let mut records = self.records.lock().unwrap();
+            records.get(&key).map(|record| record.native.clone())
         };
         let Some(native) = native else {
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
@@ -152,6 +228,10 @@ impl Cache {
     }
 
     pub(crate) fn store(&self, input: &Snapshot, compiled: &Compiled) {
+        if !cfg!(test) && input.cache_guest.is_none() {
+            self.counters.unsupported.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let (Ok(key), Ok(bytes)) = (input.cache_key(), compiled.cache_bytes()) else {
             self.counters.unsupported.fetch_add(1, Ordering::Relaxed);
             return;
@@ -169,27 +249,18 @@ impl Cache {
             return;
         }
         let mut records = self.records.lock().unwrap();
-        let id = digest(&key);
-        let mut witnessed = false;
-        if let Some(old) = records.entries.remove(&id) {
-            records.bytes -= old.size();
-            witnessed = old.witnessed;
-        }
-        // Preserve already seen records rather than making shutdown perform an
-        // unbounded eviction/write pass. A later format version may add an LRU.
-        if records.entries.len() >= ENTRIES || records.bytes + size > LIMIT - 1024 * 1024 {
-            return;
-        }
-        records.bytes += size;
-        records.entries.insert(
-            id,
+        let evicted = records.insert(
             Record {
                 key,
                 region: (*input.region).clone(),
                 native: bytes.into(),
-                witnessed,
+                witnessed: false,
+                used: 0,
             },
+            LIMIT - 1024 * 1024,
+            ENTRIES,
         );
+        self.counters.evicted.fetch_add(evicted, Ordering::Relaxed);
         self.counters.stored.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -230,7 +301,7 @@ impl Cache {
         format!(
             concat!(
                 "{{\"enabled\":true,\"hits\":{},\"misses\":{},\"rejected\":{},",
-                "\"corrupt\":{},\"stored\":{},\"unsupported\":{},\"restore_ns\":{},\"entries\":{},\"bytes\":{}}}"
+                "\"corrupt\":{},\"stored\":{},\"unsupported\":{},\"restore_ns\":{},\"evicted\":{},\"entries\":{},\"bytes\":{}}}"
             ),
             read(&self.counters.hits),
             read(&self.counters.misses),
@@ -239,6 +310,7 @@ impl Cache {
             read(&self.counters.stored),
             read(&self.counters.unsupported),
             read(&self.counters.restored_ns),
+            read(&self.counters.evicted),
             records.entries.len(),
             records.bytes
         )
@@ -257,7 +329,10 @@ fn list(out: &mut Vec<u8>, values: &[u32]) {
 fn encode(records: &Records) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     word(&mut out, records.entries.len());
-    for record in records.entries.values() {
+    // File order preserves LRU order without persisting process-local clocks.
+    let mut ordered: Vec<_> = records.entries.values().collect();
+    ordered.sort_by_key(|record| record.used);
+    for record in ordered {
         let region = &record.region;
         out.extend(region.start.to_le_bytes());
         word(&mut out, region.len);
@@ -342,11 +417,13 @@ fn parse(bytes: &[u8]) -> Option<Records> {
         let key = reader.bytes()?.to_vec();
         let native: Arc<[u8]> = reader.bytes()?.into();
         let id = digest(&key);
+        records.clock += 1;
         let record = Record {
             key,
             region,
             native,
             witnessed: flags & 8 != 0,
+            used: records.clock,
         };
         records.bytes += record.size();
         if records.entries.insert(id, record).is_some() {
@@ -360,6 +437,32 @@ fn parse(bytes: &[u8]) -> Option<Records> {
 mod tests {
     use super::*;
     #[test]
+    fn bounded_lru_evicts_old_records_and_keeps_recency_across_save() {
+        let record = |id| Record {
+            key: vec![id],
+            region: Region::new(4096, 8),
+            native: Arc::from([1, 2, 3]),
+            witnessed: false,
+            used: 0,
+        };
+        let mut records = Records::default();
+        let limit = record(1).size() * 2;
+        records.insert(record(1), limit, 2);
+        records.insert(record(2), limit, 2);
+        records.get(&[1]).unwrap().witnessed = true;
+        let mut records = parse(&encode(&records)).unwrap();
+        assert_eq!(records.insert(record(3), limit, 2), 1);
+        assert!(records.get(&[2]).is_none());
+        assert!(records.get(&[1]).unwrap().witnessed);
+        assert_eq!(records.bytes, limit);
+        assert_eq!(records.entries.len(), 2);
+        records.insert(record(1), limit, 2);
+        assert!(records.get(&[1]).unwrap().witnessed);
+        assert_eq!(records.insert(record(4), limit, 1), 2);
+        assert!(records.bytes <= limit);
+        assert_eq!(records.entries.len(), 1);
+    }
+    #[test]
     fn archive_rejects_corruption_truncation_duplicates_and_excess_counts() {
         let mut records = Records::default();
         let key = vec![1, 2, 3];
@@ -370,6 +473,7 @@ mod tests {
                 region: Region::new(4096, 8),
                 native: Arc::from([4, 5, 6]),
                 witnessed: false,
+                used: 0,
             },
         );
         let valid = encode(&records);

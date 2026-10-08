@@ -35,9 +35,7 @@ const HELPER_NAMES: &[&str] = &[
 ];
 
 pub(super) fn capture_enabled(snapshot: &Snapshot) -> bool {
-    snapshot.cache_capture
-        || cfg!(test)
-        || std::env::var("ADV_CODE_CACHE").is_ok_and(|value| value == "1")
+    snapshot.cache_capture || cfg!(test)
 }
 
 pub(super) fn x87_operations(
@@ -199,6 +197,7 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     w.bytes(MAGIC);
     w.bytes(b"tier2-semantics-v1");
     w.bool(snapshot.gir_frontend);
+    w.bytes(&crate::code_cache::host_build_identity()?);
     w.bytes(env!("ADV_CPU_CODE_CACHE_FINGERPRINT").as_bytes());
     w.bytes(isa_key()?);
     w.bytes(std::env::consts::OS.as_bytes());
@@ -226,9 +225,14 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     w.bool(cfg!(feature = "gir-capture"));
     w.bool(coverage::enabled());
     w.bool(snapshot.cache_location.is_some());
-    if let Some((base, relative)) = snapshot.cache_location {
+    if let Some((base, relative, identity)) = snapshot.cache_location {
         w.u32(base);
         w.u32(relative);
+        w.bytes(&identity);
+    }
+    w.bool(snapshot.cache_guest.is_some());
+    if let Some(identity) = snapshot.cache_guest {
+        w.bytes(&identity);
     }
     let region = &snapshot.region;
     w.u32(region.start);
@@ -1082,6 +1086,10 @@ mod tests {
         snapshot.profile = Some(Arc::new(Profile::default()));
         if let Some(path) = std::env::var_os("ADV_NATIVE_CACHE_CHILD") {
             let image = std::fs::read(path).unwrap();
+            if std::env::var_os("ADV_NATIVE_CACHE_REJECT_BINARY").is_some() {
+                assert!(restore_snapshot(&snapshot, &image).is_err());
+                return;
+            }
             let compiled = restore_snapshot(&snapshot, &image).unwrap();
             let mut state = CpuState {
                 eip: snapshot.region.start,
@@ -1114,13 +1122,46 @@ mod tests {
             .env("ADV_NATIVE_CACHE_CHILD", &path)
             .output()
             .unwrap();
-        drop(cleanup);
         assert!(
             result.status.success(),
             "child native restore failed: {}{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
+        // Appending invalidates a macOS code signature. Exercise the alternate
+        // executable on hosts that allow an unsigned test binary instead.
+        #[cfg(not(target_os = "macos"))]
+        {
+            // A valid executable with a different file identity must reject the
+            // artifact even when its machine instructions and guest bytes match.
+            let other = path.with_extension("exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &other).unwrap();
+            let other_cleanup = Cleanup(other.clone());
+            {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&other)
+                    .unwrap()
+                    .write_all(b"different native build identity")
+                    .unwrap();
+            }
+            let result = std::process::Command::new(&other)
+                .arg("--exact")
+                .arg("compile::cache::tests::native_image_restores_in_another_process")
+                .env("ADV_NATIVE_CACHE_CHILD", &path)
+                .env("ADV_NATIVE_CACHE_REJECT_BINARY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "changed host identity was not rejected: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            drop(other_cleanup);
+        }
+        drop(cleanup);
     }
 
     #[test]
@@ -1324,15 +1365,36 @@ mod tests {
         changed.parallel = !changed.parallel;
         assert!(restore_snapshot(&changed, &image).is_err());
         changed = snapshot.clone();
+        changed.gir_frontend = !changed.gir_frontend;
+        assert!(restore_snapshot(&changed, &image).is_err());
+        changed = snapshot.clone();
         changed.direct_memory = !changed.direct_memory;
         assert!(restore_snapshot(&changed, &image).is_err());
         changed = snapshot.clone();
-        changed.cache_location = Some((changed.base, 0));
+        changed.cache_location = Some((changed.base, 0, [1; 32]));
         assert!(restore_snapshot(&changed, &image).is_err());
         memory
             .protect(snapshot.region.start, 4096, READ | EXEC)
             .unwrap();
         let changed = Snapshot::capture(&snapshot.region, &mut memory).unwrap();
+        assert!(restore_snapshot(&changed, &image).is_err());
+    }
+
+    #[test]
+    fn identical_code_rejects_other_guest_images_and_bases() {
+        let (_, mut snapshot) = fixture(&[0x90, 0x90]);
+        snapshot.cache_guest = Some([1; 32]);
+        snapshot.cache_location = Some((snapshot.region.start, 0, [2; 32]));
+        let image = compile_snapshot(&snapshot).unwrap().cache_bytes().unwrap();
+        assert!(restore_snapshot(&snapshot, &image).is_ok());
+        let mut changed = snapshot.clone();
+        changed.cache_guest = Some([3; 32]);
+        assert!(restore_snapshot(&changed, &image).is_err());
+        changed = snapshot.clone();
+        changed.cache_location.as_mut().unwrap().2 = [4; 32];
+        assert!(restore_snapshot(&changed, &image).is_err());
+        changed = snapshot.clone();
+        changed.cache_location.as_mut().unwrap().0 += 4096;
         assert!(restore_snapshot(&changed, &image).is_err());
     }
 

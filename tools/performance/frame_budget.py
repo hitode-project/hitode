@@ -6,7 +6,7 @@ Usage: frame_budget.py run --platform android|windows --binary RUNNER --output D
 Inputs: ADV_SAMPLES, checked-in frame-budget-*.json scenarios, optional save/font
 seeds. Android reuses replay-sample.py; Windows reuses play_session.py. Every run
 uses one frozen binary, independent overlay and cold/warm discovery profiles.
---code-cache also transfers jit-code.bin; --aot enables bounded static discovery.
+Warm runs transfer jit-code.bin by default; --no-code-cache is a diagnostic bypass.
 ADV_DEVICE_TASK selects the shared broker task name (default bud).
 Output: summary.json/summary.md contain statistics only. Reports, actions, hashes,
 perf maps and failure logs stay under the explicit local artifact root. No APK,
@@ -87,7 +87,7 @@ def execution_metrics(report: dict) -> dict:
     aot = report.get("aot") or {}
     return {"counts": numeric_fields(report, ("native_entries", "interpreter_entries", "compilations", "compile_requests", "compile_seconds")),
         "code_cache": {"enabled": cache.get("enabled") is True} | numeric_fields(cache,
-            ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "entries", "bytes")),
+            ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "evicted", "entries", "bytes")),
         "aot": numeric_fields(aot, ("images", "image_rejections", "candidates", "decoded_instructions", "budget_exhaustions",
             "compile_requests", "private_completions", "publications", "stale_candidates", "ready_regions", "ready_bytes")),
         "tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
@@ -581,8 +581,8 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
-            "execution_options": {"code_cache": getattr(args, "code_cache", False),
-                "aot": getattr(args, "aot", False), "compile_threads": getattr(args, "compile_threads", None)},
+            "execution_options": {"code_cache": not getattr(args, "no_code_cache", False),
+                "aot": not getattr(args, "no_code_cache", False), "compile_threads": getattr(args, "compile_threads", None)},
             "no_time_skip": getattr(args, "no_time_skip", False),
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
@@ -636,13 +636,12 @@ def run(args) -> None:
                        "--binary", str(binary), "--schedule", str(root / f"{name}-schedule.json"),
                        "--output", str(output), "--codepage", str(scenario["codepage"]), "--auto-dialog-ms", "50"]
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
-            if getattr(args, "code_cache", False):
-                command += ["--code-cache"]
+            if not getattr(args, "no_code_cache", False):
                 native = root / f"{name}-cold" / ("jit-code.bin" if adb else "overlay/jit-code.bin")
                 if heat == "warm" and native.is_file():
                     command += ["--warm-code-cache", str(native)]
-            if getattr(args, "aot", False):
-                command += ["--aot"]
+            else:
+                command += ["--no-code-cache"]
             if getattr(args, "compile_threads", None):
                 command += ["--compile-threads", str(args.compile_threads)]
             if not args.no_instrumentation:
@@ -737,8 +736,7 @@ def main() -> None:
     execute.add_argument("--perf-map", action="store_true")
     execute.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
-    execute.add_argument("--code-cache", action="store_true", help="opt into native cache and reuse only its cold-run archive")
-    execute.add_argument("--aot", action="store_true", help="opt into bounded static image discovery")
+    execute.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
     execute.add_argument("--compile-threads", type=int, choices=range(1, 9))
     execute.add_argument("--headless-gpu", action="store_true", help="explicit portable GPU frontend; requires a gpu runner")
     execute.add_argument("--native-rate", type=Path, help="native_instruction_rate JSON for a conditional Tier 0 lower estimate")

@@ -191,7 +191,8 @@ pub struct Executor {
     aot: aot::State,
     persistent_cache: Option<Arc<crate::code_cache::Cache>>,
     cached_pending: Option<persistent::Pending>,
-    cache_images: Vec<(u32, u32)>,
+    cache_images: Vec<(u32, u32, [u8; 32])>,
+    cache_guest: Option<[u8; 32]>,
     /// Dedicated compile threads; zero shares the background service.
     compile_threads: usize,
     automatic_regions: BTreeSet<u32>,
@@ -492,6 +493,7 @@ impl Executor {
             persistent_cache: None,
             cached_pending: None,
             cache_images: Vec::new(),
+            cache_guest: None,
             compile_threads: 0,
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
@@ -569,7 +571,8 @@ impl Executor {
         Ok(())
     }
 
-    /// A new guest process shares host policy, never an execution context or code cache.
+    /// A new guest process shares policy and the bounded disk archive, never
+    /// execution contexts or published native code. Its image identity is new.
     pub(crate) fn inherit_process_policy(&mut self, parent: &Self) -> Result<(), String> {
         self.set_guest_workers(parent.guest_workers())?;
         self.background_service = parent.background_service.clone();
@@ -577,6 +580,8 @@ impl Executor {
         self.auto_compile_strategy = parent.auto_compile_strategy;
         self.tiered_compilation = parent.tiered_compilation;
         self.async_compilation = parent.async_compilation;
+        self.persistent_cache = parent.persistent_cache.clone();
+        self.set_aot_enabled(parent.aot.enabled);
         self.set_tier1_mode(parent.tier1_mode)?;
         self.region_linking = parent.region_linking;
         self.profiling = parent.profiling;

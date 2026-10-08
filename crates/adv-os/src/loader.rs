@@ -654,6 +654,10 @@ impl<'a> Loader<'a> {
             err,
         };
         let pe = Pe::parse(&bytes).map_err(pe_err)?;
+        let identity = self
+            .cpu
+            .wants_code_images()
+            .then(|| adv_cpu::AotImage::identity(&bytes));
         drop(bytes);
 
         let size = align_up(pe.size_of_image, PAGE);
@@ -673,7 +677,7 @@ impl<'a> Loader<'a> {
                 .reserve(size)
                 .ok_or_else(|| LoadError::NoSpace(path.to_owned(), size))?
         };
-        let result = self.populate_image(key, path, pe, base, size, retain);
+        let result = self.populate_image(key, path, pe, base, size, retain, identity);
         if result.is_err() && self.modules.by_handle(base).is_none() {
             self.sys.vm.free(self.cpu, base)?;
         }
@@ -688,6 +692,7 @@ impl<'a> Loader<'a> {
         base: u32,
         size: u32,
         retain: bool,
+        identity: Option<[u8; 32]>,
     ) -> Result<ModuleId, LoadError> {
         let pe_err = |err| LoadError::Pe {
             path: path.to_owned(),
@@ -827,7 +832,9 @@ impl<'a> Loader<'a> {
             });
         }
         self.modules.complete_ldr(self.cpu, id)?;
-        aot::register(self.cpu, &mut pe, base, path);
+        if let Some(identity) = identity {
+            aot::register(self.cpu, &mut pe, base, path, identity);
+        }
         Ok(id)
     }
 

@@ -1,6 +1,7 @@
 import copy
 import argparse
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -8,10 +9,37 @@ import unittest
 from unittest.mock import patch
 
 from sample_matrix import (analyze_report, diagnostic_completeness, milestones, quick_samples, run,
-                           validate_native_baseline)
+                           validate_native_baseline, sample_path, import_warm_archives)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_relative_samples_are_read_only_inputs_under_the_samples_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fixture.exe").write_bytes(b"fixture")
+            with patch.dict(os.environ, {"ADV_SAMPLES": str(root)}):
+                self.assertEqual(sample_path({"exe": "fixture.exe"}), root / "fixture.exe")
+
+    def test_warm_archives_require_matching_inputs_and_copy_only_cache_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cold"
+            overlay = source / "one" / "overlay"
+            overlay.mkdir(parents=True)
+            for name in ("jit-warm.bin", "jit-code.bin", "guest-save.dat"):
+                (overlay / name).write_bytes(b"fixture")
+            (source / "results.json").write_text(json.dumps({"binary_sha256": "host", "samples": [
+                {"id": "one", "guest_exe_sha256": "guest", "codepage": 932}]}))
+            destination = root / "hot"
+            destination.mkdir()
+            sample = {"id": "one", "codepage": 932}
+            for binary, guest in (("other", "guest"), ("host", "other")):
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    import_warm_archives(source, destination, sample, binary, guest)
+            inputs = import_warm_archives(source, destination, sample, "host", "guest")
+            self.assertEqual(set(inputs), {"jit-warm.bin", "jit-code.bin"})
+            self.assertEqual({p.name for p in (destination / "overlay").iterdir()}, set(inputs))
+
     def test_quick_gate_prefers_marked_samples_then_each_engines_first(self):
         samples = [{"id": "a1", "engine": "A"}, {"id": "a2", "engine": "A"},
                    {"id": "b1", "engine": "B"}, {"id": "n1"}]
@@ -27,12 +55,13 @@ class CampaignTests(unittest.TestCase):
             game.write_bytes(b"Not executed: subprocess is mocked")
             manifest = root / "samples.json"
             manifest.write_text(json.dumps({"samples": [
-                {"id": name, "exe": str(game), "engine": engine}
+                {"id": name, "exe": str(game), "engine": engine, "min_seconds": 25}
                 for name, engine in (("one", "A"), ("two", "A"), ("three", "B"))
             ]}), encoding="utf-8")
             launched = []
 
             def launch(command, **kwargs):
+                self.assertEqual(command[command.index("--seconds") + 1], "25")
                 launched.append(Path(command[command.index("--report") + 1]).parent.name)
                 return SimpleNamespace(wait=lambda timeout: 0)
 
