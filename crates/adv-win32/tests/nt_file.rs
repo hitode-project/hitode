@@ -1,4 +1,4 @@
-//! Authored native FILE_OPEN and position queries; x86 oracles live under target.
+//! Authored native file I/O and queries; x86 oracles live under target.
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU32, Ordering},
@@ -12,6 +12,9 @@ use adv_cpu::{
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{FileObj, Win32, Win32Config};
+
+#[path = "nt_file/write_tests.rs"]
+mod write_tests;
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
@@ -248,9 +251,9 @@ fn failures<B: Backend>(cpu: B) {
             0xc00000bb,
             false,
         ),
-        ("create file", r"\??\C:\Game\new.txt", 0xc00000bb, false),
+        ("supersede", r"\??\C:\Game\new.txt", 0xc00000bb, false),
         (
-            "write access",
+            "unsupported access",
             r"\??\C:\Game\present.txt",
             0xc00000bb,
             false,
@@ -289,8 +292,8 @@ fn failures<B: Backend>(cpu: B) {
             "source overrun" => m.cpu.write_u32(base + 68, SOURCE + 0xffff).unwrap(),
             "object security" => m.cpu.write_u32(base + 48, SOURCE).unwrap(),
             "no case-insensitive flag" => m.cpu.write_u32(base + 44, 0).unwrap(),
-            "create file" => args[7] = 2,
-            "write access" => args[1] |= 0x40000000,
+            "supersede" => args[7] = 0,
+            "unsupported access" => args[1] |= 0x20000000,
             "async open" => args[8] = 0x40,
             _ => {}
         }
@@ -435,6 +438,15 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwReadFile"));
     assert_eq!(
+        registry.get("ntdll.dll", "ZwWriteFile").unwrap().conv,
+        Conv::Stdcall { argc: 9 }
+    );
+    assert_eq!(
+        registry.level("ntdll.dll", "ZwWriteFile"),
+        Some(ImplementationLevel::Implement)
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "ZwWriteFile"));
+    assert_eq!(
         registry.get("ntdll.dll", "ZwClose").unwrap().conv,
         Conv::Stdcall { argc: 1 }
     );
@@ -451,6 +463,7 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
     for (name, argc) in [
         ("NtCreateFile", 11),
         ("NtReadFile", 9),
+        ("NtWriteFile", 9),
         ("NtQueryInformationFile", 5),
         ("NtSetInformationFile", 5),
     ] {

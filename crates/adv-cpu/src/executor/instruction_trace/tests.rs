@@ -16,6 +16,12 @@ fn directory() -> PathBuf {
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    // Output must sit beneath a directory named target; a custom
+    // CARGO_TARGET_DIR need not carry that name itself.
+    let named = target
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("target"));
+    let target = if named { target } else { target.join("target") };
     let path = target
         .join("scratch/instruction-trace-tests")
         .join(format!("{}-{id}-{time}", std::process::id()));
