@@ -324,7 +324,8 @@ fn scalar(code: &[u8], offset: usize, width: u8, write: bool) -> bool {
         };
         let common = size << 30 | if write { 0 } else { 1 << 22 };
         // Plain scalar unsigned-offset or register-offset LDR/STR. Exclude
-        // SIMD, pairs, atomics, sign extension, writeback and shifted indexes.
+        // SIMD, pairs, atomics, sign extension and writeback. Index scaling is
+        // supplied by lowering the already wrapped/zero-extended guest EA.
         word & 0xffc00000 == common | 0x39000000 || word & 0xffe00c00 == common | 0x38200800
     }
 }
@@ -355,6 +356,9 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
             let fp_ldp = w & 0xffc003e0 == 0x6cc003e0 || w & 0xffc003e0 == 0x6d4003e0;
             let ldr = w & 0xffc003e0 == 0xf94003e0 && w & 31 != 0;
             let fp_ldr = w & 0xffc003e0 == 0xfd4003e0;
+            // Cranelift restores an odd final callee save with LDR [SP],#16.
+            let ldr_post = w & 0xffffffe0 == 0xf84107e0 && w & 31 != 0;
+            let fp_ldr_post = w & 0xffffffe0 == 0xfc4107e0;
             if w & 0xfc000000 == 0x14000000 {
                 let delta = (((w & 0x03ff_ffff) << 6) as i32 >> 4) as isize;
                 let Some(target) = offset.checked_add_signed(delta) else {
@@ -363,7 +367,7 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
                 offset = target;
                 continue;
             }
-            if !(add_sp || ldp || fp_ldp || ldr || fp_ldr) {
+            if !(add_sp || ldp || fp_ldp || ldr || fp_ldr || ldr_post || fp_ldr_post) {
                 return false;
             }
             offset += 4;
@@ -500,6 +504,10 @@ mod tests {
         let valid = bytes(&[0x52800080, 0xa8c17bfd, 0xd65f03c0]);
         assert_eq!(recovery_start(&valid, 0), Some(4));
         assert!(epilogue(&valid, 4));
+        assert!(epilogue(
+            &bytes(&[0xfc4107e8, 0xf84107f3, 0xa8c17bfd, 0xd65f03c0]),
+            0
+        ));
         // Unknown frame mutation must not be bypassed by finding a later RET.
         let invalid = bytes(&[0x52800080, 0x910003bf, 0xd65f03c0]);
         assert_eq!(recovery_start(&invalid, 0), None);
