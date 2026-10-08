@@ -18,9 +18,11 @@ mod optical;
 mod portable_saves;
 mod section;
 mod stream;
+mod wildcard;
 pub use optical::{OpticalDriveInfo, OpticalFile};
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
 pub use stream::FileStream;
+pub use wildcard::wildcard;
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -422,37 +424,6 @@ fn normalize_unc(p: &str) -> String {
     result
 }
 
-/// Case-insensitive wildcard match (`*`, `?`), as FindFirstFile uses.
-pub fn wildcard(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let n: Vec<char> = name.to_lowercase().chars().collect();
-    // "*.*" matches names without a dot too.
-    if pattern == "*.*" || pattern == "*" {
-        return true;
-    }
-    let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ni;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
 impl crate::FileSource for Vfs {
     fn absolute_path(&self, path: &str) -> String {
         self.normalize(path)
@@ -718,14 +689,6 @@ mod tests {
         ] {
             assert!(matches!(v.locate(path), Some(Loc::Other(_))));
         }
-    }
-
-    #[test]
-    fn wildcards() {
-        assert!(wildcard("save*.dat", "SAVE001.DAT"));
-        assert!(wildcard("*.*", "README"));
-        assert!(wildcard("a?c", "abc"));
-        assert!(!wildcard("*.dat", "save.txt"));
     }
 
     #[test]
