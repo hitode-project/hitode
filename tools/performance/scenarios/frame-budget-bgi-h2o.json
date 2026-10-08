@@ -1,0 +1,81 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "bgi-h2o",
+  "game_dir": "H2O",
+  "exe": "BGI.exe",
+  "codepage": 932,
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "BGI stable title to first complete narrative text",
+    "timeout_seconds": 180,
+    "steps": [
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "a4e378f0ada1de52",
+          "timeout_ms": 60000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "move 400 380"
+      },
+      {
+        "checkpoint": "selection",
+        "await": {
+          "frame_fnv1a64": "dbc2b531d6d1f581",
+          "timeout_ms": 10000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "mouse-down 400 380"
+      },
+      {
+        "delay_ms": 300
+      },
+      {
+        "command": "mouse-up 400 380"
+      },
+      {
+        "checkpoint": "body",
+        "await": {
+          "frame_fnv1a64": "1e41190fd2a6086a",
+          "timeout_ms": 45000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "key 13"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "normal",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "gated"
+    },
+    "normal": {
+      "checkpoint": "normal",
+      "measurement": "timed_observation"
+    },
+    "transition": {
+      "checkpoint": "body",
+      "measurement": "gated"
+    },
+    "ctrl": {
+      "unavailable": "no_fixed_endpoint"
+    }
+  }
+}

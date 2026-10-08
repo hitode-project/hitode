@@ -1,0 +1,33 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "majiro-smoke",
+  "game_dir": "片羽（カタハネ）",
+  "exe": "カタハネ.exe",
+  "codepage": 932,
+  "schedule": [
+    {
+      "at": 12,
+      "checkpoint": "title",
+      "reset_metrics": true
+    },
+    {
+      "at": 13,
+      "command": "close"
+    }
+  ],
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "startup_observation"
+    },
+    "normal": {
+      "unavailable": "scene_not_gated"
+    },
+    "ctrl": {
+      "unavailable": "no_fixed_endpoint"
+    },
+    "transition": {
+      "unavailable": "scene_not_gated"
+    }
+  }
+}

@@ -46,6 +46,7 @@ struct Options {
     self_test_input: bool,
     profile: bool,
     control_stdin: bool,
+    frame_budget: bool,
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
@@ -91,6 +92,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --auto-dialog-ms N      explicitly auto-select dialog defaults after N guest ms\n\
   --self-test-input       post A key and left-click after the first idle\n\
   --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
+  --frame-budget          opt-in bounded per-frame accounting (headless, one worker)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
   --help                  show this help\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
@@ -135,6 +137,7 @@ impl Options {
             self_test_input: false,
             profile: false,
             control_stdin: false,
+            frame_budget: false,
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
             codec_kernels: adv_runtime::codec_kernels::Mode::Native,
@@ -225,6 +228,7 @@ impl Options {
                 "--self-test-input" => options.self_test_input = true,
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
+                "--frame-budget" => options.frame_budget = true,
                 "--audio" => options.audio = true,
                 "--codec" => {
                     options.codec = match value()?.as_str() {
@@ -747,7 +751,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -830,7 +834,14 @@ fn build_report(context: ReportContext<'_>) -> String {
         gpu_diagnostics,
         graphics_memory,
         scene_gate.json(),
-        json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
+        json(&runtime.report_with_profile(&runtime.machine.cpu.profile())),
+        runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map_or_else(|| "null".into(), |b| b.json())
     )
 }
 
@@ -956,6 +967,9 @@ fn capture_native_after_stop(
 }
 
 fn run(options: Options) -> Result<u8, String> {
+    if options.frame_budget && (!options.headless || options.guest_workers != 1) {
+        return Err("--frame-budget requires headless execution with one guest worker".into());
+    }
     #[cfg(not(feature = "gpu"))]
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
@@ -1228,6 +1242,13 @@ fn run_execution(
                 .executor_mut()
                 .load_warm_profile(&profile);
         }
+    }
+    if options.frame_budget {
+        runtime.machine.cpu.executor_mut().enable_frame_timing(true);
+        runtime.machine.sys.stats.frame_budget = Some(adv_machine::frame_budget::FrameBudget::new(
+            runtime.machine.sys.stats.total,
+            Some(runtime.machine.cpu.executor().frame_counters()),
+        ));
     }
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
@@ -1563,6 +1584,13 @@ fn run_execution(
                         write_report(&path, &snapshot).map(|_| format!("report {}", path.display()))
                     }
                     control::Command::ResetMetrics => {
+                        let total = runtime.machine.sys.stats.total;
+                        if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
+                            budget.reset(
+                                total,
+                                Some(runtime.machine.cpu.executor().frame_counters()),
+                            );
+                        }
                         runtime.machine.sys.schedule_trace.event("mark", 0, 0, 0, 0);
                         let serial = runtime.presented_frames();
                         performance.reset(serial);
@@ -1821,6 +1849,9 @@ fn run_execution(
                     window::WaitOutcome::Deadline
                 };
                 let waited = wait_started.elapsed();
+                if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
+                    budget.wait(delay, waited, !signaled);
+                }
                 performance.wait(delay, waited, wake);
                 wait_time += waited;
                 idle_waits += 1;

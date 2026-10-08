@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO / "tools" / "performance"))
 from play_session import load_schedule
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scene_schedule import (assert_report, await_command, digest_json, exact_hash,
-                            load_scene, validate_reference)
+                            load_scene, validate_reference, valid_acknowledgement)
 
 INPUT_COMMANDS = frozenset(("click", "move", "mouse-down", "mouse-up", "key", "key-down", "key-up", "menus",
                             "menu", "dialogs", "dialog", "dialog-track", "dialog-close",
@@ -41,27 +41,6 @@ REQUIRED_FINAL_EVIDENCE = {"final.json": "final.json", "final.png": "final.png",
 ACKNOWLEDGEMENT_VERBS = {"dialog-track": "dialog"}
 SCENE_COMMANDS = INPUT_COMMANDS | {"resume"}
 
-
-def valid_acknowledgement(command: str, reply: str | None) -> bool:
-    verb = command.split()[0]
-    expected = "control ok " + ACKNOWLEDGEMENT_VERBS.get(verb, verb)
-    if reply is None or not (reply == expected or reply.startswith(expected + " ")):
-        return False
-    if verb == "await-frame":
-        fields = dict(token.split("=", 1) for token in reply.split()[3:] if "=" in token)
-        words = command.split()
-        try:
-            if (fields.get("hash") != words[1].lower() or fields.get("frozen") != "true"
-                    or int(fields["frame"]) <= 0 or int(fields["start_frame"]) < 0
-                    or ("current" not in words and int(fields["frame"]) <= int(fields["start_frame"]))):
-                return False
-            release = words[words.index("release") + 1] if "release" in words else (
-                words[words.index("hold") + 1] if "hold" in words else None)
-            return fields.get("release") == (release or "none") and (
-                release is None or fields.get("release_posted") == "true")
-        except (ValueError, KeyError, IndexError):
-            return False
-    return True
 
 
 def sha256(path: Path) -> str:
@@ -245,7 +224,7 @@ class Adb:
     def transient_transport_error(message: str) -> bool:
         message = message.lower()
         return any(marker in message for marker in (
-            "connection reset", "cannot connect to daemon", "daemon still not running",
+            "connection reset", "push failed", "cannot connect to daemon", "daemon still not running",
             "failed to start daemon", "daemon startup failed", "adb server didn't ack"))
 
     def call(self, *args: str, timeout: float | None = None,
@@ -297,6 +276,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
                "--data-dir", remote + "/data", "--report", remote + "/final.json",
                "--screenshot", remote + "/final.png", "--codec", args.codec,
                "--codec-kernels", args.codec_kernels]
+    if getattr(args, "frame_budget", False):
+        command.append("--frame-budget")
     if args.no_tiering:
         command.append("--no-tiering")
     if args.schedule_profile:
@@ -304,6 +285,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
     if args.auto_dialog_ms is not None:
         command.extend(["--auto-dialog-ms", str(args.auto_dialog_ms)])
     environment = ["ADV_TIER1=" + getattr(args, "tier1", "off")]
+    if getattr(args, "perf_map", False):
+        environment.append("ADV_PERF_MAP_DIR=" + remote)
     if getattr(args, "compile_threads", None) is not None:
         environment.append("ADV_COMPILE_THREADS=" + str(args.compile_threads))
     if args.font_diagnostics:
@@ -353,10 +336,12 @@ def run(args: argparse.Namespace) -> None:
                                        getattr(args, "font_profile", None))
     reference_path = getattr(args, "scene_reference", None)
     record_path = getattr(args, "record_scene_reference", None)
-    if scene and not font_manifest:
+    if scene and any("await" in step for step in steps) and not font_manifest:
         raise ValueError("scene checkpoints require --font-profile and --font-manifest")
     if (reference_path or record_path) and not scene:
         raise ValueError("scene references require an adv-scene-v1 schedule")
+    if record_path and any(step.get("observe") for step in steps):
+        raise ValueError("ungated observations cannot record a fixed-work reference")
     if reference_path and record_path:
         raise ValueError("recording a reference and validating it require separate runs")
     cold = getattr(args, "cold", False)
@@ -452,6 +437,9 @@ def run(args: argparse.Namespace) -> None:
         metadata["device"]["host_page_size"] = adb.shell(["getconf", "PAGESIZE"])
         # mkdir without -p refuses a collision; no shared game directory is changed.
         adb.shell(["mkdir", remote])
+        # This durable local receipt is never overwritten with later reports.
+        # A caller may clean up only after this mkdir has actually succeeded.
+        (output / "remote-owned.txt").write_text(remote, encoding="utf-8")
         adb.push(binary, remote + "/adv-run")
         adb.shell(["chmod", "700", remote + "/adv-run"])
         if not game_reused:
@@ -554,7 +542,7 @@ def run(args: argparse.Namespace) -> None:
                     else:
                         name = step["checkpoint"]
                         gate_ack = None
-                        if scene:
+                        if scene and "await" in step:
                             spec = step["await"]
                             gate_ack = send(await_command(spec),
                                             timeout=spec["timeout_ms"] / 1000 + args.ack_timeout)
@@ -564,7 +552,7 @@ def run(args: argparse.Namespace) -> None:
                         send("capture " + remote + "/" + name + ".png")
                         adb.pull(remote + "/" + name + ".png", output / (name + ".png"))
                         validate_report(report, name)
-                        if scene:
+                        if scene and "await" in step:
                             expected_hash = step["await"]["frame_fnv1a64"]
                             if report.get("frame_fnv1a64") != expected_hash:
                                 raise RuntimeError(f"{name}: exact checkpoint hash differs: expected {expected_hash}, "
@@ -626,6 +614,15 @@ def run(args: argparse.Namespace) -> None:
             evidence += ("blocked.json", "blocked.png")
         if args.schedule_profile:
             evidence += ("schedule.tsv",)
+        if getattr(args, "perf_map", False):
+            try:
+                names = adb.shell(["find", remote, "-maxdepth", "1", "-type", "f", "-name", "perf-*"])
+                for path in names.splitlines():
+                    name = path.rsplit("/", 1)[-1]
+                    if re.fullmatch(r"perf-[0-9]+\.(map|events\.tsv)", name):
+                        evidence += (name,)
+            except Exception as caught:
+                metadata["evidence_errors"].append({"file": "perf map", "error": str(caught)})
         pulled_evidence = set()
         for name in evidence:
             try:
@@ -736,6 +733,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path, help="fresh directory below ignored target/")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--codec-kernels", choices=("guest", "verify", "native"), default="native")
+    parser.add_argument("--frame-budget", action="store_true", help="bounded per-frame diagnostics in reports")
+    parser.add_argument("--perf-map", action="store_true", help="local-only HP JIT symbol map and publication events")
     parser.add_argument("--no-tiering", action="store_true")
     parser.add_argument("--tier1", choices=("off", "bridge"), default="off")
     parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
