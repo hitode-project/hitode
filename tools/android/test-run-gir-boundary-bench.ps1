@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-Test boundary benchmark plans, parsers and atomic ownership without a device.
+Test boundary benchmark plans, parsers and scheduled release without a device.
 .DESCRIPTION
 Usage: ./tools/android/test-run-gir-boundary-bench.ps1 after setting task TEMP/TMP.
-Inputs: runner and task-local TEMP. Output: assertion count; a tiny temporary lock
-under TEMP is removed in finally. No build, device, APK or shared-lock access.
+Inputs: runner and task-local TEMP. Output: assertion count. Scheduler calls are
+mocked in memory. No build, device, APK, filesystem writes or shared-lock access.
 #>
 $ErrorActionPreference = 'Stop'
 $runner = Join-Path $PSScriptRoot 'run-gir-boundary-bench.ps1'
@@ -18,19 +18,21 @@ function Assert-Rejected([scriptblock]$Action) {
 $arguments = @{ TargetDir = (Join-Path $env:TEMP 'plan-target'); Output = (Join-Path $env:TEMP 'plan-output'); WhatIf = $true }
 $plan = & $runner @arguments -BuildOnly | ConvertFrom-Json
 Assert $plan.build_only
-Assert ($plan.adb_port -eq 5037 -and $plan.owner -eq 'g14-sub2')
+Assert ($plan.adb_port -eq 5037 -and $plan.owner -eq 'g14')
 Assert ($plan.cargo_arguments -contains 'gir_boundary_bench')
 Assert ($plan.cargo_arguments -contains '--locked')
-Assert ($plan.cooldown_seconds -ge 60 -and $plan.cleanup)
-Assert ($plan.lock_retry_seconds -eq 30 -and $plan.session_budget_seconds -lt 1200)
-$plan = & $runner @arguments -SkipBuild -CpuMask 40 -Samples 7 -Loops 12345 | ConvertFrom-Json
+Assert (-not $plan.keep_device_queue -and $plan.cleanup)
+Assert ($plan.session_budget_seconds -lt 1200)
+$plan = & $runner @arguments -SkipBuild -CpuMask 40 -Samples 7 -Loops 12345 -Task g14-sub2 -DeviceHelper scheduler.ps1 -KeepDeviceQueue | ConvertFrom-Json
 Assert $plan.skip_build
+Assert ($plan.keep_device_queue -and $plan.owner -eq 'g14-sub2' -and $plan.device_helper -eq 'scheduler.ps1')
 Assert ($plan.shell.Contains('ADV_BOUNDARY_SAMPLES=7 ADV_BOUNDARY_LOOPS=12345 taskset 40 timeout 120'))
 Assert ($plan.transport_deadline_seconds -eq 45)
 Assert-Rejected { & $runner @arguments -BuildOnly -SkipBuild }
 Assert-Rejected { & $runner @arguments -CpuMask '80;exit' }
 Assert-Rejected { & $runner @arguments -Samples 0 }
 Assert-Rejected { & $runner @arguments -TimeoutSeconds 1200 }
+Assert-Rejected { & $runner @arguments -Task '../another-task' }
 . $runner @arguments | Out-Null
 $choices = @(Get-CpuChoices @('Cpus_allowed_list: 0-2,4', '0 800', '1 900', '2 900', '4 1800', '7 2400'))
 Assert (($choices.core -join ',') -eq '4,2,1,0')
@@ -44,22 +46,12 @@ Assert (@(Test-BenchmarkOutput $text 1 100).Count -eq 17)
 Assert-Rejected { Test-BenchmarkOutput $text 7 100 }
 Assert-Rejected { Test-BenchmarkOutput $text 1 99 }
 Assert-Rejected { Test-BenchmarkOutput ($text + "`nprivate unexpected output") 1 100 }
-$testLock = Join-Path $env:TEMP ('boundary-lock-test-' + [Guid]::NewGuid().ToString('N'))
-$owned = $false
-try {
-    $owned = Try-DeviceLock $testLock
-    Assert $owned
-    Assert ((Get-Content -LiteralPath (Join-Path $testLock 'owner.txt') -Raw).Trim() -eq 'g14-sub2')
-    Assert (-not (Try-DeviceLock $testLock))
-    Assert ((Get-Content -LiteralPath (Join-Path $testLock 'owner.txt') -Raw).Trim() -eq 'g14-sub2')
-    Set-Content -LiteralPath (Join-Path $testLock 'owner.txt') -Value 'another-task'
-    Assert-Rejected { Remove-OwnedLock $testLock }
-    Assert (Test-Path -LiteralPath (Join-Path $testLock 'owner.txt'))
-    Set-Content -LiteralPath (Join-Path $testLock 'owner.txt') -Value 'g14-sub2'
-    Remove-OwnedLock $testLock
-    $owned = $false
-    Assert (-not (Test-Path -LiteralPath $testLock))
-} finally {
-    if ($owned) { Remove-OwnedLock $testLock }
+function Release-Device([string]$Task, [switch]$Done) {
+    $script:releasedTask = $Task
+    $script:releasedDone = [bool]$Done
 }
+Exit-DeviceSession 'g14-sub2' $false
+Assert ($releasedTask -eq 'g14-sub2' -and $releasedDone)
+Exit-DeviceSession 'g14' $true
+Assert ($releasedTask -eq 'g14' -and -not $releasedDone)
 Write-Output "Boundary runner checks: $assertions passed."

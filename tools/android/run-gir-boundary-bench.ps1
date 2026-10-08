@@ -3,17 +3,19 @@
 Build and run the anonymous, synthetic ARM64 GIR boundary fixture.
 .DESCRIPTION
 Inputs: shared TargetDir, task-local Output/TEMP/TMP, optional CPU mask and the
-shared atomic DeviceLock. No private corpus, APK, UI or server lifecycle calls.
+shared DeviceHelper exposing Request-Device/Release-Device. No private corpus,
+APK, UI or server lifecycle calls.
 Output: staged ELF, build log, anonymous CSV, affinity/frequency context and
 cmd.txt with environment and binary/runner SHA-256. BuildOnly/WhatIf never use
 a device. SkipBuild uses the staged ELF from this task's preceding BuildOnly.
-The owner is g14-sub2. A session includes 60 seconds of pre-lock cooldown,
-30-second lock retries, bounded transport retries and finally remote cleanup.
+The helper owns priority scheduling and fallback locking. Task identifies the
+queue owner; KeepDeviceQueue retains its place for a subsequent short session.
+A session includes bounded transport retries and finally remote cleanup.
 Device commands have deadlines; the lock budget including cleanup is <20 min.
 .EXAMPLE
 ./tools/android/run-gir-boundary-bench.ps1 -BuildOnly -TargetDir $env:ADV_ANDROID_TARGET -Output $env:ADV_BOUNDARY_OUTPUT
 .EXAMPLE
-./tools/android/run-gir-boundary-bench.ps1 -SkipBuild -TargetDir $env:ADV_ANDROID_TARGET -Output $env:ADV_BOUNDARY_OUTPUT -DeviceLock $env:ADV_DEVICE_LOCK
+./tools/android/run-gir-boundary-bench.ps1 -SkipBuild -TargetDir $env:ADV_ANDROID_TARGET -Output $env:ADV_BOUNDARY_OUTPUT -DeviceHelper $env:ADV_DEVICE_HELPER -Task g14
 #>
 param(
     [string]$Sdk = $env:ANDROID_HOME,
@@ -21,7 +23,9 @@ param(
     [Parameter(Mandatory)][string]$TargetDir,
     [Parameter(Mandatory)][string]$Output,
     [ValidatePattern('^(auto|[0-9a-fA-F]+)$')][string]$CpuMask = 'auto',
-    [string]$DeviceLock = $env:ADV_DEVICE_LOCK,
+    [string]$DeviceHelper = $env:ADV_DEVICE_HELPER,
+    [ValidatePattern('^[a-z0-9][a-z0-9-]*$')][string]$Task = 'g14',
+    [switch]$KeepDeviceQueue,
     [ValidateRange(1, 31)][int]$Samples = 7,
     [ValidateRange(1, 100000000)][long]$Loops = 1000000,
     [ValidateRange(10, 300)][int]$TimeoutSeconds = 120,
@@ -60,29 +64,8 @@ function Get-Command([string]$Remote) {
     "ADV_BOUNDARY_SAMPLES=$Samples ADV_BOUNDARY_LOOPS=$Loops taskset $CpuMask timeout $TimeoutSeconds '$Remote/gir_boundary_bench'"
 }
 
-function Try-DeviceLock([string]$Lock) {
-    try {
-        New-Item -ItemType Directory -Path $Lock -ErrorAction Stop | Out-Null
-    } catch {
-        if (Test-Path -LiteralPath $Lock -PathType Container) { return $false }
-        throw
-    }
-    # Ownership starts at atomic mkdir, even if writing its metadata fails.
-    try {
-        Set-Content -LiteralPath (Join-Path $Lock 'owner.txt') -Value 'g14-sub2' -Encoding utf8
-    } catch {
-        Remove-Item -LiteralPath (Join-Path $Lock 'owner.txt') -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $Lock
-        throw
-    }
-    return $true
-}
-
-function Remove-OwnedLock([string]$Lock) {
-    $owner = Join-Path $Lock 'owner.txt'
-    if ((Get-Content -LiteralPath $owner -Raw).Trim() -ne 'g14-sub2') { throw 'Shared lock ownership changed.' }
-    Remove-Item -LiteralPath $owner
-    Remove-Item -LiteralPath $Lock
+function Exit-DeviceSession([string]$Owner, [bool]$KeepQueue) {
+    Release-Device -Task $Owner -Done:(!$KeepQueue)
 }
 
 function Test-BenchmarkOutput([string]$Text, [int]$ExpectedSamples, [long]$ExpectedLoops) {
@@ -105,16 +88,16 @@ function Test-BenchmarkOutput([string]$Text, [int]$ExpectedSamples, [long]$Expec
 
 if ($WhatIf) {
     [ordered]@{ build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild;
-        cargo_arguments = $cargoArgs; cpu_mask = $CpuMask; adb_port = 5037; owner = 'g14-sub2';
+        cargo_arguments = $cargoArgs; cpu_mask = $CpuMask; adb_port = 5037; owner = $Task;
         shell = Get-Command '/data/local/tmp/adv-gir-boundary-DRYRUN';
-        cleanup = $true; cooldown_seconds = 60; lock_retry_seconds = 30;
-        session_budget_seconds = 1100; transport_deadline_seconds = 45; device_lock = $DeviceLock } | ConvertTo-Json -Depth 4
+        cleanup = $true; keep_device_queue = [bool]$KeepDeviceQueue;
+        session_budget_seconds = 1100; transport_deadline_seconds = 45; device_helper = $DeviceHelper } | ConvertTo-Json -Depth 4
     return
 }
 $storageRoot = [IO.Path]::GetPathRoot($Output)
 if (-not $env:TEMP -or -not $env:TMP -or [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($env:TEMP)) -ne $storageRoot -or [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($env:TMP)) -ne $storageRoot) { throw 'Set task-local TEMP and TMP on the authorized output volume before running.' }
 if ([IO.Path]::GetPathRoot($TargetDir) -ne $storageRoot) { throw 'TargetDir and Output must use the same authorized volume.' }
-if (-not $BuildOnly -and -not $DeviceLock) { throw 'Pass the shared DeviceLock directory.' }
+if (-not $BuildOnly -and -not $DeviceHelper) { throw 'Pass the shared DeviceHelper script.' }
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $binary = Join-Path $Output 'gir_boundary_bench'
 if (-not $SkipBuild) {
@@ -138,19 +121,19 @@ if (-not $SkipBuild) {
     }
 }
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Task-staged benchmark ELF missing; run BuildOnly first.' }
-@(('cargo ' + ($cargoArgs -join ' ')), "cpu_mask=$CpuMask frequency_locked=false owner=g14-sub2",
+@(('cargo ' + ($cargoArgs -join ' ')), "cpu_mask=$CpuMask frequency_locked=false owner=$Task",
     "samples=$Samples loops=$Loops TEMP=$env:TEMP TMP=$env:TMP CARGO_HOME=$env:CARGO_HOME",
     "android_target=$TargetDir timeout_seconds=$TimeoutSeconds",
     ('binary_sha256=' + (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash),
     ('runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash)) |
     Set-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Encoding utf8
 if ($BuildOnly) { Write-Output 'Boundary benchmark cross-build complete.'; return }
-$DeviceLock = [IO.Path]::GetFullPath($DeviceLock)
-$requiredLock = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetPathRoot($Output)) 'adv-tmp/device-lock'))
-if ($DeviceLock -ne $requiredLock) { throw 'Use the shared atomic device lock.' }
+. $DeviceHelper
+if (-not (Test-Path Function:\Request-Device) -or -not (Test-Path Function:\Release-Device)) { throw 'DeviceHelper must provide Request-Device and Release-Device.' }
 $adb = Join-Path $Sdk 'platform-tools/adb.exe'
 if (-not (Test-Path -LiteralPath $adb -PathType Leaf)) { throw 'adb missing.' }
 $locked = $false
+$requested = $false
 $device = $null
 $clock = $null
 $remote = '/data/local/tmp/adv-gir-boundary-' + [Guid]::NewGuid().ToString('N')
@@ -198,11 +181,9 @@ function Invoke-Adb([string[]]$Arguments, [int]$DeadlineSeconds = 45, [switch]$C
 }
 
 try {
-    Start-Sleep -Seconds 60
-    while (-not $locked) {
-        $locked = Try-DeviceLock $DeviceLock
-        if (-not $locked) { Start-Sleep -Seconds 30 }
-    }
+    $requested = $true
+    Request-Device -Task $Task
+    $locked = $true
     $clock = [Diagnostics.Stopwatch]::StartNew()
     # Serial is consumed locally and is never printed or written to evidence.
     $devices = @(Invoke-Adb @('devices'))
@@ -233,13 +214,13 @@ try {
         Set-Content -LiteralPath (Join-Path $Output 'bench.csv') -Encoding utf8
     Write-Output 'Boundary benchmark completed; anonymous statistics saved.'
 } finally {
-    if ($locked) {
-        try {
+    try {
+        if ($locked) {
             if ($device -and $remote -match '^/data/local/tmp/adv-gir-boundary-[a-f0-9]{32}$') {
                 Invoke-Adb @('-s', $device, 'shell', 'rm', '-rf', $remote) -DeadlineSeconds 30 -Cleanup | Out-Null
             }
-        } finally {
-            Remove-OwnedLock $DeviceLock
         }
+    } finally {
+        if ($requested) { Exit-DeviceSession $Task ([bool]$KeepDeviceQueue) }
     }
 }
