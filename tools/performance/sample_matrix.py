@@ -13,6 +13,7 @@ reviewer and note; codepage may be absent/unknown, otherwise it must match.
 "quick": true, or else the first sample of each engine, 10 seconds each.
 A sample's min_seconds (with a min_seconds_reason) raises its own limit for an
 engine whose first frame comes later; it never shortens a longer --seconds.
+--warm-from reuses only validated JIT archives in fresh overlays.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -369,6 +371,29 @@ def quick_samples(samples: list[dict]) -> set[str]:
     return set(first.values())
 
 
+def import_warm_archives(source: Path, folder: Path, sample: dict, binary_hash: str, guest_hash: str) -> dict:
+    """Keep guest state fresh and reject archives from another measured input."""
+    previous = json.loads((source / "results.json").read_text(encoding="utf-8-sig"))
+    row = next((r for r in previous["samples"] if r["id"] == sample["id"]), None)
+    if (previous["binary_sha256"] != binary_hash or row is None
+            or row["guest_exe_sha256"] != guest_hash
+            or row.get("codepage", 932) != sample.get("codepage", 932)):
+        raise ValueError("warm input does not match the runner, guest image and codepage")
+    origin = (source / sample["id"] / "overlay").resolve(strict=True)
+    if not origin.is_relative_to(source.resolve(strict=True)):
+        raise ValueError("warm overlay escapes its run root")
+    overlay = folder / "overlay"
+    overlay.mkdir()
+    inputs = {}
+    for name in ("jit-warm.bin", "jit-code.bin"):
+        archive = origin / name
+        if not archive.is_file() or not archive.resolve().is_relative_to(origin):
+            raise ValueError("warm input is missing an owned JIT archive")
+        inputs[name] = digest(archive)
+        shutil.copy2(archive, overlay / name)
+    return inputs
+
+
 def run(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     samples = manifest["samples"] if isinstance(manifest, dict) else manifest
@@ -383,7 +408,7 @@ def run(args: argparse.Namespace) -> None:
         if sample.get("codepage", 932) not in (932, 936):
             raise ValueError(f"unsupported codepage for {name}")
         if "min_seconds" in sample and (
-                not isinstance(sample["min_seconds"], (int, float)) or not 0 < sample["min_seconds"] <= 3600
+                type(sample["min_seconds"]) not in (int, float) or not 0 < sample["min_seconds"] <= 3600
                 or not str(sample.get("min_seconds_reason") or "").strip()):
             raise ValueError(f"{name}: min_seconds needs a value within 0..3600 and a min_seconds_reason")
     if selected - ids:
@@ -426,7 +451,16 @@ def run(args: argparse.Namespace) -> None:
         if args.trace:
             command += ["--trace", str(folder / "api.log")]
         command += getattr(args, "runner_arg", [])
-        result = dict(sample, command=command, guest_exe_sha256=digest(game), seconds=seconds)
+        result = dict(sample, command=command, guest_exe_sha256=digest(game))
+        result["seconds"] = seconds
+        if getattr(args, "warm_from", None):
+            result["warm_inputs"] = import_warm_archives(args.warm_from, folder, sample,
+                                                        metadata["binary_sha256"], result["guest_exe_sha256"])
+        (folder / "cmd.txt").write_text(subprocess.list2cmdline(command) + "\n" +
+            f"binary_sha256={metadata['binary_sha256']}\nguest_exe_sha256={result['guest_exe_sha256']}\n" +
+            "environment=" + json.dumps({k: v for k, v in environment.items()
+                                          if k.startswith("ADV_") or k in ("TEMP", "TMP", "TMPDIR")}) + "\n",
+            encoding="utf-8")
         validate_native_baseline(result)
         result["report_available"] = False
         result["milestones"] = milestones({})
@@ -453,7 +487,8 @@ def run(args: argparse.Namespace) -> None:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds", "elapsed_seconds", "host_calls",
                             "width", "height", "frame_fnv1a64", "missing_apis", "failure",
-                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup", "gpu"):
+                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup", "gpu",
+                            "code_cache", "aot", "compile_requests", "compilations"):
                     result[key] = report.get(key)
                 result["report_available"] = True
                 result["report_sha256"] = digest(report_path)
@@ -498,6 +533,7 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 10 with --quick)")
     parser.add_argument("--quick", action="store_true",
                         help="one sample per engine: those marked \"quick\": true, else each engine's first")
+    parser.add_argument("--warm-from", type=Path, help="previous cold run; copy only matching JIT archives into fresh overlays")
     parser.add_argument("--timeout-grace", type=float, default=15)
     parser.add_argument("--mode", choices=("hidden", "headless"), default="hidden")
     parser.add_argument("--codec", choices=("native", "guest"), default="native")

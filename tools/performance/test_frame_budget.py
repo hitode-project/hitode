@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tools/performance -p test_frame_budget.py
 No game, Android device or GPU is required; output is unittest statistics.
 """
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -114,6 +115,30 @@ class FrameBudgetTests(unittest.TestCase):
                 actions.insert(1, {"command": "key-up 17"})
                 budget.write_json(root / "actions.json", actions)
                 self.assertIsNone(budget.timed_ctrl_segment(root, scenario, "ctrl"))
+
+    def test_native_cache_summary_keeps_statistics_without_private_payloads(self):
+        result = budget.execution_metrics({"native_entries": 4, "interpreter_entries": 6,
+            "code_cache": {"enabled": True, "hits": 3, "bytes": 128, "raw": "private native bytes"},
+            "aot": {"private_completions": 2, "publications": 1, "guest_pc": 12345}})
+        self.assertEqual(result["counts"], {"native_entries": 4, "interpreter_entries": 6})
+        self.assertEqual(result["code_cache"], {"enabled": True, "hits": 3, "bytes": 128})
+        self.assertEqual(result["aot"], {"private_completions": 2, "publications": 1})
+        self.assertNotIn("private native bytes", json.dumps(result))
+
+    def test_shared_device_broker_accepts_the_callers_task_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "device.ps1"
+            helper.write_text("fixture")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot"}), patch.object(budget.subprocess, "run") as invoke:
+                with budget.device_lock(None, root, helper):
+                    pass
+                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "aot")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot; unexpected"}), patch.object(budget.subprocess, "run") as invoke:
+                with self.assertRaises(ValueError):
+                    with budget.device_lock(None, root, helper):
+                        pass
+                invoke.assert_not_called()
 
     def test_scene_check_can_push_combined_work_over_the_budget(self):
         row = frame(wall_ns=40_000_000, active_ns=25_000_000, guest_exec_ns=22_000_000,

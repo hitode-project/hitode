@@ -209,6 +209,18 @@ impl Worker {
         debug_assert_eq!(self.outstanding, 0);
         self.wake = Some(wake);
     }
+
+    pub(crate) fn set_code_cache(&mut self, cache: Option<Arc<crate::code_cache::Cache>>) {
+        debug_assert_eq!(self.outstanding, 0);
+        let Some(cache) = cache else { return };
+        let compiler = self.compiler.clone();
+        self.compiler = Arc::new(move |input| {
+            let mut compiled = compiler(input)?;
+            cache.store(input, &compiled);
+            compiled.discard_cache_image();
+            Ok(compiled)
+        });
+    }
     pub fn has_outstanding(&self) -> bool {
         self.outstanding != 0
     }

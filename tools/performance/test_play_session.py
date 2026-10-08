@@ -46,6 +46,23 @@ class PlaySessionTests(unittest.TestCase):
         self.assertTrue(commands[2].endswith("blocked.png"))
         self.assertNotIn("close", commands)
 
+    def test_native_cache_import_and_switches_use_only_the_new_overlay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            native = root / "jit-code.bin"
+            native.write_bytes(b"authored native cache")
+            args = self.args(root, compile_threads=4, warm_code_cache=native)
+            (command, kwargs), _ = self.launch(args)
+            self.assertNotIn("--no-code-cache", command)
+            self.assertEqual(kwargs["env"]["ADV_COMPILE_THREADS"], "4")
+            self.assertEqual((args.output / "overlay/jit-code.bin").read_bytes(), native.read_bytes())
+
+    def test_native_cache_diagnostic_bypass_reaches_the_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(Path(directory), no_code_cache=True)
+            (command, _), _ = self.launch(args)
+            self.assertIn("--no-code-cache", command)
+
     def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args(Path(directory))
@@ -159,7 +176,7 @@ class PlaySessionTests(unittest.TestCase):
 
 class ReplayDiagnosticsTest(unittest.TestCase):
     def test_trace_is_forwarded_to_isolated_output_and_excludes_performance(self):
-        scratch = Path(__file__).resolve().parents[2] / "target/scratch/play-session-tests"
+        scratch = Path(os.environ.get("ADV_ARTIFACT_ROOT", Path(__file__).resolve().parents[2] / "target")) / "scratch/play-session-tests"
         scratch.mkdir(parents=True, exist_ok=True)
         for trace in (False, True):
             with self.subTest(trace=trace), tempfile.TemporaryDirectory(dir=scratch) as temporary:
