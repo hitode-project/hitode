@@ -163,6 +163,18 @@ pub(crate) fn tier2(
     opaque: &std::collections::BTreeSet<u32>,
     opaque_memory: bool,
 ) -> Result<Tier2, super::verify::Error> {
+    // Overlapping decode entries can merge after distinct linear prefixes.
+    // Keep their common suffix independently addressable by either stream.
+    let mut fallthroughs = std::collections::BTreeSet::new();
+    let mut merges = std::collections::BTreeSet::new();
+    for i in instructions
+        .values()
+        .filter(|i| i.flow_control() == iced_x86::FlowControl::Next)
+    {
+        if !fallthroughs.insert(i.next_ip32()) {
+            merges.insert(i.next_ip32());
+        }
+    }
     let mut operations = BTreeMap::new();
     let mut ssa_instructions = 0;
     let mut opaque_instructions = 0;
@@ -177,7 +189,7 @@ pub(crate) fn tier2(
         let mut run = BTreeMap::new();
         let mut pc = start;
         while let Some(&i) = remaining.get(&pc) {
-            if pc != start && entries.contains(&pc)
+            if pc != start && (entries.contains(&pc) || merges.contains(&pc))
                 || opaque.contains(&pc)
                 || !native_integer(&i, opaque_memory)
             {
