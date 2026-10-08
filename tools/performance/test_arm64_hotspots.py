@@ -33,6 +33,13 @@ class HotspotsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "overlapping"):
                 load_ranges(path, static=True)
 
+    def test_android_top_byte_tag_is_not_an_instruction_address(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.tsv"
+            path.write_text("10 load b400000000001000 20 adv-jit-tier2\n", encoding="utf-8")
+            self.assertEqual(Ranges(load_ranges(path)).lookup(4096, 10), "Tier 2 Cranelift")
+        self.assertIsNone(host_symbol("unknown"))
+
     def test_invalid_lifetime_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "retirement"):
             Ranges([RangeEvent(0, "unload", 4096, 8, "Tier 1")]).lookup(4096, 1)
@@ -45,6 +52,10 @@ class HotspotsTests(unittest.TestCase):
         self.assertEqual(classify("memcpy", "libc.so", None), "Memory copy/set")
         self.assertEqual(classify("adv_cpu::tier1::sse::call", "adv-run", None), "JIT helper SSE")
         self.assertEqual(classify("cranelift_codegen::compile", "adv-run", None), "Compilation")
+        self.assertEqual(classify("adv_cpu::fault_recovery::recover_current", "adv-run", None), "JIT helper memory")
+        self.assertEqual(classify("<adv_device::ring::RingVoice>::render", "adv-run", None), "Audio mixing")
+        self.assertEqual(classify("pthread_getspecific", "libc.so", None), "Other host")
+        self.assertEqual(classify("__read_chk", "libc.so", None), "Kernel/syscall")
 
     def test_period_weighting_threads_and_no_private_identity(self):
         def sample(tid, comm, ip, period, symbol):

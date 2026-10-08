@@ -58,8 +58,12 @@ def load_ranges(path: Path, *, static: bool = False) -> list[RangeEvent]:
         else:
             time, action, base, size, category = fields
             ns = int(time)
-        base, size = int(base, 16), int(size, 16)
-        if (ns < 0 or base < 0 or size <= 0 or action not in ("load", "unload")
+        # Android's tagged allocator may return a TBI-tagged JIT code pointer.
+        # Sampled instruction PCs carry the canonical, untagged host address.
+        raw_base, size = int(base, 16), int(size, 16)
+        base = raw_base & 0x00FFFFFFFFFFFFFF
+        if (ns < 0 or raw_base < 0 or raw_base > 0xFFFFFFFFFFFFFFFF or size <= 0
+                or base + size > 0x0100000000000000 or action not in ("load", "unload")
                 or category not in JIT_CATEGORIES):
             raise ValueError("invalid anonymous range event")
         events.append(RangeEvent(ns, action, base, size, JIT_CATEGORIES[category]))
@@ -113,7 +117,8 @@ class Ranges:
 
 def host_symbol(name: str) -> str | None:
     """Keep recognizable host names; omit anonymous addresses and guest labels."""
-    if (not name or re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", name)
+    if (not name or name.lower() in ("unknown", "[unknown]", "<unknown>", "@plt")
+            or re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", name)
             or name.startswith(("[", "adv-jit-", "guest_", "region-"))
             or re.search(r"(?:guest|region)[_-][0-9a-fA-F]{6,}", name)):
         return None
@@ -131,7 +136,7 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
         return "Memory copy/set"
     if ("cranelift_" in name or "regalloc2" in name
             or any(token in name for token in ("adv_cpu::compile::compile", "adv_cpu::tier1::emit",
-                                               "adv_cpu::discovery", "iced_x86::decoder"))):
+                                               "adv_cpu::discovery"))):
         return "Compilation"
     if any(token in name for token in ("adv_cpu::floating", "adv_cpu::compile::x87",
                                        "adv_cpu::tier1::x87", "softfloat", "extf80", "f128_")):
@@ -140,7 +145,10 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
                                        "adv_cpu::interpreter::sse")):
         return "JIT helper SSE"
     if any(token in name for token in ("adv_cpu::memory", "adv_cpu::direct_memory",
+                                       "adv_cpu::fault_recovery", "adv_cpu::file_memory",
+                                       "adv_cpu::shared_memory", "adv_cpu::compile::loops::range_ok",
                                        "adv_cpu::tier1::native::load", "adv_cpu::tier1::native::store",
+                                       "adv_cpu::tier1::native::stack_all",
                                        "adv_cpu::tier1::simd", "adv_cpu::strings",
                                        "adv_cpu::atomic_memory", "adv_cpu::virtual_memory")):
         return "JIT helper memory"
@@ -152,13 +160,14 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
                                        "adv_runtime::codec", "adv_device::media", "vorbis", "libav")):
         return "Media/codecs"
     if any(token in name for token in ("adv_device::audio", "adv_runtime::audio", "rubato",
-                                       "adv_device::dsound", "adv_device::wave")):
+                                       "adv_device::dsound", "adv_device::wave", "adv_device::ring",
+                                       "adv_device::resample", "adv_device::actor")):
         return "Audio mixing"
     if any(token in name for token in ("fontdue", "ttf_parser", "skrifa", "swash",
                                        "adv_device::text", "adv_win32::gdi::text", "font")):
         return "HLE font"
     if any(token in name for token in ("adv_device::gdi", "adv_device::surface",
-                                       "adv_win32::gdi", "adv_device::blit", "adv_device::dib")):
+                                       "adv_win32::gdi", "adv_os::gdi", "adv_device::blit", "adv_device::dib")):
         return "HLE GDI/blit"
     if any(token in name for token in ("adv_os::vfs", "adv_os::file", "adv_win32::file",
                                        "adv_win32::kernel32::file", "adv_device::file")):
@@ -166,10 +175,13 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
     if any(token in name for token in ("adv_win32::user32", "adv_device::window",
                                        "adv_runtime::input", "adv_device::message")):
         return "HLE user32/messages"
-    if any(token in name for token in ("adv_win32::", "adv_device::", "adv_os::")):
+    if any(token in name for token in ("adv_win32::", "adv_device::", "adv_os::", "adv_dx::")):
         return "HLE other"
-    if library == "libc.so" and re.search(r"(?:syscall|futex|ioctl|pread|pwrite|read|write|poll|wait|mmap|mprotect)", name):
+    if library == "libc.so" and re.search(
+            r"^(?:__)?(?:syscall|futex|ioctl|pread(?:64)?|pwrite(?:64)?|read|write|poll|ppoll|wait(?:4|pid)?|mmap(?:64)?|munmap|mprotect)(?:$|_)", name):
         return "Kernel/syscall"
+    if name == "__kernel_clock_gettime" or "iced_x86::decoder" in name:
+        return "Runtime/scheduling"
     if any(token in name for token in ("adv_cpu::executor", "adv_machine::", "adv_sync::",
                                        "adv_shell::", "adv_runtime::")):
         return "Runtime/scheduling"
@@ -183,7 +195,7 @@ def thread_role(comm: str, categories: Counter, *, is_main: bool) -> str:
     # from exclusive leaf work instead of assuming every worker is a compiler.
     if any(token in comm.lower() for token in ("audio", "mixer", "cpal")):
         return "Audio"
-    if "background" in comm or "compil" in comm:
+    if "background" in comm or "compil" in comm or comm.startswith("adv-jit-"):
         if categories["Compilation"] > sum(categories.values()) / 2:
             return "Compilation worker"
         if categories["Audio mixing"] + categories["Media/codecs"] > sum(categories.values()) / 2:
@@ -244,7 +256,8 @@ def summarize(samples: list[dict], events: list[RangeEvent]) -> dict:
         "notes": ["Exclusive sampled user CPU when event ends in :u; kernel time is unmeasured.",
                   "Thread category percentages use the whole-process denominator.",
                   "Shared workers are not assumed to be dedicated compilation threads.",
-                  "Guest script-VM work remains anonymous JIT/interpreter; no guest attribution."],
+                  "Guest script-VM work remains anonymous JIT/interpreter; no guest attribution.",
+                  "Android top-byte pointer tags are stripped from input JIT ranges."],
     }
 
 
