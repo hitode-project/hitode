@@ -2,6 +2,8 @@
 mod audio;
 mod control;
 mod frontend;
+#[cfg(windows)]
+mod logging;
 #[cfg(all(windows, feature = "gpu"))]
 mod native_gpu;
 mod performance;
@@ -2122,6 +2124,8 @@ fn run_execution(
 
 /// Run the desktop/headless command-line shell with the process arguments.
 pub fn run_cli() -> std::process::ExitCode {
+    #[cfg(windows)]
+    logging::init();
     if std::env::var("ADV_HOST_FEATURES_REPORT").is_ok_and(|value| value == "1") {
         eprintln!(
             "host_features detected={} enabled={}",
