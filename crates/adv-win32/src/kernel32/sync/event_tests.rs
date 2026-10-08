@@ -324,44 +324,56 @@ fn open_event_uses_case_sensitive_shared_namespace_and_rejects_wrong_types_or_ac
 }
 
 #[test]
-fn remaining_mutex_and_semaphore_fronts_report_modified_native_entries() {
-    use adv_abi::{ApiDiagnostics, RunMode};
-    let cases: &[(&str, &str, &[u32])] = &[
-        ("CreateSemaphoreA", "NtCreateSemaphore", &[0, 0, 1, 0]),
-        ("CreateSemaphoreW", "NtCreateSemaphore", &[0, 0, 1, 0]),
-        ("ReleaseSemaphore", "NtReleaseSemaphore", &[0, 1, 0]),
-        ("CreateMutexA", "NtCreateMutant", &[0, 0, 0]),
-        ("CreateMutexW", "NtCreateMutant", &[0, 0, 0]),
-        ("ReleaseMutex", "NtReleaseMutant", &[0]),
-        ("OpenMutexA", "NtOpenMutant", &[0x1f0001, 0, 0]),
-        ("OpenMutexW", "NtOpenMutant", &[0x1f0001, 0, 0]),
-    ];
-    for &(front, native, args) in cases {
-        let mut f = Fixture::new();
-        crate::Win32::prepare_process_infrastructure(&mut f.0).unwrap();
-        f.call(front, args);
-        assert!(
-            f.0.ext
-                .get_or_default::<ApiDiagnostics>()
-                .acceptance_eligible(RunMode::Strict),
-            "{front}"
-        );
-        let target = {
-            let m = &mut f.0;
-            let mut env = Env {
-                context: 0,
-                cpu: &mut m.cpu,
-                sys: &mut m.sys,
-                ext: &mut m.ext,
-                thunk: 0,
-            };
-            crate::native::entry(&mut env, native).unwrap()
-        };
-        // Authored replacement bytes only test whether the host bypass is visible.
-        f.0.cpu.write(target, &[0xcc]).unwrap();
-        f.call(front, args);
-        let diagnostics = f.0.ext.get::<ApiDiagnostics>();
-        assert_eq!(diagnostics.structural_mismatches, 1, "{front}");
-        assert!(!diagnostics.acceptance_eligible(RunMode::Strict), "{front}");
+fn mutex_and_semaphore_native_entries_are_registered_and_share_release_state() {
+    let mut f = Fixture::new();
+    for (name, argc) in [
+        ("NtCreateMutant", 4),
+        ("NtOpenMutant", 3),
+        ("NtReleaseMutant", 2),
+        ("NtCreateSemaphore", 5),
+        ("NtOpenSemaphore", 3),
+        ("NtReleaseSemaphore", 3),
+    ] {
+        let entry = f.0.resolve_import("ntdll.dll", name).unwrap();
+        let thunk = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        assert_eq!(f.0.sys.thunks.get(thunk).f.conv, Conv::Stdcall { argc });
     }
+    let mutex = f.call("CreateMutexA", &[0, 1, 0]);
+    assert_eq!(f.wait(mutex), WAIT_OBJECT_0);
+    f.0.cpu.write_u32(DATA + 0x700, 0x12345678).unwrap();
+    assert_eq!(
+        f.call("ntdll.dll!NtReleaseMutant", &[mutex, DATA + 0x700]),
+        0
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), u32::MAX);
+    assert_eq!(f.call("ReleaseMutex", &[mutex]), 1);
+    assert_eq!(
+        f.call("ntdll.dll!NtReleaseMutant", &[mutex, DATA + 0x700]),
+        0xc0000046
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), u32::MAX);
+    let semaphore = f.call("CreateSemaphoreW", &[0, 1, 2, 0]);
+    assert_eq!(f.wait(semaphore), WAIT_OBJECT_0);
+    assert_eq!(
+        f.call(
+            "ntdll.dll!NtReleaseSemaphore",
+            &[semaphore, 2, DATA + 0x700]
+        ),
+        0
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), 0);
+    assert_eq!(f.call("ReleaseSemaphore", &[semaphore, 1, DATA + 0x700]), 0);
+    assert_eq!(f.error(), 298);
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), 0);
+    assert_eq!(
+        f.call(
+            "ntdll.dll!NtReleaseSemaphore",
+            &[semaphore, 0, DATA + 0x700]
+        ),
+        0xc000000d
+    );
+    assert!(matches!(
+        f.0.sys.objects.get(semaphore),
+        Some(Object::Semaphore { count: 2, max: 2 })
+    ));
 }

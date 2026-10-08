@@ -10,6 +10,9 @@ use adv_machine::{
 };
 use adv_win32::{Win32, Win32Config};
 
+#[path = "native_sync/owned.rs"]
+mod owned;
+
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const ARRAY: u32 = DATA + 0x300;
@@ -22,6 +25,22 @@ use Arg::{Stored as M, Value as I};
 fn fixture(jit: bool) -> Machine<JitCpu> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
+    registry.add(
+        "test",
+        "hold_sync_waiter",
+        adv_abi::Conv::Stdcall { argc: 1 },
+        |env| owned::hold_until_waiter(env, env.arg(0)),
+    );
+    registry.add(
+        "test",
+        "sync_aliases",
+        adv_abi::Conv::Stdcall { argc: 0 },
+        |env| {
+            adv_machine::Outcome::Return(
+                env.sys.objects.alias_count(adv_machine::Namespace::DEFAULT) as u32,
+            )
+        },
+    );
     assert!(registry.signature_conflicts().is_empty());
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, jit).unwrap(),
@@ -115,7 +134,15 @@ fn hook(
         code.mov_eax_esp(4 + i * 4)
             .mov_mem_eax(observed + 4 + u32::from(i) * 4);
     }
-    if matches!(name, "NtCreateEvent" | "NtOpenEvent") {
+    if matches!(
+        name,
+        "NtCreateEvent"
+            | "NtOpenEvent"
+            | "NtCreateMutant"
+            | "NtOpenMutant"
+            | "NtCreateSemaphore"
+            | "NtOpenSemaphore"
+    ) {
         code.mov_eax_esp(12)
             .add_eax_imm(12)
             .mov_eax_ptr_eax()

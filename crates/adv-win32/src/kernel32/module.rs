@@ -292,10 +292,7 @@ fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
 
 fn load_library_search(env: &mut Env<'_>, name: String, altered: bool) -> Outcome {
     match crate::native::overridden(env, "LdrLoadDll") {
-        Ok(Some(target)) if !altered => return native_boundary::load(env, target, name),
-        Ok(Some(_)) => {
-            crate::native::diagnose_bypass(env, "kernel32.dll!LoadLibraryEx", &["LdrLoadDll"])
-        }
+        Ok(Some(target)) => return native_boundary::load(env, target, name, altered),
         Err(_) => return crate::native::unavailable(env, "LdrLoadDll"),
         Ok(None) => {}
     }
@@ -308,13 +305,18 @@ enum LibraryFront {
     Native(u32),
 }
 
-pub(crate) fn native_load_library(env: &mut Env<'_>, name: String, output: u32) -> Outcome {
+pub(crate) fn native_load_library(
+    env: &mut Env<'_>,
+    name: String,
+    output: u32,
+    altered: bool,
+) -> Outcome {
     locked_profile(env, true, move |env| {
         // The caller may have lost the output while waiting for the loader lock.
         if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err() {
             return Outcome::Return(0xc0000005);
         }
-        load_library_front(env, name, false, LibraryFront::Native(output))
+        load_library_front(env, name, altered, LibraryFront::Native(output))
     })
 }
 
@@ -513,10 +515,36 @@ fn load_library_ex(env: &mut Env<'_>, name: String, file: Handle, flags: u32) ->
     match flags {
         0 => locked(env, move |env| load_library(env, name)),
         8 => locked(env, move |env| load_library_search(env, name, true)),
-        2 => locked(env, move |env| datafile::load(env, name)),
+        2 => locked(env, move |env| {
+            // Raw resource views need file/section ownership, not LdrLoadDll.
+            // Until that transport exists, never consume a live NT override.
+            const ENTRIES: &[&str] = &[
+                "NtCreateFile",
+                "NtOpenFile",
+                "NtQueryInformationFile",
+                "NtCreateSection",
+                "NtMapViewOfSection",
+                "NtClose",
+            ];
+            if ENTRIES
+                .iter()
+                .any(|name| !matches!(crate::native::overridden(env, name), Ok(None)))
+            {
+                crate::native::diagnose_bypass(env, "kernel32.dll!LoadLibraryEx", ENTRIES);
+                set_last_error(env, 50);
+                Outcome::Return(0)
+            } else {
+                datafile::load(env, name)
+            }
+        }),
         _ => {
             // IMAGE_RESOURCE/EXCLUSIVE need generic file leases, and DONT_RESOLVE
             // needs executable-but-uninitialized lifetime. Never run DllMain.
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!LoadLibraryEx",
+                "requested loading flags require an unavailable mapping or search policy",
+            );
             set_last_error(env, 50); // ERROR_NOT_SUPPORTED
             Outcome::Return(0)
         }
@@ -566,17 +594,170 @@ pub(crate) fn module_of(env: &Env<'_>, h: u32) -> Option<ModuleId> {
 }
 
 fn get_module_handle(env: &mut Env<'_>, name: Option<String>) -> Outcome {
-    let id = match &name {
-        None => module_of(env, 0),
-        Some(n) => adv_os::modules(env.ext).by_name(n),
-    };
-    match id {
-        Some(id) => Outcome::Return(adv_os::modules(env.ext).get(id).base),
+    if let Some(name) = name {
+        return lookup_module(env, name, |_, base| Outcome::Return(base));
+    }
+    let base = module_of(env, 0).map(|id| adv_os::modules(env.ext).get(id).base);
+    module_handle_result(env, base)
+}
+
+fn module_handle_result(env: &mut Env<'_>, base: Option<u32>) -> Outcome {
+    match base {
+        Some(base) => Outcome::Return(base),
         None => {
-            log::debug!("GetModuleHandle({name:?}): not loaded");
             set_last_error(env, err::MOD_NOT_FOUND);
             Outcome::Return(0)
         }
+    }
+}
+
+fn lookup_module(
+    env: &mut Env<'_>,
+    name: String,
+    found: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let entry = match crate::native::overridden(env, "LdrGetDllHandle") {
+        Ok(Some(target)) => Some(target),
+        Err(_) => return crate::native::unavailable(env, "LdrGetDllHandle"),
+        Ok(None) => match crate::native::overridden(env, "LdrGetDllHandleEx") {
+            Ok(None) => None,
+            // The pristine basic entry must still reach a modified Ex entry.
+            Ok(Some(_)) => match crate::native::entry(env, "LdrGetDllHandle") {
+                Ok(target) => Some(target),
+                Err(_) => return crate::native::unavailable(env, "LdrGetDllHandle"),
+            },
+            Err(_) => return crate::native::unavailable(env, "LdrGetDllHandleEx"),
+        },
+    };
+    if let Some(target) = entry {
+        return native_boundary::handle(env, target, name, found);
+    }
+    let base = adv_os::modules(env.ext)
+        .by_name(&name)
+        .map(|id| adv_os::modules(env.ext).get(id).base);
+    match base {
+        Some(base) => found(env, base),
+        None => module_handle_result(env, None),
+    }
+}
+
+pub(crate) fn native_get_dll_handle(
+    env: &mut Env<'_>,
+    flags: u32,
+    name: String,
+    output: u32,
+) -> Outcome {
+    locked_profile(env, true, move |env| {
+        // Validate after waiting and before changing any reference ownership.
+        if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err() {
+            return Outcome::Return(0xc0000005);
+        }
+        let Some(id) = adv_os::modules(env.ext).by_name(&name) else {
+            return Outcome::Return(0xc0000135);
+        };
+        let base = adv_os::modules(env.ext).get(id).base;
+        if flags & 1 == 0 {
+            match add_ref_library(env, u32::from(flags & 2 != 0), base) {
+                Outcome::Return(0) => {}
+                outcome => return outcome,
+            }
+        }
+        match env.cpu.write_u32(output, base) {
+            Ok(()) => Outcome::Return(0),
+            Err(_) => Outcome::Return(0xc0000005),
+        }
+    })
+}
+
+fn add_ref_library(env: &mut Env<'_>, flags: u32, base: u32) -> Outcome {
+    if flags & !1 != 0 {
+        return Outcome::Return(0xc000000d);
+    }
+    let Some(id) = adv_os::modules(env.ext)
+        .by_handle(base)
+        .filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
+    else {
+        return Outcome::Return(0xc0000135);
+    };
+    if let Err(error) = adv_os::modules_mut(env.ext).retain(env.cpu, id) {
+        return Outcome::Fail(error.to_string());
+    }
+    if flags & 1 != 0 {
+        adv_os::modules_mut(env.ext).get_mut(id).lifetime.pinned = true;
+    }
+    Outcome::Return(0)
+}
+
+pub(crate) fn native_add_ref_library(env: &mut Env<'_>, flags: u32, base: u32) -> Outcome {
+    locked_profile(env, true, move |env| add_ref_library(env, flags, base))
+}
+
+pub(crate) fn native_pc_to_file_header(env: &mut Env<'_>, address: u32, output: u32) -> Outcome {
+    let base = adv_os::modules(env.ext)
+        .containing(address)
+        .map_or(0, |id| adv_os::modules(env.ext).get(id).base);
+    if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err()
+        || env.cpu.write_u32(output, base).is_err()
+    {
+        adv_abi::warn_unavailable(
+            env,
+            "ntdll.dll!RtlPcToFileHeader",
+            "module base output is unavailable",
+        );
+        return Outcome::Return(0);
+    }
+    Outcome::Return(base)
+}
+
+fn publish_module_handle(env: &mut Env<'_>, out: u32, base: u32) -> Outcome {
+    if adv_abi::guest::check_range(env.cpu, out, 4, Prot::WRITE).is_err()
+        || env.cpu.write_u32(out, base).is_err()
+    {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    Outcome::Return(1)
+}
+
+fn finish_module_handle_ex(env: &mut Env<'_>, flags: u32, out: u32, base: u32) -> Outcome {
+    if adv_abi::guest::check_range(env.cpu, out, 4, Prot::WRITE).is_err() {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    if flags & 2 != 0 {
+        return publish_module_handle(env, out, base);
+    }
+    let native_flags = flags & 1;
+    match crate::native::overridden(env, "LdrAddRefDll") {
+        Ok(Some(target)) => Outcome::call(target, [native_flags, base], move |env, value| {
+            if value.value() as i32 >= 0 {
+                publish_module_handle(env, out, base)
+            } else {
+                load_io_error(env, LibraryFront::Win32, value.value())
+            }
+        }),
+        Ok(None) => match add_ref_library(env, native_flags, base) {
+            Outcome::Return(0) => publish_module_handle(env, out, base),
+            Outcome::Return(status) => load_io_error(env, LibraryFront::Win32, status),
+            outcome => outcome,
+        },
+        Err(_) => crate::native::unavailable(env, "LdrAddRefDll"),
+    }
+}
+
+fn module_by_address(env: &mut Env<'_>, flags: u32, out: u32, address: u32) -> Outcome {
+    match crate::native::overridden(env, "RtlPcToFileHeader") {
+        Ok(Some(target)) => native_boundary::address(env, target, address, move |env, base| {
+            finish_module_handle_ex(env, flags, out, base)
+        }),
+        Ok(None) => match adv_os::modules(env.ext)
+            .containing(address)
+            .map(|id| adv_os::modules(env.ext).get(id).base)
+        {
+            Some(base) => finish_module_handle_ex(env, flags, out, base),
+            None => module_handle_result(env, None),
+        },
+        Err(_) => crate::native::unavailable(env, "RtlPcToFileHeader"),
     }
 }
 
@@ -589,36 +770,23 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
         set_last_error(env, err::INVALID_PARAMETER);
         return Outcome::Return(0);
     }
-    let base = if flags & FROM_ADDRESS != 0 {
-        let modules = adv_os::modules(env.ext);
-        modules.containing(name).map(|id| modules.get(id).base)
-    } else if name == 0 {
-        module_of(env, 0).map(|id| adv_os::modules(env.ext).get(id).base)
-    } else {
-        let n = if wide { arg_w(env, 1) } else { arg_a(env, 1) };
-        adv_os::modules(env.ext)
-            .by_name(&n)
-            .map(|id| adv_os::modules(env.ext).get(id).base)
-    };
-    match base {
-        Some(base) => {
-            let id = adv_os::modules(env.ext).by_handle(base).unwrap();
-            if flags & 2 == 0
-                && let Err(error) = adv_os::modules_mut(env.ext).retain(env.cpu, id)
-            {
-                return Outcome::Fail(error.to_string());
-            }
-            if flags & 1 != 0 {
-                adv_os::modules_mut(env.ext).get_mut(id).lifetime.pinned = true;
-            }
-            let _ = env.cpu.write_u32(out, base);
-            Outcome::Return(1)
-        }
-        None => {
-            set_last_error(env, err::MOD_NOT_FOUND);
-            Outcome::Return(0)
-        }
+    if flags & FROM_ADDRESS != 0 {
+        return module_by_address(env, flags, out, name);
     }
+    if name == 0 {
+        // The native exe shortcut neither looks up nor retains a DLL.
+        return match module_of(env, 0) {
+            Some(id) => {
+                let base = adv_os::modules(env.ext).get(id).base;
+                publish_module_handle(env, out, base)
+            }
+            None => module_handle_result(env, None),
+        };
+    }
+    let name = if wide { arg_w(env, 1) } else { arg_a(env, 1) };
+    lookup_module(env, name, move |env, base| {
+        finish_module_handle_ex(env, flags, out, base)
+    })
 }
 
 /// Fixed guest path of a module. Published DLL names belong to their LDR block;

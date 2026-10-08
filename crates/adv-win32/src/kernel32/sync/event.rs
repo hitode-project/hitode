@@ -10,16 +10,16 @@ const NAME_EXISTS: u32 = 0x40000000;
 const NAME_COLLISION: u32 = 0xc0000035;
 const NOT_SUPPORTED: u32 = 0xc00000bb;
 
-struct Attributes {
-    name: Option<Vec<u16>>,
-    inherit: bool,
-    open_if: bool,
+pub(super) struct Attributes {
+    pub(super) name: Option<Vec<u16>>,
+    pub(super) inherit: bool,
+    pub(super) open_if: bool,
 }
-fn unsupported(env: &mut Env<'_>, api: &str, reason: &str) -> u32 {
+pub(super) fn unsupported(env: &mut Env<'_>, api: &str, reason: &str) -> u32 {
     adv_abi::warn_unavailable(env, &format!("ntdll.dll!{api}"), reason);
     NOT_SUPPORTED
 }
-fn error(code: u32) -> u32 {
+pub(super) fn error(code: u32) -> u32 {
     match code {
         2 => 0xc0000034,
         3 => 0xc000003a,
@@ -32,13 +32,13 @@ fn error(code: u32) -> u32 {
         _ => 0xc000000d,
     }
 }
-fn writable(env: &Env<'_>, pointer: u32) -> Result<(), u32> {
+pub(super) fn writable(env: &Env<'_>, pointer: u32) -> Result<(), u32> {
     if pointer & 3 != 0 {
         return Err(0x80000002);
     }
     check_range(env.cpu, pointer, 4, Prot::WRITE).map_err(|_| ACCESS_VIOLATION)
 }
-fn attributes(env: &mut Env<'_>, pointer: u32, api: &str) -> Result<Attributes, u32> {
+pub(super) fn attributes(env: &mut Env<'_>, pointer: u32, api: &str) -> Result<Attributes, u32> {
     let mut result = Attributes {
         name: None,
         inherit: false,
@@ -60,7 +60,7 @@ fn attributes(env: &mut Env<'_>, pointer: u32, api: &str) -> Result<Attributes, 
         return Err(unsupported(
             env,
             api,
-            "event directory handles, security descriptors and extended object attributes are unavailable",
+            "synchronization directory handles, security descriptors and extended object attributes are unavailable",
         ));
     }
     result.inherit = fields[3] & 2 != 0;
@@ -97,7 +97,7 @@ fn attributes(env: &mut Env<'_>, pointer: u32, api: &str) -> Result<Attributes, 
         return Err(unsupported(
             env,
             api,
-            "event names outside the virtual Local/Global directories are unavailable",
+            "synchronization names outside the virtual Local/Global directories are unavailable",
         ));
     };
     if leaf.is_empty() || leaf.len() > 260 || leaf.contains(&0) || leaf.contains(&(b'\\' as u16)) {
@@ -200,7 +200,7 @@ pub(crate) fn state_native(env: &mut Env<'_>, handle: u32, previous: u32, signal
     }
     0
 }
-fn marshal(
+pub(super) fn marshal(
     env: &mut Env<'_>,
     key: Option<&[u16]>,
     inherit: bool,
@@ -251,7 +251,7 @@ fn marshal(
         .map_err(|fault| Outcome::Fail(fault.to_string()))?;
     Ok(buffer)
 }
-fn front_status(env: &mut Env<'_>, status: u32, success: u32) -> Outcome {
+pub(super) fn front_status(env: &mut Env<'_>, status: u32, success: u32) -> Outcome {
     if (status as i32) >= 0 {
         return Outcome::Return(success);
     }
@@ -259,12 +259,14 @@ fn front_status(env: &mut Env<'_>, status: u32, success: u32) -> Outcome {
         0xc0000024 => 6,
         0x80000002 => 998,
         NAME_COLLISION => 183,
+        0xc0000046 => 288, // STATUS_MUTANT_NOT_OWNED -> ERROR_NOT_OWNER.
+        0xc0000047 => 298, // STATUS_SEMAPHORE_LIMIT_EXCEEDED -> ERROR_TOO_MANY_POSTS.
         _ => super::super::file::native::win32_error(status),
     };
     set_last_error(env, code);
     Outcome::Return(0)
 }
-fn published(env: &mut Env<'_>, output: u32, status: u32, create: bool) -> Outcome {
+pub(super) fn published(env: &mut Env<'_>, output: u32, status: u32, create: bool) -> Outcome {
     if (status as i32) < 0 {
         return front_status(env, status, 0);
     }

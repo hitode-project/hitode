@@ -707,6 +707,7 @@ pub(super) fn sync_lookup_named(env: &mut Env<'_>, name: &[u16], kind: u32) -> R
 }
 
 /// Open an existing process-owned mutex through the same namespace as Create.
+#[cfg(test)]
 pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
     open_sync(env, pointer, wide, 2, 0x001f0001)
 }
