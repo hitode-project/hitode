@@ -715,7 +715,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         .collect::<Vec<_>>().join(",");
     let tier1 = runtime.machine.cpu.executor().tier1_stats();
     let tier1_json = format!(
-        "{{\"mode\":{},\"compilations\":{},\"compile_seconds\":{:.9},\"publication_revisions\":{},\"publication_flushes\":{},\"cache_evictions\":{},\"compile_misses\":{},\"fallback_entries\":{},\"fallback_units\":{},\"bridge_entries\":{},\"bridge_units\":{},\"resident_bytes\":{}}}",
+        "{{\"mode\":{},\"compilations\":{},\"compile_seconds\":{:.9},\"publication_revisions\":{},\"publication_flushes\":{},\"cache_evictions\":{},\"compile_misses\":{},\"fallback_entries\":{},\"fallback_units\":{},\"native_entries\":{},\"bridge_entries\":{},\"bridge_units\":{},\"invalidations\":{},\"resident_bytes\":{}}}",
         json(&format!("{:?}", runtime.machine.cpu.executor().tier1_mode()).to_lowercase()),
         tier1.compilations,
         tier1.compile_time.as_secs_f64(),
@@ -725,8 +725,10 @@ fn build_report(context: ReportContext<'_>) -> String {
         tier1.compile_misses,
         tier1.fallback_entries,
         tier1.fallback_instructions,
+        tier1.native_entries,
         tier1.bridge_entries,
         tier1.bridge_units,
+        tier1.invalidations,
         tier1.resident_bytes
     );
     format!(

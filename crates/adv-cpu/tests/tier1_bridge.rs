@@ -190,6 +190,64 @@ mod native {
     }
 
     #[test]
+    fn publication_keeps_disjoint_cfgs_and_retires_every_overlapping_owner() {
+        let prefix = assemble(|a| {
+            a.inc(ebx).unwrap();
+            a.jmp(u64::from(CODE + 128)).unwrap();
+        });
+        let mut side = CodeAssembler::new(32).unwrap();
+        side.inc(ecx).unwrap();
+        side.jmp(u64::from(CODE + 128)).unwrap();
+        let side = side.assemble(u64::from(CODE + 64)).unwrap();
+        let leaf = assemble(|a| {
+            a.inc(eax).unwrap();
+            a.ret().unwrap();
+        });
+        let mut m = machine(&prefix, Tier1Mode::Bridge);
+        m.write(CODE + 64, &side).unwrap();
+        for offset in [128, 256, 512] {
+            m.write(CODE + offset, &leaf).unwrap();
+        }
+        m.set_tier_verification(Some(true));
+        // Two CFGs own the shared leaf; the later one overwrites its entry-map
+        // slot. A third CFG is independent and must survive both publications.
+        for offset in [0, 64, 256] {
+            reset(&mut m);
+            m.state.eip = CODE + offset;
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        let before = m.tier1_stats();
+        assert_eq!(before.compilations, 3);
+        m.add_region(Region::new(CODE + 512, leaf.len())).unwrap();
+        reset(&mut m);
+        m.state.eip = CODE + 256;
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        let unrelated = m.tier1_stats();
+        assert_eq!(unrelated.compilations, before.compilations);
+        assert_eq!(unrelated.cache_evictions, before.cache_evictions);
+        assert_eq!(unrelated.resident_bytes, before.resident_bytes);
+
+        m.add_region(Region::new(CODE + 128, leaf.len())).unwrap();
+        reset(&mut m);
+        m.state.eip = CODE + 256;
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        let conflict = m.tier1_stats();
+        assert_eq!(conflict.compilations, before.compilations);
+        assert_eq!(conflict.cache_evictions - before.cache_evictions, 2);
+        assert!(conflict.resident_bytes < before.resident_bytes);
+        assert_eq!(conflict.publication_flushes, 0);
+        for offset in [0, 64] {
+            reset(&mut m);
+            m.state.eip = CODE + offset;
+            let units = m.tier1_stats().bridge_units;
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.tier1_stats().bridge_units - units, 2);
+            assert_eq!(m.state.regs[0], 1);
+        }
+        assert_eq!(m.stats.verification.mismatches, 0);
+    }
+
+    #[test]
     fn bridge_self_modifying_code_invalidates_both_caches() {
         let body = assemble(|a| {
             a.mov(eax, 1).unwrap();
