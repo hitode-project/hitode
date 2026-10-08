@@ -23,6 +23,13 @@ static DWORD export_names(HMODULE m){ IMAGE_NT_HEADERS *nt; IMAGE_EXPORT_DIRECTO
   nt=(IMAGE_NT_HEADERS*)((BYTE*)m+((IMAGE_DOS_HEADER*)m)->e_lfanew);
   e=(IMAGE_EXPORT_DIRECTORY*)((BYTE*)m+nt->OptionalHeader.DataDirectory[0].VirtualAddress);
   return e->NumberOfNames; }
+/* Structural presence: the export directory, not the discovery surface. */
+static void *export_entry(HMODULE m, const char *name){ IMAGE_NT_HEADERS *nt; IMAGE_EXPORT_DIRECTORY *e; DWORD i, *names, *functions; WORD *ordinals;
+  nt=(IMAGE_NT_HEADERS*)((BYTE*)m+((IMAGE_DOS_HEADER*)m)->e_lfanew);
+  e=(IMAGE_EXPORT_DIRECTORY*)((BYTE*)m+nt->OptionalHeader.DataDirectory[0].VirtualAddress);
+  names=(DWORD*)((BYTE*)m+e->AddressOfNames); functions=(DWORD*)((BYTE*)m+e->AddressOfFunctions); ordinals=(WORD*)((BYTE*)m+e->AddressOfNameOrdinals);
+  for(i=0;i<e->NumberOfNames;i++){ const char *a=(char*)m+names[i], *b=name; while(*a&&*a==*b){ a++; b++; } if(*a==*b) return (BYTE*)m+functions[ordinals[i]]; }
+  return NULL; }
 
 /* ---- 1: thread lifetime: 1000 sequential short threads, including the first 200 ---- */
 static DWORD WINAPI ret_param(void *p){ return (DWORD)(UINT_PTR)p; }
@@ -93,7 +100,7 @@ static const char *nt_names[]={"NtQuerySystemInformation","NtQueryInformationPro
  "LdrInitializeThunk","KiUserApcDispatcher","NtContinue","RtlRaiseException","NtAllocateVirtualMemory","RtlExitUserThread"};
 static void t_exports(void){
   HMODULE nt=GetModuleHandleA("ntdll.dll"), k32=GetModuleHandleA("kernel32.dll"); int i; DWORD m0=0,m1=0,outside=0,count=0;
-  for(i=0;i<(int)(sizeof nt_names/sizeof *nt_names);i++){ void *p=GetProcAddress(nt,nt_names[i]);
+  for(i=0;i<(int)(sizeof nt_names/sizeof *nt_names);i++){ void *p=export_entry(nt,nt_names[i]);
     if(p){ count++; if(i<32) m0|=1u<<i; else m1|=1u<<(i-32); if(!in_image(nt,p)) outside++; } }
   put(count); put(m0); put(m1); put(outside); put(export_names(nt)); put(export_names(k32));
   /* kernel32 heap/critical-section exports forward into ntdll on native Windows */
