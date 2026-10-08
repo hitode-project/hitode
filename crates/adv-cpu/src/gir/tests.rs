@@ -224,18 +224,18 @@ fn faults(route: Route) {
         let mut frame = Frame::from_cpu(&state);
         let mut interpreter = Interpreter::new();
         let mut count = 0;
-        loop {
+        let expected = loop {
             let step = interpreter.step(&mut state, &mut reference);
             if step != Step::Executed {
                 assert!(matches!(
                     step,
                     Step::ReadFault { .. } | Step::WriteFault { .. }
                 ));
-                break;
+                break step;
             }
             count += 1;
             assert!(count < 200);
-        }
+        };
         let reason = run(&code, route, &mut candidate, &mut frame, 200, false);
         assert_eq!(
             reason,
@@ -249,6 +249,14 @@ fn faults(route: Route) {
         assert_eq!(frame.flags, state.eflags);
         assert_eq!(frame.pc, state.eip);
         assert_eq!(frame.committed, count);
+        let address = match expected {
+            Step::ReadFault { address, .. } | Step::WriteFault { address, .. } => address,
+            _ => unreachable!(),
+        };
+        assert_eq!(frame.address, address);
+        let mut resumed = initial();
+        frame.restore(&mut resumed);
+        assert_eq!(interpreter.step(&mut resumed, &mut candidate), expected);
         if protection & READ != 0 {
             assert_eq!(
                 candidate.read(DATA, 4096).unwrap(),
@@ -350,6 +358,11 @@ fn stack_faults(route: Route) {
         assert_eq!(frame.gpr, state.regs);
         assert_eq!(frame.flags, state.eflags);
         let mut resumed = initial;
+        let address = match expected {
+            Step::ReadFault { address, .. } | Step::WriteFault { address, .. } => address,
+            _ => unreachable!(),
+        };
+        assert_eq!(frame.address, address);
         frame.restore(&mut resumed);
         assert_eq!(interpreter.step(&mut resumed, &mut candidate), expected);
     }
