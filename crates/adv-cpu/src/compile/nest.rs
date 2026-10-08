@@ -207,7 +207,7 @@ fn inner_supported(i: &Instruction) -> bool {
                 | M::Setns
                 | M::Setp
                 | M::Setnp
-        ) || mmx::supported(i) && i.mnemonic() != M::Emms
+        ) || mmx::supported(i) && i.mnemonic() != M::Emms && !mmx::conversion(i)
             || simd::supported(i)
                 && i.mnemonic() != M::Movdqa
                 && (i.mnemonic() == M::Movdqu
@@ -796,6 +796,34 @@ mod tests {
                 nests(&instructions, &entries, &plans).is_empty(),
                 "shape {shape}"
             );
+        }
+    }
+
+    #[test]
+    fn conversion_rows_require_ordered_mxcsr_effects() {
+        for truncate in [false, true] {
+            let (instructions, entries, plans) = decode(|a| {
+                let mut outer = a.create_label();
+                let mut inner = a.create_label();
+                a.set_label(&mut outer).unwrap();
+                a.mov(ecx, 8).unwrap();
+                a.set_label(&mut inner).unwrap();
+                if truncate {
+                    a.cvttps2pi(mm0, qword_ptr(esi)).unwrap();
+                } else {
+                    a.cvtps2pi(mm0, qword_ptr(esi)).unwrap();
+                }
+                a.movq(qword_ptr(edi), mm0).unwrap();
+                a.add(esi, 8).unwrap();
+                a.add(edi, 8).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(inner).unwrap();
+                a.dec(edx).unwrap();
+                a.jne(outer).unwrap();
+                a.ret().unwrap();
+            });
+            assert_eq!(plans.len(), 1, "ordinary native loop remains available");
+            assert!(nests(&instructions, &entries, &plans).is_empty());
         }
     }
 

@@ -1,17 +1,24 @@
 //! Host-double execution of the x87 operations that dominate compiled float
 //! loops. It applies only where the result is bit-identical to the
 //! transactional path: no pending exception, live MMX state committed, the
-//! touched stack slots valid, and every operand an exact double. Arithmetic
+//! touched stack slots valid. Copies and comparisons keep ordinary raw80;
+//! stores round its significand once. Arithmetic requires exact doubles and
 //! also needs round-to-nearest and masked exceptions, and operands within 2^±400
 //! so neither the result nor the error terms used for the precision flag can
 //! overflow, underflow or go denormal. Precision control 53 uses the binary64
 //! result directly. Precision control 24 additionally needs 24-bit operands:
 //! rounding their binary64 result again to 24 bits is then the correctly rounded
 //! result (53 >= 2 * 24 + 2), with the extended exponent range kept. Everything
-//! else returns `None` before any state changes and takes the transactional path.
+//! at PC=64 requires an exact result, including signed zero; division also
+//! bounds the quotient so its product residual cannot underflow;
+//! other arithmetic cases return `None` before state changes and take the transaction.
 use super::{Memory, NativeX87, X87_DONE, X87_EXIT, reg_index};
 use crate::{CpuState, PAGE_SIZE, READ, WRITE, X87Register as Ext};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
+pub(crate) mod diagnostics;
+mod extra;
+mod raw;
+pub(crate) use extra::execute as execute_other;
 
 const PE: u16 = 0x20;
 const C0: u16 = 0x100;
@@ -40,6 +47,7 @@ pub(crate) enum Op {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fast {
+    Wait,
     Load(Source),
     /// FST/FSTP to m32/m64 (width 4/8) or FIST/FISTP to m32/m64 (integer).
     Store {
@@ -112,6 +120,7 @@ pub(crate) fn classify(i: &Instruction) -> Option<Fast> {
     let m = i.mnemonic();
     let memory = i.op0_kind() == OpKind::Memory;
     Some(match m {
+        M::Wait => Fast::Wait,
         M::Fld | M::Fild => Fast::Load(source(i, m == M::Fild)?),
         M::Fst | M::Fstp | M::Fist | M::Fistp if memory => {
             let width = i.memory_size().size() as u8;
@@ -285,7 +294,10 @@ fn arithmetic(op: Op, a: f64, b: f64) -> (f64, f64) {
             // r = a - q*b is computed exactly enough to give its sign; the
             // exact quotient minus q has the sign of r/b.
             let r = (a - q * b) - product_error(q, b, q * b);
-            (q, if r == 0.0 { 0.0 } else { r / b })
+            // Preserve a nonzero residual instead of dividing it a second
+            // time. Only the sign of exact - rounded is consumed by callers.
+            let sign = f64::from_bits(r.to_bits() ^ (b.to_bits() & (1 << 63)));
+            (q, r.abs().copysign(sign))
         }
     }
 }
@@ -423,12 +435,70 @@ fn rounded_up(error: f64, result: f64) -> bool {
 }
 
 /// Precision control of an arithmetic-eligible control word: round to nearest,
-/// every exception masked, and PC=24 or PC=53.
+/// every exception masked, and PC=24 or PC=53. PC=64 is admitted separately
+/// only when a result is exact; rejections retain the Control diagnostic class.
 pub(crate) fn arithmetic_precision(control: u16) -> Option<u32> {
     match control & 0x0f3f {
         0x023f => Some(53),
         0x003f => Some(24),
         _ => None,
+    }
+}
+
+/// Probe only rejected PC=64/nearest/masked calls, without changing state or
+/// faulting in file-backed memory. Range and zero are separate from candidates.
+pub(super) fn pc64_opportunity(
+    i: &Instruction,
+    fast: Fast,
+    state: &CpuState,
+    memory: &Memory,
+) -> crate::cliffs::X87Pc64 {
+    use crate::cliffs::X87Pc64;
+    let Fast::Arith {
+        op,
+        dest,
+        source,
+        reverse,
+        ..
+    } = fast
+    else {
+        return X87Pc64::Other;
+    };
+    // Keep division in Other for compatibility with this legacy add/sub/mul
+    // census. The opt-in form census reports division rejections separately.
+    if op == Op::Div {
+        return X87Pc64::Other;
+    }
+    let target = state.x87.physical_index(usize::from(dest));
+    if state.x87.physical_tag(target) == 3 {
+        return X87Pc64::Operand;
+    }
+    let Some(mut a) = double(state.x87.regs[target], i32::MAX) else {
+        return X87Pc64::Operand;
+    };
+    let Some((mut b, _)) = load(source, i, state, memory, i32::MAX) else {
+        return X87Pc64::Operand;
+    };
+    if !bounded(a, RANGE) || !bounded(b, RANGE) {
+        return X87Pc64::Range;
+    }
+    if reverse {
+        std::mem::swap(&mut a, &mut b);
+    }
+    // Every nonzero input is >= 2^-400 and a multiple of 2^-452.
+    // Products and their residuals are multiples of 2^-904; sums and their
+    // residuals are multiples of 2^-452. No nonzero residual can underflow.
+    // The largest product is < 2^802; Dekker's split cannot overflow either.
+    // Thus TwoSum/TwoProduct gives exact = rounded + error, so error == 0
+    // proves an exactly representable result, also at extended precision.
+    let (result, error) = arithmetic(op, a, b);
+    if error != 0.0 {
+        X87Pc64::Inexact
+    } else if result == 0.0 {
+        X87Pc64::Zero
+    } else {
+        debug_assert!(result.is_normal());
+        X87Pc64::Exact
     }
 }
 
@@ -447,7 +517,7 @@ pub(crate) fn round_single_precision(value: f64) -> (f64, bool) {
 }
 
 /// Run `op` if it qualifies; `None` leaves every piece of state untouched.
-pub(super) fn execute(
+pub(crate) fn execute(
     op: &NativeX87,
     fast: Fast,
     state: &mut CpuState,
@@ -472,14 +542,17 @@ pub(super) fn execute(
     let slot = |top: usize, logical: usize| (top + logical) & 7;
     let empty = |physical: usize| x87.physical_tag(physical) == 3;
     match fast {
+        // ES and deferred MMX were checked above. WAIT changes neither C1 nor
+        // the last x87 instruction/data metadata, regardless of the control word.
+        Fast::Wait => metadata = false,
         Fast::Load(source) => {
-            let (value, at) = load(source, i, state, memory, i32::MAX)?;
+            let (value, at) = raw::source(source, i, state, memory)?;
             let target = top.wrapping_sub(1) & 7;
             if !empty(target) {
                 return None;
             }
             top = target;
-            writes[0] = (target, extended(value));
+            writes[0] = (target, value);
             dp = at;
             status &= !C1;
         }
@@ -505,38 +578,7 @@ pub(super) fn execute(
             if empty(physical) {
                 return None;
             }
-            let value = double(x87.regs[physical], 1022)?;
-            let (bytes, exact, up) = if integer {
-                let result = match control >> 10 & 3 {
-                    0 => value.round_ties_even(),
-                    3 => value.trunc(),
-                    _ => return None,
-                };
-                let limit = if width == 4 {
-                    2f64.powi(31)
-                } else {
-                    2f64.powi(63)
-                };
-                if result < -limit || result >= limit {
-                    return None;
-                }
-                let bits = (result as i64).to_le_bytes();
-                (bits, result == value, result.abs() > value.abs())
-            } else if width == 8 {
-                (value.to_bits().to_le_bytes(), true, false)
-            } else {
-                if control >> 10 & 3 != 0 {
-                    return None;
-                }
-                let result = value as f32;
-                if value != 0.0 && !result.is_normal() {
-                    return None;
-                }
-                let widened = f64::from(result);
-                let mut bytes = [0; 8];
-                bytes[..4].copy_from_slice(&result.to_bits().to_le_bytes());
-                (bytes, widened == value, widened.abs() > value.abs())
-            };
+            let (bits, exact, up) = raw::store_bits(x87.regs[physical], width, integer, control)?;
             if !exact && control & PE == 0 {
                 return None;
             }
@@ -544,7 +586,7 @@ pub(super) fn execute(
             if !exact {
                 status |= PE | if up { C1 } else { 0 };
             }
-            store(memory, at, &bytes[..usize::from(width)])?;
+            store(memory, at, &bits.to_le_bytes()[..usize::from(width)])?;
             dp = Some(at);
             if pop {
                 tags_freed[0] = physical;
@@ -557,7 +599,7 @@ pub(super) fn execute(
                 return None;
             }
             // Register copies keep any valid encoding the stack already holds.
-            double(x87.regs[from], i32::MAX)?;
+            raw::ordinary(x87.regs[from])?;
             writes[0] = (slot(top, usize::from(index)), x87.regs[from]);
             status &= !C1;
             if pop {
@@ -572,7 +614,11 @@ pub(super) fn execute(
             reverse,
             pop,
         } => {
-            let precision = arithmetic_precision(control)?;
+            let precision = if control & 0x0f3f == 0x033f {
+                64
+            } else {
+                arithmetic_precision(control)?
+            };
             let target = slot(top, usize::from(dest));
             if empty(target) {
                 return None;
@@ -589,6 +635,19 @@ pub(super) fn execute(
                 return None;
             }
             let (mut result, error) = arithmetic(op, a, b);
+            // With q and b within 2^+-400, q*b and its nonzero residual
+            // lie on the 2^-904 grid; Dekker splitting cannot overflow.
+            // a and fl(q*b) are adjacent enough for exact subtraction. Thus
+            // residual == 0 proves q*b == a, including for signed zero a.
+            if precision == 64 && op == Op::Div && !bounded(result, RANGE) {
+                return None;
+            }
+            // The range proof in pc64_opportunity rules out lost residuals.
+            // Nearest cancellation gives +0 (except -0 + -0); multiplication
+            // preserves sign XOR. These zero rules match the extended model.
+            if precision == 64 && error != 0.0 {
+                return None;
+            }
             let mut inexact = error != 0.0;
             let mut up = rounded_up(error, result);
             if precision == 24 {
@@ -616,12 +675,13 @@ pub(super) fn execute(
             if empty(first) {
                 return None;
             }
-            let a = double(x87.regs[first], i32::MAX)?;
-            let (b, at) = load(source, i, state, memory, i32::MAX)?;
+            let a = raw::ordinary(x87.regs[first])?;
+            let (b, at) = raw::source(source, i, state, memory)?;
+            let comparison = raw::compare(a, b);
             status = (status & !(C0 | C1 | C2 | C3))
-                | if a == b {
+                | if comparison.is_eq() {
                     C3
-                } else if a < b {
+                } else if comparison.is_lt() {
                     C0
                 } else {
                     0
@@ -637,8 +697,8 @@ pub(super) fn execute(
             if empty(first) || empty(second) {
                 return None;
             }
-            double(x87.regs[first], i32::MAX)?;
-            double(x87.regs[second], i32::MAX)?;
+            raw::ordinary(x87.regs[first])?;
+            raw::ordinary(x87.regs[second])?;
             writes = [(first, x87.regs[second]), (second, x87.regs[first])];
             status &= !C1;
         }
@@ -647,14 +707,17 @@ pub(super) fn execute(
             if empty(target) {
                 return None;
             }
-            let value = double(x87.regs[target], i32::MAX)?;
+            let value = raw::ordinary(x87.regs[target])?;
             writes[0] = (
                 target,
-                extended(if fast == Fast::Negate {
-                    -value
-                } else {
-                    value.abs()
-                }),
+                Ext::from_parts(
+                    value.significand(),
+                    if fast == Fast::Negate {
+                        value.sign_exponent() ^ 0x8000
+                    } else {
+                        value.sign_exponent() & 0x7fff
+                    },
+                ),
             );
             status &= !C1;
         }

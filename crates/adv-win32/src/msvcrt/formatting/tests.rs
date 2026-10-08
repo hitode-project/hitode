@@ -163,6 +163,8 @@ fn families<B: Backend>(cpu: B) {
         m.cpu.write(VA, &bytes).unwrap();
         let mut args = if front.mode == Mode::Measure {
             vec![FORMAT]
+        } else if front.mode == Mode::Unbounded {
+            vec![OUT]
         } else {
             vec![OUT, 256]
         };
@@ -203,7 +205,7 @@ fn families<B: Backend>(cpu: B) {
     }
 }
 #[test]
-fn twelve_fronts_share_checked_x86_va_transport_integer_widths_and_measurement() {
+fn all_fronts_share_checked_x86_va_transport_integer_widths_and_measurement() {
     families(UnicornCpu::new(PARK_ADDR).unwrap());
     families(JitCpu::new(PARK_ADDR, false).unwrap());
 }
@@ -389,7 +391,8 @@ fn crt_locale_and_dbcs_precision_remain_independent_of_win32_acp() {
 fn safety<B: Backend>(cpu: B) {
     let mut m = machine(cpu);
     seed(&mut m);
-    format(&mut m, "%f", false);
+    // Hexadecimal floats remain unsupported and must not touch the null va_list.
+    format(&mut m, "%a", false);
     exited(invoke(&mut m, "vsprintf_s", &[OUT, 16, FORMAT, 0], None));
     assert_eq!(errno(&m), 40);
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), u32::MAX);
@@ -399,7 +402,7 @@ fn safety<B: Backend>(cpu: B) {
             .get::<adv_abi::ApiDiagnostics>()
             .warnings
             .keys()
-            .any(|(_, reason)| reason.contains("floating-point"))
+            .any(|(_, reason)| reason.contains("outside the VC80 profile"))
     );
     seed(&mut m);
     format(&mut m, "%*d", false);

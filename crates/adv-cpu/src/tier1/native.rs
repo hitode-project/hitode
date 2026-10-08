@@ -1,9 +1,9 @@
-//! Linux ARM64 entry/exit, immutable code ownership, and checked continuations.
+//! Linux/Android ARM64 entry/exit, immutable code ownership, and checked continuations.
 use super::{BUDGET, DISPATCH, Execution, FALLBACK, LOAD, STORE, Tier1Stats, emit};
 use crate::execution_abi::Tier1Frame;
 use crate::interpreter::{Execution as Interpreted, Interpreter, Step};
 use crate::{CpuState, Memory};
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 use std::collections::{BTreeMap, VecDeque};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -51,7 +51,127 @@ adv_tier1_enter:
 );
 unsafe extern "C" {
     fn adv_tier1_enter(frame: *mut Tier1Frame, entry: *const u8, window: *mut u8);
+    // Android uses the NDK compiler-rt archive already linked by build.rs.
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
+}
+
+/// The entry frame followed by exclusive helper and architectural-state data.
+/// The frame comes first, so the pointer in x27 is also the helpers' context.
+#[repr(C)]
+pub(super) struct Entry {
+    pub(super) frame: Tier1Frame,
+    pub(super) memory: *mut Memory,
+    pub(super) inline: u64,
+    pub(super) state: *mut CpuState,
+    pub(super) vector: [u64; 2],
+}
+
+/// Checked 1/2/4-byte guest load without leaving native code, zero- or
+/// sign-extended by `kind`. The checks are the same as the Tier 0 access;
+/// on refusal nothing was read and the instruction reruns there.
+extern "C" fn load(entry: *mut Entry, address: u32, kind: u32) -> u64 {
+    // SAFETY: called only by emitted code inside `run_block`, which derived
+    // `memory` from its exclusive borrow and does not touch it until return.
+    let (memory, inline) = unsafe { (&*(*entry).memory, &mut (*entry).inline) };
+    let width = (kind & 7) as u8;
+    if !crate::interpreter::accessible(memory, address, width, crate::READ) {
+        return 1 << 32;
+    }
+    let Ok(bytes) = memory.read_data(address, width as usize) else {
+        return 1 << 32;
+    };
+    *inline += 1;
+    let mut raw = [0; 4];
+    raw[..bytes.len()].copy_from_slice(&bytes);
+    let value = u32::from_le_bytes(raw);
+    let unused = 32 - 8 * u32::from(width);
+    u64::from(if kind & emit::SIGNED != 0 {
+        ((value << unused) as i32 >> unused) as u32
+    } else {
+        value
+    })
+}
+
+/// Checked 1/2/4-byte guest store without leaving native code. A store to
+/// executable memory or one that advances the epoch asks the code to leave.
+/// CHECK_WRITE probes only validate permission, matching zero-count shifts.
+extern "C" fn store(entry: *mut Entry, address: u32, value: u32, kind: u32) -> u32 {
+    // SAFETY: as for `load`.
+    let (memory, inline) = unsafe { (&mut *(*entry).memory, &mut (*entry).inline) };
+    let width = kind & 7;
+    // Memory::write is a host write API; guest permissions must be checked
+    // before it so immutable code and guards cannot be bypassed.
+    if !crate::interpreter::accessible(memory, address, width as u8, crate::WRITE) {
+        return 2;
+    }
+    if kind & emit::CHECK_WRITE != 0 {
+        return 0;
+    }
+    let epoch = memory.epoch;
+    if memory
+        .write(address, &value.to_le_bytes()[..width as usize])
+        .is_err()
+    {
+        return 2;
+    }
+    *inline += 1;
+    u32::from(
+        memory.epoch != epoch
+            || memory.executable(address, 1)
+            || memory.executable(address.wrapping_add(width - 1), 1),
+    )
+}
+
+/// Stage a complete PUSHAD/POPAD transaction. No live guest register changes
+/// before success; POPAD deliberately does not read the saved ESP slot.
+extern "C" fn stack_all(entry: *mut Entry, pop: u32) -> u32 {
+    // SAFETY: the emitted caller spilled all GPRs to its private entry frame.
+    let entry = unsafe { &mut *entry };
+    let memory = unsafe { &mut *entry.memory };
+    let mut regs = entry.frame.regs;
+    let esp = regs[4];
+    if pop != 0 {
+        for (offset, index) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
+            if index == 4 {
+                continue;
+            }
+            let address = esp.wrapping_add(offset as u32 * 4);
+            if !crate::interpreter::accessible(memory, address, 4, crate::READ) {
+                return 2;
+            }
+            let Ok(bytes) = memory.read_data(address, 4) else {
+                return 2;
+            };
+            regs[index] = u32::from_le_bytes(bytes.as_ref().try_into().expect("scalar read"));
+        }
+        regs[4] = esp.wrapping_add(32);
+        entry.frame.regs = regs;
+        entry.inline += 7;
+        return 0;
+    }
+    let Some(address) = esp.checked_sub(32) else {
+        return 2;
+    };
+    // A single private-range write avoids partially committed pushes. Shared
+    // stacks and wrapping ranges retain Tier 0's ordered store transaction.
+    if !crate::interpreter::accessible(memory, address, 32, crate::WRITE)
+        || memory.shared_range(address, 32)
+    {
+        return 2;
+    }
+    let mut bytes = [0; 32];
+    for (n, value) in regs.iter().rev().enumerate() {
+        bytes[n * 4..n * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let epoch = memory.epoch;
+    if memory.write(address, &bytes).is_err() {
+        return 2;
+    }
+    entry.frame.regs[4] = address;
+    entry.inline += 8;
+    u32::from(
+        memory.epoch != epoch || memory.executable(address, 1) || memory.executable(esp - 1, 1),
+    )
 }
 
 struct Code {
@@ -100,15 +220,16 @@ impl Code {
                 code.pointer.as_ptr(),
                 bytes,
             );
+            // Clean data and invalidate instruction caches while still RW.
+            // The serial Rc owner publishes no entry until RX succeeds; code
+            // is immutable afterwards and never has a writable executable view.
+            __clear_cache(raw, raw.cast::<u8>().add(bytes).cast());
         }
         if unsafe { libc::mprotect(raw, len, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
             return Err(format!(
                 "publish Tier 1 code: {}",
                 std::io::Error::last_os_error()
             ));
-        }
-        unsafe {
-            __clear_cache(raw, raw.cast::<u8>().add(bytes).cast());
         }
         Ok(code)
     }
@@ -120,9 +241,45 @@ impl Drop for Code {
         }
     }
 }
+
+#[cfg(test)]
+mod publication_tests {
+    use super::Code;
+
+    #[test]
+    fn published_code_is_rx_and_new_instructions_are_visible() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for value in 1..=16u32 {
+            // Authored AArch64 MOV W0, #imm; RET. Cross a real host-page boundary
+            // so both 4 KiB and 16 KiB devices exercise full mapping protection.
+            let mut words = vec![0xd503201f; page / 4 + 1];
+            words[0] = 0x52800000 | (value << 5);
+            words[1] = 0xd65f03c0;
+            let code = Code::new(&words).unwrap();
+            assert_eq!(code.len, 2 * page);
+            let start = code.pointer.as_ptr() as usize;
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let permissions = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (low, high) = fields.next()?.split_once('-')?;
+                let low = usize::from_str_radix(low, 16).ok()?;
+                let high = usize::from_str_radix(high, 16).ok()?;
+                (low <= start && high >= start + code.len).then(|| fields.next().unwrap())
+            });
+            assert_eq!(permissions, Some("r-xp"));
+            // SAFETY: the immutable RX entry obeys the host ABI and returns u32.
+            let entry: unsafe extern "C" fn() -> u32 =
+                unsafe { std::mem::transmute(code.pointer.as_ptr()) };
+            assert_eq!(unsafe { entry() }, value);
+        }
+    }
+}
+
 struct Unit {
     code: Code,
     input: Vec<(u32, Vec<u8>)>,
+    // Descriptors embedded in native calls share the immutable code lifetime.
+    _x87: super::x87::Operations,
 }
 impl Unit {
     fn valid(&self, memory: &Memory) -> bool {
@@ -191,19 +348,37 @@ impl Engine {
             if !emit::supported(&instruction) {
                 continue;
             }
-            if instruction.is_jcc_short_or_near() || instruction.mnemonic() == Mnemonic::Jmp {
-                queue.push_back(instruction.near_branch32());
+            if instruction.is_jcc_short_or_near()
+                || emit::counter_branch(&instruction).is_some()
+                || matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call)
+                    && instruction.op0_kind() == OpKind::NearBranch32
+            {
+                queue.push_back(instruction.near_branch_target() as u32);
             }
-            if instruction.flow_control() != FlowControl::UnconditionalBranch {
+            // A call's return point is likely code; bytes after RET or JMP are not.
+            if !matches!(
+                instruction.flow_control(),
+                FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+                    | FlowControl::Return
+            ) {
                 queue.push_back(instruction.next_ip32());
             }
         }
         if !instructions.contains_key(&start) {
             return Ok(false);
         }
-        let mut emitted = emit::Emitter::new();
+        let x87 = super::x87::Operations::new(&instructions, &input);
+        let mut emitted = emit::Emitter::new(emit::Helpers {
+            load: load as *const () as u64,
+            store: store as *const () as u64,
+            stack_all: stack_all as *const () as u64,
+            x87: super::x87::call as *const () as u64,
+            vector_load: super::simd::load as *const () as u64,
+            vector_store: super::simd::store as *const () as u64,
+        });
         for instruction in instructions.values() {
-            emitted.instruction(instruction);
+            emitted.instruction(instruction, x87.get(instruction.ip32()));
         }
         let emitted = emitted.finish()?;
         let code = Code::new(&emitted.words)?;
@@ -212,7 +387,11 @@ impl Engine {
         }
         self.stats.compilations += 1;
         self.stats.code_bytes += emitted.words.len() as u64 * 4;
-        let unit = Rc::new(Unit { code, input });
+        let unit = Rc::new(Unit {
+            code,
+            input,
+            _x87: x87,
+        });
         for pc in instructions.keys() {
             self.entries
                 .insert(*pc, (unit.clone(), emitted.entries[pc]));
@@ -255,24 +434,35 @@ impl Engine {
             });
         }
         let (unit, offset) = &self.entries[&state.eip];
-        let mut frame = Tier1Frame {
-            regs: state.regs,
-            flags: state.eflags,
-            pc: state.eip,
-            remaining: u64::from(units),
-            stop,
-            fs_base: state.fs_base,
-            ..Default::default()
+        let window = memory.ptr.as_ptr();
+        state.commit_mmx();
+        let mut entry = Entry {
+            frame: Tier1Frame {
+                regs: state.regs,
+                flags: state.eflags,
+                pc: state.eip,
+                remaining: u64::from(units),
+                stop,
+                fs_base: state.fs_base,
+                ..Default::default()
+            },
+            memory: std::ptr::from_mut(memory),
+            inline: 0,
+            state: std::ptr::from_mut(state),
+            vector: [0; 2],
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
-        // Every emitted entry uses the fixed ABI; helpers run only after return.
+        // Every emitted entry uses the fixed ABI; the access helpers reach
+        // memory only through `entry`, and `memory` is unused until return.
         unsafe {
             adv_tier1_enter(
-                &mut frame,
+                (&raw mut entry).cast(),
                 unit.code.pointer.as_ptr().add(*offset),
-                memory.ptr.as_ptr(),
+                window,
             );
         }
+        let frame = entry.frame;
+        self.stats.inline_accesses += entry.inline;
         state.regs = frame.regs;
         state.eflags = frame.flags;
         state.eip = frame.pc;

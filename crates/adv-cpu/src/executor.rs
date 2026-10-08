@@ -3,14 +3,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::cliffs::InterpreterDetail;
 use crate::compile::{self, Compiled};
 use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 mod code_store;
+mod coverage;
 mod instruction_trace;
 mod interpreter_profile;
 mod parallel;
+mod schedule;
+pub use schedule::CompilationSchedule;
 mod tier1;
 mod verify;
 mod warm;
@@ -36,6 +40,7 @@ pub struct Stats {
     /// Largest responsive work estimate; zero means unrestricted/unmeasured.
     pub max_compile_work: usize,
     pub compile_time: Duration,
+    pub compilation_schedule: CompilationSchedule,
     pub native_code_bytes: usize,
     pub native_regions: usize,
     pub cache_evictions: u64,
@@ -64,6 +69,18 @@ pub struct Stats {
     pub cliffs: crate::Cliffs,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
+    pub direct_memory: DirectMemoryStats,
+}
+
+/// Direct scalar site publications and dynamic access outcomes.
+#[derive(Default, Clone, Debug)]
+pub struct DirectMemoryStats {
+    pub sites: u64,
+    pub accesses: u64,
+    pub recoveries: u64,
+    pub violations: u64,
+    pub checked_fallbacks: u64,
+    pub code_writes: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -142,6 +159,7 @@ pub struct Executor {
     profiled: Vec<(u32, Arc<compile::Profile>)>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
+    schedule: schedule::Tracker,
     background_sender: Option<adv_sync::background::LocalSender>,
     background_service: Option<std::rc::Rc<adv_sync::background::Service>>,
     background_wake: Option<adv_sync::WakeEvent>,
@@ -161,7 +179,7 @@ pub struct Executor {
     compile_threads: usize,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
-    attempted: BTreeSet<u32>,
+    attempted: BTreeMap<u32, InterpreterDetail>,
     cache_region_limit: usize,
     cache_byte_limit: usize,
     cache_clock: u64,
@@ -298,6 +316,18 @@ impl Executor {
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(engine) = &self.memory.direct_engine {
+            let stats = &mut self.stats.direct_memory;
+            stats.accesses = engine.accesses.get();
+            stats.recoveries = engine.recoveries.get();
+            stats.violations = engine.violations.get();
+            stats.checked_fallbacks = engine.checked.get();
+            stats.code_writes = engine.code_writes.get();
+        }
         self.timestamp = bridge.timestamp;
         result
     }
@@ -311,6 +341,28 @@ impl Executor {
             }
             Box::new(verifier)
         });
+    }
+    /// Account one verified native exit; strict mode stops at a mismatch.
+    fn record_verification(
+        &mut self,
+        check: Option<Result<verify::Check, String>>,
+    ) -> Result<(), String> {
+        let stats = &mut self.stats.verification;
+        match check {
+            None => stats.inconclusive += 1,
+            Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+            Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+            Some(Err(report)) => {
+                stats.mismatches += 1;
+                if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                    return Err(format!("tier verification: {report}"));
+                }
+                if stats.reports.len() < verify::REPORTS {
+                    stats.reports.push(report);
+                }
+            }
+        }
+        Ok(())
     }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
@@ -337,6 +389,31 @@ impl Executor {
             .as_ref()
             .map_or_else(Default::default, |pool| pool.stats())
     }
+    /// Choose before compiling or executing. The default remains checked.
+    /// Disabling after reservation requires a fresh owner, so outstanding host
+    /// aliases can never silently move to a different allocation.
+    pub fn set_direct_memory(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled == self.memory.direct_memory_enabled() {
+            return Ok(());
+        }
+        if !enabled {
+            return Err("create a fresh executor to disable direct memory".into());
+        }
+        if self.stats.native_entries != 0
+            || self.stats.interpreter_entries != 0
+            || !self.code.compiled.is_empty()
+            || !self.pending_regions.is_empty()
+            || !self.deferred_compilations.is_empty()
+            || self.tier1.is_some()
+        {
+            return Err(
+                "direct memory must be selected before compilation and execution, without Tier 1"
+                    .into(),
+            );
+        }
+        self.memory.enable_direct_memory()
+    }
+
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Self::create(Memory::new(base, len)?)
     }
@@ -355,7 +432,7 @@ impl Executor {
                 None
             }
         };
-        Ok(Self {
+        let mut executor = Self {
             rows,
             parallel: None,
             parallel_image: None,
@@ -378,6 +455,7 @@ impl Executor {
             profiled: Vec::new(),
             async_compilation: false,
             compiler: None,
+            schedule: Default::default(),
             background_sender: None,
             background_service: None,
             background_wake: None,
@@ -394,7 +472,7 @@ impl Executor {
             compile_threads: 0,
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
-            attempted: BTreeSet::new(),
+            attempted: BTreeMap::new(),
             cache_region_limit: 16384,
             cache_byte_limit: 128 * 1024 * 1024,
             cache_clock: 0,
@@ -412,7 +490,11 @@ impl Executor {
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
-        })
+        };
+        if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
+            executor.set_direct_memory(true)?;
+        }
+        Ok(executor)
     }
 
     pub(crate) fn setup_wow64_segments(&mut self, addr: u32) -> Result<(), String> {
@@ -596,6 +678,7 @@ impl Executor {
             }
             self.demand.remove(&pc);
         }
+        self.stats.direct_memory.sites += compiled.direct_sites as u64;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));
@@ -741,6 +824,7 @@ impl Executor {
         if self.pending_regions.contains_key(&region.start)
             || self.deferred_compilations.contains_key(&region.start)
         {
+            self.stats.compilation_schedule.duplicate_requests += 1;
             return Ok(false);
         }
         let policy = self.background_sender()?.borrow().work_policy();
@@ -749,6 +833,7 @@ impl Executor {
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(false);
         }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
@@ -767,8 +852,14 @@ impl Executor {
                     while self.compile_errors.len() > 64 {
                         self.compile_errors.pop_first();
                     }
-                    self.attempted.extend(region.entries.iter().copied());
-                    self.attempted.insert(region.start);
+                    self.attempted.extend(
+                        region
+                            .entries
+                            .iter()
+                            .map(|&pc| (pc, InterpreterDetail::WorkBudget)),
+                    );
+                    self.attempted
+                        .insert(region.start, InterpreterDetail::WorkBudget);
                     self.tier_attempted.insert(region.start);
                     return Ok(false);
                 }
@@ -779,6 +870,7 @@ impl Executor {
         // The owner may hold bounded immutable fragments waiting for a permit;
         // no submission waits and no single job contains the original giant unit.
         if self.deferred_compilations.len() + fragments.len() > 4096 {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(false);
         }
         self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
@@ -791,6 +883,7 @@ impl Executor {
         }
         for fragment in fragments {
             if !self.pending_regions.contains_key(&fragment.region.start) {
+                self.schedule_deferred(fragment.region.start);
                 self.deferred_sequence += 1;
                 self.deferred_order
                     .insert(fragment.region.start, self.deferred_sequence);
@@ -843,6 +936,9 @@ impl Executor {
                 worker.set_waker(wake.clone());
             }
             self.compiler = Some(worker);
+            self.stats.compilation_schedule.compile_threads = self.compile_threads.max(1);
+            self.stats.compilation_schedule.available_cores =
+                std::thread::available_parallelism().map_or(1, usize::from);
         }
         while self.pending_regions.len() < crate::compiler::CAPACITY {
             let Some(start) = self.next_deferred() else {
@@ -861,6 +957,7 @@ impl Executor {
             let region = (*snapshot.region).clone();
             match self.compiler.as_mut().unwrap().try_submit(snapshot.clone()) {
                 Ok(ticket) => {
+                    self.schedule_submitted(&region, ticket);
                     self.deferred_compilations.remove(&start);
                     self.stats.compile_requests += 1;
                     self.stats.max_compile_work = self
@@ -876,12 +973,16 @@ impl Executor {
                     self.automatic_regions.insert(region.start);
                     self.index_region(region);
                 }
-                Err(crate::compiler::SubmitError::Full) => break,
+                Err(crate::compiler::SubmitError::Full) => {
+                    self.stats.compilation_schedule.worker_full += 1;
+                    break;
+                }
                 Err(crate::compiler::SubmitError::Closed) => {
                     return Err("compiler worker disconnected".into());
                 }
                 Err(crate::compiler::SubmitError::WorkLimit { work, limit }) => {
                     self.deferred_compilations.remove(&start);
+                    self.record_rejection(&region, InterpreterDetail::WorkBudget);
                     self.stats.compile_work_rejections += 1;
                     self.compile_errors.insert(
                         start,
@@ -910,6 +1011,7 @@ impl Executor {
                 }
             };
             self.stats.compilations += 1;
+            self.schedule_completed(&completion);
             self.stats.compile_time += completion.duration;
             let start = completion.region.start;
             if self.pending_regions.get(&start) != Some(&completion.ticket) {
@@ -941,6 +1043,7 @@ impl Executor {
                     // A compilation failure must leave the original guest code
                     // executable by the interpreter; explicit compilation returns errors.
                     self.stats.compile_failures += 1;
+                    self.record_rejection(&completion.region, InterpreterDetail::CompileFailure);
                     self.compile_errors.insert(start, error);
                     while self.compile_errors.len() > 64 {
                         self.compile_errors.pop_first();
@@ -1058,6 +1161,7 @@ impl Executor {
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.async_compilation = enabled;
         if !enabled {
+            self.schedule = Default::default();
             self.tier_attempted.clear();
             self.pending_regions.clear();
             self.deferred_compilations.clear();
@@ -1316,7 +1420,7 @@ impl Executor {
             self.rejected_entries.remove(&pc);
             self.attempted.remove(&pc);
         }
-        if self.attempted.contains(&pc) {
+        if self.attempted.contains_key(&pc) {
             return Ok(());
         }
         let hits = self.hits.entry(pc).or_default();
@@ -1338,6 +1442,7 @@ impl Executor {
                 .values()
                 .any(|input| covers(&input.region))
         {
+            self.stats.compilation_schedule.window_deferrals += 1;
             return Ok(());
         }
         let boundaries = self
@@ -1366,23 +1471,28 @@ impl Executor {
                     .chain(std::iter::once(input.region.start))
             }))
             .collect();
-        let Some(region) = crate::discovery::discover(
+        let region = match crate::discovery::discover(
             &mut self.memory,
             pc,
             stop,
             self.auto_compile_strategy,
             &boundaries,
-        ) else {
-            self.attempted.insert(pc);
-            return Ok(());
+        ) {
+            Ok(region) => region,
+            Err(reason) => {
+                self.attempted.insert(pc, reason);
+                return Ok(());
+            }
         };
         if self.async_compilation {
             if self.queue_region(region)? {
-                self.attempted.insert(pc);
+                self.attempted
+                    .insert(pc, InterpreterDetail::NoPublishedEntry);
             }
         } else {
             self.add_region(region)?;
-            self.attempted.insert(pc);
+            self.attempted
+                .insert(pc, InterpreterDetail::NoPublishedEntry);
         }
         Ok(())
     }
@@ -1545,21 +1655,8 @@ impl Executor {
                     },
                 );
                 if let Some(trace) = &trace {
-                    let stats = &mut self.stats.verification;
-                    match trace.check(&self.state, &self.memory) {
-                        None => stats.inconclusive += 1,
-                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
-                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
-                        Some(Err(report)) => {
-                            stats.mismatches += 1;
-                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
-                                return Err(format!("tier verification: {report}"));
-                            }
-                            if stats.reports.len() < verify::REPORTS {
-                                stats.reports.push(report);
-                            }
-                        }
-                    }
+                    let check = trace.check(&self.state, &self.memory);
+                    self.record_verification(check)?;
                 }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
@@ -1662,6 +1759,29 @@ impl Executor {
                 .map_or((units, None), |trace| {
                     trace.prepare(units, &self.state, &self.memory)
                 });
+            let reason = {
+                use crate::InterpreterReason as Reason;
+                if interpreter_only || single_step || pending_fpu {
+                    Reason::Forced
+                } else if self.deferred_fallback == Some(pc) {
+                    Reason::Fallback
+                } else {
+                    match self.code.entry_owner.get(&pc) {
+                        Some(owner) if self.code.compiled.contains_key(owner) => Reason::Interior,
+                        Some(_) => Reason::Pending,
+                        None if self.attempted.contains_key(&pc) => Reason::Rejected,
+                        None => Reason::Uncovered,
+                    }
+                }
+            };
+            let detail = matches!(
+                reason,
+                crate::InterpreterReason::Uncovered | crate::InterpreterReason::Rejected
+            )
+            .then(|| self.interpreter_detail(pc));
+            if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
+                self.interpreter.census = Some(Default::default());
+            }
             let tier1 =
                 self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
             let (execution, last_units) = if let Some(result) = &tier1 {
@@ -1684,29 +1804,33 @@ impl Executor {
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
+            if let Some(entry) = self.interpreter.census.take() {
+                bridge
+                    .cliffs
+                    .tier1_census
+                    .get_or_insert_with(Default::default)
+                    .record(reason, detail.unwrap(), entry);
+            }
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
             let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
-            let reason = {
-                use crate::InterpreterReason as Reason;
-                if interpreter_only || single_step || pending_fpu {
-                    Reason::Forced
-                } else if self.deferred_fallback == Some(pc) {
-                    Reason::Fallback
-                } else {
-                    match self.code.entry_owner.get(&pc) {
-                        Some(owner) if self.code.compiled.contains_key(owner) => Reason::Interior,
-                        Some(_) => Reason::Pending,
-                        None if self.attempted.contains(&pc) => Reason::Rejected,
-                        None => Reason::Uncovered,
-                    }
-                }
-            };
             if interpreted {
+                if matches!(
+                    detail,
+                    Some(
+                        InterpreterDetail::PendingCompilation
+                            | InterpreterDetail::DeferredCompilation
+                    )
+                ) {
+                    self.schedule_interpreted(pc, interpreted_units);
+                }
                 bridge.cliffs.interpreted(reason, interpreted_units);
+                if let Some(detail) = detail {
+                    bridge.cliffs.detail(reason, detail, interpreted_units);
+                }
                 if let Some(profile) = &mut self.interpreter_profile {
                     profile.record(pc, interpreted_units, reason, &self.memory);
                 }
@@ -2554,8 +2678,19 @@ mod topology_tests {
         for pc in [0x1000, 0x1200] {
             m.write(pc, &[0x40, 0xc3]).unwrap();
         }
+        // Identical guest bytes need not compile to identical sizes at every
+        // address on every host, or even twice at one address (macOS ARM64
+        // varied by a few bytes), so the budget fits either region alone with
+        // slack but never both.
+        let mut probe = machine();
+        for pc in [0x1000, 0x1200] {
+            probe.write(pc, &[0x40, 0xc3]).unwrap();
+            discover(&mut probe, pc);
+        }
+        let sizes = [0x1000, 0x1200].map(|pc| probe.code.compiled[&pc].code_size);
+        eprintln!("region code sizes: {sizes:?}");
+        let size = sizes[0].max(sizes[1]) + sizes[0].min(sizes[1]) / 2;
         discover(&mut m, 0x1000);
-        let size = m.stats.native_code_bytes;
         m.set_code_cache_limits(8, size);
         discover(&mut m, 0x1200);
         assert!(m.stats.native_code_bytes <= size);

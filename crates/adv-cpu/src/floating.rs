@@ -91,9 +91,11 @@ pub(crate) unsafe extern "C" fn x87_call(
         let memory = unsafe { &mut *bridge.memory };
         let cliffs = &mut bridge.cliffs;
         cliffs.x87_helper_calls += 1;
-        if let Some(fast) = operation.fast
-            && let Some(result) = fast::execute(operation, fast, state, memory)
-        {
+        let result = match operation.fast {
+            Some(fast) => fast::execute(operation, fast, state, memory),
+            None => fast::execute_other(operation, state, memory),
+        };
+        if let Some(result) = result {
             cliffs.x87_fast += 1;
             return result;
         }
@@ -102,6 +104,22 @@ pub(crate) unsafe extern "C" fn x87_call(
         } else if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 {
             X87Cliff::Pending
         } else if fast::arithmetic_precision(state.x87.control).is_none() {
+            if state.x87.control & 0x0f3f == 0x033f {
+                let category = fast::pc64_opportunity(
+                    &operation.instruction,
+                    operation.fast.unwrap(),
+                    state,
+                    memory,
+                );
+                *cliffs
+                    .x87_pc64
+                    .entry((operation.instruction.mnemonic(), category))
+                    .or_default() += 1;
+            }
+            *cliffs
+                .x87_control
+                .entry(state.x87.control & 0x0f3f)
+                .or_default() += 1;
             X87Cliff::Control
         } else {
             X87Cliff::Operand
@@ -110,6 +128,7 @@ pub(crate) unsafe extern "C" fn x87_call(
             .x87_exact
             .entry((operation.instruction.mnemonic(), reason))
             .or_default() += 1;
+        cliffs.x87_forms.record(operation, state, memory);
         let epoch = memory.epoch;
         match execute(
             &operation.instruction,

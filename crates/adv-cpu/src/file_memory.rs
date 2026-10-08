@@ -1,4 +1,4 @@
-//! Worker-owned lazy/COW operands used only after native software guards.
+//! Worker-owned PCM and lazy/COW operands after native software guards.
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 unsafe fn memory<'a>(bridge: *mut u8) -> &'a mut crate::Memory {

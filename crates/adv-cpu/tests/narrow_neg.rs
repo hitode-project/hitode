@@ -277,6 +277,8 @@ fn narrow_neg_memory_faults_preserve_prefix_flags_and_atomic_writes_then_resume(
 }
 
 #[test]
+// Parallel guest workers exist only on Windows x64 MSVC.
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 fn locked_narrow_neg_falls_back_with_parallel_guest_execution() {
     for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
         let bytes = code(|assembler| {

@@ -1526,20 +1526,30 @@ fn compact_copy_interrupt_publishes_progress_and_resumes() {
     m.state.eip = CODE;
     // Finish compilation before starting the interrupt producer.
     assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
-    m.state.regs = regs(COUNT, SRC, SRC);
-    m.state.eip = CODE;
     let flag = Arc::new(AtomicBool::new(false));
     m.set_host_interrupt_flag(flag.clone());
-    let notify = flag.clone();
-    let producer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(2));
-        notify.store(true, Ordering::Release);
-    });
     let budget = 1 << 40;
-    let outcome = m.run(STOP, budget).unwrap();
-    producer.join().unwrap();
-    assert_eq!(outcome, RunOutcome::Interrupted);
-    let done = COUNT - m.state.regs[1];
+    // How long the copy runs depends on host memory bandwidth (a fast ARM64
+    // host finished it within a fixed 2 ms), so retry with other delays until
+    // the interrupt lands inside the batched loop. Entry also polls, so an
+    // interrupt raised before the run starts is not a mid-loop one.
+    let mut done = 0;
+    for delay in [200, 50, 1000, 20, 2000, 5] {
+        m.state.regs = regs(COUNT, SRC, SRC);
+        m.state.eip = CODE;
+        flag.store(false, Ordering::Release);
+        let notify = flag.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(delay));
+            notify.store(true, Ordering::Release);
+        });
+        let outcome = m.run(STOP, budget).unwrap();
+        producer.join().unwrap();
+        done = COUNT - m.state.regs[1];
+        if outcome == RunOutcome::Interrupted && done >= 5 {
+            break;
+        }
+    }
     assert!(
         done >= 5 && done < COUNT,
         "must interrupt after a packed batch"

@@ -155,16 +155,88 @@ fn hot_operations_are_native_even_between_lazy_integer_flags() {
 }
 
 #[test]
+fn wait_preserves_state_and_delivers_pending_exceptions() {
+    let code = bytes(|a| a.wait().unwrap());
+    for pc in 0..4 {
+        for rc in 0..4 {
+            for masks in [0, 0x3b, 0x3f] {
+                for status in [0, 0x7f, 0x4700, 0x8000, 0x80, 0x8084] {
+                    let mut s = state();
+                    s.x87.control = 0x40 | pc << 8 | rc << 10 | masks;
+                    s.x87.status |= status;
+                    compare(&code, s, |_| {}, Some(u64::from(status & 0x80 != 0)));
+                }
+            }
+        }
+    }
+    for mode in [1, 2, 3, 0x105] {
+        let mut s = state();
+        s.mmx_mode = mode;
+        compare(&code, s, |_| {}, Some(1));
+    }
+    let mut mem = memory(&code);
+    let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+    let mut s = state();
+    s.x87.control &= !4;
+    s.x87.status |= 0x8084;
+    let expected = s.clone();
+    assert_eq!(
+        testing::run(&compiled, &mut s, &mut mem),
+        Exit::Fallback as u32
+    );
+    assert_eq!(s.eip, CODE);
+    assert_eq!(s.x87, expected.x87);
+    assert_eq!(
+        Interpreter::new().step(&mut s, &mut mem),
+        Step::Trap {
+            pc: CODE,
+            vector: 16
+        }
+    );
+    assert_eq!(s.x87, expected.x87);
+}
+
+#[test]
+fn wait_after_exceptional_arithmetic_retains_exact_state_for_every_control() {
+    let code = bytes(|a| {
+        a.fmul_2(st0, st1).unwrap();
+        a.wait().unwrap();
+    });
+    for pc in 0..4 {
+        for rc in 0..4 {
+            for masks in [0, 0x3f] {
+                for value in [
+                    X87Register::from_parts(u64::MAX, 0x7ffe), // Extended overflow.
+                    X87Register::from_parts(1, 0),             // Extended denormal/underflow.
+                    X87Register::from_parts(0xc000_0000_0000_0123, 0x7fff),
+                    X87Register::from_parts(0x8000_0000_0000_0123, 0x7fff),
+                ] {
+                    let mut initial = state();
+                    initial.x87.control = 0x40 | pc << 8 | rc << 10 | masks;
+                    for index in 0..2 {
+                        let slot = initial.x87.physical_index(index);
+                        initial.x87.regs[slot] = value;
+                        initial.x87.set_physical_tag(slot, value.tag());
+                    }
+                    initial.refresh_mmx();
+                    compare(&code, initial, |_| {}, Some(1));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn precision_rounding_pending_exceptions_and_mmx_take_the_helper() {
     let code = bytes(|a| {
         a.fmul_2(st0, st1).unwrap();
     });
-    // 1.25 and 2.5 fit 24 bits, so PC=24 and PC=53 are both native.
+    // 1.25 and 2.5 fit 24 bits and multiply exactly at all three precisions.
     for precision in [0u16, 2, 3] {
         for rounding in 0..4 {
             let mut s = state();
             s.x87.control = 0x7f | precision << 8 | rounding << 10;
-            let calls = u64::from(precision == 3 || rounding != 0);
+            let calls = u64::from(rounding != 0);
             compare(&code, s, |_| {}, Some(calls));
         }
     }
@@ -218,7 +290,8 @@ fn exceptional_encodings_stack_faults_and_divide_by_zero_are_transactional() {
         s.x87.regs[slot] = value;
         s.x87.set_physical_tag(slot, value.tag());
         s.refresh_mmx();
-        compare(&code, s, |_| {}, Some(1));
+        // Normal raw80 copies need no binary64 precision/exponent restriction.
+        compare(&code, s, |_| {}, Some(u64::from(value.tag() == 2)));
     }
     for tags in [0, 0xffff] {
         let mut s = state();
@@ -504,9 +577,8 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
         );
         assert_eq!(
             testing::calls() - before,
-            // A rejected segment resumes the remaining instruction at its
-            // canonical cold helper entry before the two extended transfers.
-            if control == 0x027f { 2 } else { 4 }
+            // The exact PC=64 sum is native too; only raw80 transfers use helpers.
+            2
         );
         assert_eq!(actual, expected);
         assert_eq!(actual_memory.epoch, reference_memory.epoch);
@@ -520,6 +592,11 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
 
 #[path = "segment_tests.rs"]
 mod segment_tests;
+
+#[path = "pc64_tests.rs"]
+mod pc64_tests;
+#[path = "rest_tests.rs"]
+mod rest_tests;
 
 #[path = "hardware_tests.rs"]
 #[cfg(target_arch = "x86_64")]

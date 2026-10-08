@@ -159,7 +159,7 @@ impl Executor {
                 || std::iter::once(&region.start)
                     .chain(&region.entries)
                     .any(|pc| {
-                        self.code.entry_owner.contains_key(pc) || self.attempted.contains(pc)
+                        self.code.entry_owner.contains_key(pc) || self.attempted.contains_key(pc)
                     });
             if !matches || known {
                 continue;
@@ -168,8 +168,13 @@ impl Executor {
             let start = region.start;
             if self.queue_region(region.clone())? {
                 self.stats.warm_requests += 1;
-                self.attempted.insert(start);
-                self.attempted.extend(entries);
+                self.attempted
+                    .insert(start, super::InterpreterDetail::NoPublishedEntry);
+                self.attempted.extend(
+                    entries
+                        .into_iter()
+                        .map(|pc| (pc, super::InterpreterDetail::NoPublishedEntry)),
+                );
             } else if !expired {
                 kept.push((region, expected));
             }

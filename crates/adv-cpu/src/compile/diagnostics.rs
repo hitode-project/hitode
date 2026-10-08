@@ -30,6 +30,8 @@ pub(super) enum Overhead {
     Transfer = 6,
     /// State writeback, exit footers and region chaining.
     Exit = 7,
+    /// Materialization of lazy arithmetic flags.
+    Flags = 8,
 }
 
 /// Code emitted for one guest instruction. Memory validation and its cold
@@ -170,6 +172,7 @@ fn rows(
             5 => (0, "budget", "overhead"),
             6 => (0, "transfer", "overhead"),
             7 => (0, "exit", "overhead"),
+            8 => (0, "flags", "overhead"),
             X87_RECOVERY => (0, "slow", "x87-recovery"),
             bits if bits >= GUEST => {
                 let pc = origin.wrapping_add((bits - GUEST) >> 2);

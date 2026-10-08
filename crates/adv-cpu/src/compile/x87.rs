@@ -2,8 +2,8 @@
 //!
 //! Canonical 80-bit registers are materialized at every observable boundary.
 //! Bounded straight-line segments retain admitted binary64 values between ops.
-//! Only exact binary64 inputs
-//! are admitted; arithmetic additionally requires PC=53 or PC=24 with 24-bit
+//! Single-instruction register transfers retain ordinary raw80 encodings.
+//! Numeric lanes admit exact binary64 inputs; arithmetic requires PC=53, exact PC=64, or PC=24 with 24-bit
 //! operands, RC=nearest, masked exceptions and the same 2^+-400 bounds as
 //! floating::fast. Error-free residuals and the 24-bit re-rounding reproduce
 //! PE/C1, including signed zero. Every rejection precedes guest writes
@@ -183,17 +183,40 @@ impl Emitter<'_> {
         let pending = self.b.ins().band_imm(status, 0x80);
         let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
         self.x87_reject(pending, slow);
+        if fast == Fast::Wait {
+            // The success path is a guarded NOP. In particular, preserve C1,
+            // FIP/FDP/FOP and the stack; the helper still delivers pending #MF.
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(slow);
+            self.x87_instruction(i, operation);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+            self.b.seal_block(done);
+            return;
+        }
         let control = self.x87_word(offset_of!(X87State, control));
         let mut tags = self.x87_word(offset_of!(X87State, tag));
         let top = self.b.ins().ushr_imm(status, 11);
         let mut top = self.b.ins().band_imm(top, 7);
         let mut writes = Vec::with_capacity(2);
+        let mut raw_writes = Vec::with_capacity(2);
         let mut freed = Vec::with_capacity(2);
         let mut dp = None;
         let mut metadata = true;
         status = self.b.ins().band_imm(status, !C1);
 
         match fast {
+            Fast::Wait => unreachable!(),
+            Fast::Load(Source::St(index)) => {
+                let from = self.x87_slot(top, index);
+                let value = self.x87_raw(from, tags, slow);
+                let target = self.x87_slot(top, 7);
+                let tag = self.x87_tag(tags, target);
+                let occupied = self.b.ins().icmp_imm(IntCC::NotEqual, tag, 3);
+                self.x87_reject(occupied, slow);
+                top = target;
+                raw_writes.push((target, value));
+            }
             Fast::Load(source) => {
                 let (value, at) = self.x87_source(i, source, top, tags, 1023, slow);
                 let target = self.x87_slot(top, 7);
@@ -290,9 +313,9 @@ impl Emitter<'_> {
                 }
             }
             Fast::StoreSt { index, pop } => {
-                let value = self.x87_double(top, tags, 1023, slow);
+                let value = self.x87_raw(top, tags, slow);
                 let target = self.x87_slot(top, index);
-                writes.push((target, value));
+                raw_writes.push((target, value));
                 if pop {
                     freed.push(top);
                     top = self.x87_slot(top, 1);
@@ -305,13 +328,13 @@ impl Emitter<'_> {
                 reverse,
                 pop,
             } => {
-                let single = self.x87_admit_arithmetic(control, slow);
+                let precision = self.x87_admit_arithmetic(control, slow);
                 let target = self.x87_slot(top, dest);
                 let a = (self.x87_double(target, tags, RANGE, slow), false);
                 let (b, at) = self.x87_source(i, source, top, tags, RANGE, slow);
                 let b = (b, matches!(source, Source::F32 | Source::I16));
                 let (a, b) = if reverse { (b, a) } else { (a, b) };
-                let (result, inexact, up) = self.x87_rounded_arithmetic(op, a, b, single, slow);
+                let (result, inexact, up) = self.x87_rounded_arithmetic(op, a, b, precision, slow);
                 status = self.x87_round_flags(status, inexact, up);
                 writes.push((target, result));
                 dp = at;
@@ -340,18 +363,18 @@ impl Emitter<'_> {
             }
             Fast::Exchange(index) => {
                 let target = self.x87_slot(top, index);
-                let a = self.x87_double(top, tags, 1023, slow);
-                let b = self.x87_double(target, tags, 1023, slow);
-                writes.extend([(top, b), (target, a)]);
+                let a = self.x87_raw(top, tags, slow);
+                let b = self.x87_raw(target, tags, slow);
+                raw_writes.extend([(top, b), (target, a)]);
             }
             Fast::Negate | Fast::Absolute => {
-                let value = self.x87_double(top, tags, 1023, slow);
-                let value = if fast == Fast::Negate {
-                    self.b.ins().fneg(value)
+                let (sig, se, zero) = self.x87_raw(top, tags, slow);
+                let se = if fast == Fast::Negate {
+                    self.b.ins().bxor_imm(se, 0x8000)
                 } else {
-                    self.b.ins().fabs(value)
+                    self.b.ins().band_imm(se, 0x7fff)
                 };
-                writes.push((top, value));
+                raw_writes.push((top, (sig, se, zero)));
             }
             Fast::LoadControl => {
                 let (_, pointer) = self.x87_memory(i, 2, false, slow);
@@ -390,6 +413,11 @@ impl Emitter<'_> {
         }
         for (slot, value) in writes {
             let zero = self.x87_write(slot, value);
+            let tag = self.b.ins().uextend(types::I32, zero);
+            tags = self.x87_set_tag(tags, slot, tag);
+        }
+        for (slot, (sig, se, zero)) in raw_writes {
+            self.x87_write_raw(slot, sig, se);
             let tag = self.b.ins().uextend(types::I32, zero);
             tags = self.x87_set_tag(tags, slot, tag);
         }
@@ -481,6 +509,36 @@ impl Emitter<'_> {
             .ins()
             .iadd_imm(pointer, (FP + offset_of!(X87State, regs)) as i64)
     }
+    /// Normal raw80 or signed zero, without imposing a binary64 precision or
+    /// exponent bound. Keep exceptional encodings on the transactional path.
+    fn x87_raw(&mut self, slot: Value, tags: Value, slow: ir::Block) -> (Value, Value, Value) {
+        let tag = self.x87_tag(tags, slot);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, tag, 3);
+        self.x87_reject(empty, slow);
+        let pointer = self.x87_register_pointer(slot);
+        let sig = self
+            .b
+            .ins()
+            .load(types::I64, MemFlags::trusted(), pointer, 0);
+        let se = self
+            .b
+            .ins()
+            .load(types::I16, MemFlags::trusted(), pointer, 8);
+        let exp = self.b.ins().band_imm(se, 0x7fff);
+        let exp_zero = self.b.ins().icmp_imm(IntCC::Equal, exp, 0);
+        let sig_zero = self.b.ins().icmp_imm(IntCC::Equal, sig, 0);
+        let zero = self.b.ins().band(exp_zero, sig_zero);
+        let relative = self.b.ins().iadd_imm(exp, -1);
+        let finite = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, relative, 0x7ffe);
+        let normalized = self.b.ins().icmp_imm(IntCC::SignedLessThan, sig, 0);
+        let normal = self.b.ins().band(finite, normalized);
+        let valid = self.b.ins().bor(zero, normal);
+        self.x87_require(valid, slow);
+        (sig, se, zero)
+    }
     fn x87_double(&mut self, slot: Value, tags: Value, range: i32, slow: ir::Block) -> Value {
         #[cfg(test)]
         testing::emitted(|counts| counts.tag_guards += 1);
@@ -552,6 +610,10 @@ impl Emitter<'_> {
         let se = self.b.ins().bor(sign, exponent);
         let se = self.b.ins().select(zero, sign, se);
         let se = self.b.ins().ireduce(types::I16, se);
+        self.x87_write_raw(slot, sig, se);
+        zero
+    }
+    fn x87_write_raw(&mut self, slot: Value, sig: Value, se: Value) {
         let pointer = self.x87_register_pointer(slot);
         self.b.ins().store(MemFlags::trusted(), sig, pointer, 0);
         self.b.ins().store(MemFlags::trusted(), se, pointer, 8);
@@ -566,7 +628,6 @@ impl Emitter<'_> {
             alias,
             offset_of!(CpuState, mmx) as i32,
         );
-        zero
     }
     fn x87_memory(
         &mut self,
@@ -671,27 +732,29 @@ impl Emitter<'_> {
         }
         (value, Some(at))
     }
-    /// Admit RC=nearest, masked exceptions and PC=53 or PC=24; the result is
-    /// true for PC=24.
-    fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> Value {
+    /// Admit RC=nearest, masked exceptions and valid PC; return PC=24/PC=64.
+    fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> (Value, Value) {
         #[cfg(test)]
         testing::emitted(|counts| counts.control_guards += 1);
         let masked = self.b.ins().band_imm(control, 0xf3f);
         let double = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x23f);
         let single = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x03f);
+        let extended = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x33f);
         let valid = self.b.ins().bor(double, single);
+        let valid = self.b.ins().bor(valid, extended);
         self.x87_require(valid, slow);
-        single
+        (single, extended)
     }
     /// One admitted arithmetic operation: (result, inexact, rounded up). PC=24
     /// rejects operands wider than 24 bits, except those known to be narrow,
     /// then re-rounds the binary64 result exactly as floating::fast does.
+    /// PC=64 rejects every nonzero residual; division also bounds the quotient.
     fn x87_rounded_arithmetic(
         &mut self,
         op: Op,
         (a, a_narrow): (Value, bool),
         (b, b_narrow): (Value, bool),
-        single: Value,
+        (single, extended): (Value, Value),
         slow: ir::Block,
     ) -> (Value, Value, Value) {
         let tail = crate::floating::fast::SINGLE_TAIL as i64;
@@ -714,7 +777,29 @@ impl Emitter<'_> {
             self.x87_reject(bad, slow);
         }
         let (result, error) = self.x87_arithmetic(op, a, b);
+        if op == Op::Div {
+            // The same 2^-904 product/residual grid as floating::fast requires
+            // both q and b to be bounded. All checks precede guest writes.
+            let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
+            let magnitude = self.b.ins().ishl_imm(bits, 1);
+            let is_zero = self.b.ins().icmp_imm(IntCC::Equal, magnitude, 0);
+            let exponent = self.b.ins().ushr_imm(magnitude, 53);
+            let relative = self.b.ins().iadd_imm(exponent, -i64::from(1023 - RANGE));
+            let bounded = self.b.ins().icmp_imm(
+                IntCC::UnsignedLessThanOrEqual,
+                relative,
+                i64::from(2 * RANGE),
+            );
+            let valid = self.b.ins().bor(is_zero, bounded);
+            let invalid = self.b.ins().bnot(valid);
+            let bad = self.b.ins().band(extended, invalid);
+            self.x87_reject(bad, slow);
+        }
         let inexact = self.b.ins().fcmp(FloatCC::NotEqual, error, zero);
+        // With bounded inputs the residual is exact, including on Dekker hosts.
+        // No guest write occurs before this PC=64 exactness guard.
+        let bad = self.b.ins().band(extended, inexact);
+        self.x87_reject(bad, slow);
         let err_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), error);
         let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
         let signs = self.b.ins().bxor(err_bits, bits);

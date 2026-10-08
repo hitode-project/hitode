@@ -95,7 +95,11 @@ pub(in crate::compile) fn segments(
         }
         let mut run = vec![*i];
         let numeric = |i: &Instruction| {
-            floating(i) && crate::floating::fast::classify(i) != Some(Fast::LoadControl)
+            floating(i)
+                && !matches!(
+                    crate::floating::fast::classify(i),
+                    Some(Fast::LoadControl | Fast::Wait)
+                )
         };
         let mut count = usize::from(numeric(i));
         while count < LIMIT && run.len() < SPAN {
@@ -174,7 +178,7 @@ struct Resident {
 struct Control {
     value: Value,
     /// Some(single) proves masked exceptions and round-to-nearest at PC=24/53.
-    arithmetic: Option<Value>,
+    arithmetic: Option<(Value, Value)>,
 }
 
 #[derive(Clone)]
@@ -269,6 +273,11 @@ impl Emitter<'_> {
                 self.x87_reject(bad, slow);
             }
             let fast = crate::floating::fast::classify(i).unwrap();
+            // Entry rejects ES/MMX, and every admitted lane operation keeps ES
+            // clear (including FLDCW). WAIT preserves the entire resident prefix.
+            if fast == Fast::Wait {
+                continue;
+            }
             if fast != Fast::LoadControl {
                 prefix.status = self.b.ins().band_imm(prefix.status, !C1);
             }
@@ -395,12 +404,12 @@ impl Emitter<'_> {
                     reverse,
                     pop,
                 } => {
-                    let tail = match prefix.control.arithmetic {
-                        Some(tail) => tail,
+                    let precision = match prefix.control.arithmetic {
+                        Some(precision) => precision,
                         None => {
-                            let tail = self.x87_admit_arithmetic(prefix.control.value, slow);
-                            prefix.control.arithmetic = Some(tail);
-                            tail
+                            let precision = self.x87_admit_arithmetic(prefix.control.value, slow);
+                            prefix.control.arithmetic = Some(precision);
+                            precision
                         }
                     };
                     let target = prefix.slot(dest);
@@ -411,7 +420,7 @@ impl Emitter<'_> {
                         op,
                         (a.value, a.narrow.known()),
                         (b.value, b.narrow.known()),
-                        tail,
+                        precision,
                         slow,
                     );
                     // Both input checks dominate this continuation. The proof
@@ -506,7 +515,7 @@ impl Emitter<'_> {
                     // FLDCW leaves C1, FIP/FDP/FOP and TOP/tag unchanged.
                     continue;
                 }
-                Fast::StoreControl | Fast::StoreStatus => unreachable!(),
+                Fast::Wait | Fast::StoreControl | Fast::StoreStatus => unreachable!(),
             }
             prefix.metadata = Some((i.ip32(), self.x87[&i.ip32()].1));
         }

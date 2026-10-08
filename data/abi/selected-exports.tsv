@@ -19,3 +19,5 @@ xinput9_1_0.dll	XInputGetCapabilities	xinput1_4.dll	XInputGetCapabilities	3
 # Classic guest UI capability queries; no whole UxTheme DLL projection.
 uxtheme.dll	IsAppThemed	uxtheme.dll	IsAppThemed	0
 uxtheme.dll	IsThemeActive	uxtheme.dll	IsThemeActive	0
+# Project the implemented safe failure without widening the DWM module scope.
+dwmapi.dll	DwmSetWindowAttribute	dwmapi.dll	DwmSetWindowAttribute	4

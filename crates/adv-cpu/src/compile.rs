@@ -17,11 +17,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub(crate) mod coverage;
 mod diagnostics;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod direct;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod fp_environment;
 mod invariants;
+mod ir_counts;
 mod loops;
 mod mmx;
 mod nest;
@@ -33,6 +39,7 @@ mod scalar;
 mod shadow;
 mod simd;
 mod sse;
+mod string;
 mod vector;
 mod write_summary;
 pub(crate) mod x87;
@@ -66,7 +73,13 @@ pub(crate) struct Compiled {
     window_base: u32,
     window_len: usize,
     pub entries: BTreeSet<u32>,
+    /// Entry forms deliberately left to the interpreter after code generation.
+    pub excluded_entries: BTreeMap<u32, iced_x86::Code>,
     pub code_size: usize,
+    pub instruction_count: usize,
+    pub decoded_bytes: usize,
+    ir_counts: Option<ir_counts::Summary>,
+    pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     _nests: Box<[crate::rows::Descriptor]>,
@@ -75,11 +88,11 @@ pub(crate) struct Compiled {
     pub cache_stamp: std::cell::Cell<u64>,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     versioned_loops: usize,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     vectorized_loops: usize,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     invariant_body: bool,
 }
 
@@ -94,6 +107,12 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    pub(crate) fn record_ir_counts(&self, service: std::time::Duration) {
+        if let Some(counts) = &self.ir_counts {
+            eprintln!("compile-ir: {}", counts.json(self.code_size, service));
+        }
+    }
+
     pub(crate) fn profile(&self) -> Option<&Profile> {
         self.input.profile.as_deref()
     }
@@ -110,7 +129,8 @@ impl Compiled {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
     }
     pub fn valid(&self, memory: &Memory) -> bool {
-        memory.base == self.window_base
+        self.input.direct_memory == memory.direct_memory_enabled()
+            && memory.base == self.window_base
             && memory.len == self.window_len
             && self
                 .pages
@@ -138,6 +158,9 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
+        if self.input.direct_memory != memory.direct_memory_enabled() {
+            return (Exit::Fallback as u32, 0);
+        }
         #[cfg(target_arch = "aarch64")]
         let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
@@ -278,6 +301,7 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
     parallel: bool,
+    direct_memory: bool,
     pub region: Box<Region>,
     base: u32,
     len: usize,
@@ -328,6 +352,7 @@ impl Snapshot {
         let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
             parallel: self.parallel,
+            direct_memory: self.direct_memory,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -393,6 +418,7 @@ impl Snapshot {
         }
         Ok(Self {
             parallel: memory.is_parallel(),
+            direct_memory: memory.direct_memory_enabled(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -416,7 +442,8 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.parallel == memory.is_parallel()
+        self.direct_memory == memory.direct_memory_enabled()
+            && self.parallel == memory.is_parallel()
             && memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
@@ -709,10 +736,15 @@ pub(crate) fn compile(
 ) -> Result<Compiled, String> {
     let mut input = Snapshot::capture(region, memory)?;
     input.shadow_returns = shadow_returns;
-    compile_snapshot(&input)
+    let started = std::time::Instant::now();
+    let compiled = compile_snapshot(&input)?;
+    compiled.record_ir_counts(started.elapsed());
+    Ok(compiled)
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    let ir_counts =
+        ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
     let bytes = &snapshot.bytes;
     let first_page = (region.start - snapshot.base) as usize / 4096;
@@ -837,6 +869,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
         if crate::strings::operation(instruction).is_some()
+            || string::repeated(instruction)
             || (!supported(instruction) && crate::floating::native_x87(instruction))
         {
             entries.insert(instruction.ip32());
@@ -845,8 +878,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         if instruction.flow_control() != FlowControl::Next {
             entries.insert(instruction.next_ip32());
         }
-        if matches!(instruction.op0_kind(), OpKind::NearBranch32) {
-            entries.insert(instruction.near_branch32());
+        // An interpreted instruction returns with canonical state. Publish its
+        // decoded continuation so a cold form does not strand the supported
+        // remainder of this block in the interpreter on every execution.
+        if !supported(instruction) && !crate::floating::native_x87(instruction) {
+            entries.insert(instruction.next_ip32());
+        }
+        if matches!(
+            instruction.op0_kind(),
+            OpKind::NearBranch16 | OpKind::NearBranch32
+        ) {
+            entries.insert(instruction.near_branch_target() as u32);
         }
     }
     // A matching indirect call dispatches to a decoded callee internally.
@@ -884,6 +926,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
+                && !string::supported(i)
                 && !matches!(i.mnemonic(), M::Int | M::Rdtsc)
         })
     } else {
@@ -928,9 +971,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         BTreeMap::new()
     };
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     let vectorized_loops = batches.iter().flatten().count();
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     let versioned_loops = plans.len();
     let return_hint = if returns.len() == 1 {
         returns.first().copied()
@@ -972,6 +1015,22 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
     builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    builder.symbol(
+        "adv_direct_scalar",
+        crate::direct_memory::access as *const u8,
+    );
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    builder.symbol(
+        "adv_direct_checked",
+        crate::direct_memory::checked as *const u8,
+    );
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
@@ -981,10 +1040,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.symbol(
         "adv_file_write_prepared",
         crate::file_memory::write_prepared as *const u8,
-    );
-    builder.symbol(
-        "adv_atomic_load_vector",
-        crate::atomic_memory::load_vector as *const u8,
     );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
     builder.symbol("adv_nest_run", crate::rows::run as *const u8);
@@ -1026,6 +1081,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let direct_ids = if snapshot.direct_memory {
+        Some(direct::declare(&mut module)?)
+    } else {
+        None
+    };
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -1056,17 +1120,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     ]);
     let atomic_store_id = module
         .declare_function("adv_atomic_store", Linkage::Import, &atomic_store_signature)
-        .map_err(|e| e.to_string())?;
-    let mut atomic_load_signature = module.make_signature();
-    atomic_load_signature
-        .params
-        .extend([AbiParam::new(ptr_ty); 2]);
-    let atomic_load_id = module
-        .declare_function(
-            "adv_atomic_load_vector",
-            Linkage::Import,
-            &atomic_load_signature,
-        )
         .map_err(|e| e.to_string())?;
     let mut file_signature = module.make_signature();
     file_signature.params.extend([
@@ -1122,9 +1175,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Fault recipes read their own source locations; keep them untagged.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
+    let source_map =
+        (diagnostics::instruction_map_enabled() || ir_counts.is_some()) && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
-    let source_map = diagnostics::instruction_map_enabled();
+    let source_map = diagnostics::instruction_map_enabled() || ir_counts.is_some();
     let mut nest_signature = module.make_signature();
     nest_signature.params.extend([AbiParam::new(ptr_ty); 4]);
     nest_signature.returns.push(AbiParam::new(types::I32));
@@ -1161,7 +1215,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
         let x87_ref = module.declare_func_in_func(x87_id, func);
         let atomic_store_ref = module.declare_func_in_func(atomic_store_id, func);
-        let atomic_load_ref = module.declare_func_in_func(atomic_load_id, func);
         let file_read_ref = module.declare_func_in_func(file_read_id, func);
         let file_write_ref = module.declare_func_in_func(file_write_id, func);
         let file_prepared_ref = module.declare_func_in_func(file_prepared_id, func);
@@ -1468,6 +1521,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                             && blocks.contains_key(&i.near_branch32())
                     })
         });
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let direct_refs = direct_ids
+            .filter(|_| kernel.is_none() && !invariant_body)
+            .map(|(access, checked)| {
+                (
+                    module.declare_func_in_func(access, b.func),
+                    module.declare_func_in_func(checked, b.func),
+                )
+            });
         let mut e = Emitter {
             b,
             optimizing: opt_level == "speed",
@@ -1561,12 +1626,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
                 .collect(),
             atomic_store_ref,
-            atomic_load_ref,
             file_read_ref,
             file_write_ref,
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            direct_refs,
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1860,6 +1929,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         e.b.seal_all_blocks();
         e.b.finalize();
+        ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
     };
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
@@ -1924,7 +1994,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let row_thunk = if nests.is_empty() {
         None
     } else {
-        let result = nest_emit::thunk(&mut module, &mut fb_ctx, &tail_signature)?;
+        let result = nest_emit::thunk(
+            &mut module,
+            &mut fb_ctx,
+            &tail_signature,
+            ir_counts.as_ref(),
+        )?;
         let id = result.0;
         kernel_functions.push(result);
         Some(id)
@@ -2111,6 +2186,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.seal_all_blocks();
         b.finalize();
     }
+    ir_counts::Counts::function(
+        ir_counts.as_ref(),
+        &wrapper.func,
+        region.start,
+        &instructions,
+    );
     module
         .define_function(wrapper_id, &mut wrapper)
         .map_err(|e| format!("{e:?}"))?;
@@ -2160,9 +2241,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     // Callee code stays owned by its own unit; only calls from here reach it.
+    let mut excluded_entries = BTreeMap::new();
     entries.retain(|pc| {
-        !callee_code.contains(pc)
-            && (supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc))
+        if callee_code.contains(pc) {
+            return false;
+        }
+        let admitted =
+            supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc);
+        if !admitted {
+            excluded_entries.insert(*pc, instructions[pc].code());
+        }
+        admitted
     });
     let input = snapshot.with_coverage(&instructions, &pages);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2196,6 +2285,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
     }
     Ok(Compiled {
+        ir_counts: ir_counts.map(|counts| {
+            counts.into_inner().finish(
+                if opt_level == "speed" {
+                    "speed"
+                } else {
+                    "fast"
+                },
+                &instructions,
+            )
+        }),
+        instruction_count: instructions.len(),
+        decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         unwind,
@@ -2215,17 +2316,41 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         window_base: snapshot.base,
         window_len: snapshot.len,
         entries,
+        excluded_entries,
+        direct_sites: {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                if snapshot.direct_memory {
+                    instructions
+                        .values()
+                        .filter(|i| direct::candidate(i))
+                        .count()
+                } else {
+                    0
+                }
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            {
+                0
+            }
+        },
         code_size,
         _x87: x87,
         _nests: descriptors,
         cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         versioned_loops,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         vectorized_loops,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         invariant_body: invariant_id.is_some(),
     })
 }
@@ -2668,7 +2793,7 @@ fn exclusive(i: &Instruction) -> bool {
 }
 
 pub(crate) fn supported(i: &Instruction) -> bool {
-    if crate::strings::operation(i).is_some() {
+    if crate::strings::operation(i).is_some() || string::supported(i) {
         return true;
     }
     // `rep ret` is the branch-predictor idiom for a plain return.
@@ -2725,6 +2850,8 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             | M::Jp
             | M::Jnp
             | M::Loop
+            | M::Jecxz
+            | M::Jcxz
     ) {
         return simd::supported(i)
             || scalar::supported(i)
@@ -2754,6 +2881,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
                 }
             }
             OpKind::Immediate32 | OpKind::Immediate8to32 | OpKind::NearBranch32 => {}
+            OpKind::NearBranch16 if matches!(i.mnemonic(), M::Jcxz | M::Jecxz) => {}
             OpKind::Immediate16 if i.mnemonic() == M::Ret || narrow => {}
             OpKind::Immediate8 if narrow => {}
             OpKind::Immediate8to16 if narrow_alu(i.mnemonic()) || word_stack(i) => {}
@@ -2887,7 +3015,6 @@ struct Emitter<'a> {
     /// lane then materializes its prefix and re-executes canonically.
     lane: Option<ir::Block>,
     atomic_store_ref: ir::FuncRef,
-    atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
     file_write_ref: ir::FuncRef,
     file_prepare_ref: ir::FuncRef,
@@ -2895,6 +3022,11 @@ struct Emitter<'a> {
     timestamp_ref: ir::FuncRef,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
     source_map: bool,
     source_origin: u32,
     source: ir::SourceLoc,
@@ -4325,17 +4457,20 @@ impl Emitter<'_> {
             return addr;
         }
         let mut addr = self.constant(i.memory_displacement32());
-        if let Some(reg) = reg_index(i.memory_base()) {
-            let value = self.b.use_var(self.regs[reg]);
+        if i.memory_base() != R::None {
+            let value = self.read_register(i.memory_base());
             addr = self.b.ins().iadd(addr, value);
         }
-        if let Some(reg) = reg_index(i.memory_index()) {
-            let value = self.b.use_var(self.regs[reg]);
+        if i.memory_index() != R::None {
+            let value = self.read_register(i.memory_index());
             let scaled = self
                 .b
                 .ins()
                 .imul_imm(value, i64::from(i.memory_index_scale()));
             addr = self.b.ins().iadd(addr, scaled);
+        }
+        if i.memory_base().is_gpr16() || i.memory_index().is_gpr16() {
+            addr = self.b.ins().band_imm(addr, 0xffff);
         }
         if i.segment_prefix() == R::FS && i.mnemonic() != M::Lea {
             let fs = self.b.ins().load(
@@ -4967,9 +5102,10 @@ impl Emitter<'_> {
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
-        let compact = self.optimizing;
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        let compact = compact && hardware.is_none();
+        let compact = hardware.is_none();
+        #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+        let compact = true;
         if compact {
             let missing = self.denied(&permissions, permission, 0);
             self.guard(missing, reason, Some(addr));
@@ -5005,36 +5141,11 @@ impl Emitter<'_> {
             self.guard(executable, Exit::Fallback, None);
             self.b.set_cold_block(self.b.current_block().unwrap());
         }
-        let file: Vec<_> = positions
-            .iter()
-            .map(|&position| {
-                let p = self.permission(position);
-                let kind = self
-                    .b
-                    .ins()
-                    .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-                self.b
-                    .ins()
-                    .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
-            })
-            .collect();
-        let file = file[1..]
-            .iter()
-            .fold(file[0], |all, &f| self.b.ins().bor(all, f));
-        let overlay = self.b.create_block();
-        self.b.set_cold_block(overlay);
-        let pcm = self.b.create_block();
-        self.b.set_cold_block(pcm);
-        self.b.ins().brif(file, overlay, &[], pcm, &[]);
-        self.b.switch_to_block(pcm);
-        if let Some(value) = value {
-            self.store_atomic(address, value);
-            self.b.ins().jump(done, &[]);
-        } else {
-            let result = self.load_atomic(address, ty);
-            self.b.ins().jump(done, &[result.into()]);
-        }
-        self.b.switch_to_block(overlay);
+        // The cold helper already preserves byte-atomic PCM subranges and
+        // prepares every lazy/COW page before a store commits. Share it with
+        // pure PCM accesses instead of emitting a second per-width access
+        // graph at every guest operand. Permission and code-write guards above
+        // retain the original fault address, PC and restartable SSA prefix.
         let slot = self.memory_buffer();
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
         let width = self.constant(size as u32);
@@ -5123,9 +5234,7 @@ impl Emitter<'_> {
     /// Consume a read immediately into SSA; no buffer pointer escapes or is
     /// live across another helper. One slot therefore serves the whole function.
     fn memory_buffer(&mut self) -> ir::StackSlot {
-        if self.optimizing
-            && let Some(slot) = self.memory_scratch
-        {
+        if let Some(slot) = self.memory_scratch {
             return slot;
         }
         let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
@@ -5133,42 +5242,8 @@ impl Emitter<'_> {
             16,
             4,
         ));
-        if self.optimizing {
-            self.memory_scratch = Some(slot);
-        }
+        self.memory_scratch = Some(slot);
         slot
-    }
-    fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
-        if ty.is_vector() {
-            // Sixteen inlined byte loads keep many GPR values live and make
-            // register allocation spill the ordinary copy loop. A bounded
-            // Relaxed helper loads into a private stack buffer instead.
-            let slot = self.memory_buffer();
-            let destination = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
-            self.b
-                .ins()
-                .call(self.atomic_load_ref, &[pointer, destination]);
-            return self.b.ins().stack_load(ty, slot, 0);
-        }
-        let mut value = self.b.ins().iconst(ty, 0);
-        for index in 0..ty.bytes() {
-            let address = self.b.ins().iadd_imm(pointer, i64::from(index));
-            // Cranelift currently exposes SeqCst atomic loads only. They are
-            // stronger than the protocol's Relaxed loads, with the same byte
-            // width. The compiler cannot combine them into an ordinary wide load.
-            let byte = self
-                .b
-                .ins()
-                .atomic_load(types::I8, MemFlags::trusted(), address);
-            if ty == types::I8 {
-                value = byte;
-            } else {
-                let byte = self.b.ins().uextend(ty, byte);
-                let byte = self.b.ins().ishl_imm(byte, i64::from(index * 8));
-                value = self.b.ins().bor(value, byte);
-            }
-        }
-        value
     }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
         if let Some(slot) = self.slot(self.b.func.dfg.value_type(value)) {
@@ -5453,13 +5528,78 @@ impl Emitter<'_> {
         })
     }
     fn materialize_flags(&mut self) -> Value {
-        let old = self.b.use_var(self.flags);
-        let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
-        for bit in [0, 2, 4, 6, 7, 11] {
-            let value = self.flag(bit);
-            let value = self.b.ins().ishl_imm(value, i64::from(bit));
-            flags = self.b.ins().bor(flags, value);
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Flags));
+        if self.optimizing {
+            // Speed already folds individual constant recipes. Keeping that
+            // shape avoids extending shared-expression live ranges at exits.
+            let old = self.b.use_var(self.flags);
+            let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
+            for bit in [0, 2, 4, 6, 7, 11] {
+                let value = self.flag(bit);
+                let value = self.b.ins().ishl_imm(value, i64::from(bit));
+                flags = self.b.ins().bor(flags, value);
+            }
+            self.mark_source(source);
+            return flags;
         }
+        // Materialize the complete word once. Independent flag consumers still
+        // use flag(), but a checkpoint shares the recipe decoding and masks.
+        let old = self.b.use_var(self.flags);
+        let a = self.b.use_var(self.lazy[0]);
+        let b = self.b.use_var(self.lazy[1]);
+        let result = self.b.use_var(self.lazy[2]);
+        let kind = self.b.use_var(self.lazy[3]);
+        let base = self.b.ins().band_imm(kind, 3);
+        let shift = self.b.ins().ushr_imm(kind, 8);
+        let raw = self.b.ins().icmp_imm(IntCC::Equal, base, 0);
+        let logical = self.b.ins().icmp_imm(IntCC::Equal, base, 3);
+        let zero = self.constant(0);
+        let ab = self.b.ins().bxor(a, b);
+
+        let low = self.b.ins().ushr(result, shift);
+        let byte = self.b.ins().band_imm(low, 255);
+        let parity = self.b.ins().popcnt(byte);
+        let parity = self.b.ins().band_imm(parity, 1);
+        let parity = self.b.ins().bxor_imm(parity, 1);
+        let parity = self.b.ins().ishl_imm(parity, 2);
+        let zf = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
+        let zf = self.b.ins().uextend(types::I32, zf);
+        let zf = self.b.ins().ishl_imm(zf, 6);
+        let sf = self.b.ins().ushr_imm(result, 24);
+        let sf = self.b.ins().band_imm(sf, 0x80);
+        let af = self.b.ins().bxor(ab, result);
+        let af = self.b.ins().ushr(af, shift);
+        let af = self.b.ins().band_imm(af, 0x10);
+        let af = self.b.ins().select(logical, zero, af);
+        let derived = self.b.ins().bor(parity, zf);
+        let derived = self.b.ins().bor(derived, sf);
+        let derived = self.b.ins().bor(derived, af);
+        let canonical = self.b.ins().band_imm(old, 0xd4);
+        let partial = self.b.ins().select(raw, canonical, derived);
+
+        // OF may be replaced by a later rotate/multiply while PF/AF/ZF/SF
+        // still refer to the previous recipe (including canonical entry flags).
+        let add = self.b.ins().icmp_imm(IntCC::Equal, base, 1);
+        let not_ab = self.b.ins().bnot(ab);
+        let first = self.b.ins().select(add, not_ab, ab);
+        let ar = self.b.ins().bxor(a, result);
+        let overflow = self.b.ins().band(first, ar);
+        let overflow = self.b.ins().ushr_imm(overflow, 20);
+        let overflow = self.b.ins().band_imm(overflow, 0x800);
+        let overflow = self.b.ins().select(logical, zero, overflow);
+        let carried = self.b.ins().band_imm(kind, 4);
+        let carried_value = self.b.ins().ishl_imm(b, 11);
+        let overflow = self.b.ins().select(carried, carried_value, overflow);
+        let raw_of = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
+        let old_of = self.b.ins().band_imm(old, 0x800);
+        let overflow = self.b.ins().select(raw_of, old_of, overflow);
+        let carry = self.flag(0);
+        let preserved = self.b.ins().band_imm(old, !0x8d5_i64);
+        let flags = self.b.ins().bor(preserved, partial);
+        let flags = self.b.ins().bor(flags, overflow);
+        let flags = self.b.ins().bor(flags, carry);
+        self.mark_source(source);
         flags
     }
     /// Whether `result` is the instruction `opcode` applied to `a` and `b`.
@@ -5576,6 +5716,21 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.direct_refs.is_some() {
+            if self.lane.is_none() && direct::candidate(i) {
+                self.direct_mov(i);
+                return false;
+            }
+            if (0..i.op_count()).any(|operand| i.op_kind(operand) == OpKind::Memory) {
+                self.b
+                    .ins()
+                    .call(self.direct_refs.unwrap().1, &[self.bridge]);
+            }
+        }
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;
@@ -5615,7 +5770,13 @@ impl Emitter<'_> {
             self.b.switch_to_block(retry);
             self.direct(i.ip32());
             self.b.switch_to_block(fallback);
-            self.exit_const(Exit::Fallback, i.ip32());
+            if string::supported(i) {
+                // Bulk guards can decline a range, overlap or host-specific
+                // direction. Keep the checked element path native.
+                self.string_instruction(i);
+            } else {
+                self.exit_const(Exit::Fallback, i.ip32());
+            }
             self.b.switch_to_block(budget);
             self.exit_const(Exit::Budget, i.ip32());
             self.b.switch_to_block(read_fault);
@@ -5623,6 +5784,9 @@ impl Emitter<'_> {
             self.b.switch_to_block(write_fault);
             self.exit_const(Exit::WriteFault, i.ip32());
             return true;
+        }
+        if string::supported(i) {
+            return self.string_instruction(i);
         }
         if narrow_alu(i.mnemonic()) {
             let size = if i.op0_kind() == OpKind::Memory {
@@ -5829,17 +5993,26 @@ impl Emitter<'_> {
                 }
                 return true;
             }
-            M::Loop => {
-                // LOOP decrements ECX without touching flags.
+            M::Loop | M::Jecxz | M::Jcxz => {
                 let count = self.b.use_var(self.regs[1]);
-                let count = self.b.ins().iadd_imm(count, -1);
-                self.b.def_var(self.regs[1], count);
-                let condition = self.b.ins().icmp_imm(IntCC::NotEqual, count, 0);
+                let condition = if i.mnemonic() == M::Loop {
+                    // LOOP decrements ECX without touching flags.
+                    let count = self.b.ins().iadd_imm(count, -1);
+                    self.b.def_var(self.regs[1], count);
+                    self.b.ins().icmp_imm(IntCC::NotEqual, count, 0)
+                } else {
+                    let count = if i.mnemonic() == M::Jcxz {
+                        self.b.ins().band_imm(count, 0xffff)
+                    } else {
+                        count
+                    };
+                    self.b.ins().icmp_imm(IntCC::Equal, count, 0)
+                };
                 let yes = self.b.create_block();
                 let no = self.b.create_block();
                 self.b.ins().brif(condition, yes, &[], no, &[]);
                 self.b.switch_to_block(yes);
-                self.direct(i.near_branch32());
+                self.direct(i.near_branch_target() as u32);
                 self.b.switch_to_block(no);
                 self.direct(i.next_ip32());
                 return true;

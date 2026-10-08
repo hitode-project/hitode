@@ -126,7 +126,7 @@ fn backwards_ranges_retain_rep_semantics() {
             assert_eq!(jit.stats.interpreter_entries, 0);
         } else {
             assert_eq!(jit.stats.bulk_bytes, 0);
-            assert!(jit.stats.interpreter_entries > 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -160,8 +160,10 @@ fn overlapping_copies_retain_element_order_and_flags() {
                     assert_eq!(jit.stats.bulk_bytes, 27 * u64::from(width(operation)));
                     assert_eq!(jit.stats.interpreter_entries, 0);
                 } else {
-                    assert_eq!(jit.stats.bulk_bytes, 0);
-                    assert!(jit.stats.interpreter_entries > 0);
+                    // Checked elements can leave a non-overlapping tail that
+                    // the existing forward bulk helper completes on ARM64.
+                    assert!(jit.stats.bulk_bytes <= 27 * u64::from(width(operation)));
+                    assert_eq!(jit.stats.interpreter_entries, 0);
                 }
             }
         }
@@ -250,7 +252,7 @@ fn protected_later_pages_preserve_unicorn_partial_fault_progress() {
 }
 
 #[test]
-fn overflowing_length_and_end_address_are_rejected_before_bulk_writes() {
+fn overflowing_bulk_ranges_use_checked_native_elements() {
     for operation in [2, 5] {
         let mut jit = machine(operation, true, 0x50000);
         let mut uc = machine(operation, false, 0x50000);
@@ -258,7 +260,7 @@ fn overflowing_length_and_end_address_are_rejected_before_bulk_writes() {
             init(m);
             start(m, 0x4000_0001, SRC, DST, 0x8d7);
         }
-        assert_eq!(jit.run(STOP, 2).unwrap(), RunOutcome::Budget);
+        assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
         assert_eq!(uc.run_unicorn(STOP, 1).unwrap(), RunOutcome::Budget);
         assert_eq!(jit.state.regs, uc.state.regs);
         assert_eq!(
@@ -451,7 +453,7 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
 }
 
 #[test]
-fn unsupported_native_address_size_and_fs_prefix_use_the_interpreter() {
+fn native_address_size_and_fs_prefix_keep_zero_count_in_native_code() {
     // Address-size 16 needs SI/DI/CX, and FS changes the MOVS source base.
     for bytes in [vec![0x67, 0xf3, 0xa4, 0xc3], vec![0x64, 0xf3, 0xa4, 0xc3]] {
         let mut jit = machine(0, true, 0x50000);
@@ -465,6 +467,6 @@ fn unsupported_native_address_size_and_fs_prefix_use_the_interpreter() {
         assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs, uc.state.regs);
         assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.interpreter_entries > 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }

@@ -516,23 +516,31 @@ fn file_cmps_and_scas_all_widths_directions_and_repeat_conditions_match_interpre
 #[cfg(windows)]
 #[test]
 fn mixed_file_audio_elements_preserve_byte_atomic_storage() {
-    let code = program(|a| {
-        a.movdqu(xmm0, ptr(DATA as i32 + 4094)).unwrap();
-        a.movdqu(ptr(DATA as i32 + 4094), xmm1).unwrap();
-        a.ret().unwrap();
-    });
-    let mut cpu = fixture(&code, true);
-    let page = FilePage::new([0x17; 4096]);
-    cpu.map_file_pages(DATA, std::slice::from_ref(&page), Prot::RW, true)
-        .unwrap();
-    let audio = cpu.map_shared_audio(DATA + 4096, 4096).unwrap();
-    cpu.write(DATA + 4096, &[0x31; 14]).unwrap();
-    cpu.executor_mut().state.xmm[1] = [0x5a; 16];
-    finish(&mut cpu);
-    assert_eq!(&cpu.executor().state.xmm[0][..2], &[0x17; 2]);
-    assert_eq!(&cpu.executor().state.xmm[0][2..], &[0x31; 14]);
-    let mut actual = [0; 14];
-    audio.read_alias.copy_into(0, &mut actual);
-    assert_eq!(actual, [0x5a; 14]);
-    assert_eq!(page.snapshot().unwrap(), [0x17; 4096]);
+    for strategy in [
+        adv_cpu::CompileStrategy::Fast,
+        adv_cpu::CompileStrategy::Speed,
+    ] {
+        let code = program(|a| {
+            a.movdqu(xmm0, ptr(DATA as i32 + 4094)).unwrap();
+            a.movdqu(ptr(DATA as i32 + 4094), xmm1).unwrap();
+            a.ret().unwrap();
+        });
+        let mut cpu = fixture(&code, false);
+        let mut region = Region::new(CODE, code.len());
+        region.compile_strategy = strategy;
+        cpu.executor_mut().add_region(region).unwrap();
+        let page = FilePage::new([0x17; 4096]);
+        cpu.map_file_pages(DATA, std::slice::from_ref(&page), Prot::RW, true)
+            .unwrap();
+        let audio = cpu.map_shared_audio(DATA + 4096, 4096).unwrap();
+        cpu.write(DATA + 4096, &[0x31; 14]).unwrap();
+        cpu.executor_mut().state.xmm[1] = [0x5a; 16];
+        finish(&mut cpu);
+        assert_eq!(&cpu.executor().state.xmm[0][..2], &[0x17; 2]);
+        assert_eq!(&cpu.executor().state.xmm[0][2..], &[0x31; 14]);
+        let mut actual = [0; 14];
+        audio.read_alias.copy_into(0, &mut actual);
+        assert_eq!(actual, [0x5a; 14]);
+        assert_eq!(page.snapshot().unwrap(), [0x17; 4096]);
+    }
 }

@@ -8,6 +8,11 @@ mod compile;
 mod compile_budget;
 mod compiler;
 mod cpu_profile;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod direct_memory;
 mod discovery;
 pub mod execution_abi;
 mod executor;
@@ -50,12 +55,15 @@ pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use compile::coverage::report as loop_coverage;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;
-pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats};
+pub use executor::{
+    DirectMemoryStats, ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats,
+};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use rows::RowStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
 pub use tier1::Tier1Stats;
+pub use tier1::census::{Coverage as Tier1Coverage, Tier1Census};
 pub use timestamp::TSC_FREQ;
 pub use trap::ExecutionTrap;
 #[cfg(unix)]

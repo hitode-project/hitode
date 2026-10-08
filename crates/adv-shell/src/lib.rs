@@ -720,8 +720,8 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
-            "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n  \"direct_memory\": {},\n",
+            "  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
@@ -761,6 +761,16 @@ fn build_report(context: ReportContext<'_>) -> String {
         stats.interpreter_entries,
         cliffs_report(&stats.cliffs),
         verification_report(&stats.verification),
+        format!(
+            "{{\"sites\":{},\"accesses\":{},\"recoveries\":{},\"violations\":{},\"checked_fallbacks\":{},\"code_writes\":{}}}",
+            stats.direct_memory.sites,
+            stats.direct_memory.accesses,
+            stats.direct_memory.recoveries,
+            stats.direct_memory.violations,
+            stats.direct_memory.checked_fallbacks,
+            stats.direct_memory.code_writes
+        ),
+        runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
         options.jit && options.async_compilation,
         stats.compile_time.as_secs_f64(),
@@ -1003,6 +1013,39 @@ fn run(options: Options) -> Result<u8, String> {
     result?
 }
 
+fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
+    // Keep the small-host policy. Larger desktop hosts can serve another
+    // compile without consuming the cores reserved for execution, audio and
+    // presentation. Phone SoCs count efficiency cores toward eight, so Android
+    // keeps three until headed device runs show a fourth worker helps there.
+    let cap = if cores >= 8 && !cfg!(target_os = "android") {
+        4
+    } else {
+        3
+    };
+    cores
+        .saturating_sub(guest_workers.saturating_add(1))
+        .clamp(1, cap)
+}
+
+#[test]
+fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
+    for guests in [1, 2] {
+        for cores in 0usize..8 {
+            assert_eq!(
+                compile_thread_count(cores, guests),
+                cores.saturating_sub(guests + 1).clamp(1, 3)
+            );
+        }
+        for cores in [8, 10, 16, 128] {
+            let cap = if cfg!(target_os = "android") { 3 } else { 4 };
+            assert_eq!(compile_thread_count(cores, guests), cap);
+            assert!(compile_thread_count(cores, guests) + guests + 1 <= cores);
+        }
+    }
+    assert_eq!(compile_thread_count(0, usize::MAX), 1);
+}
+
 fn run_execution(
     options: Options,
     mut window: Option<frontend::Worker>,
@@ -1103,10 +1146,7 @@ fn run_execution(
     if options.jit && options.async_compilation {
         // Leave cores for the guest, presentation and audio threads.
         let threads = std::thread::available_parallelism().map_or(1, |cores| {
-            cores
-                .get()
-                .saturating_sub(options.guest_workers + 1)
-                .clamp(1, 3)
+            compile_thread_count(cores.get(), options.guest_workers)
         });
         runtime
             .machine
@@ -1890,9 +1930,9 @@ fn verification_report(v: &adv_runtime::VerifyStats) -> String {
 /// Slow-path counters, each list cut to its most frequent entries.
 fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
     const ROWS: usize = 24;
-    let counts = |rows: Vec<(String, u64)>| {
+    let counts = |rows: Vec<(String, u64)>, limit: usize| {
         rows.into_iter()
-            .take(ROWS)
+            .take(limit)
             .map(|(key, n)| format!("{}:{n}", json(&key)))
             .collect::<Vec<_>>()
             .join(",")
@@ -1910,12 +1950,60 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let detail_rows = c.interpreter_detail_rows();
+    let omitted_rows = detail_rows.len().saturating_sub(ROWS);
+    let details = detail_rows
+        .iter()
+        .take(ROWS)
+        .map(|(label, n)| {
+            format!(
+                "{}:{{\"entries\":{},\"instructions\":{}}}",
+                json(label),
+                n.entries,
+                n.instructions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let omitted = ["Uncovered", "Rejected"]
+        .map(|reason| {
+            let mut entries = 0;
+            let mut instructions = 0;
+            for (label, n) in detail_rows.iter().skip(ROWS) {
+                if label.starts_with(&format!("{reason}/")) {
+                    entries += n.entries;
+                    instructions += n.instructions;
+                }
+            }
+            format!(
+                "{}:{{\"entries\":{entries},\"instructions\":{instructions}}}",
+                json(reason)
+            )
+        })
+        .join(",");
+    let census = c.tier1_census.as_ref().map_or_else(|| "null".to_owned(), |census| {
+        let groups = ["PendingCompilation", "Uncovered", "Rejected"].into_iter()
+            .zip(&census.groups).map(|(name, c)| {
+                let rows = c.unsupported_rows();
+                let omitted_rows = rows.len().saturating_sub(ROWS);
+                let omitted_units: u64 = rows.iter().skip(ROWS).map(|(_, n)| n).sum();
+                let unsupported = counts(rows, ROWS);
+                let histogram = |values: &[u64]| values.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+                format!("{}:{{\"entries\":{},\"instructions\":{},\"supported_units\":{},\"unsupported_units\":{},\"prefix_units\":{},\"blocked_prefixes\":[{}],\"censored_prefixes\":[{}],\"unsupported\":{{{unsupported}}},\"omitted_rows\":{omitted_rows},\"omitted_units\":{omitted_units}}}",
+                    json(name), c.entries, c.instructions, c.supported_units, c.unsupported_units, c.prefix_units,
+                    histogram(&c.blocked_prefixes), histogram(&c.censored_prefixes))
+            }).collect::<Vec<_>>().join(",");
+        format!("{{{groups}}}")
+    });
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census}}}",
         c.x87_helper_calls,
         c.x87_fast,
-        counts(c.x87_exact_rows()),
-        counts(c.fallback_rows()),
+        counts(c.x87_exact_rows(), ROWS),
+        counts(c.x87_control_rows(), usize::MAX),
+        counts(c.x87_control_rejections(), usize::MAX),
+        counts(c.x87_pc64_rows(), usize::MAX),
+        counts(c.fallback_rows(), ROWS),
         interpreter
     )
 }

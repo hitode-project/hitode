@@ -11,7 +11,7 @@ use adv_sync::{
 };
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ pub(crate) struct Completion {
     pub input: Snapshot,
     pub result: Result<Compiled, String>,
     pub duration: Duration,
+    pub queue_wait: Duration,
+    pub completed_at: Instant,
+    pub active_at_start: usize,
 }
 
 // The only writers are sealed compilation tasks bound to one immutable service
@@ -69,6 +72,8 @@ pub(crate) struct Worker {
     service: Option<Service>,
     wake: Option<CompletionWake>,
     pool: Option<Pool>,
+    stages: std::collections::BTreeMap<u64, Arc<AtomicUsize>>,
+    active: Arc<AtomicUsize>,
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -188,6 +193,8 @@ impl Worker {
             service: None,
             wake: None,
             pool: None,
+            stages: Default::default(),
+            active: Arc::default(),
         }
     }
 
@@ -207,6 +214,13 @@ impl Worker {
     }
     pub fn last_work(&self) -> usize {
         self.last_work
+    }
+
+    pub fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+    pub fn stage(&self, ticket: u64) -> Arc<AtomicUsize> {
+        self.stages[&ticket].clone()
     }
 
     pub fn try_submit(&mut self, input: Snapshot) -> Result<u64, SubmitError> {
@@ -239,21 +253,36 @@ impl Worker {
         let closed = self.closed.clone();
         let wake = self.wake.clone();
         let notify_here = wake.is_some();
+        let queued = Instant::now();
+        let stage = Arc::new(AtomicUsize::new(0));
+        let job_stage = stage.clone();
+        let active = self.active.clone();
         let mut task = Task::new(move || {
             if closed.load(Ordering::Acquire) {
                 return;
             }
             let _panic = ClientPanic(closed.clone());
             let started = Instant::now();
+            job_stage.store(1, Ordering::Relaxed);
+            let active_at_start = active.fetch_add(1, Ordering::Relaxed) + 1;
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
                     .unwrap_or_else(|_| Err("background compiler panicked".into()));
+            let completed_at = Instant::now();
+            if let Ok(compiled) = &result {
+                compiled.record_ir_counts(completed_at.duration_since(started));
+            }
+            active.fetch_sub(1, Ordering::Relaxed);
+            job_stage.store(2, Ordering::Relaxed);
             let completion = Completion {
                 ticket,
                 region: (*input.region).clone(),
                 input,
                 result,
-                duration: started.elapsed(),
+                duration: completed_at.duration_since(started),
+                queue_wait: started.duration_since(queued),
+                completed_at,
+                active_at_start,
             };
             if closed.load(Ordering::Acquire) {
                 return;
@@ -290,6 +319,7 @@ impl Worker {
         self.next_ticket = self.next_ticket.wrapping_add(1);
         self.last_work = work;
         self.outstanding += 1;
+        self.stages.insert(ticket, stage);
         self.jobs.push(job);
         Ok(ticket)
     }
@@ -307,20 +337,35 @@ impl Worker {
         let deliver = pool.deliver.clone();
         let closed = self.closed.clone();
         let wake = self.wake.clone();
+        let queued = Instant::now();
+        let stage = Arc::new(AtomicUsize::new(0));
+        let job_stage = stage.clone();
+        let active = self.active.clone();
         let job: Job = Box::new(move || {
             if closed.load(Ordering::Acquire) {
                 return;
             }
             let started = Instant::now();
+            job_stage.store(1, Ordering::Relaxed);
+            let active_at_start = active.fetch_add(1, Ordering::Relaxed) + 1;
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
                     .unwrap_or_else(|_| Err("background compiler panicked".into()));
+            let completed_at = Instant::now();
+            if let Ok(compiled) = &result {
+                compiled.record_ir_counts(completed_at.duration_since(started));
+            }
+            active.fetch_sub(1, Ordering::Relaxed);
+            job_stage.store(2, Ordering::Relaxed);
             let completion = Completion {
                 ticket,
                 region: (*input.region).clone(),
                 input,
                 result,
-                duration: started.elapsed(),
+                duration: completed_at.duration_since(started),
+                queue_wait: started.duration_since(queued),
+                completed_at,
+                active_at_start,
             };
             if closed.load(Ordering::Acquire) || deliver.send(completion).is_err() {
                 return;
@@ -333,6 +378,7 @@ impl Worker {
         self.next_ticket = self.next_ticket.wrapping_add(1);
         self.last_work = work;
         self.outstanding += 1;
+        self.stages.insert(ticket, stage);
         Ok(ticket)
     }
 
@@ -343,11 +389,13 @@ impl Worker {
         if let Some(pool) = &self.pool {
             let completion = pool.results.try_recv()?;
             self.outstanding -= 1;
+            self.stages.remove(&completion.ticket);
             return Ok(completion);
         }
         let results = self.results.as_mut().ok_or(TryRecvError::Disconnected)?;
         if let Some(completion) = results.pop() {
             self.outstanding -= 1;
+            self.stages.remove(&completion.ticket);
             self.jobs.retain(|job| {
                 matches!(
                     job.status(),
@@ -422,6 +470,46 @@ mod tests {
         }
         assert!(worker.try_submit(input).is_ok());
         receive(&mut worker);
+    }
+
+    #[test]
+    fn lifecycle_diagnostics_distinguish_queued_running_and_completed_work() {
+        let started = Arc::new(Barrier::new(2));
+        let released = Arc::new(Barrier::new(2));
+        let worker_started = started.clone();
+        let worker_released = released.clone();
+        let calls = AtomicUsize::new(0);
+        let mut worker = Worker::with_compiler(move |_| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                worker_started.wait();
+                worker_released.wait();
+            }
+            Err("diagnostic fixture".into())
+        })
+        .unwrap();
+        let admitted = Instant::now();
+        let first = worker.try_submit(snapshot()).unwrap();
+        started.wait();
+        let first_stage = worker.stage(first);
+        assert_eq!(first_stage.load(Ordering::Relaxed), 1);
+        let second = worker.try_submit(snapshot()).unwrap();
+        let second_stage = worker.stage(second);
+        assert_eq!(second_stage.load(Ordering::Relaxed), 0);
+        assert_eq!(worker.outstanding(), 2);
+        released.wait();
+        for ticket in [first, second] {
+            let completion = receive(&mut worker);
+            assert_eq!(completion.ticket, ticket);
+            assert_eq!(completion.active_at_start, 1);
+            assert!(
+                completion.queue_wait + completion.duration
+                    <= completion.completed_at.duration_since(admitted)
+            );
+            assert!(completion.completed_at <= Instant::now());
+        }
+        assert_eq!(first_stage.load(Ordering::Relaxed), 2);
+        assert_eq!(second_stage.load(Ordering::Relaxed), 2);
+        assert!(worker.stages.is_empty());
     }
 
     #[test]
