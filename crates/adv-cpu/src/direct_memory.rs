@@ -326,22 +326,28 @@ pub(crate) unsafe extern "C" fn checked(bridge: *mut u8) {
 /// remain free to mutate the owner: no frozen mapping view spans the call.
 /// Fault classification happens only after the native frame has returned.
 pub(crate) unsafe fn run_inline(
-    state: &mut CpuState,
-    memory: &mut crate::Memory,
-    bridge: &mut crate::trap::Bridge<'_>,
+    state: *mut CpuState,
+    memory: *mut crate::Memory,
+    bridge: *mut crate::trap::Bridge<'_>,
     permissions: &[u8],
     run: impl FnOnce() -> u32,
 ) -> u32 {
-    let engine = memory.direct_engine.as_ref().unwrap();
-    if engine.inline == 0 {
+    // Do not keep a Rust borrow of Memory/Bridge across helper execution.
+    // The caller owns their lifetime, and native helpers use its raw pointers.
+    let (window, len, base, enabled) = {
+        let memory = unsafe { &*memory };
+        let engine = memory.direct_engine.as_ref().unwrap();
+        (engine.window, memory.len, memory.base, engine.inline != 0)
+    };
+    if !enabled {
         return run();
     }
     let execution = unsafe {
         crate::fault_recovery::inline::with_protection(
             state,
-            engine.window,
-            memory.len,
-            memory.base,
+            window,
+            len,
+            base,
             Some(permissions),
             run,
         )
@@ -349,13 +355,15 @@ pub(crate) unsafe fn run_inline(
     let (result, fault) = match execution {
         Ok(result) => result,
         Err(error) => {
-            bridge.error = Some(error);
+            unsafe { (*bridge).error = Some(error) };
             return crate::Exit::Trap as u32;
         }
     };
     let Some(fault) = fault else {
         return result;
     };
+    let memory = unsafe { &*memory };
+    let engine = memory.direct_engine.as_ref().unwrap();
     use crate::virtual_memory::{FaultClassification, GuestAccess};
     let view = memory.direct_window().direct_fault_view().unwrap();
     let access = if fault.site.write {
@@ -382,7 +390,9 @@ pub(crate) unsafe fn run_inline(
         }
         FaultClassification::Accessible | FaultClassification::OutsideGuest => {
             // Never retry an unexplained host failure as guest work.
-            bridge.error = Some("unexplained host fault at an inline scalar access".into());
+            unsafe {
+                (*bridge).error = Some("unexplained host fault at an inline scalar access".into())
+            };
             crate::Exit::Trap as u32
         }
     }
