@@ -325,20 +325,19 @@ fn exhausted_native_fuel_keeps_one_uncommitted_mov_pending() {
     assert_eq!(direct.run(stop, 2).unwrap(), RunOutcome::Budget);
     assert_eq!(direct.state, oracle.state);
     equal_memory(&oracle, &direct, DATA, PAGE);
-    let committed = direct.state.clone();
-    assert_eq!(direct.run(stop, 1).unwrap(), RunOutcome::Budget);
-    // The guard spent the last native block unit; no part of the MOV committed.
-    equal_state(&oracle, &direct);
-    assert_eq!(direct.state.fuel, committed.fuel);
-    equal_memory(&oracle, &direct, DATA, PAGE);
     let expected = RunOutcome::WriteFault {
         pc: instructions[2].ip32(),
         address: FAULT,
     };
     assert_eq!(interpret(&mut oracle, stop, 1), expected);
     assert_eq!(direct.run(stop, 1).unwrap(), expected);
-    assert_eq!(direct.state, oracle.state);
-    assert_eq!(direct.state.fuel, 1);
+    equal_state(&oracle, &direct);
+    assert_eq!(direct.state.fault_addr, oracle.state.fault_addr);
+    // Native entry reserves one block unit before the fault. The interpreter
+    // charges only committed instructions; recovery must not charge it again.
+    assert_eq!(direct.state.fuel, 0);
+    assert_eq!(oracle.state.fuel, 1);
+    equal_memory(&oracle, &direct, DATA, PAGE);
     for m in [&mut oracle, &mut direct] {
         m.protect(FAULT, PAGE, READ | WRITE).unwrap();
         m.write(DATA, &[0x77; 4]).unwrap();

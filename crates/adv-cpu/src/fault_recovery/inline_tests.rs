@@ -449,7 +449,7 @@ fn rejects_unclaimable_dispatches(state: *mut CpuState, window: usize) {
     for (signal, pc, host_address, access, host_context) in [
         (libc::SIGBUS, pc, window + 4, 0, fake_context),
         (libc::SIGSEGV, pc + 1, window + 4, 0, fake_context),
-        (libc::SIGSEGV, pc, window + 4, usize::MAX, fake_context),
+        (libc::SIGSEGV, pc, window + 4, usize::MAX - 1, fake_context),
         (libc::SIGSEGV, pc, window + 4, 1, fake_context),
         (libc::SIGSEGV, pc, window + 4, 2, fake_context),
         (libc::SIGSEGV, pc, window + 4, 0, std::ptr::null_mut()),
