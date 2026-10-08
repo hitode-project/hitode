@@ -3159,6 +3159,12 @@ mod tiering_tests {
         m.state.regs[1] = 100_000;
         m.state.regs[4] = 0x4f00;
         m.state.regs[6] = 0x1000;
+        // Observe native heat only after Fast is published. A busy compiler
+        // must not let the finite fixture finish entirely in the interpreter.
+        m.hits.insert(0x1100, 31);
+        m.discover(0x3000).unwrap();
+        m.set_tiered_compilation(false);
+        collect(&mut m);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !m
             .code
@@ -3170,11 +3176,16 @@ mod tiering_tests {
             assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
             assert!(Instant::now() < deadline);
         }
+        // Keep the observed Fast profile alive until its heat is checked.
+        m.set_tiered_compilation(true);
         m.scan_profiles();
         collect(&mut m);
         let region = &m.code.regions[&0x1100];
         assert_eq!(region.callees, [0x1000]);
         assert_eq!(region.compile_strategy, CompileStrategy::Speed);
+        // Finish post-publication oracle samples before measuring steady-state
+        // entries: verification intentionally returns after each native block.
+        assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
         // The call and its return no longer leave the unit.
         let entries = m.stats.native_entries;
         assert_eq!(m.run(0x3000, 3000).unwrap(), RunOutcome::Budget);
