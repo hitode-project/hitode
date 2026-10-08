@@ -88,6 +88,7 @@ dependencies = [
  "fontdb",
  "log",
  "ogg",
+ "png",
  "pollster",
  "rubato",
  "serde_json",
