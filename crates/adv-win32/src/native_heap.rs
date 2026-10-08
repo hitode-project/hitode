@@ -37,10 +37,9 @@ pub(crate) fn free_then(env: &mut Env<'_>, pointer: u32, then: Done) -> Outcome 
             then(env, value.value())
         }),
         Ok(None) => crate::heap_lock::with_heap(env, heap, 0, move |env| {
-            let result = env
-                .ext
-                .get_mut::<Heaps>()
-                .free(env.cpu, &mut env.sys.vm, heap, pointer);
+            let previous = crate::util::last_error(env);
+            let result = crate::kernel32::memory::free(env, heap, pointer);
+            crate::util::set_last_error(env, previous);
             then(env, u32::from(result))
         }),
         Err(_) => crate::native::unavailable(env, "RtlFreeHeap"),
@@ -64,12 +63,14 @@ pub(crate) fn realloc_then(env: &mut Env<'_>, pointer: u32, size: u32, then: Don
             then(env, value.value())
         }),
         Ok(None) => crate::heap_lock::with_heap(env, heap, 0, move |env| {
-            let pointer = env
-                .ext
-                .get_mut::<Heaps>()
-                .realloc(env.cpu, &mut env.sys.vm, heap, pointer, size, false, false)
-                .unwrap_or(0);
-            then(env, pointer)
+            let previous = crate::util::last_error(env);
+            match crate::kernel32::memory::reallocate(env, heap, 0, pointer, size) {
+                Outcome::Return(pointer) => {
+                    crate::util::set_last_error(env, previous);
+                    then(env, pointer)
+                }
+                failure => failure,
+            }
         }),
         Err(_) => crate::native::unavailable(env, "RtlReAllocateHeap"),
     }
