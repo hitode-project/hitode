@@ -713,6 +713,22 @@ fn build_report(context: ReportContext<'_>) -> String {
         .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{},\"parallel_dispatches\":{}}}",
             r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns, r.parallel_dispatches))
         .collect::<Vec<_>>().join(",");
+    let tier1 = runtime.machine.cpu.executor().tier1_stats();
+    let tier1_json = format!(
+        "{{\"mode\":{},\"compilations\":{},\"compile_seconds\":{:.9},\"publication_revisions\":{},\"publication_flushes\":{},\"cache_evictions\":{},\"compile_misses\":{},\"fallback_entries\":{},\"fallback_units\":{},\"bridge_entries\":{},\"bridge_units\":{},\"resident_bytes\":{}}}",
+        json(&format!("{:?}", runtime.machine.cpu.executor().tier1_mode()).to_lowercase()),
+        tier1.compilations,
+        tier1.compile_time.as_secs_f64(),
+        tier1.publication_revisions,
+        tier1.publication_flushes,
+        tier1.cache_evictions,
+        tier1.compile_misses,
+        tier1.fallback_entries,
+        tier1.fallback_instructions,
+        tier1.bridge_entries,
+        tier1.bridge_units,
+        tier1.resident_bytes
+    );
     format!(
         concat!(
             "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
@@ -721,7 +737,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n  \"direct_memory\": {},\n",
-            "  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
@@ -770,6 +786,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             stats.direct_memory.checked_fallbacks,
             stats.direct_memory.code_writes
         ),
+        tier1_json,
         runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
         options.jit && options.async_compilation,
@@ -1028,6 +1045,31 @@ fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
         .clamp(1, cap)
 }
 
+fn compile_thread_override(value: Option<&str>, default: usize) -> Result<usize, String> {
+    match value {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| (1..=8).contains(threads))
+            .ok_or_else(|| "ADV_COMPILE_THREADS must be an integer from 1 to 8".into()),
+    }
+}
+
+#[test]
+fn experimental_compile_threads_preserve_default_and_reject_invalid_values() {
+    assert_eq!(compile_thread_override(None, 3).unwrap(), 3);
+    for threads in 1..=8 {
+        assert_eq!(
+            compile_thread_override(Some(&threads.to_string()), 3).unwrap(),
+            threads
+        );
+    }
+    for value in ["", "0", "9", "-1", "auto"] {
+        assert!(compile_thread_override(Some(value), 3).is_err());
+    }
+}
+
 #[test]
 fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
     for guests in [1, 2] {
@@ -1163,6 +1205,10 @@ fn run_execution(
         let threads = std::thread::available_parallelism().map_or(1, |cores| {
             compile_thread_count(cores.get(), options.guest_workers)
         });
+        let threads = compile_thread_override(
+            std::env::var("ADV_COMPILE_THREADS").ok().as_deref(),
+            threads,
+        )?;
         runtime
             .machine
             .cpu

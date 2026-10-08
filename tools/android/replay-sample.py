@@ -9,6 +9,7 @@ This records virtual PCM and guest frame observations, not native Android output
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import json
 import math
@@ -301,7 +302,9 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
         command.extend(["--schedule-profile", remote + "/schedule.tsv"])
     if args.auto_dialog_ms is not None:
         command.extend(["--auto-dialog-ms", str(args.auto_dialog_ms)])
-    environment = []
+    environment = ["ADV_TIER1=" + getattr(args, "tier1", "off")]
+    if getattr(args, "compile_threads", None) is not None:
+        environment.append("ADV_COMPILE_THREADS=" + str(args.compile_threads))
     if args.font_diagnostics:
         environment.append("ADV_TEXT_DIAGNOSTICS=1")
     if getattr(args, "font_profile", None):
@@ -348,8 +351,9 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError("checkpoint name is reserved for session evidence")
     args.exe_relative = relative_exe(args.exe_relative)
     output = args.output.resolve()
-    if not output.is_relative_to(REPO / "target"):
-        raise ValueError("--output must be inside this repository's ignored target directory")
+    artifact_root = Path(os.environ.get("ADV_ARTIFACT_ROOT", REPO / "target")).resolve()
+    if not output.is_relative_to(artifact_root):
+        raise ValueError("--output must be inside ADV_ARTIFACT_ROOT (default: ignored target/)")
     binary = args.binary.resolve(strict=True)
     game_dir = args.game_dir.absolute()
     if not game_dir.is_dir():
@@ -707,6 +711,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--codec-kernels", choices=("guest", "verify", "native"), default="native")
     parser.add_argument("--no-tiering", action="store_true")
+    parser.add_argument("--tier1", choices=("off", "bridge"), default="off")
+    parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
     parser.add_argument("--schedule-profile", action="store_true")
     parser.add_argument("--font-diagnostics", action="store_true",
                         help="record font requested/resolved/source in stderr; excludes performance comparisons")

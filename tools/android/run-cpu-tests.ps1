@@ -6,6 +6,9 @@ Inputs are integration target names and unit-test filters, never game assets.
 ExecutionExperiments selects A/B/C/D. WhatIf prints the build/device plan as
 JSON without tools, files or a device; BuildOnly cross-links without adb.
 Device runs retain build/test logs, hashes and result counts in Output.
+AllTests selects every integration target and unfiltered unit tests, continues
+after failures and records empty platform targets. DirectMemory and JitVerify
+configure the CPU; Tier1 records the shell selector (fixtures select their modes).
 .EXAMPLE
 ./tools/android/run-cpu-tests.ps1 -ExecutionExperiments -WhatIf
 .EXAMPLE
@@ -22,12 +25,24 @@ param(
     [string[]]$UnitFilter = @(),
     [ValidateRange(10, 600)][int]$TimeoutSeconds = 180,
     [switch]$ExecutionExperiments,
+    [switch]$AllTests,
+    [switch]$NoFailFast,
     [switch]$BuildOnly,
     [switch]$WhatIf,
-    [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off'
+    [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
+    [switch]$DirectMemory,
+    [ValidateSet('off', 'bridge')][string]$Tier1 = 'off'
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+if ($AllTests) {
+    if ($ExecutionExperiments -or $PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
+        throw '-AllTests cannot be combined with other test selectors.'
+    }
+    $TestName = @(Get-ChildItem -LiteralPath (Join-Path $repo 'crates/adv-cpu/tests') -Filter '*.rs' -File | Sort-Object Name | ForEach-Object { $_.BaseName })
+    $UnitFilter = @('')
+    $NoFailFast = $true
+}
 if ($ExecutionExperiments) {
     if ($PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
         throw '-ExecutionExperiments cannot be combined with -TestName or -UnitFilter.'
@@ -35,9 +50,9 @@ if ($ExecutionExperiments) {
     $TestName = @('tier1')
     $UnitFilter = @('virtual_memory', 'fault_recovery', 'tier1::native::publication_tests', 'compile::x87::tests')
 }
-$UnitFilter = @($UnitFilter | Where-Object { $_ -ne '' } | Select-Object -Unique)
+$UnitFilter = @($UnitFilter | Where-Object { $AllTests -or $_ -ne '' } | Select-Object -Unique)
 $TestName = @($TestName | Select-Object -Unique)
-if ((-not $TestName.Count -and -not $UnitFilter.Count) -or ($TestName | Where-Object { $_ -notmatch '^[a-zA-Z0-9_]+$' }) -or ($UnitFilter | Where-Object { $_ -notmatch '^[a-zA-Z0-9_:]+$' })) {
+if ((-not $TestName.Count -and -not $UnitFilter.Count) -or ($TestName | Where-Object { $_ -notmatch '^[a-zA-Z0-9_]+$' }) -or ($UnitFilter | Where-Object { -not $AllTests -and $_ -notmatch '^[a-zA-Z0-9_:]+$' })) {
     throw 'Select integration-test file names and/or a simple Rust unit-test filter.'
 }
 foreach ($test in $TestName) {
@@ -61,15 +76,16 @@ $runs = @(
 function Get-DeviceCommand($remote, $run) {
     # Parent tests exec their own deployed ELF and validate each child's status.
     # Never carry a host runner or an individual fault case into the parent.
-    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY'
+    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_TIER1'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
-    "cd '$remote' && $clear && ${verify}timeout $TimeoutSeconds './$($run.target)' $($run.filter) --test-threads=1 --nocapture"
+    $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
+    "cd '$remote' && $clear && ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$($run.target)' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
         mode = 'dry-run'; build_only = [bool]$BuildOnly; cargo_arguments = $cargoArgs; targets = $targets
         build_environment = @{ ANDROID_NDK_HOME = $Ndk; CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake'); CARGO_BUILD_JOBS = '2' }
-        serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify
+        serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; direct_memory = [bool]$DirectMemory; tier1 = $Tier1; all_tests = [bool]$AllTests
         runs = @($runs | ForEach-Object { [ordered]@{ id = $_.id; target = $_.target; filter = $_.filter; shell = (Get-DeviceCommand '/data/local/tmp/adv-host-cpu-DRYRUN' $_) } })
     } | ConvertTo-Json -Depth 6
     return
@@ -138,6 +154,8 @@ try {
         "CMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE"
         "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
         "ADV_JIT_VERIFY=$JitVerify (device only)"
+        "ADV_DIRECT_MEMORY=$([int][bool]$DirectMemory) (device only)"
+        "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
         $manifest | ForEach-Object { "$($_.target)_sha256=$($_.sha256)" }
@@ -147,6 +165,7 @@ try {
         return
     }
     $remote = '/data/local/tmp/adv-host-cpu-' + [Guid]::NewGuid().ToString('N')
+    Set-Content -LiteralPath (Join-Path $Output 'remote-directory.txt') -Value $remote
     & $adb @adbArgs shell mkdir -p $remote
     if ($LASTEXITCODE -ne 0) { throw 'Cannot create owned device test directory' }
     $results = [Collections.Generic.List[object]]::new()
@@ -167,19 +186,30 @@ try {
         $log = Join-Path $Output "$($run.id).log"
         & $adb @adbArgs shell $command 2>&1 | Tee-Object -FilePath $log
         $code = $LASTEXITCODE
-        $summary = [regex]::Match((Get-Content -LiteralPath $log -Raw), 'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+        $content = Get-Content -LiteralPath $log -Raw
+        $summary = [regex]::Match($content, 'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
         $passed = if ($summary.Success) { [int]$summary.Groups[1].Value } else { 0 }
+        $failed = if ($summary.Success) { [int]$summary.Groups[2].Value } else { 0 }
+        $ignored = if ($summary.Success) { [int]$summary.Groups[3].Value } else { 0 }
+        $empty = $summary.Success -and $code -eq 0 -and $passed -eq 0 -and $failed -eq 0 -and -not $filter
+        $ok = $summary.Success -and $code -eq 0 -and ($passed -gt 0 -or $empty)
+        $failedNames = @([regex]::Matches($content, '(?m)^    (\S+)\r?$') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
         $results.Add([ordered]@{
             test = $test; filter = $filter; binary = $binary; sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
-            exit_code = $code; passed = $passed; summary = $summary.Value; log = $log
+            exit_code = $code; passed = $passed; failed = $failed; ignored = $ignored; skipped_empty_target = $empty; ok = $ok; failed_names = $failedNames; summary = $summary.Value; log = $log
         })
-        [ordered]@{ context = 'adb-shell'; remote_directory = $remote; jit_verify = $JitVerify; results = $results.ToArray() } |
+        [ordered]@{ context = 'adb-shell'; remote_directory = $remote; jit_verify = $JitVerify; direct_memory = [bool]$DirectMemory; tier1 = $Tier1; bridge_scope = 'Explicit tier1_bridge fixtures; environment does not override Executor policies'; results = $results.ToArray() } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Output 'results.json') -Encoding utf8
-        if ($code -ne 0) { throw "Device test failed ($code): $test; evidence: $Output" }
-        if ($passed -eq 0) { throw "No passing tests selected: $test $filter; evidence: $Output" }
+        if (-not $ok -and -not $NoFailFast) { throw "Device test failed ($code): $test $filter; evidence: $Output" }
+        if ($empty) { Write-Output "Skipped empty platform target: $test" }
     }
+    if (@($results | Where-Object { -not $_.ok }).Count) { throw "Device suite contains failures; evidence: $Output" }
     Write-Output "CPU test evidence: $Output"
 } finally {
+    if ($remote -and $remote -match '^/data/local/tmp/adv-host-cpu-[a-f0-9]{32}$') {
+        & $adb @adbArgs shell rm -rf $remote
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Owned device directory cleanup needs retry: $remote" }
+    }
     Pop-Location
     foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name], 'Process') }
 }

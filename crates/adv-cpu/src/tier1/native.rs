@@ -464,6 +464,8 @@ impl Engine {
         if let Some((_, revision)) = boundaries
             && self.native_revision != revision
         {
+            self.stats.publication_revisions += 1;
+            self.stats.publication_flushes += u64::from(!self.units.is_empty());
             self.stats.cache_evictions += self.units.len() as u64;
             self.clear();
             self.native_revision = revision;
@@ -483,6 +485,8 @@ impl Engine {
         if !self.entries.contains_key(&state.eip)
             && !self.compile(memory, state.eip, boundaries.map(|(entries, _)| entries))?
         {
+            self.stats.compile_misses += 1;
+            self.stats.fallback_entries += 1;
             let execution = interpreter.run_chunk(state, memory, units.min(1));
             self.stats.fallback_instructions += u64::from(execution.units);
             return Ok(Execution {
@@ -534,6 +538,7 @@ impl Engine {
         let (step, extra, interpreted) = match frame.reason {
             DISPATCH | BUDGET => (Step::Executed, 0, 0),
             FALLBACK => {
+                self.stats.fallback_entries += 1;
                 let e = interpreter.run_chunk(state, memory, frame.remaining.min(1) as u32);
                 self.stats.fallback_instructions += u64::from(e.units);
                 (e.step, e.units, e.units)

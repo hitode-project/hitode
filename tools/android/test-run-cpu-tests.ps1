@@ -46,6 +46,13 @@ $build = & $runner -ExecutionExperiments -BuildOnly -WhatIf -Output $output | Co
 Assert $build.build_only 'Build-only selection was lost.'
 $multiple = & $runner -TestName tier1,tier1 -UnitFilter virtual_memory,fault_recovery,virtual_memory -WhatIf -Output $output | ConvertFrom-Json
 Assert ($multiple.targets.Count -eq 2 -and $multiple.runs.Count -eq 3) 'Duplicate selectors should run only once.'
+$full = & $runner -AllTests -DirectMemory -Tier1 bridge -WhatIf -Output $output | ConvertFrom-Json
+$expected = @(Get-ChildItem (Join-Path $PSScriptRoot '../../crates/adv-cpu/tests') -File -Filter '*.rs')
+Assert ($full.targets.Count -eq $expected.Count + 1) 'Full suite must include every integration target and the library.'
+Assert ($full.runs[-1].target -eq 'adv_cpu' -and $full.runs[-1].filter -eq '') 'Full library suite must have no filter.'
+Assert ($full.runs[0].shell.Contains('ADV_TIER1=bridge ADV_DIRECT_MEMORY=1 timeout')) 'Execution settings must reach the device.'
+Reject { & $runner -AllTests -ExecutionExperiments -WhatIf } 'Conflicting presets were accepted.'
+Reject { & $runner -AllTests -UnitFilter virtual_memory -WhatIf } 'Full suite accepted a unit filter.'
 Reject { & $runner -WhatIf -TestName @() } 'Empty selection was accepted.'
 Reject { & $runner -WhatIf -TestName missing_target } 'Unknown integration target was accepted.'
 Reject { & $runner -WhatIf -UnitFilter 'fault;exit' } 'Shell metacharacters were accepted.'

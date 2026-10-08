@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -315,7 +316,8 @@ def table(summary: dict) -> str:
 
 
 def save(path: Path, content: str) -> None:
-    require(path.resolve().is_relative_to(REPO / "target"), "output must stay inside ignored target/")
+    root = Path(os.environ.get("ADV_ARTIFACT_ROOT", REPO / "target")).resolve()
+    require(path.resolve().is_relative_to(root), "output must stay inside ADV_ARTIFACT_ROOT (default: ignored target/)")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8")

@@ -243,7 +243,7 @@ class ReplayTests(unittest.TestCase):
             self.assertIn("-T", launch)
             self.assertIn("timeout -s KILL 30", launch[-1])
             if font_diagnostics:
-                self.assertIn("env ADV_TEXT_DIAGNOSTICS=1", launch[-1])
+                self.assertIn("ADV_TEXT_DIAGNOSTICS=1", launch[-1])
             else:
                 self.assertNotIn("ADV_TEXT_DIAGNOSTICS", launch[-1])
             self.assertTrue(metadata["remote_run_directory"].startswith("/data/local/tmp/adv-host-sample-"))
