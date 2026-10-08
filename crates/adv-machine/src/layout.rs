@@ -83,4 +83,13 @@ pub mod peb {
     pub const PROCESS_PARAMETERS: u32 = 0x10;
     pub const PROCESS_HEAP: u32 = 0x18;
     pub const FAST_PEB_LOCK: u32 = 0x1c;
+    pub const OS_MAJOR_VERSION: u32 = 0xa4;
+    pub const OS_MINOR_VERSION: u32 = 0xa8;
+    pub const OS_BUILD_NUMBER: u32 = 0xac;
+    pub const OS_CSD_VERSION: u32 = 0xae;
+    pub const OS_PLATFORM_ID: u32 = 0xb0;
+    /// UNICODE_STRING, the service pack string RtlGetVersion reports.
+    pub const CSD_VERSION: u32 = 0x1f0;
+    /// Its buffer, in the PEB page past the Windows 7 x86 structure.
+    pub const CSD_BUFFER: u32 = 0x800;
 }

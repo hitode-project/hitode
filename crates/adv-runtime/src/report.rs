@@ -225,6 +225,7 @@ impl<B: Backend> Runtime<B> {
                     message.style, message.result, message.caption, message.text,
                 ));
             }
+            personality_gaps(&mut report, diagnostics);
         }
         for (label, fault) in [
             ("First", self.first_cpu_fault()),
@@ -441,5 +442,32 @@ impl<B: Backend> Runtime<B> {
             ));
         }
         report
+    }
+}
+
+/// What the guest asked of the personality and did not get
+/// (docs/personality-contracts.md): rejected discovery probes, reviewed
+/// exports answered with their failure contract, and static stub calls,
+/// whose names and callers are listed under the called API gaps.
+fn personality_gaps(report: &mut String, diagnostics: &adv_abi::ApiDiagnostics) {
+    report.push_str(&format!(
+        "\nPersonality gaps: rejected probes: {} (dropped names: {}); reviewed failure calls: {}; stub calls: {}",
+        diagnostics.rejected_probes.values().map(|probe| probe.count).sum::<u64>(),
+        diagnostics.dropped_rejected_probes,
+        diagnostics.reviewed_calls.values().sum::<u64>(),
+        diagnostics.stub_calls,
+    ));
+    for (name, probe) in &diagnostics.rejected_probes {
+        report.push_str(&format!(
+            "\n  rejected {name} ({}) x{}, first from {:#010x}",
+            probe
+                .class
+                .map_or("undeclared", adv_abi::ExportClass::as_str),
+            probe.count,
+            probe.first_caller,
+        ));
+    }
+    for (name, count) in &diagnostics.reviewed_calls {
+        report.push_str(&format!("\n  reviewed {name} x{count}"));
     }
 }
