@@ -36,7 +36,7 @@ const MAX_TRANSFER: u32 = 64 * 1024 * 1024;
 struct Allocations(BTreeMap<u32, Allocation>);
 struct Allocation {
     protection: u32,
-    /// Exact PAGE_* values for committed private pages, including WRITECOPY.
+    /// Exact PAGE_* values for committed private pages.
     pages: BTreeMap<u32, u32>,
 }
 
@@ -152,6 +152,9 @@ pub(crate) fn allocate(
     protection: u32,
 ) -> Result<u32, Error> {
     let prot = decode(protection)?;
+    if matches!(protection, 8 | 0x80) {
+        return Err(error(err::INVALID_PARAMETER));
+    }
     if ty & !(MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN) != 0 || ty & (MEM_COMMIT | MEM_RESERVE) == 0
     {
         return Err(error(err::INVALID_PARAMETER));
@@ -328,6 +331,11 @@ fn page_protection(env: &Env<'_>, page: u32) -> Option<u32> {
     if let Some(raw) = adv_os::try_modules(env.ext).and_then(|m| m.data_file_containing(page)) {
         return Some(raw.data_file.as_ref()?.protection(env.cpu, raw.base, page));
     }
+    if let Some(protection) =
+        adv_os::try_modules(env.ext).and_then(|modules| modules.image_protection(env.cpu, page))
+    {
+        return Some(protection);
+    }
     if let Some(value) = env
         .ext
         .try_get::<Allocations>()
@@ -391,7 +399,8 @@ pub(crate) fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
             .next_mapped_page(page, u64::from(limit))
             .map_err(|_| error(NOACCESS))?
             .unwrap_or(limit);
-        return Ok([page, 0, 0, end - page, MEM_FREE, 0, 0]);
+        // Windows reports free address space as PAGE_NOACCESS.
+        return Ok([page, 0, 0, end - page, MEM_FREE, 1, 0]);
     }
     let (base, _) = allocation.unwrap_or((page, PAGE));
     let limit = if allocation.is_none() {
@@ -417,6 +426,10 @@ pub(crate) fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
         .map(|a| a.protection)
         .unwrap_or(if raw.is_some() {
             2
+        } else if image.is_some() {
+            // SEC_IMAGE views are created PAGE_EXECUTE_WRITECOPY; sections
+            // narrow the page protections, not the allocation's.
+            0x80
         } else {
             protection.unwrap_or(0)
         });
@@ -450,6 +463,13 @@ fn protect(env: &mut Env<'_>, addr: u32, size: u32, protection: u32) -> Result<u
     if let Some(result) = file_mapping::protect(env, page, len, protection) {
         return result.map_err(error);
     }
+    if matches!(protection, 8 | 0x80)
+        && adv_os::try_modules(env.ext).is_none_or(|modules| {
+            modules.containing(page).is_none() && modules.data_file_containing(page).is_none()
+        })
+    {
+        return Err(error(err::INVALID_PARAMETER));
+    }
     let (base, extent) = env
         .sys
         .vm
@@ -471,6 +491,9 @@ fn protect(env: &mut Env<'_>, addr: u32, size: u32, protection: u32) -> Result<u
     env.cpu
         .protect(page, len, prot)
         .map_err(|_| error(INVALID_ADDRESS))?;
+    if let Some(modules) = env.ext.try_get_mut::<adv_os::Modules>() {
+        modules.protect_image_pages(page, len, protection);
+    }
     if let Some(allocation) = state(env).0.get_mut(&base) {
         for p in (page..page + len).step_by(PAGE as usize) {
             allocation.pages.insert(p, protection);
@@ -537,12 +560,21 @@ pub(crate) fn protect_memory(env: &mut Env<'_>, a: u32, s: u32, p: u32, out: u32
     if let Err(e) = output(env, out, 4) {
         return finish(env, Err(e));
     }
-    let result = protect(env, a, s, p).and_then(|previous| {
-        env.cpu
+    let result = match protect(env, a, s, p) {
+        Ok(previous) => env
+            .cpu
             .write_u32(out, previous)
-            .map_err(|_| error(NOACCESS))?;
-        Ok(1)
-    });
+            .map(|()| 1)
+            .map_err(|_| error(NOACCESS)),
+        Err(error) => {
+            // Native Windows publishes PAGE_NOACCESS for a rejected private
+            // COPY request; memory contents and page protections stay intact.
+            if error.code == err::INVALID_PARAMETER && matches!(p, 8 | 0x80) {
+                let _ = env.cpu.write_u32(out, 1);
+            }
+            Err(error)
+        }
+    };
     finish(env, result)
 }
 fn virtual_protect(env: &mut Env<'_>) -> Outcome {

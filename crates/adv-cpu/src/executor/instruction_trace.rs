@@ -15,6 +15,8 @@
 //! instruction.after precedes trap dispatch. A separate resume observation is
 //! state at the next interpreter dispatch, possibly in a different CPU context;
 //! it is not an instruction's after state. boundary records public run outcomes.
+//! Boundaries are recorded only after a selected instruction since the prior
+//! boundary, so unrelated execution does not consume the capture budget.
 //! Configuration or IO errors warn and disable capture without failing execution.
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -140,6 +142,7 @@ pub(crate) struct Trace {
     written: usize,
     disabled: bool,
     pending_resume: bool,
+    interval_observed: bool,
     failure: Option<String>,
 }
 
@@ -179,6 +182,7 @@ impl Trace {
             written: 0,
             disabled: false,
             pending_resume: false,
+            interval_observed: false,
             failure: None,
         }
     }
@@ -278,6 +282,7 @@ impl Trace {
             }
         }
         self.record("instruction", &fields);
+        self.interval_observed = true;
         self.pending_resume = matches!(step, Step::Trap { .. });
     }
 
@@ -287,7 +292,7 @@ impl Trace {
         state: &CpuState,
         memory: &Memory,
     ) {
-        if self.written == 0 || self.disabled {
+        if !std::mem::take(&mut self.interval_observed) || self.disabled {
             return;
         }
         let outcome = result

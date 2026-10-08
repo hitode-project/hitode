@@ -126,6 +126,7 @@ impl WorkerLayout {
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
+            private_copy_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
             #[cfg(windows)]
@@ -154,6 +155,9 @@ pub struct Memory {
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: BTreeMap<usize, SharedPage>,
+    /// Owned snapshots have no external alias. SHARED is only their first-store
+    /// barrier, retired by the same transactional store preparation as COPY.
+    private_copy_pages: BTreeMap<usize, bool>,
     /// File pages whose bytes live in this window's committed pages.
     resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
     /// Real host pins owned by this window; repeated locks do not add a count.
@@ -492,6 +496,7 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
+            private_copy_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
             #[cfg(windows)]
@@ -536,6 +541,7 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
+            private_copy_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
             #[cfg(windows)]
@@ -638,6 +644,7 @@ impl Memory {
                 self.native_read_exceptions -= 1;
             }
             self.shared_pages.remove(&page);
+            self.private_copy_pages.remove(&page);
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
         self.fast.invalidate(pages.clone());
@@ -821,7 +828,12 @@ impl Memory {
     /// after a file view becomes resident and drops the SHARED permission bit.
     pub(crate) fn externally_mutable_code(&self, address: u32, len: usize) -> bool {
         self.range(address, len).is_ok_and(|range| {
-            self.overlays(&range)
+            (!range.is_empty()
+                && self
+                    .shared_pages
+                    .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                    .next()
+                    .is_some())
                 || (!range.is_empty()
                     && self
                         .resident
@@ -948,6 +960,96 @@ impl Memory {
         Ok(storage)
     }
 
+    /// Prepared private bytes may execute without externally mutable code.
+    pub(crate) fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        perms: u8,
+    ) -> Result<(), String> {
+        let pages = self.pages(addr, bytes.len())?;
+        if perms & !7 != 0 {
+            return Err("invalid private snapshot protection".into());
+        }
+        self.map(addr, bytes.len(), READ | WRITE)?;
+        if let Err(error) = self.write(addr, bytes) {
+            let _ = self.unmap(addr, bytes.len());
+            return Err(error);
+        }
+        for page in pages.clone() {
+            self.private_copy_pages.insert(page, true);
+            #[cfg(windows)]
+            if Self::native_read_exception(self.perms[page]) {
+                self.native_read_exceptions -= 1;
+            }
+            Arc::make_mut(&mut self.perms)[page] |= SHARED;
+        }
+        self.fast.invalidate(pages);
+        if let Err(error) = self.protect(addr, bytes.len(), perms) {
+            let _ = self.unmap(addr, bytes.len());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn privatize_copy_pages(&mut self, addr: u32, len: usize) -> Result<(), String> {
+        let pages = self.pages(addr, len)?;
+        let range = self.committed(addr, len)?;
+        if pages
+            .clone()
+            .any(|page| !self.private_copy_pages.contains_key(&page))
+        {
+            return Err("only owned private snapshots can be privatized".into());
+        }
+        self.quiesce_workers();
+        self.prepare_private_copy_range(&range)?;
+        Ok(())
+    }
+    fn prepare_private_copy_range(&mut self, range: &std::ops::Range<usize>) -> Result<(), String> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let begin = range.start / PAGE_SIZE;
+        let end = (range.end - 1) / PAGE_SIZE + 1;
+        let changed: Vec<_> = self
+            .private_copy_pages
+            .range(begin..end)
+            .filter_map(|(&page, &copy)| copy.then_some(page))
+            .collect();
+        // Restore hardware permissions before removing the execution barrier.
+        // A failure leaves all COPY state and inline grants unchanged.
+        #[cfg(windows)]
+        if self.native_protection {
+            let reservation = self.reservation.as_ref().unwrap();
+            let mut scopes = Vec::new();
+            for &page in &changed {
+                scopes.push(unsafe {
+                    reservation.temporary_protection(
+                        page * PAGE_SIZE,
+                        PAGE_SIZE,
+                        Self::native_permission(self.perms[page] & !SHARED),
+                    )
+                }?);
+            }
+            for scope in scopes {
+                scope.retain()
+            }
+        }
+        for &page in &changed {
+            *self.private_copy_pages.get_mut(&page).unwrap() = false;
+            Arc::make_mut(&mut self.perms)[page] &= !SHARED;
+            #[cfg(windows)]
+            if Self::native_read_exception(self.perms[page]) {
+                self.native_read_exceptions += 1;
+            }
+            self.fast.invalidate(page..page + 1);
+        }
+        if !changed.is_empty() {
+            self.epoch += 1;
+        }
+        Ok(())
+    }
+
     pub(crate) fn map_file_pages(
         &mut self,
         addr: u32,
@@ -1021,6 +1123,9 @@ impl Memory {
     }
     pub(crate) fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         let page = addr.checked_sub(self.base)? as usize / PAGE_SIZE;
+        if let Some(copy) = self.private_copy_pages.get(&page) {
+            return Some(*copy);
+        }
         if self.resident.contains_key(&page) {
             return Some(false);
         }
@@ -1088,6 +1193,9 @@ impl Memory {
                 }
             }
         }
+        if write {
+            self.prepare_private_copy_range(range)?;
+        }
         for (index, prepared) in private {
             let Some(SharedPage::File {
                 page,
@@ -1099,6 +1207,9 @@ impl Memory {
             *page = prepared;
             *copy_on_write = false;
         }
+        // Snapshot mappings already own their initialized linear bytes. The
+        // barrier guarantees that no inline store can bypass this first write.
+        // All permissions and fallible file snapshots were checked above.
         if !self.parallel_view {
             for page in range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE {
                 self.make_resident(page);
@@ -1420,6 +1531,31 @@ mod linear_audio_tests {
             drop(permit);
         }
     }
+    #[test]
+    fn private_copy_privatization_restores_native_noaccess_permissions() {
+        for enable_first in [false, true] {
+            let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
+            if enable_first {
+                memory.enable_native_protection().unwrap();
+            }
+            memory
+                .map_private_copy_pages(0x10000, &[0x19; PAGE_SIZE], 0)
+                .unwrap();
+            if !enable_first {
+                memory.enable_native_protection().unwrap();
+            }
+            memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
+            assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
+            assert_eq!(query(&memory, 0x10000).protection, 1);
+            memory.write(0x10000, &[0x27]).unwrap();
+            assert_eq!(query(&memory, 0x10000).protection, 1);
+            let mut actual = [0; 1];
+            memory.read_into(0x10000, &mut actual).unwrap();
+            assert_eq!(actual, [0x27]);
+            assert_eq!(query(&memory, 0x10000).protection, 1);
+        }
+    }
+
     #[repr(C)]
     #[derive(Default)]
     struct MemoryInfo {
@@ -2018,6 +2154,43 @@ mod linear_audio_tests {
 mod file_page_tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn private_copy_pages_keep_execution_cache_and_retire_barriers_per_write() {
+        let mut memory = Memory::reserve(0x10000, 2 * PAGE_SIZE).unwrap();
+        memory
+            .map_private_copy_pages(0x10000, &[0x37; 2 * PAGE_SIZE], READ | EXEC)
+            .unwrap();
+        assert!(!memory.externally_mutable_code(0x10000, 2 * PAGE_SIZE));
+        assert!(memory.executable(0x10000, 2 * PAGE_SIZE));
+        assert_eq!(memory.read_data(0x10000, 4).unwrap().as_ref(), [0x37; 4]);
+        memory.protect(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
+        assert!(memory.prepare_native_access(0x10ffe, 4, true).is_err());
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        memory.prepare_native_access(0x10000, 4, false).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        memory.write(0x10000, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        assert_eq!(memory.perms[0], READ | WRITE);
+        assert!(memory.direct(0x10000, 4, true).is_some());
+        memory
+            .protect(0x11000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.watch_code(0x11000, 4);
+        let version = memory.versions[1];
+        memory.copy(0x10000, 0x11000, 4).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(false));
+        assert_eq!(memory.read(0x11000, 4).unwrap(), [1, 2, 3, 4]);
+        assert!(memory.versions[1] > version);
+        memory.unmap(0x10000, PAGE_SIZE).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x10000), None);
+        memory.map(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x10000), None);
+        memory.fill(0x10000, &[0x63], PAGE_SIZE).unwrap();
+        assert_eq!(memory.read(0x10000, 4).unwrap(), [0x63; 4]);
+    }
 
     #[test]
     fn native_preparation_checks_all_permissions_before_io_or_cow_detach() {

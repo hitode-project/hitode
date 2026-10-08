@@ -182,7 +182,7 @@ impl Modules {
             .ok_or_else(|| LoadError::NoSpace(path.into(), file_len))?;
         let base = sys
             .vm
-            .reserve(size)
+            .reserve_exact(size)
             .ok_or_else(|| LoadError::NoSpace(path.into(), size))?;
         let raw = DataFile {
             section,

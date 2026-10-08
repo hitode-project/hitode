@@ -162,6 +162,7 @@ pub struct PreparedProcess {
     pub module: ModuleId,
     initializers: Vec<InitCall>,
     delay: Vec<adv_pe::DelayImportModule>,
+    sections: Vec<(u32, u32)>,
 }
 
 pub struct Loader<'a> {
@@ -178,6 +179,7 @@ pub struct Loader<'a> {
     changes: ResolutionChanges,
     defer_executable: bool,
     pending_delay: Vec<adv_pe::DelayImportModule>,
+    pending_sections: Vec<(u32, u32)>,
 }
 
 /// Mutations made while following dynamic export forwarders. The frontend can
@@ -221,6 +223,7 @@ impl<'a> Loader<'a> {
             changes: ResolutionChanges::default(),
             defer_executable: false,
             pending_delay: Vec::new(),
+            pending_sections: Vec::new(),
         }
     }
 
@@ -251,6 +254,7 @@ impl<'a> Loader<'a> {
             module,
             initializers: std::mem::take(&mut self.inits),
             delay: std::mem::take(&mut self.pending_delay),
+            sections: std::mem::take(&mut self.pending_sections),
         })
     }
 
@@ -373,9 +377,11 @@ impl<'a> Loader<'a> {
             {
                 return Err(invalid());
             }
+            let bound_slots: Vec<_> = writes.iter().map(|&(slot, _)| slot - base).collect();
             for (slot, address) in writes {
                 self.cpu.write_u32(slot, address)?;
             }
+            self.privatize_import_sections(base, &prepared.sections, &bound_slots)?;
             Ok(())
         })();
         self.importers.pop();
@@ -590,8 +596,8 @@ impl<'a> Loader<'a> {
             }
             exports_by_ordinal.insert(export.ordinal, export.target);
         }
-        self.cpu.map(base, size, Prot::RW)?;
-        self.cpu.write(base, &image.bytes)?;
+        self.cpu
+            .map_private_copy_pages(base, &image.bytes, Prot::RW)?;
         self.cpu.protect(base, size, Prot::READ)?;
         self.cpu
             .protect(base + image.text_rva, image.text_size, Prot::RX)?;
@@ -631,6 +637,7 @@ impl<'a> Loader<'a> {
         self.changes.created.push(id);
         self.modules.publish_ldr(self.cpu, id, &path)?;
         self.modules.complete_ldr(self.cpu, id)?;
+        self.modules.capture_image_protections(self.cpu, id);
         if self.modules.get(id).name == "ntdll.dll" {
             if let Some(&rva) = image.private_entries.get("return_pad") {
                 self.sys.set_guest_return_entry(base + rva);
@@ -672,9 +679,10 @@ impl<'a> Loader<'a> {
             if stripped {
                 return Err(LoadError::NoRelocs(path.to_owned(), pe.image_base));
             }
+            // The image view spans SizeOfImage; the granule tail stays free.
             self.sys
                 .vm
-                .reserve(size)
+                .reserve_exact(size)
                 .ok_or_else(|| LoadError::NoSpace(path.to_owned(), size))?
         };
         let result = self.populate_image(key, path, pe, base, size, retain, identity);
@@ -699,9 +707,7 @@ impl<'a> Loader<'a> {
             err,
         };
         if base != pe.image_base {
-            let n = pe
-                .relocate(base.wrapping_sub(pe.image_base))
-                .map_err(pe_err)?;
+            let n = pe.rebase(base).map_err(pe_err)?;
             log::debug!(
                 "{key}: rebased {:#x} -> {base:#x} ({n} fixups)",
                 pe.image_base
@@ -785,18 +791,30 @@ impl<'a> Loader<'a> {
             .rfind(['\\', '/'])
             .map_or(String::new(), |i| path[..i].to_owned());
         self.importers.push(dir);
+        let sections: Vec<_> = pe
+            .sections
+            .iter()
+            .filter(|section| section.mem_size() != 0)
+            .map(|section| {
+                let start = section.virtual_address & !(PAGE - 1);
+                let length = align_up(section.mem_size() + section.virtual_address - start, PAGE);
+                (start, length)
+            })
+            .collect();
         let bound = if self.defer_executable && !pe.is_dll() {
             self.pending_delay = pe.delay_imports_at(base).unwrap_or_default();
-            Ok(())
+            self.pending_sections = sections.clone();
+            Ok(Vec::new())
         } else {
             self.bind(&mut pe, path, base, id)
         };
         self.importers.pop();
-        bound?;
+        let bound_slots = bound?;
 
-        // Map, copy, protect.
-        self.cpu.map(base, size, Prot::RW)?;
-        self.cpu.write(base, &pe.image)?;
+        // Seed private-copy pages without consuming their first guest write.
+        pe.image.resize(size as usize, 0);
+        self.cpu.map_private_copy_pages(base, &pe.image, Prot::RW)?;
+        self.privatize_import_sections(base, &sections, &bound_slots)?;
         if pe.section_alignment >= PAGE {
             self.cpu
                 .protect(base, align_up(pe.size_of_headers.max(1), PAGE), Prot::READ)?;
@@ -810,6 +828,7 @@ impl<'a> Loader<'a> {
         }
         log::info!("loaded {key} at {base:#010x} (+{size:#x})");
         self.modules.get_mut(id).lifetime.mapped = true;
+        self.modules.capture_image_protections(self.cpu, id);
 
         self.modules.get_mut(id).lifetime.callbacks = tls_callbacks.clone();
         for cb in tls_callbacks {
@@ -845,17 +864,19 @@ impl<'a> Loader<'a> {
         path: &str,
         base: u32,
         owner: ModuleId,
-    ) -> Result<(), LoadError> {
+    ) -> Result<Vec<u32>, LoadError> {
         let pe_err = |err| LoadError::Pe {
             path: path.to_owned(),
             err,
         };
+        let mut bound_slots = Vec::new();
         for m in pe.imports().map_err(pe_err)? {
             let dep = self.load_inner(&m.dll, false)?;
             self.dependency(owner, dep)?;
             for imp in &m.imports {
                 let addr = self.resolve_inner(dep, &imp.name, 0, false)?;
                 pe.set_u32(imp.iat_rva, addr).map_err(pe_err)?;
+                bound_slots.push(imp.iat_rva);
             }
         }
         // The Windows loader never reads the delay-import directory; the guest's
@@ -871,10 +892,28 @@ impl<'a> Loader<'a> {
             if m.module_handle_rva != 0 {
                 pe.set_u32(m.module_handle_rva, self.modules.get(dep).base)
                     .map_err(pe_err)?;
+                bound_slots.push(m.module_handle_rva);
             }
             for imp in &m.imports {
                 let addr = self.resolve_inner(dep, &imp.name, 0, false)?;
                 pe.set_u32(imp.iat_rva, addr).map_err(pe_err)?;
+                bound_slots.push(imp.iat_rva);
+            }
+        }
+        Ok(bound_slots)
+    }
+
+    /// Import binding makes its containing section private, including untouched
+    /// pages. Keep the original mapped sections when process binding is deferred.
+    fn privatize_import_sections(
+        &mut self,
+        base: u32,
+        sections: &[(u32, u32)],
+        slots: &[u32],
+    ) -> Result<(), LoadError> {
+        for &(start, length) in sections {
+            if slots.iter().any(|&slot| slot.wrapping_sub(start) < length) {
+                self.cpu.privatize_copy_pages(base + start, length)?;
             }
         }
         Ok(())

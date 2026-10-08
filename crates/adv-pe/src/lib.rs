@@ -171,6 +171,8 @@ pub struct Pe {
     pub stack_commit: u32,
     pub heap_reserve: u32,
     pub heap_commit: u32,
+    /// Offset (and RVA) of the `PE\0\0` signature.
+    pub nt_headers: u32,
     pub dirs: [DataDir; 16],
     pub sections: Vec<Section>,
     /// The mapped image, `size_of_image` bytes.
@@ -272,6 +274,7 @@ impl Pe {
             stack_commit: le32(oh, 76)?,
             heap_reserve: le32(oh, 80)?,
             heap_commit: le32(oh, 84)?,
+            nt_headers: nt as u32,
             dirs,
             sections: Vec::new(),
             image: Vec::new(),
@@ -501,6 +504,22 @@ impl Pe {
             self.set_u32(r, v.wrapping_add(delta))?;
         }
         Ok(relocs.len())
+    }
+
+    /// Rebase the mapped image and publish its actual OptionalHeader.ImageBase.
+    /// A missing relocation directory leaves embedded VAs unchanged, but does
+    /// not suppress the mapped header update.
+    pub fn rebase(&mut self, base: u32) -> Result<usize> {
+        let field = self.image_base_field()?;
+        self.slice(field, 4)?;
+        let n = self.relocate(base.wrapping_sub(self.image_base))?;
+        self.set_u32(field, base)?;
+        Ok(n)
+    }
+
+    fn image_base_field(&self) -> Result<u32> {
+        // Signature, file header, then ImageBase at optional-header offset 28.
+        add(self.nt_headers, 4 + 20 + 28)
     }
 
     /// Walk a thunk array (names at `names_rva`, slots at `iat_rva`).

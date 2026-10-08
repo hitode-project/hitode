@@ -379,6 +379,56 @@ fn nt_vm_failures_leave_outputs_last_error_and_reservations_intact() {
     }
 }
 
+#[test]
+fn nt_protect_rejects_private_copy_pages_and_publishes_noaccess_old_protection() {
+    const OLD: u32 = DATA + 0x30;
+    const SNAPSHOTS: u32 = DATA + 0x40;
+    const SENTINEL: u32 = 0x12345678;
+    for jit in [false, true] {
+        let mut f = Fixture::new(jit);
+        f.request(FIXED, 8192);
+        f.allocate("NtAllocateVirtualMemory", 0x3000, 4, 0);
+        for (index, protection) in [8, 0x80].into_iter().enumerate() {
+            f.request(FIXED + 123, 0x321);
+            f.code.mov_mem_imm(OLD, SENTINEL);
+            f.call(
+                "ntdll.dll",
+                "NtProtectVirtualMemory",
+                &[V(u32::MAX), V(BASE), V(SIZE), V(protection), V(OLD)],
+                0xc00000f2,
+            );
+            let snapshot = SNAPSHOTS + index as u32 * 16;
+            f.code
+                .mov_eax_mem(BASE)
+                .mov_mem_eax(snapshot)
+                .mov_eax_mem(SIZE)
+                .mov_mem_eax(snapshot + 4)
+                .mov_eax_mem(OLD)
+                .mov_mem_eax(snapshot + 8);
+            f.call(
+                "kernel32.dll",
+                "VirtualQuery",
+                &[V(FIXED), V(INFO + index as u32 * 32), V(28)],
+                28,
+            );
+        }
+        let m = f.run();
+        for index in 0..2 {
+            let snapshot = SNAPSHOTS + index * 16;
+            assert_eq!(m.cpu.read_u32(snapshot).unwrap(), FIXED + 123);
+            assert_eq!(m.cpu.read_u32(snapshot + 4).unwrap(), 0x321);
+            // Native initializes this output even though the request fails.
+            assert_eq!(m.cpu.read_u32(snapshot + 8).unwrap(), 1);
+            let info = INFO + index * 32;
+            assert_eq!(m.cpu.read_u32(info + 16).unwrap(), 0x1000);
+            assert_eq!(m.cpu.read_u32(info + 20).unwrap(), 4);
+            assert_eq!(m.cpu.read_u32(info + 24).unwrap(), 0x20000);
+        }
+        assert_eq!(m.sys.vm.containing(FIXED), Some((FIXED, 8192)));
+        assert!(m.cpu.accessible(FIXED, 8192, Prot::RW));
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn native_nt_vm_confirms_commit_and_free_output_rounding() {

@@ -107,6 +107,8 @@ pub struct Modules {
     // Only name-table indexes; every lookup validates current guest PE bytes.
     // Module ids are never reused, and retiring an owner removes its hints.
     export_hints: HashMap<ModuleId, HashMap<String, u32>>,
+    /// PAGE values belong to the live image owner, never to a reusable base.
+    image_protections: BTreeMap<ModuleId, Vec<u32>>,
     ldr: u32,
     ldr_used: u32,
     ldr_free: Vec<(u32, u32)>,
@@ -235,6 +237,69 @@ impl Modules {
 
     pub fn get_mut(&mut self, id: ModuleId) -> &mut Module {
         self.list.get_mut(&id).expect("live module id")
+    }
+
+    /// Publish section PAGE values only after the complete image is mapped.
+    pub fn set_image_protections(&mut self, id: ModuleId, protections: Vec<u32>) {
+        let module = self.get(id);
+        assert!(module.executable_visible());
+        assert_eq!(protections.len(), module.size.div_ceil(4096) as usize);
+        self.image_protections.insert(id, protections);
+    }
+
+    /// Capture loader-applied page permissions once; future guest PE-header
+    /// writes do not replace the mapped image's allocation/section contract.
+    pub fn capture_image_protections(&mut self, cpu: &dyn adv_cpu::backend::Guest, id: ModuleId) {
+        use adv_cpu::backend::Prot;
+        let module = self.get(id);
+        let pages = (0..module.size.div_ceil(4096))
+            .map(|index| {
+                let page = module.base + index * 4096;
+                match (
+                    cpu.accessible(page, 4096, Prot::READ),
+                    cpu.accessible(page, 4096, Prot::WRITE),
+                    cpu.accessible(page, 4096, Prot::EXEC),
+                ) {
+                    (_, true, true) => 0x40,
+                    (true, false, true) => 0x20,
+                    (false, false, true) => 0x10,
+                    (_, true, false) => 4,
+                    (true, false, false) => 2,
+                    _ => 1,
+                }
+            })
+            .collect();
+        self.set_image_protections(id, pages);
+    }
+
+    /// Writable image pages retain COPY until the execution backend's first
+    /// write. Setting COPY on an already private page never shares it again.
+    pub fn image_protection(&self, cpu: &dyn adv_cpu::backend::Guest, address: u32) -> Option<u32> {
+        let id = self.containing(address)?;
+        let index = ((address - self.get(id).base) / 4096) as usize;
+        let value = *self.image_protections.get(&id)?.get(index)?;
+        Some(match (value, cpu.file_page_copy_on_write(address)) {
+            (4 | 8, Some(true)) => 8,
+            (0x40 | 0x80, Some(true)) => 0x80,
+            (8, Some(false)) => 4,
+            (0x80, Some(false)) => 0x40,
+            _ => value,
+        })
+    }
+
+    /// The caller applies CPU protection transactionally before publishing it.
+    pub fn protect_image_pages(&mut self, address: u32, length: u32, protection: u32) {
+        let Some(id) = self.containing(address) else {
+            return;
+        };
+        let module = self.get(id);
+        let first = ((address - module.base) / 4096) as usize;
+        let count = (length / 4096) as usize;
+        if let Some(pages) = self.image_protections.get_mut(&id)
+            && let Some(changed) = pages.get_mut(first..first + count)
+        {
+            changed.fill(protection);
+        }
     }
 
     pub fn by_name(&self, path: &str) -> Option<ModuleId> {
@@ -413,6 +478,7 @@ impl Modules {
         }
         let module = self.list.remove(&id).expect("live module id");
         self.export_hints.remove(&id);
+        self.image_protections.remove(&id);
         if module.executable_visible() {
             let name = module.name;
             self.by_name.remove(&name);
