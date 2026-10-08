@@ -13,8 +13,11 @@ fn directory() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/sidt-agent/instruction-trace-tests")
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let path = target
+        .join("scratch/instruction-trace-tests")
         .join(format!("{}-{id}-{time}", std::process::id()));
     std::fs::create_dir_all(&path).unwrap();
     path.canonicalize().unwrap()
@@ -33,11 +36,22 @@ fn cpu(bytes: &[u8]) -> Executor {
 }
 
 fn attach(cpu: &mut Executor, ranges: Vec<Range<u64>>, max: usize, words: usize) -> PathBuf {
+    attach_operands(cpu, ranges, max, words, false)
+}
+
+fn attach_operands(
+    cpu: &mut Executor,
+    ranges: Vec<Range<u64>>,
+    max: usize,
+    words: usize,
+    operands: bool,
+) -> PathBuf {
     let trace = Trace::new(Config {
         directory: directory(),
         ranges,
         max,
         stack_words: words,
+        operands,
     });
     let path = trace.path.clone();
     cpu.instruction_trace = Some(Box::new(trace));
@@ -129,14 +143,25 @@ fn event_limit_stops_capture_without_stopping_the_guest() {
 fn configuration_rejects_empty_or_unbounded_capture_and_non_target_output() {
     let dir = directory();
     for ranges in ["", "0x1000..0x1000", "0..4294967297"] {
-        assert!(Config::parse(dir.clone(), ranges, "10", "4").is_err());
+        assert!(Config::parse(dir.clone(), ranges, "10", "4", "0").is_err());
     }
     for (max, words) in [("0", "4"), ("100001", "4"), ("10", "9")] {
-        assert!(Config::parse(dir.clone(), "0x1000..0x2000", max, words).is_err());
+        assert!(Config::parse(dir.clone(), "0x1000..0x2000", max, words, "0").is_err());
     }
-    let config = Config::parse(dir, "0X1000..0x2000,8192..12288", "1", "8").unwrap();
+    assert!(Config::parse(dir.clone(), "0..1", "1", "0", "true").is_err());
+    let config = Config::parse(dir, "0X1000..0x2000,8192..12288", "1", "8", "1").unwrap();
     assert_eq!(config.ranges, [0x1000..0x2000, 0x2000..0x3000]);
-    assert!(Config::parse(PathBuf::from(env!("CARGO_MANIFEST_DIR")), "0..1", "1", "0").is_err());
+    assert!(config.operands);
+    assert!(
+        Config::parse(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            "0..1",
+            "1",
+            "0",
+            "0"
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -175,6 +200,7 @@ fn io_failure_disables_diagnostics_and_preserves_execution() {
         ranges: vec![u64::from(CODE)..u64::from(CODE + 2)],
         max: 10,
         stack_words: 1,
+        operands: false,
     })));
     assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
     assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
@@ -260,4 +286,213 @@ fn jit_backend_selection_does_not_activate_instruction_capture() {
     assert_eq!(traced.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert!(!path.exists());
     assert_eq!(traced.instruction_trace.as_ref().unwrap().written, 0);
+}
+
+#[test]
+fn explicit_cmp_register_and_sign_extended_immediates_identify_the_condition() {
+    // Authored cmp ecx,78 and cmp eax,-1, both using sign-extended imm8.
+    for (bytes, register, index, value, signed) in [
+        ([0x83, 0xf9, 78, 0xc3], "ECX", 1, 78u32, 78i64),
+        ([0x83, 0xf8, 0xff, 0xc3], "EAX", 0, u32::MAX, -1),
+    ] {
+        let mut traced = cpu(&bytes);
+        traced.state.regs[index] = value;
+        let path = attach_operands(
+            &mut traced,
+            vec![u64::from(CODE)..u64::from(CODE + 3)],
+            10,
+            0,
+            true,
+        );
+        assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+        let rows = events(&path);
+        let operands = &rows[0]["operands_before"];
+        assert_eq!(operands[0]["register"], register);
+        assert_eq!(operands[0]["width"], 4);
+        assert_eq!(operands[0]["value"], value);
+        assert_eq!(operands[1]["kind"], "Immediate8to32");
+        assert_eq!(operands[1]["width"], 4);
+        assert_eq!(operands[1]["value"], value);
+        assert_eq!(operands[1]["signed_value"], signed);
+        assert_ne!(rows[0]["after"]["eflags"].as_u64().unwrap() & 64, 0);
+    }
+}
+
+#[test]
+fn explicit_cmp_memory_addresses_include_index_scale_displacement_and_fs_base() {
+    // Authored cmp dword [eax+ecx*4+4],78, optionally with FS override.
+    for fs in [false, true] {
+        let mut bytes = vec![0x83, 0x7c, 0x88, 4, 78, 0xc3];
+        if fs {
+            bytes.insert(0, 0x64);
+        }
+        let mut traced = cpu(&bytes);
+        traced.state.regs[0] = if fs { 0 } else { DATA };
+        traced.state.regs[1] = 3;
+        traced.state.fs_base = if fs { DATA } else { 0 };
+        traced.write(DATA + 16, &78u32.to_le_bytes()).unwrap();
+        let path = attach_operands(
+            &mut traced,
+            vec![u64::from(CODE)..u64::from(CODE + bytes.len() as u32 - 1)],
+            10,
+            0,
+            true,
+        );
+        assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+        let rows = events(&path);
+        let memory = &rows[0]["operands_before"][0];
+        assert_eq!(memory["kind"], "Memory");
+        assert_eq!(memory["segment"], if fs { "FS" } else { "DS" });
+        assert_eq!(memory["ea"], DATA + 16);
+        assert_eq!(memory["width"], 4);
+        assert_eq!(memory["scalar"], 78);
+        assert_eq!(rows[0]["operands_after"][0], *memory);
+    }
+}
+
+#[test]
+fn memory_after_uses_the_actual_before_address_and_observes_written_scalars() {
+    // Authored mov eax,[eax] changes its own address base.
+    let mut traced = cpu(&[0x8b, 0x00, 0xc3]);
+    traced.state.regs[0] = DATA;
+    traced.write(DATA, &(DATA + 128).to_le_bytes()).unwrap();
+    traced.write(DATA + 128, &42u32.to_le_bytes()).unwrap();
+    let path = attach_operands(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 2)],
+        10,
+        0,
+        true,
+    );
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    let rows = events(&path);
+    assert_eq!(rows[0]["operands_after"][0]["value"], DATA + 128);
+    assert_eq!(rows[0]["operands_before"][1]["ea"], DATA);
+    assert_eq!(rows[0]["operands_after"][1]["ea"], DATA);
+    assert_eq!(rows[0]["operands_after"][1]["scalar"], DATA + 128);
+
+    // Authored mov dword [eax],7 records the write at that same address.
+    let mut traced = cpu(&[0xc7, 0x00, 7, 0, 0, 0, 0xc3]);
+    traced.state.regs[0] = DATA;
+    traced.write(DATA, &10u32.to_le_bytes()).unwrap();
+    let path = attach_operands(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 6)],
+        10,
+        0,
+        true,
+    );
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    let rows = events(&path);
+    assert_eq!(rows[0]["operands_before"][0]["scalar"], 10);
+    assert_eq!(rows[0]["operands_after"][0]["scalar"], 7);
+}
+
+#[test]
+fn explicit_pop_memory_uses_the_post_pop_destination_without_observing_implicit_stack_reads() {
+    // Authored pop dword [esp]; ret. The destination is ESP+4, not ESP.
+    let mut traced = cpu(&[0x8f, 0x04, 0x24, 0xc3]);
+    traced.write(STACK + 4, &10u32.to_le_bytes()).unwrap();
+    let path = attach_operands(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 3)],
+        10,
+        0,
+        true,
+    );
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    let rows = events(&path);
+    assert_eq!(rows[0]["operands_before"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["operands_before"][0]["ea"], STACK + 4);
+    assert_eq!(rows[0]["operands_before"][0]["scalar"], 10);
+    assert_eq!(rows[0]["operands_after"][0]["ea"], STACK + 4);
+    assert_eq!(rows[0]["operands_after"][0]["scalar"], STOP);
+}
+
+#[test]
+fn unreadable_overwide_and_unknown_operands_are_null_without_mutating_execution() {
+    let mut traced = cpu(&[0x83, 0x38, 1]); // Authored cmp dword [eax],1.
+    traced
+        .protect(DATA + PAGE_SIZE as u32, PAGE_SIZE, 0)
+        .unwrap();
+    for address in [DATA + PAGE_SIZE as u32 - 2, u32::MAX - 1] {
+        traced.state.regs[0] = address;
+        let state = traced.state.clone();
+        let i = instruction(&traced.memory, CODE).unwrap();
+        let entries = operands(&i, &traced.state);
+        let row: Value =
+            serde_json::from_str(&operand_snapshot(&entries, &traced.state, &traced.memory))
+                .unwrap();
+        assert_eq!(row[0]["ea"], address);
+        assert!(row[0]["scalar"].is_null());
+        assert_eq!(traced.state, state);
+    }
+    let mut traced = cpu(&[0x0f, 0x10, 0x00]); // Authored movups xmm0,[eax].
+    traced.state.regs[0] = DATA;
+    let i = instruction(&traced.memory, CODE).unwrap();
+    let row: Value = serde_json::from_str(&operand_snapshot(
+        &operands(&i, &traced.state),
+        &traced.state,
+        &traced.memory,
+    ))
+    .unwrap();
+    assert!(row[0]["value"].is_null());
+    assert_eq!(row[1]["width"], 16);
+    assert!(row[1]["scalar"].is_null());
+}
+
+#[test]
+fn disabled_operands_preserve_the_existing_schema_and_execution() {
+    let mut plain = cpu(&[0x83, 0xf9, 78, 0xc3]);
+    let mut off = cpu(&[0x83, 0xf9, 78, 0xc3]);
+    let mut on = cpu(&[0x83, 0xf9, 78, 0xc3]);
+    for cpu in [&mut plain, &mut off, &mut on] {
+        cpu.state.regs[1] = 78;
+    }
+    let ranges = vec![u64::from(CODE)..u64::from(CODE + 4)];
+    let off_path = attach_operands(&mut off, ranges.clone(), 10, 0, false);
+    let on_path = attach_operands(&mut on, ranges, 10, 0, true);
+    for cpu in [&mut plain, &mut off, &mut on] {
+        assert_eq!(run(cpu, 100), RunOutcome::ReachedStop);
+    }
+    assert_eq!(off.state, plain.state);
+    assert_eq!(on.state, plain.state);
+    let off_rows = events(&off_path);
+    let mut on_rows = events(&on_path);
+    assert!(
+        off_rows
+            .iter()
+            .all(|row| row.get("operands_before").is_none() && row.get("operands_after").is_none())
+    );
+    for row in &mut on_rows {
+        row.as_object_mut().unwrap().remove("operands_before");
+        row.as_object_mut().unwrap().remove("operands_after");
+    }
+    assert_eq!(off_rows, on_rows);
+}
+
+#[test]
+fn rep_operands_do_not_expand_implicit_memory_observations() {
+    let mut traced = cpu(&[0xf3, 0xa4, 0xc3]); // Authored rep movsb; ret.
+    traced.state.regs[1] = 2;
+    traced.state.regs[6] = DATA;
+    traced.state.regs[7] = DATA + 16;
+    traced.write(DATA, &[1, 2]).unwrap();
+    let path = attach_operands(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 2)],
+        10,
+        0,
+        true,
+    );
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    for row in events(&path)
+        .iter()
+        .filter(|row| row["kind"] == "instruction")
+    {
+        for operand in row["operands_before"].as_array().unwrap() {
+            assert!(operand.get("ea").is_none());
+            assert!(operand["value"].is_null());
+        }
+    }
 }
