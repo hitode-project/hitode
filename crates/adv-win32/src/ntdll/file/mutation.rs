@@ -65,9 +65,42 @@ pub(super) fn open(
             PATH_NOT_FOUND
         };
     };
+    // Reparse targets need an explicit link-instance model; following one and
+    // deleting its target would silently change the requested operation.
+    let metadata = match std::fs::symlink_metadata(&host) {
+        Ok(metadata) => metadata,
+        Err(error) => return failure(env, error),
+    };
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = metadata.file_type().is_symlink();
+    if reparse {
+        return unavailable_for(
+            env,
+            "ntdll.dll!NtOpenFile",
+            "reparse-point mutation instances are unavailable",
+        );
+    }
     let file = match adv_os::vfs::FileStream::open_for_mutation(&host, access) {
         Ok(file) => file,
-        Err(error) => return failure(env, error),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && env.sys.objects.all_hosts::<FileObj>().any(|(_, file)| {
+                    file.guest_path.eq_ignore_ascii_case(path)
+                        && file
+                            .file
+                            .standard_information()
+                            .is_ok_and(|info| info.delete_pending)
+                })
+            {
+                return 0xc0000056u32 as i32; // STATUS_DELETE_PENDING
+            }
+            return failure(env, error);
+        }
     };
     // Hardlink/alias names must still honor every existing backing owner.
     let identity = file.cached_identity();
@@ -141,7 +174,11 @@ pub(super) fn set(
     length: u32,
     class: i32,
 ) -> i32 {
-    let minimum = if class == 13 { 1 } else { 12 };
+    let minimum = match class {
+        13 => 1,
+        64 => 4,
+        _ => 12,
+    };
     if length < minimum {
         return 0xc0000004u32 as i32;
     }
@@ -182,6 +219,27 @@ pub(super) fn set(
     }
     if class == 13 {
         let result = owner_delete(env, handle.0, prefix[0] != 0);
+        return match result {
+            Ok(()) => completion(env, iosb, 0, 0),
+            Err(error) => failure(env, error),
+        };
+    }
+    if class == 64 {
+        let flags = u32::from_le_bytes(prefix[..4].try_into().unwrap());
+        if flags != 3 {
+            return unavailable_for(
+                env,
+                "ntdll.dll!NtSetInformationFile",
+                "extended disposition supports DELETE | POSIX_SEMANTICS only",
+            );
+        }
+        let result = env
+            .sys
+            .objects
+            .host::<FileObj>(handle.0)
+            .unwrap()
+            .file
+            .set_delete_disposition_ex(flags);
         return match result {
             Ok(()) => completion(env, iosb, 0, 0),
             Err(error) => failure(env, error),

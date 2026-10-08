@@ -8,6 +8,7 @@ use adv_machine::Env;
 use crate::{FileObj, Win32, util};
 
 mod attributes;
+pub(crate) mod directory;
 pub(crate) mod enumeration;
 pub(crate) mod metadata;
 mod mutation;
@@ -200,7 +201,10 @@ pub(crate) fn set(
     length: u32,
     class: i32,
 ) -> i32 {
-    if class == 10 || class == 13 {
+    if directory::contains(env, handle.0) {
+        return directory::set(env, handle, iosb, input, length, class);
+    }
+    if matches!(class, 10 | 13 | 64) {
         return mutation::set(env, handle, iosb, input, length, class);
     }
     if class == 4 || class == 20 {
@@ -276,6 +280,9 @@ pub(crate) fn query(
     length: u32,
     class: i32,
 ) -> i32 {
+    if directory::contains(env, handle.0) {
+        return directory::query(env, handle, iosb, output, length, class);
+    }
     if class == 4 || class == 6 {
         return metadata::query(env, handle, iosb, output, length, class);
     }
@@ -529,30 +536,35 @@ pub(crate) fn create(
         return status;
     }
     if options & 1 != 0 {
-        if options & !0x21 != 0
-            || options & 0x20 == 0
-            || disposition != 1
-            || access & !0x8012_0089 != 0
-            || access & (GENERIC_READ | 1) == 0
-        {
-            return unavailable(
-                env,
-                "only synchronous read/list FILE_OPEN directory handles",
-            );
-        }
         if !allocation.is_null() || !ea_buffer.is_null() || ea_length != 0 {
             return unavailable(
                 env,
                 "directory allocation and extended attributes are unavailable",
             );
         }
+        if disposition != 1 && file_attributes & !0x90 != 0 {
+            return unavailable(env, "only default attributes for created directories");
+        }
         let path = match oa.path(env, "ntdll.dll!ZwCreateFile") {
             Ok(path) => path,
             Err(status) => return status,
         };
-        return enumeration::open(env, &path, output, iosb);
+        return directory::open(
+            env,
+            &path,
+            access,
+            share,
+            disposition,
+            options,
+            output,
+            iosb,
+        );
     }
-    if options & 0x30 == 0 || options & !0x874 != 0 {
+    let metadata_open = disposition == 1
+        && access & 0x10000 != 0
+        && access & (GENERIC_READ | GENERIC_WRITE | 7) == 0;
+    let allowed_options = 0x874 | if access & 0x10000 != 0 { 0x204000 } else { 0 };
+    if (options & 0x30 == 0 && !metadata_open) || options & !allowed_options != 0 {
         return unavailable(env, "only synchronous ordinary non-directory files");
     }
     let mapped_disposition = match disposition {
@@ -610,7 +622,16 @@ pub(crate) fn create(
         return if options & 0x40 != 0 {
             FILE_IS_A_DIRECTORY
         } else {
-            unavailable(env, "native directory handles are unavailable")
+            directory::open(
+                env,
+                &guest,
+                access,
+                share,
+                disposition,
+                options,
+                output,
+                iosb,
+            )
         };
     }
     if disposition != 1 {

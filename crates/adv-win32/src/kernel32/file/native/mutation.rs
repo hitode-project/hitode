@@ -1,6 +1,6 @@
 //! Path mutations compose observable open/set/close over one native handle.
 use super::*;
-use operations::{Done, close, open, set_information};
+use operations::{Done, close, open_existing, set_information};
 
 fn result(env: &mut Env<'_>, class: u32, status: Result<(), u32>) -> Outcome {
     match status {
@@ -24,7 +24,22 @@ pub(in crate::kernel32) fn delete(env: &mut Env<'_>, path: String) -> Outcome {
     if portable_active(env) {
         return portable(env, path, None);
     }
-    mutate(env, path, 13, vec![1])
+    mutate(env, path, 64, vec![])
+}
+
+/// Modern Win32 uses POSIX disposition first. NT_SUCCESS is final; every
+/// negative status except CANNOT_DELETE retries the classic BOOLEAN request.
+pub(crate) fn set_disposition(env: &mut Env<'_>, handle: u32, then: Done<()>) -> Outcome {
+    set_information(
+        env,
+        handle,
+        64,
+        3u32.to_le_bytes().to_vec(),
+        Box::new(move |env, result| match result {
+            Err(status) if status != 0xc0000121 => set_information(env, handle, 13, vec![1], then),
+            result => then(env, result),
+        }),
+    )
 }
 
 pub(in crate::kernel32) fn rename(env: &mut Env<'_>, source: String, target: String) -> Outcome {
@@ -182,31 +197,37 @@ fn mutate(env: &mut Env<'_>, path: String, class: u32, input: Vec<u8>) -> Outcom
             Ok(handle) => handle,
             Err(status) => return result(env, class, Err(status)),
         };
-        set_information(
-            env,
-            handle,
-            class,
-            input,
-            Box::new(move |env, changed| {
-                close(
-                    env,
-                    handle,
-                    // Win32 decides the mutation result from NtSetInformationFile;
-                    // native cleanup still runs, but its status is not propagated.
-                    Box::new(move |env, _closed| result(env, class, changed)),
-                )
-            }),
-        )
+        let done: Done<()> = Box::new(move |env, changed| {
+            close(
+                env,
+                handle,
+                // Win32 decides the mutation result from NtSetInformationFile;
+                // native cleanup still runs, but its status is not propagated.
+                Box::new(move |env, _closed| result(env, class, changed)),
+            )
+        });
+        if class == 64 {
+            set_disposition(env, handle, done)
+        } else {
+            set_information(env, handle, class, input, done)
+        }
     });
     // DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES. Both independent open
     // objects and duplicated aliases retain their original backing identity.
-    open(
+    open_existing(
         env,
         &path,
-        0x0011_0080,
+        if class == 64 {
+            0x0001_0080
+        } else {
+            0x0011_0080
+        },
         7,
-        1,
-        if class == 10 { 0x20 } else { 0x60 },
+        if class == 10 {
+            0x0020_4020
+        } else {
+            0x0020_4040
+        },
         then,
     )
 }

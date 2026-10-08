@@ -52,6 +52,25 @@ impl FileStream {
         open(path, access)
     }
 
+    /// Keep enumeration and mutation aliases on the same real directory FD.
+    pub fn open_directory_instance(path: &Path, access: u32) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .access_mode(access)
+                .share_mode(7)
+                .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+                .open(path)
+                .map(Self::from)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = access;
+            std::fs::File::open(path).map(Self::from)
+        }
+    }
+
     /// Native delete-pending belongs to the opened FD, including its aliases.
     pub fn set_delete_disposition(&self, delete: bool) -> io::Result<()> {
         let file = self.host().ok_or(io::ErrorKind::PermissionDenied)?;
@@ -64,6 +83,20 @@ impl FileStream {
         {
             let _ = (file, delete);
             // POSIX unlink cannot stand in for NT's cancellable pending delete.
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// FILE_DISPOSITION_INFO_EX uses one DWORD Flags, not classic BOOL.
+    pub fn set_delete_disposition_ex(&self, flags: u32) -> io::Result<()> {
+        let file = self.host().ok_or(io::ErrorKind::PermissionDenied)?;
+        #[cfg(windows)]
+        {
+            set(file, 21, &flags.to_le_bytes())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (file, flags);
             Err(io::ErrorKind::Unsupported.into())
         }
     }

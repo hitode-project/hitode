@@ -1015,16 +1015,7 @@ pub(super) fn copy_file(
 }
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
-    match create_directory_path(env, &path) {
-        Ok(()) => {
-            crate::native::diagnose_bypass(env, "kernel32.dll!CreateDirectory", &["NtCreateFile"]);
-            Outcome::Return(1)
-        }
-        Err(code) => {
-            set_last_error(env, code);
-            Outcome::Return(0)
-        }
-    }
+    native::directory::win32(env, path, false)
 }
 
 /// Kernel32 and CRT directory fronts share this checked, single-component VFS
