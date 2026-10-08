@@ -869,35 +869,7 @@ fn get_file_time(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
-    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
-    if matches!(system_file(env, &guest), Ok(Some(_))) {
-        set_last_error(env, err::ACCESS_DENIED);
-        return Outcome::Return(0);
-    }
-    let w = env.ext.get::<Win32>();
-    if w.vfs.is_base_only(&path) {
-        log::warn!("DeleteFile({path}): refusing to delete a game file");
-        set_last_error(env, err::ACCESS_DENIED);
-        return Outcome::Return(0);
-    }
-    match w.vfs.lookup(&path).map(std::fs::remove_file) {
-        Some(Ok(())) => {
-            crate::native::diagnose_bypass(
-                env,
-                "kernel32.dll!DeleteFile",
-                &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
-            );
-            Outcome::Return(1)
-        }
-        Some(Err(e)) => {
-            io_error(env, &e);
-            Outcome::Return(0)
-        }
-        None => {
-            set_last_error(env, err::FILE_NOT_FOUND);
-            Outcome::Return(0)
-        }
-    }
+    native::mutation::delete(env, path)
 }
 
 pub(super) fn copy_file(
@@ -907,6 +879,9 @@ pub(super) fn copy_file(
     fail_if_exists: bool,
     remove_src: bool,
 ) -> Outcome {
+    if remove_src {
+        return native::mutation::rename(env, src, dst);
+    }
     if !remove_src
         && native::metadata::active(
             env,
@@ -950,31 +925,6 @@ pub(super) fn copy_file(
     if !parent.is_some_and(|p| w.vfs.is_dir(&p)) {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
-    }
-    if remove_src && w.vfs.is_base_only(&src) {
-        set_last_error(env, err::ACCESS_DENIED);
-        return Outcome::Return(0);
-    }
-    // Move the actual writable object; a failed removal must not report success.
-    if remove_src {
-        let Some(to) = w.vfs.write_path(&dst) else {
-            set_last_error(env, err::PATH_NOT_FOUND);
-            return Outcome::Return(0);
-        };
-        return match std::fs::rename(from.as_ref().unwrap(), &to) {
-            Ok(()) => {
-                crate::native::diagnose_bypass(
-                    env,
-                    "kernel32.dll!MoveFile",
-                    &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
-                );
-                Outcome::Return(1)
-            }
-            Err(e) => {
-                io_error(env, &e);
-                Outcome::Return(0)
-            }
-        };
     }
     // Resolve alias/hardlink identity before opening or writing the destination.
     // Normalizing names alone cannot detect two names for the same host file.
@@ -1065,16 +1015,7 @@ pub(super) fn copy_file(
 }
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
-    match create_directory_path(env, &path) {
-        Ok(()) => {
-            crate::native::diagnose_bypass(env, "kernel32.dll!CreateDirectory", &["NtCreateFile"]);
-            Outcome::Return(1)
-        }
-        Err(code) => {
-            set_last_error(env, code);
-            Outcome::Return(0)
-        }
-    }
+    native::directory::win32(env, path, false)
 }
 
 /// Kernel32 and CRT directory fronts share this checked, single-component VFS

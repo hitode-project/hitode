@@ -375,69 +375,42 @@ fn temp_file_name_w(
 fn create_a(
     env: &mut Env<'_>,
     path: AnsiStr,
-    _attributes: GuestPtr<u8>,
+    attributes: GuestPtr<u8>,
 ) -> Result<Outcome, MemFault> {
     let path = ansi(env, path)?;
+    if !attributes.is_null() {
+        if let Err(code) = super::super::handle::security_inherit(env, attributes.addr()) {
+            set_last_error(env, code);
+            return Ok(Outcome::Return(0));
+        }
+    }
     Ok(create_directory(env, path))
 }
 #[win32(kernel32, name = "CreateDirectoryW", level = implement)]
 fn create_w(
     env: &mut Env<'_>,
     path: WideStr,
-    _attributes: GuestPtr<u8>,
+    attributes: GuestPtr<u8>,
 ) -> Result<Outcome, MemFault> {
     let path = wide(env, path)?;
+    if !attributes.is_null() {
+        if let Err(code) = super::super::handle::security_inherit(env, attributes.addr()) {
+            set_last_error(env, code);
+            return Ok(Outcome::Return(0));
+        }
+    }
     Ok(create_directory(env, path))
 }
-fn remove(env: &mut Env<'_>, path: String) -> i32 {
-    let w = env.ext.get::<Win32>();
-    let full = w.vfs.normalize(&path);
-    if full
-        .trim_end_matches('\\')
-        .eq_ignore_ascii_case(w.vfs.cwd.trim_end_matches('\\'))
-    {
-        set_last_error(env, 32);
-        return 0;
-    }
-    if w.vfs.is_base_only(&full) {
-        set_last_error(env, err::ACCESS_DENIED);
-        return 0;
-    }
-    let Some(host) = w.vfs.lookup(&full) else {
-        set_last_error(env, err::PATH_NOT_FOUND);
-        return 0;
-    };
-    match std::fs::remove_dir(host) {
-        Ok(()) => {
-            crate::native::diagnose_bypass(
-                env,
-                "kernel32.dll!RemoveDirectory",
-                &[
-                    "NtCreateFile",
-                    "NtOpenFile",
-                    "NtSetInformationFile",
-                    "NtClose",
-                ],
-            );
-            1
-        }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
-                set_last_error(env, 145);
-            } else {
-                io_error(env, &e);
-            }
-            0
-        }
-    }
+fn remove(env: &mut Env<'_>, path: String) -> Outcome {
+    native::directory::win32(env, path, true)
 }
 #[win32(kernel32, name = "RemoveDirectoryA", level = implement)]
-fn remove_a(env: &mut Env<'_>, path: AnsiStr) -> Result<i32, MemFault> {
+fn remove_a(env: &mut Env<'_>, path: AnsiStr) -> Result<Outcome, MemFault> {
     let path = ansi(env, path)?;
     Ok(remove(env, path))
 }
 #[win32(kernel32, name = "RemoveDirectoryW", level = implement)]
-fn remove_w(env: &mut Env<'_>, path: WideStr) -> Result<i32, MemFault> {
+fn remove_w(env: &mut Env<'_>, path: WideStr) -> Result<Outcome, MemFault> {
     let path = wide(env, path)?;
     Ok(remove(env, path))
 }

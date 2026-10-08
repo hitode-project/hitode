@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use crate::OsConfig;
 
 mod attributes;
+mod mutation;
 mod optical;
 mod portable_saves;
 mod section;
@@ -246,6 +247,14 @@ impl Vfs {
     pub fn is_base_only(&self, guest: &str) -> bool {
         matches!(self.locate(guest), Some(Loc::Game(rel)) if ci_find(&self.overlay, &rel).is_none()
             && (self.resources.as_ref().and_then(|p| ci_find(p, &rel)).is_some() || (!self.write_game && ci_find(&self.game_host, &rel).is_some())))
+    }
+
+    /// Deleting/renaming a writable shadow must not expose a read-only layer.
+    /// Persistent whiteouts are not yet supported by this VFS.
+    pub fn has_read_only_underlay(&self, guest: &str) -> bool {
+        matches!(self.locate(guest), Some(Loc::Game(rel)) if
+            self.resources.as_ref().and_then(|p| ci_find(p, &rel)).is_some()
+            || (!self.write_game && ci_find(&self.game_host, &rel).is_some()))
     }
 
     /// Host path to create or write `guest` at; parent directories are created.
