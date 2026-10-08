@@ -79,6 +79,12 @@ impl Cpu {
     }
 }
 impl Guest for Cpu {
+    fn wants_code_images(&self) -> bool {
+        self.guest().wants_code_images()
+    }
+    fn register_code_image(&mut self, image: adv_cpu::AotImage) {
+        self.guest_mut().register_code_image(image);
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         self.guest_mut().capture_architecture()
     }

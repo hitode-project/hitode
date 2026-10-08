@@ -146,6 +146,30 @@ fn event_limit_stops_capture_without_stopping_the_guest() {
 }
 
 #[test]
+fn unselected_budget_boundaries_leave_room_for_a_later_selected_visit() {
+    // Authored inc eax; jmp to itself outside the selected range.
+    let mut traced = cpu(&[0x40, 0xeb, 0xfe]);
+    let path = attach(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 1)],
+        5,
+        0,
+    );
+    assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    for _ in 0..10 {
+        assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    }
+    assert_eq!(events(&path).len(), 2);
+    traced.state.eip = CODE;
+    assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    let rows = events(&path);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2]["kind"], "instruction");
+    assert_eq!(rows[2]["after"]["eax"], 2);
+    assert!(rows.iter().all(|row| row["capture_stop"].is_null()));
+}
+
+#[test]
 fn configuration_rejects_empty_or_unbounded_capture_and_non_target_output() {
     let dir = directory();
     for ranges in ["", "0x1000..0x1000", "0..4294967297"] {
