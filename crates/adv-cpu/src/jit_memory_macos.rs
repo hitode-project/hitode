@@ -52,9 +52,56 @@ pub(crate) fn synchronize_execution() {
 }
 
 const CAPACITY: usize = 1 << 30;
+/// Allocation granule: Apple's 128-byte cache line. Regions share 16 KiB
+/// pages (MAP_JIT W^X is per thread, so publishing one region never revokes
+/// execution of a neighbor), but never a cache line, so one region's writes
+/// and invalidation stay disjoint from code another core may be fetching.
+const GRANULE: usize = 128;
 struct Arena {
     base: usize,
+    /// Sorted, disjoint, non-adjacent offsets of unallocated bytes.
     free: Vec<Range<usize>>,
+}
+impl Arena {
+    /// First fit. `len` is a granule multiple and `align` a power of two no
+    /// larger than a page; the page-aligned base makes offset alignment real.
+    fn take(&mut self, len: usize, align: usize) -> Option<usize> {
+        let align = align.max(GRANULE);
+        let (index, start) = self.free.iter().enumerate().find_map(|(index, span)| {
+            let start = span.start.checked_next_multiple_of(align)?;
+            (start.checked_add(len)? <= span.end).then_some((index, start))
+        })?;
+        let span = self.free[index].clone();
+        let end = start + len;
+        match (span.start < start, end < span.end) {
+            (false, false) => drop(self.free.remove(index)),
+            (false, true) => self.free[index].start = end,
+            (true, false) => self.free[index].end = start,
+            (true, true) => {
+                self.free[index].end = start;
+                self.free.insert(index + 1, end..span.end);
+            }
+        }
+        Some(start)
+    }
+
+    fn give(&mut self, mut span: Range<usize>) {
+        let index = self.free.partition_point(|free| free.start < span.start);
+        if self
+            .free
+            .get(index)
+            .is_some_and(|next| next.start == span.end)
+        {
+            span.end = self.free.remove(index).end;
+        }
+        match index
+            .checked_sub(1)
+            .map(|previous| &mut self.free[previous])
+        {
+            Some(previous) if previous.end == span.start => previous.end = span.end,
+            _ => self.free.insert(index, span),
+        }
+    }
 }
 fn arena() -> io::Result<&'static Mutex<Arena>> {
     static ARENA: OnceLock<io::Result<Mutex<Arena>>> = OnceLock::new();
@@ -104,21 +151,10 @@ impl Code {
         }
         let len = size
             .max(1)
-            .checked_add(page - 1)
-            .ok_or(io::ErrorKind::OutOfMemory)?
-            / page
-            * page;
-        let mut arena = arena()?.lock().unwrap();
-        let index = arena
-            .free
-            .iter()
-            .position(|span| span.len() >= len)
+            .checked_next_multiple_of(GRANULE)
             .ok_or(io::ErrorKind::OutOfMemory)?;
-        let offset = arena.free[index].start;
-        arena.free[index].start += len;
-        if arena.free[index].is_empty() {
-            arena.free.remove(index);
-        }
+        let mut arena = arena()?.lock().unwrap();
+        let offset = arena.take(len, align).ok_or(io::ErrorKind::OutOfMemory)?;
         Ok(Self {
             pointer: NonNull::new((arena.base + offset) as *mut u8).unwrap(),
             len,
@@ -149,18 +185,11 @@ impl Code {
 }
 impl Drop for Code {
     fn drop(&mut self) {
-        let mut arena = arena().unwrap().lock().unwrap();
-        arena.free.push(self.offset..self.offset + self.len);
-        arena.free.sort_unstable_by_key(|span| span.start);
-        let mut index = 1;
-        while index < arena.free.len() {
-            if arena.free[index - 1].end == arena.free[index].start {
-                arena.free[index - 1].end = arena.free[index].end;
-                arena.free.remove(index);
-            } else {
-                index += 1;
-            }
-        }
+        arena()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .give(self.offset..self.offset + self.len);
     }
 }
 
@@ -223,6 +252,47 @@ mod tests {
         let entry: unsafe extern "C" fn() -> u32 =
             unsafe { std::mem::transmute(code.pointer.as_ptr()) };
         unsafe { entry() }
+    }
+
+    #[test]
+    fn arena_packs_aligned_regions_and_coalesces_released_spans() {
+        let mut arena = Arena {
+            base: 0,
+            free: vec![0..CAPACITY],
+        };
+        let first = arena.take(GRANULE, 4).unwrap();
+        let second = arena.take(GRANULE, 4).unwrap();
+        assert_eq!((first, second), (0, GRANULE));
+        // An over-aligned region leaves the skipped prefix for later regions.
+        let aligned = arena.take(GRANULE, 1024).unwrap();
+        assert_eq!(aligned, 1024);
+        let third = arena.take(GRANULE, 4).unwrap();
+        assert_eq!(third, 2 * GRANULE);
+        for start in [first, aligned, second, third] {
+            arena.give(start..start + GRANULE);
+        }
+        assert_eq!(arena.free, vec![0..CAPACITY]);
+        assert_eq!(arena.take(CAPACITY + GRANULE, 4), None);
+    }
+
+    #[test]
+    fn neighboring_regions_publish_without_revoking_execution() {
+        let first = constant(1);
+        assert_eq!(first.len, GRANULE);
+        // Other tests share the process arena, so only the alignment of each
+        // region, not adjacency, is deterministic here.
+        let mut regions: Vec<_> = (2..=64).map(constant).collect();
+        assert!(
+            regions
+                .iter()
+                .all(|code| code.pointer.as_ptr() as usize % GRANULE == 0)
+        );
+        regions.retain(|code| unsafe { run(code) } % 2 == 0);
+        regions.extend((65..=96).map(constant));
+        assert_eq!(unsafe { run(&first) }, 1);
+        for (code, value) in regions.iter().zip((2..=64).step_by(2).chain(65..=96)) {
+            assert_eq!(unsafe { run(code) }, value);
+        }
     }
 
     #[test]

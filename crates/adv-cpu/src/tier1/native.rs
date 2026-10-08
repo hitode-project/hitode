@@ -272,9 +272,10 @@ mod publication_tests {
             words[0] = 0x52800000 | (value << 5);
             words[1] = 0xd65f03c0;
             let code = Code::new(&words).unwrap();
-            assert_eq!(code.len, 2 * page);
+            assert!(code.len >= std::mem::size_of_val(words.as_slice()));
             #[cfg(not(target_os = "macos"))]
             {
+                assert_eq!(code.len, 2 * page);
                 let start = code.pointer.as_ptr() as usize;
                 let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
                 let permissions = maps.lines().find_map(|line| {
