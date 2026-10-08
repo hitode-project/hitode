@@ -146,6 +146,10 @@ mod os {
         pub fn raw(&self) -> *mut c_void {
             self.0
         }
+        pub fn wait_precise(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
+            // Windows already uses a high-resolution, interruptible deadline.
+            self.wait(timeout)
+        }
     }
     impl Drop for Handle {
         fn drop(&mut self) {
@@ -187,6 +191,12 @@ mod os {
             }
         }
         pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
+            self.wait_mode(timeout, false)
+        }
+        pub fn wait_precise(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
+            self.wait_mode(timeout, true)
+        }
+        fn wait_mode(&self, timeout: Option<Duration>, precise: bool) -> std::io::Result<bool> {
             let started = std::time::Instant::now();
             loop {
                 let ms = timeout.map_or(-1, |d| {
@@ -200,7 +210,33 @@ mod os {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let result = unsafe { libc::poll(&mut fd, 1, ms) };
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let result = if precise {
+                    let remaining = timeout.map(|d| d.saturating_sub(started.elapsed()));
+                    let timespec = remaining.map(|d| libc::timespec {
+                        tv_sec: d.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+                        tv_nsec: d.subsec_nanos().into(),
+                    });
+                    // Keep the pipe in the wait set: input/audio/compiler wakes
+                    // must interrupt even an indefinite deadline. EINTR retries
+                    // use the original monotonic start, never a fresh timeout.
+                    // A null mask leaves CPU fault/safepoint signal masks intact.
+                    unsafe {
+                        libc::ppoll(
+                            &mut fd,
+                            1,
+                            timespec.as_ref().map_or(std::ptr::null(), |t| t),
+                            std::ptr::null(),
+                        )
+                    }
+                } else {
+                    unsafe { libc::poll(&mut fd, 1, ms) }
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let result = {
+                    let _ = precise;
+                    unsafe { libc::poll(&mut fd, 1, ms) }
+                };
                 if result == 0 {
                     return Ok(false);
                 }
@@ -256,6 +292,12 @@ impl WakeEvent {
     pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
         self.handle.wait(timeout)
     }
+    /// Opt-in submillisecond host deadlines on Linux/Android. Windows retains
+    /// its high-resolution timer; other Unix hosts retain poll. No spinning,
+    /// timer-resolution changes or guest-clock advancement is introduced.
+    pub fn wait_precise(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
+        self.handle.wait_precise(timeout)
+    }
     /// Native/interpreted backedges may read this flag without reading a clock.
     pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
         self.interrupt.clone()
@@ -274,6 +316,24 @@ impl WakeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn precise_deadline_preserves_notifications_and_never_expires_early() {
+        let wake = WakeEvent::new().unwrap();
+        wake.notify();
+        assert!(wake.wait_precise(Some(Duration::ZERO)).unwrap());
+        assert!(!wake.wait_precise(Some(Duration::ZERO)).unwrap());
+        for duration in [Duration::from_micros(250), Duration::from_micros(1667)] {
+            let start = std::time::Instant::now();
+            assert!(!wake.wait_precise(Some(duration)).unwrap());
+            assert!(start.elapsed() >= duration);
+        }
+        let signal = wake.clone();
+        let producer = std::thread::spawn(move || signal.signal());
+        assert!(wake.wait_precise(None).unwrap());
+        producer.join().unwrap();
+        assert!(wake.take_interrupt());
+        assert!(!wake.wait_precise(Some(Duration::ZERO)).unwrap());
+    }
     #[test]
     fn wake_before_wait_is_retained_and_cross_thread_signal_interrupts_wait() {
         let wake = WakeEvent::new().unwrap();

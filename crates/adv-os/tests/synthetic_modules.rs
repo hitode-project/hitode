@@ -428,8 +428,6 @@ fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
     for (dll, name) in [
         ("dwrite.dll", "DWriteCreateFactory"),
         ("d3d11.dll", "D3D11CreateDevice"),
-        ("gdiplus.dll", "GdiplusStartup"),
-        ("gdiplus.dll", "GdiplusShutdown"),
         ("d2d1.dll", "D2D1CreateFactory"),
     ] {
         let id = machine.load(&Empty, dll).unwrap();

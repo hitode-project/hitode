@@ -1,9 +1,7 @@
-# Reviewed proxy lookup exceptions from docs/architecture.md §5.
-# dll<TAB>export. Availability is distinct from implementation and failure return.
-# All other metadata-only exports remain in the synthetic EAT for static imports
-# and hooks, but pristine entries do not advertise dynamic capabilities.
+# Reviewed exports (docs/personality-contracts.md), proxy lookups from docs/architecture.md §5.
+# dll<TAB>export. Discoverable without a frontend; calls return the failure registered
+# in failures.tsv (HRESULT defaults to E_NOTIMPL, void returns nothing) in every run mode.
+# Remove a row once a frontend implements it; adv-runtime personality_invariants enforces both.
 d2d1.dll	D2D1CreateFactory
 d3d11.dll	D3D11CreateDevice
 dwrite.dll	DWriteCreateFactory
-gdiplus.dll	GdiplusShutdown
-gdiplus.dll	GdiplusStartup
