@@ -59,10 +59,10 @@ fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     assert_eq!(executor.state.regs[3], 2);
     assert_eq!(executor.state.regs[6], 1);
     assert_eq!(executor.stats.direct_memory.violations, 1);
+    assert_eq!(executor.stats.direct_memory.accesses, 3);
     executor.protect(DATA, 4096, READ | WRITE).unwrap();
     assert_eq!(executor.run(stop, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(executor.state.regs[3], 2);
     assert_eq!(executor.state.regs[6], 2);
-    assert_eq!(executor.stats.direct_memory.accesses, 5);
     assert_eq!(executor.stats.direct_memory.checked_fallbacks, 0);
 }
