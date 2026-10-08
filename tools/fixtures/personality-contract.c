@@ -1,5 +1,5 @@
 /* Authored personality-layer probe: no sample code, assets or third-party protection logic.
-   Usage: personality-N.exe selects contract N (1..9, a). Writes scalar DWORDs
+   Usage: personality-N.exe selects contract N (1..9, a..c). Writes scalar DWORDs
    to probe-N.bin. Build and compare with personality_contract.py; no sample inputs. */
 #include <windows.h>
 #include <intrin.h>
@@ -129,8 +129,8 @@ static void t_heap_hooks(void){
 }
 
 /* ---- 7: loader hook coverage: LdrLoadDll observed by Win32 LoadLibrary front ends ---- */
-typedef LONG (WINAPI *LLD)(PWSTR,PULONG,void*,PVOID*); static LLD oLLD; static volatile LONG cLLD;
-static LONG WINAPI hLLD(PWSTR a,PULONG b,void*c,PVOID*d){ InterlockedIncrement(&cLLD); return oLLD(a,b,c,d); }
+typedef LONG (WINAPI *LLD)(PWSTR,PULONG,void*,PVOID*); static LLD oLLD; static volatile LONG cLLD; static DWORD ldr_search_flags;
+static LONG WINAPI hLLD(PWSTR a,PULONG b,void*c,PVOID*d){ InterlockedIncrement(&cLLD);ldr_search_flags=(ULONG_PTR)a<0x10000?(DWORD)(ULONG_PTR)a:0xffffffff;return oLLD(a,b,c,d); }
 static void t_loader_hooks(void){
   void *p=GetProcAddress(GetModuleHandleA("ntdll.dll"),"LdrLoadDll"); LONG b;
   put(p!=0); if(!p) return;
@@ -248,12 +248,53 @@ static void t_unload_hook(void){
  MH_DisableHook(entry);
 }
 
+/* ---- 12: altered executable loading and module lookup/refcount boundaries ---- */
+typedef struct {USHORT Length,MaximumLength;PWSTR Buffer;} LDR_NAME;
+typedef LONG (WINAPI *LGH)(PWSTR,PULONG,LDR_NAME*,PVOID*);
+typedef LONG (WINAPI *LGHE)(ULONG,PWSTR,PULONG,LDR_NAME*,PVOID*);
+typedef LONG (WINAPI *LAR)(ULONG,PVOID);
+typedef PVOID (WINAPI *RPC)(PVOID,PVOID*);
+static LGH oLGH;static LGHE oLGHE;static LAR oLAR;static RPC oRPC;
+static DWORD cLGH,cLGHE,cLAR,cRPC,last_ref_flags;
+static LONG WINAPI hLGH(PWSTR a,PULONG b,LDR_NAME*c,PVOID*d){cLGH++;return oLGH(a,b,c,d);}
+static LONG WINAPI hLGHE(ULONG f,PWSTR a,PULONG b,LDR_NAME*c,PVOID*d){cLGHE++;return oLGHE(f,a,b,c,d);}
+static LONG WINAPI hLAR(ULONG f,PVOID m){cLAR++;last_ref_flags=f;return oLAR(f,m);}
+static PVOID WINAPI hRPC(PVOID p,PVOID*out){cRPC++;return oRPC(p,out);}
+static void t_loader_queries(void){
+ HMODULE nt=GetModuleHandleA("ntdll.dll"),m,out,exe=GetModuleHandleA(NULL);WCHAR path[MAX_PATH];
+ void *load,*get,*get_ex,*retain,*pc;DWORD a,b,c,d,len;LONG status;LDR_NAME name;
+ static WCHAR missing[]=L"fixture-never-created-personality.dll";static WCHAR suffix[]=L"\\version.dll";
+ int ok=MH_Initialize()==MH_OK;
+ len=GetSystemDirectoryW(path,MAX_PATH);if(!len||len+sizeof(suffix)/2>MAX_PATH){put(0);return;}
+ for(a=0;a<sizeof(suffix)/2;a++)path[len+a]=suffix[a];
+ load=GetProcAddress(nt,"LdrLoadDll");get=GetProcAddress(nt,"LdrGetDllHandle");get_ex=GetProcAddress(nt,"LdrGetDllHandleEx");retain=GetProcAddress(nt,"LdrAddRefDll");pc=GetProcAddress(nt,"RtlPcToFileHeader");
+ ok=ok&&MH_CreateHook(load,hLLD,(void**)&oLLD)==MH_OK&&MH_CreateHook(get,hLGH,(void**)&oLGH)==MH_OK&&MH_CreateHook(get_ex,hLGHE,(void**)&oLGHE)==MH_OK&&MH_CreateHook(retain,hLAR,(void**)&oLAR)==MH_OK&&MH_CreateHook(pc,hRPC,(void**)&oRPC)==MH_OK&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK;
+ put(ok);if(!ok)return;
+ a=cLLD;m=LoadLibraryExW(path,NULL,LOAD_WITH_ALTERED_SEARCH_PATH);put(m!=NULL);put(cLLD-a);put(ldr_search_flags==9);if(!m)return;
+ a=cLGH;b=cLGHE;put(GetModuleHandleA("version.dll")==m);put(cLGH-a);put(cLGHE-b);
+ a=cLGH;b=cLGHE;put(GetModuleHandleW(path)==m);put(cLGH-a);put(cLGHE-b);
+ a=cLGH;b=cLGHE;c=cLAR;put(GetModuleHandleExA(2,"version.dll",&out)&&out==m);put(cLGH>a&&cLGHE>b);put(cLAR==c);
+ a=cLGH;b=cLGHE;c=cLAR;put(GetModuleHandleExW(0,path,&out)&&out==m);put(cLGH>a&&cLGHE>b);put(cLAR>c&&last_ref_flags==0);FreeLibrary(out);
+ a=cLGH;b=cRPC;c=cLAR;put(GetModuleHandleExW(6,(LPCWSTR)((BYTE*)m+1024),&out)&&out==m);put(cRPC>b&&cLGH==a);put(cLAR==c);
+ b=cRPC;c=cLAR;put(GetModuleHandleExA(4,(LPCSTR)((BYTE*)m+1024),&out)&&out==m);put(cRPC>b);put(cLAR>c&&last_ref_flags==0);FreeLibrary(out);
+ a=cLGH;b=cLGHE;c=cLAR;put(GetModuleHandleExW(1,path,&out)&&out==m);put(cLGH>a&&cLGHE>b);put(cLAR>c&&last_ref_flags==1);
+ a=cLGH;b=cLGHE;c=cLAR;d=cRPC;put(GetModuleHandleExW(0,NULL,&out)&&out==exe);put(cLGH==a&&cLGHE==b&&cLAR==c&&cRPC==d);
+ a=cLGH;b=cLGHE;put(GetModuleHandleW(missing)==NULL&&GetLastError()==ERROR_MOD_NOT_FOUND);put(cLGH>a&&cLGHE>b);
+ name.Length=sizeof(missing)-2;name.MaximumLength=sizeof(missing);name.Buffer=missing;out=m;SetLastError(0x13572468);
+ status=oLGHE(1,NULL,NULL,&name,(PVOID*)&out);put(status);put(out==m);put(GetLastError()==0x13572468);
+ status=oLGHE(3,NULL,NULL,&name,(PVOID*)&out);put(status);put(out==m);
+ name.Length=(USHORT)(lstrlenW(path)*2);name.MaximumLength=name.Length+2;name.Buffer=path;out=NULL;
+ status=oLLD((PWSTR)9,NULL,&name,(PVOID*)&out);put(status);put(out==m);FreeLibrary(out);
+ MH_DisableHook(get);a=cLGH;b=cLGHE;put(GetModuleHandleA("version.dll")==m);put(cLGH==a&&cLGHE>b);
+ MH_DisableHook(MH_ALL_HOOKS);FreeLibrary(m);
+}
+
 
 void mainCRTStartup(void){
   char cl[MAX_PATH]; char t; int len=(int)GetModuleFileNameA(NULL,cl,MAX_PATH);
   main_ret=_ReturnAddress();
   t=len>5?cl[len-5]:'0'; /* probe-N.exe */
   switch(t){case '1':t_threads();break;case '2':t_file_hooks();break;case '3':t_identity();break;
-    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;default:ExitProcess(91);}
+    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;case 'c':t_loader_queries();break;default:ExitProcess(91);}
   save(t); ExitProcess(0);
 }

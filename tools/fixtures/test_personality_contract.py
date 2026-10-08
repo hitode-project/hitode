@@ -38,6 +38,17 @@ class Contracts(unittest.TestCase):
         self.assertEqual(evaluate(11, [1, 1, 1]), [])
         self.assertEqual(evaluate(11, [1, 1, 0]), ["native_unload"])
 
+    def test_loader_query_paths_require_observation_and_output_contracts(self):
+        values = [1]*38
+        values[29] = 0xc0000135
+        values[32] = 0xc000000d
+        values[34] = 0
+        self.assertEqual(evaluate(12, values), [])
+        values[2] = 0
+        values[17] = 0
+        values[30] = 0
+        self.assertEqual(evaluate(12, values), ["altered_native_load", "address_unchanged", "native_missing"])
+
 
 if __name__ == "__main__":
     unittest.main()
