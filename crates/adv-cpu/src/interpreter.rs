@@ -673,7 +673,7 @@ impl DecodedBlock {
         census: Option<&mut crate::tier1::census::Entry>,
         retired: Option<&mut u64>,
     ) -> (Execution, u32) {
-        if let Some(census) = census {
+        if census.is_some() {
             self.forms.get_or_insert_with(|| {
                 self.instructions
                     .iter()
@@ -683,12 +683,43 @@ impl DecodedBlock {
                     })
                     .collect()
             });
-            let forms = self.forms.as_ref().unwrap().as_slice();
-            self.execute(state, memory, max_units, stop, retired, |n, units| {
-                census.record(forms[n], units)
-            })
-        } else {
-            self.execute(state, memory, max_units, stop, retired, |_, _| {})
+        }
+        // Specialize the ordinary block loop: disabled diagnostics must not
+        // add a retirement branch to every interpreted instruction.
+        match (census, retired) {
+            (Some(census), Some(retired)) => {
+                let forms = self.forms.as_ref().unwrap().as_slice();
+                self.execute(
+                    state,
+                    memory,
+                    max_units,
+                    stop,
+                    |n, units| census.record(forms[n], units),
+                    |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
+                )
+            }
+            (Some(census), None) => {
+                let forms = self.forms.as_ref().unwrap().as_slice();
+                self.execute(
+                    state,
+                    memory,
+                    max_units,
+                    stop,
+                    |n, units| census.record(forms[n], units),
+                    |_, _, _, _| {},
+                )
+            }
+            (None, Some(retired)) => self.execute(
+                state,
+                memory,
+                max_units,
+                stop,
+                |_, _| {},
+                |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
+            ),
+            (None, None) => {
+                self.execute(state, memory, max_units, stop, |_, _| {}, |_, _, _, _| {})
+            }
         }
     }
 
@@ -698,8 +729,8 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut retired: Option<&mut u64>,
         mut observe: impl FnMut(usize, u32),
+        mut retire: impl FnMut(Decoded, Execution, &CpuState, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -720,9 +751,7 @@ impl DecodedBlock {
                 Some(&mut deferred_mmx),
             );
             observe(n, execution.units);
-            if let Some(retired) = &mut retired {
-                **retired += retired_instruction(decoded, execution, state, pc);
-            }
+            retire(decoded, execution, state, pc);
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;
