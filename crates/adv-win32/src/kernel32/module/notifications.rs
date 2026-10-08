@@ -16,8 +16,12 @@ pub(crate) use shutdown::shutdown_process;
 
 pub(crate) fn install_startup<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFault> {
     machine.sys.process_return = Some(exit_process);
-    // Initial suspended contexts already belong to resident system images.
-    prepare_system_modules(machine).map_err(|_| MemFault { addr: 0, len: 0 })?;
+    // Installing API providers does not start a process. Prepare resident images
+    // at the initial-context boundary, including a process created suspended.
+    machine.sys.process_prepare = Some(|cpu, sys, ext| {
+        let (win32, modules) = ext.get2_mut::<Win32, Modules>();
+        resident_system_modules(cpu, sys, win32, modules).map_err(|_| MemFault { addr: 0, len: 0 })
+    });
     if machine
         .sys
         .thunks
@@ -269,6 +273,16 @@ pub(crate) fn spawn_thread(
     param: u32,
     stack: u32,
 ) -> Result<CtxId, MemFault> {
+    if env.ext.try_get::<Modules>().is_none() {
+        // Embedders may exercise internal workers without a Win32 process.
+        let wrapper = env.sys.thunks.resolve(env.cpu, INTERNAL, THREAD_START)?;
+        return env
+            .sys
+            .spawn(env.cpu, name, wrapper, &[start, param], stack);
+    }
+    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
+    resident_system_modules(env.cpu, env.sys, win32, modules)
+        .map_err(|_| MemFault { addr: 0, len: 0 })?;
     let wrapper = system_entry(env, "ntdll.dll", "RtlUserThreadStart")?;
     let id = env
         .sys

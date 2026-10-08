@@ -135,9 +135,12 @@ fn guest_override_detects_live_inline_and_eat_edits_against_immutable_entries() 
     assert!(loader.inits.is_empty());
     // Capability filtering still applies to pristine diagnostic exports, while
     // the override probe itself neither requires nor reports host availability.
-    let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
-    assert_eq!(guest_override(&mut machine, kernel, "FlsAlloc"), None);
-    assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+    let controls = machine.load(&Empty, "comctl32.dll").unwrap();
+    assert_eq!(
+        guest_override(&mut machine, controls, "InitCommonControlsEx"),
+        None
+    );
+    assert!(dynamic(&mut machine, controls, named("InitCommonControlsEx")).is_err());
 }
 
 fn dynamic(
@@ -156,7 +159,7 @@ fn dynamic(
 }
 
 #[test]
-fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exports() {
+fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
     let mut machine = machine(false);
     let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
     for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
@@ -169,14 +172,17 @@ fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exp
             .unwrap()
             .0;
         let ordinal = *ordinal;
-        assert!(dynamic(&mut machine, kernel, named(name)).is_err());
-        assert!(dynamic(&mut machine, kernel, ImportName::Ordinal(ordinal)).is_err());
+        assert_eq!(
+            dynamic(&mut machine, kernel, named(name)).unwrap(),
+            dynamic(&mut machine, kernel, ImportName::Ordinal(ordinal)).unwrap()
+        );
         assert_ne!(
             resolve(&mut machine, kernel, named(name)),
             0,
             "static diagnostics remain hookable"
         );
     }
+    assert!(dynamic(&mut machine, kernel, named("UnknownOptionalExport")).is_err());
     for (dll, name) in [
         ("dwrite.dll", "DWriteCreateFactory"),
         ("d3d11.dll", "D3D11CreateDevice"),
@@ -206,11 +212,11 @@ fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exp
 fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or_code() {
     for jit in [false, true] {
         let mut machine = machine(jit);
-        let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+        let kernel = machine.load(&Empty, "comctl32.dll").unwrap();
         let module = adv_os::modules(&machine.ext).get(kernel);
         let (base, size) = (module.base, module.size);
-        let original = resolve(&mut machine, kernel, named("FlsAlloc"));
-        assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+        let original = resolve(&mut machine, kernel, named("InitCommonControlsEx"));
+        assert!(dynamic(&mut machine, kernel, named("InitCommonControlsEx")).is_err());
         machine
             .cpu
             .protect(original & !4095, 4096, Prot::RWX)
@@ -220,7 +226,7 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
             .write(original, &[0xb8, 99, 0, 0, 0, 0xc2, 4, 0])
             .unwrap();
         assert_eq!(
-            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            dynamic(&mut machine, kernel, named("InitCommonControlsEx")).unwrap(),
             original
         );
         machine.cpu.map(0x400000, 4096, Prot::RX).unwrap();
@@ -233,7 +239,7 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
         assert!(matches!(machine.run_virtual(100000), RunResult::Exited(99)));
         let directory = base + machine.cpu.read_u32(base + 0x80 + 120).unwrap();
         let ExportTarget::Rva(original_rva) =
-            adv_os::modules(&machine.ext).get(kernel).exports_by_name["FlsAlloc"]
+            adv_os::modules(&machine.ext).get(kernel).exports_by_name["InitCommonControlsEx"]
         else {
             panic!("code")
         };
@@ -245,12 +251,12 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
             .unwrap();
         machine.cpu.write_u32(slot, original_rva + 1).unwrap();
         assert_eq!(
-            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            dynamic(&mut machine, kernel, named("InitCommonControlsEx")).unwrap(),
             original + 1
         );
         for invalid in [0, size] {
             machine.cpu.write_u32(slot, invalid).unwrap();
-            assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+            assert!(dynamic(&mut machine, kernel, named("InitCommonControlsEx")).is_err());
         }
     }
 }

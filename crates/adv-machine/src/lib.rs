@@ -104,6 +104,8 @@ pub struct Sys {
     thread_exception_entry: Option<u32>,
     /// Frontend termination policy when the process entry point returns.
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
+    /// Personality infrastructure that must exist before the initial context.
+    pub process_prepare: Option<fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>>,
     /// Personality-supplied interpretation of precise CPU stops.
     pub exception_handler: Option<exception::ExceptionHandler>,
     /// First backend fault, retained across guest SEH execution and later slices.
@@ -1584,6 +1586,7 @@ impl<B: Backend> Machine<B> {
             guest_return_entry: thunk_addr(thunk::RETURN_PAD),
             thread_exception_entry: None,
             process_return: None,
+            process_prepare: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,
@@ -1750,6 +1753,9 @@ impl<B: Backend> Machine<B> {
         stack: u32,
         name: &str,
     ) -> Result<CtxId, MemFault> {
+        if let Some(prepare) = self.sys.process_prepare {
+            prepare(&mut self.cpu, &mut self.sys, &mut self.ext)?;
+        }
         self.cpu.write_u32(PEB_ADDR + peb::IMAGE_BASE, base)?;
         let start = self
             .sys

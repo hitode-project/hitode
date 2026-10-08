@@ -289,3 +289,28 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
     }
     Outcome::Return(value)
 }
+
+/// Existence metadata cannot authorize a return through an unknown ABI.
+pub(crate) fn fixed_dispatch(env: &mut Env<'_>) -> Outcome {
+    let thunk = env.sys.thunks.get(env.thunk);
+    let module = thunk.module.clone();
+    let name = thunk.name.clone();
+    let api = format!("{module}!{name}");
+    let call = StubCall {
+        module,
+        name,
+        caller: env.caller(),
+        context: env.context,
+        arguments: Vec::new(),
+        failure_value: None,
+    };
+    env.ext.get_or_default::<ApiDiagnostics>().record(call);
+    warn_unavailable(
+        env,
+        &api,
+        "fixed system export has no implemented frontend or verified ABI",
+    );
+    Outcome::Fail(format!(
+        "unimplemented: {api} (fixed system export; unknown ABI cannot return)"
+    ))
+}

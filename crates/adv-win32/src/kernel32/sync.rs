@@ -680,6 +680,40 @@ pub(super) fn register(reg: &mut Registry) {
         let cs = e.arg(0);
         leave_cs(e, cs)
     });
+    // Native Kernel32 exports forward to these RTL entries. Keep the shared
+    // lock state but respect RTL's NTSTATUS/BOOLEAN result contracts.
+    stdcall(reg, "ntdll.dll", "RtlInitializeCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        if let Err(error) = release_cs_wait(e, cs) {
+            return Outcome::Fail(error);
+        }
+        match initialize_cs(e.cpu, cs) {
+            Ok(()) => Outcome::Return(0),
+            Err(fault) => adv_abi::guest::memory_failure(fault),
+        }
+    });
+    stdcall(
+        reg,
+        "ntdll.dll",
+        "RtlDeleteCriticalSection",
+        1,
+        |e| match release_cs_wait(e, e.arg(0)) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error),
+        },
+    );
+    stdcall(reg, "ntdll.dll", "RtlEnterCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        enter_cs(e, cs)
+    });
+    stdcall(reg, "ntdll.dll", "RtlTryEnterCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        Outcome::Return(u32::from(try_enter_cs(e, cs)))
+    });
+    stdcall(reg, "ntdll.dll", "RtlLeaveCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        leave_cs(e, cs)
+    });
     stdcall(reg, K32, CS_WAIT, 1, |e| {
         let cs = e.arg(0);
         wait_cs(e, cs)

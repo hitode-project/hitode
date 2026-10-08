@@ -450,6 +450,7 @@ fn terminal_registration_declines_unhandled_exceptions_and_unwind_notifications(
     for jit in [false, true] {
         let services = Services::default();
         let mut machine = machine(jit, 0x1000, &services);
+        Win32::prepare_process_infrastructure(&mut machine).unwrap();
         let handler = machine.sys.thread_exception_entry().unwrap();
         let mut code = Asm::new(CODE);
         // Both ordinary dispatch and unwind flags keep searching; this frame

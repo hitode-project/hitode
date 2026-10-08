@@ -629,6 +629,14 @@ impl<'a> Loader<'a> {
         self.changes.created.push(id);
         self.modules.publish_ldr(self.cpu, id, &path)?;
         self.modules.complete_ldr(self.cpu, id)?;
+        if self.modules.get(id).name == "ntdll.dll" {
+            if let Some(&rva) = image.private_entries.get("return_pad") {
+                self.sys.set_guest_return_entry(base + rva);
+            }
+            if let Some(&rva) = image.private_entries.get("thread_exception_handler") {
+                self.sys.set_thread_exception_entry(base + rva);
+            }
+        }
         Ok(id)
     }
 
@@ -984,6 +992,14 @@ impl<'a> Loader<'a> {
                     known && module.exports_by_ordinal.contains_key(ordinal)
                 }
             };
+            if !published
+                && adv_abi::system_exports::lookup(&key, &name).is_some_and(|export| {
+                    export.kind == adv_abi::system_exports::Kind::DataUnsupported
+                })
+                && mapped_export(self.cpu, module.base, module.size, sym).is_none()
+            {
+                return Err(LoadError::MissingExport { module: key, name });
+            }
             if !dynamic && !published {
                 // Unknown static imports retain fail-before-return diagnostics;
                 // they do not fabricate a PE export or a calling convention.
@@ -1258,9 +1274,19 @@ pub(crate) fn system_image(
         (sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>();
     let names = registry.map(|r| r.exports(key)).unwrap_or_default();
     let mut known_ordinals: std::collections::BTreeMap<String, u16> =
-        adv_abi::ordinals::exports(key)
-            .map(|(ordinal, name)| (name.to_owned(), ordinal))
-            .collect();
+        if adv_abi::system_exports::has_module(key) {
+            adv_abi::system_exports::exports(key)
+                .filter_map(|export| {
+                    export
+                        .ordinal
+                        .map(|ordinal| (export.name.to_owned(), ordinal))
+                })
+                .collect()
+        } else {
+            adv_abi::ordinals::exports(key)
+                .map(|(ordinal, name)| (name.to_owned(), ordinal))
+                .collect()
+        };
     let explicit_ordinals: std::collections::BTreeSet<u16> = names
         .iter()
         .filter_map(|name| name.strip_prefix('#')?.parse().ok())
@@ -1268,7 +1294,14 @@ pub(crate) fn system_image(
     known_ordinals.retain(|_, ordinal| !explicit_ordinals.contains(ordinal));
     let mut exports = Vec::with_capacity(names.len());
     for name in names {
-        let target = if let Some(size) = sys.thunks.resolver().data_size(key, &name) {
+        let catalog = adv_abi::system_exports::lookup(key, &name);
+        let target = if let Some(adv_abi::system_exports::Export {
+            kind: adv_abi::system_exports::Kind::Forwarder(target),
+            ..
+        }) = catalog
+        {
+            crate::synthetic::Target::Forwarder((*target).to_owned())
+        } else if let Some(size) = sys.thunks.resolver().data_size(key, &name) {
             let bytes = sys
                 .thunks
                 .resolver()
@@ -1289,6 +1322,10 @@ pub(crate) fn system_image(
                     .unwrap_or_else(|| name.clone()),
                 bytes,
             }
+        } else if catalog
+            .is_some_and(|export| export.kind == adv_abi::system_exports::Kind::DataUnsupported)
+        {
+            crate::synthetic::Target::Absent
         } else {
             let thunk = sys.thunks.publish(cpu, key, &name)?;
             let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
@@ -1302,9 +1339,34 @@ pub(crate) fn system_image(
             target,
         });
     }
-    crate::synthetic::build(base, key, &exports).map_err(|err| LoadError::Pe {
-        path: key.to_owned(),
-        err,
+    let mut private = Vec::new();
+    if key == "ntdll.dll" {
+        private.push((
+            "return_pad".to_owned(),
+            sys.thunks.pristine_entry(adv_machine::thunk::RETURN_PAD),
+        ));
+        if sys
+            .thunks
+            .resolver()
+            .host_fn("<win32>", "thread_exception_handler")
+            .is_some()
+        {
+            let entry = sys
+                .thunks
+                .publish(cpu, "<win32>", "thread_exception_handler")?;
+            let index =
+                (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+            private.push((
+                "thread_exception_handler".to_owned(),
+                sys.thunks.pristine_entry(index),
+            ));
+        }
+    }
+    crate::synthetic::build_with_private_entries(base, key, &exports, &private).map_err(|err| {
+        LoadError::Pe {
+            path: key.to_owned(),
+            err,
+        }
     })
 }
 
