@@ -44,28 +44,43 @@ pub(in crate::kernel32) fn create(
     share: u32,
     inherit: bool,
 ) -> Option<Outcome> {
+    let disposition = env.arg(4);
     let (target, open) = match (hook(env, "NtCreateFile"), hook(env, "NtOpenFile")) {
         (Ok(Some(target)), _) => (target, false),
-        (Ok(None), Ok(Some(target))) => (target, true),
+        (Ok(None), Ok(Some(target))) if disposition == 3 => (target, true),
+        (Ok(None), Ok(Some(_))) => match entry(env, "NtCreateFile") {
+            Ok(target) => (target, false),
+            Err(status) => return Some(failed(env, win32_error(status), INVALID_HANDLE_VALUE)),
+        },
         (Ok(None), Ok(None)) => return None,
         _ => return Some(failed(env, 998, INVALID_HANDLE_VALUE)),
     };
     // Keep unsupported native operations explicit instead of silently opening
     // a different physical file behind a virtual provider.
     let flags = env.arg(5);
+    let native_disposition = match disposition {
+        1 => 2, // CREATE_NEW -> FILE_CREATE
+        2 => 5, // CREATE_ALWAYS -> FILE_OVERWRITE_IF
+        3 => 1, // OPEN_EXISTING -> FILE_OPEN
+        4 => 3, // OPEN_ALWAYS -> FILE_OPEN_IF
+        5 => 4, // TRUNCATE_EXISTING -> FILE_OVERWRITE
+        _ => return Some(failed(env, 87, INVALID_HANDLE_VALUE)),
+    };
     if inherit
-        || env.arg(4) != 3
-        || access & !(0x8012_0089) != 0
-        || access & 0x8000_0001 == 0
+        || access & !0xc012_019f != 0
+        || access & 0xc000_0007 == 0
         || flags & 0xe7ff_0000 != 0
         || env.arg(6) != 0
     {
         return Some(unsupported(
             env,
             "kernel32.dll!CreateFile",
-            "live NT file providers currently support non-inheritable synchronous read-only OPEN_EXISTING",
+            "live NT file providers require non-inheritable synchronous ordinary file access",
             INVALID_HANDLE_VALUE,
         ));
+    }
+    if disposition == 5 && access & 0x4000_0002 == 0 {
+        return Some(failed(env, 87, INVALID_HANDLE_VALUE));
     }
     if share & !7 != 0 {
         return Some(failed(env, 87, INVALID_HANDLE_VALUE));
@@ -96,7 +111,7 @@ pub(in crate::kernel32) fn create(
             0,
             flags & 0xffff,
             share,
-            1,
+            native_disposition,
             options,
             0,
             0,
@@ -108,6 +123,7 @@ pub(in crate::kernel32) fn create(
             return pending();
         }
         let handle = env.cpu.read_u32(attrs.extra);
+        let action = env.cpu.read_u32(attrs.extra + 12);
         attrs.free(env);
         if (status as i32) < 0 {
             return failed(env, win32_error(status), INVALID_HANDLE_VALUE);
@@ -115,7 +131,8 @@ pub(in crate::kernel32) fn create(
         match handle {
             Ok(handle) if handle != 0 && handle != INVALID_HANDLE_VALUE => {
                 crate::kernel32::handle::set_inherit(env, handle, inherit);
-                set_last_error(env, 0);
+                let already_existed = matches!(disposition, 2 | 4) && matches!(action, Ok(1 | 3)); // FILE_OPENED / FILE_OVERWRITTEN
+                set_last_error(env, if already_existed { 183 } else { 0 });
                 Outcome::Return(handle)
             }
             _ => failed(env, 998, INVALID_HANDLE_VALUE),
@@ -124,7 +141,15 @@ pub(in crate::kernel32) fn create(
 }
 
 pub(in crate::kernel32) fn read(env: &mut Env<'_>) -> Option<Outcome> {
-    let target = match hook(env, "NtReadFile") {
+    transfer(env, false)
+}
+
+pub(in crate::kernel32) fn write(env: &mut Env<'_>) -> Option<Outcome> {
+    transfer(env, true)
+}
+
+fn transfer(env: &mut Env<'_>, writing: bool) -> Option<Outcome> {
+    let target = match hook(env, if writing { "NtWriteFile" } else { "NtReadFile" }) {
         Ok(Some(target)) => target,
         Ok(None) => return None,
         Err(error) => return Some(failed(env, error, 0)),
@@ -134,12 +159,17 @@ pub(in crate::kernel32) fn read(env: &mut Env<'_>) -> Option<Outcome> {
     if overlapped != 0 {
         return Some(unsupported(
             env,
-            "kernel32.dll!ReadFile",
-            "live NT file providers require synchronous reads",
+            if writing {
+                "kernel32.dll!WriteFile"
+            } else {
+                "kernel32.dll!ReadFile"
+            },
+            "live NT file providers require synchronous transfers",
             0,
         ));
     }
-    if check_range(env.cpu, buffer, length, Prot::WRITE).is_err()
+    let permission = if writing { Prot::READ } else { Prot::WRITE };
+    if check_range(env.cpu, buffer, length, permission).is_err()
         || output != 0
             && (check_range(env.cpu, output, 4, Prot::WRITE).is_err()
                 || env.cpu.write_u32(output, 0).is_err())
@@ -159,13 +189,14 @@ pub(in crate::kernel32) fn read(env: &mut Env<'_>) -> Option<Outcome> {
             if status == 0x103 {
                 return pending();
             }
-            let count = if status == END_OF_FILE {
+            let eof = !writing && status == END_OF_FILE;
+            let count = if eof {
                 Ok(0)
             } else {
                 env.cpu.read_u32(scratch.0 + 4).map_err(|_| 998)
             };
             scratch.free(env);
-            if (status as i32) < 0 && status != END_OF_FILE {
+            if (status as i32) < 0 && !eof {
                 return failed(env, win32_error(status), 0);
             }
             let count = match count {

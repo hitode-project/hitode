@@ -3787,6 +3787,7 @@ ntdll.dll	NtSetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Threa
 ntdll.dll	NtSetInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
 ntdll.dll	NtSetInformationProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ProcessInformationClass:PROCESSINFOCLASS:i32:1|ProcessInformation:void*:ptr:1|ProcessInformationLength:u32:u32:1
 ntdll.dll	NtTerminateProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ExitStatus:Windows.Win32.Foundation.NTSTATUS:i32:1
+ntdll.dll	NtWriteFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1
 ntdll.dll	RtlAcquirePebLock	stdcall	void	void	
 ntdll.dll	RtlAllocateHeap	stdcall	ptr	void*	HeapHandle:void*:ptr:1|Flags:u32:u32:1|Size:usize:u32:1
@@ -3814,6 +3815,7 @@ ntdll.dll	ZwQueryVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Pro
 ntdll.dll	ZwReadFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1
 ntdll.dll	ZwSetInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
 ntdll.dll	ZwTerminateProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ExitStatus:Windows.Win32.Foundation.NTSTATUS:i32:1
+ntdll.dll	ZwWriteFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1
 ole32.dll	BindMoniker	stdcall	i32	Windows.Win32.Foundation.HRESULT	pmk:Windows.Win32.System.Com.IMoniker:ptr:1|grfOpt:u32:u32:1|iidResult:System.Guid*:ptr:1|ppvResult:void**:ptr:1
 ole32.dll	CLIPFORMAT_UserFree	stdcall	void	void	param0:u32*:ptr:1|param1:u16*:ptr:1
 ole32.dll	CLIPFORMAT_UserFree64	stdcall	void	void	param0:u32*:ptr:1|param1:u16*:ptr:1

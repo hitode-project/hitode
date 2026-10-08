@@ -92,11 +92,13 @@ pub struct Sys {
     pub images: Images,
     /// Static TLS templates, by TLS index.
     pub tls_images: Vec<TlsImage>,
-    /// Initializers still to run on the main context (see [`Machine::start_process`]).
+    /// Initializers run once on the main context before its requested execution starts.
     pub process_init: VecDeque<InitCall>,
     /// Frontend-supplied boundary calls after image initialization and before
     /// the application entry point (for example, releasing its startup gate).
     pub process_ready: Vec<InitCall>,
+    /// Application code is separate from the one-shot process initialization queue.
+    process_entry: Option<u32>,
     /// Frontend termination policy when the process entry point returns.
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// Personality-supplied interpretation of precise CPU stops.
@@ -288,6 +290,7 @@ impl Sys {
             stack_lo: lo,
             stack_hi: hi,
             start: Some((sp, entry)),
+            bootstrap_pending: None,
             frames: Vec::new(),
             state: State::Ready { resume: None },
             yielded: false,
@@ -729,15 +732,26 @@ impl Sys {
 /// Module name of machine-internal host functions.
 pub const INTERNAL_MODULE: &str = "<machine>";
 
-/// Main-context entry: run `process_init` in order, returning the last call's result
-/// (the exe's entry point) as the thread's exit code.
-fn process_start(env: &mut Env<'_>) -> Outcome {
-    fn next(env: &mut Env<'_>, last: u32) -> Outcome {
+/// Run initialization independently of the main context's requested instruction pointer.
+fn process_bootstrap(env: &mut Env<'_>, checkpoint: exception::Checkpoint) -> Outcome {
+    fn next(env: &mut Env<'_>, mut checkpoint: exception::Checkpoint) -> Outcome {
         match env.sys.process_init.pop_front() {
-            None => match env.sys.process_return {
-                Some(finish) => finish(env, last),
-                None => Outcome::ExitProcess(last),
-            },
+            None => {
+                // Startup calls may establish the application's floating environment.
+                // Restore requested control/integer state without discarding those effects.
+                let floating = match env.cpu.capture_architecture() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return Outcome::Fail(format!(
+                            "capture initialized floating state: {error}"
+                        ));
+                    }
+                };
+                checkpoint.state.x87 = floating.x87;
+                checkpoint.state.xmm = floating.xmm;
+                checkpoint.state.mxcsr = floating.mxcsr;
+                Outcome::ResumeExecution(checkpoint)
+            }
             Some(c) => {
                 log::debug!("process init: {} at {:#010x}", c.what, c.target);
                 if let Some((begin, token)) = c.begin {
@@ -754,12 +768,24 @@ fn process_start(env: &mut Env<'_>) -> Outcome {
                             None => Outcome::ExitProcess(status),
                         };
                     }
-                    next(env, v)
+                    next(env, checkpoint)
                 })
             }
         }
     }
-    next(env, 0)
+    env.sys.process_init.extend(env.sys.process_ready.drain(..));
+    next(env, checkpoint)
+}
+
+/// The ordinary application entry wrapper; redirected contexts do not enter it.
+fn process_entry(env: &mut Env<'_>) -> Outcome {
+    let Some(entry) = env.sys.process_entry.take() else {
+        return Outcome::Fail("application entry was already consumed".into());
+    };
+    Outcome::call(entry, [], |env, result| match env.sys.process_return {
+        Some(finish) => finish(env, result.value()),
+        None => Outcome::ExitProcess(result.value()),
+    })
 }
 
 /// Why a context stopped running inside a trap.
@@ -1372,10 +1398,10 @@ impl<B: Backend> Machine<B> {
         let mut thunks = ThunkTable::new(Box::new(resolver));
         thunks.add_internal(
             INTERNAL_MODULE,
-            "process_start",
+            "process_entry",
             HostFn {
                 conv: Conv::Cdecl { argc: 0 },
-                handler: process_start,
+                handler: process_entry,
                 data: 0,
                 trace: false,
                 guest: None,
@@ -1422,6 +1448,7 @@ impl<B: Backend> Machine<B> {
             tls_images: Vec::new(),
             process_init: VecDeque::new(),
             process_ready: Vec::new(),
+            process_entry: None,
             process_return: None,
             exception_handler: None,
             first_cpu_fault: None,
@@ -1590,21 +1617,16 @@ impl<B: Backend> Machine<B> {
         name: &str,
     ) -> Result<CtxId, MemFault> {
         self.cpu.write_u32(PEB_ADDR + peb::IMAGE_BASE, base)?;
-        self.sys
-            .process_init
-            .extend(self.sys.process_ready.drain(..));
-        self.sys.process_init.push_back(InitCall {
-            target: entry,
-            args: vec![],
-            what: format!("entry of {name}"),
-            failure_exit: None,
-            begin: None,
-        });
         let start = self
             .sys
             .thunks
-            .resolve(&mut self.cpu, INTERNAL_MODULE, "process_start")?;
-        self.spawn("main", start, &[], stack.max(DEFAULT_STACK))
+            .resolve(&mut self.cpu, INTERNAL_MODULE, "process_entry")?;
+        let main = self.spawn("main", start, &[], stack.max(DEFAULT_STACK))?;
+        self.sys.process_entry = Some(entry);
+        self.sys.contexts[main as usize].bootstrap_pending =
+            Some((start - THUNK_BASE) / THUNK_STRIDE);
+        log::debug!("application entry: {name} at {entry:#010x}");
+        Ok(main)
     }
 
     /// Resolve `module!name` to a thunk address (for the loader).
@@ -2048,6 +2070,39 @@ impl<B: Backend> Machine<B> {
                 0,
             );
 
+            // Visiting or editing a context only materializes registers. Initialization
+            // begins here, after readiness/suspension checks and before guest execution.
+            let mut resume = match &mut self.sys.contexts[id as usize].state {
+                State::Ready { resume } => resume.take(),
+                _ => unreachable!(),
+            };
+            if let Some(thunk) = self.sys.contexts[id as usize].bootstrap_pending.take() {
+                if resume.is_some() {
+                    return SliceResult::Complete(
+                        self.fail("process bootstrap crossed a pending continuation".into()),
+                    );
+                }
+                let checkpoint = match exception::Checkpoint::capture(&mut self.cpu, &self.sys) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        return SliceResult::Complete(
+                            self.fail(format!("capture process startup context: {error}")),
+                        );
+                    }
+                };
+                let origin = Origin {
+                    esp: checkpoint.state.regs[4],
+                    ret_eip: checkpoint.state.eip,
+                    thunk,
+                    trace_args: None,
+                    interrupted: true,
+                };
+                resume = Some(ReadyResume::Deferred {
+                    then: Box::new(move |env| process_bootstrap(env, checkpoint)),
+                    origin,
+                });
+            }
+
             // Keep a latency-selected/API-heavy context on the controller while
             // an already-qualified ready peer computes. Selecting only the
             // current context for offload leaves the other lane idle at wakes.
@@ -2061,6 +2116,7 @@ impl<B: Backend> Machine<B> {
                 }
                 for peer in 0..self.sys.contexts.len() {
                     if peer == id as usize
+                        || self.sys.contexts[peer].bootstrap_pending.is_some()
                         || self.sys.contexts[peer].yielded
                         || self.sys.contexts[peer].suspend_count != 0
                         || !matches!(self.sys.contexts[peer].state, State::Ready { resume: None })
@@ -2103,10 +2159,6 @@ impl<B: Backend> Machine<B> {
             );
             let frame_before = self.sys.completed_frames;
             // A woken context first finishes the host call it blocked in.
-            let resume = match &mut self.sys.contexts[id as usize].state {
-                State::Ready { resume } => resume.take(),
-                _ => unreachable!(),
-            };
             if let Some(resume) = resume {
                 let t0 = self.sys.stats.start();
                 let (out, origin) = match resume {

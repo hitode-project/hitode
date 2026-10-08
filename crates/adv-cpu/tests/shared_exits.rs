@@ -93,6 +93,62 @@ fn equal_state(jit: &mut Executor, uc: &mut Executor) {
 }
 
 #[test]
+fn repeated_guards_preserve_each_faulting_prefix() {
+    for write in [false, true] {
+        let bytes = assemble(CODE, |a| {
+            for index in 0..8 {
+                a.add(eax, 0x1234567).unwrap();
+                if write {
+                    a.mov(dword_ptr(edx + index * 4), eax).unwrap();
+                } else {
+                    a.mov(edi, dword_ptr(edx + index * 4)).unwrap();
+                }
+            }
+            a.ret().unwrap();
+        });
+        let pcs: Vec<_> = Decoder::with_ip(32, &bytes, u64::from(CODE), DecoderOptions::NONE)
+            .into_iter()
+            .filter(|i| i.memory_base() == Register::EDX)
+            .map(|i| i.ip32())
+            .collect();
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for (index, &pc) in pcs.iter().enumerate() {
+                let mut jit = machine(&bytes, Some(strategy));
+                let mut uc = machine(&bytes, None);
+                let address = DATA + 4096;
+                for m in [&mut jit, &mut uc] {
+                    seed(m, 0, 0x7fff_ffff, address - index as u32 * 4);
+                    m.write(DATA, &[0x5a; 8192]).unwrap();
+                    m.protect(address, 4096, if write { READ } else { 0 })
+                        .unwrap();
+                }
+                let expected = if write {
+                    RunOutcome::WriteFault { pc, address }
+                } else {
+                    RunOutcome::ReadFault { pc, address }
+                };
+                assert_eq!(jit.run(STOP, 1000).unwrap(), expected);
+                // Observe the oracle immediately before the faulting access:
+                // its fault delivery can leave arithmetic flags unmaterialized.
+                assert_eq!(uc.run_unicorn(pc, 1000).unwrap(), RunOutcome::ReachedStop);
+                assert_eq!(
+                    jit.state.eflags, uc.state.eflags,
+                    "{strategy:?} write={write} prefix={index}"
+                );
+                equal_state(&mut jit, &mut uc);
+                assert_eq!(jit.state.fault_addr, address);
+                assert_eq!(jit.state.fuel, 999);
+                assert_eq!(
+                    jit.memory().read(DATA, 8192).unwrap(),
+                    uc.memory().read(DATA, 8192).unwrap()
+                );
+                assert_eq!(jit.stats.interpreter_entries, 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_state() {
     let bytes = assemble(CODE, |a| {
         let mut write = a.create_label();
