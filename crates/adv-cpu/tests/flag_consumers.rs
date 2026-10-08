@@ -469,7 +469,7 @@ fn sbb_and_setcc_memory_faults_leave_registers_flags_and_bytes_before_the_instru
 }
 
 #[test]
-fn setcc_can_write_a_page_without_read_permission_and_short_sbb_keeps_fallback() {
+fn setcc_can_write_a_page_without_read_permission_and_short_sbb_stays_native() {
     let bytes = assemble(|a| {
         a.sete(byte_ptr(edi)).unwrap();
         a.ret().unwrap();
@@ -500,5 +500,5 @@ fn setcc_can_write_a_page_without_read_permission_and_short_sbb_keeps_fallback()
         jit.memory().read(DATA, 4).unwrap(),
         reference.memory().read(DATA, 4).unwrap()
     );
-    assert!(jit.stats.interpreter_entries > 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }

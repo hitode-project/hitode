@@ -19,6 +19,8 @@ cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [features]
+# Keep Cranelift verification in release test dependencies as well as unit tests.
+jit-verifier = []
 # Local research capture only; does not select a GIR execution path.
 gir-capture = []
 # Independent lift/verify census only; never selects an execution backend.
@@ -34,6 +36,7 @@ cross-dump = ["cranelift-codegen/arm64"]
 cc = "1"
 
 [dev-dependencies]
+adv-cpu = { path = ".", features = ["jit-verifier"] }
 adv-unicorn = { path = "../adv-unicorn" }
 serde_json = "1"
 unicorn-engine.workspace = true

@@ -26,7 +26,7 @@ def digest(path: Path) -> str:
 
 def evaluate(test: int, values: list[int]) -> list[str]:
     """Return violated contracts; never print pointers or binary contents."""
-    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3}
+    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38}
     if len(values) != expected_lengths[test]:
         return ["missing_results"]
     failures = []
@@ -78,6 +78,20 @@ def evaluate(test: int, values: list[int]) -> list[str]:
     elif test == 11:
         check("unload_setup", v[0] == 1)
         check("native_unload", v[1] == 1 and v[2] > 0)
+    elif test == 12:
+        check("lookup_setup", v[0] == 1)
+        check("altered_native_load", v[1] == 1 and v[2] > 0 and v[3] == 1)
+        check("named_a", v[4] == 1 and v[5] > 0 and v[6] > 0)
+        check("named_w", v[7] == 1 and v[8] > 0 and v[9] > 0)
+        for index, name in ((10, "unchanged"), (13, "retain"), (16, "address_unchanged"),
+                            (19, "address_retain"), (22, "pin")):
+            check(name, v[index:index+3] == [1, 1, 1])
+        check("exe_shortcut", v[25:27] == [1, 1])
+        check("missing_named", v[27:29] == [1, 1])
+        check("native_missing", v[29:32] == [0xc0000135, 1, 1])
+        check("native_invalid_flags", v[32:34] == [0xc000000d, 1])
+        check("native_altered", v[34:36] == [0, 1])
+        check("inner_lookup_hook", v[36:38] == [1, 1])
     return failures
 
 
@@ -126,7 +140,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--native-only", action="store_true")
-    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11")
+    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11,12")
     args = parser.parse_args()
     output = args.output.resolve()
     if "target" not in output.parts or "investigations" not in output.parts:

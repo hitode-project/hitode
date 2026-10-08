@@ -82,6 +82,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
     let count = i.op_count();
     let immediate = |n: u32| i.op_kind(n) == OpKind::Immediate8;
     match i.mnemonic() {
+        M::Stmxcsr => count == 1 && memory(i, 0, 4),
         M::Prefetchnta | M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 => count == 1,
         M::Sfence | M::Lfence | M::Mfence => count == 0,
         M::Movnti => count == 2 && memory(i, 0, 4) && gpr(i, 1),
@@ -440,6 +441,25 @@ impl Emitter<'_> {
 
     pub(super) fn sse_instruction(&mut self, i: &Instruction) {
         let m = i.mnemonic();
+        if m == M::Stmxcsr {
+            let address = self.address(i);
+            let offset = self.b.ins().band_imm(address, 4095);
+            let crosses = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, offset, 4092);
+            // The exact SIMD store reports the first inaccessible byte. A wide
+            // native fault reports its start, so retain that contract at pages.
+            self.guard(crosses, Exit::Fallback, None);
+            let value = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.state,
+                offset_of!(CpuState, mxcsr) as i32,
+            );
+            self.direct_store(address, value);
+            return;
+        }
         if matches!(
             m,
             M::Cvtsi2ss

@@ -60,6 +60,7 @@ dependencies = [
 name = "adv-cpu"
 version = "0.1.0"
 dependencies = [
+ "adv-cpu",
  "adv-sync",
  "adv-unicorn",
  "cc",
