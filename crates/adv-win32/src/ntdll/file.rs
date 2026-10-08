@@ -10,6 +10,7 @@ use crate::{FileObj, Win32, util};
 mod attributes;
 pub(crate) mod enumeration;
 pub(crate) mod metadata;
+mod mutation;
 pub(crate) mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
@@ -199,6 +200,9 @@ pub(crate) fn set(
     length: u32,
     class: i32,
 ) -> i32 {
+    if class == 10 || class == 13 {
+        return mutation::set(env, handle, iosb, input, length, class);
+    }
     if class == 4 || class == 20 {
         return metadata::set(env, handle, iosb, input, length, class);
     }
@@ -206,7 +210,7 @@ pub(crate) fn set(
         warn_unavailable(
             env,
             "ntdll.dll!ZwSetInformationFile",
-            "only basic/position/end-of-file information is implemented",
+            "only basic/position/end-of-file/rename/disposition information is implemented",
         );
         return if class == 0 {
             0xc000_0002u32 as i32
@@ -559,8 +563,8 @@ pub(crate) fn create(
         5 => 2, // FILE_OVERWRITE_IF -> CREATE_ALWAYS
         _ => return unavailable(env, "FILE_SUPERSEDE replacement semantics are unavailable"),
     };
-    if access & !(READ_ACCESS | WRITE_ACCESS) != 0
-        || access & (GENERIC_READ | GENERIC_WRITE | 0x183) == 0
+    if access & !(READ_ACCESS | WRITE_ACCESS | 0x10000) != 0
+        || access & (GENERIC_READ | GENERIC_WRITE | 0x10183) == 0
     {
         return unavailable(
             env,
@@ -621,11 +625,17 @@ pub(crate) fn create(
         }
     }
     let requested = share_access(access);
-    if env.sys.objects.hosts::<FileObj>().any(|(_, file)| {
+    if env.sys.objects.all_hosts::<FileObj>().any(|(_, file)| {
         file.guest_path.eq_ignore_ascii_case(&guest)
             && (requested & !file.share != 0 || share_access(file.access) & !share != 0)
     }) {
         return SHARING_VIOLATION;
+    }
+    if access & 0x10000 != 0 {
+        if disposition != 1 {
+            return unavailable(env, "DELETE access is supported only for an existing file");
+        }
+        return mutation::open(env, &guest, access, share, output, iosb);
     }
     let previous_error = util::last_error(env);
     // The common opener selects copy-up from generic access. Keep that host
