@@ -27,20 +27,7 @@ fn machine<B: Backend>(cpu: B, mode: RunMode) -> Machine<B> {
         assert!(production.is_implemented("kernel32.dll", name));
         assert!(production.dynamic_available("kernel32.dll", name));
     }
-    let mut registry = Registry::default();
-    for name in [
-        "GetProcAddress",
-        "TlsAlloc",
-        "TlsFree",
-        "TlsGetValue",
-        "TlsSetValue",
-    ] {
-        let api = production.get("kernel32.dll", name).unwrap();
-        registry.add_with_data("kernel32.dll", name, api.conv, api.handler, api.data);
-        if let Some(guest) = api.guest {
-            registry.set_guest("kernel32.dll", name, guest);
-        }
-    }
+    let mut registry = production;
     registry.set_mode(mode);
     let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
     Win32::install(
@@ -65,10 +52,10 @@ fn fallback<B: Backend>(cpu: B, mode: RunMode) {
         .unwrap();
     let mut code = Asm::new(CODE);
     for (i, name) in [
-        "FlsAlloc",
-        "FlsFree",
-        "FlsGetValue",
-        "FlsSetValue",
+        "OptionalFlsAlloc",
+        "OptionalFlsFree",
+        "OptionalFlsGetValue",
+        "OptionalFlsSetValue",
         "TlsAlloc",
     ]
     .iter()
@@ -139,7 +126,7 @@ fn fallback<B: Backend>(cpu: B, mode: RunMode) {
     );
 }
 #[test]
-fn crt_probe_reaches_real_tls_fallback_on_all_backends_and_modes() {
+fn optional_probe_reaches_real_tls_fallback_on_all_backends_and_modes() {
     for mode in [RunMode::Strict, RunMode::Discovery] {
         fallback(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
         fallback(JitCpu::new(PARK_ADDR, true).unwrap(), mode);
@@ -147,23 +134,24 @@ fn crt_probe_reaches_real_tls_fallback_on_all_backends_and_modes() {
     }
 }
 #[test]
-fn static_unimplemented_import_keeps_strict_named_failure() {
+fn fixed_unimplemented_export_is_addressable_but_call_fails_by_name() {
     let mut machine = machine(JitCpu::new(PARK_ADDR, true).unwrap(), RunMode::Strict);
-    let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+    let kernel = machine.load(&Empty, "ntdll.dll").unwrap();
     let entry = Loader::new(
         &mut machine.cpu,
         &mut machine.sys,
         machine.ext.get_mut::<Modules>(),
         &Empty,
     )
-    .resolve(
+    .resolve_dynamic(
         kernel,
         &ImportName::Name {
             hint: 0,
-            name: "FlsAlloc".into(),
+            name: "NtQueryWnfStateData".into(),
         },
     )
-    .unwrap();
+    .unwrap()
+    .0;
     let mut code = Asm::new(CODE);
     code.push_imm(0).call(entry).ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();
@@ -173,10 +161,46 @@ fn static_unimplemented_import_keeps_strict_named_failure() {
     let RunResult::Failed(failure) = machine.run_virtual(1_000_000) else {
         panic!("static stub must fail")
     };
-    assert!(
-        failure
-            .message
-            .contains("kernel32.dll!FlsAlloc (strict ABI stub)")
-    );
+    assert!(failure.message.contains("ntdll.dll!NtQueryWnfStateData"));
     assert_eq!(machine.ext.get::<ApiDiagnostics>().stub_calls, 1);
+}
+
+#[test]
+fn fixed_data_export_failure_is_diagnostic_but_unknown_optional_name_is_not() {
+    for name in ["NlsAnsiCodePage", "OptionalAuthoredExport"] {
+        let mut machine = machine(JitCpu::new(PARK_ADDR, false).unwrap(), RunMode::Strict);
+        let module = machine.load(&Empty, "ntdll.dll").unwrap();
+        let base = adv_os::modules(&machine.ext).get(module).base;
+        machine
+            .cpu
+            .write(DATA, format!("{name}\0").as_bytes())
+            .unwrap();
+        let get = machine
+            .resolve_import("kernel32.dll", "GetProcAddress")
+            .unwrap();
+        let mut code = Asm::new(CODE);
+        code.push_imm(DATA)
+            .push_imm(base)
+            .call(get)
+            .mov_mem_eax(DATA + 128)
+            .ret();
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        machine
+            .start_main(CODE, CODE, 65536, "data-probe.exe")
+            .unwrap();
+        assert!(matches!(
+            machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
+        assert_eq!(machine.cpu.read_u32(DATA + 128).unwrap(), 0);
+        let diagnostics = machine.ext.get::<ApiDiagnostics>();
+        assert_eq!(
+            diagnostics.acceptance_eligible(RunMode::Strict),
+            name == "OptionalAuthoredExport"
+        );
+        assert_eq!(
+            diagnostics.warnings.len(),
+            usize::from(name == "NlsAnsiCodePage")
+        );
+    }
 }

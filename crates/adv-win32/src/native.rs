@@ -2,12 +2,29 @@
 //! only while the guest-visible export still names its original implementation.
 use crate::Win32;
 use adv_machine::{Env, Outcome};
-use adv_os::{LoadError, Loader, Modules};
+use adv_os::{LoadError, Loader, ModuleId, ModuleKind, Modules};
 use adv_pe::ImportName;
+
+fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, LoadError> {
+    if let Some((id, _)) = modules.iter().find(|(_, module)| {
+        module.kind == ModuleKind::Host
+            && module.executable_visible()
+            && module.name.eq_ignore_ascii_case("ntdll.dll")
+    }) {
+        return Ok(Some(id));
+    }
+    if modules.by_name("ntdll.dll").is_some() {
+        return Err(LoadError::MissingExport {
+            module: "ntdll.dll".into(),
+            name: name.into(),
+        });
+    }
+    Ok(None)
+}
 
 pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, LoadError> {
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let Some(module) = modules.by_name("ntdll.dll") else {
+    let Some(module) = system_module(modules, name)? else {
         return Ok(None);
     };
     Loader::new(env.cpu, env.sys, modules, &win32.vfs).guest_override(module, name)
@@ -15,7 +32,9 @@ pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, L
 
 pub(crate) fn entry(env: &mut Env<'_>, name: &str) -> Result<u32, u32> {
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let module = modules.by_name("ntdll.dll").ok_or(0xc00000bbu32)?;
+    let module = system_module(modules, name)
+        .map_err(|_| 0xc00000bbu32)?
+        .ok_or(0xc00000bbu32)?;
     let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
     if let Some(target) = loader
         .guest_override(module, name)

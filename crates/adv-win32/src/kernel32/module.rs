@@ -19,6 +19,7 @@ use crate::{Win32, stdcall};
 
 mod datafile;
 mod guest_files;
+mod native_boundary;
 mod notifications;
 pub(crate) use notifications::prepare_system_modules;
 pub(crate) use notifications::shutdown_process;
@@ -264,6 +265,14 @@ fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
 }
 
 fn load_library_search(env: &mut Env<'_>, name: String, altered: bool) -> Outcome {
+    match crate::native::overridden(env, "LdrLoadDll") {
+        Ok(Some(target)) if !altered => return native_boundary::load(env, target, name),
+        Ok(Some(_)) => {
+            crate::native::diagnose_bypass(env, "kernel32.dll!LoadLibraryEx", &["LdrLoadDll"])
+        }
+        Err(_) => return crate::native::unavailable(env, "LdrLoadDll"),
+        Ok(None) => {}
+    }
     load_library_front(env, name, altered, LibraryFront::Win32)
 }
 
@@ -455,6 +464,9 @@ fn load_io_error(env: &mut Env<'_>, front: LibraryFront, status: u32) -> Outcome
                 0xc00000bb => 50,
                 0xc000007b => 193,
                 0xc0000034 | 0xc000003a => err::MOD_NOT_FOUND,
+                0xc0000135 => err::MOD_NOT_FOUND,
+                0xc0000139 => err::PROC_NOT_FOUND,
+                0xc0000142 => 1114,
                 _ => 31,
             };
             set_last_error(env, error);
@@ -694,6 +706,11 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
             name: String::from_utf8_lossy(&cstr(env.cpu, name_p)).into_owned(),
         }
     };
+    match crate::native::overridden(env, "LdrGetProcedureAddress") {
+        Ok(Some(target)) => return native_boundary::procedure(env, target, h, sym),
+        Err(_) => return crate::native::unavailable(env, "LdrGetProcedureAddress"),
+        Ok(None) => {}
+    }
     locked(env, move |env| {
         resolve_proc(env, h, sym, caller, ProcedureFront::Win32)
     })
@@ -751,6 +768,20 @@ fn record_lookup_failure(
     reason: String,
     target: Option<(String, String)>,
 ) {
+    let core = match sym {
+        ImportName::Name { name, .. } => adv_abi::system_exports::lookup(&module, name).is_some(),
+        ImportName::Ordinal(_) => false,
+    };
+    let host = adv_os::modules(env.ext)
+        .by_name(&module)
+        .is_some_and(|id| adv_os::modules(env.ext).get(id).kind == ModuleKind::Host);
+    if core && host {
+        adv_abi::warn_structural(
+            env,
+            &format!("{module}!{sym}"),
+            "fixed Windows personality export could not be resolved",
+        );
+    }
     let (failure_module, failure_name) = match target {
         Some((module, name)) => (Some(module), Some(name)),
         None => (None, None),
@@ -996,6 +1027,7 @@ fn sizeof_resource(env: &mut Env<'_>, module: Handle, resource: Handle) -> u32 {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    notifications::register_start_entries(reg);
     stdcall(
         reg,
         notifications::INTERNAL,

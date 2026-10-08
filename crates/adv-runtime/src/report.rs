@@ -53,7 +53,9 @@ impl<B: Backend> Runtime<B> {
     /// Necessary ABI conditions only; this does not certify graphics, audio or playability.
     pub(crate) fn selected_api_acceptance_eligible(&self) -> bool {
         self.api_mode() == adv_abi::RunMode::Strict
-            && self.api_diagnostics().is_none_or(|d| d.stub_calls == 0)
+            && self
+                .api_diagnostics()
+                .is_none_or(|d| d.acceptance_eligible(self.api_mode()))
             && self.api_signature_conflicts().is_empty()
             && self
                 .machine
@@ -79,7 +81,7 @@ impl<B: Backend> Runtime<B> {
                     && machine
                         .ext
                         .try_get::<adv_abi::ApiDiagnostics>()
-                        .is_none_or(|d| d.stub_calls == 0)
+                        .is_none_or(|d| d.acceptance_eligible(registry.mode()))
                     && machine
                         .sys
                         .recent
@@ -183,8 +185,8 @@ impl<B: Backend> Runtime<B> {
         ));
         if let Some(diagnostics) = self.api_diagnostics() {
             report.push_str(&format!(
-                "\nCalled API gaps: {:?}; stub calls: {}",
-                diagnostics.gaps, diagnostics.stub_calls
+                "\nCalled API gaps: {:?}; stub calls: {}; structural mismatches: {}",
+                diagnostics.gaps, diagnostics.stub_calls, diagnostics.structural_mismatches
             ));
             for call in &diagnostics.recent_stubs {
                 report.push_str(&format!(
