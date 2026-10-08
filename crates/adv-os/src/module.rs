@@ -104,6 +104,9 @@ pub struct Modules {
     list: BTreeMap<ModuleId, Module>,
     next_id: ModuleId,
     by_name: HashMap<String, ModuleId>,
+    // Only name-table indexes; every lookup validates current guest PE bytes.
+    // Module ids are never reused, and retiring an owner removes its hints.
+    export_hints: HashMap<ModuleId, HashMap<String, u32>>,
     ldr: u32,
     ldr_used: u32,
     ldr_free: Vec<(u32, u32)>,
@@ -199,6 +202,10 @@ impl Modules {
 
     pub fn try_get(&self, id: ModuleId) -> Option<&Module> {
         self.list.get(&id)
+    }
+
+    pub(crate) fn export_search(&mut self, id: ModuleId) -> (&Module, &mut HashMap<String, u32>) {
+        (&self.list[&id], self.export_hints.entry(id).or_default())
     }
 
     /// Dependency-first initialization order; callers reverse it for detach.
@@ -405,6 +412,7 @@ impl Modules {
             self.ldr_free.push((entry, size));
         }
         let module = self.list.remove(&id).expect("live module id");
+        self.export_hints.remove(&id);
         if module.executable_visible() {
             let name = module.name;
             self.by_name.remove(&name);
@@ -560,6 +568,7 @@ mod tests {
         let a = modules.add(image("a.dll", 0x10000));
         let b = modules.add(image("b.dll", 0x20000));
         let c = modules.add(image("c.dll", 0x30000));
+        modules.export_search(a).1.insert("target".into(), 7);
         modules.dependency(&mut cpu, a, b).unwrap();
         modules.dependency(&mut cpu, b, a).unwrap();
         modules.dependency(&mut cpu, a, c).unwrap();
@@ -572,6 +581,7 @@ mod tests {
         assert!(modules.release(&mut cpu, a).unwrap().is_empty());
         assert_eq!(modules.release(&mut cpu, b).unwrap(), vec![a, b]);
         modules.retire(&mut cpu, a).unwrap();
+        assert!(!modules.export_hints.contains_key(&a));
         modules.retire(&mut cpu, b).unwrap();
         assert_eq!(modules.get(c).load_count, 1);
         assert_eq!(modules.release(&mut cpu, c).unwrap(), vec![c]);
@@ -580,6 +590,7 @@ mod tests {
         let later = modules.add(image("a.dll", 0x10000));
         assert!(later > c, "host identities must not alias retired modules");
         assert_eq!(modules.by_name("A.DLL"), Some(later));
+        assert!(modules.export_search(later).1.is_empty());
     }
 
     #[test]
