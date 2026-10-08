@@ -1,5 +1,5 @@
 //! Genuine guest GPA calls over authored DLLs; diagnostics never turn probes into calls.
-use adv_abi::{ApiDiagnostics, DynamicLookupKind, Registry, RunMode};
+use adv_abi::{ApiDiagnostics, DynamicLookupKind, ExportClass, Registry, RunMode};
 use adv_cpu::{
     JitCpu,
     backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
@@ -246,6 +246,15 @@ fn optional<B: Backend>(cpu: B, label: &str, mode: RunMode) {
     assert_eq!(records[4].module, "comctl32.dll");
     assert_eq!(records[4].name, "#2");
     assert_eq!(records[5].module, "data.dll");
+    let rejected = &test.machine.ext.get::<ApiDiagnostics>().rejected_probes;
+    let hidden = &rejected["kernel32.dll!Beep"];
+    assert_eq!(
+        (hidden.class, hidden.count, hidden.first_caller),
+        (Some(ExportClass::Hidden), 1, probes[0].0.caller)
+    );
+    let optional = &rejected["kernel32.dll!AuthoredOptionalFeatureThatDoesNotExist"];
+    assert_eq!((optional.class, optional.count), (None, 1));
+    assert!(!rejected.keys().any(|api| api.starts_with("data.dll!")));
     assert!(
         test.machine
             .sys

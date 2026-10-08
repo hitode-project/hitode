@@ -25,6 +25,7 @@ pub mod code_signature;
 pub mod constants;
 pub mod guest;
 pub mod ordinals;
+pub mod personality;
 pub mod signature;
 pub mod stub;
 pub mod system_exports;
@@ -34,10 +35,11 @@ pub mod trace;
 pub mod types;
 
 pub use guest::{AnsiStr, Arguments, GuestArg, GuestPtr, GuestReturn, Handle, WideStr};
+pub use personality::ExportClass;
 pub use signature::{AbiKind, Parameter, Signature};
 pub use stub::{
-    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RunMode, StubCall,
-    warn_structural, warn_unavailable,
+    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RejectedProbe,
+    RunMode, StubCall, warn_structural, warn_unavailable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,20 +83,6 @@ pub struct Registry {
     replacements: std::collections::BTreeSet<String>,
     /// Development probe: discovery exposes the whole fixed core catalog.
     expose_fixed_exports: bool,
-}
-
-/// Reviewed exceptions: partial behavior whose failures match native results.
-fn reviewed_dynamic_export(module: &str, name: &str) -> bool {
-    include_str!("../../../data/abi/dynamic_exports.tsv")
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .any(|line| {
-            let mut fields = line.split('\t');
-            fields
-                .next()
-                .is_some_and(|dll| dll.eq_ignore_ascii_case(module))
-                && fields.next() == Some(name)
-        })
 }
 
 impl Default for Registry {
@@ -379,30 +367,48 @@ impl Registry {
         self.registered_entry(module, name).is_some() || self.data(module, name).is_some()
     }
 
-    /// Discovery exposes only callable capability. Fixed catalog names keep
-    /// their structure (export directory, static bindings), but a dynamic probe
-    /// finds them only when implemented or reviewed, so a title's own fallback
-    /// for an older Windows still runs. Data exports also need a provider.
-    pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
+    /// The personality class of a declared export, or None for a name the
+    /// personality never declares. Fixed forwarders are classified by their
+    /// final target; a frontend under either name implements both.
+    pub fn classify(&self, module: &str, name: &str) -> Option<ExportClass> {
         let name = self.canonical_name(module, name).unwrap_or(name);
-        if system_exports::has_module(module) {
-            let Some(export) = system_exports::lookup(module, name) else {
-                return false;
-            };
+        let (target, target_name) = if system_exports::has_module(module) {
+            let export = system_exports::lookup(module, name)?;
             if export.kind == system_exports::Kind::DataUnsupported {
-                return self.data(module, name).is_some();
+                return Some(if self.data(module, name).is_some() {
+                    ExportClass::Implemented
+                } else {
+                    ExportClass::DataUnsupported
+                });
             }
-            if self.expose_fixed_exports {
-                return true;
-            }
-            let (target, target_name) =
-                system_exports::final_target(module, export.name).unwrap_or((module, name));
-            return self.is_implemented(module, name)
-                || self.is_implemented(target, target_name)
-                || reviewed_dynamic_export(module, name)
-                || reviewed_dynamic_export(target, target_name);
+            system_exports::final_target(module, export.name).unwrap_or((module, name))
+        } else {
+            (module, name)
+        };
+        if self.is_implemented(module, name) || self.is_implemented(target, target_name) {
+            Some(ExportClass::Implemented)
+        } else if personality::is_reviewed(module, name)
+            || personality::is_reviewed(target, target_name)
+        {
+            Some(ExportClass::Reviewed)
+        } else if system_exports::has_module(module) || signature::lookup(module, name).is_some() {
+            Some(ExportClass::Hidden)
+        } else {
+            None
         }
-        self.is_implemented(module, name) || reviewed_dynamic_export(module, name)
+    }
+
+    /// Discovery exposes only callable capability, so a title's own fallback
+    /// for an older Windows still runs. ADV_PERSONALITY_STRICT=1 additionally
+    /// exposes hidden fixed core names.
+    pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
+        match self.classify(module, name) {
+            Some(class) if class.discoverable() => true,
+            Some(ExportClass::Hidden) => {
+                self.expose_fixed_exports && system_exports::has_module(module)
+            }
+            _ => false,
+        }
     }
     pub fn len(&self) -> usize {
         self.fns.len() + self.data.len()

@@ -20,6 +20,7 @@ mod misc;
 mod native;
 mod native_heap;
 mod ntdll;
+pub mod personality;
 pub mod printf;
 pub mod user32;
 pub mod util;
@@ -51,6 +52,8 @@ pub struct Win32Config {
     /// Headless runs: press a dialog's default button after this many (guest) ms. `None`
     /// leaves dialogs to the frontend.
     pub auto_dialog_ms: Option<u32>,
+    /// The Windows identity every version fact is generated from.
+    pub personality: personality::Profile,
 }
 
 impl Win32Config {
@@ -60,6 +63,7 @@ impl Win32Config {
             utc_offset_min: 9 * 60,
             screen: (1920, 1080),
             auto_dialog_ms: None,
+            personality: personality::WIN7_SP1,
         }
     }
 }
@@ -134,6 +138,7 @@ impl Win32 {
         m.cpu
             .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
         ntdll::install_peb_lock(m)?;
+        personality::install_peb(&mut m.cpu, &cfg.personality)?;
         let vfs = Vfs::new(&cfg.os);
         let w = Win32 {
             codec: Codec::new(cfg.os.codepage),

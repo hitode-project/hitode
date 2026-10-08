@@ -325,7 +325,7 @@ fn guest_pointers_reject_null_overflow_and_protected_writes() {
 fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     let mut machine = machine(Registry::default());
     let thunk = machine
-        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .resolve_import("dsound.dll", "DirectSoundCreate")
         .unwrap();
     let mut code = Asm::new(CODE);
     code.push_imm(DATA)
@@ -340,10 +340,10 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     let diagnostics = machine.ext.get::<ApiDiagnostics>();
     assert_eq!(diagnostics.stub_calls, 1);
     assert_eq!(diagnostics.recent_stubs[0].caller, caller);
-    assert_eq!(diagnostics.recent_stubs[0].name, "DWriteCreateFactory");
+    assert_eq!(diagnostics.recent_stubs[0].name, "DirectSoundCreate");
     assert_eq!(
         diagnostics.warnings.get(&(
-            "dwrite.dll!DWriteCreateFactory".into(),
+            "dsound.dll!DirectSoundCreate".into(),
             "API has no implemented frontend; using a generated ABI failure stub".into(),
         )),
         Some(&1),
@@ -354,7 +354,7 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
             .sys
             .thunks
             .iter()
-            .any(|(_, t)| t.name == "DWriteCreateFactory" && !t.implemented)
+            .any(|(_, t)| t.name == "DirectSoundCreate" && !t.implemented)
     );
 }
 
@@ -364,7 +364,7 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
     registry.set_mode(RunMode::Discovery);
     let mut machine = machine(registry);
     let thunk = machine
-        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .resolve_import("dsound.dll", "DirectSoundCreate")
         .unwrap();
     machine.cpu.write_u32(DATA, 0xdead_beef).unwrap();
     let mut code = Asm::new(CODE);
@@ -394,10 +394,43 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
         120
     );
     assert_eq!(
-        machine.ext.get::<ApiDiagnostics>().gaps["dwrite.dll!DWriteCreateFactory"],
+        machine.ext.get::<ApiDiagnostics>().gaps["dsound.dll!DirectSoundCreate"],
         1
     );
     assert_eq!(machine.ext.get::<ApiDiagnostics>().warnings.len(), 1);
+}
+
+#[test]
+fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_call() {
+    let mut machine = machine(Registry::default());
+    let thunk = machine
+        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .unwrap();
+    machine.cpu.write_u32(DATA, 0xdead_beef).unwrap();
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 16)
+        .push_imm(DATA)
+        .push_imm(DATA + 32)
+        .push_imm(0)
+        .call(thunk)
+        .mov_mem_eax(DATA + 4);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 20);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0x8000_4001);
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0xdead_beef);
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 16).unwrap(),
+        machine.cpu.read_u32(DATA + 20).unwrap()
+    );
+    let diagnostics = machine.ext.get::<ApiDiagnostics>();
+    assert_eq!(diagnostics.stub_calls, 0);
+    assert_eq!(
+        diagnostics.reviewed_calls["dwrite.dll!DWriteCreateFactory"],
+        1
+    );
+    assert!(diagnostics.acceptance_eligible(RunMode::Strict));
 }
 
 #[test]

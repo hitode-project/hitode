@@ -1,20 +1,57 @@
-//! One virtual OS identity, shared by GetVersion[Ex] and VerifyVersionInfo.
-//! This is the existing Windows 7 SP1 x86 personality, not the host OS version.
+//! Version APIs over the PEB-carried personality (crate::personality), not
+//! the host OS version. Native reads suite and product type from
+//! KUSER_SHARED_DATA; without that page they come from the same profile.
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome};
+use adv_machine::{
+    Env, Outcome,
+    layout::{PEB_ADDR, peb},
+};
 
-use crate::{stdcall, util::set_last_error};
+use crate::{Win32, stdcall, util::set_last_error};
 
-// Indexed by the bit position of VER_*.
-const VERSION: [u32; 8] = [1, 6, 7601, 2, 0, 1, 0, 1];
+/// Values indexed by the bit position of VER_*, plus szCSDVersion.
+struct Identity {
+    version: [u32; 8],
+    csd: Vec<u16>,
+}
+
+fn identity(env: &Env<'_>) -> Result<Identity, u32> {
+    const NOACCESS: u32 = 998;
+    let cpu = &env.cpu;
+    let word = |offset| cpu.read_u32(PEB_ADDR + offset).map_err(|_| NOACCESS);
+    let short = |offset| cpu.read_u16(PEB_ADDR + offset).map_err(|_| NOACCESS);
+    let service_pack = short(peb::OS_CSD_VERSION)?;
+    let length = u32::from(short(peb::CSD_VERSION)?).min(254) / 2;
+    let buffer = word(peb::CSD_VERSION + 4)?;
+    let csd = (0..length)
+        .map(|index| cpu.read_u16(buffer + index * 2).map_err(|_| NOACCESS))
+        .collect::<Result<_, _>>()?;
+    let profile = &env.ext.get::<Win32>().cfg.personality;
+    Ok(Identity {
+        version: [
+            word(peb::OS_MINOR_VERSION)?,
+            word(peb::OS_MAJOR_VERSION)?,
+            u32::from(short(peb::OS_BUILD_NUMBER)?),
+            word(peb::OS_PLATFORM_ID)?,
+            u32::from(service_pack & 0xff),
+            u32::from(service_pack >> 8),
+            u32::from(profile.suite_mask),
+            u32::from(profile.product_type),
+        ],
+        csd,
+    })
+}
 
 fn fail(env: &mut Env<'_>, code: u32) -> Outcome {
     set_last_error(env, code);
     Outcome::Return(0)
 }
-fn get_version(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return((VERSION[2] << 16) | (VERSION[0] << 8) | VERSION[1])
+fn get_version(env: &mut Env<'_>) -> Outcome {
+    match identity(env) {
+        Ok(Identity { version: v, .. }) => Outcome::Return((v[2] << 16) | (v[0] << 8) | v[1]),
+        Err(code) => fail(env, code),
+    }
 }
 fn get_version_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     match write_version(env, env.arg(0), wide) {
@@ -30,11 +67,11 @@ fn rtl_get_version(env: &mut Env<'_>) -> Outcome {
         Err(_) => Outcome::Return(STATUS_INVALID_PARAMETER),
     }
 }
-/// Windows 7 reports an edition for any queried version; this personality is Ultimate.
+/// Windows 7 reports the installed edition for any queried version.
 fn get_product_info(env: &mut Env<'_>) -> Outcome {
-    const PRODUCT_ULTIMATE: u32 = 0x0000_0001;
+    let edition = env.ext.get::<Win32>().cfg.personality.edition;
     let pointer = env.arg(4);
-    match env.cpu.write(pointer, &PRODUCT_ULTIMATE.to_le_bytes()) {
+    match env.cpu.write(pointer, &edition.to_le_bytes()) {
         Ok(()) => Outcome::Return(1),
         Err(_) => fail(env, 998),
     }
@@ -51,23 +88,30 @@ fn write_version(env: &mut Env<'_>, pointer: u32, wide: bool) -> Result<(), u32>
     if (size != base && size != base + 8) || !env.cpu.accessible(pointer, size, Prot::WRITE) {
         return Err(87);
     }
+    let Identity { version, csd } = identity(env)?;
     let mut bytes = [0u8; 284];
     bytes[..4].copy_from_slice(&size.to_le_bytes());
-    for (index, value) in [VERSION[1], VERSION[0], VERSION[2], VERSION[3]]
+    for (index, value) in [version[1], version[0], version[2], version[3]]
         .into_iter()
         .enumerate()
     {
         bytes[4 + index * 4..8 + index * 4].copy_from_slice(&value.to_le_bytes());
     }
-    for (index, byte) in b"Service Pack 1".iter().enumerate() {
-        bytes[20 + index * if wide { 2 } else { 1 }] = *byte;
-    }
+    let csd = if wide {
+        csd.iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>()
+    } else {
+        env.ext.get::<Win32>().codec.from_utf16(0, &csd).0
+    };
+    let room = if wide { 254 } else { 127 };
+    bytes[20..20 + csd.len().min(room)].copy_from_slice(&csd[..csd.len().min(room)]);
     if size == base + 8 {
         let at = base as usize;
-        bytes[at..at + 2].copy_from_slice(&(VERSION[5] as u16).to_le_bytes());
-        bytes[at + 2..at + 4].copy_from_slice(&(VERSION[4] as u16).to_le_bytes());
-        bytes[at + 4..at + 6].copy_from_slice(&(VERSION[6] as u16).to_le_bytes());
-        bytes[at + 6] = VERSION[7] as u8;
+        bytes[at..at + 2].copy_from_slice(&(version[5] as u16).to_le_bytes());
+        bytes[at + 2..at + 4].copy_from_slice(&(version[4] as u16).to_le_bytes());
+        bytes[at + 4..at + 6].copy_from_slice(&(version[6] as u16).to_le_bytes());
+        bytes[at + 6] = version[7] as u8;
     }
     env.cpu
         .write(pointer, &bytes[..size as usize])
@@ -97,7 +141,7 @@ fn compare(actual: u32, requested: u32, condition: u64) -> bool {
         _ => false,
     }
 }
-fn matches(requested: [u32; 8], types: u32, condition: u64) -> Result<bool, u32> {
+fn matches(actual: [u32; 8], requested: [u32; 8], types: u32, condition: u64) -> Result<bool, u32> {
     if types == 0 || types & !0xff != 0 {
         return Err(160);
     }
@@ -105,14 +149,14 @@ fn matches(requested: [u32; 8], types: u32, condition: u64) -> Result<bool, u32>
     // Independent attributes must match even if an earlier version tuple
     // component already satisfies a greater/less comparison.
     for bit in [2, 3, 7] {
-        if types & (1 << bit) != 0 && !compare(VERSION[bit], requested[bit], op(bit)) {
+        if types & (1 << bit) != 0 && !compare(actual[bit], requested[bit], op(bit)) {
             return Ok(false);
         }
     }
     if types & 0x40 != 0 {
         let good = match op(6) {
-            6 => VERSION[6] & requested[6] == requested[6],
-            7 => requested[6] == 0 || VERSION[6] & requested[6] != 0,
+            6 => actual[6] & requested[6] == requested[6],
+            7 => requested[6] == 0 || actual[6] & requested[6] != 0,
             _ => return Err(160),
         };
         if !good {
@@ -130,8 +174,8 @@ fn matches(requested: [u32; 8], types: u32, condition: u64) -> Result<bool, u32>
         if operation == 0 {
             return Ok(false);
         }
-        if VERSION[bit] != requested[bit] || bit == 4 {
-            return Ok(compare(VERSION[bit], requested[bit], operation));
+        if actual[bit] != requested[bit] || bit == 4 {
+            return Ok(compare(actual[bit], requested[bit], operation));
         }
     }
     Ok(true)
@@ -153,7 +197,11 @@ fn verify(env: &mut Env<'_>, wide: bool) -> Outcome {
         u32::from(env.cpu.read_u8(pointer + base + 6).unwrap()),
     ];
     let condition = u64::from(env.arg(2)) | (u64::from(env.arg(3)) << 32);
-    match matches(requested, env.arg(1), condition) {
+    let actual = match identity(env) {
+        Ok(identity) => identity.version,
+        Err(code) => return fail(env, code),
+    };
+    match matches(actual, requested, env.arg(1), condition) {
         Ok(true) => Outcome::Return(1),
         Ok(false) => fail(env, 1150),
         Err(code) => fail(env, code),
