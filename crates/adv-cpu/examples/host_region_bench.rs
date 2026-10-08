@@ -8,10 +8,16 @@
 //! benchmark selector, ADV_DIRECT_MEMORY=1 selects direct mode and
 //! ADV_DIRECT_MEMORY_INLINE=0 selects legacy; otherwise the default is off.
 //! Selection is fixed at process startup, before any executor or worker exists.
+//! ADV_REGION_BENCH_COMPILE=1 measures Fast/Speed synchronous compilation with
+//! 1/2/4 host compiler workers (not the background service's scheduling policy).
+//! COMPILE_REPEATS (1-31, default 9) bounds jobs per case per worker count.
+//! ADV_REGION_BENCH_TIER0_ONLY=1 and ADV_REGION_BENCH_CATEGORY filter sampling
+//! workloads; ADV_CODE_VALIDITY=event enables independent page subscriptions.
 //! Short synthetic comparisons can use ADV_REGION_BENCH_SAMPLES=3,
 //! ADV_REGION_BENCH_LOOPS=1000 and ADV_REGION_BENCH_REPEATS=1.
 use adv_cpu::{
-    ArchitecturalState, CpuState, EXEC, Executor, HostFeatures, READ, Region, RunOutcome, WRITE,
+    ArchitecturalState, CompileStrategy, CpuState, EXEC, Executor, HostFeatures, READ, Region,
+    RunOutcome, WRITE,
 };
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic as M,
@@ -28,6 +34,7 @@ const STACK: u32 = 0x2f000;
 const STOP: u32 = 0x30000;
 const BUDGET: u64 = 100_000_000;
 
+#[derive(Clone)]
 struct Case {
     category: String,
     ordinal: usize,
@@ -226,7 +233,112 @@ fn synthetic(loops: u32, repeats: usize) -> Vec<Case> {
             },
         });
     }
+    // Authored short fragments expose entry/validation costs without requiring
+    // private captures. They are labelled separately from real engine slices.
+    for instructions in [8, 16, 32] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        for _ in 0..instructions / 4 {
+            a.add(eax, 3).unwrap();
+            a.adc(edx, eax).unwrap();
+            a.xor(ebx, edx).unwrap();
+            a.sbb(eax, 1).unwrap();
+        }
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        cases.push(Case {
+            category: format!("synthetic_short_{instructions}"),
+            ordinal: 1,
+            stop: CODE + bytes.len() as u32,
+            bytes,
+            repeats: 1000,
+            memory_movs: 0,
+        });
+    }
     cases
+}
+
+fn percentiles(mut us: Vec<f64>) -> (f64, f64, f64) {
+    assert!(!us.is_empty());
+    us.sort_by(f64::total_cmp);
+    (
+        us[(us.len() - 1) / 2],
+        us[(us.len() * 95).div_ceil(100) - 1],
+        *us.last().unwrap(),
+    )
+}
+
+fn benchmark_compilation(cases: &[Case]) {
+    let repeats = option("ADV_REGION_BENCH_COMPILE_REPEATS", 9, 31);
+    println!(
+        "# compile topology=synchronous_host_workers setup_excluded=true publication_in_throughput=true repeats={repeats}"
+    );
+    println!("kind,category,strategy,threads,regions,p50_us,p95_us,max_us,regions_per_second");
+    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+        for threads in [1, 2, 4] {
+            let barrier = std::sync::Barrier::new(threads);
+            let results = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|worker| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let jobs: Vec<_> = (0..cases.len() * repeats)
+                                .filter(|n| n % threads == worker)
+                                .map(|n| {
+                                    let index = n % cases.len();
+                                    let executor =
+                                        setup(&cases[index], 0, DirectMode::Off).unwrap();
+                                    (index, executor)
+                                })
+                                .collect();
+                            barrier.wait();
+                            let start = Instant::now();
+                            let mut timings = Vec::new();
+                            // Setup and guest execution are outside this window.
+                            // Stats time includes capture, lowering and publication
+                            // preparation, but excludes the owner's cache insertion.
+                            let mut finished = Vec::new();
+                            for (index, mut executor) in jobs {
+                                let mut region = Region::new(CODE, cases[index].bytes.len());
+                                region.compile_strategy = strategy;
+                                executor.add_region(region).unwrap();
+                                timings
+                                    .push((index, executor.stats.compile_time.as_secs_f64() * 1e6));
+                                finished.push(executor); // Keep retirement outside throughput.
+                            }
+                            (start.elapsed().as_secs_f64(), timings)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let elapsed = results.iter().map(|(time, _)| *time).fold(0.0, f64::max);
+            let mut categories = BTreeMap::<&str, Vec<f64>>::new();
+            for (_, timings) in results {
+                for (index, us) in timings {
+                    categories
+                        .entry(&cases[index].category)
+                        .or_default()
+                        .push(us);
+                }
+            }
+            let all: Vec<_> = categories.values().flatten().copied().collect();
+            let count = all.len();
+            let (p50, p95, max) = percentiles(all);
+            println!(
+                "compile_total,all,{strategy:?},{threads},{count},{p50:.3},{p95:.3},{max:.3},{:.3}",
+                count as f64 / elapsed
+            );
+            for (category, times) in categories {
+                let count = times.len();
+                let (p50, p95, max) = percentiles(times);
+                println!(
+                    "compile,{category},{strategy:?},{threads},{count},{p50:.3},{p95:.3},{max:.3},"
+                );
+            }
+        }
+    }
 }
 
 fn replayable(i: &Instruction, info: &mut InstructionInfoFactory) -> bool {
@@ -565,9 +677,23 @@ fn main() {
     if cfg!(all(feature = "gir-execute", not(target_os = "macos"))) {
         tiers.push(3);
     }
+    if std::env::var("ADV_REGION_BENCH_TIER0_ONLY").as_deref() == Ok("1") {
+        tiers = vec![0];
+    }
     let mut cases = synthetic(loops, repeats);
     if let Some(root) = std::env::var_os("ADV_GIR_LIFT_CORPUS") {
         cases.extend(load_private(Path::new(&root), private_limit, 1000));
+    }
+    let filtered = if let Ok(category) = std::env::var("ADV_REGION_BENCH_CATEGORY") {
+        cases.retain(|case| case.category == category);
+        true
+    } else {
+        false
+    };
+    assert!(!cases.is_empty(), "empty benchmark selection");
+    if std::env::var("ADV_REGION_BENCH_COMPILE").as_deref() == Ok("1") {
+        benchmark_compilation(&cases);
+        return;
     }
     println!(
         "kind,category,ordinal,tier,guest_instructions_per_run,repeats,median_ns_per_guest,range_ns_per_guest,min_ns_per_guest,max_ns_per_guest,fallback_percent,cpu_start,cpu_end"
@@ -706,12 +832,39 @@ fn main() {
         "# completed accepted={accepted} skipped={skipped} cpu={}",
         cpu()
     );
-    assert!(accepted >= 6, "synthetic baseline incomplete");
+    assert!(
+        accepted >= if filtered { 1 } else { 6 },
+        "synthetic baseline incomplete"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compilation_percentiles_use_nearest_rank_and_keep_maximum() {
+        assert_eq!(percentiles(vec![10., 1., 2., 3.]), (2., 10., 10.));
+        assert_eq!(percentiles(vec![7.]), (7., 7., 7.));
+    }
+
+    #[test]
+    fn authored_short_cases_have_exact_instruction_counts_and_stop_boundaries() {
+        for case in synthetic(1, 1)
+            .into_iter()
+            .filter(|c| c.category.starts_with("synthetic_short_"))
+        {
+            let expected: usize = case.category.rsplit('_').next().unwrap().parse().unwrap();
+            assert_eq!(
+                Decoder::new(32, &case.bytes, DecoderOptions::NONE)
+                    .into_iter()
+                    .count(),
+                expected
+            );
+            assert_eq!(case.stop, CODE + case.bytes.len() as u32);
+            assert_eq!(case.memory_movs, 0);
+        }
+    }
 
     #[test]
     fn private_loader_rejects_missing_or_nonmonotonic_manifest() {
