@@ -51,7 +51,7 @@ fn query_system_information(env: &mut Env<'_>) -> Outcome {
         adv_abi::warn_unavailable(
             env,
             "ntdll.dll!NtQuerySystemInformation",
-            "system information class is not modeled",
+            &format!("system information class {class} is not modeled"),
         );
         return Outcome::Return(0xc000_0002);
     }

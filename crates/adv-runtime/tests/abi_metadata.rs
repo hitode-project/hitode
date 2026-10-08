@@ -105,7 +105,7 @@ fn native_argc(export: &str) -> Option<u8> {
         "Continue" | "FlushBuffersFile" => 8,
         "QueueApcThread" => 20,
         "TestAlert" => 0,
-        "WaitForSingleObject" | "OpenEvent" => 12,
+        "WaitForSingleObject" | "OpenEvent" | "RaiseException" => 12,
         "CreateEvent" | "WaitForMultipleObjects" => 20,
         "SetEvent" | "ResetEvent" => 8,
         "QueryVolumeInformationFile" => 20,
