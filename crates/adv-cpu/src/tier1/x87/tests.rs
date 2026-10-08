@@ -45,6 +45,7 @@ fn fixture(build: Asm) -> (Operations, Memory, CpuState) {
     let operations = Operations::new(
         &BTreeMap::from([(CODE, instruction)]),
         &[(CODE, bytes.clone())],
+        crate::HostFeatures::get(),
     );
     let mut memory = Memory::new(CODE, 0x20000).unwrap();
     memory.protect(CODE, 0x20000, READ | WRITE).unwrap();

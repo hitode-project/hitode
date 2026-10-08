@@ -40,6 +40,7 @@ mod gir;
 #[cfg(feature = "gir-capture")]
 #[path = "gir/capture.rs"]
 mod gir_capture;
+pub mod host_features;
 // The opt-in fault lane accepts only verified scalar recovery sites. Other
 // accesses and hosts retain the current checked execution lane.
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -75,6 +76,7 @@ pub use cpu_profile::SegmentState;
 pub use executor::{
     DirectMemoryStats, ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats,
 };
+pub use host_features::HostFeatures;
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use rows::RowStats;
