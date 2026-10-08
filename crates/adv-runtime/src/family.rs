@@ -35,7 +35,7 @@ pub struct ProcessStatus {
 
 pub(crate) struct Family<B: Backend> {
     pub(crate) parked: BTreeMap<u32, Machine<B>>,
-    prepared: BTreeMap<u32, PreparedChild>,
+    prepared: BTreeMap<u32, PreparedProcess>,
     publication: BTreeMap<u32, Rc<Cell<processes::Publication>>>,
     first_failure: Option<MachineError>,
     completed: BTreeSet<u32>,
@@ -46,11 +46,6 @@ pub(crate) struct Family<B: Backend> {
     width: u32,
     height: u32,
     codec: crate::vorbis::Policy,
-}
-
-struct PreparedChild {
-    image: PreparedProcess,
-    startup_prefix: usize,
 }
 
 impl<B: Backend> Family<B> {
@@ -270,7 +265,6 @@ impl<B: Backend> Runtime<B> {
         sound.capture_digests = digests;
         adv_dx::dshow::install(&mut child);
         adv_dx::dxdiag::install(&mut child);
-        let startup_prefix = child.sys.process_init.len();
         let main = child
             .start_process(exe)
             .map_err(|e| Error::new(8, e.to_string()))?;
@@ -310,13 +304,7 @@ impl<B: Backend> Runtime<B> {
             first_cpu_fault: None,
             latest_cpu_fault: None,
         });
-        self.family.prepared.insert(
-            pid,
-            PreparedChild {
-                image: prepared,
-                startup_prefix,
-            },
-        );
+        self.family.prepared.insert(pid, prepared);
         // Local timed-wait acceleration is unsound while another address space
         // can run. Family-wide acceleration is deliberately disabled here.
         self.machine.set_time_skip_source(None);
@@ -376,20 +364,12 @@ impl<B: Backend> Runtime<B> {
                 modules,
                 &win32.vfs,
             );
-            loader
-                .finish_process(prepared.image)
-                .map_err(|e| e.to_string())?;
+            loader.finish_process(prepared).map_err(|e| e.to_string())?;
             let inits = std::mem::take(&mut loader.inits);
             drop(loader);
-            // Preserve infrastructure before DLL initialization and readiness /
-            // executable entry after it, just as the initial process load does.
-            let mut ready = self
-                .machine
-                .sys
-                .process_init
-                .split_off(prepared.startup_prefix);
+            // Infrastructure precedes image initialization. The machine runs the
+            // separate readiness queue last, then resumes the requested context.
             self.machine.sys.process_init.extend(inits);
-            self.machine.sys.process_init.append(&mut ready);
             // A resumed executable owns the session's display/input from here.
             self.set_foreground(pid)?;
         }
