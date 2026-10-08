@@ -1,6 +1,6 @@
 //! Win32 adapters for native counted-string loader calls.
 use super::*;
-use adv_os::Heaps;
+use adv_cpu::backend::Reg;
 
 fn scratch(env: &mut Env<'_>, bytes: &[u8], wide: bool) -> Result<u32, Outcome> {
     if bytes.len() > 65532 {
@@ -9,34 +9,30 @@ fn scratch(env: &mut Env<'_>, bytes: &[u8], wide: bool) -> Result<u32, Outcome> 
     }
     let size = 16 + bytes.len() as u32 + if wide { 2 } else { 1 };
     let Some(p) = env
-        .ext
-        .get_mut::<Heaps>()
-        .alloc(env.cpu, &mut env.sys.vm, 0, size, true)
+        .cpu
+        .reg(Reg::Esp)
+        .checked_sub(size + 15)
+        .map(|p| p & !15)
+        .filter(|&p| env.cpu.accessible(p, size, Prot::RW))
     else {
         set_last_error(env, err::NOT_ENOUGH_MEMORY);
         return Err(Outcome::Return(0));
     };
     let result = (|| -> Result<(), MemFault> {
+        env.cpu.write(p, &vec![0; size as usize])?;
         env.cpu.write(p, &(bytes.len() as u16).to_le_bytes())?;
         env.cpu.write(p + 2, &((size - 16) as u16).to_le_bytes())?;
         env.cpu.write_u32(p + 4, p + 16)?;
         env.cpu.write(p + 16, bytes)
     })();
     if result.is_err() {
-        release(env, p);
         set_last_error(env, 998);
         return Err(Outcome::Return(0));
     }
     Ok(p)
 }
-fn release(env: &mut Env<'_>, p: u32) {
-    env.ext
-        .get_mut::<Heaps>()
-        .free(env.cpu, &mut env.sys.vm, 0, p);
-}
 fn result(env: &mut Env<'_>, p: u32, status: u32) -> Outcome {
     let output = env.cpu.read_u32(p + 8);
-    release(env, p);
     if (status as i32) < 0 {
         return load_io_error(env, LibraryFront::Win32, status);
     }
@@ -51,7 +47,7 @@ pub(super) fn load(env: &mut Env<'_>, target: u32, name: String) -> Outcome {
         Ok(p) => p,
         Err(outcome) => return outcome,
     };
-    Outcome::call(target, [0, 0, p, p + 8], move |env, value| {
+    Outcome::call_on_stack(target, [0, 0, p, p + 8], p, move |env, value| {
         result(env, p, value.value())
     })
 }
@@ -69,9 +65,10 @@ pub(super) fn procedure(
         Ok(p) => p,
         Err(outcome) => return outcome,
     };
-    Outcome::call(
+    Outcome::call_on_stack(
         target,
         [module, if ordinal == 0 { p } else { 0 }, ordinal, p + 8],
+        p,
         move |env, value| result(env, p, value.value()),
     )
 }

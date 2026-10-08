@@ -21,6 +21,7 @@ mod datafile;
 mod guest_files;
 mod native_boundary;
 mod notifications;
+pub(crate) use notifications::prepare_system_env;
 pub(crate) use notifications::prepare_system_modules;
 pub(crate) use notifications::shutdown_process;
 pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
@@ -204,6 +205,19 @@ fn unload(env: &mut Env<'_>, ids: Vec<ModuleId>, result: u32, error: Option<u32>
 
 #[win32(kernel32, name = "FreeLibrary", level = implement)]
 fn free_library(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    match crate::native::overridden(env, "LdrUnloadDll") {
+        Ok(Some(target)) => {
+            return Outcome::call(target, [handle.0], |env, result| {
+                if (result.value() as i32) < 0 {
+                    load_io_error(env, LibraryFront::Win32, result.value())
+                } else {
+                    Outcome::Return(1)
+                }
+            });
+        }
+        Err(_) => return crate::native::unavailable(env, "LdrUnloadDll"),
+        Ok(None) => {}
+    }
     locked(env, move |env| {
         let Some(id) = adv_os::modules(env.ext).by_handle(handle.0) else {
             set_last_error(env, err::MOD_NOT_FOUND);
@@ -211,6 +225,18 @@ fn free_library(env: &mut Env<'_>, handle: Handle) -> Outcome {
         };
         match adv_os::modules_mut(env.ext).release(env.cpu, id) {
             Ok(ids) => unload(env, ids, 1, None),
+            Err(error) => Outcome::Fail(error.to_string()),
+        }
+    })
+}
+
+pub(crate) fn native_unload_library(env: &mut Env<'_>, handle: u32) -> Outcome {
+    locked_profile(env, true, move |env| {
+        let Some(id) = adv_os::modules(env.ext).by_handle(handle) else {
+            return Outcome::Return(0xc0000135);
+        };
+        match adv_os::modules_mut(env.ext).release(env.cpu, id) {
+            Ok(ids) => unload(env, ids, 0, None),
             Err(error) => Outcome::Fail(error.to_string()),
         }
     })
