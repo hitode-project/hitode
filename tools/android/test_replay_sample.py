@@ -31,6 +31,15 @@ class FakeProcess:
         self.returncode = -9
 
 
+class DeviceConditionsTests(unittest.TestCase):
+    def test_temperature_and_display_state_do_not_include_window_identity(self):
+        class Device:
+            def call(self, *args, **kwargs):
+                return subprocess.CompletedProcess(args, 0, "  temperature: 271\n  mWakefulness=Awake\n  mCurrentFocus=Window{abc123 u0 fixture/app}\nCpus_allowed_list:\t0-6\n", "")
+        self.assertEqual(replay.device_conditions(Device()), {
+            "battery_temperature_c": 27.1, "screen": "Awake", "foreground": "Window{u0 fixture/app}", "allowed_cpus": "0-6"})
+
+
 class ReplayTests(unittest.TestCase):
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):
         command = "await-frame 0000000000000001 1000 hold 17"

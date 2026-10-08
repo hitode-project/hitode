@@ -82,7 +82,8 @@ function Get-DeviceCommand($remote, $run) {
     $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_TIER1'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
-    "cd '$remote' && $clear && ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$($run.target)' $($run.filter) --test-threads=1 --nocapture"
+    $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
+    "cd '$remote' && $clear && CARGO_TARGET_DIR='$remote/target' ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
@@ -99,26 +100,38 @@ foreach ($path in @((Join-Path $Ndk 'source.properties'), 'C:/msys64/usr/bin/sh.
 }
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $Output = (Resolve-Path -LiteralPath $Output).Path
+function Invoke-AdbRetry([string[]]$Arguments, [string]$Label) {
+    # Only repeat idempotent queries, file transfers and operations on our own
+    # directory. Never retry a test invocation after an uncertain execution.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        if ($deviceClock -and $deviceClock.Elapsed.TotalSeconds -gt $DeviceBudgetSeconds - 45) {
+            throw 'Device session budget exhausted during transport; retry under a new lock.'
+        }
+        $lines = @(& $adb -H 127.0.0.1 -P $AdbPort @Arguments 2>&1)
+        if ($LASTEXITCODE -eq 0) { return $lines }
+        if ($attempt -eq 4) { throw "$Label failed after transport retries: $($lines -join ' ')" }
+        Write-Warning "${Label}: transient infrastructure error; retrying in 30 seconds."
+        Start-Sleep -Seconds 30
+    }
+}
 if (-not $BuildOnly) {
+    $deviceClock = [Diagnostics.Stopwatch]::StartNew()
     if (-not $Sdk) { throw 'Set ANDROID_HOME or pass -Sdk.' }
     $adb = Join-Path $Sdk 'platform-tools/adb.exe'
     if (-not (Test-Path -LiteralPath $adb -PathType Leaf)) { throw "Missing device tool: $adb" }
-    $devices = @(& $adb -P $AdbPort devices)
-    if ($LASTEXITCODE -ne 0) { throw 'adb device discovery failed' }
+    $devices = @(Invoke-AdbRetry @('devices') 'Device discovery')
     if (-not $Serial) {
         $ready = @($devices | Where-Object { $_ -match '^\S+\s+device$' } | ForEach-Object { ($_ -split '\s+')[0] })
         if ($ready.Count -ne 1) { throw 'Pass -Serial when exactly one authorized device is not available.' }
         $Serial = $ready[0]
     }
-    $adbArgs = @('-P', "$AdbPort", '-s', $Serial)
+    $adbArgs = @('-H', '127.0.0.1', '-P', "$AdbPort", '-s', $Serial)
     $device = [ordered]@{}
     foreach ($property in @('ro.product.model', 'ro.build.version.release', 'ro.build.version.sdk', 'ro.product.cpu.abilist')) {
-        $value = & $adb @adbArgs shell getprop $property
-        if ($LASTEXITCODE -ne 0) { throw "Device property failed: $property" }
+        $value = Invoke-AdbRetry @('-s', $Serial, 'shell', 'getprop', $property) 'Device property'
         $device[$property] = ($value | Out-String).Trim()
     }
-    $pageSize = & $adb @adbArgs shell getconf PAGESIZE
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot read host page size' }
+    $pageSize = Invoke-AdbRetry @('-s', $Serial, 'shell', 'getconf', 'PAGESIZE') 'Device page size'
     $device['host_page_size'] = ($pageSize | Out-String).Trim()
     $device | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Output 'device.json') -Encoding utf8
 }
@@ -171,31 +184,37 @@ try {
         return
     }
     $remote = '/data/local/tmp/adv-host-cpu-' + [Guid]::NewGuid().ToString('N')
-    $deviceClock = [Diagnostics.Stopwatch]::StartNew()
     Set-Content -LiteralPath (Join-Path $Output 'remote-directory.txt') -Value $remote
-    & $adb @adbArgs shell mkdir -p $remote
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot create owned device test directory' }
+    Invoke-AdbRetry @('-s', $Serial, 'shell', 'mkdir', '-p', $remote) 'Device directory'
     $results = [Collections.Generic.List[object]]::new()
-    foreach ($test in $targets) {
-        if (-not $artifacts.ContainsKey($test)) { throw "Missing executable artifact: $test" }
-        $binary = $artifacts[$test]
-        & $adb @adbArgs push $binary "$remote/$test"
-        if ($LASTEXITCODE -ne 0) { throw "Push failed: $test" }
-        & $adb @adbArgs shell chmod 700 "$remote/$test"
-        if ($LASTEXITCODE -ne 0) { throw "chmod failed: $test" }
-    }
+    # One multi-file transfer avoids a connection per ELF. All sources are
+    # regular files with unique Cargo names, so repeating a partial push cannot
+    # create nested directories or overwrite another task's data.
+    $sources = @($targets | ForEach-Object { $artifacts[$_] })
+    Invoke-AdbRetry (@('-s', $Serial, 'push', '--sync') + $sources + @("$remote/")) 'Push'
+    Invoke-AdbRetry @('-s', $Serial, 'shell', "chmod 700 '$remote'/*") 'chmod'
     foreach ($run in $runs) {
         $remaining = [int]($DeviceBudgetSeconds - $deviceClock.Elapsed.TotalSeconds)
         if ($remaining -lt 10) { throw "Device session budget exhausted; resume remaining targets from $Output" }
         $TimeoutSeconds = [Math]::Min($TimeoutSeconds, $remaining)
         $test = $run.target
         $binary = $artifacts[$test]
+        $run | Add-Member -NotePropertyName executable -NotePropertyValue ([IO.Path]::GetFileName($binary))
         $filter = $run.filter
         $command = Get-DeviceCommand $remote $run
         Add-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Value "adb shell $command"
         $log = Join-Path $Output "$($run.id).log"
-        & $adb @adbArgs shell $command 2>&1 | Tee-Object -FilePath $log
-        $code = $LASTEXITCODE
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            & $adb @adbArgs shell $command 2>&1 | Tee-Object -FilePath $log
+            $code = $LASTEXITCODE
+            $transport = (Get-Content -LiteralPath $log -Raw) -match 'cannot connect to daemon|device offline|device not found'
+            if (-not $transport) { break }
+            Copy-Item -LiteralPath $log -Destination (Join-Path $Output "$($run.id)-transport-$attempt.log")
+            if ($attempt -eq 4 -or $deviceClock.Elapsed.TotalSeconds -gt $DeviceBudgetSeconds - $TimeoutSeconds - 30) {
+                throw "Device transport failed before test execution: $test"
+            }
+            Start-Sleep -Seconds 30
+        }
         $content = Get-Content -LiteralPath $log -Raw
         $summary = [regex]::Match($content, 'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
         $passed = if ($summary.Success) { [int]$summary.Groups[1].Value } else { 0 }
@@ -217,8 +236,8 @@ try {
     Write-Output "CPU test evidence: $Output"
 } finally {
     if ($remote -and $remote -match '^/data/local/tmp/adv-host-cpu-[a-f0-9]{32}$') {
-        & $adb @adbArgs shell rm -rf $remote
-        if ($LASTEXITCODE -ne 0) { Write-Warning "Owned device directory cleanup needs retry: $remote" }
+        try { Invoke-AdbRetry @('-s', $Serial, 'shell', 'rm', '-rf', $remote) 'Device cleanup' }
+        catch { Write-Warning "Owned device directory cleanup needs retry: $remote" }
     }
     Pop-Location
     foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name], 'Process') }

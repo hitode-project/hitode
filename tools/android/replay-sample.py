@@ -237,7 +237,7 @@ def validate_report(report: dict, name: str) -> None:
 
 class Adb:
     def __init__(self, args: argparse.Namespace):
-        self.prefix = [str(args.adb), "-P", str(args.adb_port), "-s", args.serial]
+        self.prefix = [str(args.adb), "-H", "127.0.0.1", "-P", str(args.adb_port), "-s", args.serial]
         self.timeout = args.transfer_timeout
         self.transport_retries = []
 
@@ -325,6 +325,22 @@ def launch_script(command: list[str], remote: str, game: str, timeout: int) -> s
             f"2>{shlex.quote(remote + '/stderr.log')}; "
             f"result=$?; printf '%s\\n' \"$result\" >{shlex.quote(remote + '/exit-code.txt')}; "
             f") | tee {shlex.quote(remote + '/stdout.log')}")
+
+
+def device_conditions(adb: Adb) -> dict:
+    """Read aggregate thermal/display/scheduling conditions outside guest timing."""
+    text = adb.call("shell", "dumpsys battery; dumpsys power; dumpsys window windows; cat /proc/self/status",
+                    idempotent=True).stdout
+    def field(pattern: str) -> str | None:
+        match = re.search(pattern, text, re.MULTILINE)
+        return match[1].strip() if match else None
+    temperature = field(r"^\s*temperature:\s*(\d+)\s*$")
+    focus = field(r"^\s*mCurrentFocus=(.*)$")
+    if focus:
+        focus = re.sub(r"Window\{[0-9a-f]+\s+", "Window{", focus)
+    return {"battery_temperature_c": int(temperature) / 10 if temperature else None,
+            "screen": field(r"^\s*mWakefulness=([A-Za-z]+)\s*$"),
+            "foreground": focus, "allowed_cpus": field(r"^Cpus_allowed_list:\s*(.*)$")}
 
 
 def run(args: argparse.Namespace) -> None:
@@ -468,6 +484,8 @@ def run(args: argparse.Namespace) -> None:
         if cold or warm_profile:
             metadata["warm_profile_input_verified"] = True
         write_json(output / "session.json", metadata)
+        if getattr(args, "record_device_state", False):
+            metadata["device_conditions_before"] = device_conditions(adb)
         with (output / "stdout.log").open("w", encoding="utf-8") as stdout, \
                 (output / "adb-stderr.log").open("w", encoding="utf-8") as adb_stderr:
             started = time.monotonic()
@@ -593,6 +611,11 @@ def run(args: argparse.Namespace) -> None:
         error = caught
         metadata["error"] = f"{type(caught).__name__}: {caught}"
     finally:
+        if getattr(args, "record_device_state", False):
+            try:
+                metadata["device_conditions_after"] = device_conditions(adb)
+            except Exception as caught:
+                metadata["device_conditions_error"] = str(caught)
         # The remote directory remains available after failures/disconnection. Never
         # recursively pull game/data resources and never delete a reused source.
         evidence = ("final.json", "final.png", "stderr.log", "stdout.log", "exit-code.txt")
@@ -713,6 +736,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-tiering", action="store_true")
     parser.add_argument("--tier1", choices=("off", "bridge"), default="off")
     parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
+    parser.add_argument("--record-device-state", action="store_true",
+                        help="record battery temperature, screen, foreground and CPU affinity before/after execution")
     parser.add_argument("--schedule-profile", action="store_true")
     parser.add_argument("--font-diagnostics", action="store_true",
                         help="record font requested/resolved/source in stderr; excludes performance comparisons")
