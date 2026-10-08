@@ -1140,10 +1140,25 @@ fn run_execution(
         .machine
         .cpu
         .set_async_compilation(options.jit && options.async_compilation);
+    if let Ok(value) = std::env::var("ADV_TIER1") {
+        let mode: adv_runtime::Tier1Mode = value.parse()?;
+        if cfg!(all(
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )) {
+            runtime.machine.cpu.executor_mut().set_tier1_mode(mode)?;
+        } else if mode != adv_runtime::Tier1Mode::Off {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| eprintln!("ADV_TIER1 ignored: requires aarch64 Linux or Android"));
+        }
+    }
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
-    if options.jit && options.async_compilation {
+    if options.jit
+        && options.async_compilation
+        && runtime.machine.cpu.executor_mut().tier1_mode() != adv_runtime::Tier1Mode::Exclusive
+    {
         // Leave cores for the guest, presentation and audio threads.
         let threads = std::thread::available_parallelism().map_or(1, |cores| {
             compile_thread_count(cores.get(), options.guest_workers)
@@ -1950,6 +1965,23 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let bridge_details = c
+        .tier1_bridge_rows()
+        .into_iter()
+        .map(|(label, n)| {
+            format!(
+                "{}:{{\"entries\":{},\"instructions\":{}}}",
+                json(&label),
+                n.entries,
+                n.instructions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let tier1_bridge = format!(
+        "{{\"entries\":{},\"instructions\":{},\"details\":{{{bridge_details}}}}}",
+        c.tier1_bridge.entries, c.tier1_bridge.instructions
+    );
     let detail_rows = c.interpreter_detail_rows();
     let omitted_rows = detail_rows.len().saturating_sub(ROWS);
     let details = detail_rows
@@ -1996,7 +2028,7 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         format!("{{{groups}}}")
     });
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census},\"tier1_bridge\":{tier1_bridge}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),

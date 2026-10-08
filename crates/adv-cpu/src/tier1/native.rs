@@ -295,21 +295,57 @@ impl Unit {
 
 pub(crate) struct Engine {
     entries: BTreeMap<u32, (Rc<Unit>, usize)>,
+    // Pin units until a whole-cache retirement, including overwritten entries.
+    // This keeps page-rounded accounting exact without scanning on each lookup.
+    units: Vec<Rc<Unit>>,
+    entry_limit: usize,
+    byte_limit: usize,
     epoch: u64,
+    native_revision: u64,
     stats: Tier1Stats,
 }
 impl Engine {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
             entries: BTreeMap::new(),
+            units: Vec::new(),
+            entry_limit: 4096,
+            byte_limit: 16 * 1024 * 1024,
             epoch: 0,
+            native_revision: 0,
             stats: Tier1Stats::default(),
         })
     }
     pub fn stats(&self) -> Tier1Stats {
         self.stats.clone()
     }
-    fn compile(&mut self, memory: &mut Memory, start: u32) -> Result<bool, String> {
+    pub fn record_bridge(&mut self, units: u32) {
+        self.stats.bridge_units += u64::from(units);
+        self.stats.bridge_entries += u64::from(units != 0);
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.units.clear();
+        self.stats.resident_bytes = 0;
+    }
+    pub fn set_cache_limits(&mut self, entries: usize, bytes: usize) {
+        self.entry_limit = entries;
+        self.byte_limit = bytes;
+        if self.entries.len() > entries || self.stats.resident_bytes > bytes {
+            self.stats.cache_evictions += self.units.len() as u64;
+            self.clear();
+        }
+    }
+    fn compile(
+        &mut self,
+        memory: &mut Memory,
+        start: u32,
+        boundaries: Option<&BTreeMap<u32, u32>>,
+    ) -> Result<bool, String> {
+        if self.entry_limit == 0 || self.byte_limit == 0 {
+            self.stats.cache_rejections += 1;
+            return Ok(false);
+        }
         let timer = Instant::now();
         let mut queue = VecDeque::from([start]);
         let mut instructions = BTreeMap::<u32, Instruction>::new();
@@ -318,6 +354,7 @@ impl Engine {
             if instructions.contains_key(&pc)
                 || instructions.len() >= 128
                 || pc.abs_diff(start) > 4096
+                || boundaries.is_some_and(|entries| entries.contains_key(&pc))
             {
                 continue;
             }
@@ -382,9 +419,17 @@ impl Engine {
         }
         let emitted = emitted.finish()?;
         let code = Code::new(&emitted.words)?;
-        if self.entries.len() + instructions.len() > 4096 {
-            self.entries.clear();
+        if instructions.len() > self.entry_limit || code.len > self.byte_limit {
+            self.stats.cache_rejections += 1;
+            return Ok(false);
         }
+        if self.entries.len() + instructions.len() > self.entry_limit
+            || self.stats.resident_bytes + code.len > self.byte_limit
+        {
+            self.stats.cache_evictions += self.units.len() as u64;
+            self.clear();
+        }
+        self.stats.resident_bytes += code.len;
         self.stats.compilations += 1;
         self.stats.code_bytes += emitted.words.len() as u64 * 4;
         let unit = Rc::new(Unit {
@@ -396,6 +441,7 @@ impl Engine {
             self.entries
                 .insert(*pc, (unit.clone(), emitted.entries[pc]));
         }
+        self.units.push(unit);
         self.epoch = memory.epoch;
         self.stats.compile_time += timer.elapsed();
         Ok(true)
@@ -407,9 +453,20 @@ impl Engine {
         interpreter: &mut Interpreter,
         units: u32,
         stop: u32,
+        boundaries: Option<(&BTreeMap<u32, u32>, u64)>,
     ) -> Result<Execution, String> {
         if memory.is_parallel() {
             return Err("Tier 1 requires an exclusive serial execution owner".into());
+        }
+        // Publications happen only on this serial owner between batches. Old
+        // CFGs may cross a newly published entry, so retire them before running
+        // again. New CFGs end at every Cranelift entry, including fallthroughs.
+        if let Some((_, revision)) = boundaries
+            && self.native_revision != revision
+        {
+            self.stats.cache_evictions += self.units.len() as u64;
+            self.clear();
+            self.native_revision = revision;
         }
         if self.epoch != memory.epoch
             || self
@@ -420,10 +477,12 @@ impl Engine {
             if !self.entries.is_empty() {
                 self.stats.invalidations += 1;
             }
-            self.entries.clear();
+            self.clear();
             self.epoch = memory.epoch;
         }
-        if !self.entries.contains_key(&state.eip) && !self.compile(memory, state.eip)? {
+        if !self.entries.contains_key(&state.eip)
+            && !self.compile(memory, state.eip, boundaries.map(|(entries, _)| entries))?
+        {
             let execution = interpreter.run_chunk(state, memory, units.min(1));
             self.stats.fallback_instructions += u64::from(execution.units);
             return Ok(Execution {

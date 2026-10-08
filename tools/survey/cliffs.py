@@ -22,6 +22,8 @@ disjoint groups. Prefix histograms use decoded instructions; supported counts
 use retirement units (REP elements). All-supported prefixes are right-censored.
 Optional x87_control fields retain the complete PC/RC/mask distribution and
 independent guard counts. Reports predating those fields are counted separately.
+Optional tier1_bridge counts actual native retirements separately from residual
+interpreter work; missing fields in old reports remain unmeasured.
 Optional compilation_schedule contains bounded aggregate duration/size histograms,
 waiting interpreter units and concurrency counters; old reports remain unmeasured.
 Optional x87_pc64 records all nearest/masked PC=64 Control rejections by
@@ -242,6 +244,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
     omitted_rows = detail_reports = 0
     census = empty_census()
     census_reports = 0
+    bridge_reports = 0
+    bridge_totals = dict.fromkeys(COUNT_KEYS, 0)
+    bridge_details = {}
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
     schedule = {"report_count": 0, "unmeasured_reports": 0}
@@ -354,6 +359,23 @@ def aggregate(reports: Iterable[dict]) -> dict:
                 for reason in DETAIL_BUCKETS:
                     for key, value in entry_count(run_interpreter.get(reason, dict.fromkeys(COUNT_KEYS, 0))).items():
                         unknown[reason][key] += value
+            if "tier1_bridge" in cliffs:
+                raw_bridge = mapping(cliffs["tier1_bridge"])
+                run_bridge = entry_count(raw_bridge)
+                bridge_sum = dict.fromkeys(COUNT_KEYS, 0)
+                for label, raw in mapping(required(raw_bridge, "details")).items():
+                    if label not in ("Pending", "Interior"):
+                        detail_label(label)
+                    values = entry_count(raw)
+                    dest = bridge_details.setdefault(label, dict.fromkeys(COUNT_KEYS, 0))
+                    for key in COUNT_KEYS:
+                        bridge_sum[key] += values[key]
+                        dest[key] += values[key]
+                if bridge_sum != run_bridge:
+                    raise ValueError("Tier 1 bridge details do not reconcile")
+                for key in COUNT_KEYS:
+                    bridge_totals[key] += run_bridge[key]
+                bridge_reports += 1
             if cliffs.get("tier1_census") is not None:
                 merge_census(census, cliffs["tier1_census"], run_interpreter)
                 census_reports += 1
@@ -374,6 +396,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
         "report_count": len(per_report),
         "compilation_schedule": schedule,
         "cpu_cliffs": {
+            "tier1_bridge": dict(bridge_totals, details=ranked_entries(bridge_details)),
+            "tier1_bridge_reports": bridge_reports,
+            "tier1_bridge_unmeasured_reports": len(per_report) - bridge_reports,
             "tier1_census": census,
             "tier1_census_reports": census_reports,
             "fallbacks": ranked(fallbacks),
@@ -453,6 +478,12 @@ def markdown(summary: dict) -> str:
                   "| 大桶 | 源报告截断指令单位 | 旧报告未细分指令单位 |", "|---|---:|---:|"])
     lines.extend(f"| {reason} | {cliffs['interpreter_details_omitted'][reason]['instructions']} | "
                  f"{cliffs['interpreter_details_unknown'][reason]['instructions']} |" for reason in DETAIL_BUCKETS)
+    lines.extend(["", f"Tier 1 Bridge 覆盖 {cliffs['tier1_bridge_reports']} 份报告；"
+                  f"未测 {cliffs['tier1_bridge_unmeasured_reports']} 份；"
+                  f"接管 {cliffs['tier1_bridge']['instructions']} 单位。",
+                  "", "| 原入口状态 | Bridge 入口 | 接管单位 |", "|---|---:|---:|"])
+    lines.extend(f"| {label} | {n['entries']} | {n['instructions']} |"
+                 for label, n in cliffs["tier1_bridge"]["details"].items())
     lines.extend(["", f"Tier 1 普查覆盖 {cliffs['tier1_census_reports']} 份报告；缺失或关闭不视为零。",
                   "只统计 Uncovered/Rejected 的实际退休单位，PendingCompilation 单列且不重复。",
                   "形式可发射不保证访存、代码验证、预算或 CFG 准入；全支持前缀为截尾下界。", "",
