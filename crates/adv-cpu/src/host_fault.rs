@@ -53,9 +53,16 @@ impl UnwindRegistration {
     ) -> Result<Self, String> {
         let mut compiler_info = vec![0; info.emit_size()];
         info.emit(&mut compiler_info);
+        unsafe { Self::cached(code, len, compiler_info[1]) }
+    }
+
+    /// # Safety
+    /// The finalized code is restored from the same verified native cache
+    /// image as its compiler prologue boundary and remains alive until drop.
+    pub(crate) unsafe fn cached(code: usize, len: usize, compiler_end: u8) -> Result<Self, String> {
         let bytes = unwind::recipe(
             unsafe { std::slice::from_raw_parts(code as *const u8, len) },
-            compiler_info[1],
+            compiler_end,
         )?;
         let (storage, capacity) = unsafe { crate::jit_memory::unwind_storage(code, len) }?;
         let registration = unsafe {

@@ -60,10 +60,7 @@ impl Emitter<'_> {
         self.x87_cold_reads |= crate::floating::x87_effects(i).unwrap().read_gpr;
         let pc = self.constant(i.ip32());
         let next = self.constant(i.next_ip32());
-        let operation = self
-            .b
-            .ins()
-            .iconst(self.ptr_ty, self.x87[&i.ip32()].0 as i64);
+        let operation = self.b.ins().func_addr(self.ptr_ty, self.x87[&i.ip32()].0);
         self.canonical_x87_recovery(pc, next, operation);
     }
 
@@ -153,7 +150,7 @@ impl Emitter<'_> {
     pub(super) fn native_x87_instruction(
         &mut self,
         i: &Instruction,
-        operation: usize,
+        operation: ir::FuncRef,
         opcode: Option<u16>,
     ) {
         let fast = crate::floating::fast::classify(i);

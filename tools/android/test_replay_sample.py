@@ -56,6 +56,9 @@ class ReplayTests(unittest.TestCase):
         args.no_time_skip = False
         command = replay.runner_command(args, "/fixture", "/game", 10)
         self.assertNotIn("--no-time-skip", command)
+        self.assertNotIn("--no-code-cache", command)
+        args.no_code_cache = True
+        self.assertIn("--no-code-cache", replay.runner_command(args, "/fixture", "/game", 10))
 
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):
         command = "await-frame 0000000000000001 1000 hold 17"
@@ -291,7 +294,8 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue({"story.json", "story.png", "final.json", "final.png"}.issubset(files))
 
     def run_scene_mocked(self, *, wrong_hash=False, bad_assert=False, gate_timeout=False,
-                         approve=False, record=False, cold=False, warm=False, capture_pcm=False):
+                         approve=False, record=False, cold=False, warm=False, capture_pcm=False,
+                         code_cache=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             binary = root / "adv-run"
@@ -305,6 +309,8 @@ class ReplayTests(unittest.TestCase):
             (seed / "jit-warm.bin").write_bytes(b"seed warm archive")
             warm_archive = root / "override-warm.bin"
             warm_archive.write_bytes(b"explicit warm override")
+            native_archive = root / "native.bin"
+            native_archive.write_bytes(b"authored native cache")
             font_manifest = root / "fonts.json"
             fonts = {"profile": {"path": "/fonts/profile.json", "sha256": "a" * 64},
                      "files": [{"path": "/fonts/fixture.ttf", "sha256": "b" * 64, "bytes": 100}]}
@@ -335,7 +341,8 @@ class ReplayTests(unittest.TestCase):
                 scene_reference=reference if approve else None,
                 record_scene_reference=output / "reference.json" if record else None,
                 font_profile="/fonts/profile.json", font_manifest=font_manifest, cold=cold,
-                warm_profile=warm_archive if warm else None, capture_pcm=capture_pcm)
+                warm_profile=warm_archive if warm else None, capture_pcm=capture_pcm,
+                warm_code_cache=native_archive if code_cache and warm else None)
             operations = []
             report = {"frames": 4, "failure": None, "frame_fnv1a64": "bad hash" if wrong_hash else target_hash,
                       "api": {"mode": "strict", "stub_calls": 0, "acceptance_eligible": True},
@@ -357,6 +364,7 @@ class ReplayTests(unittest.TestCase):
                             elif name.endswith("/game.exe"): digest = replay.sha256(game / "game.exe")
                             elif name.endswith("/savedata.bin"): digest = replay.sha256(seed / "savedata.bin")
                             elif name.endswith("/jit-warm.bin"): digest = replay.sha256(warm_archive)
+                            elif name.endswith("/jit-code.bin"): digest = replay.sha256(native_archive)
                             else: raise AssertionError(name)
                             hashes.append(digest + "  " + name)
                         return "\n".join(hashes)
@@ -435,11 +443,22 @@ class ReplayTests(unittest.TestCase):
                     deletion = [row[1] for row in operations if row[0] == "shell" and row[1][0] == "rm"]
                     self.assertEqual(len(deletion), 1)
                     self.assertTrue(deletion[0][-1].startswith("/data/local/tmp/adv-host-sample-"))
-                    self.assertTrue(deletion[0][-1].endswith("/data/jit-warm.bin"))
+                    self.assertTrue(deletion[0][-2].endswith("/data/jit-warm.bin"))
+                    self.assertTrue(deletion[0][-1].endswith("/data/jit-code.bin"))
                     self.assertIsNone(metadata["warm_input_sha256"])
                 else:
                     self.assertTrue(any(row[0] == "push" and row[2].endswith("/data/jit-warm.bin") for row in operations))
                     self.assertIsNotNone(metadata["warm_input_sha256"])
+
+    def test_native_cache_warm_import_is_verified_and_cold_output_is_recovered(self):
+        for mode in ("cold", "warm"):
+            with self.subTest(mode=mode):
+                metadata, _, operations, _ = self.run_scene_mocked(**{mode: True}, code_cache=True)
+                self.assertNotIn("--no-code-cache", metadata["command"])
+                self.assertIsNotNone(metadata["code_cache_output_sha256"])
+                self.assertTrue(any(row[0] == "pull" and row[1].endswith("/jit-code.bin") for row in operations))
+                imports = [row for row in operations if row[0] == "push" and row[2].endswith("/data/jit-code.bin")]
+                self.assertEqual(len(imports), int(mode == "warm"))
 
     def test_pcm_capture_is_bounded_snapshot_diagnostics_and_excludes_performance_comparison(self):
         metadata, _, operations, _ = self.run_scene_mocked(approve=True, capture_pcm=True)

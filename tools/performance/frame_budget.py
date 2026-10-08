@@ -6,6 +6,8 @@ Usage: frame_budget.py run --platform android|windows --binary RUNNER --output D
 Inputs: ADV_SAMPLES, checked-in frame-budget-*.json scenarios, optional save/font
 seeds. Android reuses replay-sample.py; Windows reuses play_session.py. Every run
 uses one frozen binary, independent overlay and cold/warm discovery profiles.
+Warm runs transfer jit-code.bin by default; --no-code-cache is a diagnostic bypass.
+ADV_DEVICE_TASK selects the shared broker task name (default bud).
 Output: summary.json/summary.md contain statistics only. Reports, actions, hashes,
 perf maps and failure logs stay under the explicit local artifact root. No APK,
 foreground change, server management, or native Windows comparison is performed.
@@ -81,7 +83,14 @@ def execution_metrics(report: dict) -> dict:
     raw = baseline.execution_metrics(report)
     tier1 = raw.get("tier1") or {}
     schedule = raw.get("compilation_schedule") or {}
-    return {"tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
+    cache = report.get("code_cache") or {}
+    aot = report.get("aot") or {}
+    return {"counts": numeric_fields(report, ("native_entries", "interpreter_entries", "compilations", "compile_requests", "compile_seconds")),
+        "code_cache": {"enabled": cache.get("enabled") is True} | numeric_fields(cache,
+            ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "evicted", "entries", "bytes")),
+        "aot": numeric_fields(aot, ("images", "image_rejections", "candidates", "decoded_instructions", "budget_exhaustions",
+            "compile_requests", "private_completions", "publications", "stale_candidates", "ready_regions", "ready_bytes")),
+        "tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
         "fallback_instructions", "native_entries", "bridge_entries", "bridge_units", "invalidations",
         "publication_revisions", "publication_flushes", "cache_evictions", "compile_misses", "resident_bytes")),
         "compilation_schedule": numeric_fields(schedule, ("compile_threads", "available_cores", "duplicate_requests",
@@ -355,7 +364,7 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str, nat
 
 
 def markdown(rows: list[dict]) -> str:
-    text = ["# 帧预算基线", "", "无头帧提交观测；原生参照未测，未排除任何帧。热表示新进程复用 JIT 发现档案。", "",
+    text = ["# 帧预算基线", "", "无头帧提交观测；原生参照未测，未排除任何帧。热表示新进程复用发现档案；启用 code_cache 时也复用本轮冷运行产生的机器码档案。", "",
             "| 游戏 | 场景 | 冷/热 | 状态 | 超预算/帧数 | 最长墙钟 ms | 最长活跃 ms | p99 墙钟 ms | Ctrl 秒 | 主因（保留行） |",
             "|---|---|---|---|---:|---:|---:|---:|---:|---|"]
     for row in rows:
@@ -388,6 +397,7 @@ def summarize(root: Path) -> dict:
         for heat in plan["heats"]:
             rows += summarize_run(root / f"{scenario['id']}-{heat}", scenario, heat, plan["platform"], plan.get("native_instructions_per_second"))
     summary = {"schema": "adv-frame-budget-summary-v1", "budget_ms": 33.3,
+               "execution_options": plan.get("execution_options", {}),
                "source_revision": plan["source_revision"], "source_diff_sha256": plan["source_diff_sha256"],
                "analysis_tool_sha256": digest(Path(__file__)),
                "rows": rows}
@@ -571,6 +581,8 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
+            "execution_options": {"code_cache": not getattr(args, "no_code_cache", False),
+                "aot": not getattr(args, "no_code_cache", False), "compile_threads": getattr(args, "compile_threads", None)},
             "no_time_skip": getattr(args, "no_time_skip", False),
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
@@ -589,6 +601,9 @@ def run(args) -> None:
                                                              "native_instructions_per_second", "native_calibration_sha256"))
                 or any(previous.get(key, False) != plan[key] for key in ("no_time_skip",))):
             raise ValueError("resume requires unchanged scenarios and run conditions")
+        previous_options = previous.get("execution_options", {"code_cache": False, "aot": False, "compile_threads": None})
+        if previous_options != plan["execution_options"]:
+            raise ValueError("resume requires unchanged native cache, AOT and compiler settings")
     else:
         write_json(root / "plan.json", plan)
     adb = replay.Adb(args) if args.platform == "android" else None
@@ -621,6 +636,14 @@ def run(args) -> None:
                        "--binary", str(binary), "--schedule", str(root / f"{name}-schedule.json"),
                        "--output", str(output), "--codepage", str(scenario["codepage"]), "--auto-dialog-ms", "50"]
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
+            if not getattr(args, "no_code_cache", False):
+                native = root / f"{name}-cold" / ("jit-code.bin" if adb else "overlay/jit-code.bin")
+                if heat == "warm" and native.is_file():
+                    command += ["--warm-code-cache", str(native)]
+            else:
+                command += ["--no-code-cache"]
+            if getattr(args, "compile_threads", None):
+                command += ["--compile-threads", str(args.compile_threads)]
             if not args.no_instrumentation:
                 command += ["--frame-budget"]
             if getattr(args, "headless_gpu", False):
@@ -713,6 +736,8 @@ def main() -> None:
     execute.add_argument("--perf-map", action="store_true")
     execute.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
+    execute.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
+    execute.add_argument("--compile-threads", type=int, choices=range(1, 9))
     execute.add_argument("--headless-gpu", action="store_true", help="explicit portable GPU frontend; requires a gpu runner")
     execute.add_argument("--native-rate", type=Path, help="native_instruction_rate JSON for a conditional Tier 0 lower estimate")
     args = parser.parse_args()
