@@ -226,6 +226,16 @@ mod tests {
     }
 
     fn compare(bytes: &[u8], strategy: CompileStrategy, fault: bool) {
+        compare_at(bytes, strategy, fault, &[], CODE);
+    }
+
+    fn compare_at(
+        bytes: &[u8],
+        strategy: CompileStrategy,
+        fault: bool,
+        entries: &[u32],
+        entry: u32,
+    ) {
         let mut actual_memory = memory(bytes);
         let mut oracle_memory = memory(bytes);
         if fault {
@@ -234,10 +244,11 @@ mod tests {
         }
         let mut region = crate::Region::new(CODE, bytes.len());
         region.compile_strategy = strategy;
+        region.entries.extend_from_slice(entries);
         let mut snapshot = Snapshot::capture(&region, &mut actual_memory).unwrap();
         snapshot.gir_frontend = true;
         let mut actual = CpuState {
-            eip: CODE,
+            eip: entry,
             eflags: 0xad7,
             regs: [
                 11,
@@ -349,5 +360,21 @@ mod tests {
         assert_eq!(plan.opaque_instructions, 1);
         assert!(plan.operations.contains_key(&entry));
         assert_eq!(plan.operations.len(), 4);
+    }
+
+    #[test]
+    fn overlapping_decode_entries_share_an_integer_suffix() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        // The alternate entry interprets the MOV immediate as four NOPs;
+        // both instruction streams then reach the same integer suffix.
+        a.mov(eax, 0x9090_9090u32).unwrap();
+        a.inc(eax).unwrap();
+        a.inc(ecx).unwrap();
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for entry in [CODE, CODE + 1] {
+                compare_at(&bytes, strategy, false, &[CODE + 1], entry);
+            }
+        }
     }
 }
