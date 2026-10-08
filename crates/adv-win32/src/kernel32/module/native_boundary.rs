@@ -41,14 +41,57 @@ fn result(env: &mut Env<'_>, p: u32, status: u32) -> Outcome {
         Err(_) => load_io_error(env, LibraryFront::Win32, 0xc0000005),
     }
 }
-pub(super) fn load(env: &mut Env<'_>, target: u32, name: String) -> Outcome {
+pub(super) fn load(env: &mut Env<'_>, target: u32, name: String, altered: bool) -> Outcome {
     let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let p = match scratch(env, &bytes, true) {
         Ok(p) => p,
         Err(outcome) => return outcome,
     };
-    Outcome::call_on_stack(target, [0, 0, p, p + 8], p, move |env, value| {
+    // Native x86 uses tagged LDR_PATH_IS_FLAGS | WITH_ALTERED_SEARCH_PATH.
+    let search = if altered { 9 } else { 0 };
+    Outcome::call_on_stack(target, [search, 0, p, p + 8], p, move |env, value| {
         result(env, p, value.value())
+    })
+}
+
+pub(super) fn handle(
+    env: &mut Env<'_>,
+    target: u32,
+    name: String,
+    found: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let bytes: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let p = match scratch(env, &bytes, true) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
+    Outcome::call_on_stack(target, [0, 0, p, p + 8], p, move |env, value| match result(
+        env,
+        p,
+        value.value(),
+    ) {
+        Outcome::Return(base) if base != 0 => found(env, base),
+        outcome => outcome,
+    })
+}
+
+pub(super) fn address(
+    env: &mut Env<'_>,
+    target: u32,
+    address: u32,
+    found: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let p = match scratch(env, &[], false) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
+    Outcome::call_on_stack(target, [address, p + 8], p, move |env, value| {
+        let base = value.value();
+        if base == 0 {
+            module_handle_result(env, None)
+        } else {
+            found(env, base)
+        }
     })
 }
 pub(super) fn procedure(
