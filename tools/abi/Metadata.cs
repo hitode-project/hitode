@@ -417,7 +417,7 @@ public static class AbiMetadata
                 && new[] { "NtSetInformationFile", "ZwSetInformationFile" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1";
-            bool ntRead = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwReadFile"
+            bool ntRead = f.Length == 6 && f[0] == "ntdll.dll" && new[] { "ZwReadFile", "NtWriteFile", "ZwWriteFile" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1";
             bool ntClose = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwClose"
