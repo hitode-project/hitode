@@ -413,7 +413,8 @@ public static class AbiMetadata
             bool ntQuery = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwQueryInformationFile"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1";
-            bool ntSet = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwSetInformationFile"
+            bool ntSet = f.Length == 6 && f[0] == "ntdll.dll"
+                && new[] { "NtSetInformationFile", "ZwSetInformationFile" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1";
             bool ntRead = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwReadFile"
