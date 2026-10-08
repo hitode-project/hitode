@@ -446,17 +446,21 @@ impl Engine {
         if !instructions.contains_key(&start) {
             return Ok(false);
         }
-        let x87 = super::x87::Operations::new(&instructions, &input);
-        let sse = super::sse::Operations::new(&instructions);
-        let mut emitted = emit::Emitter::new(emit::Helpers {
-            load: load as *const () as u64,
-            store: store as *const () as u64,
-            stack_all: stack_all as *const () as u64,
-            x87: super::x87::call as *const () as u64,
-            sse: super::sse::call as *const () as u64,
-            vector_load: super::simd::load as *const () as u64,
-            vector_store: super::simd::store as *const () as u64,
-        });
+        let host_features = crate::HostFeatures::get();
+        let x87 = super::x87::Operations::new(&instructions, &input, host_features);
+        let sse = super::sse::Operations::new(&instructions, host_features);
+        let mut emitted = emit::Emitter::new(
+            emit::Helpers {
+                load: load as *const () as u64,
+                store: store as *const () as u64,
+                stack_all: stack_all as *const () as u64,
+                x87: super::x87::call as *const () as u64,
+                sse: super::sse::call as *const () as u64,
+                vector_load: super::simd::load as *const () as u64,
+                vector_store: super::simd::store as *const () as u64,
+            },
+            host_features,
+        );
         for instruction in instructions.values() {
             emitted.instruction(
                 instruction,

@@ -52,6 +52,9 @@ pub(super) const SIGNED: u32 = 0x100;
 pub(super) const CHECK_WRITE: u32 = 0x100;
 
 pub(super) struct Emitter {
+    // Reserved for future instruction selection; current templates ignore it.
+    #[allow(dead_code)]
+    pub(super) host_features: crate::HostFeatures,
     pub(super) helpers: Helpers,
     pub words: Vec<u32>,
     pub entries: BTreeMap<u32, usize>,
@@ -60,8 +63,9 @@ pub(super) struct Emitter {
 }
 
 impl Emitter {
-    pub fn new(helpers: Helpers) -> Self {
+    pub fn new(helpers: Helpers, host_features: crate::HostFeatures) -> Self {
         Self {
+            host_features,
             helpers,
             words: Vec::new(),
             entries: BTreeMap::new(),
