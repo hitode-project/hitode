@@ -505,7 +505,15 @@ impl Executor {
         }
         match std::env::var("ADV_GIR").as_deref() {
             Ok("off" | "" | "0") | Err(_) => {}
-            Ok(_) => return Err("ADV_GIR execution has been removed; use the default GIR frontend or ADV_TIER2_FRONTEND=legacy for comparison".into()),
+            Ok(_) => {
+                return Err(
+                    "ADV_GIR execution has been removed; GIR is the sole Tier 2 frontend".into(),
+                );
+            }
+        }
+        match std::env::var("ADV_TIER2_FRONTEND").as_deref() {
+            Ok("gir") | Err(_) => {}
+            Ok(_) => return Err("ADV_TIER2_FRONTEND selection was removed at convergence checkpoint 2; GIR is the sole Tier 2 frontend".into()),
         }
         Ok(executor)
     }
@@ -3389,7 +3397,24 @@ mod removed_selector_tests {
             .err()
             .expect("removed execution selector must reject construction");
         assert!(error.contains("ADV_GIR execution has been removed"));
-        assert!(error.contains("ADV_TIER2_FRONTEND=legacy"));
+        assert!(error.contains("sole Tier 2 frontend"));
+    }
+
+    #[test]
+    fn legacy_tier2_frontend_is_retired_at_checkpoint_two() {
+        if std::env::var("ADV_TIER2_FRONTEND").as_deref() != Ok("legacy") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "executor::removed_selector_tests::legacy_tier2_frontend_is_retired_at_checkpoint_two"])
+                .env("ADV_TIER2_FRONTEND", "legacy")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let error = Executor::new(0x10000, 4096)
+            .err()
+            .expect("retired frontend must reject construction");
+        assert!(error.contains("convergence checkpoint 2"));
     }
 }
 

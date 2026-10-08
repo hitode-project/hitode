@@ -2,14 +2,6 @@
 use super::*;
 use crate::gir::{ir as g, lift::Tier2Operation};
 
-pub(super) fn selected() -> Result<bool, String> {
-    match std::env::var("ADV_TIER2_FRONTEND").as_deref() {
-        Ok("legacy") => Ok(false),
-        Err(_) | Ok("gir") => Ok(true),
-        Ok(_) => Err("unknown ADV_TIER2_FRONTEND selector (expected gir or legacy)".into()),
-    }
-}
-
 /// An SSA run borrows native state variables. Its opaque neighbors use these
 /// variables directly, so no extra CpuState publication or reload is needed.
 struct Lower<'a, 'b> {
@@ -245,8 +237,7 @@ mod tests {
         let mut region = crate::Region::new(CODE, bytes.len());
         region.compile_strategy = strategy;
         region.entries.extend_from_slice(entries);
-        let mut snapshot = Snapshot::capture(&region, &mut actual_memory).unwrap();
-        snapshot.gir_frontend = true;
+        let snapshot = Snapshot::capture(&region, &mut actual_memory).unwrap();
         let mut actual = CpuState {
             eip: entry,
             eflags: 0xad7,

@@ -371,7 +371,6 @@ impl Profile {
 /// retained: only bounded instruction bytes and their page stamps are copied.
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
-    pub(crate) gir_frontend: bool,
     parallel: bool,
     direct_memory: bool,
     direct_inline: bool,
@@ -424,7 +423,6 @@ impl Snapshot {
         let first = (region.start - self.base) as usize / 4096;
         let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
-            gir_frontend: self.gir_frontend,
             parallel: self.parallel,
             direct_memory: self.direct_memory,
             direct_inline: self.direct_inline,
@@ -492,7 +490,6 @@ impl Snapshot {
             }
         }
         Ok(Self {
-            gir_frontend: gir::selected()?,
             parallel: memory.is_parallel(),
             direct_memory: memory.direct_memory_enabled(),
             direct_inline: memory.direct_memory_inline(),
@@ -923,7 +920,7 @@ fn compile_snapshot_with_inline(
                     .collect();
                 write_summary::Summary::for_region(&scope).is_some()
             });
-    let gir = if snapshot.gir_frontend {
+    let gir = {
         let mut opaque = BTreeSet::new();
         for plan in &plans {
             opaque.extend(
@@ -941,12 +938,8 @@ fn compile_snapshot_with_inline(
         }
         opaque.extend(x87_segments.interiors.iter().copied());
         opaque.extend(x87_segments.integers.iter().copied());
-        Some(
-            crate::gir::lift::tier2(&instructions, &entries, &opaque, snapshot.direct_memory)
-                .map_err(|e| e.to_string())?,
-        )
-    } else {
-        None
+        crate::gir::lift::tier2(&instructions, &entries, &opaque, snapshot.direct_memory)
+            .map_err(|e| e.to_string())?
     };
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
@@ -1784,23 +1777,15 @@ fn compile_snapshot_with_inline(
                     e.canonical_x87_instruction(instruction);
                     break;
                 }
-                if let Some(gir) = &gir {
-                    let operation = gir
-                        .operations
-                        .get(&pc)
-                        .expect("GIR covers every native entry");
-                    let (finished, next) = e.gir_operation(operation);
-                    if finished {
-                        break;
-                    }
-                    pc = next;
-                } else {
-                    e.precheck(instruction);
-                    if e.instruction(instruction) {
-                        break;
-                    }
-                    pc = instruction.next_ip32();
+                let operation = gir
+                    .operations
+                    .get(&pc)
+                    .expect("GIR covers every native entry");
+                let (finished, next) = e.gir_operation(operation);
+                if finished {
+                    break;
                 }
+                pc = next;
             }
         }
         if let Some(index) = kernel {
@@ -2408,9 +2393,9 @@ fn compile_snapshot_with_inline(
         }),
         instruction_count: instructions.len(),
         #[cfg(test)]
-        gir_ssa_instructions: gir.as_ref().map_or(0, |gir| gir.ssa_instructions),
+        gir_ssa_instructions: gir.ssa_instructions,
         #[cfg(test)]
-        gir_opaque_instructions: gir.as_ref().map_or(0, |gir| gir.opaque_instructions),
+        gir_opaque_instructions: gir.opaque_instructions,
         decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
