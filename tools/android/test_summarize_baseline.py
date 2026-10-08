@@ -173,6 +173,15 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(baseline.execution_metrics(counters)["tier1"], counters["tier1"])
         self.assertEqual(baseline.execution_metrics(counters)["compilation_schedule"], counters["compilation_schedule"])
 
+    def test_device_conditions_require_a_stable_screen_and_complete_temperature(self):
+        state = {"screen": "Awake", "foreground": "fixture", "allowed_cpus": "0-6", "battery_temperature_c": 28.5}
+        self.assertEqual(baseline.condition_identity({"device_conditions_before": state,
+                         "device_conditions_after": {**state, "battery_temperature_c": 29.1}}),
+                         {key: state[key] for key in ("screen", "foreground", "allowed_cpus")})
+        for change in ({"screen": "Asleep"}, {"foreground": "other"}, {"allowed_cpus": "0-2"}, {"battery_temperature_c": None}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                baseline.condition_identity({"device_conditions_before": state, "device_conditions_after": state | change})
+
     def test_observation_diagnostics_verify_and_ambiguous_seed_are_rejected(self):
         for change in ({"scene_validation_status": "observation_only"}, {"fixed_workload_verified": False},
                        {"capture_pcm": True}, {"font_diagnostics": True}, {"warm_mode": "seed"}):

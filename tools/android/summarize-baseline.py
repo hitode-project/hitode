@@ -125,6 +125,20 @@ def execution_metrics(report: dict) -> dict:
             "tier1_bridge": cliffs.get("tier1_bridge")}
 
 
+def condition_identity(metadata: dict) -> dict | None:
+    before, after = metadata.get("device_conditions_before"), metadata.get("device_conditions_after")
+    require(not metadata.get("device_conditions_error"), "device condition capture failed")
+    if before is None and after is None:
+        return None
+    require(isinstance(before, dict) and isinstance(after, dict), "incomplete device conditions")
+    fixed = ("screen", "foreground", "allowed_cpus")
+    for state in (before, after):
+        require(all(isinstance(state.get(key), str) and state[key] for key in fixed), "missing display/CPU state")
+        number(state.get("battery_temperature_c"), "battery temperature")
+    require(all(before[key] == after[key] for key in fixed), "screen/foreground/CPU state changed during run")
+    return {key: before[key] for key in fixed}
+
+
 def command_option(command: list, name: str) -> str:
     require(command.count(name) == 1, f"session command needs one {name}")
     index = command.index(name) + 1
@@ -267,7 +281,8 @@ def load_run(directory: Path) -> dict:
     require(final["frames"] >= rows[-1]["process_counters"]["frames"], "final frame counter decreased")
     identity = {"binary_sha256": exact_hash(metadata.get("binary_sha256"), 64), "scene_binding": binding,
                 "scene_reference_sha256": reference_sha, "schedule_sha256": exact_hash(metadata.get("schedule_sha256"), 64),
-                "runtime_config": config, "device": metadata.get("device"), "serial": metadata.get("serial")}
+                "runtime_config": config, "device": metadata.get("device"), "serial": metadata.get("serial"),
+                "device_conditions": condition_identity(metadata)}
     return {"run_directory": str(directory), "run_name": directory.name, "warm_mode": warmth,
             "warm_input_sha256": warm_input, "warm_output_sha256": metadata["warm_output_sha256"],
             "session_sha256": sha256(session_path), "actions_sha256": sha256(directory / "actions.json"),
@@ -275,7 +290,9 @@ def load_run(directory: Path) -> dict:
             "identity": identity, "checkpoints": rows,
             "final_process_counters": counters(final, GLOBAL_COUNTERS, "final"),
             "final_scene_gate": final.get("scene_gate"), "first_frame_seconds": final.get("first_frame_seconds"),
-            "final_execution_metrics": execution_metrics(final)}
+            "final_execution_metrics": execution_metrics(final),
+            "device_conditions_before": metadata.get("device_conditions_before"),
+            "device_conditions_after": metadata.get("device_conditions_after")}
 
 
 def summarize(directories: list[Path]) -> dict:
