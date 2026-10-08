@@ -160,7 +160,7 @@ class ReplayTests(unittest.TestCase):
                 replay.load_schedule(path)
 
     def run_mocked(self, *, bad_checkpoint=False, bad_exit=False, bad_ack=False, missing_final=False,
-                   font_diagnostics=False, failed_evidence=None, dialog_controls=False):
+                   font_diagnostics=False, failed_evidence=None, dialog_controls=False, experimental=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             binary = root / "adv-run"
@@ -186,6 +186,8 @@ class ReplayTests(unittest.TestCase):
                                       schedule_profile=False, font_diagnostics=font_diagnostics,
                                       auto_dialog_ms=None, tail_seconds=3,
                                       timeout_grace=15, ack_timeout=1, transfer_timeout=1)
+            if experimental:
+                args.tier1, args.compile_threads, args.cpu_mask = "bridge", 4, "7f"
             operations = []
             hashes = [replay.sha256(binary), replay.sha256(game / "game.exe")]
             good_report = {"frames": 4, "failure": None, "api": {"mode": "strict", "stub_calls": 0,
@@ -251,6 +253,8 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(metadata["seed_files"][0]["sha256"], replay.sha256(seed / "savedata.bin"))
             self.assertIn("-T", launch)
             self.assertIn("timeout -s KILL 30", launch[-1])
+            if experimental:
+                self.assertIn("taskset 7f env ADV_TIER1=bridge ADV_COMPILE_THREADS=4", launch[-1])
             if font_diagnostics:
                 self.assertIn("ADV_TEXT_DIAGNOSTICS=1", launch[-1])
             else:
@@ -484,6 +488,9 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse(metadata["completed"])
         self.assertIn("final.json", metadata["error"])
 
+    def test_explicit_affinity_and_compiler_experiments_reach_the_device(self):
+        self.run_mocked(experimental=True)
+
     def test_font_diagnostics_is_opt_in_and_marks_performance_comparison_ineligible(self):
         metadata, _, _ = self.run_mocked(font_diagnostics=True)
         self.assertTrue(metadata["font_diagnostics"])
@@ -542,6 +549,16 @@ class ReplayTests(unittest.TestCase):
             client.shell(["mkdir", "/run/new"])
         self.assertEqual(execute.call_count, 1)
         self.assertEqual(client.transport_retries, [])
+
+    def test_directory_creation_can_retry_when_server_connection_never_existed(self):
+        client = self.adb_client()
+        results = [subprocess.CompletedProcess([], 1, "", "cannot connect to daemon (10060)"),
+                   subprocess.CompletedProcess([], 0, "", "")]
+        with patch.object(replay.subprocess, "run", side_effect=results) as execute, \
+                patch.object(replay.time, "sleep") as sleep:
+            client.shell(["mkdir", "/run/new"])
+        self.assertEqual(execute.call_count, 2)
+        sleep.assert_called_once_with(30)
 
     def test_unidentified_subprocess_timeout_does_not_retry(self):
         client = self.adb_client()

@@ -270,12 +270,13 @@ class Adb:
                 if not result.returncode:
                     return result
                 message = f"adb {args[0]} failed ({result.returncode}): {result.stderr.strip()} {result.stdout.strip()}"
-            if not idempotent or attempt == 2 or not self.transient_transport_error(message):
+            before_dispatch = "cannot connect to daemon" in message.lower()
+            if (not idempotent and not before_dispatch) or attempt == 2 or not self.transient_transport_error(message):
                 if timed_out is not None:
                     raise timed_out
                 raise RuntimeError(message)
             self.transport_retries.append({"command": args[0], "retry": attempt + 1, "error": message})
-            time.sleep(.25 * (attempt + 1))
+            time.sleep(30)
         raise AssertionError("unreachable adb retry state")
 
     def shell(self, words: list[str]) -> str:
@@ -313,6 +314,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
         environment += ["ADV_AUDIO_TRACE=" + remote + "/audio.log", "ADV_AUDIO_DUMP_DIR=" + remote + "/pcm"]
     if environment:
         command = ["env"] + (["-u", "ADV_AUDIO_DUMP_CHUNKS"] if getattr(args, "capture_pcm", False) else []) + environment + command
+    if getattr(args, "cpu_mask", None):
+        command = ["taskset", args.cpu_mask] + command
     return command
 
 
@@ -738,6 +741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
     parser.add_argument("--record-device-state", action="store_true",
                         help="record battery temperature, screen, foreground and CPU affinity before/after execution")
+    parser.add_argument("--cpu-mask", help="explicit hexadecimal taskset mask for the guest and compiler workers")
     parser.add_argument("--schedule-profile", action="store_true")
     parser.add_argument("--font-diagnostics", action="store_true",
                         help="record font requested/resolved/source in stderr; excludes performance comparisons")
@@ -756,6 +760,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid adb port or serial")
     if args.auto_dialog_ms is not None and not 0 <= args.auto_dialog_ms <= 60000:
         parser.error("--auto-dialog-ms must be within 0..60000")
+    if args.cpu_mask is not None and (not re.fullmatch(r"[0-9a-fA-F]{1,16}", args.cpu_mask) or int(args.cpu_mask, 16) == 0):
+        parser.error("--cpu-mask must be a nonzero hexadecimal mask")
     return args
 
 

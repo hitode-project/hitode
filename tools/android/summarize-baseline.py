@@ -114,7 +114,8 @@ def report_config(report: dict) -> dict:
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,
         "time_skip_enabled": report.get("time_skip", {}).get("enabled"),
         "tier1_mode": report.get("tier1", {}).get("mode", "off"),
-        "compile_threads": report.get("compilation_schedule", {}).get("compile_threads")}
+        "compile_threads": report.get("compilation_schedule", {}).get("compile_threads"),
+        "available_cores": report.get("compilation_schedule", {}).get("available_cores")}
 
 
 def execution_metrics(report: dict) -> dict:
@@ -206,7 +207,8 @@ def load_run(directory: Path) -> dict:
     command = metadata.get("command")
     require(isinstance(command, list) and all(isinstance(word, str) for word in command), "invalid runner command")
     config.update(codec_requested=command_option(command, "--codec"),
-                  codec_kernels_requested=command_option(command, "--codec-kernels"))
+                  codec_kernels_requested=command_option(command, "--codec-kernels"),
+                  cpu_mask_requested=command[1] if len(command) > 2 and command[0] == "taskset" else None)
     require(config["codec_kernels_requested"] == config["codec_kernel_mode"], "requested/reported kernel mode differs")
     require(config["codepage"] == binding["codepage"], "report codepage differs from binding")
     checkpoints = metadata.get("checkpoints")
@@ -225,7 +227,7 @@ def load_run(directory: Path) -> dict:
         require(sha256(png_path) == exact_hash(entry.get("png_sha256"), 64), f"{name}: PNG hash differs")
         report = valid_report(read_json(report_path), name)
         require(report_config(report) == {key: value for key, value in config.items()
-                if key not in ("codec_requested", "codec_kernels_requested")}, f"{name}: runtime configuration changed")
+                if key not in ("codec_requested", "codec_kernels_requested", "cpu_mask_requested")}, f"{name}: runtime configuration changed")
         require(report.get("frame_fnv1a64") == step["await"]["frame_fnv1a64"] == entry.get("frame_fnv1a64")
                 and report["frames"] == entry.get("frames"), f"{name}: checkpoint frame/hash differs")
         assert_report(report, step.get("assert", {}), name)
