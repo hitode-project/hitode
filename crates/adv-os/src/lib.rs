@@ -24,6 +24,7 @@ pub mod nls;
 pub mod processes;
 pub mod processor;
 pub mod registry;
+pub mod scm;
 pub mod synthetic;
 pub mod system_files;
 pub mod vfs;
