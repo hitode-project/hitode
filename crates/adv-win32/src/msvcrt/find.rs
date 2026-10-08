@@ -293,6 +293,11 @@ fn first(env: &mut Env<'_>, pattern: WideStr, data: GuestPtr<u8>) -> Outcome {
         .unwrap()
         .next = 1;
     set_last_error(env, 0);
+    crate::native::diagnose_bypass(
+        env,
+        &api(env, "_wfindfirst64i32"),
+        &["NtOpenFile", "NtCreateFile", "NtQueryDirectoryFile"],
+    );
     Outcome::Return(handle)
 }
 
@@ -329,6 +334,7 @@ fn next(env: &mut Env<'_>, handle: i32, data: GuestPtr<u8>) -> Outcome {
         .get_mut(&mut env.sys.objects, handle as u32)
         .unwrap()
         .next += 1;
+    crate::native::diagnose_bypass(env, &api(env, "_wfindnext64i32"), &["NtQueryDirectoryFile"]);
     Outcome::Return(0)
 }
 
@@ -343,6 +349,7 @@ fn close(env: &mut Env<'_>, handle: i32) -> Outcome {
         .try_get::<Searches>()
         .is_some_and(|s| s.close(&mut env.sys.objects, handle as u32));
     if closed {
+        crate::native::diagnose_bypass(env, &api(env, "_findclose"), &["NtClose"]);
         Outcome::Return(0)
     } else {
         fail(env, errno, 22, if handle == -1 { 6 } else { 998 })

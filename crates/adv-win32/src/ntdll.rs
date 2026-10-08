@@ -22,7 +22,7 @@ use adv_machine::{Env, Outcome};
 use adv_os::Heaps;
 
 use crate::stdcall;
-mod file;
+pub(crate) mod file;
 mod heap;
 mod open;
 mod section;

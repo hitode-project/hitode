@@ -405,7 +405,7 @@ fn invalid_handler_errno_eof_and_output_guards_never_publish_or_consume_failed_r
         test.machine
             .sys
             .objects
-            .host::<FindObj>(test.value(kernel_handle))
+            .get(test.value(kernel_handle))
             .is_some()
     );
     let out = test.output();

@@ -8,7 +8,8 @@ use adv_machine::Env;
 use crate::{FileObj, Win32, util};
 
 mod attributes;
-mod write;
+pub(crate) mod enumeration;
+pub(crate) mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
 const INVALID_HANDLE: i32 = 0xc000_0008u32 as i32;
@@ -34,6 +35,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(read_ABI);
     registry.register(close_ABI);
     attributes::register(registry);
+    enumeration::register(registry);
     write::register(registry);
     // Nt/Zw user-mode names have the same declarations and behavior.
     for (api, name) in [
@@ -47,7 +49,7 @@ pub(super) fn register(registry: &mut Registry) {
 }
 
 #[win32(ntdll, name = "ZwClose", level = implement)]
-pub(super) fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
+pub(crate) fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
     // Native pseudo-process/thread closes succeed without releasing an owned
     // reference. This does not apply to Win32's legacy stdio constants.
     if matches!(handle.0, 0xffff_ffff | 0xffff_fffe) {
@@ -84,7 +86,7 @@ fn completion(env: &mut Env<'_>, iosb: GuestPtr<()>, status: i32, count: u32) ->
 }
 
 #[win32(ntdll, name = "ZwReadFile", level = implement)]
-fn read(
+pub(crate) fn read(
     env: &mut Env<'_>,
     handle: Handle,
     event: Handle,
@@ -187,7 +189,7 @@ fn read(
 }
 
 #[win32(ntdll, name = "ZwSetInformationFile", level = implement)]
-fn set(
+pub(crate) fn set(
     env: &mut Env<'_>,
     handle: Handle,
     iosb: GuestPtr<()>,
@@ -257,7 +259,7 @@ fn set(
 /// The file position belongs to the shared file object, including duplicate
 /// Win32 handles and virtual System32 streams. Querying never moves it.
 #[win32(ntdll, name = "ZwQueryInformationFile", level = implement)]
-fn query(
+pub(crate) fn query(
     env: &mut Env<'_>,
     handle: Handle,
     iosb: GuestPtr<()>,
@@ -475,7 +477,7 @@ fn share_access(access: u32) -> u32 {
 }
 
 #[win32(ntdll, name = "ZwCreateFile", level = implement)]
-fn create(
+pub(crate) fn create(
     env: &mut Env<'_>,
     output: GuestPtr<u32>,
     access: u32,
@@ -513,6 +515,30 @@ fn create(
     }
     if let Err(status) = oa.scope(env, "ntdll.dll!ZwCreateFile") {
         return status;
+    }
+    if options & 1 != 0 {
+        if options & !0x21 != 0
+            || options & 0x20 == 0
+            || disposition != 1
+            || access & !0x8012_0089 != 0
+            || access & (GENERIC_READ | 1) == 0
+        {
+            return unavailable(
+                env,
+                "only synchronous read/list FILE_OPEN directory handles",
+            );
+        }
+        if !allocation.is_null() || !ea_buffer.is_null() || ea_length != 0 {
+            return unavailable(
+                env,
+                "directory allocation and extended attributes are unavailable",
+            );
+        }
+        let path = match oa.path(env, "ntdll.dll!ZwCreateFile") {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        return enumeration::open(env, &path, output, iosb);
     }
     if options & 0x30 == 0 || options & !0x874 != 0 {
         return unavailable(env, "only synchronous ordinary non-directory files");

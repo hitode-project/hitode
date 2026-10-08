@@ -166,7 +166,14 @@ pub(crate) fn file_attributes_path(env: &mut Env<'_>, path: &str, api: &str) -> 
         return Ok(FILE_ATTRIBUTE_ARCHIVE | 1);
     }
     match env.ext.get::<Win32>().vfs.file_attributes(path) {
-        Ok(attributes) => Ok(attributes),
+        Ok(attributes) => {
+            crate::native::diagnose_bypass(
+                env,
+                api,
+                &["NtQueryAttributesFile", "NtQueryFullAttributesFile"],
+            );
+            Ok(attributes)
+        }
         Err(error) => {
             failed(env, api, path, &error);
             Err(crate::util::last_error(env))
@@ -209,7 +216,14 @@ fn set(env: &mut Env<'_>, pointer: u32, flags: u32, wide: bool) -> Outcome {
         return Outcome::Return(0);
     }
     match env.ext.get::<Win32>().vfs.set_file_normal(&path) {
-        Ok(()) => Outcome::Return(1),
+        Ok(()) => {
+            crate::native::diagnose_bypass(
+                env,
+                api,
+                &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
+            );
+            Outcome::Return(1)
+        }
         Err(error) => {
             failed(env, api, &path, &error);
             Outcome::Return(0)

@@ -126,6 +126,11 @@ fn get_file_information(env: &mut Env<'_>, handle: Handle, output: GuestPtr<u8>)
         set_last_error(env, 998);
         return Outcome::Return(0);
     }
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!GetFileInformationByHandle",
+        &["NtQueryInformationFile"],
+    );
     Outcome::Return(1)
 }
 

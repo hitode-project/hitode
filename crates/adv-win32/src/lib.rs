@@ -16,6 +16,8 @@ mod guest_code;
 pub(crate) mod heap_lock;
 pub mod kernel32;
 mod misc;
+mod native;
+mod native_heap;
 mod ntdll;
 pub mod printf;
 pub mod user32;

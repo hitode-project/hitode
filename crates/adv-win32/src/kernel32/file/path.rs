@@ -86,10 +86,20 @@ fn full(
         return Ok(estimate);
     }
     let full = env.ext.get::<Win32>().vfs.normalize(&name);
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!GetFullPathName",
+        &["RtlGetFullPathName_U"],
+    );
     path_string(env, &full, cap, output, Some(part), wide)
 }
 fn current(env: &mut Env<'_>, cap: u32, output: u32, wide: bool) -> Result<u32, MemFault> {
     let path = env.ext.get::<Win32>().vfs.cwd.clone();
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!GetCurrentDirectory",
+        &["RtlGetCurrentDirectory_U"],
+    );
     path_string(env, &path, cap, output, None, wide)
 }
 fn set_current(env: &mut Env<'_>, path: String) -> i32 {
@@ -103,6 +113,11 @@ fn set_current(env: &mut Env<'_>, path: String) -> i32 {
         set_last_error(env, err::PATH_NOT_FOUND);
         return 0;
     }
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!SetCurrentDirectory",
+        &["RtlSetCurrentDirectory_U"],
+    );
     1
 }
 // The guest VFS does not publish DOS 8.3 aliases. Windows permits a long

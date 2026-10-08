@@ -37,7 +37,7 @@ pub use guest::{AnsiStr, Arguments, GuestArg, GuestPtr, GuestReturn, Handle, Wid
 pub use signature::{AbiKind, Parameter, Signature};
 pub use stub::{
     ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RunMode, StubCall,
-    warn_unavailable,
+    warn_structural, warn_unavailable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -78,6 +78,8 @@ pub struct ApiDiagnostics {
     pub gaps: BTreeMap<String, u64>,
     pub recent_stubs: VecDeque<StubCall>,
     pub stub_calls: u64,
+    /// Observed personality contract violations, independent of optional probes.
+    pub structural_mismatches: u64,
     /// Explicit capability failures, not ordinary API errors such as missing files.
     pub warnings: BTreeMap<(String, String), u64>,
     pub unrecorded_warnings: u64,
@@ -115,6 +117,14 @@ pub fn warn_unavailable(env: &mut Env<'_>, api: &str, reason: &str) {
     }
     let caller = env.caller();
     emit_warning(env, api, reason, caller, None);
+}
+
+/// Structural mismatches disqualify acceptance even if a host frontend returns
+/// success. Ordinary optional capability warnings keep their existing policy.
+pub fn warn_structural(env: &mut Env<'_>, api: &str, reason: &str) {
+    let diagnostics = env.ext.get_or_default::<ApiDiagnostics>();
+    diagnostics.structural_mismatches = diagnostics.structural_mismatches.saturating_add(1);
+    warn_unavailable(env, api, reason);
 }
 
 pub(crate) fn emit_warning(
@@ -159,7 +169,7 @@ pub(crate) fn emit_warning(
 
 impl ApiDiagnostics {
     pub fn acceptance_eligible(&self, mode: RunMode) -> bool {
-        mode == RunMode::Strict && self.stub_calls == 0
+        mode == RunMode::Strict && self.stub_calls == 0 && self.structural_mismatches == 0
     }
 
     fn next_sequence(&mut self) -> u64 {
