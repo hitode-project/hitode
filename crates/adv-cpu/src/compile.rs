@@ -102,6 +102,7 @@ pub(crate) struct Compiled {
     pub decoded_bytes: usize,
     ir_counts: Option<ir_counts::Summary>,
     pub direct_sites: usize,
+    pub direct_inline_fallbacks: u64,
     #[cfg(all(
         any(
             target_os = "linux",
@@ -841,6 +842,13 @@ pub(crate) fn compile(
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    compile_snapshot_with_inline(snapshot, snapshot.direct_inline)
+}
+
+fn compile_snapshot_with_inline(
+    snapshot: &Snapshot,
+    _inline_enabled: bool,
+) -> Result<Compiled, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let _write = crate::jit_memory_macos::WriteScope::new();
     let ir_counts =
@@ -1797,7 +1805,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 any(target_arch = "x86_64", target_arch = "aarch64")
             ))]
             inline: direct_refs
-                .filter(|_| snapshot.direct_inline)
+                .filter(|_| _inline_enabled)
                 .map(|_| direct::Inline::new()),
             source_map,
             source_origin: region.start,
@@ -2343,6 +2351,22 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     ))]
     let inline_registration =
         direct::publish(ctx.compiled_code().unwrap(), body_entry, &inline_drafts)?;
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if !inline_drafts.is_empty() && inline_registration.is_none() {
+        // No entry or recovery table has escaped. Release the rejected body
+        // and regenerate this region using the existing scalar helper lane.
+        unsafe { module.free_memory() };
+        let mut compiled = compile_snapshot_with_inline(snapshot, false)?;
+        compiled.direct_inline_fallbacks += 1;
+        return Ok(compiled);
+    }
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
@@ -2624,6 +2648,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         inline_registration,
+        direct_inline_fallbacks: 0,
         direct_sites: {
             #[cfg(all(
                 any(

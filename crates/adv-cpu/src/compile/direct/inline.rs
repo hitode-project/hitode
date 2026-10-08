@@ -6,6 +6,11 @@ use crate::fault_recovery::inline::{Registration, Site};
 const ACCESS_SOURCE: u32 = 0x4000_0000;
 const RETURN_SOURCE: u32 = 9;
 
+#[cfg(test)]
+std::thread_local! {
+    static REJECT_EPILOGUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(in crate::compile) struct Inline {
     recovery: Option<ir::Block>,
     sites: Vec<Draft>,
@@ -239,7 +244,9 @@ pub(in crate::compile) fn publish(
     if drafts.is_empty() {
         return Ok(None);
     }
-    let sites = sites(code, base, drafts)?;
+    let Some(sites) = sites(code, base, drafts)? else {
+        return Ok(None);
+    };
     // SAFETY: exact scalar instructions and a frame-only epilogue were checked;
     // generated guards/checkpoints prove the architectural prefix and commit
     // shape. Compiled drops the registration before freeing executable memory.
@@ -253,26 +260,26 @@ pub(in crate::compile) fn cache_sites(
     if drafts.is_empty() {
         return Ok(Vec::new());
     }
-    sites(code, 0, drafts).map(|sites| {
-        sites
-            .into_iter()
-            .map(|site| super::super::cache::InlineSite {
-                offset: site.host_pc as u32,
-                recovery: site.recovery_pc as u32,
-                guest_pc: site.guest_pc,
-                next_pc: site.next_pc,
-                width: site.width,
-                write: site.write,
-            })
-            .collect()
-    })
+    let sites =
+        sites(code, 0, drafts)?.ok_or("inline scalar recovery epilogue cannot be cached")?;
+    Ok(sites
+        .into_iter()
+        .map(|site| super::super::cache::InlineSite {
+            offset: site.host_pc as u32,
+            recovery: site.recovery_pc as u32,
+            guest_pc: site.guest_pc,
+            next_pc: site.next_pc,
+            width: site.width,
+            write: site.write,
+        })
+        .collect())
 }
 
 fn sites(
     code: &cranelift_codegen::CompiledCode,
     base: usize,
     drafts: &[Draft],
-) -> Result<Vec<Site>, String> {
+) -> Result<Option<Vec<Site>>, String> {
     let bytes = code.code_buffer();
     let ranges = code.buffer.get_srclocs_sorted();
     let start = ranges
@@ -281,9 +288,11 @@ fn sites(
         .map(|range| range.start as usize)
         .min()
         .ok_or("inline scalar recovery source is missing")?;
-    let recovery = recovery_start(bytes, start)
-        .filter(|&offset| epilogue(bytes, offset))
-        .ok_or("inline scalar recovery epilogue is not supported")?;
+    // A nonempty draft with no registration must be recompiled through the
+    // legacy direct lane; unrecognized frame restoration cannot be published.
+    let Some(recovery) = recovery_start(bytes, start) else {
+        return Ok(None);
+    };
     let base = untag(base);
     let mut sites = Vec::new();
     for trap in code
@@ -318,7 +327,7 @@ fn sites(
         return Err("inline scalar fault table is incomplete".into());
     }
     sites.sort_by_key(|site| site.host_pc);
-    Ok(sites)
+    Ok(Some(sites))
 }
 
 fn untag(pointer: usize) -> usize {
@@ -398,7 +407,10 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
                 offset = target;
                 continue;
             }
-            if !(add_sp || ldp || fp_ldp || ldr || fp_ldr || ldr_post || fp_ldr_post) {
+            // Darwin's Tail ABI signs LR with PACIBZ. AUTIBZ authenticates
+            // only X30 with a zero modifier before RET; it never writes X0/W0.
+            let autibz = w == 0xd50323df;
+            if !(add_sp || ldp || fp_ldp || ldr || fp_ldr || ldr_post || fp_ldr_post || autibz) {
                 return false;
             }
             offset += 4;
@@ -462,6 +474,10 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
 // moves. Skip only pure return-value setup before validating the WHOLE frame
 // restoration suffix. Searching for a later RET would lose callee saves.
 fn recovery_start(code: &[u8], mut offset: usize) -> Option<usize> {
+    #[cfg(test)]
+    if REJECT_EPILOGUE.get() {
+        return None;
+    }
     for _ in 0..8 {
         if epilogue(code, offset) {
             return Some(offset);
@@ -544,5 +560,53 @@ mod tests {
         assert_eq!(recovery_start(&invalid, 0), None);
         // Restoring X0 would overwrite the result set by the signal adapter.
         assert!(!epilogue(&bytes(&[0xf94003e0, 0xd65f03c0]), 0));
+    }
+
+    #[test]
+    fn authenticated_tail_epilogue_preserves_the_integer_result() {
+        let code = bytes(&[0x52800080, 0xa8c17bfd, 0xd50323df, 0xd65f03c0]);
+        assert_eq!(recovery_start(&code, 0), Some(4));
+        // Authentication cannot make a subsequent W0 overwrite admissible.
+        assert!(!epilogue(&bytes(&[0xd50323df, 0x52800080, 0xd65f03c0]), 0));
+    }
+
+    #[test]
+    fn unsupported_epilogue_publishes_and_counts_a_legacy_direct_region() {
+        use crate::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
+        use iced_x86::code_asm::*;
+
+        let mut assembler = CodeAssembler::new(32).unwrap();
+        assembler.mov(eax, dword_ptr(ecx)).unwrap();
+        let code = assembler.assemble(0x10000).unwrap();
+        let stop = 0x10000 + code.len() as u32;
+        let mut executor = Executor::new(0x10000, 0x20000).unwrap();
+        executor.set_direct_memory(true).unwrap();
+        // Exercise the rejection independently of the diagnostic process env.
+        executor.memory.direct_engine.as_mut().unwrap().inline = 1;
+        executor
+            .protect(0x10000, 4096, READ | WRITE | EXEC)
+            .unwrap();
+        executor.protect(0x20000, 4096, READ | WRITE).unwrap();
+        executor.write(0x10000, &code).unwrap();
+        executor.write(0x20000, &17u32.to_le_bytes()).unwrap();
+        REJECT_EPILOGUE.set(true);
+        let result = executor.add_region(Region::new(0x10000, code.len()));
+        REJECT_EPILOGUE.set(false);
+        result.unwrap();
+        assert_eq!(executor.stats.direct_memory.inline_fallbacks, 1);
+        executor.state.regs[1] = 0x20000;
+        executor.state.eip = 0x10000;
+        assert_eq!(executor.run(stop, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(executor.state.regs[0], 17);
+        executor.protect(0x20000, 4096, 0).unwrap();
+        executor.state.eip = 0x10000;
+        assert!(matches!(
+            executor.run(stop, 100).unwrap(),
+            RunOutcome::ReadFault {
+                address: 0x20000,
+                ..
+            }
+        ));
+        assert_eq!(executor.stats.direct_memory.inline_fallbacks, 1);
     }
 }

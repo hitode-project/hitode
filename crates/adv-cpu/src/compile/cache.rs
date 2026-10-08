@@ -902,6 +902,7 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         decoded_bytes: image.instructions.values().map(Instruction::len).sum(),
         ir_counts: None,
         direct_sites,
+        direct_inline_fallbacks: 0,
         #[cfg(all(
             any(
                 target_os = "linux",
