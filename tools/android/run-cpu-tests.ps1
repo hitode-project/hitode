@@ -24,16 +24,19 @@ param(
     [string[]]$TestName = @('execution_contract', 'host_interrupts', 'loop_versioning', 'address_space'),
     [string[]]$UnitFilter = @(),
     [ValidateRange(10, 600)][int]$TimeoutSeconds = 180,
+    [ValidateRange(60, 1140)][int]$DeviceBudgetSeconds = 1100,
     [switch]$ExecutionExperiments,
     [switch]$AllTests,
     [switch]$NoFailFast,
     [switch]$BuildOnly,
+    [switch]$SkipBuild,
     [switch]$WhatIf,
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
     [switch]$DirectMemory,
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off'
 )
 $ErrorActionPreference = 'Stop'
+if ($BuildOnly -and $SkipBuild) { throw '-BuildOnly and -SkipBuild are mutually exclusive.' }
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if ($AllTests) {
     if ($ExecutionExperiments -or $PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
@@ -83,7 +86,7 @@ function Get-DeviceCommand($remote, $run) {
 }
 if ($WhatIf) {
     [ordered]@{
-        mode = 'dry-run'; build_only = [bool]$BuildOnly; cargo_arguments = $cargoArgs; targets = $targets
+        mode = 'dry-run'; build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs; targets = $targets
         build_environment = @{ ANDROID_NDK_HOME = $Ndk; CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake'); CARGO_BUILD_JOBS = '2' }
         serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; direct_memory = [bool]$DirectMemory; tier1 = $Tier1; all_tests = [bool]$AllTests
         runs = @($runs | ForEach-Object { [ordered]@{ id = $_.id; target = $_.target; filter = $_.filter; shell = (Get-DeviceCommand '/data/local/tmp/adv-host-cpu-DRYRUN' $_) } })
@@ -133,8 +136,10 @@ try {
     $env:CARGO_BUILD_JOBS = '2'
     $env:PATH = 'C:/msys64/usr/bin;' + $env:PATH
     $buildLog = Join-Path $Output 'build.log'
-    & cargo @cargoArgs 2>&1 | Tee-Object -FilePath $buildLog
-    if ($LASTEXITCODE -ne 0) { throw "Android test build failed; see $buildLog" }
+    if (-not $SkipBuild) {
+        & cargo @cargoArgs 2>&1 | Tee-Object -FilePath $buildLog
+        if ($LASTEXITCODE -ne 0) { throw "Android test build failed; see $buildLog" }
+    }
     $artifacts = @{}
     # cargo-ndk consumes Cargo's artifact JSON. Use an isolated target directory
     # and refuse ambiguous hashes rather than accidentally running an old build.
@@ -150,6 +155,7 @@ try {
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Output 'build.json') -Encoding utf8
     @(
         'cargo ' + ($cargoArgs -join ' ')
+        "build_skipped=$([bool]$SkipBuild)"
         "ANDROID_NDK_HOME=$Ndk"
         "CMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE"
         "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
@@ -165,6 +171,7 @@ try {
         return
     }
     $remote = '/data/local/tmp/adv-host-cpu-' + [Guid]::NewGuid().ToString('N')
+    $deviceClock = [Diagnostics.Stopwatch]::StartNew()
     Set-Content -LiteralPath (Join-Path $Output 'remote-directory.txt') -Value $remote
     & $adb @adbArgs shell mkdir -p $remote
     if ($LASTEXITCODE -ne 0) { throw 'Cannot create owned device test directory' }
@@ -178,6 +185,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "chmod failed: $test" }
     }
     foreach ($run in $runs) {
+        $remaining = [int]($DeviceBudgetSeconds - $deviceClock.Elapsed.TotalSeconds)
+        if ($remaining -lt 10) { throw "Device session budget exhausted; resume remaining targets from $Output" }
+        $TimeoutSeconds = [Math]::Min($TimeoutSeconds, $remaining)
         $test = $run.target
         $binary = $artifacts[$test]
         $filter = $run.filter

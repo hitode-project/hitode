@@ -147,7 +147,7 @@ class BaselineTests(unittest.TestCase):
             self.assertNotIn("fps", {key.lower() for key in row})
 
     def test_different_binary_profile_or_tiering_cannot_be_mixed(self):
-        for change in ("binary", "warm", "tiering"):
+        for change in ("binary", "warm", "tiering", "bridge", "threads"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 a = self.make_run(root, "a", "warm")
@@ -156,11 +156,22 @@ class BaselineTests(unittest.TestCase):
                     self.edit_session(b, binary_sha256="0" * 64)
                 elif change == "warm":
                     self.edit_session(b, warm_input_sha256="0" * 64)
-                else:
+                elif change == "tiering":
                     for checkpoint in ("loaded", "end", "final"):
                         self.edit_report(b, checkpoint, lambda report: report.update(tiered_compilation=True))
+                else:
+                    field = {"tier1": {"mode": "bridge"}} if change == "bridge" else {"compilation_schedule": {"compile_threads": 4}}
+                    for checkpoint in ("loaded", "end", "final"):
+                        self.edit_report(b, checkpoint, lambda report: report.update(field))
                 with self.assertRaises(ValueError):
                     baseline.summarize([a, b])
+
+    def test_execution_histograms_are_kept_without_replacing_missing_evidence(self):
+        self.assertIsNone(baseline.execution_metrics({})["tier1"])
+        counters = {"tier1": {"publication_flushes": 12, "compile_misses": 7},
+                    "compilation_schedule": {"fast": {"service_us": {"buckets": [0, 1, 3]}}}}
+        self.assertEqual(baseline.execution_metrics(counters)["tier1"], counters["tier1"])
+        self.assertEqual(baseline.execution_metrics(counters)["compilation_schedule"], counters["compilation_schedule"])
 
     def test_observation_diagnostics_verify_and_ambiguous_seed_are_rejected(self):
         for change in ({"scene_validation_status": "observation_only"}, {"fixed_workload_verified": False},

@@ -112,7 +112,17 @@ def report_config(report: dict) -> dict:
     return {name: report[name] for name in REPORT_CONFIG} | {
         "codec_provider": report["codec"]["provider"], "codec_kernel_mode": report["codec_kernels"]["mode"],
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,
-        "time_skip_enabled": report.get("time_skip", {}).get("enabled")}
+        "time_skip_enabled": report.get("time_skip", {}).get("enabled"),
+        "tier1_mode": report.get("tier1", {}).get("mode", "off"),
+        "compile_threads": report.get("compilation_schedule", {}).get("compile_threads")}
+
+
+def execution_metrics(report: dict) -> dict:
+    """Keep aggregate execution counters and compiler histograms per observation."""
+    cliffs = report.get("cpu_cliffs", {})
+    return {"tier1": report.get("tier1"), "compilation_schedule": report.get("compilation_schedule"),
+            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details"),
+            "tier1_bridge": cliffs.get("tier1_bridge")}
 
 
 def command_option(command: list, name: str) -> str:
@@ -249,7 +259,8 @@ def load_run(directory: Path) -> dict:
                "gate_hash_max_seconds": number(gate.get("hash_max_seconds"), f"{name}.gate.hash_max"),
                "pending_compilations": number(report.get("pending_compilations"), f"{name}.pending_compilations"),
                "codec": report["codec"], "codec_kernels": report["codec_kernels"],
-               "measurement_elapsed_seconds_diagnostic_only": performance.get("measurement_elapsed_seconds")}
+               "measurement_elapsed_seconds_diagnostic_only": performance.get("measurement_elapsed_seconds"),
+               "execution_metrics": execution_metrics(report)}
         rows.append(row)
         previous_global, previous_gate, previous_window, previous_epoch = global_now, gate_now, window_now, epoch
     require(sum(row["active_frame_interval"]["samples"] for row in rows) > 0, "no active frame interval samples")
@@ -263,7 +274,8 @@ def load_run(directory: Path) -> dict:
             "final_report_sha256": metadata["final_report_sha256"], "final_png_sha256": metadata["final_png_sha256"],
             "identity": identity, "checkpoints": rows,
             "final_process_counters": counters(final, GLOBAL_COUNTERS, "final"),
-            "final_scene_gate": final.get("scene_gate"), "first_frame_seconds": final.get("first_frame_seconds")}
+            "final_scene_gate": final.get("scene_gate"), "first_frame_seconds": final.get("first_frame_seconds"),
+            "final_execution_metrics": execution_metrics(final)}
 
 
 def summarize(directories: list[Path]) -> dict:
