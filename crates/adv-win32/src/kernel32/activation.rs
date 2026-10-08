@@ -186,13 +186,139 @@ fn current(env: &mut Env<'_>, output: GuestPtr<Handle>) -> i32 {
     1
 }
 
+fn query_unavailable(env: &mut Env<'_>) -> i32 {
+    warn_unavailable(
+        env,
+        "kernel32.dll!QueryActCtxW",
+        "side-by-side activation context information is unavailable",
+    );
+    fail(env, 50) // ERROR_NOT_SUPPORTED
+}
+
+/// A NULL current handle also occurs in a manifest-bound Windows process.
+/// Until the loader binds SxS contexts, reject known manifests rather than
+/// describing their process/module scope as the empty default context.
+fn query_scope(env: &Env<'_>, flags: u32, handle: u32) -> Result<bool, u32> {
+    let image = flags & 24;
+    let Some(modules) = adv_os::try_modules(env.ext) else {
+        return if image == 0 { Ok(true) } else { Err(87) };
+    };
+    let main = env
+        .cpu
+        .read_u32(adv_machine::layout::PEB_ADDR + adv_machine::layout::peb::IMAGE_BASE)
+        .ok()
+        .and_then(|base| modules.by_handle(base));
+    let selected = match image {
+        8 => modules.by_handle(handle),
+        16 => modules.containing(handle),
+        _ => main,
+    }
+    .ok_or(87u32)?;
+    if !modules.get(selected).executable_visible() {
+        return Err(87);
+    }
+    let has_manifest = |id| {
+        let module = modules.get(id);
+        module
+            .resources
+            .as_ref()
+            .is_some_and(|root| root.get(&adv_pe::ResId::Id(24)).is_some())
+            || env.ext.try_get::<crate::Win32>().is_some_and(|win32| {
+                win32
+                    .vfs
+                    .lookup(&format!("{}.manifest", module.path))
+                    .is_some()
+            })
+    };
+    Ok(!has_manifest(selected) && main.is_none_or(|id| !has_manifest(id)))
+}
+
+// https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryactctxw
+#[win32(kernel32, name = "QueryActCtxW", level = implement)]
+fn query(
+    env: &mut Env<'_>,
+    flags: u32,
+    context: Handle,
+    sub_instance: GuestPtr<()>,
+    class: u32,
+    buffer: GuestPtr<()>,
+    bytes: u32,
+    required: GuestPtr<u32>,
+) -> i32 {
+    if required.addr() != 0 {
+        if check_range(env.cpu, required.addr(), 4, Prot::WRITE).is_err()
+            || env.cpu.write_u32(required.addr(), 0).is_err()
+        {
+            return fail(env, 998);
+        }
+    }
+    let image = flags & 24;
+    // Native x86 additionally accepts the legacy process-default bit 1.
+    if flags & !0x8000_001d != 0
+        || image == 24
+        || (image != 0 && flags & 5 != 0)
+        || (image != 0 && context.0 == 0)
+        || (flags & 5 != 0 && context.0 != 0)
+        || (buffer.addr() == 0 && (bytes != 0 || required.addr() == 0))
+        || (class == 2 && flags & 0x8000_0000 != 0)
+        || (matches!(class, 5 | 6) && sub_instance.addr() != 0)
+    {
+        return fail(env, 87);
+    }
+    let size = match class {
+        1 => 8,  // ACTIVATION_CONTEXT_BASIC_INFORMATION (x86)
+        2 => 48, // ACTIVATION_CONTEXT_DETAILED_INFORMATION (x86)
+        5 => 12, // ACTIVATION_CONTEXT_RUN_LEVEL_INFORMATION
+        6 => 0,  // No compatibility payload exists in an unbound default scope.
+        3 | 4 if sub_instance.addr() != 0 => return query_unavailable(env),
+        _ => return fail(env, 87),
+    };
+    if image == 0 && context.0 != 0 {
+        return if context.0 == u32::MAX {
+            fail(env, 87)
+        } else {
+            query_unavailable(env)
+        };
+    }
+    match query_scope(env, flags, context.0) {
+        Ok(true) => {}
+        Ok(false) => return query_unavailable(env),
+        Err(error) => return fail(env, error),
+    }
+    if bytes < size {
+        // The native empty detailed scope reports zero on an undersized query;
+        // Basic and RunLevel report their fixed sizes, including size probes.
+        if required.addr() != 0 && class != 2 {
+            let _ = env.cpu.write_u32(required.addr(), size);
+        }
+        return fail(env, 122);
+    }
+    if size != 0
+        && (check_range(env.cpu, buffer.addr(), size, Prot::WRITE).is_err()
+            || env
+                .cpu
+                .write(buffer.addr(), &[0; 48][..size as usize])
+                .is_err())
+    {
+        return fail(env, 998);
+    }
+    if required.addr() != 0 {
+        let _ = env.cpu.write_u32(required.addr(), size);
+    }
+    1
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_w_ABI);
     registry.register(create_a_ABI);
     registry.register(activate_ABI);
     registry.register(deactivate_ABI);
     registry.register(current_ABI);
+    registry.register(query_ABI);
 }
+
+#[cfg(test)]
+mod query_tests;
 
 #[cfg(test)]
 mod tests {
