@@ -1229,3 +1229,85 @@ fn nested_creation_updates_the_immediate_parent_timestamp() {
     assert!(time(software_after) > time(software_before));
     assert_eq!(time(root_after), time(root_before));
 }
+
+#[test]
+fn string_sets_include_only_an_adjacent_omitted_terminator() {
+    // Authored Windows A/W probes confirm these stored bytes for all three
+    // string types. Queries retain truly unterminated values and binary data.
+    let mut f = Fixture::new(932);
+    let path = f.w("Software\\Registry Terminator Fixture");
+    let (created, key, _) = f.create(path, true, 3);
+    let cases: &[(&[u8], u32, &[u8])] = &[
+        (b".\0", 1, b".\0"),
+        (b".x\0", 1, b"."),
+        (b".\0\0", 2, b".\0"),
+        (b".x\0", 2, b".x\0"),
+        (b".\0", 0, b""),
+        (b"\0\0", 1, b"\0"),
+    ];
+    let mut checks = Vec::new();
+    for wide in [false, true] {
+        let encode = |data: &[u8]| -> Vec<u8> {
+            if wide {
+                data.iter().flat_map(|&b| [b, 0]).collect()
+            } else {
+                data.to_vec()
+            }
+        };
+        for kind in [1, 2, 7, 3] {
+            for &(source, count, terminated) in cases {
+                let input = f.blob(&encode(source));
+                let set = f.call(
+                    if wide {
+                        "RegSetValueExW"
+                    } else {
+                        "RegSetValueExA"
+                    },
+                    &[
+                        L(key),
+                        I(0),
+                        I(0),
+                        I(kind),
+                        I(input),
+                        I(count * if wide { 2 } else { 1 }),
+                    ],
+                );
+                let expected = if kind == 3 {
+                    encode(&source[..count as usize])
+                } else {
+                    terminated.iter().flat_map(|&b| [b, 0]).collect()
+                };
+                let output = f.blob(&[0x11; 16]);
+                let size = f.word(16);
+                let query = f.call(
+                    "RegQueryValueExW",
+                    &[L(key), I(0), I(0), I(0), I(output), I(size)],
+                );
+                checks.push((set, query, output, size, expected));
+            }
+        }
+    }
+    // A missing optional unit beyond the readable page is not an input fault.
+    let edge = READ_ONLY + 4095;
+    f.machine.cpu.write(edge - 1, b".\0").unwrap();
+    let set = f.call(
+        "RegSetValueExW",
+        &[L(key), I(0), I(0), I(1), I(edge - 1), I(2)],
+    );
+    let output = f.blob(&[0x11; 16]);
+    let size = f.word(16);
+    let query = f.call(
+        "RegQueryValueExW",
+        &[L(key), I(0), I(0), I(0), I(output), I(size)],
+    );
+    checks.push((set, query, output, size, b".\0".to_vec()));
+    f.run();
+    assert_eq!(f.get(created), 0);
+    for (set, query, output, size, expected) in checks {
+        assert_eq!(f.get(set), 0);
+        assert_eq!(f.get(query), 0);
+        assert_eq!(f.get(size), expected.len() as u32);
+        assert_eq!(f.bytes(output, expected.len()), expected);
+        assert_eq!(f.bytes(output + expected.len() as u32, 1), [0x11]);
+    }
+}
