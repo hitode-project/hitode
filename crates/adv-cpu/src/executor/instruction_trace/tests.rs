@@ -58,6 +58,7 @@ fn attach_operands(
         max,
         stack_words: words,
         operands,
+        start: None,
     });
     let path = trace.path.clone();
     cpu.instruction_trace = Some(Box::new(trace));
@@ -170,6 +171,33 @@ fn unselected_budget_boundaries_leave_room_for_a_later_selected_visit() {
 }
 
 #[test]
+fn delayed_start_preserves_execution_and_captures_the_trigger_instruction() {
+    // Authored two increments, a jump, an increment and a return.
+    let bytes = [0x40, 0x40, 0xeb, 1, 0x90, 0x43, 0xc3];
+    let mut control = cpu(&bytes);
+    let mut traced = cpu(&bytes);
+    let path = attach(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 7)],
+        20,
+        0,
+    );
+    let trace = traced.instruction_trace.as_mut().unwrap();
+    trace.config.start = Some(CODE + 5);
+    trace.armed = false;
+    assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    assert_eq!(traced.state, control.state);
+    let rows = events(&path);
+    assert_eq!(rows[0]["before"]["eip"], CODE + 5);
+    assert_eq!(rows[0]["before"]["eax"], 2);
+    assert_eq!(
+        rows.iter().filter(|r| r["kind"] == "instruction").count(),
+        2
+    );
+}
+
+#[test]
 fn configuration_rejects_empty_or_unbounded_capture_and_non_target_output() {
     let dir = directory();
     for ranges in ["", "0x1000..0x1000", "0..4294967297"] {
@@ -231,6 +259,7 @@ fn io_failure_disables_diagnostics_and_preserves_execution() {
         max: 10,
         stack_words: 1,
         operands: false,
+        start: None,
     })));
     assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
     assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);

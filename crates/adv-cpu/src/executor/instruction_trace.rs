@@ -17,6 +17,8 @@
 //! it is not an instruction's after state. boundary records public run outcomes.
 //! Boundaries are recorded only after a selected instruction since the prior
 //! boundary, so unrelated execution does not consume the capture budget.
+//! ADV_INTERP_TRACE_START optionally delays observation until the exact PC is
+//! reached. It changes only diagnostics, not the executed instruction stream.
 //! Configuration or IO errors warn and disable capture without failing execution.
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -44,6 +46,7 @@ struct Config {
     max: usize,
     stack_words: usize,
     operands: bool,
+    start: Option<u32>,
 }
 
 impl Config {
@@ -99,6 +102,7 @@ impl Config {
             max,
             stack_words,
             operands,
+            start: None,
         })
     }
 }
@@ -143,6 +147,7 @@ pub(crate) struct Trace {
     disabled: bool,
     pending_resume: bool,
     interval_observed: bool,
+    armed: bool,
     failure: Option<String>,
 }
 
@@ -157,7 +162,28 @@ impl Trace {
             &read("ADV_INTERP_TRACE_STACK_WORDS", "4"),
             &read("ADV_INTERP_TRACE_OPERANDS", "0"),
         ) {
-            Ok(config) => Some(Box::new(Self::new(config))),
+            Ok(mut config) => {
+                if let Ok(start) = std::env::var("ADV_INTERP_TRACE_START") {
+                    let start = start.trim();
+                    let parsed = match start
+                        .strip_prefix("0x")
+                        .or_else(|| start.strip_prefix("0X"))
+                    {
+                        Some(hex) => u32::from_str_radix(hex, 16),
+                        None => start.parse::<u32>(),
+                    };
+                    match parsed {
+                        Ok(pc) => config.start = Some(pc),
+                        Err(error) => {
+                            eprintln!(
+                                "warning: interpreter instruction trace disabled: invalid start PC: {error}"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(Box::new(Self::new(config)))
+            }
             Err(error) => {
                 eprintln!("warning: interpreter instruction trace disabled: {error}");
                 None
@@ -176,6 +202,7 @@ impl Trace {
             std::process::id()
         ));
         Self {
+            armed: config.start.is_none(),
             config,
             path,
             writer: None,
@@ -195,6 +222,14 @@ impl Trace {
     ) -> (u32, Option<Before>) {
         if self.disabled {
             return (units, None);
+        }
+        if !self.armed {
+            let start = self.config.start.unwrap();
+            if state.eip != start {
+                let distance = u64::from(start.wrapping_sub(state.eip));
+                return (units.min(distance.div_ceil(15) as u32), None);
+            }
+            self.armed = true;
         }
         if self.pending_resume {
             self.pending_resume = false;
