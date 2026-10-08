@@ -219,6 +219,12 @@ pub(crate) unsafe extern "C" fn access(
     } + if write { 3 } else { 0 };
     let thunk = &engine.thunks[index];
     let base = thunk.entry as usize;
+    // Cranelift's heap-backed code can carry an Android allocation tag. The
+    // kernel reports an untagged instruction PC, so both exact recovery PCs
+    // must use that representation. Keep the entry and allocator-owned pointer
+    // unchanged: data pointers still need their original tag on deallocation.
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    let base = base & 0x00ff_ffff_ffff_ffff;
     let state = unsafe { &mut *state };
     let site = NativeRecoveryPoint {
         host_pc: base + thunk.site,

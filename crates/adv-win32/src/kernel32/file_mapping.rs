@@ -705,9 +705,10 @@ pub(super) fn open_sync(
         Some(_) => return fail(env, 6),
         None => return fail(env, 2),
     };
-    // Kernel aliases currently carry full access and do not implement process
-    // inheritance. Do not silently broaden a restricted access request.
-    if (env.arg(0) != full_access && env.arg(0) != 0x10000000) || env.arg(1) != 0 {
+    // Kernel aliases currently carry full access. Event opens record inherit
+    // flags on the existing aliases; other fronts retain their supported profile.
+    // Do not silently broaden a restricted access request.
+    if (env.arg(0) != full_access && env.arg(0) != 0x10000000) || kind != 1 && env.arg(1) != 0 {
         if kind == 4 {
             adv_abi::warn_unavailable(
                 env,
@@ -718,11 +719,21 @@ pub(super) fn open_sync(
                 },
                 "restricted access and inherited timer handles are not modeled",
             );
+        } else if kind == 1 {
+            adv_abi::warn_unavailable(
+                env,
+                if wide { "OpenEventW" } else { "OpenEventA" },
+                "restricted event access is not modeled; use EVENT_ALL_ACCESS or GENERIC_ALL",
+            );
         }
         return fail(env, 50);
     }
     match env.sys.objects.alias_identity(identity) {
         Some(handle) => {
+            if kind == 1 {
+                let inherit = env.arg(1) != 0;
+                super::handle::set_inherit(env, handle, inherit);
+            }
             set_last_error(env, 0);
             Outcome::Return(handle)
         }

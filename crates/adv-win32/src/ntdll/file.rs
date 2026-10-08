@@ -35,6 +35,7 @@ pub(super) fn register(registry: &mut Registry) {
     for (api, name) in [
         (create_ABI, "NtCreateFile"),
         (query_ABI, "NtQueryInformationFile"),
+        (set_ABI, "NtSetInformationFile"),
         (read_ABI, "NtReadFile"),
     ] {
         registry.register(adv_abi::Api { name, ..api });
@@ -260,19 +261,23 @@ fn query(
     length: u32,
     class: i32,
 ) -> i32 {
-    if class != 14 {
-        warn_unavailable(
-            env,
-            "ntdll.dll!ZwQueryInformationFile",
-            "only FilePositionInformation is implemented",
-        );
-        return if class == 0 {
-            0xc000_0002u32 as i32
-        } else {
-            NOT_SUPPORTED
-        };
-    }
-    if length < 8 {
+    let required = match class {
+        5 => 24,
+        14 => 8,
+        _ => {
+            warn_unavailable(
+                env,
+                "ntdll.dll!ZwQueryInformationFile",
+                "only FileStandardInformation and FilePositionInformation are implemented",
+            );
+            return if class == 0 {
+                0xc000_0002u32 as i32
+            } else {
+                NOT_SUPPORTED
+            };
+        }
+    };
+    if length < required {
         return 0xc000_0004u32 as i32; // STATUS_INFO_LENGTH_MISMATCH
     }
     if check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err()
@@ -291,22 +296,47 @@ fn query(
     };
     // Native also accepts attributes-only and overlapped handles for this
     // query. Do not manufacture a second per-front position or mode table.
-    let position = match file.file.stream_position() {
-        Ok(position) => position,
-        Err(error) => {
-            log::warn!("ZwQueryInformationFile position query failed: {error}");
-            return if error.kind() == std::io::ErrorKind::PermissionDenied {
-                ACCESS_DENIED
-            } else {
-                0xc000_0001u32 as i32 // STATUS_UNSUCCESSFUL
-            };
-        }
-    };
+    let mut information = [0; 24];
+    if class == 14 {
+        let position = match file.file.stream_position() {
+            Ok(position) => position,
+            Err(error) => {
+                log::warn!("ZwQueryInformationFile position query failed: {error}");
+                return if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    ACCESS_DENIED
+                } else {
+                    0xc000_0001u32 as i32 // STATUS_UNSUCCESSFUL
+                };
+            }
+        };
+        information[..8].copy_from_slice(&position.to_le_bytes());
+    } else {
+        let standard = match file.file.standard_information() {
+            Ok(standard) => standard,
+            Err(error) => {
+                log::warn!("ZwQueryInformationFile standard query failed: {error}");
+                return match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => ACCESS_DENIED,
+                    std::io::ErrorKind::Unsupported => unavailable_for(
+                        env,
+                        "ntdll.dll!ZwQueryInformationFile",
+                        "opened-file standard metadata is unavailable",
+                    ),
+                    _ => 0xc000_0001u32 as i32, // STATUS_UNSUCCESSFUL
+                };
+            }
+        };
+        information[..8].copy_from_slice(&standard.allocation_size.to_le_bytes());
+        information[8..16].copy_from_slice(&standard.end_of_file.to_le_bytes());
+        information[16..20].copy_from_slice(&standard.number_of_links.to_le_bytes());
+        information[20] = u8::from(standard.delete_pending);
+        information[21] = u8::from(standard.directory);
+    }
     let mut completion = [0; 8];
-    completion[4..].copy_from_slice(&8u32.to_le_bytes());
+    completion[4..].copy_from_slice(&required.to_le_bytes());
     if env
         .cpu
-        .write(output.addr(), &position.to_le_bytes())
+        .write(output.addr(), &information[..required as usize])
         .and_then(|()| env.cpu.write(iosb.addr(), &completion))
         .is_err()
     {
@@ -480,7 +510,7 @@ fn create(
     if let Err(status) = oa.scope(env, "ntdll.dll!ZwCreateFile") {
         return status;
     }
-    if disposition != 1 || options & 0x30 == 0 || options & !0x70 != 0 {
+    if disposition != 1 || options & 0x30 == 0 || options & !0x874 != 0 {
         return unavailable(
             env,
             "only synchronous FILE_OPEN of ordinary non-directory files",

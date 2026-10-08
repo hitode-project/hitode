@@ -14,6 +14,8 @@ use crate::{Win32, stdcall};
 mod local;
 pub(crate) use local::detach_fls;
 #[cfg(test)]
+mod event_tests;
+#[cfg(test)]
 mod wait_tests;
 
 const WAIT_OBJECT_0: u32 = 0;
@@ -401,6 +403,16 @@ fn create_event(env: &mut Env<'_>) -> Outcome {
     )
 }
 
+#[win32(kernel32, name = "OpenEventA", level = implement)]
+fn open_event_a(env: &mut Env<'_>, _access: u32, _inherit: i32, name: AnsiStr) -> Outcome {
+    super::file_mapping::open_sync(env, name.0.addr(), false, 1, 0x001f0003)
+}
+
+#[win32(kernel32, name = "OpenEventW", level = implement)]
+fn open_event_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -> Outcome {
+    super::file_mapping::open_sync(env, name.0.addr(), true, 1, 0x001f0003)
+}
+
 fn create_semaphore(env: &mut Env<'_>) -> Outcome {
     let (count, max) = (env.arg(1), env.arg(2));
     created(env, Object::Semaphore { count, max })
@@ -693,6 +705,8 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "CreateEventA", 4, create_event);
     stdcall(reg, K32, "CreateEventW", 4, create_event);
+    reg.register(open_event_a_ABI);
+    reg.register(open_event_w_ABI);
     stdcall(reg, K32, "SetEvent", 1, |e| {
         let h = e.arg(0);
         Outcome::Return(u32::from(e.sys.set_event(h)))
