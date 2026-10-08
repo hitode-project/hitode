@@ -296,6 +296,8 @@ mod publication_tests {
 }
 
 struct Unit {
+    // Field order retires the diagnostic range before Code unmaps its storage.
+    _perf_range: Option<crate::perf_map::Registration>,
     code: Code,
     input: Vec<(u32, Vec<u8>)>,
     // Descriptors embedded in native calls share the immutable code lifetime.
@@ -460,6 +462,11 @@ impl Engine {
         self.stats.compilations += 1;
         self.stats.code_bytes += emitted.words.len() as u64 * 4;
         let unit = Rc::new(Unit {
+            _perf_range: crate::perf_map::register(
+                code.pointer.as_ptr() as usize,
+                emitted.words.len() * 4,
+                crate::perf_map::Category::Tier1,
+            ),
             code,
             input,
             _x87: x87,
