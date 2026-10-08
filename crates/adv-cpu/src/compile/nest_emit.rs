@@ -92,6 +92,7 @@ pub(super) fn thunk(
     module: &mut JITModule,
     fb: &mut FunctionBuilderContext,
     tail: &ir::Signature,
+    counts: Option<&std::cell::RefCell<ir_counts::Counts>>,
 ) -> Result<(cranelift_module::FuncId, cranelift_codegen::Context), String> {
     let ptr = module.target_config().pointer_type();
     let mut ctx = module.make_context();
@@ -114,6 +115,7 @@ pub(super) fn thunk(
         b.seal_all_blocks();
         b.finalize();
     }
+    ir_counts::Counts::function(counts, &ctx.func, 0, &BTreeMap::new());
     module
         .define_function(id, &mut ctx)
         .map_err(|e| format!("{e:?}"))?;

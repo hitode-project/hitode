@@ -916,10 +916,38 @@ fn apply(
         }),
         Outcome::Defer { .. } => unreachable!("deferred outcomes were resolved above"),
         Outcome::HostRequest { then } => Err(Parked::HostRequest { then, origin }),
-        Outcome::ExitThread(c) => Err(Parked::ExitThread(c)),
-        Outcome::ExitProcess(c) => Err(Parked::ExitProcess(c)),
+        Outcome::ExitThread(c) => {
+            trace_terminal(cpu, sys, &origin, "thread", c);
+            Err(Parked::ExitThread(c))
+        }
+        Outcome::ExitProcess(c) => {
+            trace_terminal(cpu, sys, &origin, "process", c);
+            Err(Parked::ExitProcess(c))
+        }
         Outcome::Fail(msg) => Err(Parked::Fail(msg)),
     }
+}
+
+fn trace_terminal(cpu: &dyn Guest, sys: &mut Sys, origin: &Origin, kind: &str, code: u32) {
+    if !sys.trace.enabled() {
+        return;
+    }
+    let binding = sys.thunks.get(origin.thunk);
+    let record = TraceRecord {
+        ctx: sys.current,
+        frame: sys.frame,
+        module: &binding.module,
+        name: &binding.name,
+        args: origin.trace_args.as_deref().unwrap_or(&[]),
+        ret: u64::from(code),
+    };
+    sys.trace.terminal(
+        &record,
+        kind,
+        origin.esp,
+        origin.ret_eip,
+        cpu.read_u32(origin.esp).ok(),
+    );
 }
 
 /// Return from the host call described by `origin`.
@@ -1218,24 +1246,16 @@ impl TrapHandler for Dispatch<'_> {
         } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
             self.guest_return(cpu)
         } else {
-            // Validate the executed push-token/int instruction pair, including in a
-            // relocated trampoline. An API address lookup alone never runs a handler.
-            let mut instruction = [0; 7];
+            // Hooks may reconstruct the opaque token and move the INT away from
+            // its PUSH. Only an exact registered transport word authorizes dispatch;
+            // ordinary numeric services and coincidental API indices remain raw.
             let esp = cpu.reg(Reg::Esp);
-            let index = cpu.read_u32(esp).ok();
-            let valid = cpu.read(eip.wrapping_sub(7), &mut instruction).is_ok()
-                && instruction[0] == 0x68
-                && instruction[5..] == [0xcd, adv_cpu::backend::asm::TRAP_VECTOR]
-                && index.is_some_and(|i| {
-                    i > thunk::EXCEPTION_DISPATCH
-                        && i < self.sys.thunks.len()
-                        && instruction[1..5] == i.to_le_bytes()
-                });
-            if valid {
+            let word = cpu.read_u32(esp).ok();
+            if let Some(index) = word.and_then(|word| self.sys.thunks.transport_index(word)) {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
-                self.host_call(cpu, index.unwrap())
+                self.host_call(cpu, index)
             } else {
-                let candidate = index
+                let candidate = word
                     .filter(|i| *i > thunk::EXCEPTION_DISPATCH && *i < self.sys.thunks.len())
                     .map(|i| {
                         let binding = self.sys.thunks.get(i);

@@ -27,6 +27,7 @@ mod fault;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod fp_environment;
 mod invariants;
+mod ir_counts;
 mod loops;
 mod mmx;
 mod nest;
@@ -77,6 +78,7 @@ pub(crate) struct Compiled {
     pub code_size: usize,
     pub instruction_count: usize,
     pub decoded_bytes: usize,
+    ir_counts: Option<ir_counts::Summary>,
     pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
@@ -105,6 +107,12 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    pub(crate) fn record_ir_counts(&self, service: std::time::Duration) {
+        if let Some(counts) = &self.ir_counts {
+            eprintln!("compile-ir: {}", counts.json(self.code_size, service));
+        }
+    }
+
     pub(crate) fn profile(&self) -> Option<&Profile> {
         self.input.profile.as_deref()
     }
@@ -728,10 +736,15 @@ pub(crate) fn compile(
 ) -> Result<Compiled, String> {
     let mut input = Snapshot::capture(region, memory)?;
     input.shadow_returns = shadow_returns;
-    compile_snapshot(&input)
+    let started = std::time::Instant::now();
+    let compiled = compile_snapshot(&input)?;
+    compiled.record_ir_counts(started.elapsed());
+    Ok(compiled)
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    let ir_counts =
+        ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
     let bytes = &snapshot.bytes;
     let first_page = (region.start - snapshot.base) as usize / 4096;
@@ -1028,10 +1041,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         "adv_file_write_prepared",
         crate::file_memory::write_prepared as *const u8,
     );
-    builder.symbol(
-        "adv_atomic_load_vector",
-        crate::atomic_memory::load_vector as *const u8,
-    );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
     builder.symbol("adv_nest_run", crate::rows::run as *const u8);
     builder.symbol(
@@ -1112,17 +1121,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let atomic_store_id = module
         .declare_function("adv_atomic_store", Linkage::Import, &atomic_store_signature)
         .map_err(|e| e.to_string())?;
-    let mut atomic_load_signature = module.make_signature();
-    atomic_load_signature
-        .params
-        .extend([AbiParam::new(ptr_ty); 2]);
-    let atomic_load_id = module
-        .declare_function(
-            "adv_atomic_load_vector",
-            Linkage::Import,
-            &atomic_load_signature,
-        )
-        .map_err(|e| e.to_string())?;
     let mut file_signature = module.make_signature();
     file_signature.params.extend([
         AbiParam::new(ptr_ty),
@@ -1177,9 +1175,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Fault recipes read their own source locations; keep them untagged.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
+    let source_map =
+        (diagnostics::instruction_map_enabled() || ir_counts.is_some()) && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
-    let source_map = diagnostics::instruction_map_enabled();
+    let source_map = diagnostics::instruction_map_enabled() || ir_counts.is_some();
     let mut nest_signature = module.make_signature();
     nest_signature.params.extend([AbiParam::new(ptr_ty); 4]);
     nest_signature.returns.push(AbiParam::new(types::I32));
@@ -1216,7 +1215,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
         let x87_ref = module.declare_func_in_func(x87_id, func);
         let atomic_store_ref = module.declare_func_in_func(atomic_store_id, func);
-        let atomic_load_ref = module.declare_func_in_func(atomic_load_id, func);
         let file_read_ref = module.declare_func_in_func(file_read_id, func);
         let file_write_ref = module.declare_func_in_func(file_write_id, func);
         let file_prepared_ref = module.declare_func_in_func(file_prepared_id, func);
@@ -1628,7 +1626,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
                 .collect(),
             atomic_store_ref,
-            atomic_load_ref,
             file_read_ref,
             file_write_ref,
             file_prepare_ref,
@@ -1932,6 +1929,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         e.b.seal_all_blocks();
         e.b.finalize();
+        ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
     };
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
@@ -1996,7 +1994,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let row_thunk = if nests.is_empty() {
         None
     } else {
-        let result = nest_emit::thunk(&mut module, &mut fb_ctx, &tail_signature)?;
+        let result = nest_emit::thunk(
+            &mut module,
+            &mut fb_ctx,
+            &tail_signature,
+            ir_counts.as_ref(),
+        )?;
         let id = result.0;
         kernel_functions.push(result);
         Some(id)
@@ -2183,6 +2186,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.seal_all_blocks();
         b.finalize();
     }
+    ir_counts::Counts::function(
+        ir_counts.as_ref(),
+        &wrapper.func,
+        region.start,
+        &instructions,
+    );
     module
         .define_function(wrapper_id, &mut wrapper)
         .map_err(|e| format!("{e:?}"))?;
@@ -2276,6 +2285,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
     }
     Ok(Compiled {
+        ir_counts: ir_counts.map(|counts| {
+            counts.into_inner().finish(
+                if opt_level == "speed" {
+                    "speed"
+                } else {
+                    "fast"
+                },
+                &instructions,
+            )
+        }),
         instruction_count: instructions.len(),
         decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
@@ -2996,7 +3015,6 @@ struct Emitter<'a> {
     /// lane then materializes its prefix and re-executes canonically.
     lane: Option<ir::Block>,
     atomic_store_ref: ir::FuncRef,
-    atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
     file_write_ref: ir::FuncRef,
     file_prepare_ref: ir::FuncRef,
@@ -5084,9 +5102,10 @@ impl Emitter<'_> {
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
-        let compact = self.optimizing;
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        let compact = compact && hardware.is_none();
+        let compact = hardware.is_none();
+        #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+        let compact = true;
         if compact {
             let missing = self.denied(&permissions, permission, 0);
             self.guard(missing, reason, Some(addr));
@@ -5122,36 +5141,11 @@ impl Emitter<'_> {
             self.guard(executable, Exit::Fallback, None);
             self.b.set_cold_block(self.b.current_block().unwrap());
         }
-        let file: Vec<_> = positions
-            .iter()
-            .map(|&position| {
-                let p = self.permission(position);
-                let kind = self
-                    .b
-                    .ins()
-                    .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-                self.b
-                    .ins()
-                    .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
-            })
-            .collect();
-        let file = file[1..]
-            .iter()
-            .fold(file[0], |all, &f| self.b.ins().bor(all, f));
-        let overlay = self.b.create_block();
-        self.b.set_cold_block(overlay);
-        let pcm = self.b.create_block();
-        self.b.set_cold_block(pcm);
-        self.b.ins().brif(file, overlay, &[], pcm, &[]);
-        self.b.switch_to_block(pcm);
-        if let Some(value) = value {
-            self.store_atomic(address, value);
-            self.b.ins().jump(done, &[]);
-        } else {
-            let result = self.load_atomic(address, ty);
-            self.b.ins().jump(done, &[result.into()]);
-        }
-        self.b.switch_to_block(overlay);
+        // The cold helper already preserves byte-atomic PCM subranges and
+        // prepares every lazy/COW page before a store commits. Share it with
+        // pure PCM accesses instead of emitting a second per-width access
+        // graph at every guest operand. Permission and code-write guards above
+        // retain the original fault address, PC and restartable SSA prefix.
         let slot = self.memory_buffer();
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
         let width = self.constant(size as u32);
@@ -5240,9 +5234,7 @@ impl Emitter<'_> {
     /// Consume a read immediately into SSA; no buffer pointer escapes or is
     /// live across another helper. One slot therefore serves the whole function.
     fn memory_buffer(&mut self) -> ir::StackSlot {
-        if self.optimizing
-            && let Some(slot) = self.memory_scratch
-        {
+        if let Some(slot) = self.memory_scratch {
             return slot;
         }
         let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
@@ -5250,42 +5242,8 @@ impl Emitter<'_> {
             16,
             4,
         ));
-        if self.optimizing {
-            self.memory_scratch = Some(slot);
-        }
+        self.memory_scratch = Some(slot);
         slot
-    }
-    fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
-        if ty.is_vector() {
-            // Sixteen inlined byte loads keep many GPR values live and make
-            // register allocation spill the ordinary copy loop. A bounded
-            // Relaxed helper loads into a private stack buffer instead.
-            let slot = self.memory_buffer();
-            let destination = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
-            self.b
-                .ins()
-                .call(self.atomic_load_ref, &[pointer, destination]);
-            return self.b.ins().stack_load(ty, slot, 0);
-        }
-        let mut value = self.b.ins().iconst(ty, 0);
-        for index in 0..ty.bytes() {
-            let address = self.b.ins().iadd_imm(pointer, i64::from(index));
-            // Cranelift currently exposes SeqCst atomic loads only. They are
-            // stronger than the protocol's Relaxed loads, with the same byte
-            // width. The compiler cannot combine them into an ordinary wide load.
-            let byte = self
-                .b
-                .ins()
-                .atomic_load(types::I8, MemFlags::trusted(), address);
-            if ty == types::I8 {
-                value = byte;
-            } else {
-                let byte = self.b.ins().uextend(ty, byte);
-                let byte = self.b.ins().ishl_imm(byte, i64::from(index * 8));
-                value = self.b.ins().bor(value, byte);
-            }
-        }
-        value
     }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
         if let Some(slot) = self.slot(self.b.func.dfg.value_type(value)) {
@@ -5570,13 +5528,78 @@ impl Emitter<'_> {
         })
     }
     fn materialize_flags(&mut self) -> Value {
-        let old = self.b.use_var(self.flags);
-        let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
-        for bit in [0, 2, 4, 6, 7, 11] {
-            let value = self.flag(bit);
-            let value = self.b.ins().ishl_imm(value, i64::from(bit));
-            flags = self.b.ins().bor(flags, value);
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Flags));
+        if self.optimizing {
+            // Speed already folds individual constant recipes. Keeping that
+            // shape avoids extending shared-expression live ranges at exits.
+            let old = self.b.use_var(self.flags);
+            let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
+            for bit in [0, 2, 4, 6, 7, 11] {
+                let value = self.flag(bit);
+                let value = self.b.ins().ishl_imm(value, i64::from(bit));
+                flags = self.b.ins().bor(flags, value);
+            }
+            self.mark_source(source);
+            return flags;
         }
+        // Materialize the complete word once. Independent flag consumers still
+        // use flag(), but a checkpoint shares the recipe decoding and masks.
+        let old = self.b.use_var(self.flags);
+        let a = self.b.use_var(self.lazy[0]);
+        let b = self.b.use_var(self.lazy[1]);
+        let result = self.b.use_var(self.lazy[2]);
+        let kind = self.b.use_var(self.lazy[3]);
+        let base = self.b.ins().band_imm(kind, 3);
+        let shift = self.b.ins().ushr_imm(kind, 8);
+        let raw = self.b.ins().icmp_imm(IntCC::Equal, base, 0);
+        let logical = self.b.ins().icmp_imm(IntCC::Equal, base, 3);
+        let zero = self.constant(0);
+        let ab = self.b.ins().bxor(a, b);
+
+        let low = self.b.ins().ushr(result, shift);
+        let byte = self.b.ins().band_imm(low, 255);
+        let parity = self.b.ins().popcnt(byte);
+        let parity = self.b.ins().band_imm(parity, 1);
+        let parity = self.b.ins().bxor_imm(parity, 1);
+        let parity = self.b.ins().ishl_imm(parity, 2);
+        let zf = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
+        let zf = self.b.ins().uextend(types::I32, zf);
+        let zf = self.b.ins().ishl_imm(zf, 6);
+        let sf = self.b.ins().ushr_imm(result, 24);
+        let sf = self.b.ins().band_imm(sf, 0x80);
+        let af = self.b.ins().bxor(ab, result);
+        let af = self.b.ins().ushr(af, shift);
+        let af = self.b.ins().band_imm(af, 0x10);
+        let af = self.b.ins().select(logical, zero, af);
+        let derived = self.b.ins().bor(parity, zf);
+        let derived = self.b.ins().bor(derived, sf);
+        let derived = self.b.ins().bor(derived, af);
+        let canonical = self.b.ins().band_imm(old, 0xd4);
+        let partial = self.b.ins().select(raw, canonical, derived);
+
+        // OF may be replaced by a later rotate/multiply while PF/AF/ZF/SF
+        // still refer to the previous recipe (including canonical entry flags).
+        let add = self.b.ins().icmp_imm(IntCC::Equal, base, 1);
+        let not_ab = self.b.ins().bnot(ab);
+        let first = self.b.ins().select(add, not_ab, ab);
+        let ar = self.b.ins().bxor(a, result);
+        let overflow = self.b.ins().band(first, ar);
+        let overflow = self.b.ins().ushr_imm(overflow, 20);
+        let overflow = self.b.ins().band_imm(overflow, 0x800);
+        let overflow = self.b.ins().select(logical, zero, overflow);
+        let carried = self.b.ins().band_imm(kind, 4);
+        let carried_value = self.b.ins().ishl_imm(b, 11);
+        let overflow = self.b.ins().select(carried, carried_value, overflow);
+        let raw_of = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
+        let old_of = self.b.ins().band_imm(old, 0x800);
+        let overflow = self.b.ins().select(raw_of, old_of, overflow);
+        let carry = self.flag(0);
+        let preserved = self.b.ins().band_imm(old, !0x8d5_i64);
+        let flags = self.b.ins().bor(preserved, partial);
+        let flags = self.b.ins().bor(flags, overflow);
+        let flags = self.b.ins().bor(flags, carry);
+        self.mark_source(source);
         flags
     }
     /// Whether `result` is the instruction `opcode` applied to `a` and `b`.

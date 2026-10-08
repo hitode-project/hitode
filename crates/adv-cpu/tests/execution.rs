@@ -644,18 +644,19 @@ fn cliffs_count_native_fallbacks_by_instruction() {
 
 #[test]
 fn cliffs_attribute_exact_x87_work_to_the_control_word() {
-    for (control, reason) in [
-        (0x027f_u16, None),
-        (0x037f, Some(adv_cpu::X87Cliff::Control)),
-        (0x077f, Some(adv_cpu::X87Cliff::Control)),
-        (0x0b7f, Some(adv_cpu::X87Cliff::Control)),
-        (0x0f7f, Some(adv_cpu::X87Cliff::Control)),
-        (0x037e, Some(adv_cpu::X87Cliff::Control)),
+    for (control, inexact, reason) in [
+        (0x027f_u16, false, None),
+        (0x037f, false, None),
+        (0x037f, true, Some(adv_cpu::X87Cliff::Control)),
+        (0x077f, false, Some(adv_cpu::X87Cliff::Control)),
+        (0x0b7f, false, Some(adv_cpu::X87Cliff::Control)),
+        (0x0f7f, false, Some(adv_cpu::X87Cliff::Control)),
+        (0x037e, false, Some(adv_cpu::X87Cliff::Control)),
     ] {
         let code = assemble(|a| {
             a.fldcw(word_ptr(DATA)).unwrap();
             a.fld(qword_ptr(DATA + 8)).unwrap();
-            a.fdiv_2(st0, st0).unwrap();
+            a.fdiv(qword_ptr(DATA + 24)).unwrap();
             a.fld(qword_ptr(DATA + 8)).unwrap();
             a.fmul_2(st0, st1).unwrap();
             a.fstp(qword_ptr(DATA + 16)).unwrap();
@@ -665,10 +666,15 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
         let mut jit = machine(&code, true);
         jit.write(DATA, &control.to_le_bytes()).unwrap();
         jit.write(DATA + 8, &3.0f64.to_le_bytes()).unwrap();
+        jit.write(
+            DATA + 24,
+            &(if inexact { 5.0f64 } else { 3.0f64 }).to_le_bytes(),
+        )
+        .unwrap();
         assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(
             jit.memory().read(DATA + 16, 8).unwrap(),
-            3.0f64.to_le_bytes()
+            (if inexact { 1.8f64 } else { 3.0f64 }).to_le_bytes()
         );
         let cliffs = &jit.stats.cliffs;
         let exact = cliffs
@@ -685,7 +691,7 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
             "{cliffs:?}"
         );
         let candidates = cliffs.x87_pc64_rows();
-        if control == 0x037f {
+        if control == 0x037f && inexact {
             assert!(
                 candidates
                     .iter()

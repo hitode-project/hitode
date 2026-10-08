@@ -290,7 +290,8 @@ fn exceptional_encodings_stack_faults_and_divide_by_zero_are_transactional() {
         s.x87.regs[slot] = value;
         s.x87.set_physical_tag(slot, value.tag());
         s.refresh_mmx();
-        compare(&code, s, |_| {}, Some(1));
+        // Normal raw80 copies need no binary64 precision/exponent restriction.
+        compare(&code, s, |_| {}, Some(u64::from(value.tag() == 2)));
     }
     for tags in [0, 0xffff] {
         let mut s = state();
@@ -594,6 +595,8 @@ mod segment_tests;
 
 #[path = "pc64_tests.rs"]
 mod pc64_tests;
+#[path = "rest_tests.rs"]
+mod rest_tests;
 
 #[path = "hardware_tests.rs"]
 #[cfg(target_arch = "x86_64")]

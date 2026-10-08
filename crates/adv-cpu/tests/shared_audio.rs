@@ -6,7 +6,7 @@
 ))]
 use adv_cpu::JitCpu;
 use adv_cpu::backend::{Guest, Prot, SharedRegion};
-use adv_cpu::{Region, RunOutcome};
+use adv_cpu::{CompileStrategy, Region, RunOutcome};
 use iced_x86::code_asm::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +46,74 @@ fn run(cpu: &mut JitCpu) {
         cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
         RunOutcome::ReachedStop
     );
+}
+
+#[test]
+fn cold_pcm_operands_match_interpreter_at_every_width_in_both_strategies() {
+    for width in [1, 2, 4, 8, 16] {
+        let code = bytes(|a| {
+            a.add(ebx, 1).unwrap();
+            match width {
+                1 => {
+                    a.mov(al, byte_ptr(esi)).unwrap();
+                    a.mov(byte_ptr(edi), al).unwrap();
+                }
+                2 => {
+                    a.mov(ax, word_ptr(esi)).unwrap();
+                    a.mov(word_ptr(edi), ax).unwrap();
+                }
+                4 => {
+                    a.mov(eax, dword_ptr(esi)).unwrap();
+                    a.mov(dword_ptr(edi), eax).unwrap();
+                }
+                8 => {
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
+                    a.movq(qword_ptr(edi), mm0).unwrap();
+                }
+                _ => {
+                    a.movdqu(xmm0, ptr(esi)).unwrap();
+                    a.movdqu(ptr(edi), xmm0).unwrap();
+                }
+            }
+            a.ret().unwrap();
+        });
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            let mut outputs = Vec::new();
+            for native in [false, true] {
+                let (mut cpu, audio) = fixture(&code, false);
+                let input: Vec<_> = (0..8192).map(|i| (i * 37 + 11) as u8).collect();
+                cpu.write(DATA, &input).unwrap();
+                let machine = cpu.executor_mut();
+                machine.state.regs[0] = 0xabcd_ef01;
+                machine.state.regs[3] = 0x7fff_ffff;
+                machine.state.regs[6] = DATA + 4093;
+                machine.state.regs[7] = DATA + 2049;
+                machine.state.eflags = 0x203;
+                if native {
+                    let mut region = Region::new(CODE, code.len());
+                    region.compile_strategy = strategy;
+                    machine.add_region(region).unwrap();
+                }
+                run(&mut cpu);
+                let mut output = vec![0; 8192];
+                audio.read_alias.copy_into(0, &mut output);
+                assert_eq!(&output[2049..2049 + width], &input[4093..4093 + width]);
+                if native {
+                    assert_eq!(cpu.stats().interpreter_instructions, 0);
+                }
+                let state = &cpu.executor().state;
+                outputs.push((
+                    state.regs,
+                    state.eflags,
+                    state.xmm,
+                    state.mmx,
+                    state.x87.clone(),
+                    output,
+                ));
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+    }
 }
 
 #[test]

@@ -88,8 +88,8 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
     ] {
         imm(&mut code, &[opcode], value);
     }
-    // A legitimate host token on the stack is insufficient. Break the exact
-    // PUSH-token/INT transport sequence with NOP before the authored raw INT.
+    // A known API index is not a registered typed transport word. It must
+    // remain raw even with unrelated stack operations before the interrupt.
     code.push_imm(token);
     code.bytes.push(0x90);
     imm(&mut code, &[0x89, 0x25], DATA);

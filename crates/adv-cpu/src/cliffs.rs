@@ -93,6 +93,7 @@ pub struct Cliffs {
     /// Actual Tier 1 bridge retirements, disjoint from interpreter counters.
     pub tier1_bridge: Count,
     pub(crate) tier1_bridge_details: HashMap<(InterpreterReason, Option<InterpreterDetail>), Count>,
+    pub(crate) x87_forms: crate::floating::fast::diagnostics::Census,
     pub tier1_census: Option<crate::Tier1Census>,
     pub x87_helper_calls: u64,
     /// Helper calls completed by the host-double fast path.
@@ -119,6 +120,7 @@ impl Cliffs {
             count.entries += n.entries;
             count.instructions += n.instructions;
         }
+        self.x87_forms.merge(other.x87_forms);
         if let Some(census) = other.tier1_census {
             self.tier1_census
                 .get_or_insert_with(Default::default)
@@ -234,6 +236,7 @@ impl Cliffs {
 
     /// Exact-model x87 calls as (`mnemonic/reason`, count), most frequent first.
     pub fn x87_exact_rows(&self) -> Vec<(String, u64)> {
+        self.x87_forms.report();
         rows(
             self.x87_exact
                 .iter()

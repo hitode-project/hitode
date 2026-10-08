@@ -5,6 +5,8 @@ use iced_x86::code_asm::*;
 const BASE: u32 = 0x10000;
 const CODE: u32 = BASE + 0x4000;
 type Asm = fn(&mut CodeAssembler, AsmRegisterSt) -> Result<(), IcedError>;
+#[path = "rest_tests.rs"]
+mod rest;
 
 #[test]
 fn wait_helper_checks_es_and_preserves_every_status_bit() {

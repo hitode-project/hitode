@@ -1,18 +1,24 @@
 //! Host-double execution of the x87 operations that dominate compiled float
 //! loops. It applies only where the result is bit-identical to the
 //! transactional path: no pending exception, live MMX state committed, the
-//! touched stack slots valid, and every operand an exact double. Arithmetic
+//! touched stack slots valid. Copies and comparisons keep ordinary raw80;
+//! stores round its significand once. Arithmetic requires exact doubles and
 //! also needs round-to-nearest and masked exceptions, and operands within 2^±400
 //! so neither the result nor the error terms used for the precision flag can
 //! overflow, underflow or go denormal. Precision control 53 uses the binary64
 //! result directly. Precision control 24 additionally needs 24-bit operands:
 //! rounding their binary64 result again to 24 bits is then the correctly rounded
 //! result (53 >= 2 * 24 + 2), with the extended exponent range kept. Everything
-//! at PC=64 requires an exact add/subtract/product, including signed zero;
-//! other cases return `None` before state changes and take the transaction.
+//! at PC=64 requires an exact result, including signed zero; division also
+//! bounds the quotient so its product residual cannot underflow;
+//! other arithmetic cases return `None` before state changes and take the transaction.
 use super::{Memory, NativeX87, X87_DONE, X87_EXIT, reg_index};
 use crate::{CpuState, PAGE_SIZE, READ, WRITE, X87Register as Ext};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
+pub(crate) mod diagnostics;
+mod extra;
+mod raw;
+pub(crate) use extra::execute as execute_other;
 
 const PE: u16 = 0x20;
 const C0: u16 = 0x100;
@@ -288,7 +294,10 @@ fn arithmetic(op: Op, a: f64, b: f64) -> (f64, f64) {
             // r = a - q*b is computed exactly enough to give its sign; the
             // exact quotient minus q has the sign of r/b.
             let r = (a - q * b) - product_error(q, b, q * b);
-            (q, if r == 0.0 { 0.0 } else { r / b })
+            // Preserve a nonzero residual instead of dividing it a second
+            // time. Only the sign of exact - rounded is consumed by callers.
+            let sign = f64::from_bits(r.to_bits() ^ (b.to_bits() & (1 << 63)));
+            (q, r.abs().copysign(sign))
         }
     }
 }
@@ -455,7 +464,8 @@ pub(super) fn pc64_opportunity(
     else {
         return X87Pc64::Other;
     };
-    // Division needs a separate quotient-residual proof and is not a candidate.
+    // Keep division in Other for compatibility with this legacy add/sub/mul
+    // census. The opt-in form census reports division rejections separately.
     if op == Op::Div {
         return X87Pc64::Other;
     }
@@ -536,13 +546,13 @@ pub(crate) fn execute(
         // the last x87 instruction/data metadata, regardless of the control word.
         Fast::Wait => metadata = false,
         Fast::Load(source) => {
-            let (value, at) = load(source, i, state, memory, i32::MAX)?;
+            let (value, at) = raw::source(source, i, state, memory)?;
             let target = top.wrapping_sub(1) & 7;
             if !empty(target) {
                 return None;
             }
             top = target;
-            writes[0] = (target, extended(value));
+            writes[0] = (target, value);
             dp = at;
             status &= !C1;
         }
@@ -568,38 +578,7 @@ pub(crate) fn execute(
             if empty(physical) {
                 return None;
             }
-            let value = double(x87.regs[physical], 1023)?;
-            let (bytes, exact, up) = if integer {
-                let result = match control >> 10 & 3 {
-                    0 => value.round_ties_even(),
-                    3 => value.trunc(),
-                    _ => return None,
-                };
-                let limit = if width == 4 {
-                    2f64.powi(31)
-                } else {
-                    2f64.powi(63)
-                };
-                if result < -limit || result >= limit {
-                    return None;
-                }
-                let bits = (result as i64).to_le_bytes();
-                (bits, result == value, result.abs() > value.abs())
-            } else if width == 8 {
-                (value.to_bits().to_le_bytes(), true, false)
-            } else {
-                if control >> 10 & 3 != 0 {
-                    return None;
-                }
-                let result = value as f32;
-                if value != 0.0 && !result.is_normal() {
-                    return None;
-                }
-                let widened = f64::from(result);
-                let mut bytes = [0; 8];
-                bytes[..4].copy_from_slice(&result.to_bits().to_le_bytes());
-                (bytes, widened == value, widened.abs() > value.abs())
-            };
+            let (bits, exact, up) = raw::store_bits(x87.regs[physical], width, integer, control)?;
             if !exact && control & PE == 0 {
                 return None;
             }
@@ -607,7 +586,7 @@ pub(crate) fn execute(
             if !exact {
                 status |= PE | if up { C1 } else { 0 };
             }
-            store(memory, at, &bytes[..usize::from(width)])?;
+            store(memory, at, &bits.to_le_bytes()[..usize::from(width)])?;
             dp = Some(at);
             if pop {
                 tags_freed[0] = physical;
@@ -620,7 +599,7 @@ pub(crate) fn execute(
                 return None;
             }
             // Register copies keep any valid encoding the stack already holds.
-            double(x87.regs[from], i32::MAX)?;
+            raw::ordinary(x87.regs[from])?;
             writes[0] = (slot(top, usize::from(index)), x87.regs[from]);
             status &= !C1;
             if pop {
@@ -636,9 +615,6 @@ pub(crate) fn execute(
             pop,
         } => {
             let precision = if control & 0x0f3f == 0x033f {
-                if op == Op::Div {
-                    return None;
-                }
                 64
             } else {
                 arithmetic_precision(control)?
@@ -659,6 +635,13 @@ pub(crate) fn execute(
                 return None;
             }
             let (mut result, error) = arithmetic(op, a, b);
+            // With q and b within 2^+-400, q*b and its nonzero residual
+            // lie on the 2^-904 grid; Dekker splitting cannot overflow.
+            // a and fl(q*b) are adjacent enough for exact subtraction. Thus
+            // residual == 0 proves q*b == a, including for signed zero a.
+            if precision == 64 && op == Op::Div && !bounded(result, RANGE) {
+                return None;
+            }
             // The range proof in pc64_opportunity rules out lost residuals.
             // Nearest cancellation gives +0 (except -0 + -0); multiplication
             // preserves sign XOR. These zero rules match the extended model.
@@ -692,12 +675,13 @@ pub(crate) fn execute(
             if empty(first) {
                 return None;
             }
-            let a = double(x87.regs[first], i32::MAX)?;
-            let (b, at) = load(source, i, state, memory, i32::MAX)?;
+            let a = raw::ordinary(x87.regs[first])?;
+            let (b, at) = raw::source(source, i, state, memory)?;
+            let comparison = raw::compare(a, b);
             status = (status & !(C0 | C1 | C2 | C3))
-                | if a == b {
+                | if comparison.is_eq() {
                     C3
-                } else if a < b {
+                } else if comparison.is_lt() {
                     C0
                 } else {
                     0
@@ -713,8 +697,8 @@ pub(crate) fn execute(
             if empty(first) || empty(second) {
                 return None;
             }
-            double(x87.regs[first], i32::MAX)?;
-            double(x87.regs[second], i32::MAX)?;
+            raw::ordinary(x87.regs[first])?;
+            raw::ordinary(x87.regs[second])?;
             writes = [(first, x87.regs[second]), (second, x87.regs[first])];
             status &= !C1;
         }
@@ -723,14 +707,17 @@ pub(crate) fn execute(
             if empty(target) {
                 return None;
             }
-            let value = double(x87.regs[target], i32::MAX)?;
+            let value = raw::ordinary(x87.regs[target])?;
             writes[0] = (
                 target,
-                extended(if fast == Fast::Negate {
-                    -value
-                } else {
-                    value.abs()
-                }),
+                Ext::from_parts(
+                    value.significand(),
+                    if fast == Fast::Negate {
+                        value.sign_exponent() ^ 0x8000
+                    } else {
+                        value.sign_exponent() & 0x7fff
+                    },
+                ),
             );
             status &= !C1;
         }

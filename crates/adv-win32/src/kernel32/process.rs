@@ -8,6 +8,8 @@ use adv_os::{Heaps, processes};
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
+#[cfg(test)]
+mod live_context_tests;
 mod parameters;
 mod processor;
 #[cfg(test)]
@@ -834,13 +836,13 @@ fn thread_context_front(
             .sys
             .contexts
             .get(identity.context as usize)
-            .is_none_or(|context| context.suspend_count == 0 || context.is_done())
+            .is_none_or(|context| context.is_done() || (set && context.suspend_count == 0))
     {
         return front.error(
             env,
             processes::Error::new(
                 err::INVALID_PARAMETER,
-                "thread CONTEXT requires a suspended thread",
+                "thread CONTEXT requires a live target and suspended SET",
             ),
         );
     }
@@ -870,10 +872,13 @@ fn thread_context_front(
         identity.process.pid,
         Some(identity.context),
         move |target| {
-            if target.ctx().suspend_count == 0 {
+            // The supervisor has collected CPU leases and materialized this
+            // target's registers. A read needs that boundary, not an external
+            // suspend count; writes retain the existing suspended-thread rule.
+            if target.ctx().is_done() || (set && target.ctx().suspend_count == 0) {
                 return Err(processes::Error::new(
                     err::INVALID_PARAMETER,
-                    "thread CONTEXT requires a suspended thread",
+                    "thread CONTEXT requires a live target and suspended SET",
                 ));
             }
             let mut state = target
