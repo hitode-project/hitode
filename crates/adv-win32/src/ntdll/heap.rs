@@ -8,9 +8,33 @@ use adv_os::Heaps;
 const HEAP_GENERATE_EXCEPTIONS: u32 = 4;
 const STATUS_NO_MEMORY: u32 = 0xc000_0017;
 
+fn effective_flags(env: &mut Env<'_>, heap: u32, flags: u32, api: &str) -> Option<u32> {
+    match env.ext.get::<Heaps>().generates_exceptions(heap) {
+        Some(true) => Some(flags | HEAP_GENERATE_EXCEPTIONS),
+        Some(false) => Some(flags),
+        None => {
+            // Unowned storage is an invalid/corrupt heap, not an OOM result.
+            // Keep its unsupported exception behavior visible instead of raising
+            // a misleading STATUS_NO_MEMORY or inheriting the process heap policy.
+            warn_unavailable(
+                env,
+                api,
+                "heap handle is not owned by this process; invalid/corrupt heap exception behavior is unavailable",
+            );
+            None
+        }
+    }
+}
+
 /// Publish failure only after `with_heap` has released its temporary recursion.
 /// A waiter repeats this check after it obtains and releases the same heap lock.
-fn allocation_result(env: &mut Env<'_>, result: Outcome, flags: u32, size: u32) -> Outcome {
+fn allocation_result(
+    env: &mut Env<'_>,
+    result: Outcome,
+    flags: u32,
+    size: u32,
+    resume_eip: u32,
+) -> Outcome {
     match result {
         Outcome::Return(0)
             if flags & HEAP_GENERATE_EXCEPTIONS != 0
@@ -19,7 +43,7 @@ fn allocation_result(env: &mut Env<'_>, result: Outcome, flags: u32, size: u32) 
             // A vectored handler may continue this API's captured epilogue.
             // Allocation still failed; do not expose its previous EAX as success.
             env.cpu.set_reg(Reg::Eax, 0);
-            crate::kernel32::raise_status(env, STATUS_NO_MEMORY, 0, &[size])
+            crate::kernel32::raise_status(env, STATUS_NO_MEMORY, 0, &[size], resume_eip)
         }
         Outcome::Block {
             wait,
@@ -29,7 +53,7 @@ fn allocation_result(env: &mut Env<'_>, result: Outcome, flags: u32, size: u32) 
             wait,
             then: Box::new(move |env, resume| {
                 let result = then(env, resume);
-                allocation_result(env, result, flags, size)
+                allocation_result(env, result, flags, size, resume_eip)
             }),
             allow_time_skip,
         },
@@ -53,6 +77,12 @@ pub(crate) fn allocate_shared(env: &mut Env<'_>, heap: u32, flags: u32, size: u3
         );
         return Outcome::Return(0);
     }
+    let Some(flags) = effective_flags(env, heap, flags, "ntdll.dll!RtlAllocateHeap") else {
+        return Outcome::Return(0);
+    };
+    // A blocked backend parks EIP before the wake continuation runs. Retain the
+    // actual entry's epilogue, including a guest trampoline or relocated thunk.
+    let resume_eip = env.cpu.reg(Reg::Eip);
     let result = crate::heap_lock::with_heap(env, heap, flags, move |env| {
         let pointer = env
             .ext
@@ -64,7 +94,7 @@ pub(crate) fn allocate_shared(env: &mut Env<'_>, heap: u32, flags: u32, size: u3
         }
         Outcome::Return(pointer)
     });
-    allocation_result(env, result, flags, size)
+    allocation_result(env, result, flags, size, resume_eip)
 }
 
 #[win32(ntdll, name = "RtlFreeHeap", level = state)]
@@ -131,10 +161,14 @@ pub(crate) fn reallocate_shared(
         );
         return Outcome::Return(0);
     }
+    let Some(flags) = effective_flags(env, heap, flags, "ntdll.dll!RtlReAllocateHeap") else {
+        return Outcome::Return(0);
+    };
+    let resume_eip = env.cpu.reg(Reg::Eip);
     let result = crate::heap_lock::with_heap(env, heap, flags, move |env| {
         crate::kernel32::memory::reallocate(env, heap, flags, pointer, size)
     });
-    allocation_result(env, result, flags, size)
+    allocation_result(env, result, flags, size, resume_eip)
 }
 
 fn size(env: &mut Env<'_>, heap: u32, flags: u32, pointer: u32) -> Outcome {

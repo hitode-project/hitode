@@ -322,3 +322,46 @@ fn open_event_uses_case_sensitive_shared_namespace_and_rejects_wrong_types_or_ac
     assert_eq!(f.call("CloseHandle", &[event]), 1);
     assert_eq!(f.call("CloseHandle", &[mutex]), 1);
 }
+
+#[test]
+fn remaining_mutex_and_semaphore_fronts_report_modified_native_entries() {
+    use adv_abi::{ApiDiagnostics, RunMode};
+    let cases: &[(&str, &str, &[u32])] = &[
+        ("CreateSemaphoreA", "NtCreateSemaphore", &[0, 0, 1, 0]),
+        ("CreateSemaphoreW", "NtCreateSemaphore", &[0, 0, 1, 0]),
+        ("ReleaseSemaphore", "NtReleaseSemaphore", &[0, 1, 0]),
+        ("CreateMutexA", "NtCreateMutant", &[0, 0, 0]),
+        ("CreateMutexW", "NtCreateMutant", &[0, 0, 0]),
+        ("ReleaseMutex", "NtReleaseMutant", &[0]),
+        ("OpenMutexA", "NtOpenMutant", &[0x1f0001, 0, 0]),
+        ("OpenMutexW", "NtOpenMutant", &[0x1f0001, 0, 0]),
+    ];
+    for &(front, native, args) in cases {
+        let mut f = Fixture::new();
+        crate::Win32::prepare_process_infrastructure(&mut f.0).unwrap();
+        f.call(front, args);
+        assert!(
+            f.0.ext
+                .get_or_default::<ApiDiagnostics>()
+                .acceptance_eligible(RunMode::Strict),
+            "{front}"
+        );
+        let target = {
+            let m = &mut f.0;
+            let mut env = Env {
+                context: 0,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            };
+            crate::native::entry(&mut env, native).unwrap()
+        };
+        // Authored replacement bytes only test whether the host bypass is visible.
+        f.0.cpu.write(target, &[0xcc]).unwrap();
+        f.call(front, args);
+        let diagnostics = f.0.ext.get::<ApiDiagnostics>();
+        assert_eq!(diagnostics.structural_mismatches, 1, "{front}");
+        assert!(!diagnostics.acceptance_eligible(RunMode::Strict), "{front}");
+    }
+}

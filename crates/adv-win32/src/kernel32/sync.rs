@@ -350,11 +350,17 @@ fn open_event_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -
 }
 
 fn create_semaphore(env: &mut Env<'_>) -> Outcome {
+    crate::native::diagnose_bypass(env, "kernel32.dll!CreateSemaphore", &["NtCreateSemaphore"]);
     let (count, max) = (env.arg(1), env.arg(2));
     created(env, Object::Semaphore { count, max })
 }
 
 fn release_semaphore(env: &mut Env<'_>) -> Outcome {
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!ReleaseSemaphore",
+        &["NtReleaseSemaphore"],
+    );
     let (h, n, prev) = (env.arg(0), env.arg(1), env.arg(2));
     let Some(Object::Semaphore { count, max }) = env.sys.objects.get_mut(h) else {
         set_last_error(env, err::INVALID_HANDLE);
@@ -372,6 +378,7 @@ fn release_semaphore(env: &mut Env<'_>) -> Outcome {
 }
 
 fn create_mutex(env: &mut Env<'_>) -> Outcome {
+    crate::native::diagnose_bypass(env, "kernel32.dll!CreateMutex", &["NtCreateMutant"]);
     let owned = env.arg(1) != 0;
     let cur = env.context;
     let owner = owned.then_some(cur);
@@ -386,15 +393,18 @@ fn create_mutex(env: &mut Env<'_>) -> Outcome {
 
 #[win32(kernel32, name = "OpenMutexA", level = implement)]
 fn open_mutex_a(env: &mut Env<'_>, _access: u32, _inherit: i32, name: AnsiStr) -> Outcome {
+    crate::native::diagnose_bypass(env, "kernel32.dll!OpenMutex", &["NtOpenMutant"]);
     super::file_mapping::open_mutex(env, name.0.addr(), false)
 }
 
 #[win32(kernel32, name = "OpenMutexW", level = implement)]
 fn open_mutex_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -> Outcome {
+    crate::native::diagnose_bypass(env, "kernel32.dll!OpenMutex", &["NtOpenMutant"]);
     super::file_mapping::open_mutex(env, name.0.addr(), true)
 }
 
 fn release_mutex(env: &mut Env<'_>) -> Outcome {
+    crate::native::diagnose_bypass(env, "kernel32.dll!ReleaseMutex", &["NtReleaseMutant"]);
     let h = env.arg(0);
     let cur = env.context;
     let result = match env.sys.objects.get_mut(h) {
