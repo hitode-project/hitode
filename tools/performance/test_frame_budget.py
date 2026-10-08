@@ -145,7 +145,8 @@ class FrameBudgetTests(unittest.TestCase):
             root = Path(directory)
             helper = root / "device.ps1"
             helper.touch()
-            with patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
+            with patch.dict(budget.os.environ, {"ADV_DEVICE_TASK": "fixture-cvg"}), \
+                    patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
                 with self.assertRaisesRegex(RuntimeError, "fixture"):
                     with budget.device_lock(None, root, helper) as deadline:
                         self.assertGreater(deadline, time.monotonic())
@@ -154,7 +155,7 @@ class FrameBudgetTests(unittest.TestCase):
                 self.assertIn("Request-Device", invoke.call_args_list[0].args[0][-1])
                 self.assertIn("Release-Device", invoke.call_args_list[1].args[0][-1])
                 self.assertNotIn("-Done", invoke.call_args_list[1].args[0][-1])
-                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "bud")
+                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "fixture-cvg")
                 sleep.assert_not_called()
 
     def test_pcm_failure_is_explicit_without_exporting_raw_diagnostics(self):
