@@ -1003,14 +1003,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             });
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
-    let mut builder = JITBuilder::with_flags(
-        &[
-            ("opt_level", opt_level),
-            ("preserve_frame_pointers", "true"),
-        ],
-        default_libcall_names(),
-    )
-    .map_err(|e| e.to_string())?;
+    let backend_flags = [
+        ("opt_level", opt_level),
+        ("preserve_frame_pointers", "true"),
+    ];
+    #[cfg(feature = "gir-capture")]
+    let backend_flags = {
+        let mut flags = backend_flags.to_vec();
+        if std::env::var_os("ADV_GIR_NATIVE").is_some() {
+            flags.push(("machine_code_cfg_info", "true"));
+        }
+        flags
+    };
+    let mut builder = JITBuilder::with_flags(&backend_flags, default_libcall_names())
+        .map_err(|e| e.to_string())?;
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
@@ -2204,6 +2210,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     {
         if let Some(code) = context.compiled_code() {
             ir_counts::Counts::native(ir_counts.as_ref(), code, region.start, &instructions);
+            #[cfg(feature = "gir-capture")]
+            crate::gir_capture::native(context, std::env::consts::ARCH);
         }
     }
     code_size += wrapper
@@ -2295,6 +2303,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
     }
+    #[cfg(feature = "gir-capture")]
+    crate::gir_capture::record(region, snapshot.origin, bytes, &instructions);
     Ok(Compiled {
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(
@@ -2722,6 +2732,12 @@ fn aarch64_vcode(mut function: ir::Function, opt_level: &str) -> Result<String, 
     flags
         .set("preserve_frame_pointers", "true")
         .map_err(|e| e.to_string())?;
+    #[cfg(feature = "gir-capture")]
+    if std::env::var_os("ADV_GIR_NATIVE").is_some() {
+        flags
+            .set("machine_code_cfg_info", "true")
+            .map_err(|e| e.to_string())?;
+    }
     let isa = cranelift_codegen::isa::lookup_by_name("aarch64")
         .map_err(|e| e.to_string())?
         .finish(settings::Flags::new(flags))
@@ -2731,7 +2747,10 @@ fn aarch64_vcode(mut function: ir::Function, opt_level: &str) -> Result<String, 
     let code = context
         .compile(&*isa, &mut Default::default())
         .map_err(|e| format!("{e:?}"))?;
-    Ok(code.vcode.clone().unwrap_or_default())
+    let vcode = code.vcode.clone().unwrap_or_default();
+    #[cfg(feature = "gir-capture")]
+    crate::gir_capture::native(&context, "aarch64");
+    Ok(vcode)
 }
 
 /// Checked iterations a versioned loop runs after a failed proof, or after

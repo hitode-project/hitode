@@ -26,6 +26,21 @@ mod fault_recipe;
 pub mod fault_recovery;
 mod file_memory;
 mod floating;
+// Research only: no GIR code or entry points in normal library builds.
+#[cfg(all(
+    test,
+    any(
+        all(windows, target_arch = "x86_64", target_env = "msvc"),
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod gir;
+#[cfg(feature = "gir-capture")]
+#[path = "gir/capture.rs"]
+mod gir_capture;
 // The opt-in fault lane accepts only verified scalar recovery sites. Other
 // accesses and hosts retain the current checked execution lane.
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
