@@ -169,6 +169,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn polling_word_pointer_has_a_fixed_native_offset() {
+        assert_eq!(std::mem::size_of::<std::sync::atomic::AtomicBool>(), 1);
+        assert_eq!(std::mem::offset_of!(NativeContext, interrupt), 40);
+    }
+
     /// The probe generated code performs.
     fn lookup(table: &Table, pc: u32) -> Option<usize> {
         let (slots, mask) = table.parts();

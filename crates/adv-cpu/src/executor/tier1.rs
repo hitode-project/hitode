@@ -101,6 +101,11 @@ impl Executor {
             &mut self.interpreter,
             units,
             stop,
+            if self.host_interrupts {
+                self.interrupt.as_ref()
+            } else {
+                &self.inactive_interrupt
+            },
             (self.tier1_mode == Tier1Mode::Bridge)
                 .then_some((&self.code.entry_owner, self.code.cache_revision)),
         )?;
@@ -157,5 +162,36 @@ mod tests {
             assert!(m.auto_jit && m.async_compilation);
             assert_eq!(m.tier1_mode(), Tier1Mode::Off);
         }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
+    #[test]
+    fn disabling_host_interrupts_uses_the_inactive_poll_word() {
+        use iced_x86::code_asm::CodeAssembler;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut assembler = CodeAssembler::new(32).unwrap();
+        for _ in 0..4 {
+            assembler.nop().unwrap();
+        }
+        let code = assembler.assemble(0x10000).unwrap();
+        let stop = 0x10000 + code.len() as u32;
+        let mut owner = Executor::new(0x10000, 4096).unwrap();
+        owner.write(0x10000, &code).unwrap();
+        owner
+            .protect(0x10000, 4096, crate::READ | crate::EXEC)
+            .unwrap();
+        owner.set_arm64_tier1(true).unwrap();
+        owner.state.eip = 0x10000;
+        let interrupt = Arc::new(AtomicBool::new(true));
+        owner.set_host_interrupt_flag(interrupt.clone());
+        owner.set_host_interrupts(false);
+        assert_eq!(owner.run(stop, 10).unwrap(), crate::RunOutcome::ReachedStop);
+        assert_eq!(owner.tier1_stats().native_instructions, 4);
+        assert!(interrupt.load(Ordering::Acquire));
     }
 }
