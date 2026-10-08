@@ -79,6 +79,16 @@ impl Attributes {
         }
     }
     fn set_normal(&self, path: &Path, metadata: &Metadata) -> io::Result<()> {
+        if metadata.is_dir() {
+            return Ok(());
+        }
+        if !metadata.is_file() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.set_normal_instance(identity(path, metadata)?, metadata)
+    }
+
+    fn set_normal_instance(&self, identity: FileIdentity, metadata: &Metadata) -> io::Result<()> {
         // DIRECTORY is structural, never converted into a regular file. The
         // currently supported directory metadata has no other mutable bits.
         if metadata.is_dir() {
@@ -87,7 +97,6 @@ impl Attributes {
         if !metadata.is_file() {
             return Err(io::ErrorKind::Unsupported.into());
         }
-        let identity = identity(path, metadata)?;
         let mut normal = self.normal.borrow_mut();
         if !normal.contains_key(&identity) && normal.len() >= MAX_NORMAL_INSTANCES {
             return Err(io::ErrorKind::OutOfMemory.into());
@@ -110,6 +119,12 @@ impl Vfs {
         self.attributes
             .read_instance(file_identity(file)?, &metadata)
     }
+
+    /// Update the opened backing instance, even after rename or path replacement.
+    pub fn set_file_handle_normal(&self, file: &std::fs::File) -> io::Result<()> {
+        self.attributes
+            .set_normal_instance(file_identity(file)?, &file.metadata()?)
+    }
     /// Baseline guest file metadata is ARCHIVE/DIRECTORY. An explicitly cleared
     /// regular-file instance reads NORMAL through both lookup and enumeration.
     pub fn file_attributes(&self, guest: &str) -> io::Result<u32> {
@@ -129,5 +144,44 @@ impl Vfs {
         let path = self.lookup(guest).ok_or(io::ErrorKind::NotFound)?;
         self.attributes
             .set_normal(&path, &std::fs::metadata(&path)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_attribute_update_follows_the_instance_after_name_replacement() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch/personality-files/attributes")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(root.join("game")).unwrap();
+        std::fs::write(root.join("game/original.dat"), b"original").unwrap();
+        let file = std::fs::File::open(root.join("game/original.dat")).unwrap();
+        std::fs::rename(
+            root.join("game/original.dat"),
+            root.join("game/renamed.dat"),
+        )
+        .unwrap();
+        std::fs::write(root.join("game/original.dat"), b"replacement").unwrap();
+        let vfs = Vfs::new(&OsConfig::new(
+            root.join("game"),
+            "fixture.exe",
+            root.join("data"),
+        ));
+        vfs.set_file_handle_normal(&file).unwrap();
+        assert_eq!(vfs.file_handle_attributes(&file).unwrap(), NORMAL);
+        assert_eq!(vfs.file_attributes("renamed.dat").unwrap(), NORMAL);
+        assert_eq!(vfs.file_attributes("original.dat").unwrap(), ARCHIVE);
+        drop(file);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

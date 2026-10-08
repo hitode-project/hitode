@@ -340,6 +340,50 @@ fn malformed_remote_headers_end_only_the_child_and_retain_diagnostics() {
 }
 
 #[test]
+fn structural_mismatch_in_a_child_disqualifies_the_family_after_retirement() {
+    let (mut runtime, spec, exe) = fixture();
+    let parent = runtime.machine.sys.pid;
+    let created = runtime.create_child(spec).unwrap();
+    let pid = created.process.pid;
+    let diagnostics = runtime
+        .family
+        .parked
+        .get_mut(&pid)
+        .unwrap()
+        .ext
+        .get_or_default::<adv_abi::ApiDiagnostics>();
+    diagnostics.structural_mismatches = 1;
+    diagnostics.warnings.insert(
+        (
+            "fixture.dll!frontend".into(),
+            "authored structural mismatch".into(),
+        ),
+        1,
+    );
+    assert!(!runtime.api_acceptance_eligible());
+    assert_eq!(runtime.process_structural_diagnostics(pid).0, 1);
+    created.publication.set(processes::Publication::Published);
+    drop(created);
+    assert!(runtime.select_process(pid));
+    runtime.record_exit(0, None);
+    assert!(runtime.select_process(parent));
+    runtime.reap();
+    assert!(!runtime.family.parked.contains_key(&pid));
+    assert!(!runtime.api_acceptance_eligible());
+    let (count, warnings) = runtime.process_structural_diagnostics(pid);
+    assert_eq!(count, 1);
+    assert_eq!(
+        warnings,
+        vec![(
+            "fixture.dll!frontend".into(),
+            "authored structural mismatch".into(),
+            1
+        )]
+    );
+    cleanup(exe);
+}
+
+#[test]
 fn live_process_limit_fails_without_publishing_an_extra_machine() {
     let (mut runtime, spec, exe) = fixture();
     let mut children = Vec::new();

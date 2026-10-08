@@ -1,8 +1,8 @@
 //! Reproducible PE32 system images. Layout follows Microsoft's PE/COFF format:
 //! https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
 //!
-//! SDK ordinal aliases are authoritative. Other named exports receive local EAT
-//! slots, not claims about the ordinal numbering of a particular Windows build.
+//! The caller supplies authoritative core-catalog or SDK ordinals. Other named
+//! exports receive local EAT slots, without claiming native ordinal numbering.
 use std::collections::{BTreeMap, BTreeSet};
 
 use adv_pe::{PeError, scn};
@@ -10,8 +10,13 @@ use adv_pe::{PeError, scn};
 #[derive(Clone)]
 pub enum Target {
     Code(Vec<u8>),
-    Data { binding: String, bytes: Vec<u8> },
+    Data {
+        binding: String,
+        bytes: Vec<u8>,
+    },
     Forwarder(String),
+    /// Preserve a declared name without inventing storage for unknown data.
+    Absent,
 }
 
 #[derive(Clone)]
@@ -28,6 +33,7 @@ pub struct Image {
     pub text_size: u32,
     pub data_rva: u32,
     pub data_size: u32,
+    pub private_entries: BTreeMap<String, u32>,
 }
 
 fn word(bytes: &mut [u8], at: usize, value: u32) {
@@ -47,6 +53,15 @@ fn string(bytes: &mut Vec<u8>, text: &str) -> u32 {
 }
 
 pub fn build(base: u32, module: &str, exports: &[Export]) -> Result<Image, PeError> {
+    build_with_private_entries(base, module, exports, &[])
+}
+
+pub fn build_with_private_entries(
+    base: u32,
+    module: &str,
+    exports: &[Export],
+    private: &[(String, Vec<u8>)],
+) -> Result<Image, PeError> {
     let malformed = |message: &str| PeError::Malformed(message.into());
     if module.as_bytes().contains(&0) || exports.len() > u16::MAX as usize {
         return Err(malformed("invalid synthetic module or export count"));
@@ -136,6 +151,20 @@ pub fn build(base: u32, module: &str, exports: &[Export]) -> Result<Image, PeErr
                 rva,
             );
         }
+    }
+    let mut private_entries = BTreeMap::new();
+    for (name, body) in private {
+        if name.is_empty()
+            || body.is_empty()
+            || body.len() > 32
+            || private_entries.contains_key(name)
+        {
+            return Err(malformed("invalid private system entry"));
+        }
+        let start = bytes.len();
+        bytes.resize(start + 48, 0x90);
+        bytes[start + 8..start + 8 + body.len()].copy_from_slice(body);
+        private_entries.insert(name.clone(), (start + 8) as u32);
     }
     let text_end = page(bytes.len().max(text_rva + 1));
     bytes.resize(text_end, 0);
@@ -247,6 +276,7 @@ pub fn build(base: u32, module: &str, exports: &[Export]) -> Result<Image, PeErr
         text_size: (text_end - text_rva) as u32,
         data_rva: data_rva as u32,
         data_size: data_size as u32,
+        private_entries,
     })
 }
 

@@ -5,7 +5,7 @@ use adv_abi::{GuestPtr, Handle, win32};
 const INFORMATION_SIZE: u32 = 52;
 
 #[cfg(windows)]
-fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
+pub(crate) fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     struct Information {
@@ -28,7 +28,7 @@ fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
 }
 
 #[cfg(unix)]
-fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
+pub(crate) fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
     let filetime = |time: std::io::Result<SystemTime>| -> u64 {
@@ -62,12 +62,18 @@ fn backing_information(file: &std::fs::File) -> std::io::Result<[u32; 13]> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn backing_information(_: &std::fs::File) -> std::io::Result<[u32; 13]> {
+pub(crate) fn backing_information(_: &std::fs::File) -> std::io::Result<[u32; 13]> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[win32(kernel32, name = "GetFileInformationByHandle", level = implement)]
 fn get_file_information(env: &mut Env<'_>, handle: Handle, output: GuestPtr<u8>) -> Outcome {
+    if native::metadata::active(
+        env,
+        &["NtQueryInformationFile", "NtQueryVolumeInformationFile"],
+    ) {
+        return native::metadata::information(env, handle.0, output.addr());
+    }
     let Some(file) = env.sys.objects.host::<FileObj>(handle.0) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -126,6 +132,11 @@ fn get_file_information(env: &mut Env<'_>, handle: Handle, output: GuestPtr<u8>)
         set_last_error(env, 998);
         return Outcome::Return(0);
     }
+    crate::native::diagnose_bypass(
+        env,
+        "kernel32.dll!GetFileInformationByHandle",
+        &["NtQueryInformationFile"],
+    );
     Outcome::Return(1)
 }
 

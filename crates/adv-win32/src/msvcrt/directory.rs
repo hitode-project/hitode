@@ -99,7 +99,10 @@ fn mkdir(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
         env.ext.get::<crate::Win32>().codec.decode(&bytes)
     };
     match crate::kernel32::create_directory_path(env, &path) {
-        Ok(()) => Outcome::Return(0), // Preserve existing errno/DOS errno.
+        Ok(()) => {
+            crate::native::diagnose_bypass(env, &api(env, wide), &["NtCreateFile"]);
+            Outcome::Return(0)
+        } // Preserve existing errno/DOS errno.
         Err(dos) => fail(env, errno, dos_errno(dos), dos),
     }
 }

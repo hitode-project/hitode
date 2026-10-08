@@ -16,7 +16,10 @@ fn omission_reason(name: &str) -> &'static str {
     } else if export.starts_with('<')
         || export.starts_with("__pal_")
         || module == "<win32>"
-            && matches!(export, "startup_enter" | "startup_leave" | "thread_start")
+            && matches!(
+                export,
+                "startup_enter" | "startup_leave" | "thread_start" | "thread_exception_handler"
+            )
     {
         "personality-internal guest entry"
     } else if module == "kernel32.dll" && export == "GetEnvironmentStringsA" {
@@ -40,6 +43,14 @@ fn omission_reason(name: &str) -> &'static str {
         // SDK 10.0.26100.0 um/x86/ntdll.lib independently records
         // _RtlFormatCurrentUserKeyPath@4. Do not invent a full metadata signature.
         "documented legacy RTL export absent from pinned WinMD"
+    } else if module == "ntdll.dll"
+        && matches!(
+            export,
+            "LdrInitializeThunk" | "RtlUserThreadStart" | "KiUserExceptionDispatcher"
+        )
+        || module == "kernel32.dll" && export == "BaseThreadInitThunk"
+    {
+        "personality-owned x86 startup entry (initial register contract)"
     } else if module == "ntdll.dll" && native_argc(export).is_some() {
         "NT native API (WDK, outside the Win32 WinMD)"
     } else {
@@ -60,14 +71,41 @@ fn vcomp_conv(export: &str) -> Option<adv_abi::Conv> {
     }
 }
 
-/// x86 stdcall argument counts of the NT native APIs, from the decorated
-/// `_Name@bytes` imports in SDK 10.0.26100.0 um/x86/ntdll.lib. Zw aliases share them.
+/// x86 native contracts verified against SDK 10.0.26100.0 decorated imports
+/// and public System Informer phnt declarations for newer thread/APC entries.
+/// Zw aliases share the corresponding Nt contract.
 fn native_argc(export: &str) -> Option<u8> {
+    match export {
+        "LdrUnloadDll" => return Some(1),
+        "RtlRaiseException" | "RtlRemoveVectoredExceptionHandler" => return Some(1),
+        "RtlAddVectoredExceptionHandler" => return Some(2),
+        "RtlDispatchAPC" => return Some(3),
+        "RtlExitUserThread" => return Some(1),
+        "RtlCreateUserThread" => return Some(10),
+        "RtlReAllocateHeap" => return Some(4),
+        "RtlSizeHeap" => return Some(3),
+        "RtlInitializeCriticalSection"
+        | "RtlDeleteCriticalSection"
+        | "RtlEnterCriticalSection"
+        | "RtlTryEnterCriticalSection"
+        | "RtlLeaveCriticalSection" => return Some(1),
+        _ => {}
+    }
     let name = export
         .strip_prefix("Nt")
         .or_else(|| export.strip_prefix("Zw"))?;
     let bytes = match name {
         "Close" => 4,
+        "Continue" | "FlushBuffersFile" => 8,
+        "QueueApcThread" => 20,
+        "TestAlert" => 0,
+        "WaitForSingleObject" | "OpenEvent" => 12,
+        "CreateEvent" | "WaitForMultipleObjects" => 20,
+        "SetEvent" | "ResetEvent" => 8,
+        "QueryVolumeInformationFile" => 20,
+        "QueryDirectoryFile" => 44,
+        "CreateThreadEx" => 44,
+        "SuspendThread" | "TerminateThread" => 8,
         "CreateSection" => 28,
         "MapViewOfSection" => 40,
         "OpenFile" => 24,

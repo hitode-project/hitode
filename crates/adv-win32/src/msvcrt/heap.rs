@@ -25,31 +25,28 @@ fn result(env: &mut Env<'_>, address: u32) -> Result<GuestPtr<()>, MemFault> {
 
 #[win32(ucrtbase, name="malloc", level=implement)]
 fn malloc(env: &mut Env<'_>, size: u32) -> Outcome {
-    crate::heap_lock::with_process_heap(env, move |env| malloc_owned(env, size).into_outcome())
-}
-
-fn malloc_owned(env: &mut Env<'_>, size: u32) -> Result<GuestPtr<()>, MemFault> {
-    let address = if size <= 0xffffffe0 {
-        allocate(env, size, false)
-    } else {
-        0
-    };
-    result(env, address)
+    if size > HEAP_MAXREQ {
+        return result(env, 0).into_outcome();
+    }
+    crate::native_heap::allocate_then(
+        env,
+        size,
+        false,
+        Box::new(|env, address| result(env, address).into_outcome()),
+    )
 }
 
 #[win32(ucrtbase, name="calloc", level=implement)]
 fn calloc(env: &mut Env<'_>, count: u32, size: u32) -> Outcome {
-    crate::heap_lock::with_process_heap(env, move |env| {
-        let address = calloc_address(env, count, size);
-        result(env, address).into_outcome()
-    })
-}
-
-fn calloc_address(env: &mut Env<'_>, count: u32, size: u32) -> u32 {
-    count
-        .checked_mul(size)
-        .filter(|&size| size <= HEAP_MAXREQ)
-        .map_or(0, |size| allocate(env, size, true))
+    let Some(size) = count.checked_mul(size).filter(|&size| size <= HEAP_MAXREQ) else {
+        return result(env, 0).into_outcome();
+    };
+    crate::native_heap::allocate_then(
+        env,
+        size,
+        true,
+        Box::new(|env, address| result(env, address).into_outcome()),
+    )
 }
 
 #[win32(msvcr90, name = "_calloc_crt", level = implement)]
@@ -74,67 +71,41 @@ fn calloc_crt(env: &mut Env<'_>, count: u32, size: u32) -> Outcome {
         crate::util::set_last_error(env, 8);
         return Outcome::Return(0);
     }
-    crate::heap_lock::with_process_heap(env, move |env| {
-        let address = calloc_address(env, count, size);
-        if address == 0 {
-            crate::util::set_last_error(env, 8); // HeapAlloc failure: NOT_ENOUGH_MEMORY.
-        }
-        Outcome::Return(address)
-    })
+    crate::native_heap::allocate_then(
+        env,
+        requested,
+        true,
+        Box::new(|env, address| {
+            if address == 0 {
+                crate::util::set_last_error(env, 8);
+            }
+            Outcome::Return(address)
+        }),
+    )
 }
 
 #[win32(ucrtbase, name="free", level=implement)]
 fn free(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Outcome {
-    if pointer.is_null() {
-        return Outcome::Return(0);
-    }
-    crate::heap_lock::with_process_heap(env, move |env| {
-        free_owned(env, pointer);
-        Outcome::Return(0)
-    })
-}
-
-fn free_owned(env: &mut Env<'_>, pointer: GuestPtr<()>) {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer.addr());
+    crate::native_heap::free(env, pointer.addr())
 }
 
 #[win32(ucrtbase, name="realloc", level=implement)]
 fn realloc(env: &mut Env<'_>, pointer: GuestPtr<()>, size: u32) -> Outcome {
-    crate::heap_lock::with_process_heap(env, move |env| {
-        realloc_owned(env, pointer, size).into_outcome()
-    })
-}
-
-fn realloc_owned(
-    env: &mut Env<'_>,
-    pointer: GuestPtr<()>,
-    size: u32,
-) -> Result<GuestPtr<()>, MemFault> {
     if pointer.is_null() {
-        return malloc_owned(env, size);
+        return malloc(env, size);
     }
     if size == 0 {
-        free_owned(env, pointer);
-        return Ok(GuestPtr::new(0));
+        return crate::native_heap::free(env, pointer.addr());
     }
-    let address = if size <= 0xffffffe0 {
-        let heaps = env.ext.get_mut::<Heaps>();
-        heaps
-            .realloc(
-                env.cpu,
-                &mut env.sys.vm,
-                heaps.process_heap,
-                pointer.addr(),
-                size,
-                false,
-                false,
-            )
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    result(env, address)
+    if size > HEAP_MAXREQ {
+        return result(env, 0).into_outcome();
+    }
+    crate::native_heap::realloc_then(
+        env,
+        pointer.addr(),
+        size,
+        Box::new(|env, address| result(env, address).into_outcome()),
+    )
 }
 
 #[cfg(test)]

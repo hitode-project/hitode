@@ -78,14 +78,19 @@ fn access(env: &mut Env<'_>, pointer: u32, mode: i32, wide: bool) -> Outcome {
         crate::util::set_last_error(env, 3);
         return fail(env, errno, 2, 3);
     }
-    match crate::kernel32::file_attributes_path(env, &path, api) {
-        Ok(attributes) if mode & 2 != 0 && attributes & 0x11 == 1 => {
-            // Read-only denial sets the CRT error pair, preserving LastError.
-            fail(env, errno, 13, 5)
-        }
-        Ok(_) => Outcome::Return(0),
-        Err(dos) => fail(env, errno, shared_file::dos_errno(dos), dos),
-    }
+    crate::kernel32::file::file_attributes_path_then(
+        env,
+        &path,
+        api,
+        Box::new(move |env, result| match result {
+            Ok(attributes) if mode & 2 != 0 && attributes & 0x11 == 1 => {
+                // Read-only denial sets the CRT error pair, preserving LastError.
+                fail(env, errno, 13, 5)
+            }
+            Ok(_) => Outcome::Return(0),
+            Err(dos) => fail(env, errno, shared_file::dos_errno(dos), dos),
+        }),
+    )
 }
 
 #[win32(msvcrt, name = "_access", level = implement)]
@@ -97,3 +102,6 @@ fn access_a(env: &mut Env<'_>, path: AnsiStr, mode: i32) -> Outcome {
 fn access_w(env: &mut Env<'_>, path: WideStr, mode: i32) -> Outcome {
     access(env, path.0.addr(), mode, true)
 }
+
+#[cfg(test)]
+mod tests;

@@ -8,12 +8,14 @@ fn terminate(env: &mut Env<'_>, process: Handle, exit_status: i32) -> Outcome {
     if process.0 == 0 {
         let completion = &env.sys.process_identity.completion;
         if !completion.begin_termination(code) {
+            crate::kernel32::apc::retire_all(env);
             return Outcome::ExitProcess(code);
         }
         // NULL publishes termination and retires peers while preserving the
         // caller. A second NULL call terminates that remaining caller.
         env.cpu.quiesce_memory();
         env.sys.terminate_other_contexts(code);
+        crate::kernel32::apc::retire_completed(env);
         return Outcome::Return(0);
     }
     if process.0 != u32::MAX
