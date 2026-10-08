@@ -1,5 +1,5 @@
 /* Authored personality-layer probe: no sample code, assets or third-party protection logic.
-   Usage: personality-N.exe selects contract N (1..9, a..c). Writes scalar DWORDs
+   Usage: personality-N.exe selects contract N (1..9, a..d). Writes scalar DWORDs
    to probe-N.bin. Build and compare with personality_contract.py; no sample inputs. */
 #include <windows.h>
 #include <intrin.h>
@@ -289,12 +289,40 @@ static void t_loader_queries(void){
  MH_DisableHook(MH_ALL_HOOKS);FreeLibrary(m);
 }
 
+/* ---- 13: one mutant/semaphore owner for native and Win32 calls ---- */
+typedef LONG (WINAPI *NCM)(PHANDLE,ULONG,PVOID,BYTE);
+typedef LONG (WINAPI *NRM)(HANDLE,PLONG);
+typedef LONG (WINAPI *NCS)(PHANDLE,ULONG,PVOID,LONG,LONG);
+typedef LONG (WINAPI *NRS)(HANDLE,LONG,PLONG);
+static void t_owned_sync(void){
+ HMODULE nt=GetModuleHandleW(L"ntdll.dll");
+ NCM cm=(NCM)GetProcAddress(nt,"NtCreateMutant");NRM rm=(NRM)GetProcAddress(nt,"NtReleaseMutant");
+ NCS cs=(NCS)GetProcAddress(nt,"NtCreateSemaphore");NRS rs=(NRS)GetProcAddress(nt,"NtReleaseSemaphore");
+ HANDLE mutant,semaphore,output;LONG previous;
+ if(!cm||!rm||!cs||!rs){put(0xbad);return;}
+ put(cm(&mutant,0x1f0001,NULL,1));put(WaitForSingleObject(mutant,0));
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ put(ReleaseMutex(mutant));put(GetLastError());
+ put(cs(&semaphore,0x1f0003,NULL,1,2));
+ previous=0x12345678;put(rs(semaphore,0,&previous));put(previous);
+ previous=0x12345678;put(rs(semaphore,2,&previous));put(previous);
+ previous=0x12345678;put(rs(semaphore,1,&previous));put(previous);
+ previous=0x12345678;put(ReleaseSemaphore(semaphore,-1,&previous));put(GetLastError());put(previous);
+ output=(HANDLE)0x12345678;put(cs(&output,0x1f0003,NULL,-1,2));put((DWORD)(ULONG_PTR)output);
+ output=(HANDLE)0x12345678;put(cs(&output,0x1f0003,NULL,0,0));put((DWORD)(ULONG_PTR)output);
+ put(rs(semaphore,1,(LONG*)1));put(WaitForSingleObject(semaphore,0));put(WaitForSingleObject(semaphore,0));put(WaitForSingleObject(semaphore,0));
+ put(ReleaseMutex((HANDLE)0x12345678));put(GetLastError());
+ CloseHandle(mutant);CloseHandle(semaphore);
+}
+
 
 void mainCRTStartup(void){
   char cl[MAX_PATH]; char t; int len=(int)GetModuleFileNameA(NULL,cl,MAX_PATH);
   main_ret=_ReturnAddress();
   t=len>5?cl[len-5]:'0'; /* probe-N.exe */
   switch(t){case '1':t_threads();break;case '2':t_file_hooks();break;case '3':t_identity();break;
-    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;case 'c':t_loader_queries();break;default:ExitProcess(91);}
+    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;case 'c':t_loader_queries();break;case 'd':t_owned_sync();break;default:ExitProcess(91);}
   save(t); ExitProcess(0);
 }

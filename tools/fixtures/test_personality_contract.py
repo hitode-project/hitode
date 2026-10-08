@@ -49,6 +49,20 @@ class Contracts(unittest.TestCase):
         values[30] = 0
         self.assertEqual(evaluate(12, values), ["altered_native_load", "address_unchanged", "native_missing"])
 
+    def test_owned_sync_requires_recursion_counts_and_failure_output_contracts(self):
+        values = [0, 0, 0, 0xffffffff, 0, 0, 0xc0000046, 0x12345678, 0, 288,
+                  0, 0xc000000d, 0x12345678, 0xc0000047, 0x12345678, 0, 1,
+                  0, 87, 0x12345678, 0xc000000d, 0, 0xc000000d, 0,
+                  0xc0000005, 0, 0, 258, 0, 6]
+        self.assertEqual(evaluate(13, values), [])
+        self.assertEqual(evaluate(13, values[:-1]), ["missing_results"])
+        values[3] = 0
+        values[14] = 0
+        values[21] = 0x12345678
+        values[24] = 0x80000002
+        self.assertEqual(evaluate(13, values), ["mutant_recursion", "semaphore_limit",
+                                               "semaphore_invalid_initial", "semaphore_output_fault"])
+
 
 if __name__ == "__main__":
     unittest.main()
