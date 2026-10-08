@@ -90,6 +90,22 @@ fn read(operand: Operand, regs: &[u32; 8]) -> u32 {
 
 /// Return false without changing state for any potentially faulting form.
 /// Fetch validity, TF and fuel stay with the ordinary instruction boundary.
+pub(super) fn eligible(action: Action) -> bool {
+    use Operand::{Immediate, Register};
+    matches!(
+        action,
+        Action::Nop
+            | Action::Mov(Register(_), Register(_) | Immediate(_), _)
+            | Action::Lea(..)
+            | Action::Binary(_, Register(_), Register(_) | Immediate(_))
+            | Action::Unary(_, Register(_))
+            | Action::Set(Register(_), _)
+            | Action::Branch(Immediate(_), _)
+    )
+}
+
+/// The eligibility bit is cached during predecode so other forms never need
+/// this second dispatch. Keep a defensive rejection before any state mutation.
 pub(super) fn execute(instruction: Predecoded, state: &mut CpuState) -> bool {
     use Operand::{Immediate, Register};
     let mut next = instruction.next;
@@ -234,7 +250,9 @@ mod tests {
                 action: predecode(&i).unwrap(),
                 next: i.next_ip32(),
                 exclusive: false,
+                register_only: eligible(predecode(&i).unwrap()),
             };
+            assert!(instruction.register_only, "{:?}", i.code());
             for &value in &values {
                 // Exercise every defined arithmetic flag input combination,
                 // including CF preservation by INC/DEC and undefined AF by TEST.

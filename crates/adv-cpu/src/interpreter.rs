@@ -419,7 +419,7 @@ fn execute_decoded(
             units: 1,
         };
     }
-    if registers::execute(instruction, state) {
+    if instruction.register_only && registers::execute(instruction, state) {
         return Execution {
             step: if debug {
                 Step::Trap { pc, vector: 1 }
@@ -519,6 +519,7 @@ struct Predecoded {
     action: Action,
     next: u32,
     exclusive: bool,
+    register_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -632,6 +633,7 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
+            register_only: registers::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg
@@ -851,6 +853,7 @@ impl DecodedBlock {
                 break;
             }
             let execution = if let Decoded::Ready(instruction) = decoded
+                && instruction.register_only
                 && !instruction.exclusive
                 && state.rep.is_none()
                 && state.eflags & 0x100 == 0
