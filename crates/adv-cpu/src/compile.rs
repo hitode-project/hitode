@@ -63,6 +63,7 @@ pub(crate) struct NativeRun<'a> {
 pub(crate) struct Compiled {
     #[cfg(any(test, feature = "gir-execute"))]
     pub gir_instructions: BTreeMap<u32, Instruction>,
+    perf_ranges: Vec<crate::perf_map::Registration>,
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -105,6 +106,7 @@ pub(crate) struct Compiled {
 
 impl Drop for Compiled {
     fn drop(&mut self) {
+        self.perf_ranges.clear();
         // SAFETY: the entry pointer is private, run borrows self, and no generated
         // code can still be executing while this exclusive drop runs.
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2258,6 +2260,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .ok_or("missing Windows wrapper unwind")?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
     // SAFETY: exact signature declared above, finalized memory is owned by module.
+    let perf_ranges = std::iter::once((id, &ctx))
+        .chain(std::iter::once((wrapper_id, &wrapper)))
+        .chain(kernel_functions.iter().map(|(id, context)| (*id, context)))
+        .filter_map(|(id, context)| {
+            crate::perf_map::register(
+                module.get_finalized_function(id) as usize,
+                context.compiled_code()?.code_buffer().len(),
+                crate::perf_map::Category::Tier2,
+            )
+        })
+        .collect();
     let entry = unsafe {
         std::mem::transmute::<*const u8, Entry>(module.get_finalized_function(wrapper_id))
     };
@@ -2344,6 +2357,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     Ok(Compiled {
         #[cfg(any(test, feature = "gir-execute"))]
         gir_instructions: instructions.clone(),
+        perf_ranges,
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(
                 if opt_level == "speed" {

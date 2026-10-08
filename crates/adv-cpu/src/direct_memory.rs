@@ -24,6 +24,7 @@ struct Thunk {
 }
 
 pub(crate) struct Engine {
+    perf_ranges: Vec<crate::perf_map::Registration>,
     module: Option<JITModule>,
     thunks: Vec<Thunk>,
     pub recoveries: Cell<u64>,
@@ -35,6 +36,7 @@ pub(crate) struct Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.perf_ranges.clear();
         // No thunk pointer escapes the owner; its sessions borrow this engine.
         unsafe {
             self.module.take().unwrap().free_memory();
@@ -125,10 +127,16 @@ impl Engine {
             }
         }
         module.finalize_definitions().map_err(|e| e.to_string())?;
+        let mut perf_ranges = Vec::new();
         let thunks = descriptions
             .into_iter()
             .map(|(id, len, site, resume)| {
                 let pointer = module.get_finalized_function(id);
+                perf_ranges.extend(crate::perf_map::register(
+                    pointer as usize,
+                    len,
+                    crate::perf_map::Category::DirectMemory,
+                ));
                 Thunk {
                     entry: unsafe { std::mem::transmute::<*const u8, Entry>(pointer) },
                     len,
@@ -138,6 +146,7 @@ impl Engine {
             })
             .collect();
         Ok(Self {
+            perf_ranges,
             module: Some(module),
             thunks,
             recoveries: Cell::new(0),
