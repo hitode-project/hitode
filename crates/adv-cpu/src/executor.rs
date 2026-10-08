@@ -83,6 +83,8 @@ pub struct Stats {
 #[derive(Default, Clone, Debug)]
 pub struct DirectMemoryStats {
     pub sites: u64,
+    /// Regions recompiled with legacy scalar helpers after epilogue rejection.
+    pub inline_fallbacks: u64,
     pub accesses: u64,
     pub recoveries: u64,
     pub violations: u64,
@@ -707,6 +709,7 @@ impl Executor {
             self.demand.remove(&pc);
         }
         self.stats.direct_memory.sites += compiled.direct_sites as u64;
+        self.stats.direct_memory.inline_fallbacks += compiled.direct_inline_fallbacks;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));
