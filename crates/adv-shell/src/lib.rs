@@ -47,7 +47,6 @@ struct Options {
     profile: bool,
     control_stdin: bool,
     frame_budget: bool,
-    precise_waits: bool,
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
@@ -65,7 +64,6 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --no-row-batching       disable proven row batches for comparison\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
-  --precise-waits         opt in to submillisecond Linux/Android host waits\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\
@@ -147,7 +145,6 @@ impl Options {
             codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
-            precise_waits: false,
         };
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
@@ -175,7 +172,6 @@ impl Options {
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
                 "--no-time-skip" => options.time_skip = false,
-                "--precise-waits" => options.precise_waits = true,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
                         "strict" => adv_runtime::RunMode::Strict,
@@ -754,7 +750,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
-            "  \"precise_waits\": {},\n  \"wait_diagnostics\": {},\n",
+            "  \"wait_diagnostics\": {},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {}\n}}\n"
         ),
@@ -821,7 +817,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         options.time_skip,
         runtime.machine.sys.scheduling.active_time_skips,
         runtime.machine.sys.scheduling.active_time_skip_us,
-        options.precise_waits,
         runtime
             .machine
             .sys
@@ -1860,13 +1855,7 @@ fn run_execution(
                 // Every producer signals this same retained event. No UI/frame or
                 // stdin-specific blocking loop can hide another channel's wake.
                 let pending = control.as_ref().is_some_and(control::Control::has_pending);
-                let signaled = pending
-                    || if options.precise_waits {
-                        wake.wait_precise(delay)
-                    } else {
-                        wake.wait(delay)
-                    }
-                    .map_err(|e| e.to_string())?;
+                let signaled = pending || wake.wait(delay).map_err(|e| e.to_string())?;
                 let wake = if signaled {
                     window::WaitOutcome::Input
                 } else {

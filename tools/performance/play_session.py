@@ -110,8 +110,6 @@ def run(args: argparse.Namespace) -> None:
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
-    if getattr(args, "precise_waits", False):
-        command.append("--precise-waits")
     if getattr(args, "no_time_skip", False):
         command.append("--no-time-skip")
     if args.mode != "window":
@@ -281,7 +279,6 @@ if __name__ == "__main__":
     parser.add_argument("--d3d9-sm3", action="store_true", help="enable the runner's SM3 shader capability profile")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--frame-budget", action="store_true")
-    parser.add_argument("--precise-waits", action="store_true")
     parser.add_argument("--no-time-skip", action="store_true")
     parser.add_argument("--perf-map", action="store_true")
     warmth = parser.add_mutually_exclusive_group()

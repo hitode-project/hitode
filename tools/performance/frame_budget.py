@@ -274,7 +274,6 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
                 row.update(status="observed", reason=None, metrics=summarize_budget(report["frame_budget"]),
                            execution=execution_metrics(report), config=baseline.report_config(report),
                            wait_diagnostics=wait_metrics(report),
-                           precise_waits=report.get("precise_waits") is True,
                            time_skip=numeric_fields(report.get("time_skip") or {}, ("jumps", "skipped_guest_us")))
                 if name == "ctrl":
                     row["fixed_segment"] = fixed_segment(directory, scenario, checkpoint)
@@ -496,7 +495,6 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
-            "precise_waits": getattr(args, "precise_waits", False),
             "no_time_skip": getattr(args, "no_time_skip", False),
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
@@ -504,7 +502,7 @@ def run(args) -> None:
     if resume:
         previous = load_json(root / "plan.json")
         if (any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios"))
-                or any(previous.get(key, False) != plan[key] for key in ("precise_waits", "no_time_skip"))):
+                or any(previous.get(key, False) != plan[key] for key in ("no_time_skip",))):
             raise ValueError("resume requires unchanged scenarios and run conditions")
     else:
         write_json(root / "plan.json", plan)
@@ -540,8 +538,6 @@ def run(args) -> None:
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
             if not args.no_instrumentation:
                 command += ["--frame-budget"]
-            if getattr(args, "precise_waits", False):
-                command += ["--precise-waits"]
             if getattr(args, "no_time_skip", False):
                 command += ["--no-time-skip"]
             if args.perf_map:
@@ -628,7 +624,6 @@ def main() -> None:
     execute.add_argument("--device-helper", type=Path, default=os.environ.get("ADV_DEVICE_HELPER"),
                          help="shared PowerShell Request-Device/Release-Device helper (task bud)")
     execute.add_argument("--perf-map", action="store_true")
-    execute.add_argument("--precise-waits", action="store_true", help="opt-in submillisecond host deadlines")
     execute.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
     args = parser.parse_args()
