@@ -68,6 +68,33 @@ jobs:
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/direct-strict.txt"
+      - name: Full regression including Bridge differential fixtures (checked and direct)
+        if: always() && matrix.runner == 'ubuntu-24.04-arm'
+        # The bridge differential fixtures select each lane explicitly so their
+        # Tier 0 and Cranelift-only references remain independent. ADV_TIER1 is a
+        # shell option; it cannot turn CPU tests into Bridge tests. The native
+        # fixtures assert actual bridge retirements and Cranelift handoff.
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge.txt"
+          checked=${PIPESTATUS[0]}
+          ADV_DIRECT_MEMORY=1 cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-direct.txt"
+          direct=${PIPESTATUS[0]}
+          test "$checked" -eq 0 && test "$direct" -eq 0
+      - name: Bridge coexistence differential verification (strict)
+        if: always() && matrix.runner == 'ubuntu-24.04-arm'
+        continue-on-error: true
+        env:
+          ADV_JIT_VERIFY: strict
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-strict.txt"
+          checked=${PIPESTATUS[0]}
+          ADV_DIRECT_MEMORY=1 cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-direct-strict.txt"
+          direct=${PIPESTATUS[0]}
+          test "$checked" -eq 0 && test "$direct" -eq 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -78,6 +105,10 @@ jobs:
             ${{ runner.temp }}/strict.txt
             ${{ runner.temp }}/direct.txt
             ${{ runner.temp }}/direct-strict.txt
+            ${{ runner.temp }}/bridge.txt
+            ${{ runner.temp }}/bridge-direct.txt
+            ${{ runner.temp }}/bridge-strict.txt
+            ${{ runner.temp }}/bridge-direct-strict.txt
           if-no-files-found: ignore
           retention-days: 14
 

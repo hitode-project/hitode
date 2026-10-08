@@ -12,6 +12,9 @@ impl Executor {
         if !matches!(count, 1 | 2) {
             return Err("this release supports 1 or 2 guest workers".into());
         }
+        if self.tier1.is_some() {
+            return Err("Tier 1 requires a serial execution owner".into());
+        }
         if !cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
             return Err("parallel guest execution currently requires Windows x64 MSVC".into());
         }

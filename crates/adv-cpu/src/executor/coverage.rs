@@ -13,7 +13,7 @@ impl Executor {
     }
 
     pub(super) fn interpreter_detail(&self, pc: u32) -> Detail {
-        if self.tier1.is_some() {
+        if self.tier1_mode == crate::Tier1Mode::Exclusive {
             return Detail::Tier1;
         }
         if !self.auto_jit {
