@@ -122,6 +122,8 @@ impl RepContinuation {
 pub struct Interpreter {
     cache: HashMap<u32, Cached>,
     blocks: HashMap<u32, DecodedBlock>,
+    validity: crate::code_validity::CodeValidity<(bool, u32)>,
+    event_validity: bool,
     capacity: usize,
     decodes: u64,
     pub(crate) census_enabled: bool,
@@ -144,6 +146,8 @@ impl Interpreter {
         Self {
             cache: HashMap::new(),
             blocks: HashMap::new(),
+            validity: Default::default(),
+            event_validity: crate::code_validity::enabled(),
             capacity,
             decodes: 0,
             census_enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
@@ -154,6 +158,32 @@ impl Interpreter {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.blocks.clear();
+        self.validity.clear();
+    }
+
+    fn refresh(&mut self, memory: &mut Memory) {
+        if !self.event_validity {
+            return;
+        }
+        for (block, pc) in self.validity.refresh(memory) {
+            let valid = if block {
+                self.blocks
+                    .get(&pc)
+                    .is_some_and(|entry| entry.cacheable(memory) && entry.revalidate(memory))
+            } else {
+                self.cache
+                    .get(&pc)
+                    .is_some_and(|entry| entry.cacheable(memory) && entry.revalidate(memory))
+            };
+            if !valid {
+                if block {
+                    self.blocks.remove(&pc);
+                } else {
+                    self.cache.remove(&pc);
+                }
+                self.validity.remove((block, pc));
+            }
+        }
     }
 
     /// Number of decodes, including invalid, unsupported and inaccessible code.
@@ -181,8 +211,13 @@ impl Interpreter {
                 units: 0,
             };
         }
+        self.refresh(memory);
         let pc = state.eip;
-        let (decoded, form) = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
+        let (decoded, form) = if let Some(entry) = self
+            .cache
+            .get(&pc)
+            .filter(|e| self.event_validity || e.valid(memory))
+        {
             (
                 entry.decoded,
                 self.census.as_ref().map(|_| {
@@ -197,9 +232,20 @@ impl Interpreter {
                 .census
                 .as_ref()
                 .map(|_| crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize]));
-            if self.capacity != 0 {
+            if self.capacity != 0 && (!self.event_validity || entry.cacheable(memory)) {
                 if self.cache.len() >= self.capacity {
-                    self.cache.clear();
+                    if self.event_validity {
+                        self.clear_cache();
+                    } else {
+                        self.cache.clear();
+                    }
+                }
+                if self.event_validity {
+                    self.validity.insert(
+                        (false, pc),
+                        entry.pages.iter().flatten().map(|page| page.address),
+                        memory,
+                    );
                 }
                 self.cache.insert(pc, entry);
             }
@@ -231,15 +277,15 @@ impl Interpreter {
                 0,
             );
         }
+        self.refresh(memory);
         let pc = state.eip;
         let revision = native.map(|(_, revision)| revision);
-        if !self
-            .blocks
-            .get(&pc)
-            .is_some_and(|block| block.revision == revision && block.valid(memory))
-        {
-            let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
-            if self.capacity == 0 {
+        if !self.blocks.get(&pc).is_some_and(|block| {
+            block.revision == revision && (self.event_validity || block.valid(memory))
+        }) {
+            let mut block =
+                DecodedBlock::fetch(memory, pc, native, &mut self.decodes, self.event_validity);
+            if self.capacity == 0 || (self.event_validity && !block.cacheable(memory)) {
                 return block.execute_observed(
                     state,
                     memory,
@@ -251,7 +297,18 @@ impl Interpreter {
             // Bound each independent cache in entries. A larger block working set
             // avoids flushing hot floating fallback sequences during discovery.
             if self.blocks.len() >= self.capacity {
-                self.blocks.clear();
+                if self.event_validity {
+                    self.clear_cache();
+                } else {
+                    self.blocks.clear();
+                }
+            }
+            if self.event_validity {
+                self.validity.insert(
+                    (true, pc),
+                    block.pages.iter().map(|page| page.address),
+                    memory,
+                );
             }
             self.blocks.insert(pc, block);
         }
@@ -450,10 +507,21 @@ impl Cached {
         for page in self.pages.iter().flatten() {
             memory.watch_code(page.address, PAGE_SIZE);
         }
+        self.revalidate(memory)
+    }
+
+    fn cacheable(&self, memory: &Memory) -> bool {
+        self.pages
+            .iter()
+            .flatten()
+            .all(|page| !memory.externally_mutable_code(page.address, PAGE_SIZE))
+    }
+
+    fn revalidate(&self, memory: &Memory) -> bool {
         self.pages.iter().flatten().all(|p| p.matches(memory))
-            // Also makes reuse with another Memory instance safe, and catches
-            // shared executor writes before its dirty-page synchronization.
-            && memory.read_data(self.pc, self.len as usize).is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
+            && memory
+                .read_data(self.pc, self.len as usize)
+                .is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
     }
 }
 
@@ -538,9 +606,9 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
 const BLOCK_INSTRUCTIONS: usize = 64;
 const BLOCK_BYTES: usize = 512;
 
-/// A contiguous basic block, including its terminating instruction. Validation
-/// retains byte comparison (cross-Memory/external-executor safety) and negative
-/// page dependencies. Only the frequency of validation changes, not its contract.
+/// A contiguous basic block, including its terminating instruction. Page
+/// subscriptions retain negative fetch dependencies and allocation ownership;
+/// bytes are compared only after a relevant event, before executing any prefix.
 struct DecodedBlock {
     pc: u32,
     instructions: Vec<(u32, Decoded)>,
@@ -555,6 +623,16 @@ impl DecodedBlock {
         for page in &self.pages {
             memory.watch_code(page.address, PAGE_SIZE);
         }
+        self.revalidate(memory)
+    }
+
+    fn cacheable(&self, memory: &Memory) -> bool {
+        self.pages
+            .iter()
+            .all(|page| !memory.externally_mutable_code(page.address, PAGE_SIZE))
+    }
+
+    fn revalidate(&self, memory: &Memory) -> bool {
         self.pages.iter().all(|page| page.matches(memory))
             && memory
                 .read_data(self.pc, self.bytes.len())
@@ -566,6 +644,7 @@ impl DecodedBlock {
         start: u32,
         native: Option<(&BTreeMap<u32, u32>, u64)>,
         decodes: &mut u64,
+        event_validity: bool,
     ) -> Self {
         let mut block = Self {
             pc: start,
@@ -587,6 +666,13 @@ impl DecodedBlock {
             }
             *decodes += 1;
             let entry = fetch(memory, pc);
+            // Aliased writers need not advance this owner's epoch. Keep these
+            // instructions uncached and return after one instruction so a store
+            // through another view cannot leave a stale decoded suffix.
+            let volatile = event_validity && !entry.cacheable(memory);
+            if volatile && !block.instructions.is_empty() {
+                break;
+            }
             let (next, terminates) = match entry.decoded {
                 Decoded::Ready(instruction) => (
                     instruction.next,
@@ -625,7 +711,7 @@ impl DecodedBlock {
                 }
             }
             block.instructions.push((pc, entry.decoded));
-            if terminates || next <= pc {
+            if terminates || next <= pc || volatile {
                 break;
             }
             pc = next;
@@ -2325,6 +2411,126 @@ fn condition_true(condition: ConditionCode, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_blocks_keep_same_page_data_and_detect_consumed_smc_events() {
+        let mut memory = Memory::new(0x10000, 3 * PAGE_SIZE).unwrap();
+        memory
+            .protect(0x10000, 3 * PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        for pc in [0x10000, 0x11000] {
+            memory.write(pc, &[0xb8, 7, 0, 0, 0, 0xeb, 0xf9]).unwrap();
+        }
+        let mut interpreter = Interpreter::new();
+        interpreter.event_validity = true;
+        let mut state = CpuState::default();
+        for pc in [0x10000, 0x11000] {
+            state.eip = pc;
+            assert_eq!(
+                interpreter
+                    .run_block(&mut state, &mut memory, 64, 0, None)
+                    .0
+                    .units,
+                2
+            );
+        }
+        let decodes = interpreter.decode_count();
+        let other = interpreter.blocks[&0x11000].instructions.as_ptr();
+        memory.write(0x10080, &[42]).unwrap();
+        memory.dirty_pages.clear(); // Tier 2 may consume this before Tier 0 runs.
+        state.eip = 0x10000;
+        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
+        assert_eq!(interpreter.decode_count(), decodes);
+        memory.write(0x10001, &[9]).unwrap();
+        memory.dirty_pages.clear();
+        state.eip = 0x10000;
+        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
+        assert_eq!(state.regs[0], 9);
+        assert_eq!(interpreter.decode_count(), decodes + 2);
+        assert_eq!(interpreter.blocks[&0x11000].instructions.as_ptr(), other);
+        state.eip = 0x10000;
+        memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
+        let before = state.clone();
+        let result = interpreter
+            .run_block(&mut state, &mut memory, 64, 0, None)
+            .0;
+        assert_eq!(result.units, 0);
+        assert_eq!(
+            result.step,
+            Step::FetchFault {
+                pc: 0x10000,
+                address: 0x10000
+            }
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn event_blocks_exit_after_self_modifying_prefix() {
+        let mut memory = Memory::new(0x10000, PAGE_SIZE).unwrap();
+        memory
+            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        // MOV byte [next immediate],9; MOV EAX,7; JMP header.
+        memory
+            .write(
+                0x10000,
+                &[0xc6, 0x05, 8, 0, 1, 0, 9, 0xb8, 7, 0, 0, 0, 0xeb, 0xf2],
+            )
+            .unwrap();
+        let mut interpreter = Interpreter::new();
+        interpreter.event_validity = true;
+        let mut state = CpuState {
+            eip: 0x10000,
+            ..Default::default()
+        };
+        assert_eq!(
+            interpreter
+                .run_block(&mut state, &mut memory, 64, 0, None)
+                .0
+                .units,
+            1
+        );
+        assert_eq!(state.eip, 0x10007);
+        assert_eq!(state.regs[0], 0);
+        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
+        assert_eq!(state.regs[0], 9);
+    }
+
+    #[test]
+    fn event_shared_code_is_uncached_without_owner_epoch_events() {
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        let storage = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
+        storage.store_bytes(0, &[0xb8, 7, 0, 0, 0, 0x43]);
+        memory
+            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        let mut interpreter = Interpreter::new();
+        interpreter.event_validity = true;
+        let mut state = CpuState {
+            eip: 0x10000,
+            ..Default::default()
+        };
+        assert_eq!(
+            interpreter
+                .run_block(&mut state, &mut memory, 64, 0, None)
+                .0
+                .units,
+            1
+        );
+        assert!(interpreter.blocks.is_empty());
+        let epoch = memory.epoch;
+        storage.store_bytes(1, &[9]);
+        assert_eq!(
+            memory.epoch, epoch,
+            "aliased data writes have no code event"
+        );
+        state.eip = 0x10000;
+        assert_eq!(interpreter.step(&mut state, &mut memory), Step::Executed);
+        assert_eq!(state.regs[0], 9);
+        assert!(interpreter.cache.is_empty());
+        assert!(interpreter.blocks.is_empty());
+    }
 
     #[test]
     fn first_fetch_and_cross_memory_cache_hits_watch_all_code_pages() {

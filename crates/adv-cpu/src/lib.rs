@@ -4,6 +4,7 @@ mod architecture;
 mod atomic_memory;
 pub mod backend;
 mod cliffs;
+mod code_validity;
 mod compile;
 mod compile_budget;
 mod compiler;
