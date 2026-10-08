@@ -115,6 +115,37 @@ fn scalar_widths_zero_extension_partial_stores_and_unaligned_fallback() {
     }
 }
 
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+#[test]
+fn tagged_thunk_entries_recover_with_untagged_signal_pcs() {
+    use iced_x86::code_asm::*;
+
+    let mut assembler = CodeAssembler::new(32).unwrap();
+    assembler.mov(dword_ptr(ecx), edx).unwrap();
+    assembler.mov(eax, dword_ptr(ecx)).unwrap();
+    let code = assembler.assemble(0x10000).unwrap();
+    for tag in [0_u64, 0xb4, 0xa5] {
+        let mut executor = owner(&code, true);
+        for thunk in &mut executor.memory.direct_engine.as_mut().unwrap().thunks {
+            let address = (thunk.entry as usize & 0x00ff_ffff_ffff_ffff) | (tag as usize) << 56;
+            // SAFETY: Android's instruction fetch ignores the top byte. Only
+            // the borrowed entry changes; the allocator's owning pointer keeps
+            // its original tag for deallocation. Signal PCs have no such tag.
+            thunk.entry = unsafe { std::mem::transmute::<usize, super::Entry>(address) };
+        }
+        executor.state.regs[1] = 0x20000;
+        executor.state.regs[2] = 0x89abcdef;
+        assert_eq!(
+            executor.run(0x10000 + code.len() as u32, 100).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        assert_eq!(executor.state.regs[0], executor.state.regs[2]);
+        assert_eq!(executor.stats.direct_memory.accesses, 2);
+        assert_eq!(executor.stats.direct_memory.recoveries, 2);
+        assert_eq!(executor.stats.direct_memory.checked_fallbacks, 0);
+    }
+}
+
 #[test]
 fn cross_page_store_falls_back_without_partial_commit() {
     let mut e = owner(&[0x89, 0x11], true);
