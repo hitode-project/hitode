@@ -3,8 +3,9 @@
 //!
 //! Grown on demand: every import is bound to a thunk, and an import without an
 //! implementation fails by name when it is first called (`adv_machine::thunk`). For host
-//! modules, `GetProcAddress` only returns implemented functions, so feature probes (the CRT
-//! looking for `FlsAlloc`, say) take their fallback paths.
+//! modules, core code-export existence follows a fixed Windows catalog; a missing
+//! implementation fails explicitly when called. Other modules retain capability-based
+//! dynamic lookup, and unknown optional names can still take their fallback paths.
 //!
 //! State lives in [`Win32`] inside the machine's `Ext`. Handlers get it with
 //! `env.ext.get_mut::<Win32>()`, alongside `env.cpu` and `env.sys`.

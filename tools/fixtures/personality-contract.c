@@ -1,5 +1,5 @@
 /* Authored personality-layer probe: no sample code, assets or third-party protection logic.
-   Usage: personality-N.exe selects contract N (1..8). Writes scalar DWORDs
+   Usage: personality-N.exe selects contract N (1..9, a). Writes scalar DWORDs
    to probe-N.bin. Build and compare with personality_contract.py; no sample inputs. */
 #include <windows.h>
 #include <intrin.h>
@@ -150,11 +150,106 @@ static void t_ansi_names(void){
   fp=fo?fo(name,"rb"):0; put(fp!=0); if(fp) fc(fp);
 }
 
+
+/* ---- 9: public virtual-memory fronts preserve the NT boundary ---- */
+typedef LONG (WINAPI *NTA)(HANDLE,void**,ULONG,SIZE_T*,ULONG,ULONG);
+typedef LONG (WINAPI *NTF)(HANDLE,void**,SIZE_T*,ULONG);
+typedef LONG (WINAPI *NTP)(HANDLE,void**,SIZE_T*,ULONG,ULONG*);
+typedef LONG (WINAPI *NTQ)(HANDLE,void*,ULONG,void*,SIZE_T,SIZE_T*);
+typedef LONG (WINAPI *NTT)(HANDLE,void*,void*,SIZE_T,SIZE_T*);
+static NTA oVA; static NTF oVF; static NTP oVP; static NTQ oVQ; static NTT oVR,oVW;
+static LONG cVA,cVF,cVP,cVQ,cVR,cVW;
+static LONG WINAPI hVA(HANDLE h,void**a,ULONG z,SIZE_T*s,ULONG t,ULONG p){cVA++;return oVA(h,a,z,s,t,p);}
+static LONG WINAPI hVF(HANDLE h,void**a,SIZE_T*s,ULONG t){cVF++;return oVF(h,a,s,t);}
+static LONG WINAPI hVP(HANDLE h,void**a,SIZE_T*s,ULONG p,ULONG*o){cVP++;return oVP(h,a,s,p,o);}
+static LONG WINAPI hVQ(HANDLE h,void*a,ULONG c,void*b,SIZE_T s,SIZE_T*r){cVQ++;return oVQ(h,a,c,b,s,r);}
+static LONG WINAPI hVR(HANDLE h,void*a,void*b,SIZE_T s,SIZE_T*r){cVR++;return oVR(h,a,b,s,r);}
+static LONG WINAPI hVW(HANDLE h,void*a,void*b,SIZE_T s,SIZE_T*r){cVW++;return oVW(h,a,b,s,r);}
+static void t_memory_hooks(void){
+ HMODULE nt=GetModuleHandleA("ntdll.dll"); HANDLE self=GetCurrentProcess();
+ void *p,*q; LONG b; DWORD input=0x12345678,read=0,old=0; SIZE_T count=0; MEMORY_BASIC_INFORMATION mi;
+ int ok=MH_Initialize()==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtAllocateVirtualMemory"),hVA,(void**)&oVA)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtFreeVirtualMemory"),hVF,(void**)&oVF)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtProtectVirtualMemory"),hVP,(void**)&oVP)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtQueryVirtualMemory"),hVQ,(void**)&oVQ)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtReadVirtualMemory"),hVR,(void**)&oVR)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtWriteVirtualMemory"),hVW,(void**)&oVW)==MH_OK;
+ ok=ok&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK; put(ok); if(!ok)return;
+ b=cVA;p=VirtualAlloc(NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);put(p!=0);put(cVA-b);
+ b=cVA;q=VirtualAllocEx(self,NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);put(q!=0);put(cVA-b);
+ b=cVW;put(WriteProcessMemory(self,p,&input,4,&count)&&count==4);put(cVW-b);
+ b=cVR;put(ReadProcessMemory(self,p,&read,4,&count)&&count==4&&read==input);put(cVR-b);
+ b=cVP;put(VirtualProtect(p,4096,PAGE_READONLY,&old)&&old==PAGE_READWRITE);put(cVP-b);
+ b=cVP;put(VirtualProtectEx(self,q,4096,PAGE_READONLY,&old)&&old==PAGE_READWRITE);put(cVP-b);
+ b=cVQ;put(VirtualQuery(p,&mi,sizeof mi)==sizeof mi&&mi.Protect==PAGE_READONLY);put(cVQ-b);
+ b=cVQ;put(VirtualQueryEx(self,q,&mi,sizeof mi)==sizeof mi&&mi.Protect==PAGE_READONLY);put(cVQ-b);
+ b=cVF;put(VirtualFree(p,0,MEM_RELEASE));put(cVF-b);
+ b=cVF;put(VirtualFreeEx(self,q,0,MEM_RELEASE));put(cVF-b);
+ MH_DisableHook(MH_ALL_HOOKS);
+}
+
+typedef LONG (WINAPI *NC)(PCONTEXT,BOOLEAN);
+typedef VOID (WINAPI *RR)(PEXCEPTION_RECORD);
+static NC oNC; static RR oRR; static DWORD cVEH,cNC,cRR;
+static LONG WINAPI hNC(PCONTEXT c,BOOLEAN a){cNC++;return oNC(c,a);}
+static VOID WINAPI hRR(PEXCEPTION_RECORD r){cRR++;oRR(r);}
+static void *oKI; static DWORD cKI,ka,kb,kc,vr,vc;
+__declspec(naked) static void hKI(void){ __asm {
+ push eax
+ mov eax,[esp+4]
+ mov ka,eax
+ mov eax,[esp+8]
+ mov kb,eax
+ mov eax,[esp+12]
+ mov kc,eax
+ pushfd
+ inc cKI
+ popfd
+ pop eax
+ jmp dword ptr [oKI]
+} }
+static LONG WINAPI ownVEH(PEXCEPTION_POINTERS p){
+ cVEH++;
+ if(p->ExceptionRecord->ExceptionCode==0xe0001234)return EXCEPTION_CONTINUE_EXECUTION;
+ if(p->ExceptionRecord->ExceptionCode!=EXCEPTION_BREAKPOINT)return EXCEPTION_CONTINUE_SEARCH;
+ vr=(DWORD)(UINT_PTR)p->ExceptionRecord; vc=(DWORD)(UINT_PTR)p->ContextRecord;
+ p->ContextRecord->Eip++; return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void t_exception_layout(void){
+ PVOID veh=AddVectoredExceptionHandler(1,ownVEH); void *ki=GetProcAddress(GetModuleHandleA("ntdll.dll"),"KiUserExceptionDispatcher");
+ HMODULE nt=GetModuleHandleA("ntdll.dll");
+ int ok=veh&&ki&&MH_Initialize()==MH_OK&&MH_CreateHook(ki,hKI,&oKI)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtContinue"),hNC,(void**)&oNC)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"RtlRaiseException"),hRR,(void**)&oRR)==MH_OK;
+ ok=ok&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK;
+ put(ok);if(!ok)return; __debugbreak();
+ put(cKI);put(ka==vr);put(kb==vr);put(kb==vc);put(kc==vc);
+ RaiseException(0xe0001234,0,0,NULL);
+ put(cVEH);put(cNC);put(cRR);
+ MH_DisableHook(MH_ALL_HOOKS);RemoveVectoredExceptionHandler(veh);
+}
+
+
+/* ---- 11: loader lifetime reaches the shared native unload boundary ---- */
+typedef LONG (WINAPI *LUD)(HMODULE);
+static LUD oLUD; static LONG cLUD;
+static LONG WINAPI hLUD(HMODULE module){cLUD++; return oLUD(module);}
+static void t_unload_hook(void){
+ HMODULE module=LoadLibraryA("version.dll");
+ void *entry=GetProcAddress(GetModuleHandleA("ntdll.dll"),"LdrUnloadDll");
+ int ok=module&&entry&&MH_Initialize()==MH_OK&&MH_CreateHook(entry,hLUD,(void**)&oLUD)==MH_OK&&MH_EnableHook(entry)==MH_OK;
+ put(ok);if(!ok)return;
+ put(FreeLibrary(module)!=0);put(cLUD);
+ MH_DisableHook(entry);
+}
+
+
 void mainCRTStartup(void){
   char cl[MAX_PATH]; char t; int len=(int)GetModuleFileNameA(NULL,cl,MAX_PATH);
   main_ret=_ReturnAddress();
   t=len>5?cl[len-5]:'0'; /* probe-N.exe */
   switch(t){case '1':t_threads();break;case '2':t_file_hooks();break;case '3':t_identity();break;
-    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;default:ExitProcess(91);}
+    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;default:ExitProcess(91);}
   save(t); ExitProcess(0);
 }

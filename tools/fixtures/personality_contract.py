@@ -26,7 +26,7 @@ def digest(path: Path) -> str:
 
 def evaluate(test: int, values: list[int]) -> list[str]:
     """Return violated contracts; never print pointers or binary contents."""
-    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4}
+    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 9, 11: 3}
     if len(values) != expected_lengths[test]:
         return ["missing_results"]
     failures = []
@@ -62,6 +62,20 @@ def evaluate(test: int, values: list[int]) -> list[str]:
         check("load_library_ex", v[3] == 1 and v[4] > 0)
     elif test == 8:
         check("ansi_filename", v == [936, 1, 1, 1])
+    elif test == 9:
+        check("memory_hook_setup", v[0] == 1)
+        for index, name in enumerate(("alloc", "alloc_ex", "write", "read", "protect", "protect_ex", "query", "query_ex", "free", "free_ex")):
+            check(name, v[1+2*index] == 1 and v[2+2*index] > 0)
+    elif test == 10:
+        check("exception_setup", v[0] == 1)
+        check("hardware_dispatch", v[1] > 0)
+        check("raw_dispatch_frame", v[2:6] == [1, 0, 1, 0])
+        check("vectored_handlers", v[6] >= 2)
+        check("native_continue", v[7] >= 2)
+        check("native_raise", v[8] > 0)
+    elif test == 11:
+        check("unload_setup", v[0] == 1)
+        check("native_unload", v[1] == 1 and v[2] > 0)
     return failures
 
 
@@ -110,7 +124,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--native-only", action="store_true")
-    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8")
+    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11")
     args = parser.parse_args()
     output = args.output.resolve()
     if "target" not in output.parts or "investigations" not in output.parts:
@@ -129,10 +143,11 @@ def main() -> int:
         for backend in (["native"] if args.native_only else ["native", "interpreter", "jit"]):
             directory = output / f"{backend}-{test}"
             directory.mkdir()
-            exe = directory / f"personality-{test}.exe"
+            label = str(test) if test < 10 else chr(ord("a") + test - 10)
+            exe = directory / f"personality-{label}.exe"
             shutil.copyfile(fixture, exe)
             command = [str(exe)]
-            result = directory / f"probe-{test}.bin"
+            result = directory / f"probe-{label}.bin"
             if backend != "native":
                 command = [str(runner), str(exe), "--headless", "--backend", backend, "--seconds", "30",
                            "--data-dir", str(directory / 'data'), "--report", str(directory / 'report.json'),

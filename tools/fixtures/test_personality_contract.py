@@ -21,6 +21,23 @@ class Contracts(unittest.TestCase):
         self.assertEqual(evaluate(8, [936, 1, 1, 0]), ["ansi_filename"])
         self.assertEqual(evaluate(8, [936, 1, 1, 1]), [])
 
+    def test_memory_fronts_require_both_results_and_native_entry_observations(self):
+        self.assertEqual(evaluate(9, [1] + [1, 1] * 10), [])
+        values = [1] + [1, 1] * 10
+        values[4] = 0
+        self.assertEqual(evaluate(9, values), ["alloc_ex"])
+
+    def test_exception_frame_and_continuation_are_both_required(self):
+        values = [1, 1, 1, 0, 1, 0, 2, 2, 1]
+        self.assertEqual(evaluate(10, values), [])
+        values[4] = 0
+        values[7] = 0
+        self.assertEqual(evaluate(10, values), ["raw_dispatch_frame", "native_continue"])
+
+    def test_unload_requires_a_successful_observed_native_call(self):
+        self.assertEqual(evaluate(11, [1, 1, 1]), [])
+        self.assertEqual(evaluate(11, [1, 1, 0]), ["native_unload"])
+
 
 if __name__ == "__main__":
     unittest.main()
