@@ -15,7 +15,12 @@ impl FileSource for Empty {
     }
 }
 fn machine(jit: bool) -> Machine<JitCpu> {
+    machine_exposing(jit, false)
+}
+
+fn machine_exposing(jit: bool, fixed: bool) -> Machine<JitCpu> {
     let mut registry = Registry::default();
+    registry.set_expose_fixed_exports(fixed);
     registry.add(
         "comctl32.dll",
         "InitCommonControls",
@@ -391,7 +396,13 @@ fn dynamic(
 
 #[test]
 fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
-    let mut machine = machine(false);
+    let mut hidden = machine(false);
+    let kernel = hidden.load(&Empty, "kernel32.dll").unwrap();
+    for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
+        assert!(dynamic(&mut hidden, kernel, named(name)).is_err());
+        assert_ne!(resolve(&mut hidden, kernel, named(name)), 0);
+    }
+    let mut machine = machine_exposing(false, true);
     let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
     for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
         let module = adv_os::modules(&machine.ext).get(kernel);
