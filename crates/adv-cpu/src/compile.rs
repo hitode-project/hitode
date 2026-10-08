@@ -17,15 +17,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 mod contract;
 pub(crate) mod coverage;
 mod diagnostics;
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "android",
-        all(target_os = "macos", target_arch = "aarch64")
-    ),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-mod direct;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 #[cfg(target_arch = "aarch64")]
@@ -101,17 +92,6 @@ pub(crate) struct Compiled {
     pub gir_opaque_instructions: usize,
     pub decoded_bytes: usize,
     ir_counts: Option<ir_counts::Summary>,
-    pub direct_sites: usize,
-    pub direct_inline_fallbacks: u64,
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    inline_registration: Option<crate::fault_recovery::inline::Registration>,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     _nests: Box<[crate::rows::Descriptor]>,
@@ -131,15 +111,6 @@ pub(crate) struct Compiled {
 impl Drop for Compiled {
     fn drop(&mut self) {
         self.perf_ranges.clear();
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        self.inline_registration.take();
         // SAFETY: the entry pointer is private, run borrows self, and no generated
         // code can still be executing while this exclusive drop runs.
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -171,9 +142,7 @@ impl Compiled {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
     }
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.input.direct_memory == memory.direct_memory_enabled()
-            && self.input.direct_inline == memory.direct_memory_inline()
-            && memory.base == self.window_base
+        memory.base == self.window_base
             && memory.len == self.window_len
             && self
                 .pages
@@ -201,11 +170,6 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
-        if self.input.direct_memory != memory.direct_memory_enabled()
-            || self.input.direct_inline != memory.direct_memory_inline()
-        {
-            return (Exit::Fallback as u32, 0);
-        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         crate::jit_memory_macos::synchronize_execution();
         #[cfg(target_arch = "aarch64")]
@@ -248,7 +212,6 @@ impl Compiled {
             recovery_slot: std::ptr::null(),
             linked_entries: 0,
             shadow,
-            direct: memory.direct_engine_pointer(),
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Checked accesses retain their guards; verified ordinary reads
@@ -272,29 +235,7 @@ impl Compiled {
             return (result, context.linked_entries);
         }
         let memory_pointer = memory.ptr.as_ptr();
-        let mut run = || unsafe { (self.entry)(&mut context, memory_pointer) };
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        let result = if self.input.direct_memory {
-            unsafe { crate::direct_memory::run_inline(state, memory, bridge, &permissions, run) }
-        } else {
-            run()
-        };
-        #[cfg(not(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )))]
-        let result = run();
+        let result = unsafe { (self.entry)(&mut context, memory_pointer) };
         if let Some(stack) = controls.shadow {
             stack.clear();
         }
@@ -384,8 +325,6 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
     parallel: bool,
-    direct_memory: bool,
-    direct_inline: bool,
     pub region: Box<Region>,
     pub(crate) base: u32,
     len: usize,
@@ -436,8 +375,6 @@ impl Snapshot {
         let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
             parallel: self.parallel,
-            direct_memory: self.direct_memory,
-            direct_inline: self.direct_inline,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -503,8 +440,6 @@ impl Snapshot {
         }
         Ok(Self {
             parallel: memory.is_parallel(),
-            direct_memory: memory.direct_memory_enabled(),
-            direct_inline: memory.direct_memory_inline(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -528,9 +463,7 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.direct_memory == memory.direct_memory_enabled()
-            && self.direct_inline == memory.direct_memory_inline()
-            && self.parallel == memory.is_parallel()
+        self.parallel == memory.is_parallel()
             && memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
@@ -803,13 +736,6 @@ pub(crate) fn compile(
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
-    compile_snapshot_with_inline(snapshot, snapshot.direct_inline)
-}
-
-fn compile_snapshot_with_inline(
-    snapshot: &Snapshot,
-    _inline_enabled: bool,
-) -> Result<Compiled, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let _write = crate::jit_memory_macos::WriteScope::new();
     let ir_counts =
@@ -950,8 +876,7 @@ fn compile_snapshot_with_inline(
         }
         opaque.extend(x87_segments.interiors.iter().copied());
         opaque.extend(x87_segments.integers.iter().copied());
-        crate::gir::lift::tier2(&instructions, &entries, &opaque, snapshot.direct_memory)
-            .map_err(|e| e.to_string())?
+        crate::gir::lift::tier2(&instructions, &entries, &opaque).map_err(|e| e.to_string())?
     };
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
@@ -988,30 +913,6 @@ fn compile_snapshot_with_inline(
     builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    builder.symbol(
-        "adv_direct_scalar",
-        crate::direct_memory::access as *const u8,
-    );
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    builder.symbol(
-        "adv_direct_checked",
-        crate::direct_memory::checked as *const u8,
-    );
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
@@ -1056,7 +957,6 @@ fn compile_snapshot_with_inline(
     // so it cannot yet be shared by the checked and polling copies.
     // Recompute the plan from the final region CFG.
     let poll_plan = (crate::safepoint::enabled()
-        && !snapshot.direct_memory
         && !snapshot.parallel
         && plans.is_empty()
         && invariant_plan.is_none()
@@ -1084,28 +984,6 @@ fn compile_snapshot_with_inline(
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let direct_ids = if snapshot.direct_memory {
-        Some(direct::declare(&mut module)?)
-    } else {
-        None
-    };
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let mut inline_drafts = Vec::new();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -1515,22 +1393,6 @@ fn compile_snapshot_with_inline(
                             && blocks.contains_key(&i.near_branch32())
                     })
         });
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        let direct_refs = direct_ids
-            .filter(|_| kernel.is_none() && !invariant_body)
-            .map(|(access, checked)| {
-                (
-                    module.declare_func_in_func(access, b.func),
-                    module.declare_func_in_func(checked, b.func),
-                )
-            });
         let mut e = Emitter {
             poll,
             poll_block: region.start,
@@ -1634,26 +1496,6 @@ fn compile_snapshot_with_inline(
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            direct_refs,
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            inline: direct_refs
-                .filter(|_| _inline_enabled)
-                .map(|_| direct::Inline::new()),
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1948,17 +1790,6 @@ fn compile_snapshot_with_inline(
             block.emit(&mut e.b, ptr_ty);
             fault_draft = e.fault_draft.take();
         }
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        if let Some(inline) = e.finish_inline() {
-            inline_drafts = inline;
-        }
         e.b.seal_all_blocks();
         e.b.finalize();
         ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
@@ -2186,32 +2017,6 @@ fn compile_snapshot_with_inline(
         *target = body_entry;
     }
     let tail_entry = module.get_finalized_function(poll_id.unwrap_or(id)) as usize;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let inline_registration =
-        direct::publish(ctx.compiled_code().unwrap(), body_entry, &inline_drafts)?;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    if !inline_drafts.is_empty() && inline_registration.is_none() {
-        // No entry or recovery table has escaped. Release the rejected body
-        // and regenerate this region using the existing scalar helper lane.
-        unsafe { module.free_memory() };
-        let mut compiled = compile_snapshot_with_inline(snapshot, false)?;
-        compiled.direct_inline_fallbacks += 1;
-        return Ok(compiled);
-    }
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
@@ -2433,47 +2238,6 @@ fn compile_snapshot_with_inline(
         window_len: snapshot.len,
         entries,
         excluded_entries,
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        inline_registration,
-        direct_inline_fallbacks: 0,
-        direct_sites: {
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            {
-                if snapshot.direct_memory {
-                    instructions
-                        .values()
-                        .filter(|i| direct::candidate(i))
-                        .count()
-                } else {
-                    0
-                }
-            }
-            #[cfg(not(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            )))]
-            {
-                0
-            }
-        },
         code_size,
         _x87: x87,
         _nests: descriptors,
@@ -3201,24 +2965,6 @@ struct Emitter<'a> {
     timestamp_ref: ir::FuncRef,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    inline: Option<direct::Inline>,
     source_map: bool,
     source_origin: u32,
     source: ir::SourceLoc,
@@ -4860,7 +4606,7 @@ impl Emitter<'_> {
     /// page-guard cold path. No classification branch runs after an ordinary
     /// guard succeeds. RMW stores retain pointer()'s early prevalidation because
     /// their flags and value are computed between validation and writeback.
-    fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
+    fn memory_access(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
         // A forwarded slot loads its value; stores also write memory below.
@@ -5381,7 +5127,7 @@ impl Emitter<'_> {
         self.b.block_params(done)[0]
     }
     fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
-        self.direct_memory(addr, ty, None).unwrap()
+        self.memory_access(addr, ty, None).unwrap()
     }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fn capture_hardware_read(
@@ -5435,7 +5181,7 @@ impl Emitter<'_> {
     }
     fn direct_store(&mut self, addr: Value, value: Value) {
         let ty = self.b.func.dfg.value_type(value);
-        self.direct_memory(addr, ty, Some(value));
+        self.memory_access(addr, ty, Some(value));
     }
     /// Synchronous memory helpers borrow at most 16 bytes until they return.
     /// Consume a read immediately into SSA; no buffer pointer escapes or is
@@ -5923,25 +5669,6 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        if self.direct_refs.is_some() {
-            if self.lane.is_none() && direct::candidate(i) {
-                self.direct_mov(i);
-                return false;
-            }
-            if (0..i.op_count()).any(|operand| i.op_kind(operand) == OpKind::Memory) {
-                self.b
-                    .ins()
-                    .call(self.direct_refs.unwrap().1, &[self.bridge]);
-            }
-        }
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;

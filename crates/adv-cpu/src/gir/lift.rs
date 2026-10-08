@@ -161,7 +161,6 @@ pub(crate) fn tier2(
     instructions: &BTreeMap<u32, Instruction>,
     entries: &std::collections::BTreeSet<u32>,
     opaque: &std::collections::BTreeSet<u32>,
-    opaque_memory: bool,
 ) -> Result<Tier2, super::verify::Error> {
     // Overlapping decode entries can merge after distinct linear prefixes.
     // Keep their common suffix independently addressable by either stream.
@@ -180,7 +179,7 @@ pub(crate) fn tier2(
     let mut opaque_instructions = 0;
     let mut remaining = instructions.clone();
     while let Some((&start, &first)) = remaining.first_key_value() {
-        if opaque.contains(&start) || !native_integer(&first, opaque_memory) {
+        if opaque.contains(&start) || !native_integer(&first) {
             remaining.remove(&start);
             operations.insert(start, Tier2Operation::Opaque(first));
             opaque_instructions += 1;
@@ -191,7 +190,7 @@ pub(crate) fn tier2(
         while let Some(&i) = remaining.get(&pc) {
             if pc != start && (entries.contains(&pc) || merges.contains(&pc))
                 || opaque.contains(&pc)
-                || !native_integer(&i, opaque_memory)
+                || !native_integer(&i)
             {
                 break;
             }
@@ -216,11 +215,8 @@ pub(crate) fn tier2(
     })
 }
 
-fn native_integer(i: &Instruction, opaque_memory: bool) -> bool {
-    if classify(i).is_err()
-        || i.flow_control() != iced_x86::FlowControl::Next
-        || opaque_memory && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
-    {
+fn native_integer(i: &Instruction) -> bool {
+    if classify(i).is_err() || i.flow_control() != iced_x86::FlowControl::Next {
         return false;
     }
     let full_destination = match i.op0_kind() {

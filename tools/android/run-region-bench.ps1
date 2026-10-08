@@ -5,8 +5,7 @@ Build and run the anonymous, headless ARM64 region benchmark.
 Inputs: an optional locally staged private capture Corpus, hexadecimal/auto CpuMask,
 isolated TargetDir/Output and the shared atomic DeviceLock directory. Output:
 anonymous benchmark CSV/log, commands and binary/runner SHA-256. No APK or UI.
-DirectMemory selects one or more off/legacy/inline lanes on the same binary
-under one device lock. LockOwner labels that lock for the calling task.
+LockOwner labels the device lock for the calling task.
 Lock acquisition retries once per second without touching an existing owner.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
 The caller owns TEMP/TMP and storage policy. Existing adb server port 5037 only.
@@ -27,7 +26,6 @@ param(
     [ValidatePattern('^(auto|[0-9a-fA-F]+)$')][string]$CpuMask = 'auto',
     [string]$DeviceLock = $env:ADV_DEVICE_LOCK,
     [ValidatePattern('^[a-zA-Z0-9_-]+$')][string]$LockOwner = 'feat',
-    [ValidateSet('off', 'legacy', 'inline')][string[]]$DirectMemory = @('off'),
     [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
     [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [switch]$CompileBench,
@@ -62,19 +60,19 @@ function Get-CpuChoices([string[]]$Inventory) {
         }
     } | Sort-Object -Property @{ Expression = 'frequency'; Descending = $true }, @{ Expression = 'core'; Descending = $true })
 }
-function Get-Command([string]$Remote, [string]$Mode = 'off') {
+function Get-Command([string]$Remote) {
     $corpusEnv = if ($Corpus) { "ADV_GIR_LIFT_CORPUS='$Remote/corpus' " } else { '' }
     $compileEnv = if ($CompileBench) { 'ADV_REGION_BENCH_COMPILE=1 ' } else { 'ADV_REGION_BENCH_COMPILE=0 ' }
     # Compiler workers inherit affinity: a single-core taskset would serialize
     # the 1/2/4-thread throughput experiment. Execution stays on the chosen core.
     $affinity = if ($CompileBench) { '' } else { "taskset $CpuMask " }
-    "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}${compileEnv}ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_REGION_BENCH_DIRECT=$Mode ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit ${affinity}timeout $TimeoutSeconds '$Remote/host_region_bench'"
+    "unset ADV_JIT_VERIFY ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}${compileEnv}ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit ${affinity}timeout $TimeoutSeconds '$Remote/host_region_bench'"
 }
 if ($WhatIf) {
     [ordered]@{ build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs;
         cpu_mask = $CpuMask; adb_port = 5037; shell = Get-Command '/data/local/tmp/adv-region-bench-DRYRUN';
         cleanup = $true; cooldown_seconds = 60; device_lock = $DeviceLock; lock_owner = $LockOwner;
-        direct_memory = $DirectMemory; commands = @($DirectMemory | ForEach-Object { Get-Command '/data/local/tmp/adv-region-bench-DRYRUN' $_ }) } | ConvertTo-Json -Depth 4
+        commands = @(Get-Command '/data/local/tmp/adv-region-bench-DRYRUN') } | ConvertTo-Json -Depth 4
     return
 }
 if (-not $BuildOnly -and -not $DeviceLock) { throw 'Pass the shared DeviceLock directory.' }
@@ -165,25 +163,22 @@ try {
     # Record the bound core's policy/frequency as context; never change it.
     Invoke-Adb @('-s', $device, 'shell', 'cat /sys/devices/system/cpu/online; for p in /sys/devices/system/cpu/cpufreq/policy*; do echo policy; cat $p/related_cpus $p/scaling_max_freq $p/scaling_cur_freq $p/scaling_governor; done') |
         Set-Content -LiteralPath (Join-Path $Output 'frequency-before.txt')
-    foreach ($mode in ($DirectMemory | Select-Object -Unique)) {
-        $name = if ($DirectMemory.Count -eq 1) { 'bench.csv' } else { "bench-$mode.csv" }
-        $benchLog = Join-Path $Output $name
-        for ($attempt = 1; $attempt -le 4; $attempt++) {
-            $remaining = [int](1000 - $clock.Elapsed.TotalSeconds)
-            if ($remaining -lt 10) { throw 'Device session budget exhausted before benchmark.' }
-            $TimeoutSeconds = [Math]::Min($TimeoutSeconds, $remaining)
-            $command = Get-Command $remote $mode
-            Add-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Value "adb shell $command"
-            & $adb -H 127.0.0.1 -P 5037 -s $device shell $command *> $benchLog
-            $code = $LASTEXITCODE
-            $log = Get-Content -LiteralPath $benchLog -Raw
-            if ($log -notmatch 'cannot connect to daemon|device offline|device not found') { break }
-            if ($attempt -eq 4) { throw 'Benchmark transport failed before execution.' }
-            Start-Sleep -Seconds 30
-        }
-        $marker = if ($CompileBench) { 'compile_total,all,Speed,4,' } else { '# completed accepted=' }
-        if ($code -ne 0 -or $log -notmatch $marker) { throw "Benchmark failed in $mode; see benchmark CSV." }
+    $benchLog = Join-Path $Output 'bench.csv'
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $remaining = [int](1000 - $clock.Elapsed.TotalSeconds)
+        if ($remaining -lt 10) { throw 'Device session budget exhausted before benchmark.' }
+        $TimeoutSeconds = [Math]::Min($TimeoutSeconds, $remaining)
+        $command = Get-Command $remote
+        Add-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Value "adb shell $command"
+        & $adb -H 127.0.0.1 -P 5037 -s $device shell $command *> $benchLog
+        $code = $LASTEXITCODE
+        $log = Get-Content -LiteralPath $benchLog -Raw
+        if ($log -notmatch 'cannot connect to daemon|device offline|device not found') { break }
+        if ($attempt -eq 4) { throw 'Benchmark transport failed before execution.' }
+        Start-Sleep -Seconds 30
     }
+    $marker = if ($CompileBench) { 'compile_total,all,Speed,4,' } else { '# completed accepted=' }
+    if ($code -ne 0 -or $log -notmatch $marker) { throw "Benchmark failed; see benchmark CSV." }
     Write-Output 'Region benchmark completed; anonymous statistics saved in bench.csv.'
 } finally {
     if ($locked) {

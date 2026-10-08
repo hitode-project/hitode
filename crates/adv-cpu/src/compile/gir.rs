@@ -345,8 +345,7 @@ mod tests {
                 .collect();
         let entry = decoded.values().nth(1).unwrap().ip32();
         let plan =
-            crate::gir::lift::tier2(&decoded, &BTreeSet::from([entry]), &BTreeSet::new(), false)
-                .unwrap();
+            crate::gir::lift::tier2(&decoded, &BTreeSet::from([entry]), &BTreeSet::new()).unwrap();
         assert_eq!(plan.ssa_instructions, 3);
         assert_eq!(plan.opaque_instructions, 1);
         assert!(plan.operations.contains_key(&entry));

@@ -1,9 +1,5 @@
 //! Exact scalar fault recovery for supported POSIX native executions.
 //! The signal boundary only captures context and redirects to a same-frame stub;
-//! Legacy frozen sessions complete one access through `recover_current`; the
-//! inline lane returns a canonical checkpoint for ordinary interpreter fallback.
-pub(crate) mod inline;
-
 use crate::CpuState;
 use crate::execution_abi::{
     HostContextSnapshot, NativeRecoveryPoint, RecoveryAccess, RecoveryValue, StoreCommitProof,
@@ -293,16 +289,12 @@ unsafe fn capture(context: *const c_void, pc: usize) -> Option<HostContextSnapsh
 }
 
 unsafe extern "C" fn dispatch(
-    signal: i32,
+    _signal: i32,
     pc: usize,
     fault_address: usize,
     access: usize,
     context: *mut c_void,
 ) -> usize {
-    let recovery = unsafe { inline::dispatch(signal, pc, fault_address, access, context) };
-    if recovery != 0 {
-        return recovery;
-    }
     ACTIVE
         .try_with(|slot| {
             let pointer = slot.get();

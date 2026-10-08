@@ -4,7 +4,7 @@
 # Usage: tools/cpu/arm64-check.sh [REF] [OUT_DIR]
 #   REF      ref to test (default: HEAD); origin/REF wins when it exists.
 #   OUT_DIR  where logs go (default: target/arm64-acceptance/<short sha>).
-# Runs plain, ADV_JIT_VERIFY=strict, ADV_DIRECT_MEMORY=1 and direct+strict
+# Runs plain and ADV_JIT_VERIFY=strict
 # suites, then judges each log with acceptance.py. Prints one line per suite
 # and exits non-zero if any suite is not accepted. The checkout is detached;
 # run it in a clean clone, not in a working tree with uncommitted changes.
@@ -38,7 +38,5 @@ run() {
 }
 run tests ""
 run strict --strict ADV_JIT_VERIFY=strict
-run direct "" ADV_DIRECT_MEMORY=1
-run direct-strict --strict ADV_DIRECT_MEMORY=1 ADV_JIT_VERIFY=strict
 echo "logs: $OUT"
 exit $status

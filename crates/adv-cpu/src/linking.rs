@@ -165,8 +165,6 @@ pub(crate) struct NativeContext {
     /// Exclusive metadata borrowed for this chain. Cleared before/after native
     /// execution, so it cannot retain a target across publication or retirement.
     pub shadow: *mut shadow::Stack,
-    /// Optional direct scalar engine; null for checked/parallel/row execution.
-    pub direct: *const std::ffi::c_void,
 }
 
 #[cfg(test)]

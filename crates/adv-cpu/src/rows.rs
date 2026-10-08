@@ -655,7 +655,6 @@ fn execute(batch: &Batch) {
             recovery_slot: std::ptr::null(),
             linked_entries: 0,
             shadow: std::ptr::null_mut(),
-            direct: std::ptr::null(),
             rows: std::ptr::null(),
             written: 0,
         };
@@ -1118,7 +1117,6 @@ mod tests {
                 recovery_slot: std::ptr::null(),
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
-                direct: std::ptr::null(),
                 rows: &pool,
                 written: 0,
             };
@@ -1206,7 +1204,6 @@ mod tests {
                 recovery_slot: std::ptr::null(),
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
-                direct: std::ptr::null(),
                 rows: &pool,
                 written: 0,
             };
