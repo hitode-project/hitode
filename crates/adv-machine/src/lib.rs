@@ -1284,6 +1284,13 @@ impl Dispatch<'_> {
         cpu: &mut dyn Guest,
         event: exception::Exception,
     ) -> Result<(), Parked> {
+        // A backend fault is an input event, not a completed host call. Emit it
+        // before unwinding or invoking handlers; traps already have raw_interrupt.
+        if let exception::Exception::Fault(fault) = &event {
+            self.sys
+                .trace
+                .cpu_fault(self.sys.current, self.sys.frame, fault);
+        }
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(cpu, |frame| esp >= frame.stack, "exception")?;
         // Retain the original stop before a personality can edit registers or
