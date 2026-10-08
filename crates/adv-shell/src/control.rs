@@ -382,6 +382,9 @@ impl SceneGate {
             )),
         })
     }
+    pub fn check_duration(&self) -> Duration {
+        self.check_time
+    }
     pub fn json(&self) -> String {
         let frozen = self.frozen_wall
             + self

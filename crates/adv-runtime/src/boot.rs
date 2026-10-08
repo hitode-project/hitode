@@ -249,7 +249,10 @@ impl<B: Backend> Runtime<B> {
             adv_dx::d3d9::cancel_pending(&mut self.machine);
             return outcome;
         }
-        if let Err(message) = adv_dx::dshow::pump_video(&mut self.machine) {
+        let service_started = self.machine.sys.stats.start();
+        let video = adv_dx::dshow::pump_video(&mut self.machine);
+        self.machine.sys.stats.add_render(service_started);
+        if let Err(message) = video {
             return SliceResult::Complete(RunResult::Failed(adv_machine::MachineError {
                 ctx: self.machine.sys.current,
                 pc: self.machine.cpu.reg(adv_cpu::backend::Reg::Eip),
@@ -258,7 +261,14 @@ impl<B: Backend> Runtime<B> {
             }));
         }
         #[cfg(feature = "gpu")]
-        match adv_dx::d3d9::pump(&mut self.machine) {
+        let graphics = {
+            let service_started = self.machine.sys.stats.start();
+            let graphics = adv_dx::d3d9::pump(&mut self.machine);
+            self.machine.sys.stats.add_render(service_started);
+            graphics
+        };
+        #[cfg(feature = "gpu")]
+        match graphics {
             Ok(true) if matches!(outcome, SliceResult::Complete(RunResult::Idle { .. })) => {
                 return SliceResult::Yielded;
             }
@@ -272,7 +282,10 @@ impl<B: Backend> Runtime<B> {
                 }));
             }
         }
-        match adv_dx::dsound::pump(&mut self.machine) {
+        let service_started = self.machine.sys.stats.start();
+        let audio = adv_dx::dsound::pump(&mut self.machine);
+        self.machine.sys.stats.add_audio(service_started);
+        match audio {
             Ok(Some(at)) => match outcome {
                 SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                     SliceResult::Complete(RunResult::Idle {
