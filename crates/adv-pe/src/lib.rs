@@ -178,7 +178,8 @@ pub struct Pe {
 }
 
 fn le16(b: &[u8], off: usize) -> Result<u16> {
-    b.get(off..off + 2)
+    off.checked_add(2)
+        .and_then(|end| b.get(off..end))
         .map(|s| u16::from_le_bytes([s[0], s[1]]))
         .ok_or(PeError::OutOfImage {
             rva: off as u32,
@@ -187,12 +188,24 @@ fn le16(b: &[u8], off: usize) -> Result<u16> {
 }
 
 fn le32(b: &[u8], off: usize) -> Result<u32> {
-    b.get(off..off + 4)
+    off.checked_add(4)
+        .and_then(|end| b.get(off..end))
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
         .ok_or(PeError::OutOfImage {
             rva: off as u32,
             len: 4,
         })
+}
+
+fn add(rva: u32, offset: u32) -> Result<u32> {
+    rva.checked_add(offset)
+        .ok_or(PeError::OutOfImage { rva, len: offset })
+}
+
+fn reserve<T>(values: &mut Vec<T>, additional: usize) -> Result<()> {
+    values
+        .try_reserve(additional)
+        .map_err(|_| PeError::Malformed("PE allocation failed".into()))
 }
 
 impl Pe {
@@ -210,48 +223,57 @@ impl Pe {
             return Err(PeError::NotPe);
         }
         let nt = le32(file, 0x3c).map_err(|_| PeError::NotPe)? as usize;
-        if file.get(nt..nt + 4) != Some(b"PE\0\0") {
+        let nt_end = nt.checked_add(24).ok_or(PeError::NotPe)?;
+        let header = file.get(nt..nt_end).ok_or(PeError::NotPe)?;
+        if &header[..4] != b"PE\0\0" {
             return Err(PeError::NotPe);
         }
-        let fh = nt + 4;
-        let machine = le16(file, fh)?;
+        let machine = le16(header, 4)?;
         if machine != 0x14c {
             return Err(PeError::NotI386(machine));
         }
-        let nsections = le16(file, fh + 2)? as usize;
-        let timestamp = le32(file, fh + 4)?;
-        let opt_size = le16(file, fh + 16)? as usize;
-        let characteristics = le16(file, fh + 18)?;
-        let oh = fh + 20;
-        if le16(file, oh)? != 0x10b {
+        let nsections = le16(header, 6)? as usize;
+        let timestamp = le32(header, 8)?;
+        let opt_size = le16(header, 20)? as usize;
+        let characteristics = le16(header, 22)?;
+        let opt_end = nt_end
+            .checked_add(opt_size)
+            .ok_or_else(|| PeError::Malformed("optional header range overflows".into()))?;
+        let oh = file
+            .get(nt_end..)
+            .filter(|header| header.len() >= 96)
+            .ok_or_else(|| PeError::Malformed("optional header truncated".into()))?;
+        if le16(oh, 0)? != 0x10b {
             return Err(PeError::Malformed("optional header is not PE32".into()));
         }
-        let ndirs = (le32(file, oh + 92)? as usize).min(16);
+        // Windows clamps the advertised count to complete entries in the header.
+        let available_dirs = opt_size.saturating_sub(96).min(oh.len() - 96) / 8;
+        let ndirs = (le32(oh, 92)? as usize).min(available_dirs).min(16);
         let mut dirs = [DataDir::default(); 16];
         for (i, d) in dirs.iter_mut().enumerate().take(ndirs) {
             *d = DataDir {
-                rva: le32(file, oh + 96 + 8 * i)?,
-                size: le32(file, oh + 100 + 8 * i)?,
+                rva: le32(oh, 96 + 8 * i)?,
+                size: le32(oh, 100 + 8 * i)?,
             };
         }
         let mut pe = Pe {
             machine,
             characteristics,
             timestamp,
-            entry_rva: le32(file, oh + 16)?,
-            image_base: le32(file, oh + 28)?,
-            section_alignment: le32(file, oh + 32)?,
-            file_alignment: le32(file, oh + 36)?,
-            size_of_image: le32(file, oh + 56)?,
-            size_of_headers: le32(file, oh + 60)?,
-            subsystem: le16(file, oh + 68)?,
-            dll_characteristics: le16(file, oh + 70)?,
-            stack_reserve: le32(file, oh + 72)?,
-            stack_commit: le32(file, oh + 76)?,
-            heap_reserve: le32(file, oh + 80)?,
-            heap_commit: le32(file, oh + 84)?,
+            entry_rva: le32(oh, 16)?,
+            image_base: le32(oh, 28)?,
+            section_alignment: le32(oh, 32)?,
+            file_alignment: le32(oh, 36)?,
+            size_of_image: le32(oh, 56)?,
+            size_of_headers: le32(oh, 60)?,
+            subsystem: le16(oh, 68)?,
+            dll_characteristics: le16(oh, 70)?,
+            stack_reserve: le32(oh, 72)?,
+            stack_commit: le32(oh, 76)?,
+            heap_reserve: le32(oh, 80)?,
+            heap_commit: le32(oh, 84)?,
             dirs,
-            sections: Vec::with_capacity(nsections),
+            sections: Vec::new(),
             image: Vec::new(),
         };
         if pe.size_of_image == 0 || pe.size_of_image > 0x4000_0000 {
@@ -261,58 +283,70 @@ impl Pe {
             )));
         }
 
-        let sh = oh + opt_size;
-        for i in 0..nsections {
-            let s = sh + 40 * i;
-            let raw_name = file
-                .get(s..s + 8)
-                .ok_or(PeError::Malformed("section table truncated".into()))?;
+        // Unused directories and advisory sizes do not prevent image mapping.
+        // Each consumer checks the actual records it dereferences instead.
+        let sections_end = nsections
+            .checked_mul(40)
+            .and_then(|size| opt_end.checked_add(size))
+            .ok_or_else(|| PeError::Malformed("section table range overflows".into()))?;
+        let sections = if nsections == 0 {
+            &[][..]
+        } else {
+            file.get(opt_end..sections_end)
+                .ok_or_else(|| PeError::Malformed("section table truncated".into()))?
+        };
+        reserve(&mut pe.sections, nsections)?;
+        for s in sections.chunks_exact(40) {
+            let raw_name = &s[..8];
             let name_len = raw_name.iter().position(|&c| c == 0).unwrap_or(8);
             pe.sections.push(Section {
                 name: String::from_utf8_lossy(&raw_name[..name_len]).into_owned(),
-                virtual_size: le32(file, s + 8)?,
-                virtual_address: le32(file, s + 12)?,
-                raw_size: le32(file, s + 16)?,
-                raw_offset: le32(file, s + 20)?,
-                characteristics: le32(file, s + 36)?,
+                virtual_size: le32(s, 8)?,
+                virtual_address: le32(s, 12)?,
+                raw_size: le32(s, 16)?,
+                raw_offset: le32(s, 20)?,
+                characteristics: le32(s, 36)?,
             });
         }
 
         Ok(pe)
     }
 
-    fn map_image(&mut self, file: &[u8]) -> Result<()> {
-        let pe = self;
+    fn mapped_size(&self) -> Result<u32> {
         // SEC_IMAGE rounds the reserved extent to a page even when a linker
         // leaves SizeOfImage unaligned. Preserve the header value, but include
         // the final page's raw padding in the mapped buffer and bounds checks.
-        let mapped_size = if pe.section_alignment >= 0x1000 {
-            pe.size_of_image
+        if self.section_alignment >= 0x1000 {
+            self.size_of_image
                 .checked_add(0xfff)
                 .map(|size| size & !0xfff)
-                .ok_or_else(|| PeError::Malformed("SizeOfImage rounding overflows".into()))?
+                .ok_or_else(|| PeError::Malformed("SizeOfImage rounding overflows".into()))
         } else {
-            pe.size_of_image
-        };
-        let mut image = vec![0u8; mapped_size as usize];
-        let hdr = (pe.size_of_headers as usize)
-            .min(file.len())
-            .min(image.len());
-        image[..hdr].copy_from_slice(&file[..hdr]);
-        for s in &pe.sections {
+            Ok(self.size_of_image)
+        }
+    }
+
+    fn map_image(&mut self, file: &[u8]) -> Result<()> {
+        let pe = self;
+        let mapped_size = pe.mapped_size()?;
+        let section_size = |s: &Section| {
             // SEC_IMAGE preserves raw padding inside the section's final page.
             // Extra raw pages do not enlarge a nonzero VirtualSize or overwrite
             // the next section (some packed images have oversized raw data).
-            let mapped = if pe.section_alignment >= 0x1000 {
+            if pe.section_alignment >= 0x1000 {
                 s.mem_size()
                     .checked_add(0xfff)
                     .map(|size| size & !0xfff)
                     .ok_or_else(|| {
                         PeError::Malformed(format!("section {} mapped size overflows", s.name))
-                    })?
+                    })
             } else {
-                s.mem_size()
-            };
+                Ok(s.mem_size())
+            }
+        };
+        // Reject invalid virtual extents before requesting the image buffer.
+        for s in &pe.sections {
+            let mapped = section_size(s)?;
             if s.virtual_address
                 .checked_add(mapped)
                 .is_none_or(|end| end > mapped_size)
@@ -322,6 +356,16 @@ impl Pe {
                     s.name
                 )));
             }
+        }
+        let mut image = Vec::new();
+        reserve(&mut image, mapped_size as usize)?;
+        image.resize(mapped_size as usize, 0);
+        let hdr = (pe.size_of_headers as usize)
+            .min(file.len())
+            .min(image.len());
+        image[..hdr].copy_from_slice(&file[..hdr]);
+        for s in &pe.sections {
+            let mapped = section_size(s)?;
             // Windows rounds the raw pointer down to 512 when FileAlignment is at least that.
             let off = if pe.file_alignment >= 0x200 {
                 s.raw_offset & !0x1ff
@@ -353,7 +397,7 @@ impl Pe {
     }
 
     pub fn slice(&self, rva: u32, len: u32) -> Result<&[u8]> {
-        let (s, e) = (rva as usize, rva as usize + len as usize);
+        let (s, e) = (rva as usize, add(rva, len)? as usize);
         self.image.get(s..e).ok_or(PeError::OutOfImage { rva, len })
     }
 
@@ -368,7 +412,7 @@ impl Pe {
     pub fn set_u32(&mut self, rva: u32, v: u32) -> Result<()> {
         let s = self
             .image
-            .get_mut(rva as usize..rva as usize + 4)
+            .get_mut(rva as usize..add(rva, 4)? as usize)
             .ok_or(PeError::OutOfImage { rva, len: 4 })?;
         s.copy_from_slice(&v.to_le_bytes());
         Ok(())
@@ -413,19 +457,30 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        let end = d.rva + d.size;
-        let mut blk = d.rva;
-        while blk + 8 <= end {
-            let page = self.u32_at(blk)?;
-            let size = self.u32_at(blk + 4)?;
-            if size < 8 {
+        let mut blocks = self.slice(d.rva, d.size)?;
+        while blocks.len() >= 8 {
+            let page = le32(blocks, 0)?;
+            let size = le32(blocks, 4)?;
+            if size == 0 {
                 break;
             }
-            for e in (blk + 8..blk + size).step_by(2) {
-                let v = self.u16_at(e)?;
+            if size < 8 {
+                return Err(PeError::Malformed("relocation block is too short".into()));
+            }
+            if size as usize > blocks.len() {
+                return Err(PeError::Malformed("relocation block truncated".into()));
+            }
+            let (block, remaining) = blocks.split_at(size as usize);
+            for entry in block[8..].chunks_exact(2) {
+                let v = le16(entry, 0)?;
                 match v >> 12 {
                     0 => {}
-                    3 => out.push(page + u32::from(v & 0xfff)),
+                    3 => {
+                        let target = add(page, u32::from(v & 0xfff))?;
+                        self.slice(target, 4)?;
+                        reserve(&mut out, 1)?;
+                        out.push(target);
+                    }
                     t => {
                         return Err(PeError::Malformed(format!(
                             "relocation type {t} at page {page:#x}"
@@ -433,7 +488,7 @@ impl Pe {
                     }
                 }
             }
-            blk += size;
+            blocks = remaining;
         }
         Ok(out)
     }
@@ -456,11 +511,29 @@ impl Pe {
         name_va_base: Option<u32>,
     ) -> Result<Vec<Import>> {
         let mut out = Vec::new();
-        for i in 0.. {
-            let t = self.u32_at(names_rva + 4 * i)?;
-            if t == 0 {
-                break;
-            }
+        let tail = self
+            .image
+            .get(names_rva as usize..)
+            .ok_or(PeError::OutOfImage {
+                rva: names_rva,
+                len: 4,
+            })?;
+        let count = tail
+            .chunks_exact(4)
+            .position(|word| word == [0; 4])
+            .ok_or_else(|| PeError::Malformed("import thunk array lacks a terminator".into()))?;
+        let len = u32::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| PeError::Malformed("import thunk array size overflows".into()))?;
+        let names = self.slice(names_rva, len)?;
+        if len != 0 {
+            self.slice(iat_rva, len)?;
+        }
+        reserve(&mut out, count)?;
+        let mut iat_rva = iat_rva;
+        for word in names.chunks_exact(4) {
+            let t = le32(word, 0)?;
             let name = if t & 0x8000_0000 != 0 {
                 ImportName::Ordinal(t as u16)
             } else {
@@ -470,13 +543,11 @@ impl Pe {
                 };
                 ImportName::Name {
                     hint: self.u16_at(rva)?,
-                    name: self.string_at(rva + 2)?,
+                    name: self.string_at(add(rva, 2)?)?,
                 }
             };
-            out.push(Import {
-                name,
-                iat_rva: iat_rva + 4 * i,
-            });
+            out.push(Import { name, iat_rva });
+            iat_rva = add(iat_rva, 4)?;
         }
         Ok(out)
     }
@@ -487,24 +558,30 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        for i in 0.. {
-            let desc = d.rva + 20 * i;
-            let (int, name, iat) = (
-                self.u32_at(desc)?,
-                self.u32_at(desc + 12)?,
-                self.u32_at(desc + 16)?,
-            );
+        // The loader follows the terminator, even when Size excludes it.
+        let descriptors = self
+            .image
+            .get(d.rva as usize..)
+            .ok_or(PeError::OutOfImage {
+                rva: d.rva,
+                len: 20,
+            })?;
+        for desc in descriptors.chunks_exact(20) {
+            let (int, name, iat) = (le32(desc, 0)?, le32(desc, 12)?, le32(desc, 16)?);
             if name == 0 && iat == 0 {
-                break;
+                return Ok(out);
             }
             // Old linkers leave OriginalFirstThunk 0; the IAT then holds the names.
             let names = if int != 0 { int } else { iat };
+            reserve(&mut out, 1)?;
             out.push(ImportModule {
                 dll: self.string_at(name)?,
                 imports: self.thunks(names, iat, None)?,
             });
         }
-        Ok(out)
+        Err(PeError::Malformed(
+            "import directory lacks a terminator".into(),
+        ))
     }
 
     /// The import directory an image had before Detours' `setdll` added DLLs to it, read from
@@ -515,14 +592,15 @@ impl Pe {
         let Some(s) = self.sections.iter().find(|s| s.name == ".detour") else {
             return Ok(None);
         };
-        let at = s.virtual_address;
-        if self.u32_at(at + 4)? != SIGNATURE {
+        if self.u32_at(add(s.virtual_address, 4)?)? != SIGNATURE {
             return Ok(None);
         }
-        Ok(Some(DataDir {
-            rva: self.u32_at(at + 0x10)?,
-            size: self.u32_at(at + 0x14)?,
-        }))
+        let header = self.slice(s.virtual_address, 0x18)?;
+        let d = DataDir {
+            rva: le32(header, 0x10)?,
+            size: le32(header, 0x14)?,
+        };
+        Ok(Some(d))
     }
 
     pub fn delay_imports(&self) -> Result<Vec<DelayImportModule>> {
@@ -537,12 +615,18 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        for i in 0.. {
-            let desc = d.rva + 32 * i;
-            let attrs = self.u32_at(desc)?;
-            let name = self.u32_at(desc + 4)?;
+        let descriptors = self
+            .image
+            .get(d.rva as usize..)
+            .ok_or(PeError::OutOfImage {
+                rva: d.rva,
+                len: 32,
+            })?;
+        for desc in descriptors.chunks_exact(32) {
+            let attrs = le32(desc, 0)?;
+            let name = le32(desc, 4)?;
             if name == 0 {
-                break;
+                return Ok(out);
             }
             if attrs & !1 != 0 {
                 return Err(PeError::Malformed(format!(
@@ -558,20 +642,23 @@ impl Pe {
                 }
             };
             let (hmod, iat, int) = (
-                fix(self.u32_at(desc + 8)?)?,
-                fix(self.u32_at(desc + 12)?)?,
-                fix(self.u32_at(desc + 16)?)?,
+                fix(le32(desc, 8)?)?,
+                fix(le32(desc, 12)?)?,
+                fix(le32(desc, 16)?)?,
             );
             // Translate old-format name pointers before dereferencing the hint/name.
             // Ordinal thunks still use their high-bit encoding in either format.
             let imports = self.thunks(int, iat, (attrs & 1 == 0).then_some(base))?;
+            reserve(&mut out, 1)?;
             out.push(DelayImportModule {
                 dll: self.string_at(fix(name)?)?,
                 module_handle_rva: hmod,
                 imports,
             });
         }
-        Ok(out)
+        Err(PeError::Malformed(
+            "delay import directory lacks a terminator".into(),
+        ))
     }
 
     pub fn tls(&self) -> Result<Option<Tls>> {
@@ -579,12 +666,13 @@ impl Pe {
         if !d.is_present() {
             return Ok(None);
         }
+        let header = self.slice(d.rva, 20)?;
         Ok(Some(Tls {
-            raw_start_va: self.u32_at(d.rva)?,
-            raw_end_va: self.u32_at(d.rva + 4)?,
-            index_va: self.u32_at(d.rva + 8)?,
-            callbacks_va: self.u32_at(d.rva + 12)?,
-            zero_fill: self.u32_at(d.rva + 16)?,
+            raw_start_va: le32(header, 0)?,
+            raw_end_va: le32(header, 4)?,
+            index_va: le32(header, 8)?,
+            callbacks_va: le32(header, 12)?,
+            zero_fill: le32(header, 16)?,
         }))
     }
 
@@ -595,14 +683,17 @@ impl Pe {
         if tls.callbacks_va == 0 {
             return Ok(out);
         }
+        // VA rebasing wraps as before; reads are bounded by the mapped image,
+        // which can include padding beyond the logical SizeOfImage.
         let mut rva = tls.callbacks_va.wrapping_sub(base);
         loop {
             let cb = self.u32_at(rva)?;
             if cb == 0 {
                 break;
             }
+            reserve(&mut out, 1)?;
             out.push(cb);
-            rva += 4;
+            rva = add(rva, 4)?;
         }
         Ok(out)
     }
@@ -613,33 +704,66 @@ impl Pe {
         if !d.is_present() {
             return Ok(out);
         }
-        let ordinal_base = self.u32_at(d.rva + 16)?;
-        let nfuncs = self.u32_at(d.rva + 20)?;
-        let nnames = self.u32_at(d.rva + 24)?;
-        let (funcs, names, ords) = (
-            self.u32_at(d.rva + 28)?,
-            self.u32_at(d.rva + 32)?,
-            self.u32_at(d.rva + 36)?,
-        );
-        let mut name_of = vec![None; nfuncs as usize];
-        for i in 0..nnames {
-            let idx = self.u16_at(ords + 2 * i)? as usize;
-            if let Some(slot) = name_of.get_mut(idx) {
-                *slot = Some(self.string_at(self.u32_at(names + 4 * i)?)?);
+        // Export metadata is consulted lazily by Windows; unusable entries are
+        // absent lookups rather than a reason to reject the entire image.
+        let Ok(header) = self.slice(d.rva, 40) else {
+            return Ok(out);
+        };
+        let ordinal_base = le32(header, 16)?;
+        let nfuncs = le32(header, 20)?;
+        let nnames = le32(header, 24)?;
+        let (funcs, names, ords) = (le32(header, 28)?, le32(header, 32)?, le32(header, 36)?);
+        let array = |rva, count: u32, width| {
+            let len = count
+                .checked_mul(width)
+                .ok_or_else(|| PeError::Malformed("export array size overflows".into()))?;
+            self.slice(rva, len)
+        };
+        // Validate the EAT before allocation, then keep only ordinals exposed
+        // by the existing u16 interface. Never truncate them into aliases.
+        let Ok(funcs) = array(funcs, nfuncs, 4) else {
+            return Ok(out);
+        };
+        let count = (u32::from(u16::MAX) + 1)
+            .saturating_sub(ordinal_base)
+            .min(nfuncs) as usize;
+        let mut name_of = Vec::new();
+        reserve(&mut name_of, count)?;
+        name_of.resize_with(count, || None);
+        let ords = self.image.get(ords as usize..).unwrap_or_default();
+        for (i, ord) in ords.chunks_exact(2).take(nnames as usize).enumerate() {
+            let idx = le16(ord, 0)? as usize;
+            let Some(slot) = name_of.get_mut(idx) else {
+                continue;
+            };
+            let Some(name_rva) = (i as u32)
+                .checked_mul(4)
+                .and_then(|offset| names.checked_add(offset))
+            else {
+                continue;
+            };
+            if let Ok(name) = self.u32_at(name_rva).and_then(|rva| self.string_at(rva)) {
+                *slot = Some(name);
             }
         }
-        for (i, name) in name_of.into_iter().enumerate() {
-            let rva = self.u32_at(funcs + 4 * i as u32)?;
+        reserve(&mut out, count)?;
+        for (i, (name, func)) in name_of.into_iter().zip(funcs.chunks_exact(4)).enumerate() {
+            let rva = le32(func, 0)?;
             if rva == 0 {
                 continue;
             }
-            let target = if rva >= d.rva && rva < d.rva + d.size {
-                ExportTarget::Forwarder(self.string_at(rva)?)
+            let target = if rva.checked_sub(d.rva).is_some_and(|offset| offset < d.size) {
+                let Ok(name) = self.string_at(rva) else {
+                    continue;
+                };
+                ExportTarget::Forwarder(name)
             } else {
                 ExportTarget::Rva(rva)
             };
+            let ordinal = u16::try_from(add(ordinal_base, i as u32)?)
+                .map_err(|_| PeError::Malformed("export ordinal exceeds u16".into()))?;
             out.push(Export {
-                ordinal: (ordinal_base + i as u32) as u16,
+                ordinal,
                 name,
                 target,
             });
@@ -653,6 +777,27 @@ impl Pe {
         if !d.is_present() {
             return Ok(None);
         }
-        resource::parse(self, d.rva).map(Some)
+        resource::parse(self, d).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_capacity_overflow_is_a_pe_error() {
+        let mut bytes = Vec::<u8>::new();
+        assert!(matches!(
+            reserve(&mut bytes, usize::MAX),
+            Err(PeError::Malformed(_))
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn little_endian_reads_reject_overflowing_host_offsets() {
+        assert!(le16(&[], usize::MAX).is_err());
+        assert!(le32(&[], usize::MAX).is_err());
     }
 }
