@@ -21,7 +21,8 @@ impl Executor {
     /// Both caches watch Memory code pages and independently validate their code;
     /// consuming Cranelift's dirty-page list cannot invalidate Tier 1's epoch.
     /// Bridge CFGs end before published Cranelift entries. A publication revision
-    /// retires old Tier 1 CFGs before they can cross a newly available entry.
+    /// retires conflicting Tier 1 CFGs before they can cross a new entry;
+    /// unrelated publications keep existing CFGs and their pinned mappings.
     pub fn set_tier1_mode(&mut self, mode: Tier1Mode) -> Result<(), String> {
         if mode == self.tier1_mode {
             return Ok(());
