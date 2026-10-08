@@ -9,6 +9,8 @@ use adv_os::{Heaps, Loader, Modules};
 use adv_pe::ImportName;
 use std::path::PathBuf;
 
+mod write;
+
 const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 const OUT: u32 = 0x0042_0000;

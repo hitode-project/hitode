@@ -8,6 +8,7 @@ use adv_machine::Env;
 use crate::{FileObj, Win32, util};
 
 mod attributes;
+mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
 const INVALID_HANDLE: i32 = 0xc000_0008u32 as i32;
@@ -22,7 +23,9 @@ const FILE_IS_A_DIRECTORY: i32 = 0xc000_00bau32 as i32;
 const NOT_SUPPORTED: i32 = 0xc000_00bbu32 as i32;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
 const READ_ACCESS: u32 = GENERIC_READ | SYNCHRONIZE | 0x0002_0000 | 0x89;
+const WRITE_ACCESS: u32 = GENERIC_WRITE | SYNCHRONIZE | 0x0002_0000 | 0x116;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
@@ -31,6 +34,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(read_ABI);
     registry.register(close_ABI);
     attributes::register(registry);
+    write::register(registry);
     // Nt/Zw user-mode names have the same declarations and behavior.
     for (api, name) in [
         (create_ABI, "NtCreateFile"),
@@ -478,7 +482,7 @@ fn create(
     attributes: GuestPtr<()>,
     iosb: GuestPtr<()>,
     allocation: GuestPtr<()>,
-    _file_attributes: u32,
+    file_attributes: u32,
     share: u32,
     disposition: u32,
     options: u32,
@@ -510,16 +514,35 @@ fn create(
     if let Err(status) = oa.scope(env, "ntdll.dll!ZwCreateFile") {
         return status;
     }
-    if disposition != 1 || options & 0x30 == 0 || options & !0x874 != 0 {
+    if options & 0x30 == 0 || options & !0x874 != 0 {
+        return unavailable(env, "only synchronous ordinary non-directory files");
+    }
+    let mapped_disposition = match disposition {
+        1 => 3, // FILE_OPEN -> OPEN_EXISTING
+        2 => 1, // FILE_CREATE -> CREATE_NEW
+        3 => 4, // FILE_OPEN_IF -> OPEN_ALWAYS
+        4 => 5, // FILE_OVERWRITE -> TRUNCATE_EXISTING
+        5 => 2, // FILE_OVERWRITE_IF -> CREATE_ALWAYS
+        _ => return unavailable(env, "FILE_SUPERSEDE replacement semantics are unavailable"),
+    };
+    if access & !(READ_ACCESS | WRITE_ACCESS) != 0
+        || access & (GENERIC_READ | GENERIC_WRITE | 3) == 0
+    {
         return unavailable(
             env,
-            "only synchronous FILE_OPEN of ordinary non-directory files",
+            "only file read/write access and synchronization/attribute rights",
         );
     }
-    if access & !READ_ACCESS != 0 || access & (GENERIC_READ | 1) == 0 {
+    if access & 4 != 0 && access & (GENERIC_WRITE | 2) == 0 {
+        return unavailable(env, "append-only file handles require append write support");
+    }
+    if matches!(disposition, 4 | 5) && access & (GENERIC_WRITE | 2) == 0 {
+        return ACCESS_DENIED;
+    }
+    if disposition != 1 && file_attributes & !0x80 != 0 {
         return unavailable(
             env,
-            "only file read access and its synchronization/attribute rights",
+            "only default attributes for created or overwritten files",
         );
     }
     if !ea_buffer.is_null() || ea_length != 0 {
@@ -527,6 +550,17 @@ fn create(
     }
     if !allocation.is_null() && check_range(env.cpu, allocation.addr(), 8, Prot::READ).is_err() {
         return ACCESS_VIOLATION;
+    }
+    if !allocation.is_null() && disposition != 1 {
+        let mut bytes = [0; 8];
+        if env.cpu.read(allocation.addr(), &mut bytes).is_err() {
+            return ACCESS_VIOLATION;
+        }
+        match i64::from_le_bytes(bytes) {
+            0 => {}
+            value if value < 0 => return INVALID_PARAMETER,
+            _ => return unavailable(env, "initial file allocation reservations are unavailable"),
+        }
     }
     // AllocationSize and FileAttributes do not change an existing FILE_OPEN.
     let guest = match oa.path(env, "ntdll.dll!ZwCreateFile") {
@@ -541,6 +575,17 @@ fn create(
             unavailable(env, "native directory handles are unavailable")
         };
     }
+    if disposition != 1 {
+        let parent = guest.rsplit_once('\\').map_or("", |(parent, _)| parent);
+        let parent = if parent.len() == 2 {
+            format!("{parent}\\")
+        } else {
+            parent.to_owned()
+        };
+        if !vfs.is_dir(&parent) {
+            return PATH_NOT_FOUND;
+        }
+    }
     let requested = share_access(access);
     if env.sys.objects.hosts::<FileObj>().any(|(_, file)| {
         file.guest_path.eq_ignore_ascii_case(&guest)
@@ -549,7 +594,13 @@ fn create(
         return SHARING_VIOLATION;
     }
     let previous_error = util::last_error(env);
-    let handle = crate::kernel32::open_with_share(env, &guest, access, 3, share);
+    // The common opener selects copy-up from generic access. Keep that host
+    // selection separate from the native handle's actual requested rights.
+    let mapped_access = access
+        | if access & 1 != 0 { GENERIC_READ } else { 0 }
+        | if access & 2 != 0 { GENERIC_WRITE } else { 0 };
+    let handle =
+        crate::kernel32::open_with_share(env, &guest, mapped_access, mapped_disposition, share);
     let error = util::last_error(env);
     util::set_last_error(env, previous_error);
     if handle == util::INVALID_HANDLE_VALUE {
@@ -564,15 +615,29 @@ fn create(
             }
             5 => ACCESS_DENIED,
             8 => INSUFFICIENT_RESOURCES,
+            19 => 0xc000_00a2u32 as i32, // STATUS_MEDIA_WRITE_PROTECTED
             32 => SHARING_VIOLATION,
+            80 => 0xc000_0035u32 as i32, // STATUS_OBJECT_NAME_COLLISION
+            1224 => 0xc000_0243u32 as i32, // STATUS_USER_MAPPED_FILE
             _ => unavailable(
                 env,
                 "the common file opener reported an unmapped native error",
             ),
         };
     }
+    if let Some(file) = env.sys.objects.host_mut::<FileObj>(handle) {
+        file.access = access;
+    }
     let mut status = [0; 8];
-    status[4..].copy_from_slice(&1u32.to_le_bytes()); // FILE_OPENED
+    let information = match disposition {
+        1 => 1u32, // FILE_OPENED
+        2 => 2,    // FILE_CREATED
+        3 if error == 183 => 1,
+        4 => 3, // FILE_OVERWRITTEN
+        5 if error == 183 => 3,
+        _ => 2,
+    };
+    status[4..].copy_from_slice(&information.to_le_bytes());
     if env
         .cpu
         .write(iosb.addr(), &status)
