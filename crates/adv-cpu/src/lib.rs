@@ -57,6 +57,7 @@ mod linking;
 mod memory;
 mod parallel;
 mod parallel_memory;
+mod perf_map;
 mod rows;
 mod shared_memory;
 mod state;
