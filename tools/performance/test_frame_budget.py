@@ -22,11 +22,36 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_mixed_execution_and_wait_are_not_a_hidden_host_gap(self):
+        result = budget.classify(frame(wall_ns=50_000_000, active_ns=29_000_000,
+                                       guest_exec_ns=22_000_000, wait_ns=18_000_000))
+        self.assertEqual(result["cause"], "platform.mixed_wait_execution")
+
+    def test_explicit_host_costs_and_observer_freezes_have_separate_causes(self):
+        for field, cause in (("scheduler_ns", "host.scheduler"), ("frontend_ns", "host.frontend_control"),
+                             ("control_pause_ns", "observer.control_pause")):
+            result = budget.classify(frame(**{field: 30_000_000}, active_ns=5_000_000))
+            self.assertEqual(result["cause"], cause)
+
+    def test_api_allowlist_and_retained_subset_totals(self):
+        row = budget.clean_row(frame(top_apis=[{"api": "kernel32.dll!ReadFile", "ns": 17, "calls": 2},
+                                               {"api": "private/path!bad", "ns": 999}]))
+        self.assertEqual(len(row["top_apis"]), 1)
+        self.assertEqual(budget.top_apis([row, row]), [{"api": "kernel32.dll!ReadFile", "ns": 34, "calls": 4}])
+
+    def test_native_partial_estimate_does_not_promote_rep_units_or_blocks(self):
+        row = frame(cpu={"retired_tier0_instructions": 100_000_000, "tier0_units": 999_000_000,
+                         "tier2_blocks": 999_000_000})
+        estimate = budget.native_estimate(row, 2_000_000_000)
+        self.assertEqual(estimate["native_time_lower_estimate_ns"], 50_000_000)
+        self.assertTrue(estimate["native_over_budget_estimate"])
+        self.assertEqual(estimate["retirement_coverage"], "tier0_only")
+        self.assertIsNone(budget.native_estimate(frame(cpu={"tier2_blocks": 999_000_000}), 1)["native_time_lower_estimate_ns"])
     def test_compile_overlap_is_explicit_and_worker_time_is_not_charged(self):
         row = frame(cpu={"compile_wait_execution_ns": 30_000_000, "compile_time": 2_000_000_000})
         self.assertEqual(budget.classify(row)["cause"], "cold.compile_pending_execution")
         self.assertEqual(budget.classify(row)["confidence"], "measured_overlap")
-        self.assertEqual(budget.classify(frame(cpu={"compile_time": 2_000_000_000}))["cause"], "unattributed")
+        self.assertEqual(budget.classify(frame(cpu={"compile_time": 2_000_000_000}))["cause"], "structure.guest_execution")
 
     def test_largest_measured_cost_wins_before_count_hints(self):
         row = frame(hle_ns={"file": 32_000_000}, cpu={"sync_compile_ns": 20_000_000, "softfloat_calls": 99999})
@@ -42,7 +67,7 @@ class FrameBudgetTests(unittest.TestCase):
 
     def test_frequency_and_sparse_core_change_are_not_proof_of_throttling(self):
         result = budget.classify(frame(core=0, frequency_khz=300000))
-        self.assertEqual(result["cause"], "unattributed")
+        self.assertEqual(result["cause"], "structure.guest_execution")
         self.assertEqual(result["evidence"]["frequency_khz"], 300000)
 
     def test_wait_overshoot_distinguishes_requested_idle(self):

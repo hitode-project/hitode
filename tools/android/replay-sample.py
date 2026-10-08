@@ -278,6 +278,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
                "--codec-kernels", args.codec_kernels]
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
+    if getattr(args, "headless_gpu", False):
+        command.append("--headless-gpu")
     if args.no_tiering:
         command.append("--no-tiering")
     if args.schedule_profile:
@@ -734,6 +736,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--codec-kernels", choices=("guest", "verify", "native"), default="native")
     parser.add_argument("--frame-budget", action="store_true", help="bounded per-frame diagnostics in reports")
+    parser.add_argument("--headless-gpu", action="store_true", help="explicit portable GPU frontend; requires a gpu runner")
     parser.add_argument("--perf-map", action="store_true", help="local-only HP JIT symbol map and publication events")
     parser.add_argument("--no-tiering", action="store_true")
     parser.add_argument("--tier1", choices=("off", "bridge"), default="off")

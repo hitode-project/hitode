@@ -16,6 +16,8 @@ pub struct FrameCounters {
     pub tier0_units: u64,
     pub tier1_units: u64,
     pub tier2_blocks: u64,
+    /// Confirmed retired Tier 0 instructions only; never present this as all tiers.
+    pub retired_tier0_instructions: u64,
     pub native_entries: u64,
     pub interpreter_entries: u64,
     pub sync_compile_ns: u64,
@@ -42,6 +44,7 @@ impl FrameCounters {
             tier0_units,
             tier1_units,
             tier2_blocks,
+            retired_tier0_instructions,
             native_entries,
             interpreter_entries,
             sync_compile_ns,
@@ -63,7 +66,7 @@ impl FrameCounters {
             .join(",");
         format!(
             concat!(
-                "{{\"tier0_units\":{},\"tier1_units\":{},\"tier2_blocks\":{},",
+                "{{\"tier0_units\":{},\"tier1_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
                 "\"native_entries\":{},\"interpreter_entries\":{},\"sync_compile_ns\":{},",
                 "\"compile_wait_execution_ns\":{},\"compile_wait_units\":{},\"invalidations\":{},",
                 "\"recompilations\":{},\"compilations\":{},\"x87_helpers\":{},\"softfloat_calls\":{},\"reasons\":{{{}}}}}"
@@ -71,6 +74,7 @@ impl FrameCounters {
             self.tier0_units,
             self.tier1_units,
             self.tier2_blocks,
+            self.retired_tier0_instructions,
             self.native_entries,
             self.interpreter_entries,
             self.sync_compile_ns,
@@ -90,6 +94,7 @@ impl Executor {
     /// Does not enable the PC profiler or change region linking/execution policy.
     pub fn enable_frame_timing(&mut self, enabled: bool) {
         self.frame_timing = enabled;
+        self.interpreter.frame_retired = enabled.then_some(0);
     }
     pub fn frame_counters(&self) -> FrameCounters {
         let s = &self.stats;
@@ -107,6 +112,7 @@ impl Executor {
             tier0_units: s.interpreter_instructions,
             tier1_units: t.native_instructions,
             tier2_blocks: s.native_blocks,
+            retired_tier0_instructions: s.frame_retired_tier0,
             native_entries: s.native_entries,
             interpreter_entries: s.interpreter_entries,
             sync_compile_ns: (s.sync_compile_time + t.compile_time).as_nanos() as u64,

@@ -124,6 +124,7 @@ pub struct Interpreter {
     blocks: HashMap<u32, DecodedBlock>,
     capacity: usize,
     decodes: u64,
+    pub(crate) frame_retired: Option<u64>,
     pub(crate) census_enabled: bool,
     pub(crate) census: Option<crate::tier1::census::Entry>,
 }
@@ -146,6 +147,7 @@ impl Interpreter {
             blocks: HashMap::new(),
             capacity,
             decodes: 0,
+            frame_retired: None,
             census_enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
             census: None,
         }
@@ -206,6 +208,9 @@ impl Interpreter {
             (decoded, form)
         };
         let execution = execute_decoded(decoded, state, memory, max_units, None);
+        if let Some(retired) = &mut self.frame_retired {
+            *retired += retired_instruction(decoded, execution, state, pc);
+        }
         if let (Some(census), Some(form)) = (&mut self.census, form) {
             census.record(form, execution.units);
         }
@@ -246,6 +251,7 @@ impl Interpreter {
                     max_units,
                     stop,
                     self.census.as_mut(),
+                    self.frame_retired.as_mut(),
                 );
             }
             // Bound each independent cache in entries. A larger block working set
@@ -261,6 +267,7 @@ impl Interpreter {
             max_units,
             stop,
             self.census.as_mut(),
+            self.frame_retired.as_mut(),
         )
     }
 }
@@ -403,6 +410,30 @@ enum Decoded {
     Ready(Predecoded),
     Extended(Instruction, crate::floating::Operation, Option<u16>),
     Stop(Step),
+}
+
+fn retired_instruction(decoded: Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
+    if execution.units == 0 {
+        return 0;
+    }
+    // REP elements are work units. The instruction retires once, at completion.
+    if matches!(
+        decoded,
+        Decoded::Ready(Predecoded {
+            action: Action::String(_),
+            ..
+        })
+    ) {
+        u64::from(
+            state.eip != pc
+                && matches!(
+                    execution.step,
+                    Step::Executed | Step::Trap { vector: 1, .. }
+                ),
+        )
+    } else {
+        1
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -640,6 +671,7 @@ impl DecodedBlock {
         max_units: u32,
         stop: u32,
         census: Option<&mut crate::tier1::census::Entry>,
+        retired: Option<&mut u64>,
     ) -> (Execution, u32) {
         if let Some(census) = census {
             self.forms.get_or_insert_with(|| {
@@ -652,11 +684,11 @@ impl DecodedBlock {
                     .collect()
             });
             let forms = self.forms.as_ref().unwrap().as_slice();
-            self.execute(state, memory, max_units, stop, |n, units| {
+            self.execute(state, memory, max_units, stop, retired, |n, units| {
                 census.record(forms[n], units)
             })
         } else {
-            self.execute(state, memory, max_units, stop, |_, _| {})
+            self.execute(state, memory, max_units, stop, retired, |_, _| {})
         }
     }
 
@@ -666,6 +698,7 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
+        mut retired: Option<&mut u64>,
         mut observe: impl FnMut(usize, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
@@ -687,6 +720,9 @@ impl DecodedBlock {
                 Some(&mut deferred_mmx),
             );
             observe(n, execution.units);
+            if let Some(retired) = &mut retired {
+                **retired += retired_instruction(decoded, execution, state, pc);
+            }
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;
@@ -2325,6 +2361,45 @@ fn condition_true(condition: ConditionCode, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_retirement_counts_rep_once_and_keeps_fault_prefix() {
+        let mut interpreter = Interpreter::new();
+        interpreter.frame_retired = Some(0);
+        let mut state = CpuState {
+            eip: 0x1000,
+            ..Default::default()
+        };
+        let mut memory = Memory::new(0x1000, 0x3000).unwrap();
+        memory.protect(0x1000, 0x3000, READ | WRITE | EXEC).unwrap();
+        // Authored REP MOVSB, followed by a precise out-of-window load.
+        memory
+            .write(0x1000, &[0xf3, 0xa4, 0xa1, 0, 0, 9, 0])
+            .unwrap();
+        state.regs[1] = 300;
+        state.regs[6] = 0x2000;
+        state.regs[7] = 0x3000;
+        assert_eq!(
+            interpreter.run_chunk(&mut state, &mut memory, 256).units,
+            256
+        );
+        assert_eq!(interpreter.frame_retired, Some(0));
+        assert_eq!(
+            interpreter.run_chunk(&mut state, &mut memory, 256).units,
+            44
+        );
+        assert_eq!(interpreter.frame_retired, Some(1));
+        assert!(matches!(
+            interpreter.run_chunk(&mut state, &mut memory, 256).step,
+            Step::ReadFault { .. }
+        ));
+        assert_eq!(interpreter.frame_retired, Some(1));
+        interpreter.frame_retired = None;
+        state.eip = 0x1000;
+        state.regs[1] = 0;
+        interpreter.run_chunk(&mut state, &mut memory, 256);
+        assert_eq!(interpreter.frame_retired, None);
+    }
 
     #[test]
     fn first_fetch_and_cross_memory_cache_hits_watch_all_code_pages() {

@@ -62,6 +62,8 @@ pub struct Stats {
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
+    /// Opt-in exact Tier 0 retirement, excluding REP elements and oracle replay.
+    pub frame_retired_tier0: u64,
     pub invalidations: u64,
     /// Region candidates checked after changes to their code pages only.
     pub invalidation_candidates: u64,
@@ -149,7 +151,7 @@ pub struct Executor {
     pub(crate) memory: Memory,
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
-    interpreter: crate::interpreter::Interpreter,
+    pub(crate) interpreter: crate::interpreter::Interpreter,
     tier1: Option<crate::tier1::Engine>,
     tier1_mode: crate::Tier1Mode,
     #[cfg(any(test, feature = "gir-execute"))]
@@ -1850,6 +1852,7 @@ impl Executor {
                 )
             );
             let wait_timer = (self.frame_timing && waiting).then(Instant::now);
+            let retired_before = self.interpreter.frame_retired;
             let tier1 = self.run_tier1(
                 stop,
                 units,
@@ -1889,6 +1892,15 @@ impl Executor {
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
+            if tier1.is_none()
+                && let Some(before) = retired_before
+            {
+                self.stats.frame_retired_tier0 += self
+                    .interpreter
+                    .frame_retired
+                    .unwrap()
+                    .saturating_sub(before);
+            }
             if let Some(timer) = wait_timer {
                 self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
                 self.stats.compile_wait_units += u64::from(execution.units);
