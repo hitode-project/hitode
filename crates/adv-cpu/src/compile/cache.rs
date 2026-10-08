@@ -1262,7 +1262,7 @@ mod tests {
         assert_eq!(state.regs[3], 13);
         assert_eq!(state.eip, snapshot.region.start + 3);
         assert_eq!(state.fault_addr, 0x11020);
-        assert_eq!(memory.read_data(0x11020, 4).unwrap(), [0; 4]);
+        assert_eq!(memory.read_data(0x11020, 4).unwrap().as_ref(), &[0; 4]);
     }
 
     #[test]

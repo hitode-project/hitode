@@ -77,7 +77,14 @@ def execution_metrics(report: dict) -> dict:
     raw = baseline.execution_metrics(report)
     tier1 = raw.get("tier1") or {}
     schedule = raw.get("compilation_schedule") or {}
-    return {"tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
+    cache = report.get("code_cache") or {}
+    aot = report.get("aot") or {}
+    return {"counts": numeric_fields(report, ("native_entries", "interpreter_entries", "compilations", "compile_requests", "compile_seconds")),
+        "code_cache": {"enabled": cache.get("enabled") is True} | numeric_fields(cache,
+            ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "entries", "bytes")),
+        "aot": numeric_fields(aot, ("images", "image_rejections", "candidates", "decoded_instructions", "budget_exhaustions",
+            "compile_requests", "private_completions", "publications", "stale_candidates", "ready_regions", "ready_bytes")),
+        "tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
         "fallback_instructions", "native_entries", "bridge_entries", "bridge_units", "invalidations",
         "publication_revisions", "publication_flushes", "cache_evictions", "compile_misses", "resident_bytes")),
         "compilation_schedule": numeric_fields(schedule, ("compile_threads", "available_cores", "duplicate_requests",
@@ -271,7 +278,7 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
 
 
 def markdown(rows: list[dict]) -> str:
-    text = ["# 帧预算基线", "", "无头帧提交观测；原生参照未测，未排除任何帧。热表示新进程复用 JIT 发现档案。", "",
+    text = ["# 帧预算基线", "", "无头帧提交观测；原生参照未测，未排除任何帧。热表示新进程复用发现档案；启用 code_cache 时也复用本轮冷运行产生的机器码档案。", "",
             "| 游戏 | 场景 | 冷/热 | 状态 | 超预算/帧数 | 最长墙钟 ms | 最长活跃 ms | p99 墙钟 ms | Ctrl 秒 | 主因（保留行） |",
             "|---|---|---|---|---:|---:|---:|---:|---:|---|"]
     for row in rows:
@@ -292,6 +299,7 @@ def summarize(root: Path) -> dict:
         for heat in plan["heats"]:
             rows += summarize_run(root / f"{scenario['id']}-{heat}", scenario, heat, plan["platform"])
     summary = {"schema": "adv-frame-budget-summary-v1", "budget_ms": 33.3,
+               "execution_options": plan.get("execution_options", {}),
                "source_revision": plan["source_revision"], "source_diff_sha256": plan["source_diff_sha256"],
                "analysis_tool_sha256": digest(Path(__file__)),
                "rows": rows}

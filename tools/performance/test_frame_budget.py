@@ -23,6 +23,15 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_native_cache_summary_keeps_statistics_without_private_payloads(self):
+        result = budget.execution_metrics({"native_entries": 4, "interpreter_entries": 6,
+            "code_cache": {"enabled": True, "hits": 3, "bytes": 128, "raw": "private native bytes"},
+            "aot": {"private_completions": 2, "publications": 1, "guest_pc": 12345}})
+        self.assertEqual(result["counts"], {"native_entries": 4, "interpreter_entries": 6})
+        self.assertEqual(result["code_cache"], {"enabled": True, "hits": 3, "bytes": 128})
+        self.assertEqual(result["aot"], {"private_completions": 2, "publications": 1})
+        self.assertNotIn("private native bytes", json.dumps(result))
+
     def test_shared_device_broker_accepts_the_callers_task_name(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -161,7 +170,7 @@ class FrameBudgetTests(unittest.TestCase):
             root = Path(directory)
             helper = root / "device.ps1"
             helper.touch()
-            with patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "bud"}), patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
                 with self.assertRaisesRegex(RuntimeError, "fixture"):
                     with budget.device_lock(None, root, helper) as deadline:
                         self.assertGreater(deadline, time.monotonic())
