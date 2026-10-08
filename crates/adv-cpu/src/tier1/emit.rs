@@ -40,6 +40,7 @@ pub(super) struct Helpers {
     pub stack_all: u64,
     /// `(frame, operation) -> store status`; x87 stays canonical in CpuState.
     pub x87: u64,
+    pub sse: u64,
     /// Complete 4/8/16-byte access via Entry::vector, with store-style status.
     pub vector_load: u64,
     pub vector_store: u64,
@@ -744,7 +745,7 @@ impl Emitter {
             self.jump(Label::Exit(FALLBACK), Branch::B);
         }
     }
-    pub fn instruction(&mut self, i: &Instruction, x87: Option<u64>) {
+    pub fn instruction(&mut self, i: &Instruction, x87: Option<u64>, sse: Option<u64>) {
         let pc = i.ip32();
         self.entries.insert(pc, self.words.len() * 4);
         self.constant(5, pc);
@@ -753,6 +754,25 @@ impl Emitter {
         self.jump(Label::Exit(BUDGET), Branch::Zero64(7));
         if !supported(i) {
             self.jump(Label::Exit(FALLBACK), Branch::B);
+            return;
+        }
+        if let Some(operation) = sse {
+            for n in 0..8 {
+                self.store32(19 + n, u32::from(n) * 4);
+            }
+            if (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory) {
+                self.ea(i, true);
+                self.mov(2, 9);
+            } else {
+                self.constant(2, 0);
+            }
+            self.address64(1, operation);
+            self.call(self.helpers.sse);
+            self.stored(pc, Some(i.next_ip32()), false, |e| {
+                for n in 0..8 {
+                    e.load32(19 + n, u32::from(n) * 4);
+                }
+            });
             return;
         }
         if let Some(operation) = x87 {

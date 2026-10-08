@@ -112,7 +112,8 @@ impl Executor {
         self.stats.linked_entries += after.direct_transfers - before.direct_transfers;
         if let Some(trace) = trace {
             let steps = execution.execution.units as usize;
-            let check = trace.check_at(steps, &self.state, &self.memory);
+            let check =
+                trace.check_tier1(steps, execution.execution.step, &self.state, &self.memory);
             self.record_verification(check)?;
         }
         Ok(Some(execution))
