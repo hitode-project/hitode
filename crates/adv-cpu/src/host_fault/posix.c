@@ -46,8 +46,14 @@ static const struct adv_fpsimd_context *adv_fpsimd(const ucontext_t *context) {
              * the FPSIMD record, and recovery changes only the PC, so that
              * record stays authoritative. Streaming mode is not admitted. */
             if (head->size < 16 || *(const uint16_t *)(records + offset + 10) & 1) return NULL;
+        } else if (head->magic == 0x54504902 || head->magic == 0x54366345) {
+            /* SME-capable Linux also supplies TPIDR2 and a header-only ZA
+             * record when ZA is disabled. Neither changes the FPSIMD image;
+             * sigreturn preserves TPIDR2 unchanged. A ZA payload represents
+             * live matrix state, which this snapshot does not admit. */
+            if (head->size != 16) return NULL;
         } else if (head->magic != 0x45535201) {
-            /* SME, extension storage and unknown records are not admitted. */
+            /* Extension storage and unknown records are not admitted. */
             return NULL;
         }
         offset += head->size;
