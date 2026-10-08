@@ -84,7 +84,11 @@ impl Emitter<'_> {
         let address = self.shadow_address(stack, top);
         let target = self.constant(pc);
         let entry = if self.shadow_entries.contains(&pc) {
-            self.b.ins().func_addr(self.ptr_ty, caller)
+            if self.poll.is_some() {
+                self.poll_checked_address()
+            } else {
+                self.b.ins().func_addr(self.ptr_ty, caller)
+            }
         } else {
             // A sliced CALL's continuation may belong to a different body.
             // Keep the frame balanced but let RET use the current slot table.
