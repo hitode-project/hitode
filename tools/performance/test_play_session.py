@@ -37,6 +37,17 @@ class FakeProcess:
 
 
 class PlaySessionTests(unittest.TestCase):
+    def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(Path(directory))
+            args.cdrom = ["D=authored image.iso", "F=second.iso"]
+            args.auto_dialog_ms = 0
+            (command, _), metadata = self.launch(args)
+            mounts = [command[i + 1] for i, value in enumerate(command) if value == "--cdrom"]
+            self.assertEqual(mounts, args.cdrom)
+            self.assertEqual(command[command.index("--auto-dialog-ms") + 1], "0")
+            self.assertEqual(metadata["command"], command)
+
     def test_shader_profiles_are_only_forwarded_when_explicit(self):
         for sm2, sm3 in ((False, False), (True, False), (False, True)):
             with tempfile.TemporaryDirectory() as directory:
