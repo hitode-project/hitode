@@ -9,6 +9,7 @@ use crate::{FileObj, Win32, util};
 
 mod attributes;
 pub(crate) mod enumeration;
+pub(crate) mod metadata;
 pub(crate) mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
@@ -36,6 +37,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(close_ABI);
     attributes::register(registry);
     enumeration::register(registry);
+    metadata::register(registry);
     write::register(registry);
     // Nt/Zw user-mode names have the same declarations and behavior.
     for (api, name) in [
@@ -197,11 +199,14 @@ pub(crate) fn set(
     length: u32,
     class: i32,
 ) -> i32 {
+    if class == 4 || class == 20 {
+        return metadata::set(env, handle, iosb, input, length, class);
+    }
     if class != 14 {
         warn_unavailable(
             env,
             "ntdll.dll!ZwSetInformationFile",
-            "only FilePositionInformation is implemented",
+            "only basic/position/end-of-file information is implemented",
         );
         return if class == 0 {
             0xc000_0002u32 as i32
@@ -267,6 +272,9 @@ pub(crate) fn query(
     length: u32,
     class: i32,
 ) -> i32 {
+    if class == 4 || class == 6 {
+        return metadata::query(env, handle, iosb, output, length, class);
+    }
     let required = match class {
         5 => 24,
         14 => 8,
@@ -274,7 +282,7 @@ pub(crate) fn query(
             warn_unavailable(
                 env,
                 "ntdll.dll!ZwQueryInformationFile",
-                "only FileStandardInformation and FilePositionInformation are implemented",
+                "only basic/standard/internal/position information is implemented",
             );
             return if class == 0 {
                 0xc000_0002u32 as i32
@@ -552,7 +560,7 @@ pub(crate) fn create(
         _ => return unavailable(env, "FILE_SUPERSEDE replacement semantics are unavailable"),
     };
     if access & !(READ_ACCESS | WRITE_ACCESS) != 0
-        || access & (GENERIC_READ | GENERIC_WRITE | 3) == 0
+        || access & (GENERIC_READ | GENERIC_WRITE | 0x183) == 0
     {
         return unavailable(
             env,

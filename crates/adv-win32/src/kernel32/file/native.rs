@@ -17,7 +17,9 @@ fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
     });
 }
 pub(in crate::kernel32) mod bridge;
+pub(in crate::kernel32) mod copy;
 pub(in crate::kernel32) mod find;
+pub(in crate::kernel32) mod metadata;
 pub(crate) mod operations;
 
 const CHUNK: u32 = 64 * 1024;

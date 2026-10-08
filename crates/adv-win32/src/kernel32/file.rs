@@ -13,7 +13,7 @@ use crate::{FileObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod attributes;
 pub(crate) mod native;
 
-mod information;
+pub(crate) mod information;
 mod locking;
 pub(crate) use attributes::file_attributes_path;
 mod path;
@@ -555,6 +555,9 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
 }
 
 fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
+    if native::metadata::active(env, &["NtSetInformationFile", "NtQueryInformationFile"]) {
+        return native::metadata::end(env, env.arg(0));
+    }
     let Some(file) = env.sys.objects.host_mut::<FileObj>(env.arg(0)) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -842,6 +845,9 @@ fn write_filetime(cpu: &mut dyn Guest, p: u32, ft: u64) {
 
 fn get_file_time(env: &mut Env<'_>) -> Outcome {
     let (h, c, a, m) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if native::metadata::active(env, &["NtQueryInformationFile"]) {
+        return native::metadata::times(env, h, [c, a, m]);
+    }
     let Some(md) = env
         .sys
         .objects
@@ -901,6 +907,23 @@ pub(super) fn copy_file(
     fail_if_exists: bool,
     remove_src: bool,
 ) -> Outcome {
+    if !remove_src
+        && native::metadata::active(
+            env,
+            &[
+                "NtCreateFile",
+                "NtOpenFile",
+                "NtReadFile",
+                "NtWriteFile",
+                "NtSetInformationFile",
+                "NtQueryInformationFile",
+                "NtQueryVolumeInformationFile",
+                "NtClose",
+            ],
+        )
+    {
+        return native::copy::copy(env, src, dst, fail_if_exists);
+    }
     let w = env.ext.get::<Win32>();
     let optical = w.vfs.is_optical_path(&src);
     if w.vfs.is_optical_path(&dst) || (remove_src && optical) {
@@ -1654,18 +1677,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetFileSizeEx", 2, get_file_size_ex);
     stdcall(reg, K32, "GetFileType", 1, get_file_type);
     stdcall(reg, K32, "FlushFileBuffers", 1, |env| {
-        crate::native::diagnose_bypass(
-            env,
-            "kernel32.dll!FlushFileBuffers",
-            &["NtFlushBuffersFile"],
-        );
-        Outcome::Return(1)
+        native::metadata::flush(env, env.arg(0))
     });
     stdcall(reg, K32, "SetEndOfFile", 1, set_end_of_file);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |env| {
-        crate::native::diagnose_bypass(env, "kernel32.dll!SetFileTime", &["NtSetInformationFile"]);
-        Outcome::Return(1)
+        native::metadata::set_times(env, env.arg(0), [env.arg(1), env.arg(2), env.arg(3)])
     });
     attributes::register(reg);
     information::register(reg);

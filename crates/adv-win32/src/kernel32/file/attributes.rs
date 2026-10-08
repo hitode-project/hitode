@@ -205,6 +205,9 @@ fn set(env: &mut Env<'_>, pointer: u32, flags: u32, wide: bool) -> Outcome {
         );
         return Outcome::Return(0);
     }
+    if native::metadata::active(env, &["NtCreateFile", "NtOpenFile", "NtSetInformationFile"]) {
+        return native::metadata::attributes(env, &path, flags);
+    }
     let guest = env.ext.get::<Win32>().vfs.normalize(&path);
     if matches!(system_file(env, &guest), Ok(Some(_))) {
         unavailable(

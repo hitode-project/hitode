@@ -22,6 +22,36 @@ fn call(
     }
 }
 
+pub(crate) fn flush(env: &mut Env<'_>, handle: u32, then: Done<()>) -> Outcome {
+    let scratch = match attributes(env, r"C:\", 8) {
+        Ok(scratch) => scratch,
+        Err(status) => return then(env, Err(status)),
+    };
+    let iosb = scratch.extra;
+    call(
+        env,
+        "NtFlushBuffersFile",
+        vec![handle, iosb],
+        move |env| {
+            crate::ntdll::file::metadata::flush(env, Handle(handle), GuestPtr::new(iosb)) as u32
+        },
+        move |env, status| {
+            if status == 0x103 {
+                return pending();
+            }
+            scratch.free(env);
+            then(
+                env,
+                if (status as i32) < 0 {
+                    Err(status)
+                } else {
+                    Ok(())
+                },
+            )
+        },
+    )
+}
+
 fn pending() -> Outcome {
     Outcome::Fail("native file operation: asynchronous completion is unavailable".into())
 }
@@ -287,6 +317,109 @@ pub(crate) fn close(env: &mut Env<'_>, handle: u32, then: Done<()>) -> Outcome {
         vec![handle],
         move |env| crate::ntdll::file::close(env, Handle(handle)) as u32,
         move |env, status| {
+            then(
+                env,
+                if (status as i32) < 0 {
+                    Err(status)
+                } else {
+                    Ok(())
+                },
+            )
+        },
+    )
+}
+
+pub(crate) fn information(
+    env: &mut Env<'_>,
+    handle: u32,
+    class: u32,
+    length: u32,
+    volume: bool,
+    then: Done<Vec<u8>>,
+) -> Outcome {
+    let scratch = match attributes(env, r"C:\", 8 + length) {
+        Ok(scratch) => scratch,
+        Err(status) => return then(env, Err(status)),
+    };
+    let (iosb, output) = (scratch.extra, scratch.extra + 8);
+    call(
+        env,
+        if volume {
+            "NtQueryVolumeInformationFile"
+        } else {
+            "NtQueryInformationFile"
+        },
+        vec![handle, iosb, output, length, class],
+        move |env| {
+            let implementation = if volume {
+                crate::ntdll::file::metadata::volume
+            } else {
+                crate::ntdll::file::query
+            };
+            implementation(
+                env,
+                Handle(handle),
+                GuestPtr::new(iosb),
+                GuestPtr::new(output),
+                length,
+                class as i32,
+            ) as u32
+        },
+        move |env, status| {
+            if status == 0x103 {
+                return pending();
+            }
+            let mut bytes = vec![0; length as usize];
+            let result = if (status as i32) < 0 {
+                Err(status)
+            } else {
+                env.cpu
+                    .read(output, &mut bytes)
+                    .map(|()| bytes)
+                    .map_err(|_| ACCESS_VIOLATION)
+            };
+            scratch.free(env);
+            then(env, result)
+        },
+    )
+}
+
+pub(crate) fn set_information(
+    env: &mut Env<'_>,
+    handle: u32,
+    class: u32,
+    bytes: Vec<u8>,
+    then: Done<()>,
+) -> Outcome {
+    let length = bytes.len() as u32;
+    let scratch = match attributes(env, r"C:\", 8 + length) {
+        Ok(scratch) => scratch,
+        Err(status) => return then(env, Err(status)),
+    };
+    let (iosb, input) = (scratch.extra, scratch.extra + 8);
+    if env.cpu.write(input, &bytes).is_err() {
+        scratch.free(env);
+        return then(env, Err(ACCESS_VIOLATION));
+    }
+    call(
+        env,
+        "NtSetInformationFile",
+        vec![handle, iosb, input, length, class],
+        move |env| {
+            crate::ntdll::file::set(
+                env,
+                Handle(handle),
+                GuestPtr::new(iosb),
+                GuestPtr::new(input),
+                length,
+                class as i32,
+            ) as u32
+        },
+        move |env, status| {
+            if status == 0x103 {
+                return pending();
+            }
+            scratch.free(env);
             then(
                 env,
                 if (status as i32) < 0 {

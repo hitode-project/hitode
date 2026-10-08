@@ -294,7 +294,7 @@ fn open_front(env: &mut Env<'_>, wide: bool, secure: bool) -> Outcome {
             Ok(stream) => {
                 if secure {
                     if let Err(fault) = GuestPtr::new(output).write(env.cpu, stream) {
-                        return memory_failure(fault);
+                        return close(env, stream, Box::new(move |_, _| memory_failure(fault)));
                     }
                     Outcome::Return(0)
                 } else {
