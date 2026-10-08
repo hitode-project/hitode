@@ -103,6 +103,29 @@ pub struct Thunk {
     /// Address of the pointer the entry jumps through: to the guest code, or to
     /// the trap after it when guest code is off.
     pub guest_slot: Option<u32>,
+    /// Registered host transport identity, distinct from a numeric system service.
+    pub transport_token: Option<TransportToken>,
+}
+
+/// Opaque word transported on the guest stack. Its identity survives ordinary
+/// instruction relocation and arithmetic reconstruction; it is not an API index.
+/// Tokens belong to the current process's binding table. Copying code within
+/// that process preserves its identity; cross-process stub transfer is not modeled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportToken(u32);
+
+const TRANSPORT_TAG: u32 = 0xad80_0000;
+
+impl TransportToken {
+    fn for_binding(index: u32) -> Self {
+        debug_assert!(index > EXCEPTION_DISPATCH && index < THUNK_CAP);
+        debug_assert_eq!(TRANSPORT_TAG & (THUNK_CAP - 1), 0);
+        Self(TRANSPORT_TAG | index)
+    }
+
+    pub fn word(self) -> u32 {
+        self.0
+    }
 }
 
 impl Thunk {
@@ -124,6 +147,8 @@ pub struct ThunkTable {
     internal: HashMap<(String, String), HostFn>,
     thunks: Vec<Thunk>,
     by_name: HashMap<(String, String), u32>,
+    /// Only successfully published ordinary bindings authorize transport.
+    by_transport: HashMap<TransportToken, u32>,
     /// Next free byte of the guest code arena.
     guest_next: u32,
     guest_code: bool,
@@ -162,6 +187,7 @@ impl ThunkTable {
             implemented: true,
             requested: false,
             guest_slot: None,
+            transport_token: None,
         };
         Self {
             resolver,
@@ -181,9 +207,11 @@ impl ThunkTable {
                     implemented: true,
                     requested: false,
                     guest_slot: None,
+                    transport_token: None,
                 },
             ],
             by_name: HashMap::new(),
+            by_transport: HashMap::new(),
             guest_next: GUEST_CODE_BASE,
             guest_code: true,
         }
@@ -197,7 +225,16 @@ impl ThunkTable {
     /// writes to either its published entry or the original thunk page.
     pub fn pristine_entry(&self, index: u32) -> Vec<u8> {
         let thunk = self.get(index);
-        Self::emit(index, thunk.f.conv, thunk.guest_slot)
+        match thunk.transport_token {
+            Some(token) => Self::emit(index, token, thunk.f.conv, thunk.guest_slot),
+            None if index == RETURN_PAD => {
+                let mut pad = Asm::new(thunk_addr(RETURN_PAD));
+                pad.trap().hlt();
+                pad.bytes
+            }
+            // The exception binding is diagnostic and has no callable entry.
+            None => Vec::new(),
+        }
     }
 
     /// Guest code replaces host traps for later bindings, and existing entries
@@ -217,7 +254,7 @@ impl ThunkTable {
         Ok(())
     }
 
-    /// The `push index; int` pair of a thunk with guest code.
+    /// The `push transport-token; int` pair of a thunk with guest code.
     fn trap_addr(index: u32) -> u32 {
         thunk_addr(index) + 12
     }
@@ -273,7 +310,12 @@ impl ThunkTable {
 
     /// A hook library can relocate the entry instructions or the entire thunk. The token
     /// identifies the handler independently of the address where `int 0x2e` executes.
-    pub(crate) fn emit(index: u32, conv: Conv, guest_slot: Option<u32>) -> Vec<u8> {
+    pub(crate) fn emit(
+        index: u32,
+        token: TransportToken,
+        conv: Conv,
+        guest_slot: Option<u32>,
+    ) -> Vec<u8> {
         let mut a = Asm::new(thunk_addr(index));
         // mov edi,edi; push ebp; mov ebp,esp; pop ebp. The first five bytes are
         // ordinary relocatable instructions; the frame is gone before argument decoding.
@@ -285,7 +327,7 @@ impl ThunkTable {
             a.bytes.extend_from_slice(&[0xff, 0x25]);
             a.bytes.extend_from_slice(&slot.to_le_bytes());
         }
-        a.push_imm(index);
+        a.push_imm(token.word());
         a.trap();
         match conv {
             Conv::Cdecl { .. } | Conv::CdeclVariadic { .. } => a.ret(),
@@ -369,7 +411,11 @@ impl ThunkTable {
             Some(guest) => Some(self.place(cpu, index, guest, &links)?),
             None => None,
         };
-        cpu.write(thunk_addr(index), &Self::emit(index, f.conv, guest_slot))?;
+        let token = TransportToken::for_binding(index);
+        cpu.write(
+            thunk_addr(index),
+            &Self::emit(index, token, f.conv, guest_slot),
+        )?;
         self.thunks.push(Thunk {
             module: key.0.clone(),
             name: name.to_owned(),
@@ -377,9 +423,21 @@ impl ThunkTable {
             implemented,
             requested,
             guest_slot,
+            transport_token: Some(token),
         });
         self.by_name.insert(key, index);
+        self.by_transport.insert(token, index);
         Ok(thunk_addr(index))
+    }
+
+    /// A prefix or a coincidental small index never authorizes dispatch. The
+    /// exact opaque word must name an ordinary binding owned by this table.
+    pub fn transport_index(&self, word: u32) -> Option<u32> {
+        if word & !(THUNK_CAP - 1) != TRANSPORT_TAG {
+            return None;
+        }
+        let index = *self.by_transport.get(&TransportToken(word))?;
+        (index > EXCEPTION_DISPATCH).then_some(index)
     }
 
     pub fn get(&self, index: u32) -> &Thunk {
