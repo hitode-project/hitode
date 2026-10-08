@@ -1,0 +1,87 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "kirikiri",
+  "game_dir": "AQUA",
+  "exe": "AQUA.exe",
+  "codepage": 932,
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "Headless frame-budget observations; only explicit hash gates verify endpoints.",
+    "timeout_seconds": 240,
+    "steps": [
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "c60eee66531db288",
+          "timeout_ms": 90000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "mouse-down 280 655"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 280 655"
+      },
+      {
+        "delay_ms": 15000
+      },
+      {
+        "command": "mouse-down 320 617"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 320 617"
+      },
+      {
+        "delay_ms": 25000
+      },
+      {
+        "checkpoint": "normal",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "key 13"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "transition",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "gated"
+    },
+    "normal": {
+      "checkpoint": "normal",
+      "measurement": "timed_observation"
+    },
+    "transition": {
+      "checkpoint": "transition",
+      "measurement": "timed_observation"
+    },
+    "ctrl": {
+      "unavailable": "no_fixed_endpoint"
+    }
+  },
+  "deploy_directories": [
+    "plugin",
+    "savedata",
+    "savedata_cn"
+  ]
+}

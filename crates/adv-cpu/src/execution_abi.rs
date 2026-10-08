@@ -2,7 +2,10 @@
 //! No guest memory is read while reconstructing an interrupted register prefix.
 
 /// Increment when a native entry or recovery description changes its meaning.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+/// Owner-pinned request word shared by native lanes. Producers use Release
+/// stores; generated code uses atomic loads. Only the owner consumes requests.
+pub type PollWord = std::sync::atomic::AtomicBool;
 /// EAX, ECX, EDX, EBX, ESP, EBP, ESI and EDI in the ARM64 Tier 1 ABI.
 pub const ARM64_GPRS: [u8; 8] = [19, 20, 21, 22, 23, 24, 25, 26];
 pub const ARM64_FLAGS: u8 = 8;
@@ -116,6 +119,8 @@ pub(crate) struct Tier1Frame {
     pub value: u32,
     pub fs_base: u32,
     pub operand: u32,
+    /// Borrowed AtomicBool address, valid for the entire native entry.
+    pub poll: u64,
 }
 
 #[cfg(test)]
@@ -125,14 +130,19 @@ mod tests {
 
     #[test]
     fn entry_frame_and_signal_snapshot_have_fixed_c_layouts() {
-        assert_eq!(size_of::<Tier1Frame>(), 80);
+        assert_eq!(size_of::<Tier1Frame>(), 88);
+        assert_eq!(offset_of!(Tier1Frame, regs), 0);
         assert_eq!(offset_of!(Tier1Frame, flags), 32);
         assert_eq!(offset_of!(Tier1Frame, pc), 36);
         assert_eq!(offset_of!(Tier1Frame, remaining), 40);
         assert_eq!(offset_of!(Tier1Frame, stop), 48);
+        assert_eq!(offset_of!(Tier1Frame, reason), 52);
         assert_eq!(offset_of!(Tier1Frame, links), 56);
         assert_eq!(offset_of!(Tier1Frame, address), 64);
+        assert_eq!(offset_of!(Tier1Frame, value), 68);
         assert_eq!(offset_of!(Tier1Frame, fs_base), 72);
+        assert_eq!(offset_of!(Tier1Frame, operand), 76);
+        assert_eq!(offset_of!(Tier1Frame, poll), 80);
         assert_eq!(offset_of!(HostContextSnapshot, sp), 256);
         assert_eq!(offset_of!(HostContextSnapshot, simd), 280);
         assert_eq!(offset_of!(HostContextSnapshot, fpcr), 792);

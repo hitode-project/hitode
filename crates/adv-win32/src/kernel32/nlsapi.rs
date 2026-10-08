@@ -354,6 +354,9 @@ pub(super) fn register(reg: &mut Registry) {
     preferred_ui::register(reg);
     stdcall(reg, K32, "CompareStringA", 6, compare_string_a);
     stdcall(reg, K32, "CompareStringW", 6, compare_string_w);
+    // Same leading layout with a locale name; the version, reserved and
+    // lParam arguments must be null and do not affect the comparison.
+    stdcall(reg, K32, "CompareStringEx", 9, compare_string_w);
     // Enumerates nothing: callers probing for a locale name find none and use their default.
     stdcall(reg, K32, "EnumSystemLocalesW", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetACP", 0, |e| {
@@ -372,6 +375,9 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "WideCharToMultiByte", 8, wide_char_to_multi_byte);
     stdcall(reg, K32, "LCMapStringW", 6, lc_map_string_w);
     stdcall(reg, K32, "LCMapStringA", 6, lc_map_string_a);
+    // The locale name replaces the LCID; the mapping itself ignores both, and
+    // the trailing version, reserved and sort-handle arguments are unused.
+    stdcall(reg, K32, "LCMapStringEx", 9, lc_map_string_w);
     stdcall(reg, K32, "GetStringTypeW", 4, get_string_type_w);
     stdcall(reg, K32, "GetStringTypeA", 5, get_string_type_a);
     stdcall(reg, K32, "GetLocaleInfoA", 4, |e| get_locale_info(e, false));

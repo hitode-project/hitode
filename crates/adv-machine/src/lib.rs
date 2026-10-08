@@ -13,6 +13,7 @@
 pub mod clock;
 pub mod exception;
 pub mod ext;
+pub mod frame_budget;
 pub mod layout;
 pub mod objects;
 pub mod outcome;
@@ -655,6 +656,9 @@ impl Sys {
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
         self.completed_frames = self.completed_frames.wrapping_add(1);
+        if let Some(budget) = &mut self.stats.frame_budget {
+            budget.mark_frame(u64::from(self.completed_frames));
+        }
         self.schedule_trace.event(
             "frame",
             self.current,
@@ -1343,7 +1347,7 @@ impl Dispatch<'_> {
             thunk: index,
         });
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
-        self.sys.stats.host(t0, index, true);
+        self.sys.stats.host(t0, index, true, &self.sys.thunks);
         r
     }
 
@@ -1383,7 +1387,7 @@ impl Dispatch<'_> {
             Resume::Returned(eax),
         );
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
-        self.sys.stats.host(t0, thunk, true);
+        self.sys.stats.host(t0, thunk, true, &self.sys.thunks);
         r
     }
 }
@@ -2364,7 +2368,7 @@ impl<B: Backend> Machine<B> {
                     origin,
                     latency_mode,
                 );
-                self.sys.stats.host(t0, thunk, false);
+                self.sys.stats.host(t0, thunk, false, &self.sys.thunks);
                 self.note_frame();
                 if let Err(p) = applied {
                     if let Some(r) = self.park(p) {
@@ -2632,6 +2636,22 @@ impl<B: Backend> Machine<B> {
 
     /// Close the stats row when the presentation sequence moves on.
     fn note_frame(&mut self) {
+        if self
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .is_some_and(|b| b.pending())
+        {
+            let cpu = self.cpu.frame_counters();
+            let total = self.sys.stats.total;
+            self.sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .finish(total, cpu);
+        }
         let blocks = self.cpu.executed_blocks();
         self.sys
             .stats

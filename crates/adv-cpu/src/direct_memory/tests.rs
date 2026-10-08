@@ -8,6 +8,9 @@ fn owner(code: &[u8], mixed: bool) -> Executor {
         // Real mmap/mprotect, grouped to 16 KiB on a 4 KiB host.
         executor.memory.direct_test_pages(16384).unwrap();
     }
+    // Retain coverage of the legacy per-access frozen lease. The production
+    // inline lane has independent end-to-end fixtures in direct_memory_inline.
+    executor.memory.direct_engine.as_mut().unwrap().inline = 0;
     executor
         .memory
         .protect(0x10000, 4096, READ | WRITE | EXEC)

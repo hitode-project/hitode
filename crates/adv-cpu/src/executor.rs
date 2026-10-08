@@ -42,6 +42,9 @@ pub struct Stats {
     /// Largest responsive work estimate; zero means unrestricted/unmeasured.
     pub max_compile_work: usize,
     pub compile_time: Duration,
+    pub sync_compile_time: Duration,
+    pub compile_wait_execution_ns: u64,
+    pub compile_wait_units: u64,
     pub compilation_schedule: CompilationSchedule,
     pub native_code_bytes: usize,
     pub native_regions: usize,
@@ -78,6 +81,8 @@ pub struct Stats {
 #[derive(Default, Clone, Debug)]
 pub struct DirectMemoryStats {
     pub sites: u64,
+    /// Regions recompiled with legacy scalar helpers after epilogue rejection.
+    pub inline_fallbacks: u64,
     pub accesses: u64,
     pub recoveries: u64,
     pub violations: u64,
@@ -135,6 +140,7 @@ const SCAN_BLOCKS: u64 = 1 << 18;
 /// Owns the guest CPU, decoded instructions and native cache. Both executors
 /// access the same state and address space; only this owner publishes links.
 pub struct Executor {
+    pub(crate) frame_timing: bool,
     rows: Option<Box<crate::rows::RowPool>>,
     parallel: Option<crate::parallel::Pool>,
     parallel_image: Option<(u64, Arc<crate::parallel::Image>)>,
@@ -438,6 +444,7 @@ impl Executor {
             }
         };
         let mut executor = Self {
+            frame_timing: false,
             rows,
             parallel: None,
             parallel_image: None,
@@ -651,7 +658,9 @@ impl Executor {
         let start = Instant::now();
         let compiled = compile::compile(&region, &mut self.memory, self.shadow_returns.is_some())?;
         self.stats.compilations += 1;
-        self.stats.compile_time += start.elapsed();
+        let elapsed = start.elapsed();
+        self.stats.compile_time += elapsed;
+        self.stats.sync_compile_time += elapsed;
         self.pending_regions.remove(&region.start);
         self.deferred_compilations.remove(&region.start);
         self.stats.deferred_compilations = self.deferred_compilations.len();
@@ -698,6 +707,7 @@ impl Executor {
             self.demand.remove(&pc);
         }
         self.stats.direct_memory.sites += compiled.direct_sites as u64;
+        self.stats.direct_memory.inline_fallbacks += compiled.direct_inline_fallbacks;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));
@@ -1836,6 +1846,13 @@ impl Executor {
             if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
                 self.interpreter.census = Some(Default::default());
             }
+            let waiting = matches!(
+                detail,
+                Some(
+                    InterpreterDetail::PendingCompilation | InterpreterDetail::DeferredCompilation
+                )
+            );
+            let wait_timer = (self.frame_timing && waiting).then(Instant::now);
             let tier1 = self.run_tier1(
                 stop,
                 units,
@@ -1875,6 +1892,10 @@ impl Executor {
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
+            if let Some(timer) = wait_timer {
+                self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
+                self.stats.compile_wait_units += u64::from(execution.units);
+            }
             let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
             if self.tier1_mode == crate::Tier1Mode::Bridge && tier1.is_some() {
                 let native_units = execution.units - interpreted_units;

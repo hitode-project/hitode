@@ -1,0 +1,31 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "himawari",
+  "game_dir": "Himawari - The Sunflower -",
+  "exe": "Himawari.exe",
+  "codepage": 932,
+  "schedule": [
+    {
+      "at": 30,
+      "checkpoint": "startup"
+    },
+    {
+      "at": 31,
+      "command": "close"
+    }
+  ],
+  "scenes": {
+    "title": {
+      "unavailable": "android_d3d_scene_gate_unavailable"
+    },
+    "normal": {
+      "unavailable": "scene_not_gated"
+    },
+    "ctrl": {
+      "unavailable": "no_fixed_endpoint"
+    },
+    "transition": {
+      "unavailable": "scene_not_gated"
+    }
+  }
+}

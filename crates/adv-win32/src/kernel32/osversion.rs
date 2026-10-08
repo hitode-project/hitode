@@ -17,11 +17,39 @@ fn get_version(_: &mut Env<'_>) -> Outcome {
     Outcome::Return((VERSION[2] << 16) | (VERSION[0] << 8) | VERSION[1])
 }
 fn get_version_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
-    let pointer = env.arg(0);
+    match write_version(env, env.arg(0), wide) {
+        Ok(()) => Outcome::Return(1),
+        Err(code) => fail(env, code),
+    }
+}
+/// RtlGetVersion reports the same identity as an NTSTATUS, without LastError.
+fn rtl_get_version(env: &mut Env<'_>) -> Outcome {
+    const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
+    match write_version(env, env.arg(0), true) {
+        Ok(()) => Outcome::Return(0),
+        Err(_) => Outcome::Return(STATUS_INVALID_PARAMETER),
+    }
+}
+/// Windows 7 reports an edition for any queried version; this personality is Ultimate.
+fn get_product_info(env: &mut Env<'_>) -> Outcome {
+    const PRODUCT_ULTIMATE: u32 = 0x0000_0001;
+    let pointer = env.arg(4);
+    match env.cpu.write(pointer, &PRODUCT_ULTIMATE.to_le_bytes()) {
+        Ok(()) => Outcome::Return(1),
+        Err(_) => fail(env, 998),
+    }
+}
+/// Desktop processes have no package identity; the buffer is left untouched.
+fn get_current_package_id(_: &mut Env<'_>) -> Outcome {
+    const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+    Outcome::Return(APPMODEL_ERROR_NO_PACKAGE)
+}
+/// Fill an OSVERSIONINFO[EX]{A,W} whose size field selects the layout.
+fn write_version(env: &mut Env<'_>, pointer: u32, wide: bool) -> Result<(), u32> {
     let base = if wide { 276 } else { 148 };
     let size = env.cpu.read_u32(pointer).unwrap_or(0);
     if (size != base && size != base + 8) || !env.cpu.accessible(pointer, size, Prot::WRITE) {
-        return fail(env, 87);
+        return Err(87);
     }
     let mut bytes = [0u8; 284];
     bytes[..4].copy_from_slice(&size.to_le_bytes());
@@ -41,10 +69,9 @@ fn get_version_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
         bytes[at + 4..at + 6].copy_from_slice(&(VERSION[6] as u16).to_le_bytes());
         bytes[at + 6] = VERSION[7] as u8;
     }
-    match env.cpu.write(pointer, &bytes[..size as usize]) {
-        Ok(()) => Outcome::Return(1),
-        Err(_) => fail(env, 998),
-    }
+    env.cpu
+        .write(pointer, &bytes[..size as usize])
+        .map_err(|_| 998)
 }
 
 fn condition_mask(env: &mut Env<'_>) -> Outcome {
@@ -140,6 +167,15 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, super::K32, "GetVersionExW", 1, |e| {
         get_version_ex(e, true)
     });
+    stdcall(registry, "ntdll.dll", "RtlGetVersion", 1, rtl_get_version);
+    stdcall(registry, super::K32, "GetProductInfo", 5, get_product_info);
+    stdcall(
+        registry,
+        super::K32,
+        "GetCurrentPackageId",
+        2,
+        get_current_package_id,
+    );
     stdcall(
         registry,
         super::K32,

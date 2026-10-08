@@ -434,6 +434,7 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
                 fault_reads: 0,
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
+                direct: std::ptr::null(),
             };
             let result = {
                 #[cfg(target_arch = "aarch64")]

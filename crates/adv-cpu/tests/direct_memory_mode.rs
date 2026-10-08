@@ -34,11 +34,14 @@ fn direct_memory_selection_reports_platform_and_lifecycle_limits() {
 fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
     use iced_x86::code_asm::*;
+    let hardware = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } == 4096
+        || std::env::var("ADV_DIRECT_MEMORY_INLINE").as_deref() == Ok("0");
 
     const CODE: u32 = 0x10000;
     const DATA: u32 = 0x20000;
     let mut assembler = CodeAssembler::new(32).unwrap();
     assembler.inc(ebx).unwrap();
+    let write_pc = CODE + assembler.assemble(u64::from(CODE)).unwrap().len() as u32;
     assembler.mov(dword_ptr(ecx), edx).unwrap();
     assembler.mov(eax, dword_ptr(ecx)).unwrap();
     assembler.inc(esi).unwrap();
@@ -49,14 +52,24 @@ fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     executor.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
     executor.protect(DATA, 4096, READ | WRITE).unwrap();
     executor.write(CODE, &code).unwrap();
-    executor.add_region(Region::new(CODE, code.len())).unwrap();
+    // The counter assertions below require native reentry at the pending
+    // store after a permission fault, without replaying the committed INC.
+    let mut region = Region::new(CODE, code.len());
+    region.entries.push(write_pc);
+    executor.add_region(region).unwrap();
     executor.state.regs[1] = DATA;
     executor.state.regs[2] = 0x12345678;
     executor.state.eip = CODE;
     assert_eq!(executor.run(stop, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(executor.state.regs[0], executor.state.regs[2]);
-    assert_eq!(executor.stats.direct_memory.accesses, 2);
-    assert_eq!(executor.stats.direct_memory.checked_fallbacks, 0);
+    assert_eq!(
+        executor.stats.direct_memory.accesses,
+        if hardware { 2 } else { 0 }
+    );
+    assert_eq!(
+        executor.stats.direct_memory.checked_fallbacks,
+        if hardware { 0 } else { 2 }
+    );
 
     executor.protect(DATA, 4096, READ).unwrap();
     executor.state.eip = CODE;
@@ -66,13 +79,19 @@ fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     ));
     assert_eq!(executor.state.regs[3], 2);
     assert_eq!(executor.state.regs[6], 1);
-    assert_eq!(executor.stats.direct_memory.violations, 1);
-    assert_eq!(executor.stats.direct_memory.accesses, 3);
+    assert_eq!(executor.stats.direct_memory.violations, u64::from(hardware));
+    assert_eq!(
+        executor.stats.direct_memory.accesses,
+        if hardware { 3 } else { 0 }
+    );
     executor.protect(DATA, 4096, READ | WRITE).unwrap();
     assert_eq!(executor.run(stop, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(executor.state.regs[3], 2);
     assert_eq!(executor.state.regs[6], 2);
-    assert_eq!(executor.stats.direct_memory.checked_fallbacks, 0);
+    assert_eq!(
+        executor.stats.direct_memory.checked_fallbacks,
+        if hardware { 0 } else { 5 }
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -118,8 +137,15 @@ fn native_16k_subpages_boundaries_and_partial_recommit_keep_guest_permissions() 
                 assert_eq!(outcome, RunOutcome::ReadFault { pc: CODE, address });
             }
         }
-        assert_eq!(e.stats.direct_memory.recoveries, 2);
-        assert_eq!(e.stats.direct_memory.violations, 2);
+        // Mixed 16 KiB pages use checked aliases in the inline configuration.
+        // The legacy opt-out retains its explicit recovery sessions.
+        if std::env::var("ADV_DIRECT_MEMORY_INLINE").as_deref() == Ok("0") {
+            assert_eq!(e.stats.direct_memory.recoveries, 2);
+            assert_eq!(e.stats.direct_memory.violations, 2);
+        } else {
+            assert_eq!(e.stats.direct_memory.accesses, 0);
+            assert!(e.stats.direct_memory.checked_fallbacks >= 4);
+        }
         // Cross both a guest boundary and a real host boundary. A denied
         // suffix must not commit even the writable prefix of a store.
         e.protect(DATA, 32768, READ | WRITE).unwrap();

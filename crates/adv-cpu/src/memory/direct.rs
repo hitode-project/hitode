@@ -2,6 +2,56 @@
 use super::*;
 
 impl Memory {
+    pub(crate) fn direct_memory_inline(&self) -> bool {
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        return self
+            .direct_engine
+            .as_ref()
+            .is_some_and(|engine| engine.inline != 0);
+        #[cfg(not(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        false
+    }
+
+    pub(crate) fn direct_engine_pointer(&self) -> *const std::ffi::c_void {
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        return self
+            .direct_engine
+            .as_ref()
+            .map_or(std::ptr::null(), |engine| {
+                (engine as *const crate::direct_memory::Engine).cast()
+            });
+        #[cfg(not(all(
+            any(
+                target_os = "linux",
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        std::ptr::null()
+    }
+
     #[cfg(all(
         test,
         any(
@@ -84,9 +134,11 @@ impl Memory {
     fn install_direct_window(
         &mut self,
         window: crate::virtual_memory::Reservation,
-        engine: crate::direct_memory::Engine,
+        mut engine: crate::direct_memory::Engine,
     ) -> Result<(), String> {
         use crate::virtual_memory::GuestPageProtection;
+        engine.window = window.ptr.as_ptr() as usize;
+        engine.host_page_size = window.direct_host_page_size();
         let alias = window.checked_pointer().unwrap();
         let mut first = 0;
         while first < self.mapped.len() {

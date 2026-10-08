@@ -34,6 +34,7 @@ mod fault_recipe;
 pub mod fault_recovery;
 mod file_memory;
 mod floating;
+pub mod frame_counters;
 // Independent semantics and diagnostics; no GIR code in default library builds.
 #[cfg(any(test, feature = "gir-lift"))]
 mod gir;
@@ -59,6 +60,7 @@ mod parallel;
 mod parallel_memory;
 mod perf_map;
 mod rows;
+mod safepoint;
 mod shared_memory;
 mod state;
 mod strings;
