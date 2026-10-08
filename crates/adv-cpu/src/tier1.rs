@@ -5,7 +5,7 @@
 #![cfg_attr(
     not(all(
         target_arch = "aarch64",
-        any(target_os = "linux", target_os = "android")
+        any(target_os = "linux", target_os = "android", target_os = "macos")
     )),
     allow(dead_code)
 )]
@@ -70,23 +70,23 @@ pub struct Tier1Stats {
 
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod emit;
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod native;
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod simd;
 
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 mod sse;
 
@@ -99,25 +99,25 @@ pub(crate) struct Execution {
 
 #[cfg(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ))]
 pub(crate) use native::Engine;
 
 #[cfg(not(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 )))]
 pub(crate) struct Engine;
 #[cfg(not(all(
     target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 )))]
 impl Engine {
     pub fn record_bridge(&mut self, _units: u32) {}
     pub fn set_cache_limits(&mut self, _entries: usize, _bytes: usize) {}
     pub fn new() -> Result<Self, String> {
         Err(
-            "ARM64 Tier 1 requires aarch64 Linux or Android; other platforms are not supported"
+            "ARM64 Tier 1 requires aarch64 Linux, Android or macOS; other platforms are not supported"
                 .into(),
         )
     }

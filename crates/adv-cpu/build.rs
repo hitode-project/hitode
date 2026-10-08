@@ -21,11 +21,13 @@ fn main() {
     }
     if matches!(
         std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("linux" | "android")
+        Ok("linux" | "android" | "macos")
     ) && matches!(
         std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
         Ok("x86_64" | "aarch64")
-    ) {
+    ) && (std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64"))
+    {
         cc::Build::new()
             .file("src/host_fault/posix.c")
             .file("src/host_fault/probe.S")

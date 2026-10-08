@@ -19,6 +19,8 @@ cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [features]
+# Local research capture only; does not select a GIR execution path.
+gir-capture = []
 # ADV_JIT_DUMP_DIR also writes AArch64 vcode for each dumped region.
 cross-dump = ["cranelift-codegen/arm64"]
 

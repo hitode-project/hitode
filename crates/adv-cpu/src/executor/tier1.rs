@@ -130,7 +130,11 @@ mod tests {
         m.set_async_compilation(true);
         if cfg!(all(
             target_arch = "aarch64",
-            any(target_os = "linux", target_os = "android")
+            any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos"
+            )
         )) {
             m.set_tier1_mode(Tier1Mode::Bridge).unwrap();
             assert!(m.auto_jit && m.async_compilation);

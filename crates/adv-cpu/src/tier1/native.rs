@@ -1,10 +1,11 @@
-//! Linux/Android ARM64 entry/exit, immutable code ownership, and checked continuations.
+//! Linux/Android/macOS ARM64 entry/exit, immutable code ownership, and checked continuations.
 use super::{BUDGET, DISPATCH, Execution, FALLBACK, LOAD, STORE, Tier1Stats, emit};
 use crate::execution_abi::Tier1Frame;
 use crate::interpreter::{Execution as Interpreted, Interpreter, Step};
 use crate::{CpuState, Memory};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(not(target_os = "macos"))]
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Instant;
@@ -13,9 +14,14 @@ core::arch::global_asm!(
     r#"
 .text
 .p2align 2
+.if {apple}
+.global _adv_tier1_enter
+_adv_tier1_enter:
+.else
 .global adv_tier1_enter
 .type adv_tier1_enter,%function
 adv_tier1_enter:
+.endif
     stp x29, x30, [sp, #-96]!
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -46,12 +52,16 @@ adv_tier1_enter:
     ldp x27, x28, [sp, #80]
     ldp x29, x30, [sp], #96
     ret
+.if !{apple}
 .size adv_tier1_enter, .-adv_tier1_enter
-"#
+.endif
+"#,
+    apple = const cfg!(target_os = "macos") as u8
 );
 unsafe extern "C" {
     fn adv_tier1_enter(frame: *mut Tier1Frame, entry: *const u8, window: *mut u8);
     // Android uses the NDK compiler-rt archive already linked by build.rs.
+    #[cfg(not(target_os = "macos"))]
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
 }
 
@@ -174,10 +184,15 @@ extern "C" fn stack_all(entry: *mut Entry, pop: u32) -> u32 {
     )
 }
 
+#[cfg(target_os = "macos")]
+use crate::jit_memory_macos::Code;
+
+#[cfg(not(target_os = "macos"))]
 struct Code {
     pointer: NonNull<u8>,
     len: usize,
 }
+#[cfg(not(target_os = "macos"))]
 impl Code {
     fn new(words: &[u32]) -> Result<Self, String> {
         let bytes = words
@@ -234,6 +249,7 @@ impl Code {
         Ok(code)
     }
 }
+#[cfg(not(target_os = "macos"))]
 impl Drop for Code {
     fn drop(&mut self) {
         unsafe {
@@ -256,17 +272,21 @@ mod publication_tests {
             words[0] = 0x52800000 | (value << 5);
             words[1] = 0xd65f03c0;
             let code = Code::new(&words).unwrap();
-            assert_eq!(code.len, 2 * page);
-            let start = code.pointer.as_ptr() as usize;
-            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-            let permissions = maps.lines().find_map(|line| {
-                let mut fields = line.split_whitespace();
-                let (low, high) = fields.next()?.split_once('-')?;
-                let low = usize::from_str_radix(low, 16).ok()?;
-                let high = usize::from_str_radix(high, 16).ok()?;
-                (low <= start && high >= start + code.len).then(|| fields.next().unwrap())
-            });
-            assert_eq!(permissions, Some("r-xp"));
+            assert!(code.len >= std::mem::size_of_val(words.as_slice()));
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(code.len, 2 * page);
+                let start = code.pointer.as_ptr() as usize;
+                let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+                let permissions = maps.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let (low, high) = fields.next()?.split_once('-')?;
+                    let low = usize::from_str_radix(low, 16).ok()?;
+                    let high = usize::from_str_radix(high, 16).ok()?;
+                    (low <= start && high >= start + code.len).then(|| fields.next().unwrap())
+                });
+                assert_eq!(permissions, Some("r-xp"));
+            }
             // SAFETY: the immutable RX entry obeys the host ABI and returns u32.
             let entry: unsafe extern "C" fn() -> u32 =
                 unsafe { std::mem::transmute(code.pointer.as_ptr()) };
@@ -519,6 +539,8 @@ impl Engine {
             vector: [0; 2],
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::jit_memory_macos::synchronize_execution();
         // Every emitted entry uses the fixed ABI; the access helpers reach
         // memory only through `entry`, and `memory` is unused until return.
         unsafe {
