@@ -4,8 +4,8 @@ use crate::gir::{ir as g, lift::Tier2Operation};
 
 pub(super) fn selected() -> Result<bool, String> {
     match std::env::var("ADV_TIER2_FRONTEND").as_deref() {
-        Err(_) | Ok("legacy") => Ok(false),
-        Ok("gir") => Ok(true),
+        Ok("legacy") => Ok(false),
+        Err(_) | Ok("gir") => Ok(true),
         Ok(_) => Err("unknown ADV_TIER2_FRONTEND selector (expected gir or legacy)".into()),
     }
 }
