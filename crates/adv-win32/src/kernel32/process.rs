@@ -8,6 +8,7 @@ use adv_os::{Heaps, processes};
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
+pub(crate) mod apc;
 #[cfg(test)]
 mod live_context_tests;
 pub(crate) mod native_thread;
@@ -56,6 +57,7 @@ pub(crate) fn terminate_process_owner(
     complete: impl FnOnce(&mut Env<'_>, Result<u32, processes::Error>) -> Outcome + 'static,
 ) -> Outcome {
     if pid == env.sys.pid {
+        apc::retire_all(env);
         return Outcome::ExitProcess(code);
     }
     processes::visit(
@@ -76,6 +78,7 @@ pub(crate) fn terminate_process_owner(
                 ));
             }
             target.sys.terminate_process_stopped(code);
+            apc::retire_all(target);
             Ok(1)
         },
         complete,
@@ -686,9 +689,11 @@ fn terminate_thread_legacy(env: &mut Env<'_>) -> Outcome {
     }
     if identity.process.pid == env.sys.pid {
         if identity.context == env.context {
+            apc::retire(env, env.context);
             return Outcome::ExitThread(code);
         }
         env.sys.terminate_context(identity.context, code);
+        apc::retire(env, identity.context);
         return Outcome::Return(1);
     }
     processes::visit(
@@ -697,6 +702,7 @@ fn terminate_thread_legacy(env: &mut Env<'_>) -> Outcome {
         None,
         move |target| {
             target.sys.terminate_context_stopped(identity.context, code);
+            apc::retire(target, identity.context);
             Ok(1)
         },
         |env, result| api_result(env, result, 0),
@@ -969,6 +975,11 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "TerminateThread", 2, terminate_thread);
     stdcall(reg, K32, "CreateThread", 6, create_thread);
     stdcall(reg, K32, "CreateRemoteThread", 7, create_remote_thread);
+    stdcall(reg, K32, "QueueUserAPC", 3, apc::queue_front);
+    stdcall(reg, K32, "SleepEx", 2, |env| {
+        let args = [env.arg(0), env.arg(1)];
+        apc::sleep_front(env, args[0], args[1] != 0, true)
+    });
     stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
     stdcall(reg, K32, "ResumeThread", 1, resume_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);

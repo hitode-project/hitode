@@ -94,6 +94,12 @@ pub(crate) fn prepare_system_modules<B: adv_cpu::backend::Backend>(
     resident_system_modules(&mut machine.cpu, &mut machine.sys, win32, modules)
 }
 
+pub(crate) fn prepare_system_env(env: &mut Env<'_>) -> Result<(), MemFault> {
+    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
+    resident_system_modules(env.cpu, env.sys, win32, modules)
+        .map_err(|_| MemFault { addr: 0, len: 0 })
+}
+
 fn resident_system_modules(
     cpu: &mut dyn adv_cpu::backend::Guest,
     sys: &mut adv_machine::Sys,
@@ -307,10 +313,15 @@ fn thread_start_at(env: &mut Env<'_>, start: u32, param: u32) -> Outcome {
     after(
         env,
         locked_start,
-        Box::new(move |_| {
-            Outcome::call(start, vec![param], |env, returned| {
-                exit_thread(env, returned.value())
-            })
+        Box::new(move |env| {
+            super::super::process::apc::drain(
+                env,
+                Box::new(move |_| {
+                    Outcome::call(start, vec![param], |env, returned| {
+                        exit_thread(env, returned.value())
+                    })
+                }),
+            )
         }),
     )
 }
@@ -355,6 +366,7 @@ pub(super) fn after(env: &mut Env<'_>, outcome: Outcome, then: DeferredContinuat
 }
 
 pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
+    super::super::process::apc::retire(env, env.context);
     if !env
         .ext
         .get_mut::<Win32>()
@@ -400,6 +412,7 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
 }
 
 pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
+    super::super::process::apc::retire(env, env.context);
     if env.sys.process_identity.completion.exit_status().is_some() {
         return Outcome::ExitProcess(code);
     }
@@ -411,6 +424,7 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     env.cpu.quiesce_memory();
     crate::user32::hooks::exit_process(env);
     env.sys.terminate_other_contexts(code);
+    super::super::process::apc::retire_completed(env);
     let shutdown = shutdown_process(env);
     after(env, shutdown, Box::new(move |_| Outcome::ExitProcess(code)))
 }

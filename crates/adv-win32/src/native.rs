@@ -23,6 +23,11 @@ fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, Load
 }
 
 pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, LoadError> {
+    // Standalone handler embedders may install no Windows personality. There
+    // is then no guest system image whose entry could have been replaced.
+    if env.ext.try_get::<Win32>().is_none() || env.ext.try_get::<Modules>().is_none() {
+        return Ok(None);
+    }
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
     let Some(module) = system_module(modules, name)? else {
         return Ok(None);

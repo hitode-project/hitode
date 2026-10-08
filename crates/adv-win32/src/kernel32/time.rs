@@ -381,14 +381,7 @@ fn query_performance_frequency(
 /// Sleep(ms): 0 yields, anything else blocks the context until the deadline.
 #[win32(kernel32, name = "Sleep", level = implement)]
 pub(crate) fn sleep(env: &mut Env<'_>, ms: u32) -> Outcome {
-    if ms == 0 {
-        return Outcome::block_then_return(Wait::Yield, 0);
-    }
-    if ms == u32::MAX {
-        return Outcome::Fail("Sleep(INFINITE)".into());
-    }
-    let until = env.sys.clock.now_us() + u64::from(ms) * 1000;
-    delay_until(env, until)
+    super::apc::sleep_front(env, ms, false, false)
 }
 
 pub(crate) fn delay_until(env: &mut Env<'_>, until: u64) -> Outcome {

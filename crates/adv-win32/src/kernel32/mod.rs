@@ -36,6 +36,7 @@ mod nlsapi;
 mod osversion;
 mod process;
 pub(crate) use environment::entries as environment_entries;
+pub(crate) use process::apc;
 pub(crate) use process::install_parameters;
 pub(crate) use process::native_resume_thread;
 pub(crate) use process::native_suspend_thread;

@@ -12,6 +12,7 @@ use crate::util::{err, out_u32, set_last_error};
 use crate::{Win32, stdcall};
 
 mod local;
+pub(crate) mod native;
 pub(crate) use local::detach_fls;
 #[cfg(test)]
 mod event_tests;
@@ -616,6 +617,7 @@ mod critical_tests {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    native::register(reg);
     local::register(reg);
     stdcall(reg, K32, "InitializeSListHead", 1, |e| {
         let _ = e.cpu.write(e.arg(0), &[0; 8]);
@@ -759,11 +761,11 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ReleaseMutex", 1, release_mutex);
     stdcall(reg, K32, "WaitForSingleObject", 2, |e| {
         let (h, ms) = (e.arg(0), e.arg(1));
-        wait_one(e, h, ms)
+        native::wait_front(e, h, ms, false)
     });
     stdcall(reg, K32, "WaitForSingleObjectEx", 3, |e| {
-        let (h, ms) = (e.arg(0), e.arg(1));
-        wait_one(e, h, ms)
+        let (h, ms, alertable) = (e.arg(0), e.arg(1), e.arg(2));
+        native::wait_front(e, h, ms, alertable != 0)
     });
     stdcall(reg, K32, "WaitForMultipleObjects", 4, wait_multiple);
     stdcall(reg, K32, "TlsAlloc", 0, |e| {

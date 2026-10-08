@@ -18,14 +18,19 @@ fn status(error: &processes::Error) -> u32 {
         _ => 0xc0000001,
     }
 }
-fn front_status(env: &mut Env<'_>, status: u32, success: u32, failure: u32) -> Outcome {
+pub(in crate::kernel32) fn front_status(
+    env: &mut Env<'_>,
+    status: u32,
+    success: u32,
+    failure: u32,
+) -> Outcome {
     if status & 0x80000000 == 0 {
         return Outcome::Return(success);
     }
     set_last_error(env, super::super::file::native::win32_error(status));
     Outcome::Return(failure)
 }
-fn scratch(env: &mut Env<'_>, size: u32) -> Result<u32, Outcome> {
+pub(in crate::kernel32) fn scratch(env: &mut Env<'_>, size: u32) -> Result<u32, Outcome> {
     let pointer = env
         .cpu
         .reg(Reg::Esp)
@@ -42,6 +47,49 @@ fn scratch(env: &mut Env<'_>, size: u32) -> Result<u32, Outcome> {
         .write(pointer, &vec![0; size as usize])
         .map_err(|error| Outcome::Fail(error.to_string()))?;
     Ok(pointer)
+}
+
+pub(in crate::kernel32) fn map_status(env: &mut Env<'_>, outcome: Outcome, then: Done) -> Outcome {
+    match outcome {
+        Outcome::Return(value) => then(env, value),
+        Outcome::Call {
+            target,
+            args,
+            then: resume,
+            stack,
+            unwindable,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            unwindable,
+            then: Box::new(move |env, value| {
+                let next = resume(env, value);
+                map_status(env, next, then)
+            }),
+        },
+        Outcome::Block {
+            wait,
+            then: resume,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, value| {
+                let next = resume(env, value);
+                map_status(env, next, then)
+            }),
+        },
+        Outcome::Defer { then: resume } => Outcome::defer(move |env| {
+            let next = resume(env);
+            map_status(env, next, then)
+        }),
+        Outcome::HostRequest { then: resume } => Outcome::host_request(move |env| {
+            let next = resume(env);
+            map_status(env, next, then)
+        }),
+        terminal => terminal,
+    }
 }
 
 pub(super) fn context_front(env: &mut Env<'_>, set: bool) -> Outcome {
@@ -94,6 +142,7 @@ pub(crate) fn create_native(env: &mut Env<'_>, args: [u32; 11]) -> Outcome {
 }
 
 fn create(env: &mut Env<'_>, args: [u32; 11], then: Done) -> Outcome {
+    super::apc::retire_completed(env);
     let [
         output,
         desired,
@@ -352,10 +401,12 @@ pub(crate) fn terminate_native(env: &mut Env<'_>, handle: u32, code: u32) -> Out
     }
     if identity.process.pid == env.sys.pid {
         if identity.context == env.context {
+            super::apc::retire(env, env.context);
             return Outcome::ExitThread(code);
         }
         env.cpu.quiesce_memory();
         env.sys.terminate_context(identity.context, code);
+        super::apc::retire(env, identity.context);
         return Outcome::Return(0);
     }
     processes::visit(
@@ -364,6 +415,7 @@ pub(crate) fn terminate_native(env: &mut Env<'_>, handle: u32, code: u32) -> Out
         None,
         move |target| {
             target.sys.terminate_context_stopped(identity.context, code);
+            super::apc::retire(target, identity.context);
             Ok(())
         },
         |_, result| Outcome::Return(result.as_ref().err().map_or(0, status)),
