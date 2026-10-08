@@ -91,9 +91,11 @@ pub(crate) unsafe extern "C" fn x87_call(
         let memory = unsafe { &mut *bridge.memory };
         let cliffs = &mut bridge.cliffs;
         cliffs.x87_helper_calls += 1;
-        if let Some(fast) = operation.fast
-            && let Some(result) = fast::execute(operation, fast, state, memory)
-        {
+        let result = match operation.fast {
+            Some(fast) => fast::execute(operation, fast, state, memory),
+            None => fast::execute_other(operation, state, memory),
+        };
+        if let Some(result) = result {
             cliffs.x87_fast += 1;
             return result;
         }
