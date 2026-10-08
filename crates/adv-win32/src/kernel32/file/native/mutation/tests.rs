@@ -70,7 +70,7 @@ fn last<B: Backend>(machine: &mut Machine<B>) -> u32 {
 
 #[cfg(windows)]
 #[test]
-fn rename_retains_the_owner_and_delete_waits_for_its_final_alias() {
+fn rename_retains_the_owner_and_posix_delete_keeps_aliases_alive() {
     let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
     machine
         .spawn("authored owner", PARK_ADDR, &[], 65536)
@@ -116,17 +116,28 @@ fn rename_retains_the_owner_and_delete_waits_for_its_final_alias() {
             .unwrap()
             .delete_pending
     );
-    assert!(root.join("data/overlay/renamed.dat").exists());
+    // DeleteFile uses POSIX disposition: the name leaves at once while every
+    // alias keeps the original instance alive.
+    assert!(!root.join("data/overlay/renamed.dat").exists());
     assert_eq!(
         crate::kernel32::open_with_share(&mut env(&mut machine), "renamed.dat", 0x80000000, 3, 7),
         u32::MAX
     );
-    assert_eq!(last(&mut machine), 5);
+    assert_eq!(last(&mut machine), 2);
     assert_eq!(
         crate::ntdll::file::close(&mut env(&mut machine), Handle(h)),
         0
     );
-    assert!(root.join("data/overlay/renamed.dat").exists());
+    assert_eq!(
+        machine
+            .sys
+            .objects
+            .host::<crate::FileObj>(alias)
+            .unwrap()
+            .file
+            .cached_identity(),
+        identity
+    );
     assert_eq!(
         crate::ntdll::file::close(&mut env(&mut machine), Handle(alias)),
         0
@@ -330,13 +341,18 @@ fn install(env: &mut Env<'_>) -> Outcome {
 fn set(env: &mut Env<'_>) -> Outcome {
     let args = [env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4)];
     assert!(env.sys.objects.host::<crate::FileObj>(args[0]).is_some());
+    // DeleteFile opens DELETE | FILE_READ_ATTRIBUTES; rename adds SYNCHRONIZE.
     assert_eq!(
         env.sys
             .objects
             .host::<crate::FileObj>(args[0])
             .unwrap()
             .access,
-        0x00110080
+        if args[4] == 64 {
+            0x00010080
+        } else {
+            0x00110080
+        }
     );
     let p = env.ext.get_mut::<Provider>();
     p.sets += 1;
@@ -361,9 +377,11 @@ fn set(env: &mut Env<'_>) -> Outcome {
             env.cpu.write(args[2] + 12, &name).unwrap();
             env.cpu.write_u32(args[2] + 8, name.len() as u32).unwrap();
         } else {
-            assert_eq!((args[4], args[3]), (13, 1));
+            assert_eq!((args[4], args[3]), (64, 4));
+            assert_eq!(env.cpu.read_u32(args[2]).unwrap(), 3);
             if mode == 3 {
-                env.cpu.write(args[2], &[0]).unwrap(); // Guest changes delete into cancel.
+                // Guest changes delete into FILE_DISPOSITION_DO_NOT_DELETE.
+                env.cpu.write_u32(args[2], 0).unwrap();
             }
         }
         Outcome::Return(crate::ntdll::file::set(

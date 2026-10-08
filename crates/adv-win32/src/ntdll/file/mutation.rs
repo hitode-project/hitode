@@ -226,11 +226,13 @@ pub(super) fn set(
     }
     if class == 64 {
         let flags = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-        if flags != 3 {
+        // DO_NOT_DELETE, DELETE and POSIX_SEMANTICS share the directory
+        // owner's subset; on-close and read-only overrides need their own model.
+        if flags & !3 != 0 {
             return unavailable_for(
                 env,
                 "ntdll.dll!NtSetInformationFile",
-                "extended disposition supports DELETE | POSIX_SEMANTICS only",
+                "extended disposition supports DELETE and POSIX_SEMANTICS only",
             );
         }
         let result = env

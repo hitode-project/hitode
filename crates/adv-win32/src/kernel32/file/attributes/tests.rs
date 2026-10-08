@@ -284,7 +284,8 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
             invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
             u32::MAX
         );
-        assert_eq!(error(&mut machine), 5); // The retained FD keeps deletion pending.
+        // POSIX disposition unlinks the name although the retained FD lives on.
+        assert_eq!(error(&mut machine), 2);
         drop(old);
     }
     #[cfg(not(windows))]

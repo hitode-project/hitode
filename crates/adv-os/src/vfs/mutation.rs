@@ -119,8 +119,11 @@ impl FileStream {
                 .encode_wide()
                 .collect();
             let offset = std::mem::offset_of!(Header, name);
+            // FileNameLength excludes the NUL, but kernelbase converts the DOS
+            // name as a terminated string; without it, a size that is a
+            // multiple of eight reads past the buffer (ERROR_FILENAME_EXCED_RANGE).
             let length = offset
-                .checked_add(name.len() * 2)
+                .checked_add(name.len() * 2 + 2)
                 .ok_or(io::ErrorKind::OutOfMemory)?;
             // u64 storage provides host structure alignment on x86/x64/ARM64.
             let mut storage = vec![0u64; length.div_ceil(8)];

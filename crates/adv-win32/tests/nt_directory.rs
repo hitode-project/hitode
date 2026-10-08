@@ -275,7 +275,7 @@ fn lifecycle<B: Backend>(cpu: B) {
         (16, 0),
         (20, 0),
         (24, 0),
-        (28, 0x10),
+        (28, u32::MAX), // Native GetFileAttributes reports the pending instance.
         (32, 0xc0000056),
         (36, 0),
         (40, u32::MAX),
