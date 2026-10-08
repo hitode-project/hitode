@@ -1,5 +1,7 @@
 //! Explicit checkpointed scalar lane; every other instruction stays checked.
 use super::*;
+mod inline;
+pub(super) use inline::{Inline, publish};
 
 pub(super) fn candidate(i: &Instruction) -> bool {
     if i.has_lock_prefix() || !matches!(i.memory_size().size(), 1 | 2 | 4) {
@@ -41,7 +43,7 @@ pub(super) fn declare(
 }
 
 impl Emitter<'_> {
-    pub(super) fn direct_mov(&mut self, i: &Instruction) {
+    fn legacy_direct_mov(&mut self, i: &Instruction) {
         let write = i.op0_kind() == OpKind::Memory;
         let width = i.memory_size().size();
         let destination = if write {

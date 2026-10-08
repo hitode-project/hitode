@@ -1,6 +1,4 @@
-//! Narrow Cranelift access thunks with a per-access frozen recovery lease.
-//! Keeping the lease inside the thunk call lets ordinary JIT helpers and traps
-//! change mappings after it returns, without weakening A's freeze contract.
+//! Opt-in scalar memory, with inline accesses and a retained legacy thunk lane.
 use crate::CpuState;
 use crate::execution_abi::{NativeRecoveryPoint, RecoveryAccess, RecoveryValue, StoreCommitProof};
 use crate::fault_recovery::{CodeRegion, RecoveryKind};
@@ -23,7 +21,11 @@ struct Thunk {
     resume: usize,
 }
 
+#[repr(C)]
 pub(crate) struct Engine {
+    pub window: usize,
+    pub host_page_size: usize,
+    pub inline: usize,
     perf_ranges: Vec<crate::perf_map::Registration>,
     module: Option<JITModule>,
     thunks: Vec<Thunk>,
@@ -146,6 +148,9 @@ impl Engine {
             })
             .collect();
         Ok(Self {
+            window: 0,
+            host_page_size: 0,
+            inline: usize::from(std::env::var("ADV_DIRECT_MEMORY_INLINE").as_deref() != Ok("0")),
             perf_ranges,
             module: Some(module),
             thunks,
@@ -314,6 +319,82 @@ pub(crate) unsafe extern "C" fn checked(bridge: *mut u8) {
     let memory = unsafe { &*bridge.memory };
     if let Some(engine) = &memory.direct_engine {
         engine.checked.set(engine.checked.get() + 1);
+    }
+}
+
+/// One lightweight context covers the complete native chain. Mapping helpers
+/// remain free to mutate the owner: no frozen mapping view spans the call.
+/// Fault classification happens only after the native frame has returned.
+pub(crate) unsafe fn run_inline(
+    state: *mut CpuState,
+    memory: *mut crate::Memory,
+    bridge: *mut crate::trap::Bridge<'_>,
+    permissions: &[u8],
+    run: impl FnOnce() -> u32,
+) -> u32 {
+    // Do not keep a Rust borrow of Memory/Bridge across helper execution.
+    // The caller owns their lifetime, and native helpers use its raw pointers.
+    let (window, len, base, enabled) = {
+        let memory = unsafe { &*memory };
+        let engine = memory.direct_engine.as_ref().unwrap();
+        (engine.window, memory.len, memory.base, engine.inline != 0)
+    };
+    if !enabled {
+        return run();
+    }
+    let execution = unsafe {
+        crate::fault_recovery::inline::with_protection(
+            state,
+            window,
+            len,
+            base,
+            Some(permissions),
+            run,
+        )
+    };
+    let (result, fault) = match execution {
+        Ok(result) => result,
+        Err(error) => {
+            unsafe { (*bridge).error = Some(error) };
+            return crate::Exit::Trap as u32;
+        }
+    };
+    let Some(fault) = fault else {
+        return result;
+    };
+    let memory = unsafe { &*memory };
+    let engine = memory.direct_engine.as_ref().unwrap();
+    use crate::virtual_memory::{FaultClassification, GuestAccess};
+    let view = memory.direct_window().direct_fault_view().unwrap();
+    let access = if fault.site.write {
+        GuestAccess::Write
+    } else {
+        GuestAccess::Read
+    };
+    match view.classify(fault.host_address, access) {
+        FaultClassification::AccessViolation => {
+            engine.violations.set(engine.violations.get() + 1);
+            if fault.site.write {
+                crate::Exit::WriteFault as u32
+            } else {
+                crate::Exit::ReadFault as u32
+            }
+        }
+        FaultClassification::CodeWriteProtection => {
+            engine.code_writes.set(engine.code_writes.get() + 1);
+            crate::Exit::Fallback as u32
+        }
+        FaultClassification::MixedPage => {
+            engine.recoveries.set(engine.recoveries.get() + 1);
+            crate::Exit::Fallback as u32
+        }
+        FaultClassification::Accessible | FaultClassification::OutsideGuest => {
+            // Never retry an unexplained host failure as guest work.
+            unsafe {
+                (*bridge).error = Some("unexplained host fault at an inline scalar access".into())
+            };
+            crate::Exit::Trap as u32
+        }
     }
 }
 

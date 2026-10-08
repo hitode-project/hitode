@@ -653,6 +653,7 @@ fn execute(batch: &Batch) {
             fault_reads: 0,
             linked_entries: 0,
             shadow: std::ptr::null_mut(),
+            direct: std::ptr::null(),
             rows: std::ptr::null(),
             written: 0,
         };
@@ -1113,6 +1114,7 @@ mod tests {
                 fault_reads: 0,
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
+                direct: std::ptr::null(),
                 rows: &pool,
                 written: 0,
             };
@@ -1198,6 +1200,7 @@ mod tests {
                 fault_reads: 0,
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
+                direct: std::ptr::null(),
                 rows: &pool,
                 written: 0,
             };
