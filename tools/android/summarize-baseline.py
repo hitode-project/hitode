@@ -107,8 +107,6 @@ def report_config(report: dict) -> dict:
             "missing codec provider")
     require(isinstance(report.get("codec_kernels"), dict) and report["codec_kernels"].get("mode") in ("guest", "native"),
             "Verify or unknown kernel mode cannot be a performance baseline")
-    require(isinstance(report.get("parallel"), dict) and report["parallel"].get("workers") == 1,
-            "expected one guest worker")
     return {name: report[name] for name in REPORT_CONFIG} | {
         "codec_provider": report["codec"]["provider"], "codec_kernel_mode": report["codec_kernels"]["mode"],
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,

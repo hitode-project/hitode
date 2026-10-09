@@ -144,10 +144,6 @@ impl Compiled {
     pub(crate) fn shared_profile(&self) -> Option<Arc<Profile>> {
         self.input.profile.clone()
     }
-    pub(crate) fn parallel_entry(&self) -> crate::parallel::Entry {
-        assert!(!self.input.shadow_returns);
-        self.entry
-    }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub(crate) fn storage_bytes(&self) -> Result<(usize, usize), String> {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
@@ -338,7 +334,6 @@ pub(crate) struct Snapshot {
     pub(crate) cache_capture: bool,
     pub(crate) cache_location: Option<(u32, u32, [u8; 32])>,
     pub(crate) cache_guest: Option<[u8; 32]>,
-    parallel: bool,
     pub region: Box<Region>,
     pub(crate) base: u32,
     len: usize,
@@ -397,7 +392,6 @@ impl Snapshot {
                 .cache_location
                 .map(|(base, _, identity)| (base, region.start - base, identity)),
             cache_guest: self.cache_guest,
-            parallel: self.parallel,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -422,9 +416,6 @@ impl Snapshot {
         {
             return Err("region must contain 1..16384 executable bytes".into());
         }
-        // Capture is owner-only. Selective grants are revoked before sampling;
-        // conservative native peers already forbid all executable stores.
-        memory.quiesce_code_observation();
         let mut region = region.clone();
         let origin = callee_origin(&mut region, memory);
         let extent = (region.start - origin) as usize + region.len;
@@ -465,7 +456,6 @@ impl Snapshot {
             cache_capture: false,
             cache_location: None,
             cache_guest: None,
-            parallel: memory.is_parallel(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -489,8 +479,7 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.parallel == memory.is_parallel()
-            && memory.base == self.base
+        memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
                 memory.versions.get(stamp.page) == Some(&stamp.version)
@@ -791,7 +780,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let versioned = fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let versioned = true;
-    let (mut plans, mut rejected) = if versioned {
+    let (plans, rejected) = if versioned {
         loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
@@ -801,28 +790,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         (Vec::new(), Vec::new())
     };
-    // A memory bound is stable only while this guest thread owns execution.
-    // Another guest worker may change it even if this loop never does.
-    if snapshot.parallel {
-        plans.retain(|plan| {
-            if matches!(plan.bound, loops::Bound::Memory(_)) {
-                rejected.push(loops::Rejected {
-                    header: plan.header,
-                    latch: plan.latch,
-                    reason: "shared execution memory bound".into(),
-                });
-                false
-            } else {
-                true
-            }
-        });
-    }
-    // A kernel leaves at an access its windows reject; the region resumes
-    // the loop's checked code there.
-    for plan in &plans {
-        entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
-    }
-    let nests = if snapshot.parallel || plans.is_empty() {
+    let nests = if plans.is_empty() {
         Vec::new()
     } else {
         nest::nests(&instructions, &entries, &plans)
@@ -850,25 +818,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         None
     };
 
-    let opt_level = match if snapshot.parallel {
-        CompileStrategy::Fast
-    } else {
-        region.compile_strategy
-    } {
+    let opt_level = match region.compile_strategy {
         CompileStrategy::Speed => "speed",
         CompileStrategy::Fast => "none",
     };
-    let invariant_plan =
-        (opt_level == "speed" && !snapshot.parallel && plans.is_empty() && nests.is_empty())
-            .then(|| invariants::analyze(&instructions))
-            .flatten()
-            .filter(|plan| {
-                let scope = instructions
-                    .range(plan.header..=plan.latch)
-                    .map(|(&pc, i)| (pc, *i))
-                    .collect();
-                write_summary::Summary::for_region(&scope).is_some()
-            });
+    let invariant_plan = (opt_level == "speed" && plans.is_empty() && nests.is_empty())
+        .then(|| invariants::analyze(&instructions))
+        .flatten()
+        .filter(|plan| {
+            let scope = instructions
+                .range(plan.header..=plan.latch)
+                .map(|(&pc, i)| (pc, *i))
+                .collect();
+            write_summary::Summary::for_region(&scope).is_some()
+        });
     let gir = {
         let mut opaque = BTreeSet::new();
         for plan in &plans {
@@ -1153,9 +1116,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let write_summary = write_summary::Summary::for_region(&scoped_instructions);
         // Unused GPRs remain canonical in memory. Written GPRs must still
         // load their prefix for guards and alternate native entries.
-        let footprint = write_summary.filter(|_| {
-            opt_level == "speed" && kernel.is_none() && !snapshot.parallel && nests.is_empty()
-        });
+        let footprint =
+            write_summary.filter(|_| opt_level == "speed" && kernel.is_none() && nests.is_empty());
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let footprint = footprint.filter(|_| !snapshot.native_fault_reads);
         let mut b = FunctionBuilder::new(func, fb_ctx);
@@ -1509,7 +1471,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             x87_native: x87::enabled(),
             x87_cold: None,
             x87_cold_reads: 0,
-            parallel: snapshot.parallel,
             heat: heat_ref,
             call_sites: call_refs,
             lane: None,
@@ -2368,7 +2329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_counted_loops_get_an_invariant_body_only_in_serial_speed_code() {
+    fn memory_counted_loops_get_an_invariant_body_only_in_speed_code() {
         use iced_x86::code_asm::*;
         let mut a = CodeAssembler::new(32).unwrap();
         let mut top = a.create_label();
@@ -2387,18 +2348,12 @@ mod tests {
         memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
         memory.write(0x10000, &bytes).unwrap();
         for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-            for parallel in [false, true] {
-                let mut region = Region::new(0x10000, bytes.len());
-                region.compile_strategy = strategy;
-                let mut input = Snapshot::capture(&region, &mut memory).unwrap();
-                input.parallel = parallel;
-                let compiled = compile_snapshot(&input).unwrap();
-                assert_eq!(compiled.versioned_loops, 0);
-                assert_eq!(
-                    compiled.invariant_body,
-                    strategy == CompileStrategy::Speed && !parallel
-                );
-            }
+            let mut region = Region::new(0x10000, bytes.len());
+            region.compile_strategy = strategy;
+            let input = Snapshot::capture(&region, &mut memory).unwrap();
+            let compiled = compile_snapshot(&input).unwrap();
+            assert_eq!(compiled.versioned_loops, 0);
+            assert_eq!(compiled.invariant_body, strategy == CompileStrategy::Speed);
         }
     }
 
@@ -2478,33 +2433,6 @@ mod tests {
         let compiled = compile(&region, &mut machine.memory, false).unwrap();
         assert_eq!(compiled.versioned_loops, 1);
         assert_eq!(compiled.vectorized_loops, 1);
-    }
-
-    #[test]
-    fn memory_bound_kernels_require_single_guest_execution() {
-        let mut a = CodeAssembler::new(32).unwrap();
-        let mut top = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(esi, 4).unwrap();
-        a.add(edi, 4).unwrap();
-        a.inc(ecx).unwrap();
-        a.cmp(ecx, dword_ptr(ebp)).unwrap();
-        a.jb(top).unwrap();
-        a.ret().unwrap();
-        let bytes = a.assemble(0x10000).unwrap();
-        let mut memory = Memory::new(0x10000, 4096).unwrap();
-        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
-        memory.write(0x10000, &bytes).unwrap();
-        let region = Region::new(0x10000, bytes.len());
-        let mut snapshot = Snapshot::capture(&region, &mut memory).unwrap();
-        let serial = compile_snapshot(&snapshot).unwrap();
-        assert_eq!(serial.versioned_loops, 1);
-        assert_eq!(serial.vectorized_loops, 0);
-        snapshot.parallel = true;
-        let parallel = compile_snapshot(&snapshot).unwrap();
-        assert_eq!(parallel.versioned_loops, 0);
     }
 
     #[test]
@@ -2714,8 +2642,7 @@ fn narrow_alu(mnemonic: M) -> bool {
 }
 
 /// LOCK forms the emitter lowers as ordinary read-modify-writes. They are
-/// atomic only while this guest thread owns execution; a parallel snapshot
-/// sends them to the interpreter, which quiesces the native workers.
+/// atomic because a single guest thread owns execution.
 fn lockable(i: &Instruction) -> bool {
     i.op0_kind() == OpKind::Memory
         && matches!(
@@ -2738,13 +2665,6 @@ fn lockable(i: &Instruction) -> bool {
                 | M::Btr
                 | M::Btc
         )
-}
-
-/// Whether this instruction must be one transaction relative to other guest
-/// threads: LOCK, or XCHG's implicit lock on a memory operand.
-fn exclusive(i: &Instruction) -> bool {
-    i.has_lock_prefix()
-        || i.mnemonic() == M::Xchg && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
 }
 
 /// Boundaries required by opaque operations and interpreter continuations.
@@ -2971,7 +2891,6 @@ struct Emitter<'a> {
     x87_cold: Option<ir::Block>,
     x87_cold_reads: u8,
     /// Other guest threads may run native code at the same time.
-    parallel: bool,
     /// Symbol of the profile's block counter, for Fast code that may tier up.
     heat: Option<ir::FuncRef>,
     /// Indirect call site -> symbol of its profile target cell.
@@ -5523,10 +5442,6 @@ impl Emitter<'_> {
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;
-        }
-        if self.parallel && exclusive(i) {
-            let always = self.b.ins().iconst(types::I8, 1);
-            self.guard(always, Exit::Fallback, None);
         }
         if let Some(operation) = crate::strings::operation(i) {
             let pc = self.constant(i.ip32());

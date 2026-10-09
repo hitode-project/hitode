@@ -559,35 +559,3 @@ fn conditional_moves_memory_shifts_bit_tests_and_exchanges_stay_native() {
         assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
     }
 }
-
-#[test]
-// Parallel guest workers exist only on Windows x64 MSVC.
-#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-fn locked_forms_fall_back_while_other_guest_threads_may_run() {
-    let bytes = assemble(|a| {
-        a.lock().inc(dword_ptr(edi)).unwrap();
-        a.xchg(dword_ptr(edi + 4), ecx).unwrap();
-        a.add(eax, ecx).unwrap();
-        a.ret().unwrap();
-    });
-    let mut jit = machine(&bytes, false);
-    jit.set_guest_workers(2).unwrap();
-    jit.set_region(Region::new(CODE, bytes.len())).unwrap();
-    let mut interpreted = machine(&bytes, false);
-    for m in [&mut jit, &mut interpreted] {
-        reset(m, [5, 7, 0, 0, 0, 0, 0, DATA], 0x202);
-        m.write(DATA, &[0xff, 0xff, 0xff, 0xff, 9, 0, 0, 0])
-            .unwrap();
-        assert_eq!(m.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
-    }
-    interpreted.state.fuel = jit.state.fuel;
-    assert_eq!(jit.state, interpreted.state);
-    assert_eq!(
-        jit.memory().read(DATA, 8).unwrap().to_vec(),
-        [0, 0, 0, 0, 7, 0, 0, 0]
-    );
-    assert_eq!(jit.state.regs[0], 14);
-    // Both atomic forms execute in the interpreter, which quiesces workers.
-    assert!(jit.stats.interpreter_instructions >= 2);
-    assert!(jit.stats.native_entries > 0);
-}

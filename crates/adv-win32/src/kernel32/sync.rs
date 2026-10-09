@@ -404,7 +404,7 @@ mod critical_tests {
                 Outcome::block(Wait::Yield, |env, _| hold_until_waiters(env))
             }
         }
-        for workers in [1, 2] {
+        {
             let mut registry = Registry::default();
             register(&mut registry);
             registry.add(
@@ -436,8 +436,7 @@ mod critical_tests {
             registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
                 Outcome::ExitThread(0)
             });
-            let mut cpu = JitCpu::new(PARK_ADDR, true).unwrap();
-            cpu.set_guest_workers(workers).unwrap();
+            let cpu = JitCpu::new(PARK_ADDR, true).unwrap();
             let mut m = Machine::new(cpu, registry, Clock::real()).unwrap();
             m.ext.insert(Observed::default());
             m.cpu.map(CODE, 4096, Prot::RX).unwrap();

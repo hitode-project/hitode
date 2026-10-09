@@ -275,29 +275,3 @@ fn narrow_neg_memory_faults_preserve_prefix_flags_and_atomic_writes_then_resume(
         }
     }
 }
-
-#[test]
-// Parallel guest workers exist only on Windows x64 MSVC.
-#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-fn locked_narrow_neg_falls_back_with_parallel_guest_execution() {
-    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-        let bytes = code(|assembler| {
-            assembler.lock().neg(byte_ptr(esi)).unwrap();
-            assembler.lock().neg(word_ptr(esi + 2)).unwrap();
-            assembler.ret().unwrap();
-        });
-        let mut jit = machine(&bytes);
-        jit.set_guest_workers(2).unwrap();
-        compile(&mut jit, &bytes, strategy, &[]);
-        let mut interpreter = machine(&bytes);
-        let mut unicorn = machine(&arithmetic_oracle(&bytes));
-        for machine in [&mut jit, &mut interpreter, &mut unicorn] {
-            reset(machine, 0x1234_5678, 0xed7, DATA);
-            machine.write(DATA, &[1, 0x5a, 0, 0x80]).unwrap();
-        }
-        finished(&mut jit, &mut interpreter, &mut unicorn, "parallel LOCK");
-        assert_eq!(jit.memory().read(DATA, 4).unwrap(), [0xff, 0x5a, 0, 0x80]);
-        assert!(jit.stats.interpreter_instructions >= 2);
-        assert!(jit.stats.native_entries > 0);
-    }
-}

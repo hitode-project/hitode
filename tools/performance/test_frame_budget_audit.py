@@ -350,7 +350,7 @@ class WindowsProtocolAudit(SyntheticAudit):
         args = argparse.Namespace(binary=binary, exe=guest, schedule=self.root / "schedule.json",
                                   output=output, seed_data=None, audio=False, mode="headless",
                                   capture_audio=False, trace=False, tail_seconds=0, codepage=932,
-                                  codec="native", guest_workers=1, sync_compilation=False,
+                                  codec="native", sync_compilation=False,
                                   no_tiering=False, cold=True)
 
         class Runner:

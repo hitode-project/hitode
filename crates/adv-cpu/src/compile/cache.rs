@@ -187,7 +187,6 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     w.u32(snapshot.base);
     w.u64(snapshot.len as u64);
     w.u32(snapshot.origin);
-    w.bool(snapshot.parallel);
     w.bool(snapshot.shadow_returns);
     w.bool(snapshot.profile.is_some());
     w.bool(cfg!(test));
@@ -1166,9 +1165,6 @@ mod tests {
         assert!(restore_snapshot(&snapshot, &image[..image.len() - 1]).is_err());
         let mut changed = snapshot.clone();
         changed.shadow_returns = !changed.shadow_returns;
-        assert!(restore_snapshot(&changed, &image).is_err());
-        changed = snapshot.clone();
-        changed.parallel = !changed.parallel;
         assert!(restore_snapshot(&changed, &image).is_err());
         changed = snapshot.clone();
         changed.cache_location = Some((changed.base, 0, [1; 32]));

@@ -142,9 +142,6 @@ pub enum PageLockError {
 /// Why [`Backend::run`] returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
-    /// CPU state has been leased to a worker. The controller must not restore
-    /// this context until poll_parallel returns the matching token.
-    Dispatched { token: u64 },
     /// A trap handler returned [`TrapAction::Park`]. EIP is at the park address and the rest
     /// of the guest state is exactly what the handler left.
     Parked,
@@ -455,31 +452,6 @@ pub trait Backend: Guest {
         Err("backend does not support independent guest processes".into())
     }
     type Context;
-
-    fn guest_workers(&self) -> usize {
-        1
-    }
-    fn parallel_capacity_available(&self) -> bool {
-        true
-    }
-    /// Lease a ready peer without disturbing the controller's loaded CPU state.
-    /// A backend may decline cold, pending-trap or otherwise unsuitable contexts.
-    fn dispatch_ready_context(
-        &mut self,
-        _context: &Self::Context,
-        _duration: Duration,
-        _guest_us: u64,
-    ) -> Result<Option<u64>, String> {
-        Ok(None)
-    }
-    /// Offload only when another ready context can use the inline lane.
-    fn set_parallel_demand(&mut self, _ready_peer: bool) {}
-    fn poll_parallel(&mut self) -> Option<(u64, Self::Context)> {
-        None
-    }
-    fn wait_parallel(&mut self, _duration: Duration) -> Result<(), String> {
-        Err("backend has no parallel execution workers".into())
-    }
 
     /// Install the guest-owned GDT/IDT and load flat CS/DS/ES/SS before running.
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault>;

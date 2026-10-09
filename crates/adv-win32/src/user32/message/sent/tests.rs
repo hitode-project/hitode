@@ -77,7 +77,7 @@ fn procedure(env: &mut Env<'_>) -> Outcome {
     }
 }
 
-fn fixture(workers: usize) -> Machine<JitCpu> {
+fn fixture() -> Machine<JitCpu> {
     let mut registry = Registry::default();
     crate::register(&mut registry);
     registry.add("sent-test", "setup", Conv::Stdcall { argc: 0 }, setup);
@@ -86,8 +86,7 @@ fn fixture(workers: usize) -> Machine<JitCpu> {
         exit_thread(env);
         Outcome::ExitThread(0)
     });
-    let mut cpu = JitCpu::new(PARK_ADDR, true).unwrap();
-    cpu.set_guest_workers(workers).unwrap();
+    let cpu = JitCpu::new(PARK_ADDR, true).unwrap();
     let mut m = Machine::new(cpu, registry, Clock::real()).unwrap();
     crate::Win32::install(
         &mut m,
@@ -102,11 +101,8 @@ fn fixture(workers: usize) -> Machine<JitCpu> {
 
 #[test]
 fn sent_callbacks_reenter_the_sender_and_keep_owning_context_in_both_modes() {
-    for workers in [1, 2] {
-        if workers == 2 && !cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
-            continue;
-        }
-        let mut m = fixture(workers);
+    {
+        let mut m = fixture();
         let setup = m.resolve_import("sent-test", "setup").unwrap();
         let done = m.resolve_import("sent-test", "finish").unwrap();
         let send = m.resolve_import(USER32, "SendMessageA").unwrap();
@@ -176,11 +172,8 @@ fn run(m: &mut Machine<JitCpu>) {
 
 #[test]
 fn timed_out_send_is_removed_before_receiver_pumps_and_preserves_output() {
-    for workers in [1, 2] {
-        if workers == 2 && !cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
-            continue;
-        }
-        let mut m = fixture(workers);
+    {
+        let mut m = fixture();
         let setup = m.resolve_import("sent-test", "setup").unwrap();
         let done = m.resolve_import("sent-test", "finish").unwrap();
         let send = m.resolve_import(USER32, "SendMessageTimeoutA").unwrap();

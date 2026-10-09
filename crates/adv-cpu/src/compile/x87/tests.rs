@@ -533,63 +533,6 @@ fn helper_only_compilation_retains_a_reproducible_comparison_lane() {
     compare(&code, state(), |_| {}, Some(0));
 }
 
-#[test]
-#[cfg(target_arch = "x86_64")] // Parallel execution is not enabled on ARM64.
-fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
-    use std::sync::Arc;
-
-    let code = bytes(|a| {
-        a.fld(qword_ptr(esi)).unwrap();
-        a.fadd_2(st0, st1).unwrap();
-        a.fstp(qword_ptr(esi + 8)).unwrap();
-        a.fld(tbyte_ptr(esi + 16)).unwrap();
-        a.fstp(tbyte_ptr(esi + 32)).unwrap();
-    });
-    let extended = X87Register::from_parts((1 << 63) | 1, 0x3fff);
-    for control in [0x027f, 0x037f] {
-        let mut reference_memory = memory(&code);
-        let mut actual_memory = memory(&code);
-        for m in [&mut reference_memory, &mut actual_memory] {
-            m.write(DATA + 16, &extended.0).unwrap();
-        }
-        let fence = Arc::new(crate::parallel_memory::Fence::default());
-        actual_memory.parallel = Some(fence.clone());
-        // A parallel snapshot selects the Fast compilation strategy even when
-        // the region requests Speed. The permit exercises foreign-memory helpers.
-        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
-        let mut actual = state();
-        actual.x87.control = control;
-        let mut expected = actual.clone();
-        let mut interpreter = Interpreter::new();
-        for _ in 0..5 {
-            assert!(matches!(
-                interpreter.step(&mut expected, &mut reference_memory),
-                Step::Executed
-            ));
-        }
-        expected.fuel -= 5;
-        let permit = fence.enter();
-        assert!(actual_memory.foreign_access_required());
-        let before = testing::calls();
-        assert_eq!(
-            testing::run(&compiled, &mut actual, &mut actual_memory),
-            Exit::Dispatch as u32
-        );
-        assert_eq!(
-            testing::calls() - before,
-            // The exact PC=64 sum is native too; only raw80 transfers use helpers.
-            2
-        );
-        assert_eq!(actual, expected);
-        assert_eq!(actual_memory.epoch, reference_memory.epoch);
-        assert_eq!(
-            actual_memory.read_data(DATA, 4096).unwrap(),
-            reference_memory.read_data(DATA, 4096).unwrap()
-        );
-        drop(permit);
-    }
-}
-
 #[path = "segment_tests.rs"]
 mod segment_tests;
 

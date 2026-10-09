@@ -447,8 +447,5 @@ fn contended_critical_sections_hand_over_between_guest_code_and_host() {
         contend(UnicornCpu::new(PARK_ADDR).unwrap(), guest_code, false);
         contend(JitCpu::new(PARK_ADDR, false).unwrap(), guest_code, false);
         contend(jit(), guest_code, false);
-        let mut parallel = JitCpu::new(PARK_ADDR, true).unwrap();
-        parallel.set_guest_workers(2).unwrap();
-        contend(parallel, guest_code, true);
     }
 }

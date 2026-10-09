@@ -641,9 +641,6 @@ impl Engine {
         _interrupt: &AtomicBool,
         boundaries: Option<(&BTreeMap<u32, u32>, u64)>,
     ) -> Result<Execution, String> {
-        if memory.is_parallel() {
-            return Err("Tier 1 requires an exclusive serial execution owner".into());
-        }
         // Publications happen only on this serial owner between batches. Old
         // CFGs may cross a newly published entry, so retire conflicting owners
         // before running again. Disjoint CFGs remain valid across publications.

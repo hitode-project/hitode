@@ -137,11 +137,6 @@ mod tests {
             .unwrap();
         let serial = memory.native_permissions();
         assert_eq!(serial[0], READ | WRITE | EXEC);
-        memory.parallel = Some(Arc::default());
-        assert_eq!(memory.native_permissions()[0], READ | WRITE | SHARED);
-        assert_eq!(serial[0], READ | WRITE | EXEC);
-        memory.parallel = None;
-        assert_eq!(memory.native_permissions()[0], serial[0]);
         #[cfg(windows)]
         {
             memory.protect(0x10000, 4096, 0).unwrap();
@@ -213,15 +208,6 @@ mod tests {
         );
         memory.write(0x11010, &[8]).unwrap();
         assert_eq!(memory.epoch, epoch + 2, "code writes keep the SMC barrier");
-        // Switching to the parallel policy revokes the entire old table, even
-        // when no guest page permissions changed since its last snapshot.
-        memory.parallel = Some(Arc::default());
-        let conservative = memory.native_permissions();
-        assert_eq!(&**conservative, &[39, 39, 7]);
-        assert_eq!(&**watched, &[35, 39, 3]);
-        let epoch = memory.epoch;
-        memory.write(0x12010, &[9]).unwrap();
-        assert_eq!(memory.epoch, epoch + 1);
     }
 
     #[test]

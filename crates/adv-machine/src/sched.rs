@@ -197,11 +197,6 @@ impl ReadyResume {
 }
 
 pub(crate) enum State {
-    /// Exclusive native lease. No scheduler path may select this context until
-    /// the backend returns the matching token and complete register state.
-    Running {
-        token: u64,
-    },
     /// Runnable. `resume` completes a satisfied guest wait or deferred host work before
     /// the guest continues. Only satisfied waits enter the wake-priority queue.
     Ready {
@@ -254,7 +249,6 @@ impl Context {
     /// Read-only scheduler diagnostics for frontends and failure reports.
     pub fn state_name(&self) -> &'static str {
         match self.state {
-            State::Running { .. } => "Running",
             State::Ready { .. } => "Ready",
             State::Blocked { .. } => "Blocked",
             State::Done { .. } => "Done",

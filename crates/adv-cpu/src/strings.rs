@@ -143,11 +143,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     if bridge.expired() {
         return BUDGET;
     }
-    let mut bytes = len.min(if memory.foreign_access_required() {
-        16 * 1024
-    } else {
-        CHUNK_BYTES
-    });
+    let mut bytes = len.min(CHUNK_BYTES);
     let shared = memory.shared_range(dst, bytes as usize)
         || (copy && memory.shared_range(src, bytes as usize));
     // Ordinary x64 RAM can use the real forward REP instruction even when its
@@ -202,9 +198,9 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         if result.is_err() {
             std::process::abort();
         }
-    } else if overlap || memory.foreign_access_required() {
+    } else if overlap {
         unsafe {
-            crate::parallel_memory::repeat(
+            crate::machine_memory::repeat(
                 memory.ptr.as_ptr().add(src_offset),
                 memory.ptr.as_ptr().add(dst_offset),
                 (bytes / width) as usize,
@@ -281,7 +277,7 @@ fn backwards(
     } else {
         0
     };
-    // The owner or worker lease pins the allocation and mapping metadata.
+    // The execution owner pins the allocation and mapping metadata.
     let memory = unsafe { &mut *bridge.memory };
     let dst_offset = match checked_range(memory, dst_start, len, true, bridge.deadline) {
         Ok(at) => at,
@@ -305,20 +301,20 @@ fn backwards(
         return BUDGET;
     }
     // Every access lies in the checked ordinary RAM chunk. Explicit machine
-    // loads/stores permit concurrent guest access without Rust byte references.
+    // loads/stores avoid Rust byte references into guest memory.
     unsafe {
         let mut left = len as usize;
         while left > (len - bytes) as usize {
             left -= width as usize;
             let value = if copy {
-                crate::parallel_memory::load(
+                crate::machine_memory::load(
                     memory.ptr.as_ptr().add(src_offset + left),
                     width as usize,
                 )
             } else {
                 u64::from(state.regs[0])
             };
-            crate::parallel_memory::store(
+            crate::machine_memory::store(
                 memory.ptr.as_ptr().add(dst_offset + left),
                 value,
                 width as usize,
@@ -413,8 +409,6 @@ unsafe fn read_element<const KIND: u8>(
             value |= u32::from(atom.load(Ordering::Relaxed)) << (byte * 8);
         }
         value
-    } else if KIND == 0 && memory.foreign_access_required() {
-        unsafe { crate::parallel_memory::load(pointer, width as usize) as u32 }
     } else {
         unsafe {
             match width {

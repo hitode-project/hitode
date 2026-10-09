@@ -93,7 +93,7 @@ class PlaySessionTests(unittest.TestCase):
         values = dict(binary=binary, exe=game, schedule=schedule, output=root / "output",
                       seed_data=None, audio=True, mute_audio=False, capture_audio=False,
                       mode="hidden", tail_seconds=0, codepage=932, codec="native",
-                      guest_workers=1, sync_compilation=False, no_tiering=False, trace=False)
+                      sync_compilation=False, no_tiering=False, trace=False)
         values.update(changes)
         return argparse.Namespace(**values)
 
@@ -190,7 +190,7 @@ class ReplayDiagnosticsTest(unittest.TestCase):
                 args = argparse.Namespace(binary=binary, exe=game, schedule=schedule,
                     output=output, seed_data=None, mode="hidden", codepage=932,
                     audio=False, capture_audio=False, trace=trace, tail_seconds=0,
-                    codec="native", guest_workers=1, sync_compilation=False, no_tiering=False)
+                    codec="native", sync_compilation=False, no_tiering=False)
 
                 class Runner:
                     returncode = None

@@ -47,9 +47,8 @@ mod jit_memory_android;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod jit_memory_macos;
 mod linking;
+mod machine_memory;
 mod memory;
-mod parallel;
-mod parallel_memory;
 mod perf_map;
 mod rows;
 mod shared_memory;
@@ -71,7 +70,6 @@ pub use executor::{
 };
 pub use host_features::HostFeatures;
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
-pub use parallel::ParallelStats;
 pub use rows::RowStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
 pub use tier1::census::{Coverage as Tier1Coverage, Tier1Census};

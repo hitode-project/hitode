@@ -92,54 +92,7 @@ impl SharedPage {
 }
 
 /// A fixed, page-aligned guest window. Both executors borrow this same allocation.
-/// Resizing and host worker writes are deliberately excluded from this prototype.
-/// Immutable mapping description for one native lease. Byte storage remains
-/// owned by the controller, whose fence must outlive and drain every lease.
-#[derive(Clone)]
-pub(crate) struct WorkerLayout {
-    base: u32,
-    len: usize,
-    pointer: usize,
-    perms: Arc<Vec<u8>>,
-    fast: Arc<Vec<u8>>,
-    mapped: Arc<Vec<bool>>,
-}
-
-impl WorkerLayout {
-    /// # Safety
-    /// A live parallel permit pins the allocation and OS mappings until this
-    /// facade is dropped. It may execute guarded native helpers only.
-    pub(crate) unsafe fn into_memory(self) -> Memory {
-        Memory {
-            parallel: None,
-            parallel_view: true,
-            base: self.base,
-            len: self.len,
-            ptr: NonNull::new(self.pointer as *mut u8).expect("pinned guest window"),
-            perms: self.perms,
-            fast: FastPermissions::from_snapshot(self.fast),
-            mapped: self.mapped,
-            code_identity: code_identity(),
-            epoch: 0,
-            versions: Vec::new(),
-            watched: Vec::new(),
-            dirty_pages: BTreeSet::new(),
-            reservation: None,
-            shared_pages: BTreeMap::new(),
-            private_copy_pages: BTreeMap::new(),
-            resident: BTreeMap::new(),
-            locked_pages: BTreeSet::new(),
-            #[cfg(windows)]
-            native_protection: false,
-            #[cfg(windows)]
-            native_read_exceptions: 0,
-        }
-    }
-}
-
 pub struct Memory {
-    pub(crate) parallel: Option<Arc<crate::parallel_memory::Fence>>,
-    parallel_view: bool,
     pub(crate) base: u32,
     pub(crate) len: usize,
     pub(crate) ptr: NonNull<u8>,
@@ -169,12 +122,9 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Only serial, software-checked memory distinguishes RWX data from code.
-    /// Native host protection and guest workers retain the full EXEC barrier.
+    /// Only software-checked memory distinguishes RWX data from code.
+    /// Native host protection retains the full EXEC barrier.
     fn selective_code_writes(&self) -> bool {
-        if self.is_parallel() {
-            return false;
-        }
         #[cfg(windows)]
         if self.native_protection {
             return false;
@@ -190,22 +140,10 @@ impl Memory {
             .snapshot(&self.perms, watched, &self.private_copy_pages)
     }
 
-    /// Conservative modes already forbid every executable guest store in
-    /// native peers. Sampling code there needs no new grant-revocation fence.
-    pub(crate) fn quiesce_code_observation(&self) {
-        if self.selective_code_writes() {
-            self.quiesce_workers();
-        }
-    }
-
     /// Register every sampled code page before reading or reusing its bytes.
     /// This is monotonic, including negative tail dependencies and remappings.
     /// The epoch revokes grants at a paused trap without changing byte stamps.
     pub(crate) fn watch_code(&mut self, address: u32, len: usize) {
-        assert!(
-            !self.parallel_view,
-            "worker attempted to observe guest code"
-        );
         let begin = u64::from(address).max(u64::from(self.base));
         let end = (u64::from(address).saturating_add(len as u64))
             .min(u64::from(self.base) + self.len as u64);
@@ -217,10 +155,7 @@ impl Memory {
         if self.watched[first..=last].iter().all(|&watched| watched) {
             return;
         }
-        // Revoke only a selective table: conservative peers already forbid
-        // executable stores, and may hold an inline permit on this thread.
         let selective = self.selective_code_writes();
-        self.quiesce_code_observation();
         self.watched[first..=last].fill(true);
         if selective {
             self.fast.invalidate(first..last + 1);
@@ -251,56 +186,6 @@ impl Memory {
             .iter()
             .position(|&mapped| mapped)
             .map(|offset| self.base + ((first + offset) * PAGE_SIZE) as u32)
-    }
-
-    pub(crate) fn is_parallel(&self) -> bool {
-        self.parallel_view || self.parallel.is_some()
-    }
-
-    /// A worker always uses machine-memory accesses. The owner may use ordinary
-    /// private accesses once the last lease releases: only this owner can issue
-    /// another lease, and it cannot do so while a helper borrows its Memory.
-    /// Keep is_parallel separate: code generation must allow future concurrency.
-    pub(crate) fn foreign_access_required(&self) -> bool {
-        self.parallel_view || self.parallel.as_ref().is_some_and(|f| !f.is_idle())
-    }
-
-    pub(crate) fn quiesce_workers(&self) {
-        assert!(
-            !self.parallel_view,
-            "worker attempted to mutate mapping metadata"
-        );
-        if let Some(fence) = &self.parallel {
-            fence.quiesce();
-        }
-    }
-
-    pub(crate) fn worker_layout(&mut self) -> WorkerLayout {
-        assert!(self.parallel.is_some());
-        WorkerLayout {
-            base: self.base,
-            len: self.len,
-            pointer: self.ptr.as_ptr() as usize,
-            perms: self.perms.clone(),
-            fast: self.native_permissions(),
-            mapped: self.mapped.clone(),
-        }
-    }
-
-    fn worker_access(&self, range: &std::ops::Range<usize>, write: bool) -> Result<(), String> {
-        if !self.parallel_view || range.is_empty() {
-            return Ok(());
-        }
-        let required = if write { WRITE } else { READ };
-        if self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-            .iter()
-            .any(|p| {
-                p & required == 0 || (write && p & EXEC != 0) || p & (SHARED | AUDIO) == SHARED
-            })
-        {
-            return Err("worker operand requires owner-side recovery".into());
-        }
-        Ok(())
     }
 
     #[cfg(windows)]
@@ -482,8 +367,6 @@ impl Memory {
         // SAFETY: nonzero, valid layout; Memory exclusively owns this allocation.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
         Ok(Self {
-            parallel: None,
-            parallel_view: false,
             base,
             len,
             ptr,
@@ -527,8 +410,6 @@ impl Memory {
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         Ok(Self {
-            parallel: None,
-            parallel_view: false,
             base,
             len,
             ptr: reservation.ptr,
@@ -577,7 +458,6 @@ impl Memory {
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
-        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         if perms & !7 != 0 || self.mapped[pages.clone()].iter().any(|&v| v) {
             return Err("invalid or overlapping mapping".into());
@@ -599,7 +479,6 @@ impl Memory {
     }
 
     pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
-        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         self.committed(addr, len)?;
         // Retire pins while their original committed host addresses still exist.
@@ -655,7 +534,6 @@ impl Memory {
     }
 
     pub(crate) fn touch(&mut self, addr: u32, len: usize) {
-        self.quiesce_workers();
         if len == 0 {
             return;
         }
@@ -685,9 +563,6 @@ impl Memory {
     /// Borrow ordinary exclusively owned storage. Shared device pages require
     /// read_into/read_data so no ordinary reference escapes over atomic bytes.
     pub fn read(&self, addr: u32, len: usize) -> Result<&[u8], String> {
-        if self.parallel_view || self.parallel.as_ref().is_some_and(|f| !f.is_idle()) {
-            return Err("parallel guest bytes require a foreign-memory copy".into());
-        }
         let range = self.committed(addr, len)?;
         if self.overlays(&range) {
             return Err("shared bytes require an atomic copy".into());
@@ -702,11 +577,7 @@ impl Memory {
 
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         let range = self.committed(addr, len)?;
-        if self.parallel_view
-            || self.parallel.as_ref().is_some_and(|f| !f.is_idle())
-            || self.overlays(&range)
-            || self.host_copy_required(&range)
-        {
+        if self.overlays(&range) || self.host_copy_required(&range) {
             let mut bytes = vec![0; len];
             self.read_into(addr, &mut bytes)?;
             return Ok(Cow::Owned(bytes));
@@ -719,7 +590,6 @@ impl Memory {
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
-        self.worker_access(&range, false)?;
         #[cfg(windows)]
         let _host = Self::host_scope(
             self.reservation.as_ref(),
@@ -729,16 +599,6 @@ impl Memory {
             false,
         )?;
         if !self.overlays(&range) {
-            if self.foreign_access_required() {
-                unsafe {
-                    crate::parallel_memory::copy(
-                        self.ptr.as_ptr().add(range.start),
-                        destination.as_mut_ptr(),
-                        range.len(),
-                    )
-                };
-                return Ok(());
-            }
             // SAFETY: committed ordinary storage and non-aliasing caller output.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -766,17 +626,6 @@ impl Memory {
             } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
             } else {
-                if self.foreign_access_required() {
-                    unsafe {
-                        crate::parallel_memory::copy(
-                            self.ptr.as_ptr().add(at),
-                            output.as_mut_ptr(),
-                            len,
-                        )
-                    };
-                    at += len;
-                    continue;
-                }
                 // SAFETY: committed ordinary page, valid non-aliasing output.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -862,9 +711,6 @@ impl Memory {
         if !aliased(&src) || !aliased(&dst) {
             return false;
         }
-        if self.parallel_view {
-            return true;
-        }
         if len == 0 {
             return false;
         }
@@ -912,7 +758,6 @@ impl Memory {
         addr: u32,
         len: usize,
     ) -> Result<Arc<SharedAllocation>, String> {
-        self.quiesce_workers();
         if self.reservation.is_none() {
             return Err("shared audio requires reserved guest memory".into());
         }
@@ -1002,7 +847,6 @@ impl Memory {
         {
             return Err("only owned private snapshots can be privatized".into());
         }
-        self.quiesce_workers();
         self.prepare_private_copy_range(&range)?;
         Ok(())
     }
@@ -1062,7 +906,6 @@ impl Memory {
             .len()
             .checked_mul(PAGE_SIZE)
             .ok_or("file view length overflow")?;
-        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         if self.reservation.is_none()
             || perms & !(READ | WRITE) != 0
@@ -1151,7 +994,6 @@ impl Memory {
         write: bool,
     ) -> Result<(), String> {
         let range = self.committed(addr, len)?;
-        self.worker_access(&range, write)?;
         if !range.is_empty() {
             let required = if write { WRITE } else { READ };
             let permissions = &self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE];
@@ -1211,10 +1053,8 @@ impl Memory {
         // Snapshot mappings already own their initialized linear bytes. The
         // barrier guarantees that no inline store can bypass this first write.
         // All permissions and fallible file snapshots were checked above.
-        if !self.parallel_view {
-            for page in range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE {
-                self.make_resident(page);
-            }
+        for page in range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE {
+            self.make_resident(page);
         }
         Ok(())
     }
@@ -1222,9 +1062,7 @@ impl Memory {
     pub(crate) fn copy(&mut self, source: u32, destination: u32, len: usize) -> Result<(), String> {
         let src = self.committed(source, len)?;
         let dst = self.committed(destination, len)?;
-        self.worker_access(&src, false)?;
-        self.worker_access(&dst, true)?;
-        if self.foreign_access_required() || self.overlays(&src) || self.overlays(&dst) {
+        if self.overlays(&src) || self.overlays(&dst) {
             let mut scratch = [0; PAGE_SIZE];
             let backwards =
                 destination > source && u64::from(destination) < u64::from(source) + len as u64;
@@ -1294,7 +1132,6 @@ impl Memory {
     /// must validate WRITE permission before using this operation.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let range = self.committed(addr, bytes.len())?;
-        self.worker_access(&range, true)?;
         let overlays = self.overlays(&range);
         // Keep ordinary stores allocation-free. Overlay stores resolve every
         // fallible page read and private COW snapshot before committing bytes,
@@ -1331,17 +1168,6 @@ impl Memory {
                 } else if let Some(storage) = self.shared_pages.get_mut(&page) {
                     storage.write(at % PAGE_SIZE, input)?;
                 } else {
-                    if self.foreign_access_required() {
-                        unsafe {
-                            crate::parallel_memory::copy(
-                                input.as_ptr(),
-                                self.ptr.as_ptr().add(at),
-                                len,
-                            )
-                        };
-                        at += len;
-                        continue;
-                    }
                     // SAFETY: committed ordinary subrange and exclusive borrow.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1353,16 +1179,6 @@ impl Memory {
                 }
                 at += len;
             }
-            return Ok(());
-        }
-        if self.foreign_access_required() {
-            unsafe {
-                crate::parallel_memory::copy(
-                    bytes.as_ptr(),
-                    self.ptr.as_ptr().add(range.start),
-                    bytes.len(),
-                )
-            };
             return Ok(());
         }
         // SAFETY: checked range and exclusive borrow; source cannot alias this allocation.
@@ -1378,7 +1194,6 @@ impl Memory {
 
     /// Set guest permissions and invalidate dependent decoded/compiled code.
     pub fn protect(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
-        self.quiesce_workers();
         if !(addr as usize).is_multiple_of(PAGE_SIZE)
             || len == 0
             || !len.is_multiple_of(PAGE_SIZE)
@@ -1473,17 +1288,14 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        if let Some(fence) = &self.parallel {
-            fence.quiesce();
-        }
         // The Reservation release also retires any pin whose host unlock failed.
-        // Worker views and heap-backed test windows can never acquire a pin.
+        // Heap-backed test windows can never acquire a pin.
         let _ = self.retire_page_locks(0..self.len / PAGE_SIZE);
         // Sections outlive their views; give them their bytes back.
         for file in std::mem::take(&mut self.resident).into_values() {
             file.evict();
         }
-        if self.reservation.is_some() || self.parallel_view {
+        if self.reservation.is_some() {
             return;
         }
         // SAFETY: same layout as allocation; executors are dropped before Memory.
@@ -1499,39 +1311,6 @@ impl Drop for Memory {
 #[cfg(all(test, windows))]
 mod linear_audio_tests {
     use super::*;
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn idle_owner_copy_preserves_parallel_codegen_contract_and_active_lease_accesses() {
-        let mut memory = Memory::new(0x1000, 4 * PAGE_SIZE).unwrap();
-        memory.protect(0x1000, 4 * PAGE_SIZE, READ | WRITE).unwrap();
-        let fence = Arc::new(crate::parallel_memory::Fence::default());
-        memory.parallel = Some(fence.clone());
-        for active in [false, true, false] {
-            let bytes: Vec<u8> = (0..3 * PAGE_SIZE).map(|i| i as u8).collect();
-            memory.write(0x1000, &bytes).unwrap();
-            let permit = active.then(|| fence.enter());
-            assert!(
-                memory.is_parallel(),
-                "code contract cannot follow transient activity"
-            );
-            assert_eq!(memory.foreign_access_required(), active);
-            assert_eq!(
-                matches!(memory.read_data(0x1000, 4).unwrap(), Cow::Owned(_)),
-                active
-            );
-            let mut expected = bytes.clone();
-            expected.copy_within(..2 * PAGE_SIZE, 3);
-            memory.copy(0x1000, 0x1003, 2 * PAGE_SIZE).unwrap();
-            let mut actual = vec![0; expected.len()];
-            memory.read_into(0x1000, &mut actual).unwrap();
-            assert_eq!(actual, expected);
-            expected.copy_within(3..2 * PAGE_SIZE + 3, 0);
-            memory.copy(0x1003, 0x1000, 2 * PAGE_SIZE).unwrap();
-            memory.read_into(0x1000, &mut actual).unwrap();
-            assert_eq!(actual, expected);
-            drop(permit);
-        }
-    }
     #[test]
     fn private_copy_privatization_restores_native_noaccess_permissions() {
         for enable_first in [false, true] {

@@ -64,7 +64,7 @@ class BaselineTests(unittest.TestCase):
                       "backend": "jit", "compile_strategy": "fast", "region_linking": True,
                       "tiered_compilation": False, "async_compilation": True, "codepage": 932,
                       "codec": {"provider": "native"}, "codec_kernels": {"mode": "native", "installed": 1},
-                      "parallel": {"workers": 1}, "time_skip": {"enabled": True},
+                      "time_skip": {"enabled": True},
                       "compilations": 10 + index * 5, "compile_seconds": 1 + index / 2, "compile_requests": 10 + index * 5,
                       "compile_failures": 0, "stale_compilations": 0, "idle_waits": 10 + index * 5,
                       "idle_wait_seconds": 2 + index, "host_calls": 100 * (index + 1),

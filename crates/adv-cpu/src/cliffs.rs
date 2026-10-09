@@ -112,46 +112,6 @@ pub struct Cliffs {
 }
 
 impl Cliffs {
-    pub(crate) fn merge(&mut self, other: Cliffs) {
-        self.tier1_bridge.entries += other.tier1_bridge.entries;
-        self.tier1_bridge.instructions += other.tier1_bridge.instructions;
-        for (key, n) in other.tier1_bridge_details {
-            let count = self.tier1_bridge_details.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-        self.x87_forms.merge(other.x87_forms);
-        if let Some(census) = other.tier1_census {
-            self.tier1_census
-                .get_or_insert_with(Default::default)
-                .merge(census);
-        }
-        self.x87_helper_calls += other.x87_helper_calls;
-        self.x87_fast += other.x87_fast;
-        for (key, n) in other.x87_exact {
-            *self.x87_exact.entry(key).or_default() += n;
-        }
-        for (key, n) in other.x87_control {
-            *self.x87_control.entry(key).or_default() += n;
-        }
-        for (key, n) in other.x87_pc64 {
-            *self.x87_pc64.entry(key).or_default() += n;
-        }
-        for (key, n) in other.fallbacks {
-            *self.fallbacks.entry(key).or_default() += n;
-        }
-        for (key, n) in other.interpreter {
-            let count = self.interpreter.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-        for (key, n) in other.interpreter_details {
-            let count = self.interpreter_details.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-    }
-
     pub(crate) fn fallback(&mut self, memory: &Memory, pc: u32) {
         *self.fallbacks.entry(mnemonic_at(memory, pc)).or_default() += 1;
     }
@@ -318,25 +278,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detail_merge_and_ranking_preserve_whole_batch_units() {
+    fn detail_ranking_preserves_whole_batch_units() {
         let mut first = Cliffs::default();
         first.detail(
             InterpreterReason::Rejected,
             InterpreterDetail::Unsupported(Code::Cbw),
             9,
         );
-        let mut second = Cliffs::default();
-        second.detail(
+        first.detail(
             InterpreterReason::Rejected,
             InterpreterDetail::Unsupported(Code::Cbw),
             11,
         );
-        second.detail(
+        first.detail(
             InterpreterReason::Uncovered,
             InterpreterDetail::BelowThreshold,
             20,
         );
-        first.merge(second);
         let rows = first.interpreter_detail_rows();
         assert_eq!(
             rows,
@@ -360,16 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn control_distribution_merges_and_counts_overlapping_guards() {
+    fn control_distribution_counts_overlapping_guards() {
         let mut a = Cliffs::default();
-        a.x87_control.insert(0x033f, 10);
-        a.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 10);
-        let mut b = Cliffs::default();
-        b.x87_control.insert(0x033f, 2);
-        b.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 2);
-        b.x87_control.insert(0x0b3e, 3);
-        b.x87_control.insert(0x063f, 5);
-        a.merge(b);
+        a.x87_control.insert(0x033f, 12);
+        a.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 12);
+        a.x87_control.insert(0x0b3e, 3);
+        a.x87_control.insert(0x063f, 5);
         assert_eq!(a.x87_pc64_rows(), vec![("Fadd/Exact".into(), 12)]);
         assert_eq!(
             a.x87_control_rows(),

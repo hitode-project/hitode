@@ -43,12 +43,6 @@ impl Census {
         }
     }
 
-    pub(crate) fn merge(&mut self, other: Self) {
-        for (key, count) in other.counts {
-            *self.counts.entry(key).or_default() += count;
-        }
-    }
-
     pub(crate) fn report(&self) {
         if !self.enabled {
             return;
@@ -84,10 +78,7 @@ fn reason(op: &NativeX87, state: &CpuState, memory: &Memory) -> Reason {
             Fast::Store { .. } | Fast::StoreControl | Fast::StoreStatus
         );
         // Never repeat an observable file/device/foreign access just for a census.
-        if memory.foreign_access_required()
-            || memory.shared_range(at, width)
-            || !accessible(memory, at, width, write)
-        {
+        if memory.shared_range(at, width) || !accessible(memory, at, width, write) {
             return Reason::Memory;
         }
     }
@@ -195,8 +186,6 @@ mod tests {
         census.enabled = true;
         census.record(&op, &state, &memory);
         assert_eq!(census.counts[&(instruction.code(), Reason::Inexact)], 1);
-        census.merge(census.clone());
-        assert_eq!(census.counts.values().sum::<u64>(), 2);
         assert_eq!(state, before);
         state.x87.control = 0x077f;
         assert_eq!(reason(&op, &state, &memory), Reason::Control);

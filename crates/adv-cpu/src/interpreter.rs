@@ -361,9 +361,6 @@ fn execute_decoded(
             };
         }
         Decoded::Extended(i, operation, opcode) => {
-            // Extended interpreter transactions remain conservative until their
-            // full memory protocol is independently covered in parallel tests.
-            memory.quiesce_workers();
             let x87 = operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
             if let Some(dirty) = deferred_mmx.as_deref()
@@ -393,12 +390,6 @@ fn execute_decoded(
             };
         }
     };
-    if instruction.exclusive {
-        // LOCK and implicit atomic RMW execute as one transaction relative to
-        // native workers. Ordinary scalar instructions use Memory's audited
-        // foreign loads/stores and do not stop unrelated native execution.
-        memory.quiesce_workers();
-    }
     if let Action::String(operation) = instruction.action {
         return run_string(
             state,
@@ -2703,55 +2694,6 @@ mod tests {
         watched(&mut fourth);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn scalar_interpreter_does_not_park_native_peers_but_atomic_operations_do() {
-        use std::sync::{Arc, atomic::Ordering};
-        let mut memory = crate::Memory::new(0x1000, 0x2000).unwrap();
-        memory
-            .protect(0x1000, 0x2000, crate::READ | crate::WRITE)
-            .unwrap();
-        // inc eax; mov [0x2000],eax; lock inc [0x2000]; xchg eax,[0x2000]
-        let code = [
-            0x40, 0xa3, 0, 0x20, 0, 0, 0xf0, 0xff, 0x05, 0, 0x20, 0, 0, 0x87, 0x05, 0, 0x20, 0, 0,
-        ];
-        memory.write(0x1000, &code).unwrap();
-        memory
-            .protect(0x1000, 4096, crate::READ | crate::EXEC)
-            .unwrap();
-        let fence = Arc::new(crate::parallel_memory::Fence::default());
-        memory.parallel = Some(fence.clone());
-        let mut state = crate::CpuState {
-            eip: 0x1000,
-            ..Default::default()
-        };
-        let mut interpreter = super::Interpreter::new();
-        let permit = fence.enter();
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(!fence.stop.load(Ordering::Acquire));
-        assert!(!fence.is_idle());
-        drop(permit);
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(fence.stop.load(Ordering::Acquire));
-        fence.stop.store(false, Ordering::Release);
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(fence.stop.load(Ordering::Acquire));
-        assert_eq!(state.regs[0], 2);
-        assert_eq!(&*memory.read_data(0x2000, 4).unwrap(), &1u32.to_le_bytes());
-    }
     #[test]
     fn stable_native_revision_reuses_blocks_and_publication_rebuilds_the_boundary() {
         let code = 0x10000;

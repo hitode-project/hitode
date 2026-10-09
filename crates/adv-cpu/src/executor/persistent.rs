@@ -224,10 +224,7 @@ impl Executor {
                 continue;
             };
             input.shadow_returns = self.shadow_returns.is_some();
-            if self.tiered_compilation
-                && self.parallel.is_none()
-                && region.compile_strategy == CompileStrategy::Fast
-            {
+            if self.tiered_compilation && region.compile_strategy == CompileStrategy::Fast {
                 input.profile = Some(Arc::default());
             }
             self.locate_cache_input(&mut input);

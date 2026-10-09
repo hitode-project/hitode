@@ -275,7 +275,7 @@ class Adb:
 
 def runner_command(args: argparse.Namespace, remote: str, game: str, duration: float) -> list[str]:
     command = [remote + "/adv-run", game + "/" + args.exe_relative,
-               "--headless", "--audio", "--guest-workers", "1", "--api-mode", "strict",
+               "--headless", "--audio", "--api-mode", "strict",
                "--codepage", str(args.codepage), "--seconds", str(duration), "--control-stdin",
                "--data-dir", remote + "/data", "--report", remote + "/final.json",
                "--screenshot", remote + "/final.png", "--codec", args.codec,

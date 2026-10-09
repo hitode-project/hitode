@@ -27,8 +27,7 @@ impl Executor {
         if mode == self.tier1_mode {
             return Ok(());
         }
-        if self.parallel.is_some()
-            || !self.code.compiled.is_empty()
+        if !self.code.compiled.is_empty()
             || self.stats.native_entries != 0
             || self.stats.interpreter_entries != 0
             || !self.pending_regions.is_empty()
@@ -144,7 +143,6 @@ mod tests {
         )) {
             m.set_tier1_mode(Tier1Mode::Bridge).unwrap();
             assert!(m.auto_jit && m.async_compilation);
-            assert!(m.set_guest_workers(2).is_err());
             m.set_tier1_mode(Tier1Mode::Off).unwrap();
             assert!(m.auto_jit && m.async_compilation);
             m.set_arm64_tier1(true).unwrap();
