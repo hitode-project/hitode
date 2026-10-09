@@ -61,11 +61,47 @@ fn drain(
         let before = stream.pcm_position();
         let bytes = stream.peek_pcm(usize::MAX, S16);
         assert_eq!(stream.peek_pcm(usize::MAX, S16), bytes);
+        assert_eq!(stream.prepare_pcm(usize::MAX, S16), bytes);
         assert_eq!(stream.pcm_position(), before);
         stream.consume_samples(bytes.len() / 2);
         output.extend(bytes);
     }
     output
+}
+
+#[test]
+fn reusable_pcm_preparation_keeps_frame_alignment_formats_and_retry_position() {
+    let mut stream = Stream::new(STEREO.to_vec());
+    let mut cursor = 0;
+    open(&mut stream, STEREO, &mut cursor, 65_536);
+    while !stream.has_pcm() {
+        let audio = packet(&mut stream, STEREO, &mut cursor, 65_536).unwrap();
+        stream.decode_packet(audio).unwrap();
+    }
+    for word in [1, 2] {
+        for byte_order in [ByteOrder::Little, ByteOrder::Big] {
+            for signed in [false, true] {
+                let format = PcmFormat {
+                    bytes_per_sample: word,
+                    byte_order,
+                    signed,
+                };
+                for limit in [0, 1, 7, 513, 4096, 512] {
+                    let before = stream.pcm_position();
+                    let expected = stream.peek_pcm(limit, format);
+                    assert_eq!(stream.prepare_pcm(limit, format), expected);
+                    assert_eq!(stream.prepare_pcm(limit, format), expected);
+                    assert_eq!(expected.len() % (2 * word as usize), 0);
+                    assert_eq!(stream.pcm_position(), before);
+                }
+            }
+        }
+    }
+    let count = stream.prepare_pcm(512, S16).len();
+    stream.consume_samples(count / 2);
+    assert_eq!(stream.pcm_position(), (count / 4) as u64);
+    stream.reset();
+    assert!(stream.prepare_pcm(512, S16).is_empty());
 }
 
 fn snr(reference: &[u8], actual: &[u8]) -> f64 {

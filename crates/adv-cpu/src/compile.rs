@@ -1164,7 +1164,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.switch_to_block(prologue);
         if source_map {
             // Context and guest-state loads on region entry.
-            b.set_srcloc(diagnostics::overhead_source(diagnostics::Overhead::Entry));
+            b.set_srcloc(diagnostics::overhead_source(
+                diagnostics::Overhead::StateRead,
+            ));
         }
         b.seal_block(prologue);
         let params = b.block_params(prologue).to_vec();
@@ -1261,7 +1263,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             var
         });
         let flags = b.declare_var(types::I32);
-        let lazy: [Variable; 7] = std::array::from_fn(|_| b.declare_var(types::I32));
+        let lazy: [Variable; 5] = std::array::from_fn(|_| b.declare_var(types::I32));
         let zero = b.ins().iconst(types::I32, 0);
         let invariant_gate = invariant_ref.map(|entry| {
             let attempted = b.declare_var(types::I32);
@@ -1408,6 +1410,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             && !invariant_body
             && write_summary.is_some()
             && write_summary::crosses_regions(&instructions);
+        if source_map {
+            b.set_srcloc(diagnostics::overhead_source(diagnostics::Overhead::Entry));
+        }
         if !hot_exits && kernel.is_none() {
             if shadow_ref.is_some() {
                 let absent = b.ins().iconst(ptr_ty, 0);
@@ -1539,6 +1544,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // Keep their dispatches separate so a known local recipe is not widened
         // before a normal exit.
         if hot_exits {
+            e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Entry));
             let entry_miss = e.b.create_block();
             e.b.set_cold_block(entry_miss);
             let mut switch = Switch::new();
@@ -1722,11 +1728,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
             // Each predecessor already committed its own deferred MMX prefix.
             e.mmx_effects = None;
-            if let Some((kind, carry_kind)) = recipe {
+            if let Some(kind) = recipe {
                 let kind = e.constant(kind);
-                let carry_kind = e.constant(carry_kind);
                 e.b.def_var(e.lazy[3], kind);
-                e.b.def_var(e.lazy[6], carry_kind);
             }
             let reason = e.b.block_params(block)[0];
             let pc = e.b.block_params(block)[1];
@@ -2900,8 +2904,8 @@ struct Emitter<'a> {
     flags: Variable,
     fuel: Variable,
     // Last flag-producing instruction: lhs, rhs, result, kind (0=raw,1=add,2=sub,3=logic).
-    // Carry has its own operands/kind because INC/DEC preserve it.
-    lazy: [Variable; 7],
+    // The fifth value is the independent CF bit, preserved by INC/DEC.
+    lazy: [Variable; 5],
     state: Value,
     mem: Value,
     perms: Value,
@@ -2944,7 +2948,7 @@ struct Emitter<'a> {
     kernel: Option<(usize, Variable, ir::StackSlot)>,
     dispatch: ir::Block,
     shared_exit: ir::Block,
-    flag_exits: BTreeMap<(u32, u32), ir::Block>,
+    flag_exits: BTreeMap<u32, ir::Block>,
     guard_exits: BTreeMap<guards::Key, (Exit, ir::Block)>,
     /// Additional guarded paths pay off after the optimizing tier folds them.
     optimizing: bool,
@@ -3170,11 +3174,9 @@ impl Emitter<'_> {
             return self.shared_exit;
         }
         let kind = self.b.use_var(self.lazy[3]);
-        let carry_kind = self.b.use_var(self.lazy[6]);
-        let (Some(kind), Some(carry_kind)) = (self.known(kind), self.known(carry_kind)) else {
+        let Some(recipe) = self.known(kind) else {
             return self.shared_exit;
         };
-        let recipe = (kind, carry_kind);
         if let Some(&block) = self.flag_exits.get(&recipe) {
             return block;
         }
@@ -3274,6 +3276,10 @@ impl Emitter<'_> {
         }
     }
     fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(
+            diagnostics::Overhead::StateWrite,
+        ));
         self.save_extended_state();
         for (i, reg) in self.regs.iter().enumerate() {
             if self.unchanged & (1 << i) != 0 {
@@ -3304,12 +3310,17 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eip) as i32,
         );
+        self.mark_source(source);
     }
     fn save_link_state(&mut self, pc: Value) {
         let Some(summary) = self.write_summary else {
             self.save_state(pc);
             return;
         };
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(
+            diagnostics::Overhead::StateWrite,
+        ));
         for index in 0..8 {
             if summary.gpr & (1 << index) != 0 {
                 let value = self.b.use_var(self.regs[index]);
@@ -3351,6 +3362,7 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eip) as i32,
         );
+        self.mark_source(source);
     }
     fn reload_state(&mut self) {
         for (index, var) in self.mmx.iter().enumerate() {
@@ -4976,7 +4988,10 @@ impl Emitter<'_> {
         let outputs = std::array::from_fn(|index| match index {
             0..=7 => self.b.use_var(self.regs[index]),
             8 => self.b.use_var(self.flags),
-            9..=15 => self.b.use_var(self.lazy[index - 9]),
+            9..=13 => self.b.use_var(self.lazy[index - 9]),
+            // Keep the recovery recipe's existing raw-carry layout. Its old
+            // right operand and kind are both zero for the canonical CF bit.
+            14..=15 => self.constant(0),
             16 => self.b.use_var(self.fuel),
             _ => address,
         });
@@ -5208,39 +5223,24 @@ impl Emitter<'_> {
             self.b.def_var(*var, value);
         }
         if !keep_cf {
-            let (left, right, kind) = if logical {
-                let zero = self.constant(0);
-                (zero, zero, zero)
+            // Carry is a single SSA bit. Keeping two operands and a dynamic
+            // recipe across joins extends their live ranges through every
+            // checked access, even after INC/DEC has replaced the other flags.
+            // Unused comparisons are still removed by ordinary SSA DCE.
+            let carry = if logical {
+                self.constant(0)
             } else {
-                let kind = self.constant(1);
-                if subtract {
-                    (a, b, kind)
-                } else {
-                    (result, a, kind)
-                }
+                let (left, right) = if subtract { (a, b) } else { (result, a) };
+                let carry = self.b.ins().icmp(IntCC::UnsignedLessThan, left, right);
+                self.b.ins().uextend(types::I32, carry)
             };
-            for (var, value) in self.lazy[4..].iter().zip([left, right, kind]) {
-                self.b.def_var(*var, value);
-            }
+            self.b.def_var(self.lazy[4], carry);
         }
     }
     /// Compute only the requested flag. Full EFLAGS is reconstructed on exits.
     fn flag(&mut self, bit: u32) -> Value {
         if bit == 0 {
-            let a = self.b.use_var(self.lazy[4]);
-            let b = self.b.use_var(self.lazy[5]);
-            let kind = self.b.use_var(self.lazy[6]);
-            if self.optimizing && self.known(kind) == Some(0) {
-                return a;
-            }
-            let known_compare = self.optimizing && self.known(kind) == Some(1);
-            let raw = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
-            let c = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
-            let c = self.b.ins().uextend(types::I32, c);
-            if known_compare {
-                return c;
-            }
-            return self.b.ins().select(raw, a, c);
+            return self.b.use_var(self.lazy[4]);
         }
         let old = self.b.use_var(self.flags);
         let old = self.b.ins().ushr_imm(old, i64::from(bit));
@@ -5422,13 +5422,27 @@ impl Emitter<'_> {
         match kind {
             // SUB, CMP and DEC: OF and SF order a and b exactly.
             2 if self.computes(result, ir::Opcode::Isub, a, b) => {
-                // DEC keeps the old CF, so unsigned orders also need CF's
-                // lazy operands to be this subtraction's.
-                let carry = [self.lazy[4], self.lazy[5], self.lazy[6]].map(|v| self.b.use_var(v));
+                // DEC keeps the old CF. Fuse an unsigned order only when the
+                // carried bit is exactly this subtraction's borrow comparison.
+                let carry = self.b.use_var(self.lazy[4]);
                 let dfg = &self.b.func.dfg;
-                let borrows = dfg.resolve_aliases(carry[0]) == dfg.resolve_aliases(a)
-                    && dfg.resolve_aliases(carry[1]) == dfg.resolve_aliases(b)
-                    && self.known(carry[2]) == Some(1);
+                let borrow = dfg
+                    .value_def(dfg.resolve_aliases(carry))
+                    .inst()
+                    .and_then(|inst| match dfg.insts[inst] {
+                        ir::InstructionData::Unary {
+                            opcode: ir::Opcode::Uextend,
+                            arg,
+                        } => dfg.value_def(dfg.resolve_aliases(arg)).inst(),
+                        _ => None,
+                    });
+                let borrows = borrow.is_some_and(|inst| {
+                    matches!(dfg.insts[inst],
+                    ir::InstructionData::IntCompare {
+                        opcode: ir::Opcode::Icmp, cond: IntCC::UnsignedLessThan, args: [x, y],
+                    } if dfg.resolve_aliases(x) == dfg.resolve_aliases(a)
+                        && dfg.resolve_aliases(y) == dfg.resolve_aliases(b))
+                });
                 let cc = signed(m).or(match m {
                     M::Jbe if borrows => Some(IntCC::UnsignedLessThanOrEqual),
                     M::Ja if borrows => Some(IntCC::UnsignedGreaterThan),

@@ -15,23 +15,31 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-// 1 and 2 belong to compile::fault. 3 and 5..=7 are Overhead.
+// 1 and 2 belong to compile::fault. Other values below GUEST are overhead.
 const X87_RECOVERY: u32 = 4;
 const GUEST: u32 = 16;
 
 /// Region code outside any guest instruction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Overhead {
-    /// Context/state loads and the entry switch.
+    /// Entry dispatch after context/state loading.
     Entry = 3,
     /// Per-block fuel guard and MMX block setup.
     Budget = 5,
     /// Direct block transfers and the indirect dispatch switch.
     Transfer = 6,
-    /// State writeback, exit footers and region chaining.
+    /// Exit plumbing outside the more specific publication and link tags.
     Exit = 7,
     /// Materialization of lazy arithmetic flags.
     Flags = 8,
+    /// Canonical CPU state publication, excluding flag arithmetic.
+    StateWrite = 9,
+    /// Tail eligibility, interrupt polling and slot lookup.
+    Link = 10,
+    /// The backend's tail transfer, including its frame teardown.
+    Tail = 11,
+    /// Context and canonical CPU state loads on entry.
+    StateRead = 12,
 }
 
 /// Code emitted for one guest instruction. Memory validation and its cold
@@ -173,6 +181,10 @@ fn rows(
             6 => (0, "transfer", "overhead"),
             7 => (0, "exit", "overhead"),
             8 => (0, "flags", "overhead"),
+            9 => (0, "state-write", "overhead"),
+            10 => (0, "link", "overhead"),
+            11 => (0, "tail", "overhead"),
+            12 => (0, "state-read", "overhead"),
             X87_RECOVERY => (0, "slow", "x87-recovery"),
             bits if bits >= GUEST => {
                 let pc = origin.wrapping_add((bits - GUEST) >> 2);
@@ -305,9 +317,9 @@ mod tests {
         for (pc, part, class) in [
             (start.as_str(), "check", "int.mem"),
             (start.as_str(), "body", "int.mem"),
-            ("0", "entry", "overhead"),
+            ("0", "state-read", "overhead"),
             ("0", "budget", "overhead"),
-            ("0", "exit", "overhead"),
+            ("0", "state-write", "overhead"),
         ] {
             assert!(
                 parts.contains(&(pc, part, class)),
@@ -357,6 +369,10 @@ mod tests {
                 (12, 20, check),
                 (20, 24, guest_source(4, Part::Body)),
                 (30, 31, x87_recovery_source()),
+                (31, 32, overhead_source(Overhead::StateRead)),
+                (32, 33, overhead_source(Overhead::StateWrite)),
+                (33, 34, overhead_source(Overhead::Link)),
+                (34, 35, overhead_source(Overhead::Tail)),
             ],
             &instructions,
         );
@@ -365,7 +381,11 @@ mod tests {
             "7\t4\t8\t0\texit\toverhead\n\
              7\t8\t20\t4100\tcheck\tint.mem\n\
              7\t20\t24\t4100\tbody\tint.mem\n\
-             7\t30\t31\t0\tslow\tx87-recovery\n"
+             7\t30\t31\t0\tslow\tx87-recovery\n\
+             7\t31\t32\t0\tstate-read\toverhead\n\
+             7\t32\t33\t0\tstate-write\toverhead\n\
+             7\t33\t34\t0\tlink\toverhead\n\
+             7\t34\t35\t0\ttail\toverhead\n"
         );
     }
 }
