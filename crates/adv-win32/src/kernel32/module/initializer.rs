@@ -26,9 +26,16 @@ pub(super) fn register(reg: &mut Registry) {
 
 pub(super) fn prepare(env: &mut Env<'_>, call: &mut InitCall) -> Result<(), String> {
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let id = modules
-        .by_name("kernel32.dll")
-        .ok_or("DLL initializer requires the resident system image")?;
+    // Without a resident kernel32 image, guest imports of RtlUnwind bind to the
+    // published host entry; that entry is then the live public routine.
+    let Some(id) = modules.by_name("kernel32.dll") else {
+        let unwind = env
+            .sys
+            .thunks
+            .resolve(env.cpu, "kernel32.dll", "RtlUnwind")
+            .map_err(|error| error.to_string())?;
+        return wrap(env, call, unwind);
+    };
     let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
     // Resolve the live public entry, including EAT/entry hooks, just as guest
     // code would. Never bypass it with a private host implementation.
@@ -48,6 +55,10 @@ pub(super) fn prepare(env: &mut Env<'_>, call: &mut InitCall) -> Result<(), Stri
         }
         Err(error) => return Err(error.to_string()),
     };
+    wrap(env, call, unwind)
+}
+
+fn wrap(env: &mut Env<'_>, call: &mut InitCall, unwind: u32) -> Result<(), String> {
     let target = env
         .sys
         .thunks
