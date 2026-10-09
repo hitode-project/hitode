@@ -21,6 +21,7 @@ const MAX_REGION_BYTES: usize = 8 * 1024;
 const MAX_READY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_READY_REGIONS: usize = 512;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CLOCK_CALLS: u32 = 8;
 
 /// Loader metadata uses module-relative offsets. An empty snapshot still
 /// registers the module for persistent-cache identity.
@@ -138,6 +139,8 @@ pub(super) struct State {
     ready_bytes: usize,
     admitting: bool,
     next_poll: Instant,
+    /// Calls since the clock was last read for the speculative poll.
+    calls: u32,
 }
 
 impl Default for State {
@@ -159,6 +162,7 @@ impl Default for State {
             ready_bytes: 0,
             admitting: false,
             next_poll: Instant::now(),
+            calls: 0,
         }
     }
 }
@@ -233,7 +237,8 @@ impl Executor {
         }
         self.stats.aot.image_rejections += self.aot.sink.take_rejections();
         // Registration is lightweight even when static discovery is disabled.
-        while let Ok(image) = self.aot.images.try_recv() {
+        let images = self.aot.sink.take_sent();
+        while images && let Ok(image) = self.aot.images.try_recv() {
             self.register_code_cache_module(image.base, image.size, image.identity, image.primary);
             if !self.aot.enabled || image.image.is_empty() {
                 self.aot.sink.release(image.image.len());
@@ -277,6 +282,12 @@ impl Executor {
             }
         }
         if !self.aot.enabled || !self.auto_jit || !self.async_compilation {
+            return Ok(());
+        }
+        // Every executor run calls this; read the clock on a fraction of them.
+        let calls = self.aot.calls;
+        self.aot.calls = calls.wrapping_add(1);
+        if calls % CLOCK_CALLS != 0 {
             return Ok(());
         }
         let now = Instant::now();

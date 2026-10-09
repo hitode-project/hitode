@@ -128,10 +128,10 @@ impl Executor {
     /// Queue profile regions whose code is mapped and unchanged. Called from the
     /// execution owner between native runs; bounded by the retry interval.
     pub(super) fn apply_warm(&mut self) -> Result<(), String> {
-        let now = Instant::now();
         let Some(pending) = self.warm.as_mut() else {
             return Ok(());
         };
+        let now = Instant::now();
         if now < pending.next_try {
             return Ok(());
         }
