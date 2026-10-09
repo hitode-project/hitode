@@ -123,6 +123,7 @@ pub(crate) unsafe extern "C" fn trap_call(
 ) -> u32 {
     // SAFETY: Executor creates both objects for this run and pauses native code here.
     let (bridge, state) = unsafe { (&mut *bridge.cast::<Bridge<'_>>(), &mut *state) };
+    state.settle_flags();
     if bridge.handler.is_none() {
         bridge.trap = Some((pc, 0x2e));
         return 1;

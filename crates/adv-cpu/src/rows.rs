@@ -844,6 +844,7 @@ unsafe fn try_run(
         }
     }
     merged.mmx_mode = results.mmx_mode;
+    merged.settle_flags();
     merged.fuel = batch.initial.fuel
         - (u64::from(claimed) * row_cost + u64::from(claimed - 1) * descriptor.glue_cost);
     // The last kernel contains cur + (claimed-1)*delta and the outer counter

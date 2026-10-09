@@ -228,10 +228,12 @@ impl Compiled {
                 memory.ptr.as_ptr(),
             )
         {
+            state.settle_flags();
             return result;
         }
         let memory_pointer = memory.ptr.as_ptr();
         let result = unsafe { (self.entry)(&mut context, memory_pointer) };
+        state.settle_flags();
         result
     }
 
@@ -1248,15 +1250,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .load(types::I32, MemFlags::trusted(), state, (i * 4) as i32);
             b.def_var(*reg, v);
         }
-        let f = b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            state,
-            offset_of!(CpuState, eflags) as i32,
-        );
-        b.def_var(flags, f);
-        let carry = b.ins().band_imm(f, 1);
-        b.def_var(lazy[4], carry);
+        load_flags(&mut b, state, flags, lazy);
         let f = b.ins().load(
             types::I64,
             MemFlags::trusted(),
@@ -1389,7 +1383,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             kernel: None,
             dispatch,
             shared_exit,
-            flag_exits: BTreeMap::new(),
             guard_exits: BTreeMap::new(),
             pc: region.start,
             return_hint,
@@ -1594,54 +1587,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         e.b.switch_to_block(outside);
         e.exit(Exit::Dispatch, target);
         e.emit_guard_exits();
-        // Merge only compatible flag recipes at specialized cold exits. A
-        // single generic merge makes kind/width and unused operands live on
-        // every predecessor. Limit duplication and retain the generic exit for
-        // dynamic recipes, including kernel fuel settlement.
-        // Keep recipe-specific arithmetic separate, then merge only its final
-        // EFLAGS word. Canonical stores and link probing are emitted once.
-        let cold_publish = e.optimizing.then(|| {
-            let block = e.b.create_block();
-            e.b.set_cold_block(block);
-            for _ in 0..3 {
-                e.b.append_block_param(block, types::I32);
-            }
-            block
-        });
-        let flag_exits = std::mem::take(&mut e.flag_exits);
-        for (recipe, block) in flag_exits
-            .into_iter()
-            .map(|(recipe, block)| (Some(recipe), block))
-            .chain(std::iter::once((None, shared_exit)))
-        {
-            e.b.switch_to_block(block);
-            e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
-            // Each predecessor already committed its own deferred MMX prefix.
-            e.mmx_effects = None;
-            if let Some(kind) = recipe {
-                let kind = e.constant(kind);
-                e.b.def_var(e.lazy[3], kind);
-            }
-            let reason = e.b.block_params(block)[0];
-            let pc = e.b.block_params(block)[1];
-            if let Some(publish) = cold_publish {
-                let flags = e.materialize_flags();
-                e.b.ins()
-                    .jump(publish, &[reason.into(), pc.into(), flags.into()]);
-            } else {
-                e.publish_cold_exit(pc, reason, None, hot_exits || kernel.is_some());
-            }
-        }
-        if let Some(publish) = cold_publish {
-            e.b.switch_to_block(publish);
-            let params = e.b.block_params(publish).to_vec();
-            e.publish_cold_exit(
-                params[1],
-                params[0],
-                Some(params[2]),
-                hot_exits || kernel.is_some(),
-            );
-        }
+        e.b.switch_to_block(shared_exit);
+        e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
+        // Each predecessor already committed its own deferred MMX prefix.
+        e.mmx_effects = None;
+        let reason = e.b.block_params(shared_exit)[0];
+        let pc = e.b.block_params(shared_exit)[1];
+        e.publish_cold_exit(pc, reason, hot_exits || kernel.is_some());
         // Normal transfers do not merge with fault/budget prefixes. Bound the
         // number of constant-target footers, sharing all remaining destinations.
         let direct_footers = std::mem::take(&mut e.direct_footers);
@@ -2771,7 +2723,6 @@ struct Emitter<'a> {
     kernel: Option<(usize, Variable, ir::StackSlot)>,
     dispatch: ir::Block,
     shared_exit: ir::Block,
-    flag_exits: BTreeMap<u32, ir::Block>,
     guard_exits: BTreeMap<guards::Key, (Exit, ir::Block)>,
     /// Additional guarded paths pay off after the optimizing tier folds them.
     optimizing: bool,
@@ -2875,15 +2826,6 @@ impl Emitter<'_> {
                         .store(MemFlags::trusted(), value, self.state, (index * 4) as i32);
                 }
             }
-            if effects.read_flags {
-                let flags = self.materialize_flags();
-                self.b.ins().store(
-                    MemFlags::trusted(),
-                    flags,
-                    self.state,
-                    offset_of!(CpuState, eflags) as i32,
-                );
-            }
             self.b.ins().store(
                 MemFlags::trusted(),
                 pc,
@@ -2968,38 +2910,12 @@ impl Emitter<'_> {
             return;
         }
         let reason = self.constant(reason as u32);
-        let block = self.flag_exit();
-        self.b.ins().jump(block, &[reason.into(), pc.into()]);
+        self.b
+            .ins()
+            .jump(self.shared_exit, &[reason.into(), pc.into()]);
     }
-    fn flag_exit(&mut self) -> ir::Block {
-        if !self.optimizing {
-            return self.shared_exit;
-        }
-        let kind = self.b.use_var(self.lazy[3]);
-        let Some(recipe) = self.known(kind) else {
-            return self.shared_exit;
-        };
-        if let Some(&block) = self.flag_exits.get(&recipe) {
-            return block;
-        }
-        if self.flag_exits.len() == 8 {
-            return self.shared_exit;
-        }
-        let block = self.b.create_block();
-        self.b.set_cold_block(block);
-        self.b.append_block_param(block, types::I32);
-        self.b.append_block_param(block, types::I32);
-        self.flag_exits.insert(recipe, block);
-        block
-    }
-    fn publish_cold_exit(
-        &mut self,
-        pc: Value,
-        reason: Value,
-        flags: Option<Value>,
-        terminal: bool,
-    ) {
-        self.save_state_with_flags(pc, flags);
+    fn publish_cold_exit(&mut self, pc: Value, reason: Value, terminal: bool) {
+        self.save_state(pc);
         if let Some(written) = self.written {
             let value = self.b.use_var(written);
             self.b.ins().store(
@@ -3029,9 +2945,6 @@ impl Emitter<'_> {
         } else {
             self.chain_or_return(pc, None, Some(reason));
         }
-    }
-    fn save_state(&mut self, pc: Value) {
-        self.save_state_with_flags(pc, None);
     }
     fn save_extended_state(&mut self) {
         self.flush_mmx_effects();
@@ -3073,7 +2986,7 @@ impl Emitter<'_> {
             }
         }
     }
-    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+    fn save_state(&mut self, pc: Value) {
         let source = self.source;
         self.mark_source(diagnostics::overhead_source(
             diagnostics::Overhead::StateWrite,
@@ -3088,13 +3001,7 @@ impl Emitter<'_> {
                 .ins()
                 .store(MemFlags::trusted(), value, self.state, (i * 4) as i32);
         }
-        let flags = flags.unwrap_or_else(|| self.materialize_flags());
-        self.b.ins().store(
-            MemFlags::trusted(),
-            flags,
-            self.state,
-            offset_of!(CpuState, eflags) as i32,
-        );
+        self.store_flags();
         let fuel = self.b.use_var(self.fuel);
         self.b.ins().store(
             MemFlags::trusted(),
@@ -3139,13 +3046,7 @@ impl Emitter<'_> {
             }
         }
         if summary.flags {
-            let flags = self.materialize_flags();
-            self.b.ins().store(
-                MemFlags::trusted(),
-                flags,
-                self.state,
-                offset_of!(CpuState, eflags) as i32,
-            );
+            self.store_flags();
         }
         let fuel = self.b.use_var(self.fuel);
         self.b.ins().store(
@@ -3220,19 +3121,29 @@ impl Emitter<'_> {
         self.begin_mmx_block();
     }
     fn reload_flags(&mut self) {
-        let flags = self.b.ins().load(
-            types::I32,
+        load_flags(&mut self.b, self.state, self.flags, self.lazy);
+    }
+    /// Publish flags as their lazy recipe: four stores, never the full word.
+    fn store_flags(&mut self) {
+        let old = self.b.use_var(self.flags);
+        let carry = self.b.use_var(self.lazy[4]);
+        let old = self.b.ins().band_imm(old, !1);
+        let flags = self.b.ins().bor(old, carry);
+        self.b.ins().store(
             MemFlags::trusted(),
+            flags,
             self.state,
             offset_of!(CpuState, eflags) as i32,
         );
-        self.b.def_var(self.flags, flags);
-        let zero = self.constant(0);
-        for var in self.lazy {
-            self.b.def_var(var, zero);
+        for (index, var) in self.lazy[..4].iter().enumerate() {
+            let value = self.b.use_var(*var);
+            self.b.ins().store(
+                MemFlags::trusted(),
+                value,
+                self.state,
+                (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
+            );
         }
-        let carry = self.b.ins().band_imm(flags, 1);
-        self.b.def_var(self.lazy[4], carry);
     }
     fn trap_call(&mut self, next: u32) {
         let pc = self.constant(next);
@@ -5017,7 +4928,7 @@ impl Emitter<'_> {
             self.b.def_var(self.lazy[4], carry);
         }
     }
-    /// Compute only the requested flag. Full EFLAGS is reconstructed on exits.
+    /// Compute only the requested flag. Exits publish the lazy recipe instead.
     fn flag(&mut self, bit: u32) -> Value {
         if bit == 0 {
             return self.b.use_var(self.lazy[4]);
@@ -5597,4 +5508,26 @@ fn integer_type(size: usize) -> ir::Type {
         8 => types::I64,
         _ => unreachable!(),
     }
+}
+
+/// Entry and helper returns take the published lazy recipe as it stands.
+fn load_flags(b: &mut FunctionBuilder<'_>, state: Value, flags: Variable, lazy: [Variable; 5]) {
+    let word = b.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        state,
+        offset_of!(CpuState, eflags) as i32,
+    );
+    b.def_var(flags, word);
+    for (index, var) in lazy[..4].iter().enumerate() {
+        let value = b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            state,
+            (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
+        );
+        b.def_var(*var, value);
+    }
+    let carry = b.ins().band_imm(word, 1);
+    b.def_var(lazy[4], carry);
 }

@@ -1,7 +1,7 @@
 //! Share compatible cold guard footers while retaining each SSA state prefix.
 use super::*;
 
-pub(super) type Key = (u32, bool, Option<u32>);
+pub(super) type Key = (u32, bool);
 
 impl Emitter<'_> {
     pub(super) fn shared_guard(&mut self, bad: Value, reason: Exit, addr: Option<Value>) -> bool {
@@ -19,13 +19,7 @@ impl Emitter<'_> {
         }
         // Vector/FP regions keep local footers: merging their long-lived state
         // increases register-allocation spills and final code size.
-        let recipe = if self.optimizing {
-            let kind = self.b.use_var(self.lazy[3]);
-            self.known(kind)
-        } else {
-            None
-        };
-        let key = (reason as u32, addr.is_some(), recipe);
+        let key = (reason as u32, addr.is_some());
         let block = if let Some(&(_, block)) = self.guard_exits.get(&key) {
             block
         } else {
@@ -51,14 +45,10 @@ impl Emitter<'_> {
     }
 
     pub(super) fn emit_guard_exits(&mut self) {
-        for ((_, address, recipe), (reason, block)) in std::mem::take(&mut self.guard_exits) {
+        for ((_, address), (reason, block)) in std::mem::take(&mut self.guard_exits) {
             self.b.switch_to_block(block);
             self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
             self.mmx_effects = None;
-            if let Some(kind) = recipe {
-                let kind = self.constant(kind);
-                self.b.def_var(self.lazy[3], kind);
-            }
             let pc = self.b.block_params(block)[0];
             if address {
                 let addr = self.b.block_params(block)[1];

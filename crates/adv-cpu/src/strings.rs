@@ -812,6 +812,7 @@ pub(crate) unsafe extern "C" fn repeat(
 ) -> u32 {
     // SAFETY: same ABI/lifetime contract as host_call; validation precedes all writes.
     let (bridge, state) = unsafe { (&mut *bridge.cast::<crate::trap::Bridge<'_>>(), &mut *state) };
+    state.settle_flags();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         execute(bridge, state, operation)
     }))
