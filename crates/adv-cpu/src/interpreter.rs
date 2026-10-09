@@ -17,6 +17,8 @@ use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
 mod strings;
+#[cfg(test)]
+mod window_tests;
 
 const CF: u32 = 1;
 const PF: u32 = 1 << 2;
@@ -129,6 +131,8 @@ pub struct Interpreter {
     capacity: usize,
     decodes: u64,
     pub(crate) frame_retired: Option<u64>,
+    /// Discovery and tracing observe every transfer before windows may loop.
+    pub(crate) observe_transfers: bool,
 }
 
 impl Default for Interpreter {
@@ -150,6 +154,7 @@ impl Interpreter {
             capacity,
             decodes: 0,
             frame_retired: None,
+            observe_transfers: false,
         }
     }
 
@@ -205,7 +210,7 @@ impl Interpreter {
         execution
     }
 
-    /// Execute one bounded predecoded basic block. This is internal to Executor:
+    /// Execute a bounded predecoded window. This is internal to Executor:
     /// public step/run_chunk retain their single-instruction/REP contract.
     pub(crate) fn run_block(
         &mut self,
@@ -237,6 +242,7 @@ impl Interpreter {
                 max_units,
                 stop,
                 self.frame_retired.as_mut(),
+                self.observe_transfers,
             );
         }
         let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
@@ -247,6 +253,7 @@ impl Interpreter {
                 max_units,
                 stop,
                 self.frame_retired.as_mut(),
+                self.observe_transfers,
             );
         }
         // Bound each independent cache in entries. A larger block working set
@@ -261,6 +268,7 @@ impl Interpreter {
             max_units,
             stop,
             self.frame_retired.as_mut(),
+            self.observe_transfers,
         )
     }
 }
@@ -569,12 +577,15 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
 const BLOCK_INSTRUCTIONS: usize = 64;
 const BLOCK_BYTES: usize = 512;
 
-/// A contiguous basic block, including its terminating instruction. Page
-/// subscriptions retain negative fetch dependencies and allocation ownership;
-/// bytes are compared only after a relevant event, before executing any prefix.
+/// A contiguous decode window with local branch targets indexed by byte offset.
+/// Validate bytes and all page dependencies at each entry. A store changing the
+/// code epoch ends execution before the cached suffix can run.
 struct DecodedBlock {
     pc: u32,
     instructions: Vec<(u32, Decoded)>,
+    offsets: Vec<u8>,
+    native_start: bool,
+    local_branches: bool,
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
@@ -604,6 +615,9 @@ impl DecodedBlock {
         let mut block = Self {
             pc: start,
             instructions: Vec::new(),
+            offsets: Vec::new(),
+            native_start: native.is_some_and(|(entries, _)| entries.contains_key(&start)),
+            local_branches: true,
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
@@ -620,14 +634,23 @@ impl DecodedBlock {
             }
             *decodes += 1;
             let entry = fetch(memory, pc);
+            let shared = entry
+                .pages
+                .iter()
+                .flatten()
+                .any(|p| p.permissions & crate::memory::SHARED != 0);
+            // Another view may change shared code without an owner epoch. Keep
+            // its original transfer boundaries; never cache it in a local loop.
+            if shared && block.local_branches && !block.instructions.is_empty() {
+                break;
+            }
+            block.local_branches &= !shared;
             let (next, terminates) = match entry.decoded {
                 Decoded::Ready(instruction) => (
                     instruction.next,
                     matches!(
                         instruction.action,
-                        Action::Branch(..)
-                            | Action::Loop(..)
-                            | Action::Call(..)
+                        Action::Call(..)
                             | Action::Ret(..)
                             | Action::Int(..)
                             | Action::Ud2
@@ -635,7 +658,9 @@ impl DecodedBlock {
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
-                    ),
+                    ) || matches!(instruction.action, Action::Branch(Operand::Immediate(target), ConditionCode::None) if target <= pc)
+                        || !block.local_branches
+                            && matches!(instruction.action, Action::Branch(..) | Action::Loop(..)),
                 ),
                 Decoded::Extended(instruction, _, _) => (
                     instruction.next_ip32(),
@@ -657,6 +682,10 @@ impl DecodedBlock {
                     block.pages.push(page);
                 }
             }
+            block.offsets.resize(block.bytes.len(), u8::MAX);
+            if let Some(offset) = block.offsets.get_mut(pc.wrapping_sub(start) as usize) {
+                *offset = block.instructions.len() as u8;
+            }
             block.instructions.push((pc, entry.decoded));
             if terminates || next <= pc {
                 break;
@@ -673,18 +702,36 @@ impl DecodedBlock {
         max_units: u32,
         stop: u32,
         retired: Option<&mut u64>,
+        observe_transfers: bool,
+    ) -> (Execution, u32) {
+        if observe_transfers || !self.local_branches {
+            self.execute_mode::<true>(state, memory, max_units, stop, retired)
+        } else {
+            self.execute_mode::<false>(state, memory, max_units, stop, retired)
+        }
+    }
+
+    fn execute_mode<const OBSERVE: bool>(
+        &self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        max_units: u32,
+        stop: u32,
+        retired: Option<&mut u64>,
     ) -> (Execution, u32) {
         // Specialize the ordinary block loop: disabled diagnostics must not
         // add a retirement branch to every interpreted instruction.
         match retired {
-            Some(retired) => self.execute(state, memory, max_units, stop, |d, e, s, pc| {
-                *retired += retired_instruction(d, e, s, pc)
-            }),
-            None => self.execute(state, memory, max_units, stop, |_, _, _, _| {}),
+            Some(retired) => {
+                self.execute::<OBSERVE>(state, memory, max_units, stop, |d, e, s, pc| {
+                    *retired += retired_instruction(d, e, s, pc)
+                })
+            }
+            None => self.execute::<OBSERVE>(state, memory, max_units, stop, |_, _, _, _| {}),
         }
     }
 
-    fn execute(
+    fn execute<const OBSERVE: bool>(
         &self,
         state: &mut CpuState,
         memory: &mut Memory,
@@ -699,7 +746,8 @@ impl DecodedBlock {
         };
         let mut last_units = 0;
         let mut deferred_mmx = false;
-        for &(pc, decoded) in &self.instructions {
+        let mut index = 0;
+        while let Some(&(pc, decoded)) = self.instructions.get(index) {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
@@ -732,8 +780,37 @@ impl DecodedBlock {
             if execution.step != Step::Executed
                 || memory.epoch != epoch
                 || state.eflags & 0x100 != 0
+                // Leave room for a full straight-line segment. Prefer a branch
+                // boundary for the owner's next interrupt/deadline poll, while
+                // retaining the hard instruction/REP allowance above.
+                || (OBSERVE || result.units >= max_units.saturating_sub(BLOCK_INSTRUCTIONS as u32))
+                    && matches!(decoded, Decoded::Ready(i) if matches!(i.action, Action::Branch(..) | Action::Loop(..)))
             {
                 break;
+            }
+            if self
+                .instructions
+                .get(index + 1)
+                .is_some_and(|&(next, _)| state.eip == next)
+            {
+                index += 1;
+            } else {
+                // Only branches may stay in this decoded window. Calls, returns,
+                // REP and owner/trap boundaries still return to the executor.
+                if !matches!(decoded, Decoded::Ready(i) if matches!(i.action, Action::Branch(..) | Action::Loop(..)))
+                    || !self.local_branches
+                    || self.native_start && state.eip == self.pc
+                {
+                    break;
+                }
+                let Some(&next) = self
+                    .offsets
+                    .get(state.eip.wrapping_sub(self.pc) as usize)
+                    .filter(|&&next| next != u8::MAX)
+                else {
+                    break;
+                };
+                index = usize::from(next);
             }
         }
         if deferred_mmx {
@@ -2241,12 +2318,12 @@ mod tests {
         assert_eq!(interpreter.decode_count(), decodes + 1);
 
         let mut third = memory();
-        let (execution, _) = interpreter.run_block(&mut state(), &mut third, 64, 0, None);
+        let (execution, _) = interpreter.run_block(&mut state(), &mut third, 3, 0, None);
         assert_eq!(execution.units, 3);
         let decodes = interpreter.decode_count();
         let mut fourth = memory();
         let mut fourth_state = state();
-        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
+        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 3, 0, None);
         assert_eq!(execution.units, 3);
         assert_eq!(fourth_state.eip, CODE);
         assert_eq!(

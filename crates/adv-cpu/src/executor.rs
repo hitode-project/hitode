@@ -1758,6 +1758,10 @@ impl Executor {
                 )
             );
             let wait_timer = self.frame_timing.then(Instant::now);
+            // Discovery heat and optional observers still sample every transfer.
+            self.interpreter.observe_transfers = instruction_trace.is_some()
+                || self.interpreter_profile.is_some()
+                || self.auto_jit && reason == crate::InterpreterReason::Uncovered;
             let retired_before = self.interpreter.frame_retired;
             let (execution, last_units) = if self.profiling || single_step || observed.is_some() {
                 let execution =
