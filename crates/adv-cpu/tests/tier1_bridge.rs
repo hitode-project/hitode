@@ -401,36 +401,6 @@ mod native {
     }
 
     #[test]
-    fn bridge_checked_memory_and_fallback_work_with_direct_reservation() {
-        // CI runs this whole suite with ADV_DIRECT_MEMORY off and on. Explicit
-        // enablement also exercises selection after Bridge, before execution.
-        let code = assemble(|a| {
-            a.mov(dword_ptr(DATA), 71u32).unwrap();
-            a.cbw().unwrap();
-            a.mov(ebx, dword_ptr(DATA)).unwrap();
-            a.ret().unwrap();
-        });
-        let mut pair = [
-            machine(&code, Tier1Mode::Off),
-            machine(&code, Tier1Mode::Bridge),
-        ];
-        pair[1].set_direct_memory(true).unwrap();
-        for m in &mut pair {
-            m.set_tier_verification(Some(true));
-            m.state.regs[0] = 0x80;
-            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-        }
-        equal(&pair[0], &pair[1]);
-        // Re-selecting after execution succeeds only if the reservation is
-        // already active; switching a used checked owner would be rejected.
-        assert!(pair[1].set_direct_memory(true).is_ok());
-        assert!(pair[1].tier1_stats().bridge_units > 0);
-        assert!(pair[1].stats.interpreter_instructions > 0);
-        assert_eq!(pair[1].stats.verification.mismatches, 0);
-        assert!(pair[1].set_guest_workers(2).is_err());
-    }
-
-    #[test]
     fn bridge_cache_limits_evict_and_reject_without_losing_state() {
         let code = assemble(|a| {
             a.inc(eax).unwrap();

@@ -100,19 +100,6 @@ void adv_posix_fault_set_pc(void *raw, uintptr_t pc) {
 #endif
 }
 
-/* An inline cold exit restores its frame without consuming the interrupted
- * load's result. The validated epilogue preserves this integer return value. */
-void adv_posix_fault_set_result(void *raw, uint32_t value) {
-    ucontext_t *context = raw;
-#if defined(__x86_64__)
-    context->uc_mcontext.gregs[REG_RAX] = value;
-#elif defined(__APPLE__)
-    context->uc_mcontext->__ss.__x[0] = value;
-#else
-    context->uc_mcontext.regs[0] = value;
-#endif
-}
-
 uint64_t adv_posix_fault_gpr(const void *raw, unsigned index) {
     const ucontext_t *context = raw;
 #if defined(__x86_64__)

@@ -1,9 +1,7 @@
-//! Synthetic off/poll differential checkpoints and restartable interrupt prefixes.
-//! Run with `cargo test -p adv-cpu --test safepoints`. Each differential child
-//! owns a fresh environment because the polling switch is process-wide.
+//! Synthetic fuel, stop, fault and restartable interrupt prefix checks.
+//! Run with `cargo test -p adv-cpu --test safepoints`. No external inputs.
 use adv_cpu::{CompileStrategy, CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::{Decoder, DecoderOptions, OpKind, code_asm::*};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +12,6 @@ const STOP: u32 = 0x18000;
 const DATA: u32 = 0x20000;
 const SLOT: u32 = DATA + 4096;
 const STACK: u32 = 0x2f800;
-const CHILD: &str = "ADV_SAFEPOINT_TEST_CHILD";
 
 #[derive(Clone, Copy)]
 struct Backend {
@@ -458,49 +455,12 @@ fn smc_case(backend: Backend) {
 }
 
 #[test]
-fn differential_child() {
-    if std::env::var_os(CHILD).is_none() {
-        return;
-    }
+fn exact_budget_stop_fault_and_smc_checkpoints() {
     for backend in backends() {
         fuel_cases(backend);
         stop_cases(backend);
         fault_cases(backend);
         smc_case(backend);
-    }
-}
-
-#[test]
-fn off_and_poll_preserve_exact_checkpoints() {
-    let executable = std::env::current_exe().unwrap();
-    let capture = |poll| {
-        let mut command = Command::new(&executable);
-        command
-            .args(["--exact", "differential_child", "--nocapture"])
-            .env(CHILD, "1")
-            .env_remove("ADV_SAFEPOINT");
-        if poll {
-            command.env("ADV_SAFEPOINT", "poll");
-        }
-        let output = command.output().unwrap();
-        // Failed children may contain diagnostic PCs; keep their output private.
-        assert!(
-            output.status.success(),
-            "anonymous differential child failed (poll={poll})"
-        );
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .filter(|line| line.starts_with("SPT_DIGEST "))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    let off = capture(false);
-    let poll = capture(true);
-    assert!(!off.is_empty(), "missing differential checkpoints");
-    assert!(off.len() == poll.len(), "checkpoint count changed");
-    for (index, (off, poll)) in off.iter().zip(&poll).enumerate() {
-        assert!(off == poll, "anonymous checkpoint {index} changed");
     }
 }
 

@@ -97,3 +97,43 @@ fn cross_region_implicit_partial_and_vector_writes_survive_a_cold_fault_and_retu
         }
     }
 }
+
+#[test]
+fn linked_stack_pointer_survives_a_cold_exit_in_a_region_that_does_not_write_it() {
+    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+        let mut m = Executor::new(CODE, 0x20000).unwrap();
+        // Exercise an actual native tail, including under the strict harness.
+        m.set_tier_verification(None);
+        m.protect(CODE, 0x20000, READ | WRITE).unwrap();
+        let prefix = code(CODE, |a| {
+            a.push(eax).unwrap();
+            a.jmp(u64::from(BODY)).unwrap();
+        });
+        let body = code(BODY, |a| {
+            a.mov(ebx, dword_ptr(DATA)).unwrap();
+        });
+        for (at, bytes) in [(CODE, prefix), (BODY, body)] {
+            m.write(at, &bytes).unwrap();
+            m.protect(at, 4096, READ | EXEC).unwrap();
+            let mut region = Region::new(at, bytes.len());
+            region.compile_strategy = strategy;
+            m.add_region(region).unwrap();
+        }
+        m.protect(DATA, 4096, 0).unwrap();
+        m.set_region_linking(true);
+        m.state.eip = CODE;
+        m.state.regs[0] = 123;
+        m.state.regs[4] = STACK;
+        assert_eq!(
+            m.run(STOP, 100).unwrap(),
+            RunOutcome::ReadFault {
+                pc: BODY,
+                address: DATA,
+            }
+        );
+        assert_eq!(m.state.regs[4], STACK - 4);
+        assert_eq!(m.stats.linked_entries, 1);
+        assert_eq!(m.memory().read(STACK - 4, 4).unwrap(), 123u32.to_le_bytes());
+        assert_eq!(m.stats.interpreter_entries, 0);
+    }
+}
