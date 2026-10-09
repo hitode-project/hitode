@@ -494,6 +494,9 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     out_u32(env.cpu, read_out, got as u32);
+    if let Some(budget) = &mut env.sys.stats.frame_budget {
+        budget.file_read(got as u64);
+    }
     Outcome::Return(1)
 }
 

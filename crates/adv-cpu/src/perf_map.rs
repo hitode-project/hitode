@@ -12,7 +12,6 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) enum Category {
     Tier1,
     Tier2,
-    DirectMemory,
 }
 
 impl Category {
@@ -20,7 +19,6 @@ impl Category {
         match self {
             Self::Tier1 => "adv-jit-tier1",
             Self::Tier2 => "adv-jit-tier2",
-            Self::DirectMemory => "adv-jit-direct-memory",
         }
     }
 }

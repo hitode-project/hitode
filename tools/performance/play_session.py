@@ -94,6 +94,13 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
     return environment, removed
 
 
+def preserve_failure(send, output: Path) -> None:
+    """Capture a frozen failed gate before close handlers change the scene."""
+    send("key-up 17")
+    send(f"report {output / 'blocked.json'}")
+    send(f"capture {output / 'blocked.png'}")
+
+
 def run(args: argparse.Namespace) -> None:
     scene = load_scene(args.schedule)
     steps = scene["steps"] if scene else load_schedule(args.schedule)
@@ -255,6 +262,11 @@ def run(args: argparse.Namespace) -> None:
             metadata["completed"] = False
             metadata["suitable_for_performance_comparison"] = False
             metadata["error"] = str(error)
+            if process.poll() is None:
+                try:
+                    preserve_failure(send, output)
+                except (RuntimeError, OSError, queue.Empty) as capture_error:
+                    metadata["failure_capture_error"] = type(capture_error).__name__
             raise
         finally:
             if process.poll() is None:

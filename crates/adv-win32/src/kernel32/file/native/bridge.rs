@@ -205,6 +205,9 @@ fn transfer(env: &mut Env<'_>, writing: bool) -> Option<Outcome> {
                 Ok(_) => return failed(env, 87, 0),
                 Err(error) => return failed(env, error, 0),
             };
+            if !writing && let Some(budget) = &mut env.sys.stats.frame_budget {
+                budget.file_read(u64::from(count));
+            }
             if output != 0
                 && (check_range(env.cpu, output, 4, Prot::WRITE).is_err()
                     || env.cpu.write_u32(output, count).is_err())

@@ -161,7 +161,6 @@ pub(crate) fn tier2(
     instructions: &BTreeMap<u32, Instruction>,
     entries: &std::collections::BTreeSet<u32>,
     opaque: &std::collections::BTreeSet<u32>,
-    opaque_memory: bool,
 ) -> Result<Tier2, super::verify::Error> {
     // Overlapping decode entries can merge after distinct linear prefixes.
     // Keep their common suffix independently addressable by either stream.
@@ -180,7 +179,7 @@ pub(crate) fn tier2(
     let mut opaque_instructions = 0;
     let mut remaining = instructions.clone();
     while let Some((&start, &first)) = remaining.first_key_value() {
-        if opaque.contains(&start) || !native_integer(&first, opaque_memory) {
+        if opaque.contains(&start) || !native_integer(&first) {
             remaining.remove(&start);
             operations.insert(start, Tier2Operation::Opaque(first));
             opaque_instructions += 1;
@@ -191,7 +190,7 @@ pub(crate) fn tier2(
         while let Some(&i) = remaining.get(&pc) {
             if pc != start && (entries.contains(&pc) || merges.contains(&pc))
                 || opaque.contains(&pc)
-                || !native_integer(&i, opaque_memory)
+                || !native_integer(&i)
             {
                 break;
             }
@@ -199,16 +198,7 @@ pub(crate) fn tier2(
             run.insert(pc, i);
             pc = i.next_ip32();
         }
-        let region = lift_impl(
-            &run,
-            start,
-            super::cfg::Limits {
-                depth: 0,
-                instructions: run.len(),
-            },
-            false,
-        )?
-        .region;
+        let region = lift_linear(&run)?;
         ssa_instructions += run.len();
         operations.insert(
             start,
@@ -225,11 +215,8 @@ pub(crate) fn tier2(
     })
 }
 
-fn native_integer(i: &Instruction, opaque_memory: bool) -> bool {
-    if classify(i).is_err()
-        || i.flow_control() != iced_x86::FlowControl::Next
-        || opaque_memory && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
-    {
+fn native_integer(i: &Instruction) -> bool {
+    if classify(i).is_err() || i.flow_control() != iced_x86::FlowControl::Next {
         return false;
     }
     let full_destination = match i.op0_kind() {
@@ -268,6 +255,46 @@ fn lift_impl(
     compact: bool,
 ) -> Result<Lifted, super::verify::Error> {
     let plan = super::cfg::discover(instructions, start, limits)?;
+    build_region(instructions, plan, limits, compact)
+}
+
+/// Native CFG planning has already bounded and split this straight-line run.
+/// Do not rediscover call contexts or predecessor maps for every integer span.
+fn lift_linear(instructions: &BTreeMap<u32, Instruction>) -> Result<Region, super::verify::Error> {
+    debug_assert!(
+        instructions
+            .values()
+            .all(|i| i.flow_control() == iced_x86::FlowControl::Next)
+    );
+    let plan = super::cfg::Plan {
+        blocks: vec![super::cfg::Planned {
+            instructions: instructions.keys().copied().collect(),
+            targets: BTreeMap::new(),
+            expected_return: None,
+            depth: 0,
+        }],
+        entry: BlockId(0),
+        inlined_calls: 0,
+        call_boundaries: BTreeMap::new(),
+    };
+    build_region(
+        instructions,
+        plan,
+        super::cfg::Limits {
+            depth: 0,
+            instructions: instructions.len(),
+        },
+        false,
+    )
+    .map(|lifted| lifted.region)
+}
+
+fn build_region(
+    instructions: &BTreeMap<u32, Instruction>,
+    plan: super::cfg::Plan,
+    limits: super::cfg::Limits,
+    compact: bool,
+) -> Result<Lifted, super::verify::Error> {
     let mut region = Region {
         entry: plan.entry,
         blocks: vec![],

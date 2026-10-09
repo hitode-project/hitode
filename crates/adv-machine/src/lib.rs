@@ -2729,6 +2729,7 @@ impl<B: Backend> Machine<B> {
 
     /// Close the stats row when the presentation sequence moves on.
     fn note_frame(&mut self) {
+        let guest_us = self.sys.clock.now_us();
         if self
             .sys
             .stats
@@ -2737,7 +2738,12 @@ impl<B: Backend> Machine<B> {
             .is_some_and(|b| b.pending())
         {
             let cpu = self.cpu.frame_counters();
-            let total = self.sys.stats.total;
+            // Stats' CSV clock is optional; frame diagnostics need the current
+            // clock even when only --frame-budget is collecting timings.
+            let total = crate::stats::FrameRow {
+                guest_us,
+                ..self.sys.stats.total
+            };
             self.sys
                 .stats
                 .frame_budget
@@ -2746,9 +2752,7 @@ impl<B: Backend> Machine<B> {
                 .finish(total, cpu);
         }
         let blocks = self.cpu.executed_blocks();
-        self.sys
-            .stats
-            .note_frame(self.sys.frame, self.sys.clock.now_us(), blocks);
+        self.sys.stats.note_frame(self.sys.frame, guest_us, blocks);
     }
 
     /// Count executed translation blocks for [`Stats`] (a measurement mode; it slows guest

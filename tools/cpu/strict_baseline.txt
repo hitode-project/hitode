@@ -1,5 +1,5 @@
-# Tests that fail by design under ADV_JIT_VERIFY=strict (with or without
-# ADV_DIRECT_MEMORY=1). Strict verification replays native entries through
+# Tests that fail by design under ADV_JIT_VERIFY=strict.
+# Strict verification replays native entries through
 # the interpreter, so tests asserting native execution shape, link reuse or
 # interrupt timing observe the interpreter instead. One name per line; unit
 # tests keep their module path. Union of the x64 and Neoverse-N2 strict and

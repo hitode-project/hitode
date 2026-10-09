@@ -399,7 +399,6 @@ pub(crate) struct Engine {
     validity: crate::code_validity::CodeValidity<usize>,
     event_validity: bool,
     native_revision: u64,
-    poll: bool,
     stats: Tier1Stats,
 }
 impl Engine {
@@ -413,7 +412,6 @@ impl Engine {
             validity: Default::default(),
             event_validity: crate::code_validity::enabled(),
             native_revision: 0,
-            poll: crate::safepoint::enabled(),
             stats: Tier1Stats::default(),
         })
     }
@@ -547,11 +545,7 @@ impl Engine {
                 vector_store: super::simd::store as *const () as u64,
             },
             host_features,
-            self.poll,
         );
-        if self.poll {
-            emitted.set_poll_batches(super::poll_batches(&instructions));
-        }
         for instruction in instructions.values() {
             emitted.instruction(
                 instruction,
@@ -644,7 +638,7 @@ impl Engine {
         interpreter: &mut Interpreter,
         units: u32,
         stop: u32,
-        interrupt: &AtomicBool,
+        _interrupt: &AtomicBool,
         boundaries: Option<(&BTreeMap<u32, u32>, u64)>,
     ) -> Result<Execution, String> {
         if memory.is_parallel() {
@@ -698,7 +692,6 @@ impl Engine {
                 pc: state.eip,
                 remaining: u64::from(units),
                 stop,
-                poll: std::ptr::from_ref(interrupt) as u64,
                 fs_base: state.fs_base,
                 ..Default::default()
             },
@@ -802,264 +795,5 @@ impl Engine {
             interpreted: frame.reason == FALLBACK,
             last_units: extra,
         })
-    }
-}
-
-#[cfg(test)]
-mod poll_tests {
-    use super::*;
-    use iced_x86::code_asm::*;
-    use std::sync::atomic::Ordering;
-
-    struct Fixture {
-        code: Code,
-        entries: BTreeMap<u32, usize>,
-        pcs: Vec<u32>,
-    }
-
-    impl Fixture {
-        fn new(poll: bool, load: u64, f: impl FnOnce(&mut CodeAssembler)) -> Self {
-            Self::with_helpers(poll, load, 0, f)
-        }
-
-        fn with_helpers(
-            poll: bool,
-            load: u64,
-            store: u64,
-            f: impl FnOnce(&mut CodeAssembler),
-        ) -> Self {
-            let mut assembler = CodeAssembler::new(32).unwrap();
-            f(&mut assembler);
-            let bytes = assembler.assemble(0x10000).unwrap();
-            let instructions: BTreeMap<_, _> =
-                Decoder::with_ip(32, &bytes, 0x10000, DecoderOptions::NONE)
-                    .into_iter()
-                    .map(|i| (i.ip32(), i))
-                    .collect();
-            let mut emitter = emit::Emitter::new(
-                emit::Helpers {
-                    load,
-                    store,
-                    stack_all: 0,
-                    x87: 0,
-                    sse: 0,
-                    vector_load: 0,
-                    vector_store: 0,
-                },
-                crate::HostFeatures::get(),
-                poll,
-            );
-            if poll {
-                emitter.set_poll_batches(super::super::poll_batches(&instructions));
-            }
-            for i in instructions.values() {
-                emitter.instruction(i, None, None);
-            }
-            let emitter = emitter.finish().unwrap();
-            Self {
-                code: Code::new(&emitter.words).unwrap(),
-                entries: emitter.entries,
-                pcs: instructions.keys().copied().collect(),
-            }
-        }
-
-        fn run(&self, start: u32, stop: u32, units: u32, flag: &AtomicBool) -> Tier1Frame {
-            let mut frame = Tier1Frame {
-                regs: [7, 3, 5, 0, 0, 0, 0, 0],
-                flags: 2,
-                pc: start,
-                remaining: u64::from(units),
-                stop,
-                poll: std::ptr::from_ref(flag) as u64,
-                ..Default::default()
-            };
-            // SAFETY: authored fixtures use register templates and the supplied
-            // frame-only helper. Code, frame and the AtomicBool stay pinned;
-            // no guest-memory window is accessed by these instructions.
-            #[cfg(target_os = "macos")]
-            crate::jit_memory_macos::synchronize_execution();
-            unsafe {
-                adv_tier1_enter(
-                    &raw mut frame,
-                    self.code.pointer.as_ptr().add(self.entries[&start]),
-                    std::ptr::null_mut(),
-                );
-            }
-            frame
-        }
-    }
-
-    #[test]
-    fn every_fast_suffix_retains_exact_budget_and_stop() {
-        fn program(a: &mut CodeAssembler) {
-            for _ in 0..70 {
-                a.add(eax, 1).unwrap();
-            }
-            a.ret().unwrap();
-        }
-        let checked = Fixture::new(false, 0, program);
-        let poll = Fixture::new(true, 0, program);
-        let flag = AtomicBool::new(false);
-        for &start in &poll.pcs {
-            for &stop in &poll.pcs {
-                if stop < start {
-                    continue;
-                }
-                for units in [0, 1, 2, 7, 31, 32, 33, 70, 100] {
-                    let expected = checked.run(start, stop, units, &flag);
-                    let actual = poll.run(start, stop, units, &flag);
-                    assert_eq!(actual.regs, expected.regs);
-                    assert_eq!(actual.flags, expected.flags);
-                    assert_eq!(actual.pc, expected.pc);
-                    assert_eq!(actual.remaining, expected.remaining);
-                    assert_eq!(actual.reason, expected.reason);
-                    assert_eq!(actual.links, expected.links);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn stop_and_exhausted_budget_precede_pending_poll() {
-        let fixture = Fixture::new(true, 0, |a| {
-            a.nop().unwrap();
-            a.nop().unwrap();
-        });
-        let flag = AtomicBool::new(true);
-        let start = fixture.pcs[0];
-        for (stop, units, reason) in [(start, 0, DISPATCH), (0, 0, BUDGET), (0, 7, DISPATCH)] {
-            let frame = fixture.run(start, stop, units, &flag);
-            assert_eq!(frame.pc, start);
-            assert_eq!(frame.remaining, u64::from(units));
-            assert_eq!(frame.reason, reason);
-            assert_eq!(frame.regs[0], 7);
-        }
-    }
-
-    extern "C" fn request_interrupt(frame: *mut Tier1Frame, _address: u32, _kind: u32) -> u64 {
-        // SAFETY: Fixture pins the frame and borrowed AtomicBool until return.
-        unsafe { &*((*frame).poll as *const AtomicBool) }.store(true, Ordering::Release);
-        123
-    }
-
-    extern "C" fn store_interrupt(
-        frame: *mut Tier1Frame,
-        _address: u32,
-        _value: u32,
-        _kind: u32,
-    ) -> u32 {
-        // SAFETY: the same pinned frame and AtomicBool contract as the load.
-        unsafe { &*((*frame).poll as *const AtomicBool) }.store(true, Ordering::Release);
-        0
-    }
-
-    #[test]
-    fn helper_request_yields_after_at_most_one_complete_batch() {
-        let fixture = Fixture::new(true, request_interrupt as *const () as u64, |a| {
-            a.mov(eax, dword_ptr(0x20000)).unwrap();
-            for _ in 0..69 {
-                a.add(eax, 1).unwrap();
-            }
-            a.ret().unwrap();
-        });
-        let flag = AtomicBool::new(false);
-        let frame = fixture.run(fixture.pcs[0], *fixture.pcs.last().unwrap(), 100, &flag);
-        assert_eq!(frame.reason, DISPATCH);
-        assert_eq!(frame.pc, fixture.pcs[32]);
-        assert_eq!(frame.remaining, 68);
-        assert_eq!(frame.regs[0], 154);
-        assert!(flag.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn helper_poll_waits_for_push_and_rep_element_commits() {
-        let push = Fixture::with_helpers(true, 0, store_interrupt as *const () as u64, |a| {
-            a.push(eax).unwrap();
-        });
-        let flag = AtomicBool::new(false);
-        let frame = push.run(push.pcs[0], 0, 5, &flag);
-        assert_eq!(frame.reason, DISPATCH);
-        assert_eq!(frame.remaining, 4);
-        assert_eq!(frame.regs[4], u32::MAX - 3);
-        assert_ne!(frame.pc, push.pcs[0]);
-        assert!(flag.load(Ordering::Acquire));
-
-        let rep = Fixture::with_helpers(true, 0, store_interrupt as *const () as u64, |a| {
-            a.rep().stosb().unwrap();
-        });
-        flag.store(false, Ordering::Release);
-        let frame = rep.run(rep.pcs[0], 0, 5, &flag);
-        assert_eq!(frame.reason, DISPATCH);
-        assert_eq!(frame.pc, rep.pcs[0]);
-        assert_eq!(frame.remaining, 4);
-        assert_eq!(frame.regs[1], 2);
-        assert_eq!(frame.regs[7], 1);
-        assert!(flag.load(Ordering::Acquire));
-    }
-
-    extern "C" fn load_refused(_frame: *mut Tier1Frame, _address: u32, _kind: u32) -> u64 {
-        1 << 32
-    }
-
-    extern "C" fn store_changed(
-        _frame: *mut Tier1Frame,
-        _address: u32,
-        _value: u32,
-        _kind: u32,
-    ) -> u32 {
-        1
-    }
-
-    #[test]
-    fn fast_prefix_preserves_fault_pc_and_committed_store_exit() {
-        let flag = AtomicBool::new(false);
-        for prefix in [1, 7, 31, 33] {
-            let load = Fixture::new(true, load_refused as *const () as u64, |a| {
-                for _ in 0..prefix {
-                    a.nop().unwrap();
-                }
-                a.mov(eax, dword_ptr(0x20000)).unwrap();
-                a.nop().unwrap();
-            });
-            let frame = load.run(load.pcs[0], 0, 100, &flag);
-            assert_eq!(frame.reason, LOAD);
-            assert_eq!(frame.pc, load.pcs[prefix]);
-            assert_eq!(frame.remaining, 100 - prefix as u64);
-            assert_eq!(frame.regs[0], 7);
-            assert_eq!(frame.address, 0x20000);
-
-            let store = Fixture::with_helpers(true, 0, store_changed as *const () as u64, |a| {
-                for _ in 0..prefix {
-                    a.nop().unwrap();
-                }
-                a.mov(dword_ptr(0x20000), eax).unwrap();
-                a.add(eax, 1).unwrap();
-            });
-            let frame = store.run(store.pcs[0], 0, 100, &flag);
-            assert_eq!(frame.reason, DISPATCH);
-            assert_eq!(frame.pc, store.pcs[prefix + 1]);
-            assert_eq!(frame.remaining, 99 - prefix as u64);
-            assert_eq!(frame.regs[0], 7);
-        }
-    }
-
-    #[test]
-    fn cyclic_edges_keep_checked_entries() {
-        let fixture = Fixture::new(true, 0, |a| {
-            let mut loop_body = a.create_label();
-            a.set_label(&mut loop_body).unwrap();
-            a.add(eax, 1).unwrap();
-            a.add(edx, 1).unwrap();
-            a.jmp(loop_body).unwrap();
-        });
-        let flag = AtomicBool::new(false);
-        for units in [0, 1, 2, 3, 31, 32, 33, 100] {
-            let frame = fixture.run(fixture.pcs[0], 0, units, &flag);
-            assert_eq!(frame.reason, BUDGET);
-            assert_eq!(frame.remaining, 0);
-            assert_eq!(frame.pc, fixture.pcs[units as usize % 3]);
-            assert_eq!(frame.regs[0], 7 + (units + 2) / 3);
-            assert_eq!(frame.regs[2], 5 + (units + 1) / 3);
-        }
     }
 }

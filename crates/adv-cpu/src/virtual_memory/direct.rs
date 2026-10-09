@@ -568,16 +568,6 @@ impl DirectFaultView<'_> {
 
 #[cfg(unix)]
 impl Reservation {
-    /// Stable alias for the existing software-checked Memory owner. The caller
-    /// must enforce guest permissions and the normal code invalidation protocol.
-    pub(crate) fn checked_pointer(&self) -> Option<NonNull<u8>> {
-        self.direct_alias.as_ref().map(|alias| alias.pointer)
-    }
-
-    pub(crate) fn direct_host_page_size(&self) -> usize {
-        self.pages.borrow().host_page_size
-    }
-
     /// Explicit opt-in; existing Reservation::new and Memory constructors keep
     /// software permissions and their existing RW mapping behavior unchanged.
     pub fn new_direct(len: usize) -> Result<Self, String> {

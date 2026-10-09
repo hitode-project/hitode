@@ -1,0 +1,111 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "majiro-windows",
+  "game_dir": "片羽（カタハネ）",
+  "exe": "カタハネ.exe",
+  "codepage": 932,
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "Windows headless GPU gates with system fonts; intro transition and fixed narrative Ctrl segment.",
+    "timeout_seconds": 180,
+    "steps": [
+      {
+        "delay_ms": 4000
+      },
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "b96e2b73e9596d67",
+          "timeout_ms": 90000,
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "mouse-down 220 315"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 220 315"
+      },
+      {
+        "delay_ms": 300
+      },
+      {
+        "command": "key-down 13"
+      },
+      {
+        "delay_ms": 200
+      },
+      {
+        "command": "key-up 13"
+      },
+      {
+        "checkpoint": "body",
+        "await": {
+          "frame_fnv1a64": "22a38758b572d5c7",
+          "timeout_ms": 45000
+        },
+        "reset_metrics": true
+      },
+      {
+        "checkpoint": "ctrl",
+        "await": {
+          "frame_fnv1a64": "445aaa18bb6a1c8f",
+          "timeout_ms": 45000,
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "normal",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "key-down 13"
+      },
+      {
+        "delay_ms": 500
+      },
+      {
+        "command": "key-up 13"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "transition",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "gated"
+    },
+    "normal": {
+      "checkpoint": "normal",
+      "measurement": "timed_observation"
+    },
+    "ctrl": {
+      "checkpoint": "ctrl",
+      "measurement": "gated",
+      "start_checkpoint": "body"
+    },
+    "transition": {
+      "checkpoint": "body",
+      "measurement": "gated"
+    }
+  }
+}

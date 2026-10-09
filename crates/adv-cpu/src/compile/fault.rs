@@ -10,7 +10,6 @@ use cranelift_codegen::{
 };
 
 pub(super) const LOAD_SOURCE: u32 = 1;
-pub(super) const RETURN_SOURCE: u32 = 2;
 const LABEL_BASE: u32 = 100;
 
 pub(super) fn candidate(start: u32, instructions: &BTreeMap<u32, Instruction>) -> Option<u32> {
@@ -64,6 +63,7 @@ pub(super) struct Draft {
     values: Vec<Option<Value>>,
     pub pc: u32,
     pub width: usize,
+    recovery: contract::RecoveryExit,
 }
 
 pub(super) struct Pending {
@@ -73,6 +73,7 @@ pub(super) struct Pending {
     entry: u32,
     pc: u32,
     width: usize,
+    recovery: contract::RecoveryExit,
 }
 
 impl Draft {
@@ -84,6 +85,7 @@ impl Draft {
         entry: u32,
         pc: u32,
         width: usize,
+        recovery: contract::RecoveryExit,
     ) -> Option<Pending> {
         let _ = b;
         Some(Pending {
@@ -93,6 +95,7 @@ impl Draft {
             entry,
             pc,
             width,
+            recovery,
         })
     }
 
@@ -114,44 +117,10 @@ impl Draft {
         if loads.next().is_some() {
             return None;
         }
-        let instruction = Decoder::with_ip(
-            64,
-            &buffer.data()[offset as usize..],
-            u64::from(offset),
-            DecoderOptions::NONE,
-        )
-        .decode();
-        if !matches!(
-            instruction.mnemonic(),
-            M::Mov | M::Movzx | M::Movsx | M::Movsxd
-        ) || instruction.op1_kind() != OpKind::Memory
-            || instruction.memory_size().size() != self.width
-        {
-            return None;
-        }
-        let mut recovery = buffer
-            .get_srclocs_sorted()
-            .iter()
-            .filter(|range| range.loc.bits() == RETURN_SOURCE)
-            .map(|range| range.start)
-            .min()?;
-        if !epilogue(buffer.data(), recovery as usize) {
-            // Constant CSE can leave the return's mov eax,reason assigned to
-            // its earlier SSA source location. Include only one immediately
-            // preceding, decoded instruction and revalidate the entire return.
-            let mut decoder = Decoder::new(64, buffer.data(), DecoderOptions::NONE);
-            let mut previous = None;
-            while decoder.can_decode() && decoder.ip() < u64::from(recovery) {
-                let instruction = decoder.decode();
-                if instruction.next_ip() == u64::from(recovery) {
-                    previous = Some(instruction.ip() as u32);
-                }
-            }
-            recovery = previous?;
-        }
-        if !epilogue(buffer.data(), recovery as usize) {
-            return None;
-        }
+        // The unique trap is emitted on the typed scalar load itself. Its IR
+        // width and access direction remain authoritative after instruction
+        // selection; no machine-byte decoder participates in publication.
+        let recovery = self.recovery.location(code)?;
         // Debug labels do not extend liveness. Use only a final range actually
         // containing the faulting instruction; otherwise retain the pure DAG.
         for (index, value) in self.values.iter().enumerate() {
@@ -181,6 +150,7 @@ impl Draft {
                 guest_pc: self.pc,
                 width: self.width,
                 access: Access::Read,
+                recovery_result: Some(super::Exit::ReadFault as u32),
             },
             self.recipe,
         ))
@@ -235,6 +205,7 @@ impl Pending {
             values,
             pc: self.pc,
             width: self.width,
+            recovery: self.recovery,
         })
     }
 }
@@ -416,70 +387,6 @@ fn binary(opcode: Opcode) -> Option<Operation> {
         Opcode::Sshr | Opcode::SshrImm => Operation::Sshr,
         _ => return None,
     })
-}
-
-fn epilogue(code: &[u8], mut offset: usize) -> bool {
-    let mut reason = false;
-    for _ in 0..32 {
-        if offset >= code.len() {
-            return false;
-        }
-        let instruction =
-            Decoder::with_ip(64, &code[offset..], offset as u64, DecoderOptions::NONE).decode();
-        if instruction.is_invalid() {
-            return false;
-        }
-        match instruction.mnemonic() {
-            M::Mov
-                if matches!(instruction.op0_register(), R::EAX | R::RAX)
-                    && matches!(
-                        instruction.op1_kind(),
-                        OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64
-                    ) =>
-            {
-                if instruction.immediate(1) != Exit::ReadFault as u64 {
-                    return false;
-                }
-                reason = true;
-            }
-            M::Mov
-                if instruction.op0_register() == R::RSP && instruction.op1_register() == R::RBP => {
-            }
-            M::Mov
-            | M::Movups
-            | M::Movaps
-            | M::Movdqu
-            | M::Movdqa
-            | M::Vmovups
-            | M::Vmovaps
-            | M::Vmovdqu
-            | M::Vmovdqa
-                if instruction.op0_kind() == OpKind::Register
-                    && instruction.op1_kind() == OpKind::Memory
-                    && instruction.memory_base() == R::RSP
-                    && instruction.memory_index() == R::None
-                    && (matches!(
-                        instruction.op0_register(),
-                        R::RBX | R::RBP | R::RSI | R::RDI | R::R12 | R::R13 | R::R14 | R::R15
-                    ) || (R::XMM6 as u32..=R::XMM15 as u32)
-                        .contains(&(instruction.op0_register() as u32))) => {}
-            M::Add
-                if instruction.op0_register() == R::RSP
-                    && matches!(
-                        instruction.op1_kind(),
-                        OpKind::Immediate8to64 | OpKind::Immediate32to64
-                    ) => {}
-            M::Pop if instruction.op0_register() == R::RBP => {}
-            M::Jmp if instruction.op0_kind() == OpKind::NearBranch64 => {
-                offset = instruction.near_branch64() as usize;
-                continue;
-            }
-            M::Ret => return reason,
-            _ => return false,
-        }
-        offset = instruction.next_ip() as usize;
-    }
-    false
 }
 
 #[cfg(test)]

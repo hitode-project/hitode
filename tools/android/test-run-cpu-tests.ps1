@@ -27,10 +27,8 @@ $defaults = & $runner -WhatIf -Sdk '' -Ndk '' -Output $output | ConvertFrom-Json
 Assert (($defaults.targets -join ',') -eq 'execution_contract,host_interrupts,loop_versioning,address_space') 'Default integration targets changed.'
 Assert ($defaults.runs.Count -eq 4) 'Default run count changed.'
 Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lockfile.'
-Assert ($defaults.runs[0].shell.Contains('ADV_SAFEPOINT=off')) 'Safepoints must remain opt-in.'
+Assert (-not $defaults.runs[0].shell.Contains('ADV_SAFEPOINT')) 'Retired poll selector must not reach the device.'
 Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
-$poll = & $runner -WhatIf -Safepoint poll -Output $output | ConvertFrom-Json
-Assert ($poll.runs[0].shell.Contains('ADV_SAFEPOINT=poll')) 'Poll mode did not reach the device.'
 $event = & $runner -WhatIf -CodeValidity event -Output $output | ConvertFrom-Json
 Assert ($event.runs[0].shell.Contains('ADV_CODE_VALIDITY=event')) 'Event validity did not reach the device.'
 Assert ($defaults.runs[0].shell.Contains('ADV_CODE_VALIDITY=legacy')) 'Event validity must remain opt-in.'
@@ -59,11 +57,11 @@ $build = & $runner -ExecutionExperiments -BuildOnly -WhatIf -Output $output | Co
 Assert $build.build_only 'Build-only selection was lost.'
 $multiple = & $runner -TestName tier1,tier1 -UnitFilter virtual_memory,fault_recovery,virtual_memory -WhatIf -Output $output | ConvertFrom-Json
 Assert ($multiple.targets.Count -eq 2 -and $multiple.runs.Count -eq 3) 'Duplicate selectors should run only once.'
-$full = & $runner -AllTests -DirectMemory -Tier1 bridge -WhatIf -Output $output | ConvertFrom-Json
+$full = & $runner -AllTests -Tier1 bridge -WhatIf -Output $output | ConvertFrom-Json
 $expected = @(Get-ChildItem (Join-Path $PSScriptRoot '../../crates/adv-cpu/tests') -File -Filter '*.rs')
 Assert ($full.targets.Count -eq $expected.Count + 1) 'Full suite must include every integration target and the library.'
 Assert ($full.runs[-1].target -eq 'adv_cpu' -and $full.runs[-1].filter -eq '') 'Full library suite must have no filter.'
-Assert ($full.runs[0].shell.Contains('ADV_TIER1=bridge ADV_DIRECT_MEMORY=1 timeout')) 'Execution settings must reach the device.'
+Assert ($full.runs[0].shell.Contains('ADV_TIER1=bridge timeout')) 'Execution settings must reach the device.'
 Reject { & $runner -AllTests -ExecutionExperiments -WhatIf } 'Conflicting presets were accepted.'
 Reject { & $runner -AllTests -UnitFilter virtual_memory -WhatIf } 'Full suite accepted a unit filter.'
 Reject { & $runner -BuildOnly -SkipBuild -WhatIf } 'Contradictory build modes were accepted.'
