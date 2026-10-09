@@ -228,3 +228,141 @@ fn rtl_and_crt_free_realloc_retire_fixed_global_aliases() {
         }
     }
 }
+
+#[test]
+fn large_heap_exports_zero_freed_storage_without_zero_memory() {
+    for jit in [false, true] {
+        for moving in [false, true] {
+            let mut machine = machine(jit);
+            let alloc = machine.resolve_import("kernel32.dll", "HeapAlloc").unwrap();
+            let realloc = machine
+                .resolve_import("kernel32.dll", "HeapReAlloc")
+                .unwrap();
+            let free = machine.resolve_import("kernel32.dll", "HeapFree").unwrap();
+            let heap = machine.ext.get::<adv_os::Heaps>().process_heap;
+            let old_size = 0x80001;
+            let size = 0x9000d;
+            let old = moving.then(|| {
+                let block = machine
+                    .ext
+                    .get_mut::<adv_os::Heaps>()
+                    .alloc(&mut machine.cpu, &mut machine.sys.vm, heap, old_size, false)
+                    .unwrap();
+                machine
+                    .cpu
+                    .write(block, &vec![0x3c; old_size as usize])
+                    .unwrap();
+                block
+            });
+            let dirty = machine
+                .ext
+                .get_mut::<adv_os::Heaps>()
+                .alloc(&mut machine.cpu, &mut machine.sys.vm, heap, size, false)
+                .unwrap();
+            machine
+                .cpu
+                .write(dirty, &vec![0xa5; size as usize])
+                .unwrap();
+            let mut code = Asm::new(CODE);
+            code.push_imm(dirty)
+                .push_imm(0)
+                .push_imm(heap)
+                .call(free)
+                .mov_mem_eax(DATA);
+            code.push_imm(size);
+            if let Some(old) = old {
+                code.push_imm(old);
+            }
+            code.push_imm(0)
+                .push_imm(heap)
+                .call(if moving { realloc } else { alloc })
+                .mov_mem_eax(DATA + 4);
+            execute(&mut machine, code);
+            assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 1);
+            let new = machine.cpu.read_u32(DATA + 4).unwrap();
+            assert_ne!(new, 0);
+            let mut bytes = vec![0xff; size as usize];
+            machine.cpu.read(new, &mut bytes).unwrap();
+            let preserved = if moving { old_size as usize } else { 0 };
+            assert!(bytes[..preserved].iter().all(|&b| b == 0x3c));
+            assert!(bytes[preserved..].iter().all(|&b| b == 0));
+        }
+    }
+}
+
+#[test]
+fn large_global_local_and_heap_allocations_retire_without_stale_aliases() {
+    for jit in [false, true] {
+        let mut machine = machine(jit);
+        let global_alloc = machine
+            .resolve_import("kernel32.dll", "GlobalAlloc")
+            .unwrap();
+        let global_free = machine
+            .resolve_import("kernel32.dll", "GlobalFree")
+            .unwrap();
+        let local_alloc = machine
+            .resolve_import("kernel32.dll", "LocalAlloc")
+            .unwrap();
+        let local_free = machine.resolve_import("kernel32.dll", "LocalFree").unwrap();
+        let heap_alloc = machine.resolve_import("kernel32.dll", "HeapAlloc").unwrap();
+        let heap_free = machine.resolve_import("kernel32.dll", "HeapFree").unwrap();
+        let heap_size = machine.resolve_import("kernel32.dll", "HeapSize").unwrap();
+        let heap = machine.ext.get::<adv_os::Heaps>().process_heap;
+        let size = 0x90001;
+        let mut code = Asm::new(CODE);
+        code.push_imm(size)
+            .push_imm(0x40)
+            .call(global_alloc)
+            .mov_mem_eax(DATA);
+        code.push_eax().call(global_free).mov_mem_eax(DATA + 4);
+        code.push_imm(size + 8)
+            .push_imm(0x40)
+            .call(local_alloc)
+            .mov_mem_eax(DATA + 8);
+        code.push_eax().call(local_free).mov_mem_eax(DATA + 12);
+        code.push_imm(size + 16)
+            .push_imm(8)
+            .push_imm(heap)
+            .call(heap_alloc)
+            .mov_mem_eax(DATA + 16);
+        code.push_eax()
+            .push_imm(0)
+            .push_imm(heap)
+            .call(heap_size)
+            .mov_mem_eax(DATA + 20);
+        code.mov_eax_mem(DATA + 16)
+            .mov_eax_ptr_eax()
+            .mov_mem_eax(DATA + 32);
+        code.mov_eax_mem(DATA + 16)
+            .push_eax()
+            .push_imm(0)
+            .push_imm(heap)
+            .call(heap_free)
+            .mov_mem_eax(DATA + 24);
+        code.mov_eax_mem(DATA + 16)
+            .push_eax()
+            .push_imm(0)
+            .push_imm(heap)
+            .call(heap_size)
+            .mov_mem_eax(DATA + 28);
+        execute(&mut machine, code);
+        let first = machine.cpu.read_u32(DATA).unwrap();
+        let local = machine.cpu.read_u32(DATA + 8).unwrap();
+        let plain = machine.cpu.read_u32(DATA + 16).unwrap();
+        assert_ne!(first, 0);
+        assert_ne!(local, 0);
+        assert_ne!(plain, 0);
+        assert_eq!(plain % 8, 0);
+        assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(DATA + 12).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(DATA + 20).unwrap(), size + 16);
+        assert_eq!(machine.cpu.read_u32(DATA + 24).unwrap(), 1);
+        assert_eq!(machine.cpu.read_u32(DATA + 28).unwrap(), u32::MAX);
+        let globals = machine.ext.get::<Globals>();
+        assert_eq!(globals.from_pointer(&machine.sys.objects, plain), None);
+        assert_eq!(globals.from_allocation(&machine.sys.objects, plain), None);
+        assert_eq!(machine.ext.get::<adv_os::Heaps>().owner(plain), None);
+        assert_eq!(machine.cpu.read_u32(DATA + 32).unwrap(), 0);
+        assert!(!machine.cpu.accessible(plain, 1, Prot::READ));
+    }
+}

@@ -5,7 +5,7 @@
 //!
 //! `<ctx>\t<frame>\t<module>!<name>\t<arg0,arg1,...>\t<ret>` (numbers in hex)
 
-use adv_cpu::backend::{Guest, GuestExt, Reg};
+use adv_cpu::backend::{Fault, FaultKind, Guest, GuestExt, Reg};
 use std::collections::HashSet;
 use std::io::Write;
 use std::{cell::RefCell, rc::Rc};
@@ -71,6 +71,34 @@ impl Trace {
 
     pub fn enabled(&self) -> bool {
         self.sink.is_some()
+    }
+
+    /// Precise backend fault input, before exception callbacks or cleanup. Text
+    /// is escaped to keep the diagnostic on one line; API records stay unchanged.
+    pub fn cpu_fault(&mut self, context: u32, frame: u32, fault: &Fault) {
+        if let Some(w) = &mut self.sink {
+            let (kind, access) = match &fault.kind {
+                FaultKind::Read(address) => ("read", Some(("read", *address))),
+                FaultKind::Write(address) => ("write", Some(("write", *address))),
+                FaultKind::Fetch(address) => ("fetch", Some(("execute", *address))),
+                FaultKind::InvalidInstruction => ("invalid_instruction", None),
+                FaultKind::Other(_) => ("other", None),
+            };
+            let _ = write!(
+                w,
+                "# cpu_fault\t{context}\t{frame}\tKind={kind:?}\tPc={:08x}",
+                fault.pc
+            );
+            if let Some((access, address)) = access {
+                let _ = write!(w, "\tAccess={access:?}\tAddress={address:08x}");
+            }
+            if let FaultKind::Other(reason) = &fault.kind {
+                let _ = write!(w, "\tReason={reason:?}");
+            }
+            let _ = writeln!(w);
+            // Preserve evidence even if a guest exception handler never returns.
+            let _ = w.flush();
+        }
     }
 
     /// Architectural trap input before OS-personality handling. Valid host
@@ -180,5 +208,50 @@ impl Trace {
         if let Some(w) = &mut self.sink {
             let _ = w.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Buffer(Rc<RefCell<Vec<u8>>>);
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cpu_fault_escapes_reason_and_keeps_api_record_columns_unchanged() {
+        let buffer = Rc::new(RefCell::new(Vec::new()));
+        let mut trace = Trace::to_writer(Box::new(Buffer(buffer.clone())));
+        trace.cpu_fault(
+            4,
+            9,
+            &Fault {
+                pc: 0x400000,
+                kind: FaultKind::Other("failure\tinput\n# forged\r\u{1b}".into()),
+            },
+        );
+        trace.record(&TraceRecord {
+            ctx: 4,
+            frame: 9,
+            module: "test",
+            name: "cleanup",
+            args: &[],
+            ret: 0,
+        });
+        let text = String::from_utf8(buffer.borrow().clone()).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "# cpu_fault\t4\t9\tKind=\"other\"\tPc=00400000\tReason=\"failure\\tinput\\n# forged\\r\\u{1b}\""
+        );
+        assert_eq!(text.lines().nth(1).unwrap(), "4\t9\ttest!cleanup\t\t0");
     }
 }

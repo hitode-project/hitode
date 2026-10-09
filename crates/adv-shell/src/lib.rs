@@ -799,7 +799,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n  \"direct_memory\": {},\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
             "  \"code_cache\": {},\n  \"aot\": {},\n",
             "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
@@ -842,15 +842,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         stats.interpreter_entries,
         cliffs_report(&stats.cliffs),
         verification_report(&stats.verification),
-        format!(
-            "{{\"sites\":{},\"accesses\":{},\"recoveries\":{},\"violations\":{},\"checked_fallbacks\":{},\"code_writes\":{}}}",
-            stats.direct_memory.sites,
-            stats.direct_memory.accesses,
-            stats.direct_memory.recoveries,
-            stats.direct_memory.violations,
-            stats.direct_memory.checked_fallbacks,
-            stats.direct_memory.code_writes
-        ),
         runtime.machine.cpu.executor().persistent_code_cache_json(),
         stats.aot.json(),
         tier1_json,
@@ -928,6 +919,33 @@ fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> 
     }
     let _ = wake;
     runtime.capture_latest_frame().map(|_| ())
+}
+
+fn observe_scene_gate(
+    runtime: &mut Runtime,
+    wake: &window::WakeEvent,
+    gate: &mut control::SceneGate,
+) -> Result<Option<control::GateCompletion>, String> {
+    let before = gate.check_duration();
+    if gate.needs_frame_pixels(runtime.presented_frames(), runtime.frame().frames) {
+        // Both software composition and native presentation can defer CPU
+        // pixels until a diagnostic capture. Materialize the current frame
+        // before hashing; ordinary execution never asks for this readback.
+        let started = Instant::now();
+        let result = capture_diagnostic_frame(runtime, wake);
+        gate.frame_capture(started.elapsed());
+        result?;
+    }
+    let completion = gate.observe(
+        runtime.presented_frames(),
+        runtime.frame().width,
+        &runtime.frame().bgra,
+        Instant::now(),
+    );
+    if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
+        budget.scene_check(gate.check_duration().saturating_sub(before));
+    }
+    Ok(completion)
 }
 
 fn acknowledge_scene_gate(
@@ -1763,29 +1781,7 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            runtime.presented_frames(),
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
@@ -1883,29 +1879,7 @@ fn run_execution(
         {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            presented,
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }

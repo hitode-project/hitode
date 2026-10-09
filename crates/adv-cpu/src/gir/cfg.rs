@@ -1,6 +1,7 @@
-//! Bounded, context-sensitive direct-call discovery over a supplied decode set.
+//! Production region decode and entry discovery; bounded call contexts for the
+//! standalone integer oracle use the same instruction and block vocabulary.
 use super::{ir::BlockId, lift::classify, verify::Error};
-use iced_x86::{Code, FlowControl, Instruction};
+use iced_x86::{Code, Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, OpKind};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy)]
@@ -232,4 +233,199 @@ pub fn discover(
         inlined_calls,
         call_boundaries,
     })
+}
+
+/// The one production decode graph. Opaque emission supplies only its required
+/// restart boundaries; GIR owns target discovery and overlapping entry decode.
+pub(crate) struct Native {
+    pub instructions: BTreeMap<u32, Instruction>,
+    pub pages: BTreeSet<usize>,
+    pub callee_code: BTreeSet<u32>,
+    pub entries: BTreeSet<u32>,
+    pub returns: BTreeSet<u32>,
+}
+
+impl Native {
+    pub fn decode(snapshot: &crate::compile::Snapshot) -> Result<Self, String> {
+        let region = &snapshot.region;
+        let bytes = snapshot.bytes();
+        let first_page = (region.start - snapshot.base) as usize / 4096;
+        let mut pages: BTreeSet<usize> = if region.reachable {
+            BTreeSet::new()
+        } else {
+            (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096)
+                .collect()
+        };
+        let mut instructions = BTreeMap::new();
+        if !region.reachable {
+            let mut decoder =
+                Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
+            while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64
+            {
+                let instruction = decoder.decode();
+                record_tail_dependencies(
+                    region,
+                    snapshot,
+                    bytes,
+                    0,
+                    &decoder,
+                    &instruction,
+                    &mut pages,
+                );
+                instructions.insert(instruction.ip32(), instruction);
+            }
+        }
+        // Entry points can follow padding/data or overlap an earlier linear decode.
+        // Decode direct targets independently, as the CPU would at the actual target PC.
+        let private_callee = |pc: u32| {
+            region.reachable
+                && region.callees.contains(&pc)
+                && pc != region.start
+                && !region.entries.contains(&pc)
+        };
+        let mut pending: Vec<u32> = region.entries.clone();
+        if region.reachable && pending.is_empty() {
+            pending.push(region.start);
+        }
+        if !region.reachable {
+            pending.extend(
+                instructions
+                    .values()
+                    .filter(|i| i.op0_kind() == OpKind::NearBranch32)
+                    .map(Instruction::near_branch32),
+            );
+        }
+        while let Some(target) = pending.pop() {
+            if instructions.contains_key(&target)
+                || region.frontier.contains(&target)
+                || private_callee(target)
+            {
+                continue;
+            }
+            let Some(offset) = target
+                .checked_sub(region.start)
+                .map(|n| n as usize)
+                .filter(|&n| n < region.len)
+            else {
+                continue;
+            };
+            let offset = offset + (region.start - snapshot.origin()) as usize;
+            let mut decoder = Decoder::with_ip(
+                32,
+                &bytes[offset..],
+                u64::from(target),
+                DecoderOptions::NONE,
+            );
+            while decoder.can_decode()
+                && decoder.ip() < u64::from(region.start) + region.len as u64
+                && !instructions.contains_key(&(decoder.ip() as u32))
+                && !region.frontier.contains(&(decoder.ip() as u32))
+                && !private_callee(decoder.ip() as u32)
+            {
+                let i = decoder.decode();
+                record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &i, &mut pages);
+                if i.op0_kind() == OpKind::NearBranch32 {
+                    pending.push(i.near_branch32());
+                }
+                instructions.insert(i.ip32(), i);
+                if region.reachable
+                    && (i.is_invalid()
+                        || matches!(
+                            i.flow_control(),
+                            FlowControl::UnconditionalBranch
+                                | FlowControl::IndirectBranch
+                                | FlowControl::Return
+                                | FlowControl::Exception
+                        ))
+                {
+                    break;
+                }
+            }
+        }
+        let mut callee_code = BTreeSet::new();
+        for i in snapshot.callee_code(&instructions) {
+            callee_code.insert(i.ip32());
+            let first = (i.ip32() - snapshot.base) as usize / 4096;
+            let last = (i.ip32() - snapshot.base) as usize + i.len() - 1;
+            pages.extend(first..=last / 4096);
+            instructions.insert(i.ip32(), i);
+        }
+        let mut entries = BTreeSet::from([region.start]);
+        for instruction in instructions.values() {
+            let (before, after) = crate::compile::opaque_boundaries(instruction);
+            if before {
+                entries.insert(instruction.ip32());
+                entries.insert(instruction.next_ip32());
+            }
+            if instruction.flow_control() != FlowControl::Next {
+                entries.insert(instruction.next_ip32());
+            }
+            // An interpreted instruction returns with canonical state. Publish its
+            // decoded continuation so a cold form does not strand the supported
+            // remainder of this block in the interpreter on every execution.
+            if after {
+                entries.insert(instruction.next_ip32());
+            }
+            if matches!(
+                instruction.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32
+            ) {
+                entries.insert(instruction.near_branch_target() as u32);
+            }
+        }
+        // A matching indirect call dispatches to a decoded callee internally.
+        entries.extend(region.callees.iter().copied());
+        for &entry in &region.entries {
+            if !instructions.contains_key(&entry) {
+                return Err(format!("entry {entry:#x} is not an instruction boundary"));
+            }
+            entries.insert(entry);
+        }
+        entries.retain(|pc| instructions.contains_key(pc));
+        let returns: BTreeSet<_> = instructions
+            .values()
+            .filter(|i| {
+                matches!(
+                    i.flow_control(),
+                    FlowControl::Call | FlowControl::IndirectCall
+                )
+            })
+            .map(Instruction::next_ip32)
+            .filter(|pc| entries.contains(pc))
+            .collect();
+        Ok(Self {
+            instructions,
+            pages,
+            callee_code,
+            entries,
+            returns,
+        })
+    }
+}
+
+fn record_tail_dependencies(
+    region: &crate::Region,
+    snapshot: &crate::compile::Snapshot,
+    bytes: &[u8],
+    offset: usize,
+    decoder: &Decoder<'_>,
+    instruction: &Instruction,
+    pages: &mut BTreeSet<usize>,
+) {
+    let start = (snapshot.origin() - snapshot.base) as usize;
+    let read_start = (instruction.ip32() - snapshot.base) as usize;
+    let read_end = start + offset + decoder.position();
+    pages.extend(read_start / 4096..=(read_end - 1) / 4096);
+    if region.complete_tail && decoder.last_error() == DecoderError::NoMoreBytes {
+        // The next page's mapping/EXEC permission can make a previously
+        // truncated instruction compilable, even if none of its bytes
+        // could be read. Keep that negative dependency in the cache.
+        if let Some(address) = u64::from(snapshot.origin())
+            .checked_add(bytes.len() as u64)
+            .and_then(|address| u32::try_from(address).ok())
+            && let Some(page) = snapshot.page_index(address)
+        {
+            pages.insert(page);
+        }
+    }
 }

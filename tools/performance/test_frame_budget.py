@@ -23,6 +23,99 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_measured_fallback_lanes_outrank_entry_and_helper_count_hints(self):
+        cpu = {"tier2_blocks": 100000, "interpreter_entries": 9000, "softfloat_calls": 9000,
+               "reason_ns": {"uncovered": 1000, "pending": 1000}}
+        self.assertEqual(budget.classify(frame(cpu=cpu))["cause"], "structure.tier2_execution")
+        cpu["reason_ns"]["uncovered"] = 30_000_000
+        self.assertEqual(budget.classify(frame(cpu=cpu))["cause"], "execution.interpreter_uncovered")
+
+    def test_ux_sequence_splits_loading_but_keeps_compute_stalls(self):
+        rows = [frame(serial=i, present_interval_ns=20_000_000, wall_ns=20_000_000,
+                      active_ns=18_000_000, guest_exec_ns=17_000_000) for i in range(1, 23)]
+        rows[5].update(present_interval_ns=60_000_000, wall_ns=60_000_000)
+        rows[12].update(present_interval_ns=800_000_000, wall_ns=800_000_000, file_read_bytes=1024)
+        ux = budget.ux_metrics(dict(sequence=rows, frames=len(rows), sequence_dropped=0), {"cadence_ms": 20})
+        self.assertTrue(ux["sequence_complete"])
+        self.assertEqual(len(ux["animation"]["windows"]), 2)
+        first = ux["animation"]["windows"][0]
+        self.assertEqual(first["estimated_missed_presents"], 2)
+        self.assertEqual(first["gaps_missing_at_least_two"], 1)
+        self.assertEqual(first["stall_costs"]["wall_ns"], 60_000_000)
+        self.assertEqual(ux["animation"]["boundaries"][0]["kind"], "possible_loading")
+        rows[12]["file_read_bytes"] = 0
+        self.assertEqual(len(budget.animation_windows(rows, 20)["windows"]), 1)
+
+    def test_ux_cannot_use_sparse_long_frames_or_evicted_rows(self):
+        for data in (dict(rows=[frame()], frames=1),
+                     dict(sequence=[frame(serial=1), frame(serial=3)], frames=2),
+                     dict(sequence=[frame()], frames=1, sequence_dropped=1),
+                     dict(sequence=[frame()], frames=1, coalesced_frames=1)):
+            ux = budget.ux_metrics(data, {})
+            self.assertFalse(ux["sequence_complete"])
+            self.assertNotIn("animation", ux)
+
+    def test_ux_waiting_phase_is_not_missed_frames_against_an_earlier_fast_burst(self):
+        rows = [frame(serial=i, present_interval_ns=10_000_000, wall_ns=10_000_000,
+                      wait_ns=0) for i in range(1, 17)]
+        rows += [frame(serial=i, present_interval_ns=50_000_000, wall_ns=50_000_000,
+                       wait_ns=45_000_000) for i in range(17, 33)]
+        value = budget.animation_windows(rows)
+        self.assertEqual(len(value["windows"]), 2)
+        self.assertEqual(value["unclassified_frames"], 0)
+        self.assertTrue(value["windows"][1]["waiting_dominated"])
+        self.assertEqual(sum(w["estimated_missed_presents"] for w in value["windows"]), 0)
+
+    def test_ux_marks_self_cadence_as_proxy_and_excludes_freezes(self):
+        rows = [frame(serial=i, present_interval_ns=16_000_000) for i in range(1, 20)]
+        rows[9].update(present_interval_ns=100_000_000, control_pause_ns=90_000_000)
+        value = budget.animation_windows(rows)
+        self.assertEqual(len(value["windows"]), 2)
+        self.assertTrue(all(w["cadence_reference"] == "observed_p20_proxy" for w in value["windows"]))
+        self.assertEqual(value["boundaries"][0]["kind"], "observer")
+        with self.assertRaises(ValueError):
+            budget.animation_windows(rows, float("nan"))
+
+    def test_cost_totals_keep_compilation_and_api_subsets_inclusive(self):
+        row = frame(operation_ns={"text": 1000}, file_read_bytes=17,
+                    cpu={"reason_ns": {"pending": 30}, "sync_compile_ns": 5})
+        total = budget.cost_totals([budget.clean_row(row)] * 2)
+        self.assertEqual(total["file_read_bytes"], 34)
+        self.assertEqual(total["cpu"]["reason_ns"]["pending"], 60)
+        self.assertEqual(total["operation_ns"]["text"], 2000)
+        self.assertNotIn("image_decode", total)
+
+    def test_first_entry_uses_title_ack_and_does_not_claim_warm_cold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            budget.write_json(root / "actions.json", [
+                {"command": "await-frame 1111111111111111 10000", "ack_seconds": 2.5},
+                {"command": "report /private/title.json", "ack_seconds": 3.2}])
+            value = budget.first_entry(root, "title", True, {}, True)
+            self.assertEqual(value["seconds"], 2.5)
+            self.assertEqual(value["status"], "observed_upper_bound")
+            self.assertEqual(budget.first_entry(root, "title", False, {}, True)["status"], "unmeasured")
+
+    def test_timed_ctrl_requires_frozen_start_successful_hold_and_no_early_release(self):
+        scenario = {"schedule": {"steps": [{"checkpoint": "body", "await": {"frame_fnv1a64": "1" * 16}}]},
+                    "scenes": {"ctrl": {"start_checkpoint": "body"}}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            budget.write_json(root / "body.json", {"frames": 3, "frame_fnv1a64": "1" * 16,
+                "scene_gate": {"frozen": True, "pending": False}})
+            budget.write_json(root / "ctrl.json", {"frames": 33})
+            actions = [{"command": "key-down 17", "ack_seconds": 1, "ack": "control ok key-down 17"},
+                       {"command": "report /private/ctrl.json", "sent_seconds": 6},
+                       {"command": "key-up 17", "ack": "control ok key-up 17"}]
+            budget.write_json(root / "actions.json", actions)
+            with patch.object(budget.baseline, "valid_report"):
+                value = budget.timed_ctrl_segment(root, scenario, "ctrl")
+                self.assertEqual(value["commits_per_second"], 6)
+                self.assertFalse(value["fixed_workload"])
+                actions.insert(1, {"command": "key-up 17"})
+                budget.write_json(root / "actions.json", actions)
+                self.assertIsNone(budget.timed_ctrl_segment(root, scenario, "ctrl"))
+
     def test_native_cache_summary_keeps_statistics_without_private_payloads(self):
         result = budget.execution_metrics({"native_entries": 4, "interpreter_entries": 6,
             "code_cache": {"enabled": True, "hits": 3, "bytes": 128, "raw": "private native bytes"},

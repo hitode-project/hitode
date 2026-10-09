@@ -3,7 +3,8 @@
 //! Metadata lives on the host: blocks never carry headers in guest memory, so guest
 //! overruns can't corrupt the allocator. Each heap owns arenas from the VM; free space is
 //! indexed by address (for coalescing) and by size (best fit). Blocks are 8-byte aligned
-//! like the x86 Windows heap. Large blocks get their own VM region.
+//! like the x86 Windows heap. Large blocks get their own zeroed VM region and
+//! release it on free, preserving fresh committed-page contents on each allocation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -243,8 +244,10 @@ impl Heaps {
     ) -> Option<u32> {
         let h = self.heap(handle)?;
         let rsize = round(size)?;
+        let mut freshly_mapped = false;
         let addr = if rsize >= LARGE {
             let a = vm.alloc(cpu, rsize, h.protection()).ok()?;
+            freshly_mapped = true; // Guest::map guarantees zeroed memory, even without ZERO_MEMORY.
             h.large.insert(a, rsize);
             a
         } else {
@@ -257,7 +260,7 @@ impl Heaps {
             }
         };
         h.used.insert(addr, (rsize, size));
-        if zero && zero_memory(cpu, addr, rsize).is_err() {
+        if zero && !freshly_mapped && zero_memory(cpu, addr, rsize).is_err() {
             self.free(cpu, vm, handle, addr);
             return None;
         }
@@ -345,6 +348,7 @@ impl Heaps {
             if cpu.read(addr + offset, &mut buf[..n as usize]).is_err()
                 || cpu.write(new + offset, &buf[..n as usize]).is_err()
             {
+                // Failed reallocations must release speculative VM storage.
                 self.free(cpu, vm, handle, new);
                 return None;
             }
@@ -359,6 +363,7 @@ impl Heaps {
 mod tests {
     use super::*;
     use adv_cpu::backend::Reg;
+    use adv_machine::layout::GRANULE;
     use std::cell::Cell;
 
     #[derive(Default)]
@@ -371,6 +376,7 @@ mod tests {
         fail_read_call: Option<usize>,
         fail_write_call: Option<usize>,
         last_map: u32,
+        map_calls: usize,
     }
     impl MemoryGuest {
         fn bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
@@ -420,6 +426,7 @@ mod tests {
             Ok(())
         }
         fn map(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
+            self.map_calls += 1;
             self.last_map = addr;
             self.memory.insert(addr, vec![0; len as usize]);
             Ok(())
@@ -436,6 +443,114 @@ mod tests {
         let (mut guest, mut vm, mut heaps) = (MemoryGuest::default(), Vm::new(), Heaps::default());
         heaps.process_heap = heaps.create(&mut guest, &mut vm).unwrap();
         (guest, vm, heaps)
+    }
+
+    #[test]
+    fn large_zero_allocation_after_free_without_zero_memory() {
+        let (mut guest, mut vm, mut heaps) = heap();
+        let size = LARGE + 13;
+        let block = heaps.alloc(&mut guest, &mut vm, 0, size, false).unwrap();
+        guest.write(block, &vec![0xa5; size as usize]).unwrap();
+        assert!(heaps.free(&mut guest, &mut vm, 0, block));
+        let next = heaps.alloc(&mut guest, &mut vm, 0, size, false).unwrap();
+        assert_eq!(heaps.size(0, next), Some(size));
+        assert!(
+            guest
+                .bytes(next, size as usize)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0),
+            "large allocations must retain fresh committed-page contents"
+        );
+    }
+
+    #[test]
+    fn large_zero_moving_realloc_preserves_data_and_zeroes_growth() {
+        for zero in [false, true] {
+            let (mut guest, mut vm, mut heaps) = heap();
+            let old_size = LARGE + 1;
+            let new_size = LARGE + GRANULE + 13;
+            let old = heaps
+                .alloc(&mut guest, &mut vm, 0, old_size, false)
+                .unwrap();
+            let pattern: Vec<_> = (0..old_size).map(|i| (i % 251) as u8).collect();
+            guest.write(old, &pattern).unwrap();
+            let spare = heaps
+                .alloc(&mut guest, &mut vm, 0, new_size, false)
+                .unwrap();
+            guest.write(spare, &vec![0xa5; new_size as usize]).unwrap();
+            assert!(heaps.free(&mut guest, &mut vm, 0, spare));
+            let new = heaps
+                .realloc(&mut guest, &mut vm, 0, old, new_size, zero, false)
+                .unwrap();
+            assert_ne!(new, old);
+            assert_eq!(heaps.size(0, old), None);
+            assert_eq!(heaps.size(0, new), Some(new_size));
+            assert_eq!(guest.bytes(new, old_size as usize).unwrap(), pattern);
+            assert!(
+                guest
+                    .bytes(new + old_size, (new_size - old_size) as usize)
+                    .unwrap()
+                    .iter()
+                    .all(|&b| b == 0),
+                "moving large realloc must expose zeroed growth even without ZERO_MEMORY"
+            );
+        }
+    }
+
+    #[test]
+    fn large_mappings_are_zero_without_redundant_writes_and_retire_on_free() {
+        for zero in [false, true] {
+            let (mut guest, mut vm, mut heaps) = heap();
+            let maps = guest.map_calls;
+            let size = LARGE + 13;
+            guest.fail_write_call = Some(1);
+            for requested in [size, size + 9] {
+                let block = heaps
+                    .alloc(&mut guest, &mut vm, 0, requested, zero)
+                    .unwrap();
+                assert_eq!(guest.write_calls, 0, "a new mapping is already zeroed");
+                assert!(
+                    guest
+                        .bytes(block, requested as usize)
+                        .unwrap()
+                        .iter()
+                        .all(|&b| b == 0)
+                );
+                assert_eq!(heaps.size(0, block), Some(requested));
+                assert!(heaps.free(&mut guest, &mut vm, 0, block));
+                assert_eq!(heaps.owner(block), None);
+                assert_eq!(heaps.size(0, block), None);
+                assert_eq!(vm.region(block), None);
+                assert!(!guest.memory.contains_key(&block));
+                assert!(!heaps.free(&mut guest, &mut vm, 0, block));
+            }
+            assert_eq!(guest.map_calls, maps + 2);
+        }
+    }
+
+    #[test]
+    fn large_mapping_ownership_is_per_heap_and_destroy_retires_live_regions() {
+        let (mut guest, mut vm, mut heaps) = heap();
+        let other = heaps.create(&mut guest, &mut vm).unwrap();
+        let first = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
+        let live = heaps
+            .alloc(&mut guest, &mut vm, 0, LARGE + 8, false)
+            .unwrap();
+        let foreign = heaps
+            .alloc(&mut guest, &mut vm, other, LARGE, false)
+            .unwrap();
+        assert!(heaps.free(&mut guest, &mut vm, 0, first));
+        assert_eq!(vm.region(first), None);
+        assert!(!guest.memory.contains_key(&first));
+        assert!(heaps.destroy(&mut guest, &mut vm, heaps.process_heap));
+        assert_eq!(vm.region(live), None);
+        assert!(!guest.memory.contains_key(&live));
+        assert_eq!(vm.region(foreign), Some(LARGE));
+        assert_eq!(heaps.owner(foreign), Some(other));
+        assert!(heaps.destroy(&mut guest, &mut vm, other));
+        assert_eq!(vm.region(foreign), None);
+        assert!(guest.memory.is_empty());
     }
 
     #[test]
@@ -627,17 +742,17 @@ mod tests {
             None
         );
         assert_eq!(heaps.size(0, old), Some(16));
+        // New VM mappings cannot fail a redundant clear; exercise reused arena bytes.
+        let spare = heaps.alloc(&mut guest, &mut vm, 0, 5000, false).unwrap();
+        assert!(heaps.free(&mut guest, &mut vm, 0, spare));
         guest.reset_counts();
         guest.fail_write_call = Some(1);
-        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, LARGE, true), None);
-        let failed = guest.last_map;
-        assert_eq!(vm.region(failed), None);
-        assert_eq!(heaps.owner(failed), None);
+        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), None);
+        assert_eq!(heaps.owner(spare), None);
+        assert_eq!(heaps.size(0, old), Some(16));
         guest.fail_write_call = None;
-        assert_eq!(
-            heaps.alloc(&mut guest, &mut vm, 0, LARGE, true),
-            Some(failed)
-        );
+        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), Some(spare));
+        assert!(guest.bytes(spare, 5000).unwrap().iter().all(|&b| b == 0));
         assert!(guest.max_write <= 4096);
     }
 }

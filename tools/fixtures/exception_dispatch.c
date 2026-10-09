@@ -3,6 +3,7 @@
 
 static DWORD words[256], used;
 static DWORD fault_pc, resume_pc, phase, repaired_seh_head;
+static DWORD original_stack_limit;
 static volatile DWORD *page;
 static WORD desired_cw = 0x077f, after_cw;
 static DWORD desired_mxcsr = 0x5f80, after_mxcsr;
@@ -100,6 +101,12 @@ static __attribute__((noinline)) DWORD caller_frame_holds(void *a, void *b, void
     record(caller_frame_holds(a, b, c, d, *(void ***)__builtin_frame_address(0)))
 
 static LONG __cdecl stack_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
+    if (phase == 14) {
+        DWORD current_limit;
+        __asm__ volatile("movl %%fs:8,%0" : "=r"(current_limit) : : "memory");
+        record(current_limit > (DWORD)frame);
+        __asm__ volatile("movl %0,%%fs:8" : : "r"(original_stack_limit) : "memory");
+    }
     record(0x300 + phase);
     RECORD_CALLER_FRAME(exception, frame, context, dispatcher);
     record(frame == expected_frame);
@@ -117,6 +124,13 @@ static LONG __cdecl inner_handler(EXCEPTION_RECORD *exception, void *frame, CONT
     record(0x600 + phase);
     RECORD_CALLER_FRAME(exception, frame, context, dispatcher);
     record(exception->ExceptionFlags);
+    if (phase == 14) {
+        DWORD limit = (DWORD)frame + sizeof(Registration), observed;
+        __asm__ volatile("movl %%fs:8,%0" : "=r"(original_stack_limit) : : "memory");
+        __asm__ volatile("movl %0,%%fs:8" : : "r"(limit) : "memory");
+        __asm__ volatile("movl %%fs:8,%0" : "=r"(observed) : : "memory");
+        record(observed == limit);
+    }
     return 1; // ExceptionContinueSearch, also during unwind.
 }
 static LONG __cdecl execute_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
@@ -248,6 +262,17 @@ void mainCRTStartup(void) {
     __asm__ volatile("movl %0,%%fs:0" : : "r"(&frames[0]) : "memory");
     read_fault();
     __asm__ volatile("movl %0,%%fs:0" : : "r"(frames[1].previous) : "memory");
+    // Dispatch samples the TEB limits once, before calling frame handlers.
+    // The head both descends and raises the live limit above the next record.
+    phase = 14;
+    frames[1].handler = inner_handler;
+    frames[1].previous = &frames[0];
+    frames[0].handler = stack_handler;
+    expected_frame = &frames[0];
+    __asm__ volatile("movl %%fs:0,%0" : "=r"(frames[0].previous) : : "memory");
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(&frames[1]) : "memory");
+    read_fault();
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(frames[0].previous) : "memory");
     record(nested_entries);
     record(RemoveVectoredExceptionHandler(first));
     record(RemoveVectoredExceptionHandler(second));

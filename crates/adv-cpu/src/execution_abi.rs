@@ -119,8 +119,6 @@ pub(crate) struct Tier1Frame {
     pub value: u32,
     pub fs_base: u32,
     pub operand: u32,
-    /// Borrowed AtomicBool address, valid for the entire native entry.
-    pub poll: u64,
 }
 
 #[cfg(test)]
@@ -130,7 +128,7 @@ mod tests {
 
     #[test]
     fn entry_frame_and_signal_snapshot_have_fixed_c_layouts() {
-        assert_eq!(size_of::<Tier1Frame>(), 88);
+        assert_eq!(size_of::<Tier1Frame>(), 80);
         assert_eq!(offset_of!(Tier1Frame, regs), 0);
         assert_eq!(offset_of!(Tier1Frame, flags), 32);
         assert_eq!(offset_of!(Tier1Frame, pc), 36);
@@ -142,7 +140,6 @@ mod tests {
         assert_eq!(offset_of!(Tier1Frame, value), 68);
         assert_eq!(offset_of!(Tier1Frame, fs_base), 72);
         assert_eq!(offset_of!(Tier1Frame, operand), 76);
-        assert_eq!(offset_of!(Tier1Frame, poll), 80);
         assert_eq!(offset_of!(HostContextSnapshot, sp), 256);
         assert_eq!(offset_of!(HostContextSnapshot, simd), 280);
         assert_eq!(offset_of!(HostContextSnapshot, fpcr), 792);

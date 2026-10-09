@@ -58,6 +58,8 @@ fn attach_operands(
         max,
         stack_words: words,
         operands,
+        start: None,
+        watch_dword: None,
     });
     let path = trace.path.clone();
     cpu.instruction_trace = Some(Box::new(trace));
@@ -146,6 +148,57 @@ fn event_limit_stops_capture_without_stopping_the_guest() {
 }
 
 #[test]
+fn unselected_budget_boundaries_leave_room_for_a_later_selected_visit() {
+    // Authored inc eax; jmp to itself outside the selected range.
+    let mut traced = cpu(&[0x40, 0xeb, 0xfe]);
+    let path = attach(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 1)],
+        5,
+        0,
+    );
+    assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    for _ in 0..10 {
+        assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    }
+    assert_eq!(events(&path).len(), 2);
+    traced.state.eip = CODE;
+    assert_eq!(run(&mut traced, 2), RunOutcome::Budget);
+    let rows = events(&path);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2]["kind"], "instruction");
+    assert_eq!(rows[2]["after"]["eax"], 2);
+    assert!(rows.iter().all(|row| row["capture_stop"].is_null()));
+}
+
+#[test]
+fn delayed_start_preserves_execution_and_captures_the_trigger_instruction() {
+    // Authored two increments, a jump, an increment and a return.
+    let bytes = [0x40, 0x40, 0xeb, 1, 0x90, 0x43, 0xc3];
+    let mut control = cpu(&bytes);
+    let mut traced = cpu(&bytes);
+    let path = attach(
+        &mut traced,
+        vec![u64::from(CODE)..u64::from(CODE + 7)],
+        20,
+        0,
+    );
+    let trace = traced.instruction_trace.as_mut().unwrap();
+    trace.config.start = Some(CODE + 5);
+    trace.armed = false;
+    assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    assert_eq!(traced.state, control.state);
+    let rows = events(&path);
+    assert_eq!(rows[0]["before"]["eip"], CODE + 5);
+    assert_eq!(rows[0]["before"]["eax"], 2);
+    assert_eq!(
+        rows.iter().filter(|r| r["kind"] == "instruction").count(),
+        2
+    );
+}
+
+#[test]
 fn configuration_rejects_empty_or_unbounded_capture_and_non_target_output() {
     let dir = directory();
     for ranges in ["", "0x1000..0x1000", "0..4294967297"] {
@@ -207,6 +260,8 @@ fn io_failure_disables_diagnostics_and_preserves_execution() {
         max: 10,
         stack_words: 1,
         operands: false,
+        start: None,
+        watch_dword: None,
     })));
     assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
     assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
@@ -500,5 +555,153 @@ fn rep_operands_do_not_expand_implicit_memory_observations() {
             assert!(operand.get("ea").is_none());
             assert!(operand["value"].is_null());
         }
+    }
+}
+
+fn stores_then_unrelated_loop() -> Vec<u8> {
+    // Each store belongs to a decoded block ending in a jump. The later loop
+    // does not touch the DWORD and must not consume the watch-event budget.
+    let mut bytes = Vec::new();
+    for value in [1u32, 2] {
+        bytes.extend_from_slice(&[0xc7, 0x05]);
+        bytes.extend_from_slice(&DATA.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&[0xeb, 0]);
+    }
+    bytes.extend_from_slice(&[0x40, 0xeb, 0xfd]);
+    bytes
+}
+
+#[test]
+fn watch_changes_cover_unselected_blocks_without_tracing_unrelated_iterations() {
+    let bytes = stores_then_unrelated_loop();
+    let mut control = cpu(&bytes);
+    let mut traced = cpu(&bytes);
+    let path = attach(&mut traced, vec![0..1], 20, 0);
+    traced
+        .instruction_trace
+        .as_mut()
+        .unwrap()
+        .config
+        .watch_dword = Some(DATA);
+    assert_eq!(run(&mut control, 80), RunOutcome::Budget);
+    assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
+    assert_eq!(traced.state, control.state);
+    assert_eq!(traced.memory.read(DATA, 4).unwrap(), 2u32.to_le_bytes());
+    let rows = events(&path);
+    assert_eq!(rows.len(), 3);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row["kind"], "watch_change");
+        assert_eq!(row["scope"], "between_dispatches");
+        assert_eq!(row["watch_address"], DATA);
+        assert_eq!(row["value"], index);
+        assert_eq!(row["current_state"]["eip"], CODE + index as u32 * 12);
+        assert!(row.get("store_pc").is_none());
+    }
+    assert!(rows[0]["previous_dispatch_pc"].is_null());
+    assert!(rows[0]["previous_value"].is_null());
+    assert_eq!(rows[1]["previous_dispatch_pc"], CODE);
+    assert_eq!(rows[2]["previous_dispatch_pc"], CODE + 12);
+    assert_eq!(rows[1]["previous_value"], 0);
+    assert_eq!(rows[2]["previous_value"], 1);
+    assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
+    assert_eq!(events(&path).len(), 3);
+}
+
+#[test]
+fn watch_first_mapping_and_readability_changes_are_observations_without_cpu_faults() {
+    let mut traced = Executor::create(Memory::reserve(CODE, 0x10000).unwrap()).unwrap();
+    traced.instruction_trace = None;
+    traced.map(CODE, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+    traced.write(CODE, &[0x40, 0xc3]).unwrap();
+    traced
+        .map(STACK & !(PAGE_SIZE as u32 - 1), PAGE_SIZE, READ | WRITE)
+        .unwrap();
+    traced.write(STACK, &STOP.to_le_bytes()).unwrap();
+    traced.state.eip = CODE;
+    traced.state.regs[4] = STACK;
+    let path = attach(&mut traced, vec![0..1], 10, 0);
+    traced
+        .instruction_trace
+        .as_mut()
+        .unwrap()
+        .config
+        .watch_dword = Some(DATA);
+    let observe = |cpu: &mut Executor| {
+        let state = cpu.state.clone();
+        let trace = cpu.instruction_trace.as_mut().unwrap();
+        let (units, instruction) = trace.prepare(32, &state, &cpu.memory);
+        assert_eq!(units, 32);
+        assert!(instruction.is_none());
+        assert_eq!(cpu.state, state);
+    };
+    observe(&mut traced);
+    observe(&mut traced);
+    assert!(!path.exists());
+    traced.map(DATA, PAGE_SIZE, READ | WRITE).unwrap();
+    traced.write(DATA, &123u32.to_le_bytes()).unwrap();
+    observe(&mut traced);
+    observe(&mut traced);
+    traced.protect(DATA, PAGE_SIZE, 0).unwrap();
+    observe(&mut traced);
+    observe(&mut traced);
+    traced.protect(DATA, PAGE_SIZE, READ).unwrap();
+    observe(&mut traced);
+    let rows = events(&path);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["value"], 123);
+    assert!(rows[0]["previous_value"].is_null());
+    assert_eq!(rows[1]["previous_value"], 123);
+    assert!(rows[1]["value"].is_null());
+    assert!(rows[2]["previous_value"].is_null());
+    assert_eq!(rows[2]["value"], 123);
+    assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
+    assert_eq!(events(&path).len(), 3);
+}
+
+#[test]
+fn watch_uses_the_delayed_start_and_shared_event_limit_without_changing_execution() {
+    let bytes = stores_then_unrelated_loop();
+    let mut control = cpu(&bytes);
+    let mut traced = cpu(&bytes);
+    let path = attach(&mut traced, vec![0..1], 2, 0);
+    let trace = traced.instruction_trace.as_mut().unwrap();
+    trace.config.watch_dword = Some(DATA);
+    trace.config.start = Some(CODE + 12);
+    trace.armed = false;
+    assert_eq!(run(&mut control, 80), RunOutcome::Budget);
+    assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
+    assert_eq!(traced.state, control.state);
+    let rows = events(&path);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["value"], 1);
+    assert_eq!(rows[0]["current_state"]["eip"], CODE + 12);
+    assert!(rows[0]["previous_dispatch_pc"].is_null());
+    assert_eq!(rows[1]["value"], 2);
+    assert_eq!(rows[1]["capture_stop"], "limit");
+    traced.write(DATA, &3u32.to_le_bytes()).unwrap();
+    assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
+    assert_eq!(events(&path).len(), 2);
+}
+
+#[test]
+fn watch_address_configuration_rejects_invalid_or_wrapping_dword_ranges() {
+    let mut config = Config::parse(directory(), "0..1", "10", "0", "0").unwrap();
+    assert!(config.watch_dword.is_none());
+    for value in [
+        "",
+        "-1",
+        "invalid",
+        "0x",
+        "4294967296",
+        "0xffffffff",
+        "0xfffffffd",
+    ] {
+        assert!(config.set_watch(value).is_err(), "{value}");
+        assert!(config.watch_dword.is_none());
+    }
+    for (text, address) in [("0", 0), (" 98304 ", DATA), ("0XFFFFFFFC", u32::MAX - 3)] {
+        config.set_watch(text).unwrap();
+        assert_eq!(config.watch_dword, Some(address));
     }
 }

@@ -273,6 +273,8 @@ pub struct SceneGate {
     check_time: Duration,
     hash_time: Duration,
     hash_max: Duration,
+    frame_captures: u64,
+    frame_capture_time: Duration,
 }
 impl SceneGate {
     pub fn arm(&mut self, spec: FrameGateSpec, frame: u64, now: Instant) -> Result<(), String> {
@@ -308,6 +310,14 @@ impl SceneGate {
     }
     pub fn pending(&self) -> bool {
         self.pending.is_some()
+    }
+    pub fn needs_frame_pixels(&self, presented: u64, captured: u64) -> bool {
+        self.pending() && presented != 0 && presented != captured
+    }
+    pub fn frame_capture(&mut self, elapsed: Duration) {
+        self.frame_captures += 1;
+        self.frame_capture_time += elapsed;
+        self.check_time += elapsed;
     }
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
         self.pending
@@ -394,7 +404,8 @@ impl SceneGate {
             concat!(
                 "{{\"arms\":{},\"matches\":{},\"pending\":{},\"frozen\":{},",
                 "\"frame_checks\":{},\"full_hash_checks\":{},\"check_seconds\":{:.9},",
-                "\"hash_seconds\":{:.9},\"hash_max_seconds\":{:.9},\"frozen_observation_seconds\":{:.9}}}"
+                "\"hash_seconds\":{:.9},\"hash_max_seconds\":{:.9},\"frozen_observation_seconds\":{:.9},",
+                "\"frame_captures\":{},\"frame_capture_seconds\":{:.9}}}"
             ),
             self.arms,
             self.matches,
@@ -405,7 +416,9 @@ impl SceneGate {
             self.check_time.as_secs_f64(),
             self.hash_time.as_secs_f64(),
             self.hash_max.as_secs_f64(),
-            frozen.as_secs_f64()
+            frozen.as_secs_f64(),
+            self.frame_captures,
+            self.frame_capture_time.as_secs_f64()
         )
     }
 }
@@ -655,6 +668,28 @@ impl Drop for Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gate_reads_only_pending_uncaptured_frames_and_accounts_observer_cost() {
+        let mut gate = SceneGate::default();
+        assert!(!gate.needs_frame_pixels(8, 7));
+        gate.arm(
+            FrameGateSpec::parse("1111111111111111 1000").unwrap(),
+            7,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(gate.needs_frame_pixels(8, 7));
+        assert!(!gate.needs_frame_pixels(8, 8));
+        assert!(!gate.needs_frame_pixels(0, 7));
+        gate.frame_capture(Duration::from_millis(3));
+        assert_eq!(gate.check_duration(), Duration::from_millis(3));
+        assert!(
+            gate.json()
+                .contains("\"frame_capture_seconds\":0.003000000")
+        );
+        gate.abort("fixture complete", 8, Instant::now());
+        assert!(!gate.needs_frame_pixels(9, 8));
+    }
     #[test]
     fn saturated_diagnostics_cannot_consume_input_capacity_or_grow_pending_storage() {
         let (mut sender, receiver) = channel();

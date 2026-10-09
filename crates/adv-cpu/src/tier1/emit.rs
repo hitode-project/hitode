@@ -3,21 +3,19 @@
 //! other forms leave before the instruction and use the existing interpreter.
 use super::forms::{cmovcc, double_shift, register, register_part, rmw, setcc, shift, string};
 pub(super) use super::forms::{counter_branch, supported};
-use super::{BUDGET, DISPATCH, FALLBACK, LOAD, PollBatch, STORE};
+use super::{BUDGET, DISPATCH, FALLBACK, LOAD, STORE};
 use iced_x86::{ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
 pub(super) enum Label {
     Guest(u32),
-    Fast(u32),
     Exit(u32),
 }
 #[derive(Clone, Copy)]
 pub(super) enum Branch {
     B,
     Equal,
-    CarrySet,
     Zero64(u8),
     Nonzero32(u8),
 }
@@ -62,14 +60,10 @@ pub(super) struct Emitter {
     pub entries: BTreeMap<u32, usize>,
     exits: BTreeMap<u32, usize>,
     fixups: Vec<Fixup>,
-    poll: bool,
-    batches: BTreeMap<u32, PollBatch>,
-    fast_entries: BTreeMap<u32, usize>,
-    fast_next: Option<u32>,
 }
 
 impl Emitter {
-    pub fn new(helpers: Helpers, host_features: crate::HostFeatures, poll: bool) -> Self {
+    pub fn new(helpers: Helpers, host_features: crate::HostFeatures) -> Self {
         Self {
             host_features,
             helpers,
@@ -77,14 +71,7 @@ impl Emitter {
             entries: BTreeMap::new(),
             exits: BTreeMap::new(),
             fixups: Vec::new(),
-            poll,
-            batches: BTreeMap::new(),
-            fast_entries: BTreeMap::new(),
-            fast_next: None,
         }
-    }
-    pub fn set_poll_batches(&mut self, batches: BTreeMap<u32, PollBatch>) {
-        self.batches = batches;
     }
     pub(super) fn word(&mut self, x: u32) {
         self.words.push(x);
@@ -128,10 +115,6 @@ impl Emitter {
         self.word(0xb900_0000 | (offset / 4) << 10 | 27 << 5 | d as u32);
     }
     pub(super) fn jump(&mut self, label: Label, kind: Branch) {
-        let label = match label {
-            Label::Guest(pc) if self.fast_next == Some(pc) => Label::Fast(pc),
-            label => label,
-        };
         self.fixups.push(Fixup {
             at: self.words.len(),
             label,
@@ -771,27 +754,7 @@ impl Emitter {
         self.entries.insert(pc, self.words.len() * 4);
         self.stop_guard(pc);
         self.jump(Label::Exit(BUDGET), Branch::Zero64(7));
-        if self.poll {
-            // The frame pins a borrowed AtomicBool. LDARB is an acquire byte
-            // load, emitted at every checked entry and never inside a helper's
-            // partial commit. Exhausted budget and stop always win this yield.
-            self.word(0xf940_2b69); // ldr x9,[x27,#80]
-            self.word(0x08df_fd29); // ldarb w9,[x9]
-            self.jump(Label::Exit(DISPATCH), Branch::Nonzero32(9));
-        }
-        let batch = self.batches.get(&pc).copied();
-        if let Some(batch) = batch {
-            self.word(0xf100_00ff | batch.units << 10); // cmp x7,#units
-            self.jump(Label::Fast(pc), Branch::CarrySet);
-        }
         self.instruction_body(i, x87, sse);
-        if let Some(batch) = batch {
-            self.fast_entries.insert(pc, self.words.len() * 4);
-            self.stop_guard(pc);
-            self.fast_next = batch.next;
-            self.instruction_body(i, x87, sse);
-            self.fast_next = None;
-        }
     }
     fn stop_guard(&mut self, pc: u32) {
         self.constant(5, pc);
@@ -1248,17 +1211,12 @@ impl Emitter {
         for f in &self.fixups {
             let to = match f.label {
                 Label::Guest(pc) => self.entries[&pc],
-                Label::Fast(pc) => *self
-                    .fast_entries
-                    .get(&pc)
-                    .ok_or("missing Tier 1 fast entry")?,
                 Label::Exit(r) => self.exits[&r],
             };
             let delta = (to as i64 - f.at as i64 * 4) / 4;
             let (base, bits) = match f.kind {
                 Branch::B => (0x1400_0000, 26),
                 Branch::Equal => (0x5400_0000, 19),
-                Branch::CarrySet => (0x5400_0002, 19),
                 Branch::Zero64(r) => (0xb400_0000 | r as u32, 19),
                 Branch::Nonzero32(r) => (0x3500_0000 | r as u32, 19),
             };
