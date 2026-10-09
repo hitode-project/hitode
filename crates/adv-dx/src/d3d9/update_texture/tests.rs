@@ -8,6 +8,8 @@ use adv_cpu::{
 use adv_device::gpu::Image;
 use adv_machine::{Resume, WakeReason};
 
+mod benchmark;
+
 const STACK: u32 = 0x550000;
 #[derive(Default)]
 struct Surfaces {
@@ -443,4 +445,220 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
     assert!(f.m.ext.get::<Surfaces>().targets.is_empty());
     assert!(f.m.ext.get::<Heaps>().owner(source_storage).is_none());
     assert!(f.m.ext.get::<Heaps>().owner(destination_storage).is_none());
+}
+
+#[test]
+fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
+    let mut f = Fixture::new();
+    let source = f.texture(8, 4, 1, 2, 21);
+    let destination = f.texture(8, 4, 1, 0, 21);
+    f.fill(source, 0, &[1, 2, 3, 4], 0);
+    let image = f.image(destination, 0);
+    let storage = resources::resource(&env(&mut f.m), source).unwrap().storage;
+    let rectangle = f.packet(RECT {
+        left: 1,
+        top: 1,
+        right: 3,
+        bottom: 2,
+    });
+    let pause =
+        f.m.ext
+            .get::<State>()
+            .gpu
+            .as_ref()
+            .unwrap()
+            .context()
+            .pause_submissions()
+            .unwrap();
+    let outcome = f.call(
+        "IDirect3DDevice9::UpdateTexture",
+        &[f.device, source, destination],
+    );
+    assert!(matches!(outcome, Outcome::Block { .. }));
+    f.m.cpu.write(storage, &[9, 8, 7, 6].repeat(32)).unwrap();
+    assert_eq!(
+        f.invoke("IDirect3DTexture9::AddDirtyRect", &[source, rectangle]),
+        0
+    );
+    drop(pause);
+    assert_eq!(f.finish(outcome), 0);
+    assert_eq!(f.pixels(&image), [1, 2, 3, 4].repeat(32));
+    let locked = f.lock(destination, 0, 0x10);
+    assert_eq!(
+        f.m.cpu.read_u32(locked.pBits).unwrap().to_le_bytes(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        f.invoke("IDirect3DTexture9::UnlockRect", &[destination, 0]),
+        0
+    );
+    assert_eq!(f.dirty(source), [true]);
+    assert_eq!(f.update(source, destination), 0);
+    assert_eq!(f.pixels(&image), [9, 8, 7, 6].repeat(32));
+    assert_eq!(f.dirty(source), [false]);
+}
+
+#[test]
+fn partial_dirty_marks_copy_matching_tail_mips_and_no_dirty_lock_stays_clean() {
+    let mut f = Fixture::new();
+    let source = f.texture(16, 8, 5, 2, 21);
+    let destination = f.texture(8, 4, 4, 0, 21);
+    for level in 0..5 {
+        f.fill(source, level, &[level as u8, 2, 3, 4], 0x8000);
+    }
+    assert_eq!(f.update(source, destination), 0);
+    let image = f.image(destination, 1);
+    assert_eq!(f.pixels(&image), [2, 2, 3, 4].repeat(8));
+    f.fill(source, 2, &[11, 12, 13, 14], 0x8000);
+    assert_eq!(f.update(source, destination), 0);
+    assert_eq!(f.pixels(&image), [2, 2, 3, 4].repeat(8));
+    let first = f.packet(RECT {
+        left: 1,
+        top: 1,
+        right: 4,
+        bottom: 3,
+    });
+    let second = f.packet(RECT {
+        left: 3,
+        top: 2,
+        right: 7,
+        bottom: 5,
+    });
+    for rectangle in [first, second] {
+        assert_eq!(
+            f.invoke("IDirect3DTexture9::AddDirtyRect", &[source, rectangle]),
+            0
+        );
+    }
+    assert_eq!(f.update(source, destination), 0);
+    assert_eq!(f.pixels(&image), [11, 12, 13, 14].repeat(8));
+    assert_eq!(f.dirty(source), [false; 5]);
+    let output = f.packet(D3DLOCKED_RECT::default());
+    assert_eq!(
+        f.invoke(
+            "IDirect3DTexture9::LockRect",
+            &[source, 0, output, first, 0]
+        ),
+        0
+    );
+    assert_eq!(f.invoke("IDirect3DTexture9::UnlockRect", &[source, 0]), 0);
+    assert_eq!(f.dirty(source), [true; 5]);
+    assert_eq!(f.update(source, destination), 0);
+    assert_eq!(f.dirty(source), [false; 5]);
+}
+
+#[test]
+fn updated_render_target_texture_is_visible_to_get_render_target_data() {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    let mut f = Fixture::new();
+    let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+    let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();
+    let sender = builder.sender(8, 8).unwrap();
+    let _service = builder.start().unwrap();
+    let state = f.m.ext.get_mut::<State>();
+    state.sender = Some(std::rc::Rc::new(std::cell::RefCell::new(sender)));
+    state.wake = Some(wake.clone());
+    let source = f.texture(8, 4, 1, 2, 21);
+    f.fill(source, 0, &[31, 41, 59, 26], 0);
+    let output = f.packet(0u32);
+    assert_eq!(
+        f.invoke(
+            "IDirect3DDevice9::CreateTexture",
+            &[f.device, 8, 4, 1, 1, 21, 0, output, 0]
+        ),
+        0
+    );
+    let destination = f.m.cpu.read_u32(output).unwrap();
+    assert_eq!(f.update(source, destination), 0);
+    assert_eq!(
+        f.invoke(
+            "IDirect3DTexture9::GetSurfaceLevel",
+            &[destination, 0, output]
+        ),
+        0
+    );
+    let surface = f.m.cpu.read_u32(output).unwrap();
+    assert_eq!(
+        f.invoke(
+            "IDirect3DDevice9::CreateOffscreenPlainSurface",
+            &[f.device, 8, 4, 21, 2, output, 0]
+        ),
+        0
+    );
+    let staging = f.m.cpu.read_u32(output).unwrap();
+    let outcome = f.call(
+        "IDirect3DDevice9::GetRenderTargetData",
+        &[f.device, surface, staging],
+    );
+    let Outcome::Block {
+        wait: Wait::Object { handle, .. },
+        then,
+        ..
+    } = outcome
+    else {
+        panic!("expected readback continuation")
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        super::super::pump(&mut f.m).unwrap();
+        if matches!(
+            f.m.sys.objects.get(handle),
+            Some(Object::Event { signaled: true, .. })
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bounded readback wait");
+        wake.wait(Some(Duration::from_millis(10))).unwrap();
+    }
+    assert!(matches!(
+        then(&mut env(&mut f.m), Resume::Woke(WakeReason::Signaled)),
+        Outcome::Return(0)
+    ));
+    let locked = f.packet(D3DLOCKED_RECT::default());
+    assert_eq!(
+        f.invoke("IDirect3DSurface9::LockRect", &[staging, locked, 0, 0x10]),
+        0
+    );
+    let locked: D3DLOCKED_RECT = GuestPtr::new(locked).read(&f.m.cpu).unwrap();
+    let mut pixels = vec![0; 8 * 4 * 4];
+    f.m.cpu.read(locked.pBits, &mut pixels).unwrap();
+    assert_eq!(pixels, [31, 41, 59, 26].repeat(32));
+}
+
+#[test]
+fn successive_sizes_formats_and_mip_chains_keep_original_shadow_and_gpu_pixels() {
+    let mut f = Fixture::new();
+    for (width, height, levels, format) in
+        [(16, 8, 1, 22), (4, 2, 3, 26), (2, 2, 1, 21), (16, 8, 5, 22)]
+    {
+        let source = f.texture(width, height, levels, 2, format);
+        let destination = f.texture(width, height, levels, 0, format);
+        let (raw, bgra) = match format {
+            26 => (vec![0x23, 0x81], vec![51, 34, 17, 136]),
+            22 => (vec![1, 2, 3, 4], vec![1, 2, 3, 255]),
+            _ => (vec![5, 6, 7, 8], vec![5, 6, 7, 8]),
+        };
+        for level in 0..levels {
+            f.fill(source, level, &raw, 0x8000);
+        }
+        assert_eq!(f.update(source, destination), 0);
+        for level in 0..levels {
+            let count = ((width >> level).max(1) * (height >> level).max(1)) as usize;
+            let image = f.image(destination, level as usize);
+            assert_eq!(f.pixels(&image), bgra.repeat(count));
+            let locked = f.lock(destination, level, 0x10);
+            let mut shadow = vec![0; raw.len() * count];
+            f.m.cpu.read(locked.pBits, &mut shadow).unwrap();
+            assert_eq!(shadow, raw.repeat(count));
+            assert_eq!(
+                f.invoke("IDirect3DTexture9::UnlockRect", &[destination, level]),
+                0
+            );
+        }
+        assert_eq!(f.invoke("IDirect3DTexture9::Release", &[source]), 0);
+        assert_eq!(f.invoke("IDirect3DTexture9::Release", &[destination]), 0);
+    }
 }

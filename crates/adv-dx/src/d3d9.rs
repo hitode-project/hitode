@@ -34,6 +34,7 @@ mod targets;
 mod tests;
 mod update_texture;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const INVALID: u32 = 0x8876086c;
 const UNAVAILABLE: u32 = 0x8876086a;
@@ -191,7 +192,7 @@ enum Operation {
         resource: Id,
         level: Option<u32>,
         target: Target,
-        pixels: Vec<u8>,
+        pixels: Arc<Vec<u8>>,
         pitch: u32,
         rectangle: adv_device::surface::Rect,
     },

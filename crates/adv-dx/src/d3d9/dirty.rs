@@ -155,7 +155,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
             resource: id,
             level: Some(index),
             target,
-            pixels,
+            pixels: Arc::new(pixels),
             pitch,
             rectangle,
         },
