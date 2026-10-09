@@ -71,9 +71,12 @@ pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: V
 
 impl Emitter<'_> {
     pub(super) fn tail_to(&mut self, address: Value) {
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Tail));
         self.b
             .ins()
             .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        self.mark_source(source);
     }
 }
 
@@ -197,6 +200,7 @@ impl Emitter<'_> {
         reason: Option<Value>,
         prediction: Option<Value>,
     ) {
+        self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Link));
         let returned = self.b.create_block();
         if let Some(reason) = reason {
             let candidate = self.b.create_block();

@@ -54,6 +54,66 @@ fn consumer(a: &mut CodeAssembler, form: usize) {
 }
 
 #[test]
+fn carry_from_mixed_predecessors_survives_partial_writers_and_a_fault() {
+    const BAD: u32 = 0x2e000;
+    for form in 0..7 {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut raw = a.create_label();
+        let mut join = a.create_label();
+        // JECXZ selects a predecessor without replacing its incoming flags.
+        a.jecxz(raw).unwrap();
+        producer(&mut a, form);
+        a.jmp(join).unwrap();
+        a.set_label(&mut raw).unwrap();
+        a.cmc().unwrap();
+        a.set_label(&mut join).unwrap();
+        a.inc(edi).unwrap();
+        a.shl(esi, cl).unwrap(); // Both tested counts mask to zero.
+        a.setb(dl).unwrap();
+        a.mov(eax, dword_ptr(BAD)).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+            let mut jit = machine(&bytes, Some(strategy));
+            let mut reference = machine(&bytes, None);
+            for m in [&mut jit, &mut reference] {
+                m.protect(BAD, 4096, 0).unwrap();
+            }
+            for (left, right) in [
+                (0, 1),
+                (u32::MAX, 1),
+                (0x7fff_ffff, 1),
+                (0x8000_0000, u32::MAX),
+                (0xff, 1),
+            ] {
+                for flags in [0x202, 0xad7] {
+                    for count in [0, 32] {
+                        for m in [&mut jit, &mut reference] {
+                            m.state = CpuState {
+                                regs: [left, count, 0, right, STACK, 0, left ^ right, 7],
+                                eflags: flags,
+                                eip: CODE,
+                                ..CpuState::default()
+                            };
+                        }
+                        let expected = reference.run(STOP, 100).unwrap();
+                        assert!(matches!(
+                            expected,
+                            RunOutcome::ReadFault { address: BAD, .. }
+                        ));
+                        assert_eq!(jit.run(STOP, 100).unwrap(), expected);
+                        assert_eq!(jit.state.regs, reference.state.regs);
+                        assert_eq!(jit.state.eflags, reference.state.eflags);
+                        assert_eq!(jit.state.eip, reference.state.eip);
+                    }
+                }
+            }
+            assert_eq!(jit.stats.interpreter_entries, 0);
+        }
+    }
+}
+
+#[test]
 fn carry_controls_preserve_carried_overflow_after_rotate_and_multiply() {
     for operation in [0, 3] {
         let mut a = CodeAssembler::new(32).unwrap();

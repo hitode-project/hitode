@@ -119,6 +119,10 @@ fn label(loc: ir::SourceLoc, origin: u32, instructions: &BTreeMap<u32, Instructi
         6 => "transfer",
         7 => "exit",
         8 => "flags",
+        9 => "state-write",
+        10 => "link",
+        11 => "tail",
+        12 => "state-read",
         _ => "unknown",
     };
     if !loc.is_default() && bits >= 16 {

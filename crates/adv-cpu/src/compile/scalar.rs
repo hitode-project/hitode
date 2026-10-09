@@ -302,10 +302,7 @@ impl Emitter<'_> {
         self.b.def_var(self.lazy[0], a);
         self.b.def_var(self.lazy[1], overflow);
         self.b.def_var(self.lazy[3], kind);
-        let zero = self.constant(0);
-        for (var, value) in self.lazy[4..].iter().zip([carry, zero, zero]) {
-            self.b.def_var(*var, value);
-        }
+        self.b.def_var(self.lazy[4], carry);
     }
 
     /// Make `flags` the whole EFLAGS, with no lazily derived bits.
@@ -319,8 +316,8 @@ impl Emitter<'_> {
         self.b.def_var(self.lazy[4], carry);
     }
 
-    fn flags_state(&mut self) -> [Value; 8] {
-        let mut state = [self.b.use_var(self.flags); 8];
+    fn flags_state(&mut self) -> [Value; 6] {
+        let mut state = [self.b.use_var(self.flags); 6];
         for (value, var) in state[1..].iter_mut().zip(self.lazy) {
             *value = self.b.use_var(var);
         }
@@ -328,8 +325,8 @@ impl Emitter<'_> {
     }
 
     /// A zero masked count leaves every flag unchanged.
-    fn keep_flags_if(&mut self, keep: Value, saved: [Value; 8]) {
-        let mut vars = [self.flags; 8];
+    fn keep_flags_if(&mut self, keep: Value, saved: [Value; 6]) {
+        let mut vars = [self.flags; 6];
         vars[1..].copy_from_slice(&self.lazy);
         for (var, old) in vars.into_iter().zip(saved) {
             let new = self.b.use_var(var);
@@ -355,10 +352,7 @@ impl Emitter<'_> {
             };
             // Only CF changes. Keep the arithmetic producer and raw EFLAGS
             // intact, including any lazily carried OF from a rotate/MUL.
-            let zero = self.constant(0);
-            for (var, value) in self.lazy[4..].iter().zip([carry, zero, zero]) {
-                self.b.def_var(*var, value);
-            }
+            self.b.def_var(self.lazy[4], carry);
             return;
         }
         if matches!(i.mnemonic(), M::Cld | M::Std) {
@@ -596,10 +590,7 @@ impl Emitter<'_> {
         let equal_and_carry = self.b.ins().band(equal, carry);
         let carry_out = self.b.ins().bor(less, equal_and_carry);
         self.arithmetic_flags(a, b, result, size, false);
-        let zero = self.constant(0);
-        for (var, value) in self.lazy[4..].iter().zip([carry_out, zero, zero]) {
-            self.b.def_var(*var, value);
-        }
+        self.b.def_var(self.lazy[4], carry_out);
         self.write(i, ptr, result);
     }
 
@@ -623,10 +614,7 @@ impl Emitter<'_> {
         let borrow = self.b.ins().bor(less, equal_and_carry);
         // The original operands and final result also give SBB's AF and OF.
         self.arithmetic_flags(a, b, result, size, true);
-        let zero = self.constant(0);
-        for (var, value) in self.lazy[4..].iter().zip([borrow, zero, zero]) {
-            self.b.def_var(*var, value);
-        }
+        self.b.def_var(self.lazy[4], borrow);
         self.write(i, ptr, result);
     }
 
