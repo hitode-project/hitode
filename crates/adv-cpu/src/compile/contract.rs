@@ -24,6 +24,19 @@ fn requested(b: &mut FunctionBuilder<'_>, interrupt: Value) -> Value {
 /// Rust entries start from canonical state. Linked entries have already polled
 /// their outgoing edge, so repeating this check in every Tail body is wasteful.
 pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: Value) {
+    let interrupt = b.ins().load(
+        ptr,
+        MemFlags::trusted(),
+        context,
+        offset_of!(NativeContext, interrupt) as i32,
+    );
+    let pending = requested(b, interrupt);
+    let polled = b.create_block();
+    b.set_cold_block(polled);
+    let continued = b.create_block();
+    b.ins().brif(pending, polled, &[], continued, &[]);
+    b.switch_to_block(polled);
+    // Exhausted fuel and the stop PC outrank an interrupt; the body reports them.
     let state = b.ins().load(
         ptr,
         MemFlags::trusted(),
@@ -42,27 +55,17 @@ pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: V
         state,
         offset_of!(CpuState, fuel) as i32,
     );
-    let interrupt = b.ins().load(
-        ptr,
-        MemFlags::trusted(),
-        context,
-        offset_of!(NativeContext, interrupt) as i32,
-    );
-    let pending = requested(b, interrupt);
     let stop = b.ins().load(
         types::I32,
         MemFlags::trusted(),
         context,
         offset_of!(NativeContext, stop) as i32,
     );
-    let work = b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-    let ordinary = b.ins().icmp(IntCC::NotEqual, pc, stop);
-    let pending = b.ins().band(pending, work);
-    let pending = b.ins().band(pending, ordinary);
+    let idle = b.ins().icmp_imm(IntCC::Equal, fuel, 0);
+    let stopped = b.ins().icmp(IntCC::Equal, pc, stop);
+    let deferred = b.ins().bor(idle, stopped);
     let interrupted = b.create_block();
-    b.set_cold_block(interrupted);
-    let continued = b.create_block();
-    b.ins().brif(pending, interrupted, &[], continued, &[]);
+    b.ins().brif(deferred, continued, &[], interrupted, &[]);
     b.switch_to_block(interrupted);
     let reason = b.ins().iconst(types::I32, Exit::Interrupted as i64);
     b.ins().return_(&[reason]);
@@ -308,13 +311,21 @@ impl Emitter<'_> {
         let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
         self.b.ins().return_(&[reason]);
     }
+    /// The hot path tests the interrupt byte alone. Exhausted fuel and the
+    /// stop PC outrank an interrupt; the cold side lets them report themselves.
     pub(super) fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
-        let mut pending = requested(&mut self.b, self.interrupt);
+        let pending = requested(&mut self.b, self.interrupt);
+        let polled = self.b.create_block();
+        self.b.set_cold_block(polled);
+        let continued = self.b.create_block();
+        self.b.ins().brif(pending, polled, &[], continued, &[]);
+        self.b.switch_to_block(polled);
+        self.b.seal_block(polled);
+        let mut deferred = None;
         // A clone checks interrupts after funding its next iteration.
         if self.fast.is_none() {
             let fuel = self.b.use_var(self.fuel);
-            let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-            pending = self.b.ins().band(pending, work);
+            deferred = Some(self.b.ins().icmp_imm(IntCC::Equal, fuel, 0));
         }
         if respect_stops {
             let stop = self.b.ins().load(
@@ -323,15 +334,23 @@ impl Emitter<'_> {
                 self.context,
                 offset_of!(NativeContext, stop) as i32,
             );
-            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
-            pending = self.b.ins().band(pending, ordinary);
+            let stopped = self.b.ins().icmp(IntCC::Equal, pc, stop);
+            deferred = Some(match deferred {
+                Some(idle) => self.b.ins().bor(idle, stopped),
+                None => stopped,
+            });
         }
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let continued = self.b.create_block();
-        self.b.ins().brif(pending, interrupted, &[], continued, &[]);
-        self.b.switch_to_block(interrupted);
+        if let Some(deferred) = deferred {
+            let interrupted = self.b.create_block();
+            self.b.set_cold_block(interrupted);
+            self.b
+                .ins()
+                .brif(deferred, continued, &[], interrupted, &[]);
+            self.b.switch_to_block(interrupted);
+            self.b.seal_block(interrupted);
+        }
         self.exit(Exit::Interrupted, pc);
         self.b.switch_to_block(continued);
+        self.b.seal_block(continued);
     }
 }
