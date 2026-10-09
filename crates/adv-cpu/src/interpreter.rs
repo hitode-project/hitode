@@ -1,8 +1,9 @@
 //! Bounded predecoded x86-32 integer execution on the shared CPU and memory.
 //!
-//! Each supported instruction stages its integer state and its memory
-//! write. All guest accesses are checked before that write and the CPU commit;
-//! faults and unsupported forms therefore leave the instruction restartable.
+//! Potentially faulting instructions stage integer state and memory writes.
+//! Infallible register forms commit directly at the same instruction boundary.
+//! Guest accesses are checked before the write and CPU commit, keeping faults
+//! and unsupported forms restartable.
 //! Undefined arithmetic flags are preserved rather than borrowed from the host.
 //! GS, segment/control registers and far transfers remain outside the flat model.
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +14,8 @@ use iced_x86::{
 };
 
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
+
+mod registers;
 
 const CF: u32 = 1;
 const PF: u32 = 1 << 2;
@@ -285,39 +288,47 @@ impl Interpreter {
         self.refresh(memory);
         let pc = state.eip;
         let revision = native.map(|(_, revision)| revision);
-        if !self.blocks.get(&pc).is_some_and(|block| {
+        if let Some(block) = self.blocks.get_mut(&pc).filter(|block| {
             block.revision == revision && (self.event_validity || block.valid(memory))
         }) {
-            let mut block =
-                DecodedBlock::fetch(memory, pc, native, &mut self.decodes, self.event_validity);
-            if self.capacity == 0 || (self.event_validity && !block.cacheable(memory)) {
-                return block.execute_observed(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    self.census.as_mut(),
-                    self.frame_retired.as_mut(),
-                );
-            }
-            // Bound each independent cache in entries. A larger block working set
-            // avoids flushing hot floating fallback sequences during discovery.
-            if self.blocks.len() >= self.capacity {
-                if self.event_validity {
-                    self.clear_cache();
-                } else {
-                    self.blocks.clear();
-                }
-            }
-            if self.event_validity {
-                self.validity.insert(
-                    (true, pc),
-                    block.pages.iter().map(|page| page.address),
-                    memory,
-                );
-            }
-            self.blocks.insert(pc, block);
+            return block.execute_observed(
+                state,
+                memory,
+                max_units,
+                stop,
+                self.census.as_mut(),
+                self.frame_retired.as_mut(),
+            );
         }
+        let mut block =
+            DecodedBlock::fetch(memory, pc, native, &mut self.decodes, self.event_validity);
+        if self.capacity == 0 || (self.event_validity && !block.cacheable(memory)) {
+            return block.execute_observed(
+                state,
+                memory,
+                max_units,
+                stop,
+                self.census.as_mut(),
+                self.frame_retired.as_mut(),
+            );
+        }
+        // Bound each independent cache in entries. A larger block working set
+        // avoids flushing hot floating fallback sequences during discovery.
+        if self.blocks.len() >= self.capacity {
+            if self.event_validity {
+                self.clear_cache();
+            } else {
+                self.blocks.clear();
+            }
+        }
+        if self.event_validity {
+            self.validity.insert(
+                (true, pc),
+                block.pages.iter().map(|page| page.address),
+                memory,
+            );
+        }
+        self.blocks.insert(pc, block);
         self.blocks.get_mut(&pc).unwrap().execute_observed(
             state,
             memory,
@@ -404,6 +415,16 @@ fn execute_decoded(
             step: Step::ReadTimestamp {
                 pc,
                 next: instruction.next,
+            },
+            units: 1,
+        };
+    }
+    if instruction.register_only && registers::execute(instruction, state) {
+        return Execution {
+            step: if debug {
+                Step::Trap { pc, vector: 1 }
+            } else {
+                Step::Executed
             },
             units: 1,
         };
@@ -498,6 +519,7 @@ struct Predecoded {
     action: Action,
     next: u32,
     exclusive: bool,
+    register_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -611,6 +633,7 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
+            register_only: registers::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg
@@ -829,13 +852,26 @@ impl DecodedBlock {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
-            let execution = execute_decoded(
-                decoded,
-                state,
-                memory,
-                max_units - result.units,
-                Some(&mut deferred_mmx),
-            );
+            let execution = if let Decoded::Ready(instruction) = decoded
+                && instruction.register_only
+                && !instruction.exclusive
+                && state.rep.is_none()
+                && state.eflags & 0x100 == 0
+                && registers::execute(instruction, state)
+            {
+                Execution {
+                    step: Step::Executed,
+                    units: 1,
+                }
+            } else {
+                execute_decoded(
+                    decoded,
+                    state,
+                    memory,
+                    max_units - result.units,
+                    Some(&mut deferred_mmx),
+                )
+            };
             observe(n, execution.units);
             retire(decoded, execution, state, pc);
             result.units += execution.units;
@@ -944,17 +980,20 @@ impl Address {
         })
     }
     fn resolve(self, tx: &Transaction) -> u32 {
+        self.resolve_regs(&tx.regs, tx.fs_base)
+    }
+    fn resolve_regs(self, regs: &[u32; 8], fs_base: u32) -> u32 {
         let mut offset = self.displacement;
         if let Some(r) = self.base {
-            offset = offset.wrapping_add(r.read(&tx.regs));
+            offset = offset.wrapping_add(r.read(regs));
         }
         if let Some(r) = self.index {
-            offset = offset.wrapping_add(r.read(&tx.regs).wrapping_mul(u32::from(self.scale)));
+            offset = offset.wrapping_add(r.read(regs).wrapping_mul(u32::from(self.scale)));
         }
         if self.word {
             offset &= 0xffff;
         }
-        offset.wrapping_add(if self.fs { tx.fs_base } else { 0 })
+        offset.wrapping_add(if self.fs { fs_base } else { 0 })
     }
 }
 
@@ -1716,37 +1755,10 @@ impl Transaction {
         self.flags = (self.flags & !bit) | if value { bit } else { 0 };
     }
     fn szp(&mut self, value: u32, width: u8) {
-        let value = value & mask(width);
-        self.flag(ZF, value == 0);
-        self.flag(SF, value & (1 << (u32::from(width) * 8 - 1)) != 0);
-        self.flag(PF, (value as u8).count_ones().is_multiple_of(2));
+        registers::szp(&mut self.flags, value, width);
     }
     fn arithmetic(&mut self, a: u32, b: u32, carry: u32, width: u8, subtract: bool) -> u32 {
-        let a = a & mask(width);
-        let b = b & mask(width);
-        let result = if subtract {
-            a.wrapping_sub(b).wrapping_sub(carry)
-        } else {
-            a.wrapping_add(b).wrapping_add(carry)
-        } & mask(width);
-        let wide = if subtract {
-            signed(a, width) - signed(b, width) - i64::from(carry)
-        } else {
-            signed(a, width) + signed(b, width) + i64::from(carry)
-        };
-        let limit = 1i64 << (u32::from(width) * 8 - 1);
-        self.flag(
-            CF,
-            if subtract {
-                u64::from(a) < u64::from(b) + u64::from(carry)
-            } else {
-                u64::from(a) + u64::from(b) + u64::from(carry) > u64::from(mask(width))
-            },
-        );
-        self.flag(OF, wide < -limit || wide >= limit);
-        self.flag(AF, (a ^ b ^ result) & 0x10 != 0);
-        self.szp(result, width);
-        result
+        registers::arithmetic(&mut self.flags, a, b, carry, width, subtract)
     }
     fn execute(&mut self, action: Action, memory: &Memory) -> Result<Option<u8>, Step> {
         match action {
@@ -1807,22 +1819,7 @@ impl Transaction {
             Action::Binary(kind, dst, src) => {
                 let (a, b) = (self.read(memory, dst)?, self.read(memory, src)?);
                 let width = dst.width().unwrap();
-                let carry = u32::from(self.flags & CF != 0 && matches!(kind, M::Adc | M::Sbb));
-                let value = match kind {
-                    M::Add | M::Adc => self.arithmetic(a, b, carry, width, false),
-                    M::Sub | M::Sbb | M::Cmp => self.arithmetic(a, b, carry, width, true),
-                    _ => {
-                        let value = match kind {
-                            M::And | M::Test => a & b,
-                            M::Or => a | b,
-                            M::Xor => a ^ b,
-                            _ => unreachable!(),
-                        };
-                        self.flags &= !(CF | OF);
-                        self.szp(value, width);
-                        value
-                    }
-                };
+                let value = registers::binary(&mut self.flags, kind, a, b, width);
                 if !matches!(kind, M::Cmp | M::Test) {
                     self.store(memory, dst, value)?;
                 }
@@ -1830,16 +1827,7 @@ impl Transaction {
             Action::Unary(kind, dst) => {
                 let value = self.read(memory, dst)?;
                 let width = dst.width().unwrap();
-                let result = match kind {
-                    M::Not => !value,
-                    M::Neg => self.arithmetic(0, value, 0, width, true),
-                    _ => {
-                        let carry = self.flags & CF;
-                        let result = self.arithmetic(value, 1, 0, width, kind == M::Dec);
-                        self.flags = (self.flags & !CF) | carry;
-                        result
-                    }
-                };
+                let result = registers::unary(&mut self.flags, kind, value, width);
                 self.store(memory, dst, result)?;
             }
             Action::Shift(kind, dst, count) => {
