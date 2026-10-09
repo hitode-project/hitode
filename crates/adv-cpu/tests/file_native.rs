@@ -43,6 +43,95 @@ fn finish(cpu: &mut JitCpu) {
 }
 
 #[test]
+fn owned_copy_reads_and_first_store_preserve_page_ownership() {
+    for strategy in [
+        adv_cpu::CompileStrategy::Fast,
+        adv_cpu::CompileStrategy::Speed,
+    ] {
+        let code = program(|a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.movdqu(xmm0, ptr(esi)).unwrap();
+            a.add(dword_ptr(edi), eax).unwrap();
+            a.ret().unwrap();
+        });
+        let mut cpu = fixture(&code, false);
+        let bytes: Vec<_> = (0..8192).map(|i| (i * 17 % 251) as u8).collect();
+        cpu.map_private_copy_pages(DATA, &bytes, Prot::RW).unwrap();
+        cpu.executor_mut().state.regs[6] = DATA + 4094;
+        cpu.executor_mut().state.regs[7] = DATA + 16;
+        let mut region = Region::new(CODE, code.len());
+        region.compile_strategy = strategy;
+        cpu.executor_mut().add_region(region).unwrap();
+        assert_eq!(
+            cpu.executor_mut().run(STOP, 10000).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        let expected = u32::from_le_bytes(bytes[4094..4098].try_into().unwrap());
+        assert_eq!(cpu.executor().state.regs[0], expected);
+        assert_eq!(cpu.executor().state.xmm[0], bytes[4094..4110]);
+        let mut actual = [0; 4];
+        cpu.read(DATA + 16, &mut actual).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(actual),
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()).wrapping_add(expected)
+        );
+        assert_eq!(cpu.file_page_copy_on_write(DATA), Some(false));
+        assert_eq!(cpu.file_page_copy_on_write(DATA + 4096), Some(true));
+    }
+}
+
+#[test]
+fn owned_copy_cross_page_permission_faults_preserve_the_uncommitted_operand() {
+    for strategy in [
+        adv_cpu::CompileStrategy::Fast,
+        adv_cpu::CompileStrategy::Speed,
+    ] {
+        for write in [false, true] {
+            let code = program(|a| {
+                if write {
+                    a.add(dword_ptr(esi), eax).unwrap();
+                } else {
+                    a.movdqu(xmm0, ptr(esi)).unwrap();
+                }
+                a.ret().unwrap();
+            });
+            let mut cpu = fixture(&code, false);
+            cpu.map_private_copy_pages(DATA, &[0x37; 8192], Prot::RW)
+                .unwrap();
+            cpu.protect(DATA + 4096, 4096, if write { Prot::READ } else { Prot(0) })
+                .unwrap();
+            cpu.executor_mut().state.regs[6] = DATA + 4094;
+            cpu.executor_mut().state.regs[0] = 0x1823_4589;
+            cpu.executor_mut().state.xmm[0] = [0x91; 16];
+            let before = cpu.executor().state.clone();
+            let mut region = Region::new(CODE, code.len());
+            region.compile_strategy = strategy;
+            cpu.executor_mut().add_region(region).unwrap();
+            let expected = if write {
+                RunOutcome::WriteFault {
+                    pc: CODE,
+                    address: DATA + 4094,
+                }
+            } else {
+                RunOutcome::ReadFault {
+                    pc: CODE,
+                    address: DATA + 4094,
+                }
+            };
+            assert_eq!(cpu.executor_mut().run(STOP, 10000).unwrap(), expected);
+            assert_eq!(cpu.executor().state.regs, before.regs);
+            assert_eq!(cpu.executor().state.xmm, before.xmm);
+            assert_eq!(cpu.executor().state.eflags, before.eflags);
+            let mut actual = [0; 8192];
+            cpu.read(DATA, &mut actual).unwrap();
+            assert_eq!(actual, [0x37; 8192]);
+            assert_eq!(cpu.file_page_copy_on_write(DATA), Some(true));
+            assert_eq!(cpu.file_page_copy_on_write(DATA + 4096), Some(true));
+        }
+    }
+}
+
+#[test]
 fn scalar_mmx_and_simd_cross_page_reads_writes_and_cow_aliases_stay_native() {
     for width in [1, 2, 4, 8, 16] {
         for cow in [false, true] {

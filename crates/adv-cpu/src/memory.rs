@@ -186,7 +186,8 @@ impl Memory {
         let watched = self
             .selective_code_writes()
             .then_some(self.watched.as_slice());
-        self.fast.snapshot(&self.perms, watched)
+        self.fast
+            .snapshot(&self.perms, watched, &self.private_copy_pages)
     }
 
     /// Conservative modes already forbid every executable guest store in
