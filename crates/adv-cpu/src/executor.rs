@@ -829,10 +829,6 @@ impl Executor {
         // optimize an already admitted whole loop under a separate finite cap;
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
-        if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
-            self.stats.compilation_schedule.capacity_rejections += 1;
-            return Ok(false);
-        }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         self.locate_cache_input(&mut snapshot);
@@ -903,6 +899,12 @@ impl Executor {
                     self.publish(region, compiled);
                 }
                 continue;
+            }
+            // A native-cache hit needs no compiler permit. Only an actual miss
+            // is subject to the unrestricted queue's admission limit.
+            if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
+                self.stats.compilation_schedule.capacity_rejections += 1;
+                return Ok(false);
             }
             if !self.pending_regions.contains_key(&fragment.region.start) {
                 self.schedule_deferred(fragment.region.start);
@@ -1482,6 +1484,21 @@ impl Executor {
         let hits = self.hits.entry(pc).or_default();
         *hits = hits.saturating_add(1);
         if *hits < 32 {
+            return Ok(());
+        }
+        // An unrestricted queue cannot retain this discovery until a permit is
+        // free. Avoid rebuilding the same CFG on every interpreter chunk.
+        // Persistent entries have already been offered by apply_code_cache.
+        if self.async_compilation
+            && self.pending_regions.len() >= crate::compiler::CAPACITY
+            && self
+                .background_sender()?
+                .borrow()
+                .work_policy()
+                .background_limit()
+                .is_none()
+        {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(());
         }
         // The interpreter keeps running a loop while its region compiles. Its
