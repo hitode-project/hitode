@@ -541,7 +541,7 @@ impl Cached {
     }
 }
 
-fn fetch(memory: &mut Memory, pc: u32) -> Cached {
+fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Option<u32>) {
     memory.watch_code(pc, 15);
     let mut entry = Cached {
         decoded: Decoded::Stop(Step::InvalidInstruction { pc }),
@@ -551,9 +551,10 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         pages: [None; 2],
     };
     let mut denied = None;
-    for offset in 0..15u32 {
-        let Some(address) = pc.checked_add(offset) else {
-            denied = Some(pc.wrapping_add(offset));
+    while entry.len < 15 {
+        let offset = usize::from(entry.len);
+        let Some(address) = pc.checked_add(offset as u32) else {
+            denied = Some(pc.wrapping_add(offset as u32));
             break;
         };
         let page = Page::at(memory, address);
@@ -566,17 +567,38 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
             denied = Some(address);
             break;
         }
-        match memory.read_data(address, 1) {
-            Ok(byte) => {
-                entry.bytes[offset as usize] = byte[0];
-                entry.len += 1;
-            }
-            Err(_) => {
+        // Preserve the existing bytewise reads of concurrently shared code.
+        // Ordinary ranges require only one mapping/host-protection check per
+        // page, including execute-only pages (data READ is not required here).
+        let mut len = if BULK && page.permissions & crate::memory::SHARED == 0 {
+            (15 - offset).min(PAGE_SIZE - address as usize % PAGE_SIZE)
+        } else {
+            1
+        };
+        if memory
+            .read_into(address, &mut entry.bytes[offset..offset + len])
+            .is_err()
+        {
+            // Retain exact prefix/fault behavior for a partially available
+            // range or a host access failure, without assuming page alignment
+            // of the owning Memory's end.
+            if len == 1
+                || memory
+                    .read_into(address, &mut entry.bytes[offset..offset + 1])
+                    .is_err()
+            {
                 denied = Some(address);
                 break;
             }
+            len = 1;
         }
+        entry.len += len as u8;
     }
+    (entry, denied)
+}
+
+fn fetch(memory: &mut Memory, pc: u32) -> Cached {
+    let (mut entry, denied) = fetch_bytes::<true>(memory, pc);
     let mut decoder = Decoder::with_ip(
         32,
         &entry.bytes[..entry.len as usize],
@@ -2445,5 +2467,67 @@ mod tests {
         state.eip = code;
         assert_eq!(uncached.step(&mut state, &mut memory), Step::Executed);
         assert_eq!(uncached.cached_instructions(), 0);
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    #[test]
+    fn bulk_fetch_matches_bytewise_prefixes_permissions_and_wraparound() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.inc(eax).unwrap();
+        let first = a.assemble(0x10000).unwrap();
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.inc(ecx).unwrap();
+        let second = a.assemble(0x11000).unwrap();
+        assert_eq!((first.len(), second.len()), (1, 1));
+        for base in [0x10000, 0xffffe000] {
+            for permission in [0, READ, EXEC, READ | EXEC] {
+                for mapped in [false, true] {
+                    let mut memory = Memory::reserve(base, 2 * PAGE_SIZE).unwrap();
+                    memory.map(base, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+                    memory.write(base, &first.repeat(PAGE_SIZE)).unwrap();
+                    if mapped {
+                        memory
+                            .map(base + PAGE_SIZE as u32, PAGE_SIZE, READ | WRITE)
+                            .unwrap();
+                        memory
+                            .write(base + PAGE_SIZE as u32, &second.repeat(PAGE_SIZE))
+                            .unwrap();
+                        memory
+                            .protect(base + PAGE_SIZE as u32, PAGE_SIZE, permission)
+                            .unwrap();
+                    }
+                    for offset in [0, 4080, 4081, 4082, 4094, 4095, 4096, 8180, 8190, 8191] {
+                        let pc = base + offset;
+                        let (bulk, bulk_fault) = fetch_bytes::<true>(&mut memory, pc);
+                        let (bytes, byte_fault) = fetch_bytes::<false>(&mut memory, pc);
+                        assert_eq!(bulk.bytes, bytes.bytes);
+                        assert_eq!(bulk.len, bytes.len);
+                        assert_eq!(bulk_fault, byte_fault);
+                        for (a, b) in bulk.pages.into_iter().zip(bytes.pages) {
+                            assert_eq!(
+                                a.map(|p| (p.address, p.permissions, p.mapped)),
+                                b.map(|p| (p.address, p.permissions, p.mapped))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
+        let shared = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
+        memory
+            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.write(0x10000, &first.repeat(15)).unwrap();
+        let (bulk, denied) = fetch_bytes::<true>(&mut memory, 0x10000);
+        let (bytes, other) = fetch_bytes::<false>(&mut memory, 0x10000);
+        assert_eq!(bulk.bytes, bytes.bytes);
+        assert_eq!(denied, other);
+        drop(shared);
     }
 }
