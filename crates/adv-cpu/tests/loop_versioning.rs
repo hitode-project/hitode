@@ -218,6 +218,165 @@ fn loop_instruction_latches_match_unicorn_inside_and_across_page_permissions() {
     );
 }
 
+/// Interleaved affine steps must be included in the transfer addresses and
+/// replayed in order for flags. Keep MMX live at the exit, without EMMS.
+fn packed_loop(wide: bool, fill: bool) -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        let width = if wide { 8 } else { 4 };
+        a.set_label(&mut top).unwrap();
+        if !fill {
+            a.add(esi, width).unwrap();
+            if wide {
+                a.movq(mm0, qword_ptr(esi - width)).unwrap();
+            } else {
+                a.mov(eax, dword_ptr(esi - width)).unwrap();
+            }
+        }
+        a.add(edi, width).unwrap();
+        if wide {
+            a.movq(qword_ptr(edi - width), mm0).unwrap();
+        } else {
+            a.mov(dword_ptr(edi - width), eax).unwrap();
+        }
+        a.loop_(top).unwrap();
+        a.ret().unwrap();
+    })
+}
+
+#[test]
+fn packed_loop_transfers_preserve_aliases_faults_and_every_budget_prefix() {
+    for (wide, fill) in [(false, false), (true, false), (false, true), (true, true)] {
+        let bytes = packed_loop(wide, fill);
+        let width = if wide { 8 } else { 4 };
+        let seed = |m: &mut Executor| {
+            m.state.regs[0] = 0x1234_abcd;
+            m.state.x87.regs[0] = adv_cpu::X87Register::from_parts(0x1234_abcd_9876_fedc, 0x3fff);
+            m.state.x87.status = 3 << 11;
+            m.state.refresh_mmx();
+            m.state.eflags = 0xad7;
+        };
+        let floating = |m: &Executor| {
+            // Intel SDM Vol. 1, MMX/x87 transitions: Unicorn preserves the
+            // old exponent and rebuilds tags from payloads, so it cannot be
+            // the oracle for these fields. Check the architectural contract.
+            assert_eq!(m.state.x87.tag, if wide { 0 } else { 0xffff });
+            assert_eq!(m.state.x87.status, if wide { 0 } else { 3 << 11 });
+            assert_eq!(
+                m.state.x87.regs[0].sign_exponent(),
+                if wide && !fill { 0xffff } else { 0x3fff }
+            );
+            assert_eq!(m.state.x87.regs[0].significand(), m.state.mmx[0]);
+        };
+        for count in [1, 2, 3, 4, 5, 17, 257] {
+            for destination in [DST + 3, SRC, SRC + 7, SRC - 7, SRC + 15, SRC + 16] {
+                differential(
+                    "packed-loop",
+                    &bytes,
+                    regs(count, SRC, destination),
+                    seed,
+                    37,
+                );
+            }
+        }
+        for fault in [SRC, DST] {
+            differential(
+                "packed-loop-fault",
+                &bytes,
+                regs(1031, SRC, DST),
+                |m| {
+                    seed(m);
+                    m.protect(fault + 4096, 4096, if fault == SRC { 0 } else { READ })
+                        .unwrap();
+                },
+                1 << 30,
+            );
+        }
+        // Zero wraps ECX; the bounded mapping must fault normally, not admit
+        // an empty packed batch or skip all stores.
+        differential("packed-loop-zero", &bytes, regs(0, SRC, DST), seed, 1 << 30);
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for fuel in 1..=19 {
+                let mut jit = machine(&bytes, Some(strategy));
+                let mut uc = machine(&bytes, None);
+                for m in [&mut jit, &mut uc] {
+                    m.state.regs = regs(200, SRC, DST);
+                    seed(m);
+                }
+                assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
+                let done = 200 - jit.state.regs[1];
+                assert!(done > 0 && done < 200);
+                let instructions = if fill { 3 } else { 5 };
+                assert_eq!(
+                    uc.run_unicorn(STOP, (done * instructions) as usize)
+                        .unwrap(),
+                    RunOutcome::Budget
+                );
+                assert_eq!(jit.state.eip, uc.state.eip);
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                floating(&jit);
+                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+                assert_eq!(
+                    jit.memory().read(DST, 201 * width).unwrap(),
+                    uc.memory().read(DST, 201 * width).unwrap()
+                );
+                // A fault before the next transfer exposes the previous
+                // packed batch's final state, including flags and MMX.
+                for m in [&mut jit, &mut uc] {
+                    m.protect(DST, 4096, READ).unwrap();
+                }
+                // Canonicalize Unicorn's flags after each ADD; its lazy AF
+                // otherwise disappears when a following store faults.
+                let mut expected = RunOutcome::Budget;
+                for _ in 0..8 {
+                    expected = uc.run_unicorn(STOP, 1).unwrap();
+                    if expected != RunOutcome::Budget {
+                        break;
+                    }
+                }
+                assert_ne!(expected, RunOutcome::Budget);
+                assert_eq!(jit.run(STOP, 100).unwrap(), expected);
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                floating(&jit);
+                assert_eq!(
+                    jit.state.eflags & 0x8d5,
+                    uc.state.eflags & 0x8d5,
+                    "wide={wide} fill={fill} {strategy:?} fuel={fuel}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_batches_reconstruct_body_flags_before_budget_and_fault_exits() {
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, 17).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.lea(esi, dword_ptr(esi + 4)).unwrap();
+        a.lea(edi, dword_ptr(edi + 4)).unwrap();
+        a.loop_(top).unwrap();
+        a.ret().unwrap();
+    });
+    for count in [3, 4, 5, 9, 1027] {
+        differential("loop-body-flags", &bytes, regs(count, SRC, DST), |_| {}, 7);
+        differential(
+            "loop-body-flags-fault",
+            &bytes,
+            regs(count, SRC, DST),
+            |m| {
+                m.protect(DST + 4096, 4096, READ).unwrap();
+            },
+            1 << 30,
+        );
+    }
+}
+
 #[test]
 fn versioned_loops_with_negative_steps_narrow_counters_and_skips_match_unicorn() {
     let backwards = counted(false, |a| {
@@ -1506,15 +1665,31 @@ fn compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state() {
 
 #[test]
 fn compact_copy_interrupt_publishes_progress_and_resumes() {
-    let bytes = counted(false, |a| {
-        a.movd(mm0, dword_ptr(esi)).unwrap();
-        a.movd(dword_ptr(edi), mm0).unwrap();
-        a.add(esi, 4).unwrap();
-        a.add(edi, 4).unwrap();
-    });
+    transfer_interrupt(false, false, false);
+}
+
+#[test]
+fn packed_loop_interrupt_publishes_progress_and_resumes() {
+    for (wide, fill) in [(false, false), (true, false), (false, true), (true, true)] {
+        transfer_interrupt(wide, fill, true);
+    }
+}
+
+fn transfer_interrupt(wide: bool, fill: bool, looping: bool) {
+    let bytes = if looping {
+        packed_loop(wide, fill)
+    } else {
+        counted(false, |a| {
+            a.movd(mm0, dword_ptr(esi)).unwrap();
+            a.movd(dword_ptr(edi), mm0).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+        })
+    };
+    let width = if wide { 8 } else { 4 };
     // A sufficiently long in-place copy allows an asynchronous interrupt;
     // one zero-filled allocation, without a second large oracle allocation.
-    const COUNT: u32 = 16_000_000;
+    let count = 64_000_000 / width;
     let mut m = adv_cpu::Executor::new(CODE, 0x4200000).unwrap();
     m.protect(CODE, 0x4200000, READ | WRITE).unwrap();
     m.write(CODE, &bytes).unwrap();
@@ -1522,7 +1697,7 @@ fn compact_copy_interrupt_publishes_progress_and_resumes() {
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     m.add_region(Region::new(CODE, bytes.len())).unwrap();
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
-    m.state.regs = regs(COUNT, SRC, SRC);
+    m.state.regs = regs(count, SRC, SRC);
     m.state.eip = CODE;
     // Finish compilation before starting the interrupt producer.
     assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
@@ -1535,7 +1710,7 @@ fn compact_copy_interrupt_publishes_progress_and_resumes() {
     // interrupt raised before the run starts is not a mid-loop one.
     let mut done = 0;
     for delay in [200, 50, 1000, 20, 2000, 5] {
-        m.state.regs = regs(COUNT, SRC, SRC);
+        m.state.regs = regs(count, SRC, SRC);
         m.state.eip = CODE;
         flag.store(false, Ordering::Release);
         let notify = flag.clone();
@@ -1545,23 +1720,26 @@ fn compact_copy_interrupt_publishes_progress_and_resumes() {
         });
         let outcome = m.run(STOP, budget).unwrap();
         producer.join().unwrap();
-        done = COUNT - m.state.regs[1];
+        done = count - m.state.regs[1];
         if outcome == RunOutcome::Interrupted && done >= 5 {
             break;
         }
     }
     assert!(
-        done >= 5 && done < COUNT,
+        done >= 5 && done < count,
         "must interrupt after a packed batch"
     );
-    assert_eq!(m.state.regs[6], SRC + done * 4);
-    assert_eq!(m.state.regs[7], SRC + done * 4);
+    assert_eq!(m.state.regs[6], SRC + if fill { 0 } else { done * width });
+    assert_eq!(m.state.regs[7], SRC + done * width);
     assert_eq!(m.state.mmx[0], 0);
-    assert_eq!(budget - m.state.fuel, u64::from(done) + 1);
+    assert_eq!(budget - m.state.fuel, u64::from(done) + u64::from(!looping));
     assert_eq!(m.stats.interpreter_instructions, 0);
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 11;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(m.state.regs[6], SRC + (done + 11) * 4);
-    assert_eq!(m.state.regs[7], m.state.regs[6]);
+    assert_eq!(
+        m.state.regs[6],
+        SRC + if fill { 0 } else { (done + 11) * width }
+    );
+    assert_eq!(m.state.regs[7], SRC + (done + 11) * width);
 }

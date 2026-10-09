@@ -5570,27 +5570,7 @@ impl Emitter<'_> {
                 return true;
             }
             M::Loop | M::Jecxz | M::Jcxz => {
-                let count = self.b.use_var(self.regs[1]);
-                let condition = if i.mnemonic() == M::Loop {
-                    // LOOP decrements ECX without touching flags.
-                    let count = self.b.ins().iadd_imm(count, -1);
-                    self.b.def_var(self.regs[1], count);
-                    self.b.ins().icmp_imm(IntCC::NotEqual, count, 0)
-                } else {
-                    let count = if i.mnemonic() == M::Jcxz {
-                        self.b.ins().band_imm(count, 0xffff)
-                    } else {
-                        count
-                    };
-                    self.b.ins().icmp_imm(IntCC::Equal, count, 0)
-                };
-                let yes = self.b.create_block();
-                let no = self.b.create_block();
-                self.b.ins().brif(condition, yes, &[], no, &[]);
-                self.b.switch_to_block(yes);
-                self.direct(i.near_branch_target() as u32);
-                self.b.switch_to_block(no);
-                self.direct(i.next_ip32());
+                self.counted_branch(i, true);
                 return true;
             }
             branch => {
@@ -5606,6 +5586,31 @@ impl Emitter<'_> {
             }
         }
         false
+    }
+
+    /// Batches have already stepped LOOP before polling or checking funding.
+    /// Its branch then observes that count without decrementing it again.
+    fn counted_branch(&mut self, i: &Instruction, step: bool) {
+        let mut count = self.b.use_var(self.regs[1]);
+        let condition = if i.mnemonic() == M::Loop {
+            if step {
+                count = self.b.ins().iadd_imm(count, -1);
+                self.b.def_var(self.regs[1], count);
+            }
+            self.b.ins().icmp_imm(IntCC::NotEqual, count, 0)
+        } else {
+            if i.mnemonic() == M::Jcxz {
+                count = self.b.ins().band_imm(count, 0xffff);
+            }
+            self.b.ins().icmp_imm(IntCC::Equal, count, 0)
+        };
+        let yes = self.b.create_block();
+        let no = self.b.create_block();
+        self.b.ins().brif(condition, yes, &[], no, &[]);
+        self.b.switch_to_block(yes);
+        self.direct(i.near_branch_target() as u32);
+        self.b.switch_to_block(no);
+        self.direct(i.next_ip32());
     }
 }
 

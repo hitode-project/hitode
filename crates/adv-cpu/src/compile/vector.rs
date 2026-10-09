@@ -18,8 +18,8 @@
 //! whose lanes agree on the path preserves in its last lane: the last lane
 //! is the state after the batch.
 //!
-//! Bit-preserving DWORD copies pack four iterations densely and reconstruct
-//! their scalar state at the batch-loop exit using the same admission proofs.
+//! Bit-preserving copies and invariant fills pack 16 bytes per batch and
+//! reconstruct scalar state at the exit using the same admission proofs.
 use super::*;
 use iced_x86::{InstructionInfoFactory, OpAccess, RflagsBits};
 
@@ -28,16 +28,15 @@ use iced_x86::{InstructionInfoFactory, OpAccess, RflagsBits};
 /// of an `I32X4`, which `movd` to and from MMX keeps in place.
 pub(super) const LANES: i64 = 2;
 
-/// A bit-preserving DWORD load/store pair. Its four packed lanes have no
-/// per-lane arithmetic or branches; the last scalar value is rebuilt on exit.
+/// A bit-preserving copy or invariant fill. Packed lanes have no per-lane
+/// arithmetic or branches; the last scalar value is rebuilt on exit.
 #[derive(Debug, Clone, Copy)]
 struct CopyBatch {
-    load: u32,
+    load: Option<u32>,
     store: u32,
     register: R,
+    size: u32,
 }
-
-const COPY_LANES: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub(super) struct Batch {
@@ -64,57 +63,72 @@ impl Batch {
         self.copy.is_some()
     }
     fn width(&self) -> i64 {
-        if self.copy.is_some() {
-            COPY_LANES
+        if let Some(copy) = self.copy {
+            16 / i64::from(copy.size)
         } else {
             LANES
         }
     }
 }
 
-fn copy_batch(plan: &loops::Plan, body: &[&Instruction], tail: u32) -> Option<CopyBatch> {
+fn copy_batch(plan: &loops::Plan, body: &[&Instruction]) -> Option<CopyBatch> {
     let operations: Vec<_> = body
         .iter()
         .copied()
-        .filter(|i| i.ip32() < tail && i.mnemonic() != M::Nop)
+        .filter(|i| !plan.updates.contains(&i.ip32()) && i.mnemonic() != M::Nop)
         .collect();
-    let [load, store] = operations.as_slice() else {
-        return None;
+    let (load, store) = match operations.as_slice() {
+        [load, store] => (Some(*load), *store),
+        [store] => (None, *store),
+        _ => return None,
     };
-    let register = load.op0_register();
-    let plain = load.mnemonic() == M::Mov && register.is_gpr32();
-    let packed = load.mnemonic() == M::Movd && mmx::register(register).is_some();
+    let register = store.op1_register();
+    let size = store.memory_size().size() as u32;
+    let plain = store.mnemonic() == M::Mov && register.is_gpr32() && size == 4;
+    let packed = mmx::register(register).is_some()
+        && matches!((store.mnemonic(), size), (M::Movd, 4) | (M::Movq, 8));
     if !(plain || packed)
-        || load.op0_kind() != OpKind::Register
-        || load.op1_kind() != OpKind::Memory
-        || store.mnemonic() != load.mnemonic()
         || store.op0_kind() != OpKind::Memory
         || store.op1_kind() != OpKind::Register
-        || store.op1_register() != register
-        || load.memory_size().size() != 4
-        || store.memory_size().size() != 4
     {
         return None;
     }
-    for pc in [load.ip32(), store.ip32()] {
+    if let Some(load) = load {
+        if load.mnemonic() != store.mnemonic()
+            || load.op0_kind() != OpKind::Register
+            || load.op1_kind() != OpKind::Memory
+            || load.op0_register() != register
+            || load.memory_size().size() as u32 != size
+        {
+            return None;
+        }
+    } else if plain && plan.invariant & (1 << reg_index(register)?) == 0 {
+        return None;
+    }
+    for pc in load
+        .map(Instruction::ip32)
+        .into_iter()
+        .chain([store.ip32()])
+    {
         let (_, access, _, _) = plan.accesses.iter().find(|(at, ..)| *at == pc)?;
-        if access.step != 4 {
+        if access.step != i64::from(size) {
             return None;
         }
     }
-    // Cleanup replays ONLY the register-only affine tail's last iteration.
-    // No hidden memory effects or control flow may be deferred there.
-    if body.iter().filter(|i| i.ip32() >= tail).any(|i| {
-        !plan.updates.contains(&i.ip32())
-            || i.flow_control() != FlowControl::Next
-            || i.op0_kind() != OpKind::Register
-    }) {
+    // Steps can be interleaved with the copy. Addresses include their proven
+    // per-instruction deltas; cleanup replays only register-only affine steps.
+    if body
+        .iter()
+        .filter(|i| plan.updates.contains(&i.ip32()))
+        .any(|i| i.flow_control() != FlowControl::Next || i.op0_kind() != OpKind::Register)
+    {
         return None;
     }
     Some(CopyBatch {
-        load: load.ip32(),
+        load: load.map(Instruction::ip32),
         store: store.ip32(),
         register,
+        size,
     })
 }
 
@@ -254,10 +268,6 @@ pub(super) fn batch(
     }
     if !plan.windows.is_empty() {
         return Err("windows".into());
-    }
-    // A LOOP latch is its own counter step; batches replay steps separately.
-    if plan.counter_step == plan.latch {
-        return Err("loop latch".into());
     }
     if !plan.slots.is_empty() {
         return Err("slots".into());
@@ -436,8 +446,8 @@ pub(super) fn batch(
         return Err("exit flags".into());
     }
 
-    let copy = copy_batch(plan, &body, tail);
-    let width = if copy.is_some() { COPY_LANES } else { LANES };
+    let copy = copy_batch(plan, &body);
+    let width = copy.map_or(LANES, |copy| 16 / i64::from(copy.size));
     // Lanes of operands through the same registers keep fixed distances.
     let meets = |a: &loops::Access, b: &loops::Access| {
         (0..width).any(|x| {
@@ -560,7 +570,7 @@ impl Emitter<'_> {
             let origin_a = self.group_origin(a);
             let origin_b = self.group_origin(b);
             let apart = if copy {
-                // Four contiguous DWORDs conflict across lanes precisely
+                // Contiguous packed elements conflict across lanes precisely
                 // when their byte distance is nonzero and less than 16.
                 // Equal addresses and a whole-batch distance are safe, even
                 // if later batches read bytes earlier batches wrote.
@@ -568,12 +578,11 @@ impl Emitter<'_> {
                 let origin_b = self.b.ins().iadd_imm(origin_b, b.low);
                 let distance = self.b.ins().isub(origin_b, origin_a);
                 let same = self.b.ins().icmp_imm(IntCC::Equal, distance, 0);
-                let shifted = self.b.ins().iadd_imm(distance, width * 4 - 1);
-                let far = self.b.ins().icmp_imm(
-                    IntCC::UnsignedGreaterThanOrEqual,
-                    shifted,
-                    width * 8 - 1,
-                );
+                let shifted = self.b.ins().iadd_imm(distance, 15);
+                let far = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, shifted, 31);
                 self.b.ins().bor(same, far)
             } else if a.step == b.step {
                 let distance = self.b.ins().isub(origin_b, origin_a);
@@ -830,7 +839,7 @@ impl Emitter<'_> {
 
     /// A copy uses the same admission/range/alias proofs as arithmetic batches,
     /// but keeps only native pointers and a funded batch counter on its backedge.
-    /// Scalar tail semantics, flags and the last MOV/MOVD value are reconstructed
+    /// Scalar steps, flags and the last loaded value are reconstructed
     /// on the common exit, before either an interrupt or scalar continuation.
     fn emit_copy_batch(
         &mut self,
@@ -847,22 +856,38 @@ impl Emitter<'_> {
             plan.inductions,
             plan.steps,
         );
-        let tail = self.batches[index].as_ref().unwrap().tail;
+        let updates = plan.updates.clone();
+        let width = 16 / i64::from(copy.size);
+        let shift = width.trailing_zeros() as i64;
+        let ty = if copy.size == 8 {
+            types::I64X2
+        } else {
+            types::I32X4
+        };
         self.fast = Some(index);
         self.b.switch_to_block(entry);
         self.lanes().active = false;
         self.mmx_effects = None;
-        self.at(copy.load);
-        let (source, offset) = self.proven(4).unwrap();
-        let source = self.b.ins().iadd_imm(source, i64::from(offset));
-        self.at(copy.store);
-        let (destination, offset) = self.proven(4).unwrap();
-        let destination = self.b.ins().iadd_imm(destination, i64::from(offset));
+        let source = copy.load.map(|pc| self.copy_address(index, pc));
+        let fill = if source.is_none() {
+            let value = if let Some(register) = mmx::register(copy.register) {
+                let value = self.b.use_var(self.mmx[register].unwrap());
+                let value = self.mmx_cast(value, ty);
+                self.b.ins().extractlane(value, 0)
+            } else {
+                self.b.use_var(self.regs[reg_index(copy.register).unwrap()])
+            };
+            Some(self.b.ins().splat(ty, value))
+        } else {
+            None
+        };
+        let source = source.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
+        let destination = self.copy_address(index, copy.store);
         let count = self.b.use_var(self.regs[counter]);
         let (_, stop, _) = self.kernel.unwrap();
         let stop = self.b.use_var(stop);
         let available = self.counter_steps(index, count, stop);
-        let batches = self.b.ins().ushr_imm(available, 2);
+        let batches = self.b.ins().ushr_imm(available, shift);
         let body = self.b.create_block();
         self.b.append_block_param(body, self.ptr_ty);
         self.b.append_block_param(body, self.ptr_ty);
@@ -877,7 +902,7 @@ impl Emitter<'_> {
         let source = self.b.block_params(body)[0];
         let destination = self.b.block_params(body)[1];
         let remaining = self.b.block_params(body)[2];
-        let value = self.b.ins().load(types::I32X4, MemFlags::new(), source, 0);
+        let value = fill.unwrap_or_else(|| self.b.ins().load(ty, MemFlags::new(), source, 0));
         self.b.ins().store(MemFlags::new(), value, destination, 0);
         let remaining = self.b.ins().iadd_imm(remaining, -1);
         let again = self.b.create_block();
@@ -895,8 +920,8 @@ impl Emitter<'_> {
             .ins()
             .brif(pending, cleanup, &[pending.into()], advance, &[]);
         self.b.switch_to_block(advance);
-        let source = self.b.ins().iadd_imm(source, COPY_LANES * 4);
-        let destination = self.b.ins().iadd_imm(destination, COPY_LANES * 4);
+        let source = self.b.ins().iadd_imm(source, 16);
+        let destination = self.b.ins().iadd_imm(destination, 16);
         self.b
             .ins()
             .jump(body, &[source.into(), destination.into(), remaining.into()]);
@@ -910,7 +935,7 @@ impl Emitter<'_> {
         }
         let pending = self.b.block_params(cleanup)[0];
         let completed = self.b.ins().isub(batches, remaining);
-        let completed = self.b.ins().ishl_imm(completed, 2);
+        let completed = self.b.ins().ishl_imm(completed, shift);
         let preceding = self.b.ins().iadd_imm(completed, -1);
         for register in bits(inductions) {
             let original = self.b.use_var(self.regs[register]);
@@ -919,21 +944,33 @@ impl Emitter<'_> {
             self.b.def_var(self.regs[register], last);
         }
         self.begin_mmx_block();
-        let last = self.b.ins().extractlane(value, (COPY_LANES - 1) as u8);
+        let last = self.b.ins().extractlane(value, (width - 1) as u8);
         if let Some(register) = mmx::register(copy.register) {
-            let last = self.b.ins().uextend(types::I64, last);
-            let last = self.b.ins().scalar_to_vector(types::I64X2, last);
-            let last = self.mmx_cast(last, types::I8X16);
-            self.b.def_var(self.mmx[register].unwrap(), last);
-            self.mmx_written(Some(register));
-        } else {
+            if copy.load.is_some() {
+                let last = if copy.size == 4 {
+                    self.b.ins().uextend(types::I64, last)
+                } else {
+                    last
+                };
+                let last = self.b.ins().scalar_to_vector(types::I64X2, last);
+                let last = self.mmx_cast(last, types::I8X16);
+                self.b.def_var(self.mmx[register].unwrap(), last);
+                self.mmx_written(Some(register));
+            } else {
+                self.mmx_written(None);
+            }
+        } else if copy.load.is_some() {
             self.b
                 .def_var(self.regs[reg_index(copy.register).unwrap()], last);
         }
-        for (&pc, instruction) in instructions.range(tail..latch) {
+        for (&pc, instruction) in instructions
+            .range(header..latch)
+            .filter(|(pc, _)| updates.contains(pc))
+        {
             self.at(pc);
             self.instruction(instruction);
         }
+        self.step_batch_latch(&instructions[&latch]);
         let interrupted = self.b.create_block();
         self.b.set_cold_block(interrupted);
         let finished = self.b.create_block();
@@ -941,8 +978,50 @@ impl Emitter<'_> {
         self.b.switch_to_block(interrupted);
         self.exit_const(Exit::Interrupted, header);
         self.b.switch_to_block(finished);
-        self.at(latch);
-        self.instruction(&instructions[&latch]);
+        self.finish_batch_latch(&instructions[&latch]);
+    }
+
+    /// Address of a transfer in iteration zero, including affine steps that
+    /// precede it. The range proof excludes wrap and checks every touched byte.
+    fn copy_address(&mut self, index: usize, pc: u32) -> Value {
+        let (_, access, read, write) = self.plans[index]
+            .accesses
+            .iter()
+            .find(|(at, ..)| *at == pc)
+            .unwrap()
+            .clone();
+        let group = loops::Group {
+            base: access.base,
+            index: access.index,
+            step: access.step,
+            low: access.low,
+            high: access.high,
+            read,
+            write,
+        };
+        let origin = self.group_origin(&group);
+        let offset = self
+            .b
+            .ins()
+            .iadd_imm(origin, access.low - i64::from(self.base));
+        self.b.ins().iadd(self.mem, offset)
+    }
+
+    fn step_batch_latch(&mut self, latch: &Instruction) {
+        if latch.mnemonic() == M::Loop {
+            let count = self.b.use_var(self.regs[1]);
+            let count = self.b.ins().iadd_imm(count, -1);
+            self.b.def_var(self.regs[1], count);
+        }
+    }
+
+    fn finish_batch_latch(&mut self, latch: &Instruction) {
+        self.at(latch.ip32());
+        if latch.mnemonic() == M::Loop {
+            self.counted_branch(latch, false);
+        } else {
+            self.instruction(latch);
+        }
     }
 
     /// The batch's back edge: another batch while one fits, else the scalar
@@ -953,6 +1032,7 @@ impl Emitter<'_> {
         let header = self.plans[index].header;
         let fast = self.fast_blocks[index][&header];
         self.flush_mmx_effects();
+        self.step_batch_latch(latch);
         let room = self.batch_room(index);
         let again = self.b.create_block();
         let leave = self.b.create_block();
@@ -982,8 +1062,7 @@ impl Emitter<'_> {
         self.materialize_lanes();
         self.lanes().active = false;
         if exact {
-            self.at(latch.ip32());
-            self.instruction(latch);
+            self.finish_batch_latch(latch);
         } else {
             self.b.ins().jump(fast, &[]);
         }
