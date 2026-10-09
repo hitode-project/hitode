@@ -6,8 +6,9 @@ pub(super) type Key = (u32, bool);
 impl Emitter<'_> {
     pub(super) fn shared_guard(&mut self, bad: Value, reason: Exit, addr: Option<Value>) -> bool {
         // Resident lanes, deferred MMX effects and kernel fuel settlement need
-        // their site-specific recovery. Ordinary guards can merge their SSA
-        // prefixes directly, without a forwarding block for every check.
+        // their site-specific recovery. Ordinary guards merge their SSA prefixes
+        // through a one-jump cold site, which keeps the PC constant off the
+        // hot path.
         if self.fast.is_some()
             || self.kernel.is_some()
             || self.mmx_effects.is_some()
@@ -32,13 +33,18 @@ impl Emitter<'_> {
             self.guard_exits.insert(key, (reason, block));
             block
         };
+        let site = self.b.create_block();
+        self.b.set_cold_block(site);
+        let ok = self.b.create_block();
+        self.b.ins().brif(bad, site, &[], ok, &[]);
+        self.b.switch_to_block(site);
+        self.b.seal_block(site);
         let pc = self.constant(self.pc);
         let mut args = vec![pc.into()];
         if let Some(addr) = addr {
             args.push(addr.into());
         }
-        let ok = self.b.create_block();
-        self.b.ins().brif(bad, block, &args, ok, &[]);
+        self.b.ins().jump(block, &args);
         self.b.switch_to_block(ok);
         self.b.seal_block(ok);
         true

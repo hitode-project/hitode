@@ -3199,7 +3199,13 @@ impl Emitter<'_> {
             self.b.switch_to_block(store);
             done
         });
-        for (index, var) in self.lazy[..4].iter().enumerate() {
+        // A logical recipe without a carried OF reads neither operand.
+        let operands = if known.is_some_and(|kind| kind & 7 == 3) {
+            2
+        } else {
+            0
+        };
+        for (index, var) in self.lazy[..4].iter().enumerate().skip(operands) {
             let value = self.b.use_var(*var);
             self.b.ins().store(
                 MemFlags::trusted(),
