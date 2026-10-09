@@ -1,6 +1,7 @@
 //! Authored Tier 0 workloads. No game bytes, native JIT, or downloaded programs.
-//! Run: cargo run --release -p adv-cpu --example interpreter_bench -- [samples=7] [iterations=100000] [workload=all]
+//! Run: cargo run --release -p adv-cpu --example interpreter_bench -- [samples=7] [iterations=100000] [workload=all] [mode=warm|fresh]
 //! Output: CSV medians/range, exact fuel units, retired instructions, and checksum.
+//! Fresh samples construct a new executor outside the timer and include decoding.
 //! REP elements are fuel units, not individually retired x86 instructions.
 use adv_cpu::{CpuState, EXEC, ExecutionTrap, Executor, Memory, READ, RunOutcome, WRITE};
 use iced_x86::{BlockEncoderOptions, code_asm::*};
@@ -281,9 +282,11 @@ fn main() {
         .get(2)
         .map_or(100_000, |x| x.parse().expect("iterations"));
     let selection = args.get(3).map_or("all", String::as_str);
+    let mode = args.get(4).map_or("warm", String::as_str);
+    assert!(matches!(mode, "warm" | "fresh"));
     assert!(samples > 0 && (selection == "all" || NAMES.contains(&selection)));
     println!(
-        "workload,samples,iterations,units,instructions,cold_ns_per_unit,median_ns_per_unit,min_ns_per_unit,max_ns_per_unit,median_ns_per_instruction,checksum"
+        "workload,mode,samples,iterations,units,instructions,cold_ns_per_unit,median_ns_per_unit,min_ns_per_unit,max_ns_per_unit,median_ns_per_instruction,checksum"
     );
     for &name in NAMES
         .iter()
@@ -291,10 +294,19 @@ fn main() {
     {
         let mut w = workload(name, n);
         let cold = w.run() / w.units as f64;
-        let mut times: Vec<_> = (0..samples).map(|_| w.run()).collect();
+        let mut times: Vec<_> = (0..samples)
+            .map(|_| {
+                // Construction and assembly remain outside the timer. A fresh
+                // executor has no decoded instructions from earlier samples.
+                if mode == "fresh" {
+                    w = workload(name, n);
+                }
+                w.run()
+            })
+            .collect();
         times.sort_by(f64::total_cmp);
         println!(
-            "{name},{samples},{n},{},{},{cold:.3},{:.3},{:.3},{:.3},{:.3},{}",
+            "{name},{mode},{samples},{n},{},{},{cold:.3},{:.3},{:.3},{:.3},{:.3},{}",
             w.units,
             w.instructions,
             times[samples / 2] / w.units as f64,

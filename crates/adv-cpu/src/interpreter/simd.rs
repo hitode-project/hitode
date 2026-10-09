@@ -164,7 +164,7 @@ impl Plan {
         Ok(bytes)
     }
 
-    pub(super) fn execute(self, state: &mut CpuState, memory: &mut Memory) -> Step {
+    pub(super) fn execute(self, state: &mut CpuState, memory: &mut Memory, coherent: bool) -> Step {
         let pc = state.eip;
         // MMX checks the pending x87 exception before alignment or memory.
         if self.mmx && state.x87.status & 0x80 != 0 {
@@ -204,7 +204,9 @@ impl Plan {
         }
         // No operation below can fault. Canonicalize imported native MMX state
         // only after memory commits, so failures preserve the whole CPU image.
-        state.commit_mmx();
+        if !coherent {
+            state.commit_mmx();
+        }
         match self.destination {
             Location::Xmm(n) => state.xmm[n as usize] = value,
             Location::Mmx(n) => {
@@ -222,7 +224,11 @@ impl Plan {
             state.x87.set_top(0);
             state.x87.tag = 0;
         }
-        state.refresh_mmx();
+        // A prior checked commit in this window proves every untouched alias
+        // is already coherent. MMX writes above update both representations.
+        if !coherent {
+            state.refresh_mmx();
+        }
         state.eip = self.next;
         Step::Executed
     }

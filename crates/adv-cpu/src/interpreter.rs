@@ -275,12 +275,19 @@ impl Interpreter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MmxCache {
+    Unknown,
+    Coherent,
+    Deferred,
+}
+
 fn execute_decoded(
     decoded: Decoded,
     state: &mut CpuState,
     memory: &mut Memory,
     max_units: u32,
-    deferred_mmx: Option<&mut bool>,
+    deferred_mmx: Option<&mut MmxCache>,
 ) -> Execution {
     let pc = state.eip;
     if state.rep.as_ref().is_some_and(|r| r.pc != pc) {
@@ -296,13 +303,22 @@ fn execute_decoded(
             };
         }
         Decoded::Simd(plan) => {
-            if let Some(dirty) = deferred_mmx {
-                if *dirty {
-                    state.refresh_mmx();
-                }
-                *dirty = false;
+            let mut coherent = false;
+            if let Some(cache) = deferred_mmx.as_deref()
+                && *cache == MmxCache::Deferred
+            {
+                state.refresh_mmx();
+                coherent = true;
             }
-            let step = plan.execute(state, memory);
+            coherent |= deferred_mmx
+                .as_deref()
+                .is_some_and(|c| *c == MmxCache::Coherent);
+            let step = plan.execute(state, memory, coherent);
+            if let Some(cache) = deferred_mmx {
+                if coherent || step == Step::Executed {
+                    *cache = MmxCache::Coherent;
+                }
+            }
             let completed = step == Step::Executed;
             return Execution {
                 step: if completed && debug {
@@ -317,7 +333,7 @@ fn execute_decoded(
             let x87 = operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
             if let Some(dirty) = deferred_mmx.as_deref()
-                && *dirty
+                && *dirty == MmxCache::Deferred
                 && !x87
             {
                 // A following SIMD/MMX instruction can read the physical x87
@@ -326,11 +342,17 @@ fn execute_decoded(
             }
             let step = crate::floating::execute(&i, operation, opcode, state, memory, !defer);
             let completed = step == Step::Executed;
-            if let Some(dirty) = deferred_mmx {
-                if x87 {
-                    *dirty |= completed;
-                } else {
-                    *dirty = false;
+            if let Some(cache) = deferred_mmx {
+                if completed {
+                    *cache = if x87 {
+                        MmxCache::Deferred
+                    } else {
+                        MmxCache::Coherent
+                    };
+                } else if !x87 && *cache == MmxCache::Deferred {
+                    // The completed x87 prefix was materialized before the
+                    // faulting operation; its aliases remain canonical.
+                    *cache = MmxCache::Coherent;
                 }
             }
             return Execution {
@@ -793,7 +815,7 @@ impl DecodedBlock {
             units: 0,
         };
         let mut last_units = 0;
-        let mut deferred_mmx = false;
+        let mut deferred_mmx = MmxCache::Unknown;
         let mut index = 0;
         while let Some(&(pc, decoded)) = self.instructions.get(index) {
             if result.units == max_units || state.eip != pc || pc == stop {
@@ -862,7 +884,7 @@ impl DecodedBlock {
                 index = usize::from(next);
             }
         }
-        if deferred_mmx {
+        if deferred_mmx == MmxCache::Deferred {
             // Every public/context/native boundary still exposes a coherent
             // MMX cache; only consecutive x87 instructions skip redundant work.
             state.refresh_mmx();

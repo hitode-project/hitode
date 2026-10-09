@@ -89,7 +89,7 @@ fn decoded_simd_matches_transactional_effects_and_fault_priority() {
                             actual.xmm[n] = std::array::from_fn(|k| (k * 19 + n * 33) as u8);
                         }
                         let mut expected = actual.clone();
-                        let got = plan.execute(&mut actual, &mut a);
+                        let got = plan.execute(&mut actual, &mut a, false);
                         let want = crate::floating::execute(
                             i,
                             crate::floating::Operation::Simd,
@@ -168,5 +168,74 @@ fn decoded_simd_keeps_shared_stores_code_invalidation_and_tf() {
             &[0x31; 16]
         );
         drop(shared);
+    }
+}
+
+#[test]
+fn window_alias_coherence_matches_steps_across_mixed_prefixes_and_faults() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+    a.paddw(xmm0, xmm1).unwrap();
+    a.movd(mm0, eax).unwrap();
+    a.paddb(mm0, mm1).unwrap();
+    a.movq(qword_ptr(edi), mm0).unwrap();
+    a.emms().unwrap();
+    a.fld1().unwrap();
+    a.fld1().unwrap();
+    a.faddp(st1, st0).unwrap();
+    a.movdqu(xmm2, xmmword_ptr(ebx)).unwrap();
+    a.movd(eax, xmm2).unwrap();
+    a.emms().unwrap();
+    a.fld1().unwrap();
+    a.fstp(qword_ptr(edi + 16)).unwrap();
+    a.dec(ecx).unwrap();
+    a.jne(top).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0x10000).unwrap();
+    for budget in 1..=256 {
+        for mode in [0, 1, 2, 0x405] {
+            for address in [0x20000, 0x21ff8] {
+                let mut m = Memory::new(0x10000, 0x20000).unwrap();
+                let mut reference = Memory::new(0x10000, 0x20000).unwrap();
+                for memory in [&mut m, &mut reference] {
+                    memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
+                    memory.write(0x10000, &code).unwrap();
+                    memory.write(0x20000, &[0x71; 32]).unwrap();
+                    memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+                    memory.protect(0x22000, PAGE_SIZE, 0).unwrap();
+                }
+                let mut actual = CpuState {
+                    eip: 0x10000,
+                    eflags: 0x202,
+                    mmx_mode: mode,
+                    regs: [19, 100, 0, address, 0x2f000, 0, 0x20000, 0x24000],
+                    ..Default::default()
+                };
+                for n in 0..8 {
+                    actual.mmx[n] = 0xfedcba98u64 * (n as u64 + 1);
+                    actual.x87.regs[n] = crate::X87Register::from_parts(n as u64 * 71, 0x3fff);
+                }
+                let mut expected = actual.clone();
+                let mut window = Interpreter::new();
+                let result = window.run_block(&mut actual, &mut m, budget, 0, None).0;
+                let mut steps = Interpreter::new();
+                for _ in 0..result.units {
+                    assert_eq!(steps.step(&mut expected, &mut reference), Step::Executed);
+                }
+                if result.step != Step::Executed {
+                    assert_eq!(steps.step(&mut expected, &mut reference), result.step);
+                }
+                assert_eq!(
+                    actual, expected,
+                    "budget {budget}, mode {mode}, address {address}"
+                );
+                assert_eq!(
+                    m.read_data(0x24000, 32).unwrap(),
+                    reference.read_data(0x24000, 32).unwrap()
+                );
+            }
+        }
     }
 }
