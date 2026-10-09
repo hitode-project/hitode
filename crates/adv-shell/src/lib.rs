@@ -792,6 +792,20 @@ fn build_report(context: ReportContext<'_>) -> String {
         tier1.invalidations,
         tier1.resident_bytes
     );
+    // Snapshot the existing cumulative service counters, without the per-frame
+    // top-five truncation. Checkpoint differences delimit a fixed scene.
+    let host_services = if options.frame_budget || options.host_profile.is_some() {
+        let mut csv = Vec::new();
+        runtime
+            .machine
+            .sys
+            .stats
+            .write_host_csv(&runtime.machine.sys.thunks, &mut csv)
+            .unwrap();
+        json(std::str::from_utf8(&csv).unwrap())
+    } else {
+        "null".into()
+    };
     format!(
         concat!(
             "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
@@ -806,7 +820,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"wait_diagnostics\": {},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {},\n  \"host_services_csv\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -896,7 +910,8 @@ fn build_report(context: ReportContext<'_>) -> String {
             .stats
             .frame_budget
             .as_ref()
-            .map_or_else(|| "null".into(), |b| b.json())
+            .map_or_else(|| "null".into(), |b| b.json()),
+        host_services
     )
 }
 

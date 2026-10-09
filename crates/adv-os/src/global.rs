@@ -74,14 +74,13 @@ impl Globals {
             }
             handle
         };
-        self.get_mut(objects, handle).unwrap().handle = handle;
+        let identity = self.identity(objects, handle).unwrap();
+        objects.owned_mut(identity).unwrap().handle = handle;
         if pointer != 0 {
-            self.pointers
-                .insert(pointer, self.identity(objects, handle).unwrap());
+            self.pointers.insert(pointer, identity);
         }
         if allocation != 0 {
-            self.allocations
-                .insert(allocation, self.identity(objects, handle).unwrap());
+            self.allocations.insert(allocation, identity);
         }
         Some(handle)
     }
@@ -179,6 +178,39 @@ mod tests {
             attributes: 0,
             clipboard: false,
         }
+    }
+    #[test]
+    fn biased_allocation_indexes_follow_conversion_move_and_discard() {
+        let mut objects = Objects::default();
+        let mut globals = Globals::default();
+        let mut fixed = block(0x10008, false);
+        fixed.allocation = 0x10000;
+        let old = globals.insert(&mut objects, fixed.clone()).unwrap();
+        assert_eq!(globals.from_pointer(&objects, 0x10008), Some(old));
+        assert_eq!(globals.from_allocation(&objects, 0x10000), Some(old));
+        assert_eq!(globals.from_pointer(&objects, 0x10000), None);
+        fixed.movable = true;
+        let replacement = globals.insert(&mut objects, fixed).unwrap();
+        globals.remove(&mut objects, old).unwrap();
+        assert_eq!(globals.from_pointer(&objects, 0x10008), Some(replacement));
+        assert_eq!(
+            globals.from_allocation(&objects, 0x10000),
+            Some(replacement)
+        );
+        globals.set_allocation(&mut objects, replacement, 0x20000, 0x20008, 32);
+        assert_eq!(globals.from_pointer(&objects, 0x10008), None);
+        assert_eq!(globals.from_allocation(&objects, 0x10000), None);
+        assert_eq!(globals.from_pointer(&objects, 0x20008), Some(replacement));
+        assert_eq!(
+            globals.from_allocation(&objects, 0x20000),
+            Some(replacement)
+        );
+        globals.set_allocation(&mut objects, replacement, 0, 0, 0);
+        assert_eq!(globals.from_pointer(&objects, 0x20008), None);
+        assert_eq!(globals.from_allocation(&objects, 0x20000), None);
+        assert!(globals.get(&objects, replacement).is_some());
+        globals.remove(&mut objects, replacement).unwrap();
+        assert_eq!(objects.object_count(), 0);
     }
     #[test]
     fn borrowed_pointer_index_survives_failed_and_committed_conversion_then_move_discard_remove() {

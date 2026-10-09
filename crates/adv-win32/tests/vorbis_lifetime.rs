@@ -443,3 +443,43 @@ fn moved_decoder_keeps_pcm_position_and_matches_the_authored_libvorbis_reference
     assert_eq!(test.word(CLOSES), 1);
     test.no_arena();
 }
+
+#[test]
+fn failed_pcm_publication_can_retry_through_named_and_ordinal_read_entries() {
+    let mut test = Test::new(ObjectLimits::default());
+    test.open(VF, TONE.len(), CLOSE_CB, OUT);
+    test.call("ov_read", &[VF, 0x600000, 512, 0, 2, 1, OUT + 80], OUT + 4);
+    test.call("ov_pcm_tell", &[VF], OUT + 8);
+    test.call("ov_read", &[VF, PCM, 513, 0, 2, 1, OUT + 80], OUT + 12);
+    test.call("ov_pcm_tell", &[VF], OUT + 16);
+    test.call(
+        "ov_read",
+        &[VF, PCM + 1024, 512, 0, 2, 1, 0x600000],
+        OUT + 20,
+    );
+    test.call("ov_pcm_tell", &[VF], OUT + 24);
+    test.call("#15", &[VF, PCM + 512, 512, 0, 2, 1, OUT + 80], OUT + 28);
+    test.call("ov_pcm_tell", &[VF], OUT + 32);
+    test.call("ov_clear", &[VF], OUT + 36);
+    test.run();
+    for offset in [4, 20] {
+        assert_eq!(test.word(OUT + offset) as i32, -129);
+    }
+    assert_eq!(test.word(OUT + 8), 0);
+    assert_eq!(test.word(OUT + 12), 512);
+    assert_eq!(test.word(OUT + 16), 256);
+    assert_eq!(test.word(OUT + 24), 256);
+    assert_eq!(test.word(OUT + 28), 512);
+    assert_eq!(test.word(OUT + 32), 512);
+    let mut failed_section = [0; 512];
+    let mut retry = [0; 512];
+    test.machine
+        .cpu
+        .read(PCM + 1024, &mut failed_section)
+        .unwrap();
+    test.machine.cpu.read(PCM + 512, &mut retry).unwrap();
+    assert_eq!(failed_section, retry);
+    assert_eq!(test.word(OUT + 36), 0);
+    assert_eq!(test.word(CLOSES), 1);
+    test.no_arena();
+}

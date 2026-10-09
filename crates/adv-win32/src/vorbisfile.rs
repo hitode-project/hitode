@@ -294,13 +294,20 @@ pub fn register(registry: &mut Registry, policy: Policy) {
         return;
     }
     registry.replace_module("vorbisfile.dll");
-    for &(name, argc, ordinal) in EXPORTS {
-        registry.add("vorbisfile.dll", name, Conv::Cdecl { argc }, call);
-        registry.add(
+    for (index, &(name, argc, ordinal)) in EXPORTS.iter().enumerate() {
+        registry.add_with_data(
+            "vorbisfile.dll",
+            name,
+            Conv::Cdecl { argc },
+            call,
+            index as u64,
+        );
+        registry.add_with_data(
             "vorbisfile.dll",
             &format!("#{ordinal}"),
             Conv::Cdecl { argc },
             call,
+            index as u64,
         );
     }
 }
@@ -400,18 +407,10 @@ fn total_error(name: &str, code: i32) -> Outcome {
 }
 
 fn call(e: &mut Env<'_>) -> Outcome {
-    let mut name = e.sys.thunks.get(e.thunk).name.clone();
-    if let Some(ordinal) = name.strip_prefix('#').and_then(|s| s.parse::<u16>().ok()) {
-        name = EXPORTS
-            .iter()
-            .find(|&&(_, _, o)| o == ordinal)
-            .unwrap()
-            .0
-            .to_owned();
-    }
+    let name = EXPORTS[e.sys.thunks.get(e.thunk).f.data as usize].0;
     let vf = e.arg(0);
     if matches!(
-        name.as_str(),
+        name,
         "ov_read" | "ov_clear" | "ov_pcm_seek" | "ov_time_seek" | "ov_test_open"
     ) && e
         .ext
@@ -421,7 +420,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     {
         return error(OV_EINVAL);
     }
-    match name.as_str() {
+    match name {
         "ov_open_callbacks" | "ov_test_callbacks" => open(e, name == "ov_test_callbacks"),
         "ov_clear" => clear(e, vf),
         "ov_read" => {
@@ -462,18 +461,17 @@ fn call(e: &mut Env<'_>) -> Outcome {
             };
             seek(e, vf, target)
         }
-        "ov_time_total" | "ov_pcm_total" | "ov_raw_total" => totals(e, vf, e.arg(1) as i32, name),
+        "ov_time_total" | "ov_pcm_total" | "ov_raw_total" => {
+            totals(e, vf, e.arg(1) as i32, name.to_owned())
+        }
         _ => {
             let link = e.arg(1) as i32;
             let Some(s) = e.ext.get::<Provider>().get_mut(&mut e.sys.objects, vf) else {
-                return if matches!(
-                    name.as_str(),
-                    "ov_time_tell" | "ov_pcm_tell" | "ov_raw_tell"
-                ) {
+                return if matches!(name, "ov_time_tell" | "ov_pcm_tell" | "ov_raw_tell") {
                     total_error(&name, OV_EINVAL)
                 } else {
                     if matches!(
-                        name.as_str(),
+                        name,
                         "ov_info" | "ov_comment" | "ov_streams" | "ov_seekable"
                     ) {
                         Outcome::Return(0)
@@ -482,15 +480,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     }
                 };
             };
-            if s.partial
-                && matches!(
-                    name.as_str(),
-                    "ov_pcm_tell" | "ov_raw_tell" | "ov_time_tell"
-                )
-            {
+            if s.partial && matches!(name, "ov_pcm_tell" | "ov_raw_tell" | "ov_time_tell") {
                 return total_error(&name, OV_EINVAL);
             }
-            match name.as_str() {
+            match name {
                 "ov_test_open" => {
                     if !s.partial {
                         return error(OV_EINVAL);
@@ -726,7 +719,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 signed,
                 section,
             } if s.codec.has_pcm() || *length == 0 => {
-                let bytes = s.codec.peek_pcm(
+                let bytes = s.codec.prepare_pcm(
                     *length as usize,
                     PcmFormat {
                         bytes_per_sample: *word as u8,
@@ -738,13 +731,14 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                         signed: *signed,
                     },
                 );
-                let result = if e.cpu.write(*output, &bytes).is_err()
+                let count = bytes.len();
+                let result = if e.cpu.write(*output, bytes).is_err()
                     || (*section != 0 && e.cpu.write_u32(*section, 0).is_err())
                 {
                     error(OV_EFAULT)
                 } else {
-                    s.codec.consume_samples(bytes.len() / *word as usize);
-                    Outcome::Return(bytes.len() as u32)
+                    s.codec.consume_samples(count / *word as usize);
+                    Outcome::Return(count as u32)
                 };
                 s.busy = false;
                 Provider::put(&mut e.sys.objects, identity, s);

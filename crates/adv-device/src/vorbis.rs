@@ -56,6 +56,7 @@ pub struct Stream {
     decoder: Option<Box<dyn Decoder>>,
     pcm: Vec<f32>,
     pcm_at: usize,
+    output: Vec<u8>,
     decoded_frames: u64,
     pcm_offset: u64,
     total: Option<u64>,
@@ -77,6 +78,7 @@ impl Stream {
             decoder: None,
             pcm: Vec::new(),
             pcm_at: 0,
+            output: Vec::new(),
             decoded_frames: 0,
             pcm_offset: 0,
             total: None,
@@ -167,14 +169,27 @@ impl Stream {
         self.raw.extend(bytes);
     }
     pub fn peek_pcm(&self, maximum_bytes: usize, format: PcmFormat) -> Vec<u8> {
+        let samples = self.pcm_count(maximum_bytes, format);
+        pcm_bytes(&self.pcm[self.pcm_at..self.pcm_at + samples], format)
+    }
+    /// Prepare PCM in stream-owned scratch storage without consuming samples.
+    /// Publication failures can retry the same samples and position.
+    pub fn prepare_pcm(&mut self, maximum_bytes: usize, format: PcmFormat) -> &[u8] {
+        let samples = self.pcm_count(maximum_bytes, format);
+        pcm_bytes_into(
+            &self.pcm[self.pcm_at..self.pcm_at + samples],
+            format,
+            &mut self.output,
+        );
+        &self.output
+    }
+    fn pcm_count(&self, maximum_bytes: usize, format: PcmFormat) -> usize {
         assert!(matches!(format.bytes_per_sample, 1 | 2));
         if self.channels == 0 {
-            return Vec::new();
+            return 0;
         }
-        let samples = (maximum_bytes / usize::from(format.bytes_per_sample) / self.channels
-            * self.channels)
-            .min(self.pcm.len() - self.pcm_at);
-        pcm_bytes(&self.pcm[self.pcm_at..self.pcm_at + samples], format)
+        (maximum_bytes / usize::from(format.bytes_per_sample) / self.channels * self.channels)
+            .min(self.pcm.len() - self.pcm_at)
     }
     pub fn consume_samples(&mut self, count: usize) {
         if count == 0 {
@@ -202,6 +217,7 @@ impl Stream {
         self.decoder = None;
         self.pcm.clear();
         self.pcm_at = 0;
+        self.output.clear();
         self.decoded_frames = 0;
         self.pcm_offset = 0;
         self.headers.clear();
@@ -209,8 +225,15 @@ impl Stream {
 }
 
 pub fn pcm_bytes(samples: &[f32], format: PcmFormat) -> Vec<u8> {
-    assert!(matches!(format.bytes_per_sample, 1 | 2));
     let mut bytes = Vec::with_capacity(samples.len() * usize::from(format.bytes_per_sample));
+    pcm_bytes_into(samples, format, &mut bytes);
+    bytes
+}
+
+fn pcm_bytes_into(samples: &[f32], format: PcmFormat, bytes: &mut Vec<u8>) {
+    assert!(matches!(format.bytes_per_sample, 1 | 2));
+    bytes.clear();
+    bytes.reserve(samples.len() * usize::from(format.bytes_per_sample));
     for &sample in samples {
         if format.bytes_per_sample == 1 {
             let value = (sample * 128.0).round().clamp(-128.0, 127.0) as i32;
@@ -224,7 +247,6 @@ pub fn pcm_bytes(samples: &[f32], format: PcmFormat) -> Vec<u8> {
             });
         }
     }
-    bytes
 }
 
 fn next_packet(s: &mut Stream) -> Next {
