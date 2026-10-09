@@ -650,6 +650,7 @@ impl DecodedBlock {
             revision: native.map(|(_, revision)| revision),
         };
         let mut pc = start;
+        let mut furthest_target = start;
         while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
             // Published entries already exclude forms unsupported by native code.
             // Check all forms, including SSE/MMX, only while building the block.
@@ -672,22 +673,41 @@ impl DecodedBlock {
                 break;
             }
             block.local_branches &= !shared;
+            if let Decoded::Ready(instruction) = entry.decoded
+                && let Action::Call(Operand::Immediate(target))
+                | Action::Branch(Operand::Immediate(target), _) = instruction.action
+                && target > pc
+                && target.wrapping_sub(start) < BLOCK_BYTES as u32
+            {
+                furthest_target = furthest_target.max(target);
+            }
             let (next, terminates) = match entry.decoded {
                 Decoded::Ready(instruction) => (
                     instruction.next,
                     matches!(
                         instruction.action,
-                        Action::Call(..)
-                            | Action::Ret(..)
-                            | Action::Int(..)
+                        Action::Int(..)
                             | Action::Ud2
                             | Action::Privileged
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
-                    ) || matches!(instruction.action, Action::Branch(Operand::Immediate(target), ConditionCode::None) if target <= pc)
-                        || !block.local_branches
-                            && matches!(instruction.action, Action::Branch(..) | Action::Loop(..)),
+                    ) || match instruction.action {
+                        Action::Call(Operand::Immediate(target)) => {
+                            target.wrapping_sub(start) >= BLOCK_BYTES as u32
+                        }
+                        Action::Call(_) => true,
+                        // A forward local target can follow an earlier return
+                        // or backedge. Decode through it, but do not scan past
+                        // the final terminator of this bounded static frontier.
+                        Action::Ret(_) => pc >= furthest_target,
+                        Action::Branch(Operand::Immediate(target), ConditionCode::None)
+                            if target <= pc =>
+                        {
+                            pc >= furthest_target
+                        }
+                        _ => false,
+                    } || !block.local_branches && instruction.action.is_transfer(),
                 ),
                 Decoded::Simd(plan) => (plan.next, false),
                 Decoded::Extended(instruction, _, _) => (
@@ -813,7 +833,7 @@ impl DecodedBlock {
                 // boundary for the owner's next interrupt/deadline poll, while
                 // retaining the hard instruction/REP allowance above.
                 || (OBSERVE || result.units >= max_units.saturating_sub(BLOCK_INSTRUCTIONS as u32))
-                    && matches!(decoded, Decoded::Ready(i) if matches!(i.action, Action::Branch(..) | Action::Loop(..)))
+                    && matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
             {
                 break;
             }
@@ -824,9 +844,9 @@ impl DecodedBlock {
             {
                 index += 1;
             } else {
-                // Only branches may stay in this decoded window. Calls, returns,
-                // REP and owner/trap boundaries still return to the executor.
-                if !matches!(decoded, Decoded::Ready(i) if matches!(i.action, Action::Branch(..) | Action::Loop(..)))
+                // Transfers may stay only at decoded instruction boundaries;
+                // REP, published native entries and owner operations still exit.
+                if !matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
                     || !self.local_branches
                     || self.native_start && state.eip == self.pc
                 {
@@ -1034,6 +1054,15 @@ enum Action {
     Int(u8),
     Ud2,
     Privileged,
+}
+
+impl Action {
+    fn is_transfer(self) -> bool {
+        matches!(
+            self,
+            Self::Branch(..) | Self::Loop(..) | Self::Call(..) | Self::Ret(..)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

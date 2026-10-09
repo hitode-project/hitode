@@ -227,3 +227,125 @@ fn shared_code_keeps_transfer_revalidation_boundaries() {
     );
     assert_eq!(s.regs[0], 9);
 }
+
+#[test]
+fn local_calls_returns_and_stack_faults_match_single_steps() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    let mut leaf = a.create_label();
+    let mut nested = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.push(ecx).unwrap();
+    a.call(leaf).unwrap();
+    a.dec(ecx).unwrap();
+    a.jne(top).unwrap();
+    a.ret().unwrap();
+    a.set_label(&mut leaf).unwrap();
+    a.push(ebx).unwrap();
+    a.call(nested).unwrap();
+    a.pop(ebx).unwrap();
+    a.ret_1(4).unwrap();
+    a.set_label(&mut nested).unwrap();
+    a.add(eax, 7).unwrap();
+    a.ret().unwrap();
+    let code = a
+        .assemble_options(
+            CODE as u64,
+            BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+        )
+        .unwrap();
+    let leaf_pc = code.label_ip(&leaf).unwrap() as u32;
+    let nested_pc = code.label_ip(&nested).unwrap() as u32;
+    for budget in 1..=256 {
+        for stack in [STACK, 0x20008, 0x20002] {
+            let mut m = memory(&code.inner.code_buffer);
+            let mut reference = memory(&code.inner.code_buffer);
+            for m in [&mut m, &mut reference] {
+                m.write(stack, &STOP.to_le_bytes()).unwrap();
+                m.protect(0x1f000, PAGE_SIZE, 0).unwrap();
+            }
+            let mut actual = state();
+            actual.regs[4] = stack;
+            let mut expected = actual.clone();
+            let mut window = Interpreter::new();
+            let result = window.run_block(&mut actual, &mut m, budget, STOP, None).0;
+            let mut scalar = Interpreter::new();
+            for _ in 0..result.units {
+                assert_ne!(expected.eip, STOP);
+                assert_eq!(scalar.step(&mut expected, &mut reference), Step::Executed);
+            }
+            if result.step != Step::Executed {
+                assert_eq!(scalar.step(&mut expected, &mut reference), result.step);
+            }
+            assert_eq!(actual, expected, "budget {budget}, stack {stack}");
+            assert_eq!(
+                m.read_data(0x20000, 0x10000).unwrap(),
+                reference.read_data(0x20000, 0x10000).unwrap()
+            );
+            if budget == 256 && stack == STACK {
+                assert!(result.units >= 192);
+            }
+        }
+    }
+    // Discovery/tracing and newly published native callees keep owner exits.
+    for observe in [false, true] {
+        let mut m = memory(&code.inner.code_buffer);
+        let mut interpreter = Interpreter::new();
+        let mut s = state();
+        interpreter.observe_transfers = observe;
+        let native = BTreeMap::from([(leaf_pc, leaf_pc)]);
+        let result = interpreter
+            .run_block(&mut s, &mut m, 256, STOP, Some((&native, 1)))
+            .0;
+        assert_eq!(result.units, 2);
+        assert_eq!(s.eip, leaf_pc);
+        let result = interpreter
+            .run_block(&mut s, &mut m, 256, nested_pc, None)
+            .0;
+        assert_eq!(result.units, 2);
+        assert_eq!(s.eip, nested_pc);
+    }
+    let mut m = memory(&code.inner.code_buffer);
+    let mut interpreter = Interpreter::new();
+    let mut s = state();
+    s.eflags |= 0x100;
+    let result = interpreter.run_block(&mut s, &mut m, 256, STOP, None).0;
+    assert_eq!(result.units, 1);
+    assert_eq!(
+        result.step,
+        Step::Trap {
+            pc: CODE,
+            vector: 1
+        }
+    );
+    assert_eq!(s.regs[4], STACK - 4);
+}
+
+#[test]
+fn local_callee_code_write_exits_before_cached_successor() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut leaf = a.create_label();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.call(leaf).unwrap();
+    a.jmp(top).unwrap();
+    a.set_label(&mut leaf).unwrap();
+    a.mov(dword_ptr(esi), eax).unwrap();
+    a.inc(ebx).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(CODE as u64).unwrap();
+    let mut m = memory(&code);
+    m.protect(CODE, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+    let mut s = state();
+    s.regs[6] = CODE + 128;
+    s.regs[0] = 17;
+    let mut interpreter = Interpreter::new();
+    let result = interpreter.run_block(&mut s, &mut m, 256, STOP, None).0;
+    assert_eq!(result.units, 2);
+    assert_eq!(s.regs[3], 0);
+    assert_eq!(s.regs[4], STACK - 4);
+    assert_eq!(
+        m.read_data(CODE + 128, 4).unwrap().as_ref(),
+        &17u32.to_le_bytes()
+    );
+}
