@@ -483,15 +483,14 @@ struct Cached {
 }
 
 impl Cached {
-    /// Unchanged page stamps need no byte compare; after a write elsewhere on
-    /// a page, intact bytes restamp it instead of forcing a redecode.
+    /// Unchanged page stamps need no byte compare: versions are private to
+    /// one window, so the fetch already watched these bytes in this one. A
+    /// changed or foreign stamp watches them here, then compares and restamps.
     fn valid(&mut self, memory: &mut Memory) -> bool {
-        for page in self.pages.iter().flatten() {
-            memory.watch_code(page.address, PAGE_SIZE);
-        }
         if self.pages.iter().flatten().all(|page| page.current(memory)) {
             return true;
         }
+        memory.watch_code(self.pc, self.len as usize);
         if !self.revalidate(memory) {
             return false;
         }
@@ -602,14 +601,12 @@ struct DecodedBlock {
 }
 
 impl DecodedBlock {
-    /// As `Cached::valid`: compare bytes only after a page changed.
+    /// As `Cached::valid`: watch and compare bytes only after a page changed.
     fn valid(&mut self, memory: &mut Memory) -> bool {
-        for page in &self.pages {
-            memory.watch_code(page.address, PAGE_SIZE);
-        }
         if self.pages.iter().all(|page| page.current(memory)) {
             return true;
         }
+        memory.watch_code(self.pc, self.bytes.len());
         if !self.revalidate(memory) {
             return false;
         }
@@ -2459,9 +2456,12 @@ mod tests {
             "reuse the full decoded block"
         );
         watched(&mut fourth);
-        // Data stored beside the block bumps its page; intact bytes restamp it.
+        // Data stored beside the block is not code: its page keeps the version.
         let version = fourth.versions[1];
         fourth.write(0x11800, &[1]).unwrap();
+        assert_eq!(fourth.versions[1], version);
+        // The same byte stored over code bumps the page; intact bytes restamp.
+        fourth.write(CODE + 5, &[0x43]).unwrap();
         assert_ne!(fourth.versions[1], version);
         let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
         assert_eq!(execution.units, 3);

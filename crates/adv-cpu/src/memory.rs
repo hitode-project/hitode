@@ -20,6 +20,31 @@ fn epoch_origin() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed) << EPOCH_BITS
 }
 const EPOCH_BITS: u32 = 40;
+
+/// Split a window range into (page, in-page byte range) pieces.
+fn page_spans(
+    range: std::ops::Range<usize>,
+) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> {
+    let mut at = range.start;
+    std::iter::from_fn(move || {
+        (at < range.end).then(|| {
+            let page = at / PAGE_SIZE;
+            let stop = range.end.min((page + 1) * PAGE_SIZE);
+            let span = (page, at % PAGE_SIZE..stop - page * PAGE_SIZE);
+            at = stop;
+            span
+        })
+    })
+}
+
+/// The (word, mask) pairs covering a byte range of a page's code bitmap.
+fn bit_words(bytes: std::ops::Range<usize>) -> impl Iterator<Item = (usize, u64)> {
+    (bytes.start / 64..bytes.end.div_ceil(64)).map(move |word| {
+        let low = bytes.start.max(word * 64) - word * 64;
+        let high = bytes.end.min((word + 1) * 64) - word * 64;
+        (word, (u64::MAX >> (64 - (high - low))) << low)
+    })
+}
 pub const READ: u8 = 1;
 pub const WRITE: u8 = 2;
 pub const EXEC: u8 = 4;
@@ -106,6 +131,8 @@ pub struct Memory {
     pub(crate) versions: Vec<u64>,
     /// Monotonic code observations owned by the controller, not guest protection.
     watched: Vec<bool>,
+    /// Bytes of each watched page that were fetched or captured as code.
+    code: BTreeMap<usize, Box<[u64; PAGE_SIZE / 64]>>,
     pub(crate) mapped: Arc<Vec<bool>>,
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
@@ -142,9 +169,10 @@ impl Memory {
             .snapshot(&self.perms, watched, &self.private_copy_pages)
     }
 
-    /// Register every sampled code page before reading or reusing its bytes.
-    /// This is monotonic, including negative tail dependencies and remappings.
-    /// The epoch revokes grants at a paused trap without changing byte stamps.
+    /// Register sampled code bytes before reading or reusing them. This is
+    /// monotonic, including negative tail dependencies and remappings. A
+    /// page's first observation makes it a store barrier: the epoch revokes
+    /// grants at a paused trap without changing byte stamps.
     pub(crate) fn watch_code(&mut self, address: u32, len: usize) {
         let begin = u64::from(address).max(u64::from(self.base));
         let end = (u64::from(address).saturating_add(len as u64))
@@ -152,26 +180,57 @@ impl Memory {
         if begin >= end {
             return;
         }
-        let first = ((begin - u64::from(self.base)) / PAGE_SIZE as u64) as usize;
-        let last = ((end - u64::from(self.base) - 1) / PAGE_SIZE as u64) as usize;
-        if self.watched[first..=last].iter().all(|&watched| watched) {
-            return;
+        let (begin, end) = (
+            (begin - u64::from(self.base)) as usize,
+            (end - u64::from(self.base)) as usize,
+        );
+        let mut fresh = None;
+        for (page, bytes) in page_spans(begin..end) {
+            let bits = self
+                .code
+                .entry(page)
+                .or_insert_with(|| Box::new([0; PAGE_SIZE / 64]));
+            for (word, mask) in bit_words(bytes) {
+                bits[word] |= mask;
+            }
+            if !self.watched[page] {
+                self.watched[page] = true;
+                fresh = Some(fresh.map_or(page..page + 1, |old: std::ops::Range<usize>| {
+                    old.start..page + 1
+                }));
+            }
         }
-        let selective = self.selective_code_writes();
-        self.watched[first..=last].fill(true);
-        if selective {
-            self.fast.invalidate(first..last + 1);
+        if let Some(pages) = fresh
+            && self.selective_code_writes()
+        {
+            self.fast.invalidate(pages);
             self.epoch += 1;
         }
     }
 
+    /// Software-checked memory changes code only when a store reaches bytes
+    /// observed as code; other data on a code page is ordinary data.
     fn writes_code(&self, range: &std::ops::Range<usize>) -> bool {
         if range.is_empty() {
             return false;
         }
-        let selective = self.selective_code_writes();
-        (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-            .any(|page| self.perms[page] & EXEC != 0 && (!selective || self.watched[page]))
+        if !self.selective_code_writes() {
+            return (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                .any(|page| self.perms[page] & EXEC != 0);
+        }
+        page_spans(range.clone()).any(|(page, bytes)| {
+            self.perms[page] & EXEC != 0
+                && self
+                    .code
+                    .get(&page)
+                    .is_some_and(|bits| bit_words(bytes).any(|(word, mask)| bits[word] & mask != 0))
+        })
+    }
+
+    /// Whether a store of `len` bytes at `addr` would change observed code.
+    pub(crate) fn stores_code(&self, addr: u32, len: usize) -> bool {
+        self.range(addr, len)
+            .is_ok_and(|range| self.writes_code(&range))
     }
 
     /// Search the existing page table in one bounded metadata slice pass. This
@@ -378,6 +437,7 @@ impl Memory {
             epoch: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: None,
@@ -421,6 +481,7 @@ impl Memory {
             epoch: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
@@ -533,6 +594,11 @@ impl Memory {
         Arc::make_mut(&mut self.perms)[pages].fill(0);
         self.touch(addr, len);
         Ok(())
+    }
+
+    /// Distinguishes live windows; epoch overflow only reads as a new one.
+    pub(crate) fn identity(&self) -> u64 {
+        self.epoch >> EPOCH_BITS
     }
 
     /// Epochs this window has counted, comparable across windows.

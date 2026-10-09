@@ -97,6 +97,8 @@ pub(crate) struct Compiled {
     /// Owner-side recency sampled at Rust entries, never read by generated code.
     // Controller-only metadata; native descriptors never reference this cell.
     pub cache_stamp: std::cell::Cell<u64>,
+    /// One more than the identity of the window whose code bytes are watched.
+    watched_in: std::cell::Cell<u64>,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
     #[cfg(all(test, target_arch = "x86_64"))]
@@ -183,8 +185,10 @@ impl Compiled {
         let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
         // window. Establish that owner's code barriers before its first entry.
-        for &(page, _) in &self.pages {
-            memory.watch_code(self.window_base + (page * 4096) as u32, 4096);
+        let window = memory.identity() + 1;
+        if self.watched_in.get() != window {
+            memory.watch_code(self.input.origin, self.input.bytes.len());
+            self.watched_in.set(window);
         }
         bridge.memory = memory;
         assert!(!self.input.shadow_returns || controls.shadow.is_some());
@@ -985,6 +989,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let prepare_id = module
         .declare_function("adv_file_prepare", Linkage::Import, &prepare_signature)
         .map_err(|e| e.to_string())?;
+    let code_store_id = module
+        .declare_function("adv_code_store", Linkage::Import, &prepare_signature)
+        .map_err(|e| e.to_string())?;
     let mut timestamp_signature = module.make_signature();
     timestamp_signature.params.push(AbiParam::new(ptr_ty));
     timestamp_signature.returns.push(AbiParam::new(types::I64));
@@ -1092,6 +1099,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let file_write_ref = module.declare_func_in_func(file_write_id, func);
         let file_prepared_ref = module.declare_func_in_func(file_prepared_id, func);
         let file_prepare_ref = module.declare_func_in_func(prepare_id, func);
+        let code_store_ref = module.declare_func_in_func(code_store_id, func);
         let timestamp_ref = module.declare_func_in_func(timestamp_id, func);
         let range_ok_ref = module.declare_func_in_func(range_id, func);
         // A kernel loads and stores only the state its loop can touch.
@@ -1476,6 +1484,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_read_ref,
             file_write_ref,
             file_prepare_ref,
+            code_store_ref,
             file_prepared_ref,
             timestamp_ref,
             source_map,
@@ -2225,6 +2234,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         _x87: x87,
         _nests: descriptors,
         cache_stamp: std::cell::Cell::new(0),
+        watched_in: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
         #[cfg(all(test, target_arch = "x86_64"))]
@@ -2900,6 +2910,7 @@ struct Emitter<'a> {
     file_read_ref: ir::FuncRef,
     file_write_ref: ir::FuncRef,
     file_prepare_ref: ir::FuncRef,
+    code_store_ref: ir::FuncRef,
     file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
     // Optional sampler attribution (compile::diagnostics); `source` is the
@@ -4318,8 +4329,7 @@ impl Emitter<'_> {
                 self.b.set_cold_block(self.b.current_block().unwrap());
             }
         }
-        self.guard(executable, Exit::Fallback, None);
-        self.b.set_cold_block(self.b.current_block().unwrap());
+        self.code_store_guard(executable, addr, size);
         let file: Vec<_> = permissions
             .iter()
             .map(|&p| {
@@ -4820,8 +4830,7 @@ impl Emitter<'_> {
         if write {
             let executable = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
             let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
-            self.guard(executable, Exit::Fallback, None);
-            self.b.set_cold_block(self.b.current_block().unwrap());
+            self.code_store_guard(executable, addr, size);
         }
         // The cold helper already preserves byte-atomic PCM subranges and
         // prepares every lazy/COW page before a store commits. Share it with
@@ -4833,6 +4842,27 @@ impl Emitter<'_> {
         self.b.seal_block(done);
         self.mark(diagnostics::Part::Body);
         (!write).then(|| self.b.block_params(done)[0])
+    }
+    /// In a cold path: a store to an executable page leaves native code only
+    /// when it reaches bytes observed as code. Data beside code stays native.
+    fn code_store_guard(&mut self, executable: Value, addr: Value, size: usize) {
+        let check = self.b.create_block();
+        self.b.set_cold_block(check);
+        let data = self.b.create_block();
+        self.b.set_cold_block(data);
+        self.b.ins().brif(executable, check, &[], data, &[]);
+        self.b.switch_to_block(check);
+        self.b.seal_block(check);
+        let width = self.constant(size as u32);
+        let call = self
+            .b
+            .ins()
+            .call(self.code_store_ref, &[self.bridge, addr, width]);
+        let code = self.b.inst_results(call)[0];
+        self.guard(code, Exit::Fallback, None);
+        self.b.ins().jump(data, &[]);
+        self.b.switch_to_block(data);
+        self.b.seal_block(data);
     }
     /// Emit the bounded transactional helper in the current cold block.
     fn memory_completion(

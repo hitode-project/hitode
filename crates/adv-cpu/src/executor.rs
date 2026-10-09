@@ -3515,8 +3515,13 @@ mod native_deadline_tests {
         m.refresh().unwrap();
         assert_eq!(m.stats.invalidation_candidates, checks);
         assert_eq!(m.stats.compilations, compilations);
-        // Mutable data on a code page checks one region without recompiling it.
+        // Mutable data beside code on its page is ordinary data: no check.
         m.write(0x1080, &[42]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks);
+        assert_eq!(m.stats.compilations, compilations);
+        // Rewriting a code byte with its own value checks one region and keeps it.
+        m.write(0x1001, &[0xc3]).unwrap();
         m.refresh().unwrap();
         assert_eq!(m.stats.invalidation_candidates, checks + 1);
         assert_eq!(m.stats.code_revalidations, 1);

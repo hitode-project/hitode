@@ -291,11 +291,12 @@ fn code_writes_invalidate_before_native_reentry() {
     assert_eq!(m.memory().read(OUT, 64).unwrap(), &expected(false)[..64]);
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    let interpreted_before = m.stats.interpreter_instructions;
     m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
-    // Protection changed the code version: readmit, then write the active code page.
+    // Protection changed the code version: readmit, then write the active code
+    // page beside its observed bytes, which stays native.
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
+    let interpreted_before = m.stats.interpreter_instructions;
     start(&mut m, SRC, CODE + 0x300, STACK);
     m.state.regs[1] = 8;
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
@@ -304,7 +305,7 @@ fn code_writes_invalidate_before_native_reentry() {
         &expected(false)[..32]
     );
     assert!(m.stats.invalidations > 0);
-    assert!(m.stats.interpreter_instructions > interpreted_before);
+    assert_eq!(m.stats.interpreter_instructions, interpreted_before);
 }
 
 #[test]
