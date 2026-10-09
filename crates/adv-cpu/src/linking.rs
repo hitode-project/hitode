@@ -1,27 +1,34 @@
 //! Versioned native entry slots. Only the owning execution thread publishes or
 //! retires code, between native calls. Generated tail calls never own code pages.
 
-pub(crate) const PROBES: usize = 8;
-
 pub(crate) fn hash(pc: u32) -> u32 {
     let mixed = (pc ^ (pc >> 16)).wrapping_mul(0x9e37_79b1);
     mixed ^ (mixed >> 16)
 }
 
+/// A key no zero-extended guest PC can equal.
+pub(crate) const VACANT: u64 = u64::MAX;
+
 #[repr(C)]
 pub(crate) struct Slot {
-    pub pc: u32,
+    pub key: u64,
     pub entry: usize,
 }
 
-/// One absent slot: generated probes need no null or empty-table check.
-static EMPTY: [Slot; 1] = [Slot { pc: 0, entry: 0 }];
+const EMPTY_SLOT: Slot = Slot {
+    key: VACANT,
+    entry: 0,
+};
+
+/// One vacant slot: generated probes need no null or empty-table check.
+static EMPTY: [Slot; 1] = [EMPTY_SLOT];
 
 /// Probe operands for a chain that links nothing.
 pub(crate) fn unlinked() -> (*const Slot, u32) {
     (EMPTY.as_ptr(), 0)
 }
 
+/// Linear probing at most half full: every probe run ends at a vacant slot.
 #[derive(Default)]
 pub(crate) struct Table {
     slots: Vec<Slot>,
@@ -31,96 +38,73 @@ pub(crate) struct Table {
 impl Table {
     pub fn rebuild(&mut self, entries: impl Iterator<Item = (u32, usize)>) {
         let entries: Vec<_> = entries.collect();
-        self.len = entries.len();
+        self.slots.clear();
+        self.len = 0;
         if entries.is_empty() {
-            self.slots.clear();
             return;
         }
-        let mut capacity = (entries.len() * 4).next_power_of_two().max(256);
-        loop {
-            let mut slots: Vec<_> = (0..capacity).map(|_| Slot { pc: 0, entry: 0 }).collect();
-            let mask = capacity - 1;
-            let mut complete = true;
-            for &(pc, entry) in &entries {
-                let first = hash(pc) as usize & mask;
-                let index = (0..PROBES)
-                    .map(|offset| (first + offset) & mask)
-                    .find(|&index| slots[index].entry == 0);
-                let Some(index) = index else {
-                    complete = false;
-                    break;
-                };
-                slots[index].pc = pc;
-                slots[index].entry = entry;
-            }
-            if complete {
-                self.slots = slots;
-                return;
-            }
-            capacity *= 2;
+        let capacity = (entries.len() * 4).next_power_of_two().max(256);
+        self.slots.resize_with(capacity, || EMPTY_SLOT);
+        for (pc, entry) in entries {
+            assert!(self.insert(pc, entry));
         }
+    }
+
+    /// The slot holding `pc`, or the vacant slot ending its probe run.
+    fn find(&self, pc: u32) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut index = hash(pc) as usize & mask;
+        while self.slots[index].key != VACANT && self.slots[index].key != u64::from(pc) {
+            index = (index + 1) & mask;
+        }
+        index
     }
 
     /// Updates one key in an exclusively owned table. False asks the caller to
-    /// rebuild: the table is empty, would pass half load, or the probe window is full.
+    /// rebuild: the table is empty or would pass half load.
     pub fn insert(&mut self, pc: u32, entry: usize) -> bool {
         debug_assert_ne!(entry, 0);
-        let Some(mask) = self.slots.len().checked_sub(1) else {
+        if self.slots.is_empty() {
             return false;
-        };
-        let first = hash(pc) as usize & mask;
-        for offset in 0..PROBES {
-            let slot = &mut self.slots[(first + offset) & mask];
-            let current = &mut slot.entry;
-            if *current == 0 {
-                if (self.len + 1) * 2 > mask + 1 {
-                    return false;
-                }
-                self.len += 1;
-                slot.pc = pc;
-                *current = entry;
-                return true;
-            }
-            if slot.pc == pc {
-                *current = entry;
-                return true;
-            }
         }
-        false
+        let index = self.find(pc);
+        if self.slots[index].key == VACANT {
+            if (self.len + 1) * 2 > self.slots.len() {
+                return false;
+            }
+            self.len += 1;
+        }
+        self.slots[index] = Slot {
+            key: u64::from(pc),
+            entry,
+        };
+        true
     }
 
     /// Removes one key by shifting later members of its probe run backward.
-    /// Lookups stop at the first empty slot, so no tombstone may remain.
+    /// Lookups stop at the first vacant slot, so no tombstone may remain.
     pub fn remove(&mut self, pc: u32) {
-        let Some(mask) = self.slots.len().checked_sub(1) else {
+        if !self.contains(pc) {
             return;
-        };
-        let first = hash(pc) as usize & mask;
-        let Some(mut hole) = (0..PROBES)
-            .map(|offset| (first + offset) & mask)
-            .take_while(|&index| self.slots[index].entry != 0)
-            .find(|&index| self.slots[index].pc == pc)
-        else {
-            return;
-        };
+        }
+        let mask = self.slots.len() - 1;
+        let mut hole = self.find(pc);
         self.len -= 1;
         let mut next = hole;
         loop {
             next = (next + 1) & mask;
-            let entry = self.slots[next].entry;
-            if entry == 0 {
+            let key = self.slots[next].key;
+            if key == VACANT {
                 break;
             }
-            let home = hash(self.slots[next].pc) as usize & mask;
+            let home = hash(key as u32) as usize & mask;
             // Move a key only when the hole lies on its own probe path.
             if next.wrapping_sub(home) & mask >= next.wrapping_sub(hole) & mask {
-                self.slots[hole].pc = self.slots[next].pc;
-                self.slots[hole].entry = entry;
+                self.slots.swap(hole, next);
                 hole = next;
             }
         }
-        self.slots[hole].pc = 0;
-        self.slots[hole].entry = 0;
+        self.slots[hole] = EMPTY_SLOT;
     }
 
     /// The caller keeps this table borrowed throughout native execution.
@@ -135,14 +119,7 @@ impl Table {
 
     /// Whether the generated probe would find `pc`.
     pub fn contains(&self, pc: u32) -> bool {
-        let Some(mask) = self.slots.len().checked_sub(1) else {
-            return false;
-        };
-        let first = hash(pc) as usize & mask;
-        (0..PROBES)
-            .map(|offset| &self.slots[(first + offset) & mask])
-            .take_while(|slot| slot.entry != 0)
-            .any(|slot| slot.pc == pc)
+        !self.slots.is_empty() && self.slots[self.find(pc)].key != VACANT
     }
 }
 
@@ -164,12 +141,17 @@ mod tests {
         let (slots, mask) = table.parts();
         // SAFETY: parts belongs to this borrowed table.
         let slots = unsafe { std::slice::from_raw_parts(slots, mask as usize + 1) };
-        (0..PROBES)
-            .map(|offset| &slots[(hash(pc) as usize + offset) & mask as usize])
-            .map(|slot| (slot.pc, slot.entry))
-            .take_while(|&(_, entry)| entry != 0)
-            .find(|&(key, _)| key == pc)
-            .map(|(_, entry)| entry)
+        let mut index = hash(pc) & mask;
+        loop {
+            let slot = &slots[index as usize];
+            if slot.key == u64::from(pc) {
+                return Some(slot.entry);
+            }
+            if slot.key == VACANT {
+                return None;
+            }
+            index = (index + 1) & mask;
+        }
     }
 
     #[test]

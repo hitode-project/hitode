@@ -205,7 +205,7 @@ impl Emitter<'_> {
             self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
             self.b.switch_to_block(candidate);
         }
-        // The table always has at least one slot and never names the caller's
+        // The table always has a vacant slot and never names the caller's
         // stop PC, so a miss returns before reading interrupt or fuel state.
         let slots = self.b.ins().load(
             self.ptr_ty,
@@ -215,6 +215,7 @@ impl Emitter<'_> {
         );
         let hit = self.b.create_block();
         self.b.append_block_param(hit, self.ptr_ty);
+        let wanted = self.b.ins().uextend(types::I64, pc);
         let mask = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),
@@ -233,61 +234,40 @@ impl Emitter<'_> {
         let index = self.b.ins().band(hashed, mask);
         let search = self.b.create_block();
         self.b.append_block_param(search, types::I32);
-        self.b.append_block_param(search, types::I32);
-        let zero = self.constant(0);
-        self.b.ins().jump(search, &[index.into(), zero.into()]);
+        self.b.ins().jump(search, &[index.into()]);
         self.b.switch_to_block(search);
         let index = self.b.block_params(search)[0];
-        let probes = self.b.block_params(search)[1];
         let offset = self.b.ins().uextend(self.ptr_ty, index);
         let offset = self
             .b
             .ins()
             .imul_imm(offset, std::mem::size_of::<Slot>() as i64);
         let address = self.b.ins().iadd(slots, offset);
-        let entry_address = self
+        // The whole table is immutable for this borrowed chain. Publication
+        // and retirement happen between calls, not concurrently with these loads.
+        let key = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted().with_readonly(),
+            address,
+            offset_of!(Slot, key) as i32,
+        );
+        let found = self.b.ins().icmp(IntCC::Equal, wanted, key);
+        let advance = self.b.create_block();
+        self.b
+            .ins()
+            .brif(found, hit, &[address.into()], advance, &[]);
+        self.b.switch_to_block(advance);
+        let vacant = self
             .b
             .ins()
-            .iadd_imm(address, offset_of!(Slot, entry) as i64);
-        // The whole table is immutable for this borrowed chain. Publication
-        // and retirement happen between calls, not concurrently with this load.
-        let entry = self.b.ins().load(
-            self.ptr_ty,
-            MemFlags::trusted().with_readonly(),
-            entry_address,
-            0,
-        );
-        let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
-        let occupied = self.b.create_block();
-        self.b.ins().brif(absent, returned, &[], occupied, &[]);
-        self.b.switch_to_block(occupied);
-        let key = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            address,
-            offset_of!(Slot, pc) as i32,
-        );
-        let found = self.b.ins().icmp(IntCC::Equal, pc, key);
-        let advance = self.b.create_block();
-        self.b.ins().brif(found, hit, &[entry.into()], advance, &[]);
-        self.b.switch_to_block(advance);
+            .icmp_imm(IntCC::Equal, key, crate::linking::VACANT as i64);
         let next = self.b.ins().iadd_imm(index, 1);
         let next = self.b.ins().band(next, mask);
-        let probes = self.b.ins().iadd_imm(probes, 1);
-        let exhausted = self.b.ins().icmp_imm(
-            IntCC::UnsignedGreaterThanOrEqual,
-            probes,
-            crate::linking::PROBES as i64,
-        );
-        self.b.ins().brif(
-            exhausted,
-            returned,
-            &[],
-            search,
-            &[next.into(), probes.into()],
-        );
+        self.b
+            .ins()
+            .brif(vacant, returned, &[], search, &[next.into()]);
         self.b.switch_to_block(hit);
-        let entry = self.b.block_params(hit)[0];
+        let address = self.b.block_params(hit)[0];
         // Fuel and this poll bound a chain, as they bound an in-region loop.
         // Both hot footers and cold exits have published canonical state.
         let pending = requested(&mut self.b, self.interrupt);
@@ -317,6 +297,12 @@ impl Emitter<'_> {
                 offset_of!(NativeContext, fault_reads) as i32,
             );
         }
+        let entry = self.b.ins().load(
+            self.ptr_ty,
+            MemFlags::trusted().with_readonly(),
+            address,
+            offset_of!(Slot, entry) as i32,
+        );
         self.tail_to(entry);
         self.b.switch_to_block(returned);
         let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));

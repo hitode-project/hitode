@@ -3284,10 +3284,8 @@ mod publication_tests {
         // SAFETY: parts belongs to this borrowed immutable table generation.
         unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
             .iter()
-            .filter_map(|slot| {
-                let entry = slot.entry;
-                (entry != 0).then_some((slot.pc, entry))
-            })
+            .filter(|slot| slot.key != crate::linking::VACANT)
+            .map(|slot| (slot.key as u32, slot.entry))
             .collect()
     }
 
