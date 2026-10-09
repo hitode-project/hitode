@@ -46,6 +46,9 @@ pub struct Stats {
     pub compile_time: Duration,
     pub sync_compile_time: Duration,
     pub compile_wait_execution_ns: u64,
+    /// Opt-in chunk timings: deferred, queued, compiling, completed.
+    pub compile_wait_stage_ns: [u64; 4],
+    pub publication_ns: u64,
     /// Opt-in fallback lane timings, split by the existing entry reason.
     pub frame_reason_ns: [u64; 6],
     pub compile_wait_units: u64,
@@ -648,6 +651,7 @@ impl Executor {
             }
             return;
         }
+        let timer = self.frame_timing.then(Instant::now);
         self.native_heat.remove(&region.start);
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
@@ -688,6 +692,9 @@ impl Executor {
             .collect();
         self.index_region_with_pages(region, Some(pages));
         self.code.cache_revision += 1;
+        if let Some(timer) = timer {
+            self.stats.publication_ns += timer.elapsed().as_nanos() as u64;
+        }
     }
 
     fn retire_compiled(&mut self, start: u32) {
@@ -822,10 +829,6 @@ impl Executor {
         // optimize an already admitted whole loop under a separate finite cap;
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
-        if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
-            self.stats.compilation_schedule.capacity_rejections += 1;
-            return Ok(false);
-        }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         self.locate_cache_input(&mut snapshot);
@@ -896,6 +899,12 @@ impl Executor {
                     self.publish(region, compiled);
                 }
                 continue;
+            }
+            // A native-cache hit needs no compiler permit. Only an actual miss
+            // is subject to the unrestricted queue's admission limit.
+            if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
+                self.stats.compilation_schedule.capacity_rejections += 1;
+                return Ok(false);
             }
             if !self.pending_regions.contains_key(&fragment.region.start) {
                 self.schedule_deferred(fragment.region.start);
@@ -1477,6 +1486,21 @@ impl Executor {
         if *hits < 32 {
             return Ok(());
         }
+        // An unrestricted queue cannot retain this discovery until a permit is
+        // free. Avoid rebuilding the same CFG on every interpreter chunk.
+        // Persistent entries have already been offered by apply_code_cache.
+        if self.async_compilation
+            && self.pending_regions.len() >= crate::compiler::CAPACITY
+            && self
+                .background_sender()?
+                .borrow()
+                .work_policy()
+                .background_limit()
+                .is_none()
+        {
+            self.stats.compilation_schedule.capacity_rejections += 1;
+            return Ok(());
+        }
         // The interpreter keeps running a loop while its region compiles. Its
         // interior PCs must not become regions of their own: each would bound
         // later discoveries and turn every iteration into region transfers.
@@ -1904,8 +1928,8 @@ impl Executor {
                     .unwrap()
                     .saturating_sub(before);
             }
-            if let Some(timer) = wait_timer {
-                let elapsed = timer.elapsed().as_nanos() as u64;
+            let elapsed = wait_timer.map_or(0, |timer| timer.elapsed().as_nanos() as u64);
+            if wait_timer.is_some() {
                 // Tier 1 bridge time remains inclusive; frame reports identify
                 // that configuration rather than claiming pure Tier 0 time.
                 let index = crate::frame_counters::reason_index(if waiting {
@@ -1929,14 +1953,8 @@ impl Executor {
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
             if interpreted {
-                if matches!(
-                    detail,
-                    Some(
-                        InterpreterDetail::PendingCompilation
-                            | InterpreterDetail::DeferredCompilation
-                    )
-                ) {
-                    self.schedule_interpreted(pc, interpreted_units);
+                if waiting || reason == crate::InterpreterReason::Pending {
+                    self.schedule_interpreted(pc, interpreted_units, elapsed);
                 }
                 bridge.cliffs.interpreted(reason, interpreted_units);
                 if let Some(detail) = detail {

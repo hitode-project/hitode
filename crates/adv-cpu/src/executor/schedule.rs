@@ -172,7 +172,7 @@ impl Executor {
             p.native_bytes.record(compiled.code_size as u64);
         }
     }
-    pub(super) fn schedule_interpreted(&mut self, pc: u32, units: u32) {
+    pub(super) fn schedule_interpreted(&mut self, pc: u32, units: u32, elapsed_ns: u64) {
         // Attribute each chunk once, to the oldest matching request window.
         // A window can include CFG gaps; these are blocked discovery units,
         // not a claim that the eventual native unit will cover every instruction.
@@ -186,6 +186,8 @@ impl Executor {
         {
             pending.waiting.units = pending.waiting.units.saturating_add(u64::from(units));
             let stage = pending.stage.load(Ordering::Relaxed).min(2) + 1;
+            // Sample the stage at the chunk boundary, as for the unit counts.
+            self.stats.compile_wait_stage_ns[stage] += elapsed_ns;
             self.stats.compilation_schedule.phases[pending.phase].interpreter_units[stage] +=
                 u64::from(units);
         } else if let Some((&start, input)) = self
@@ -195,6 +197,7 @@ impl Executor {
             .min_by_key(|(start, _)| self.schedule.deferred.get(start).map(|w| w.born))
         {
             if let Some(waiting) = self.schedule.deferred.get_mut(&start) {
+                self.stats.compile_wait_stage_ns[0] += elapsed_ns;
                 waiting.units = waiting.units.saturating_add(u64::from(units));
                 self.stats.compilation_schedule.phases[phase(input.region.compile_strategy)]
                     .interpreter_units[0] += u64::from(units);
@@ -278,11 +281,12 @@ mod tests {
         m.pending_regions.insert(0x1001, 3);
         for stage in 0..3 {
             m.schedule.pending[&2].stage.store(stage, Ordering::Relaxed);
-            m.schedule_interpreted(0x1002, 7);
+            m.schedule_interpreted(0x1002, 7, 11);
         }
         assert_eq!(m.schedule.pending[&1].waiting.units, 0);
         assert_eq!(m.schedule.pending[&2].waiting.units, 21);
         assert_eq!(m.schedule.pending[&3].waiting.units, 0);
+        assert_eq!(m.stats.compile_wait_stage_ns, [0, 11, 11, 11]);
         assert_eq!(
             m.stats.compilation_schedule.phases[0].interpreter_units,
             [0, 7, 7, 7]
@@ -304,5 +308,40 @@ mod tests {
         m.add_region(Region::new(0x1000, 2)).unwrap();
         assert_eq!(m.stats.compilation_schedule.phases[0].service_us.count, 0);
         assert_eq!(m.stats.compilation_schedule.in_flight.count, 0);
+    }
+
+    #[test]
+    fn indexed_pending_entries_contribute_to_stage_timing() {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 4096, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        m.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap();
+        m.refresh().unwrap();
+        m.index_region(Region::new(0x1000, 3));
+        m.code.entry_owner.insert(0x1000, 0x1000);
+        m.enable_auto_jit(true);
+        m.pending_regions.insert(0x1000, 1);
+        m.schedule.pending.insert(
+            1,
+            Pending {
+                waiting: Waiting {
+                    born: Instant::now(),
+                    units: 0,
+                },
+                start: 0x1000,
+                len: 3,
+                phase: 0,
+                stage: Arc::new(AtomicUsize::new(1)),
+            },
+        );
+        m.enable_frame_timing(true);
+        m.state.eip = 0x1000;
+        m.run(0x4000, 100).unwrap();
+        assert!(m.stats.compile_wait_execution_ns > 0);
+        assert_eq!(
+            m.stats.compile_wait_stage_ns,
+            [0, 0, m.stats.compile_wait_execution_ns, 0]
+        );
+        assert_eq!(m.schedule.pending[&1].waiting.units, 100);
     }
 }
