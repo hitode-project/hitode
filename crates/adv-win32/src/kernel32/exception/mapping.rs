@@ -110,6 +110,11 @@ pub(super) fn normalize_context(record: &Record, state: &mut ArchitecturalState)
         // The handler must explicitly advance/edit this saved EIP to continue;
         // returning unchanged repeats CC just as on the owned native oracle.
         state.eip = record.address;
+    } else {
+        // All other supported hardware stops are fault-class exceptions. x86
+        // saves RF=1 for faults (#PF/#GP/#UD/#DE); the native x86 DLL-init
+        // oracle observes this bit in the delivered Windows CONTEXT.
+        state.eflags |= 1 << 16;
     }
 }
 

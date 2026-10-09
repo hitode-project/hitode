@@ -341,6 +341,11 @@ fn execute_decoded(
         state.rep = None;
     }
     let debug = state.eflags & (1 << 8) != 0;
+    // RF supplied by an architectural continuation is consumed when the next
+    // decoded instruction starts. A fetch/decode stop has not started it yet.
+    if !matches!(decoded, Decoded::Stop(_)) {
+        state.eflags &= !(1 << 16);
+    }
     let instruction = match decoded {
         Decoded::Ready(i) => i,
         Decoded::Stop(result) => {

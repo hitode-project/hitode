@@ -1659,11 +1659,14 @@ impl Executor {
                 self.admit_aot(self.state.eip, stop);
             }
             let single_step = self.state.eflags & (1 << 8) != 0;
+            // A restored RF needs one precise instruction boundary before
+            // ordinary native execution; RF itself must not generate #DB.
+            let precise_flags = self.state.eflags & ((1 << 8) | (1 << 16)) != 0;
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
             let pending_fpu = self.state.x87.status & 0x80 != 0;
             if !interpreter_only
-                && !single_step
+                && !precise_flags
                 && !pending_fpu
                 && self.tier1_mode != crate::Tier1Mode::Exclusive
             {
@@ -1685,7 +1688,7 @@ impl Executor {
             let native = native.filter(|(_, code)| {
                 !interpreter_only
                     && self.tier1_mode != crate::Tier1Mode::Exclusive
-                    && !single_step
+                    && !precise_flags
                     && !pending_fpu
                     && code.entries.contains(&self.state.eip)
                     && self.deferred_fallback != Some(self.state.eip)
@@ -1873,7 +1876,7 @@ impl Executor {
                 });
             let reason = {
                 use crate::InterpreterReason as Reason;
-                if interpreter_only || single_step || pending_fpu {
+                if interpreter_only || precise_flags || pending_fpu {
                     Reason::Forced
                 } else if self.deferred_fallback == Some(pc) {
                     Reason::Fallback
@@ -1906,14 +1909,14 @@ impl Executor {
                 stop,
                 units,
                 interpreter_only
-                    || single_step
+                    || precise_flags
                     || pending_fpu
                     || (self.tier1_mode == crate::Tier1Mode::Bridge
                         && (self.parallel.is_some() || self.deferred_fallback == Some(pc))),
             )?;
             let (execution, last_units) = if let Some(result) = &tier1 {
                 (result.execution, result.last_units)
-            } else if self.profiling || single_step || observed.is_some() {
+            } else if self.profiling || precise_flags || observed.is_some() {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1925,7 +1928,7 @@ impl Executor {
                     units,
                     stop,
                     (!interpreter_only
-                        && !single_step
+                        && !precise_flags
                         && !pending_fpu
                         && !self.code.entry_owner.is_empty())
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),

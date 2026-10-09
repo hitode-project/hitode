@@ -218,6 +218,11 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint
         }
     };
     mapping::normalize_context(&record, &mut checkpoint.state);
+    // Windows enters the user exception dispatcher with DF clear, while the
+    // saved CONTEXT retains the interrupted DF for an explicit continuation.
+    // Do this before any guest dispatcher override or VEH/SEH callback runs.
+    env.cpu
+        .set_reg(Reg::Eflags, env.cpu.reg(Reg::Eflags) & !(1 << 10));
     dispatch_origin(env, checkpoint, record, native::Source::Hardware)
 }
 
