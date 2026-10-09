@@ -60,6 +60,9 @@ fn entry(service: u32, argc: u8) -> Vec<u8> {
 }
 impl<B: LabCpu> Lab<B> {
     fn new(cpu: B, dir: &Path) -> Self {
+        Self::with_profile(cpu, dir, adv_win32::personality::WIN7_SP1)
+    }
+    fn with_profile(cpu: B, dir: &Path, profile: adv_win32::personality::Profile) -> Self {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
         registry.add("fixture", "context", Conv::Stdcall { argc: 0 }, |env| {
@@ -74,11 +77,9 @@ impl<B: LabCpu> Lab<B> {
         });
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
         machine.set_execution_budget(Some(std::time::Duration::from_secs(20)));
-        adv_win32::Win32::install(
-            &mut machine,
-            adv_win32::Win32Config::new(dir, "owned.exe", dir.join("overlay")),
-        )
-        .unwrap();
+        let mut config = adv_win32::Win32Config::new(dir, "owned.exe", dir.join("overlay"));
+        config.personality = profile;
+        adv_win32::Win32::install(&mut machine, config).unwrap();
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
         machine.cpu.map(ENTRY, 4096, Prot::RX).unwrap();
@@ -186,6 +187,22 @@ impl<B: LabCpu> Lab<B> {
 }
 
 fn exercise<B: LabCpu>(factory: impl Fn() -> B, dir: &Path) {
+    let mut empty = Lab::new(factory(), dir);
+    empty.raw(372, u32::MAX, 0);
+    empty.run();
+    empty.eq(0, 0);
+    let mut other = Lab::with_profile(
+        factory(),
+        dir,
+        adv_win32::personality::Profile {
+            build: 7600,
+            ..adv_win32::personality::WIN7_SP1
+        },
+    );
+    other.raw(64, u32::MAX, 0);
+    other.run();
+    other.eq(0, STATUS_INVALID_SYSTEM_SERVICE);
+    drop((empty, other));
     let mut lab = Lab::new(factory(), dir);
     lab.service(1, &[DATA, 0x1f0003, 0, 0, 0], 0x10);
     // Raw EDX arguments are separate from both the caller and bridge stacks.

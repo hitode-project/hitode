@@ -102,6 +102,22 @@ pub(super) fn dispatch(env: &mut Env<'_>, mut checkpoint: Checkpoint) -> Outcome
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn available_directory_entries_have_fixed_native_signatures() {
+        let mut registry = adv_abi::Registry::default();
+        crate::register(&mut registry);
+        for &name in win7::WIN7_SP1 {
+            if registry.is_implemented("ntdll.dll", name) {
+                assert!(
+                    matches!(
+                        registry.get("ntdll.dll", name).unwrap().conv,
+                        adv_machine::Conv::Stdcall { .. }
+                    ),
+                    "{name}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn build_numbers_are_separate_from_transport_and_gui_selectors() {
