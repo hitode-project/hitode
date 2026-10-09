@@ -9,7 +9,7 @@ LockOwner labels the device lock for the calling task.
 Lock acquisition retries once per second without touching an existing owner.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
 The caller owns TEMP/TMP and storage policy. Existing adb server port 5037 only.
-CodeValidity selects legacy/event cache validation; CompileBench measures cold
+CompileBench measures cold
 Fast/Speed compilation with 1/2/4 synchronous host compiler workers.
 .EXAMPLE
 ./tools/android/run-region-bench.ps1 -BuildOnly -TargetDir $env:CARGO_TARGET_DIR -Output $env:ADV_BENCH_OUTPUT
@@ -25,7 +25,6 @@ param(
     [ValidatePattern('^(auto|[0-9a-fA-F]+)$')][string]$CpuMask = 'auto',
     [string]$DeviceLock = $env:ADV_DEVICE_LOCK,
     [ValidatePattern('^[a-zA-Z0-9_-]+$')][string]$LockOwner = 'feat',
-    [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [switch]$CompileBench,
     [ValidateRange(1, 31)][int]$Samples = 7,
     [ValidateRange(1, 100000)][int]$Loops = 10000,
@@ -64,7 +63,7 @@ function Get-Command([string]$Remote) {
     # Compiler workers inherit affinity: a single-core taskset would serialize
     # the 1/2/4-thread throughput experiment. Execution stays on the chosen core.
     $affinity = if ($CompileBench) { '' } else { "taskset $CpuMask " }
-    "unset ADV_JIT_VERIFY ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}${compileEnv}ADV_CODE_VALIDITY=$CodeValidity ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit ${affinity}timeout $TimeoutSeconds '$Remote/host_region_bench'"
+    "unset ADV_JIT_VERIFY ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}${compileEnv}ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit ${affinity}timeout $TimeoutSeconds '$Remote/host_region_bench'"
 }
 if ($WhatIf) {
     [ordered]@{ build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs;

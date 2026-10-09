@@ -302,141 +302,135 @@ mod tests {
 
     #[test]
     fn direct_prefix_materializes_flags_before_cross_page_fault_and_tf() {
-        for event_validity in [false, true] {
-            let mut a = CodeAssembler::new(32).unwrap();
-            a.add(eax, -1).unwrap();
-            a.mov(ebx, dword_ptr(0x21ffe)).unwrap();
-            let bytes = a.assemble(0x10000).unwrap();
-            let mut memory = Memory::new(0x10000, 0x20000).unwrap();
-            memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
-            memory.write(0x10000, &bytes).unwrap();
-            memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
-            memory.write(0x21ffe, &123u32.to_le_bytes()).unwrap();
-            memory.protect(0x22000, PAGE_SIZE, 0).unwrap();
-            let mut interpreter = Interpreter::new();
-            interpreter.event_validity = event_validity;
-            let mut state = CpuState {
-                eip: 0x10000,
-                eflags: 0x202,
-                ..Default::default()
-            };
-            state.regs[0] = 1;
-            state.regs[3] = 99;
-            let result = interpreter.run_block(&mut state, &mut memory, 2, 0, None).0;
-            assert_eq!(result.units, 1);
-            assert!(matches!(
-                result.step,
-                Step::ReadFault {
-                    address: 0x21ffe,
-                    ..
-                }
-            ));
-            assert_eq!(state.regs[0], 0);
-            assert_eq!(state.regs[3], 99);
-            assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
-            let fault_pc = state.eip;
-            memory.protect(0x22000, PAGE_SIZE, READ).unwrap();
-            assert_eq!(
-                interpreter
-                    .run_block(&mut state, &mut memory, 1, 0, None)
-                    .0
-                    .units,
-                1
-            );
-            assert_eq!(state.regs[3], 123);
-            assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
-            // Reuse the original block, but require a trap at its first boundary.
-            state.eip = 0x10000;
-            state.regs[0] = 1;
-            state.regs[3] = 99;
-            state.eflags = 0x302;
-            let result = interpreter.run_block(&mut state, &mut memory, 2, 0, None).0;
-            assert_eq!(
-                result,
-                Execution {
-                    step: Step::Trap {
-                        pc: 0x10000,
-                        vector: 1
-                    },
-                    units: 1
-                }
-            );
-            assert_eq!(state.eip, fault_pc);
-            assert_eq!(state.regs[3], 99);
-            assert_eq!(state.eflags, 0x302 | CF | AF | PF | ZF);
-        }
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.add(eax, -1).unwrap();
+        a.mov(ebx, dword_ptr(0x21ffe)).unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 0x20000).unwrap();
+        memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+        memory.write(0x21ffe, &123u32.to_le_bytes()).unwrap();
+        memory.protect(0x22000, PAGE_SIZE, 0).unwrap();
+        let mut interpreter = Interpreter::new();
+        let mut state = CpuState {
+            eip: 0x10000,
+            eflags: 0x202,
+            ..Default::default()
+        };
+        state.regs[0] = 1;
+        state.regs[3] = 99;
+        let result = interpreter.run_block(&mut state, &mut memory, 2, 0, None).0;
+        assert_eq!(result.units, 1);
+        assert!(matches!(
+            result.step,
+            Step::ReadFault {
+                address: 0x21ffe,
+                ..
+            }
+        ));
+        assert_eq!(state.regs[0], 0);
+        assert_eq!(state.regs[3], 99);
+        assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
+        let fault_pc = state.eip;
+        memory.protect(0x22000, PAGE_SIZE, READ).unwrap();
+        assert_eq!(
+            interpreter
+                .run_block(&mut state, &mut memory, 1, 0, None)
+                .0
+                .units,
+            1
+        );
+        assert_eq!(state.regs[3], 123);
+        assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
+        // Reuse the original block, but require a trap at its first boundary.
+        state.eip = 0x10000;
+        state.regs[0] = 1;
+        state.regs[3] = 99;
+        state.eflags = 0x302;
+        let result = interpreter.run_block(&mut state, &mut memory, 2, 0, None).0;
+        assert_eq!(
+            result,
+            Execution {
+                step: Step::Trap {
+                    pc: 0x10000,
+                    vector: 1
+                },
+                units: 1
+            }
+        );
+        assert_eq!(state.eip, fault_pc);
+        assert_eq!(state.regs[3], 99);
+        assert_eq!(state.eflags, 0x302 | CF | AF | PF | ZF);
     }
 
     #[test]
     fn direct_prefix_survives_partial_rep_and_cached_code_replacement() {
-        for event_validity in [false, true] {
-            let mut a = CodeAssembler::new(32).unwrap();
-            a.add(eax, -1).unwrap();
-            a.rep().movsd().unwrap();
-            let bytes = a.assemble(0x10000).unwrap();
-            let mut memory = Memory::new(0x10000, 0x20000).unwrap();
-            memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
-            memory.write(0x10000, &bytes).unwrap();
-            memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
-            memory.write(0x21ffc, &123u32.to_le_bytes()).unwrap();
-            memory.write(0x22000, &[7; 8]).unwrap();
-            memory.protect(0x22000, PAGE_SIZE, 0).unwrap();
-            let mut interpreter = Interpreter::new();
-            interpreter.event_validity = event_validity;
-            let mut state = CpuState {
-                eip: 0x10000,
-                eflags: 0x202,
-                ..Default::default()
-            };
-            state.regs[0] = 1;
-            state.regs[1] = 3;
-            state.regs[6] = 0x21ffc;
-            state.regs[7] = 0x24000;
-            let result = interpreter.run_block(&mut state, &mut memory, 4, 0, None).0;
-            assert_eq!(result.units, 2);
-            assert!(matches!(
-                result.step,
-                Step::ReadFault {
-                    address: 0x22000,
-                    ..
-                }
-            ));
-            assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
-            assert_eq!(state.regs[1], 2);
-            assert_eq!(state.regs[6], 0x22000);
-            assert_eq!(state.regs[7], 0x24004);
-            memory.write(0x21ffc, &456u32.to_le_bytes()).unwrap();
-            memory.protect(0x22000, PAGE_SIZE, READ).unwrap();
-            assert_eq!(
-                interpreter
-                    .run_block(&mut state, &mut memory, 2, 0, None)
-                    .0
-                    .units,
-                2
-            );
-            assert_eq!(
-                memory.read_data(0x24000, 4).unwrap().as_ref(),
-                &123u32.to_le_bytes()
-            );
-            assert_eq!(memory.read_data(0x24004, 8).unwrap().as_ref(), &[7; 8]);
-            assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
-            let decodes = interpreter.decode_count();
-            let mut replacement = CodeAssembler::new(32).unwrap();
-            replacement.add(eax, 9).unwrap();
-            replacement.rep().movsd().unwrap();
-            memory
-                .write(0x10000, &replacement.assemble(0x10000).unwrap())
-                .unwrap();
-            state.eip = 0x10000;
-            assert_eq!(
-                interpreter
-                    .run_block(&mut state, &mut memory, 1, 0, None)
-                    .0
-                    .units,
-                1
-            );
-            assert_eq!(state.regs[0], 9);
-            assert!(interpreter.decode_count() > decodes);
-        }
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.add(eax, -1).unwrap();
+        a.rep().movsd().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 0x20000).unwrap();
+        memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+        memory.write(0x21ffc, &123u32.to_le_bytes()).unwrap();
+        memory.write(0x22000, &[7; 8]).unwrap();
+        memory.protect(0x22000, PAGE_SIZE, 0).unwrap();
+        let mut interpreter = Interpreter::new();
+        let mut state = CpuState {
+            eip: 0x10000,
+            eflags: 0x202,
+            ..Default::default()
+        };
+        state.regs[0] = 1;
+        state.regs[1] = 3;
+        state.regs[6] = 0x21ffc;
+        state.regs[7] = 0x24000;
+        let result = interpreter.run_block(&mut state, &mut memory, 4, 0, None).0;
+        assert_eq!(result.units, 2);
+        assert!(matches!(
+            result.step,
+            Step::ReadFault {
+                address: 0x22000,
+                ..
+            }
+        ));
+        assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
+        assert_eq!(state.regs[1], 2);
+        assert_eq!(state.regs[6], 0x22000);
+        assert_eq!(state.regs[7], 0x24004);
+        memory.write(0x21ffc, &456u32.to_le_bytes()).unwrap();
+        memory.protect(0x22000, PAGE_SIZE, READ).unwrap();
+        assert_eq!(
+            interpreter
+                .run_block(&mut state, &mut memory, 2, 0, None)
+                .0
+                .units,
+            2
+        );
+        assert_eq!(
+            memory.read_data(0x24000, 4).unwrap().as_ref(),
+            &123u32.to_le_bytes()
+        );
+        assert_eq!(memory.read_data(0x24004, 8).unwrap().as_ref(), &[7; 8]);
+        assert_eq!(state.eflags, 0x202 | CF | AF | PF | ZF);
+        let decodes = interpreter.decode_count();
+        let mut replacement = CodeAssembler::new(32).unwrap();
+        replacement.add(eax, 9).unwrap();
+        replacement.rep().movsd().unwrap();
+        memory
+            .write(0x10000, &replacement.assemble(0x10000).unwrap())
+            .unwrap();
+        state.eip = 0x10000;
+        assert_eq!(
+            interpreter
+                .run_block(&mut state, &mut memory, 1, 0, None)
+                .0
+                .units,
+            1
+        );
+        assert_eq!(state.regs[0], 9);
+        assert!(interpreter.decode_count() > decodes);
     }
 }

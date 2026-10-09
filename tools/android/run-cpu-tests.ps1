@@ -9,7 +9,6 @@ Device runs retain build/test logs, hashes and result counts in Output.
 AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. JitVerify
 configures the CPU.
-CodeValidity selects legacy/event code-cache validation on the device.
 Features adds explicit Cargo features. Tier 2 uses the default GIR frontend.
 .EXAMPLE
 ./tools/android/run-cpu-tests.ps1 -ExecutionExperiments -WhatIf
@@ -34,7 +33,6 @@ param(
     [switch]$SkipBuild,
     [switch]$WhatIf,
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
-    [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [string[]]$Features = @()
 )
 $ErrorActionPreference = 'Stop'
@@ -86,7 +84,7 @@ function Get-DeviceCommand($remote, $run) {
     $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{

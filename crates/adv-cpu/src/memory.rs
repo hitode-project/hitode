@@ -4,12 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-
-fn code_identity() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
+use std::sync::atomic::{AtomicU8, Ordering};
 
 mod fast;
 mod locks;
@@ -100,7 +95,6 @@ pub struct Memory {
     pub(crate) fast: FastPermissions,
     pub(crate) epoch: u64,
     /// Allocation identity survives moves and cannot alias a reused host address.
-    pub(crate) code_identity: u64,
     pub(crate) versions: Vec<u64>,
     /// Monotonic code observations owned by the controller, not guest protection.
     watched: Vec<bool>,
@@ -372,7 +366,6 @@ impl Memory {
             ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            code_identity: code_identity(),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -415,7 +408,6 @@ impl Memory {
             ptr: reservation.ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            code_identity: code_identity(),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -672,25 +664,6 @@ impl Memory {
     pub(crate) fn shared_range(&self, address: u32, len: usize) -> bool {
         self.range(address, len)
             .is_ok_and(|range| self.overlays(&range))
-    }
-
-    /// Aliased backing can change without this allocation's page stamps, even
-    /// after a file view becomes resident and drops the SHARED permission bit.
-    pub(crate) fn externally_mutable_code(&self, address: u32, len: usize) -> bool {
-        self.range(address, len).is_ok_and(|range| {
-            (!range.is_empty()
-                && self
-                    .shared_pages
-                    .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-                    .next()
-                    .is_some())
-                || (!range.is_empty()
-                    && self
-                        .resident
-                        .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-                        .next()
-                        .is_some())
-        })
     }
 
     /// Distinct guest views can overlap physically. REP must retain its element
@@ -1959,7 +1932,6 @@ mod file_page_tests {
         memory
             .map_private_copy_pages(0x10000, &[0x37; 2 * PAGE_SIZE], READ | EXEC)
             .unwrap();
-        assert!(!memory.externally_mutable_code(0x10000, 2 * PAGE_SIZE));
         assert!(memory.executable(0x10000, 2 * PAGE_SIZE));
         assert_eq!(memory.read_data(0x10000, 4).unwrap().as_ref(), [0x37; 4]);
         memory.protect(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
@@ -2258,12 +2230,10 @@ mod file_page_tests {
                 .unwrap();
         }
         assert!(memory.shared_range(0x10000, 4));
-        assert!(memory.externally_mutable_code(0x10000, 4));
         assert!(!page.initialized());
 
         memory.prepare_native_access(0x10000, 4, true).unwrap();
         assert!(!memory.shared_range(0x10000, PAGE_SIZE));
-        assert!(memory.externally_mutable_code(0x10000, PAGE_SIZE));
         assert!(memory.shared_range(0x20000, 4));
         assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
         assert!(!page.dirty());

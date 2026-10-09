@@ -29,9 +29,6 @@ Assert ($defaults.runs.Count -eq 4) 'Default run count changed.'
 Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lockfile.'
 Assert (-not $defaults.runs[0].shell.Contains('ADV_SAFEPOINT')) 'Retired poll selector must not reach the device.'
 Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
-$event = & $runner -WhatIf -CodeValidity event -Output $output | ConvertFrom-Json
-Assert ($event.runs[0].shell.Contains('ADV_CODE_VALIDITY=event')) 'Event validity did not reach the device.'
-Assert ($defaults.runs[0].shell.Contains('ADV_CODE_VALIDITY=legacy')) 'Event validity must remain opt-in.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
 $features = & $runner -WhatIf -TestName execution_contract -Features gir-lift -JitVerify strict -Output $output | ConvertFrom-Json
 Assert ($features.features.Count -eq 1 -and $features.features[0] -eq 'gir-lift') 'Explicit diagnostic feature was lost.'

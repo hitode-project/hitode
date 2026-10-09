@@ -7,7 +7,7 @@
 //! 1/2/4 host compiler workers (not the background service's scheduling policy).
 //! COMPILE_REPEATS (1-31, default 9) bounds jobs per case per worker count.
 //! ADV_REGION_BENCH_TIER0_ONLY=1 and ADV_REGION_BENCH_CATEGORY filter sampling
-//! workloads; ADV_CODE_VALIDITY=event enables independent page subscriptions.
+//! workloads.
 //! Short synthetic comparisons can use ADV_REGION_BENCH_SAMPLES=3,
 //! ADV_REGION_BENCH_LOOPS=1000 and ADV_REGION_BENCH_REPEATS=1.
 use adv_cpu::{
