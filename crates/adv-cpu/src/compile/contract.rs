@@ -177,7 +177,6 @@ pub(crate) struct NativeContext {
     pub interrupt: *const std::sync::atomic::AtomicBool,
     pub slots: *const Slot,
     pub mask: u32,
-    pub remaining: u32,
     pub stop: u32,
     /// Only the initial borrowed owner has a hardware-fault session. Tail
     /// transfers clear this flag before entering another checked region.
@@ -186,13 +185,6 @@ pub(crate) struct NativeContext {
     /// Private session cell receiving the IR-owned recovery stack address.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub recovery_slot: *const std::cell::Cell<usize>,
-}
-
-impl NativeContext {
-    /// Tail calls taken by this chain: each consumed one `remaining` unit.
-    pub fn linked(&self) -> u64 {
-        u64::from(crate::linking::CHAIN_LIMIT - self.remaining)
-    }
 }
 
 impl Emitter<'_> {
@@ -214,7 +206,7 @@ impl Emitter<'_> {
             self.b.switch_to_block(candidate);
         }
         // The table always has at least one slot and never names the caller's
-        // stop PC, so a miss returns before reading chain or fuel state.
+        // stop PC, so a miss returns before reading interrupt or fuel state.
         let slots = self.b.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -296,16 +288,7 @@ impl Emitter<'_> {
         );
         self.b.switch_to_block(hit);
         let entry = self.b.block_params(hit)[0];
-        let remaining = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let exhausted = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
-        let budgeted = self.b.create_block();
-        self.b.ins().brif(exhausted, returned, &[], budgeted, &[]);
-        self.b.switch_to_block(budgeted);
+        // Fuel and this poll bound a chain, as they bound an in-region loop.
         // Both hot footers and cold exits have published canonical state.
         let pending = requested(&mut self.b, self.interrupt);
         let interrupted = self.b.create_block();
@@ -324,13 +307,6 @@ impl Emitter<'_> {
             .select(fuel, interrupted_reason, dispatch_reason);
         self.b.ins().return_(&[interrupted_reason]);
         self.b.switch_to_block(linked);
-        let remaining = self.b.ins().iadd_imm(remaining, -1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            remaining,
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if self.fault_mode.is_some() {
             let disabled = self.b.ins().iconst(types::I8, 0);

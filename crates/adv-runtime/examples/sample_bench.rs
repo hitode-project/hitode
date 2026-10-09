@@ -174,10 +174,10 @@ fn run() -> Result<(), String> {
         .copied()
         .unwrap_or(0.0);
     println!(
-        "backend,compile_strategy,frames,width,height,fnv1a64,wall_seconds,first_frame_seconds,guest_seconds,compile_seconds,native_entries,interpreter_entries,steps,warm_frames,warm_frame_mean_ms,warm_frame_p95_ms,warm_fps,compilations,native_code_bytes,region_linking,linked_entries,interpreter_instructions,async_compilation,pending_compilations,stale_compilations,compile_failures,peak_pending_compilations"
+        "backend,compile_strategy,frames,width,height,fnv1a64,wall_seconds,first_frame_seconds,guest_seconds,compile_seconds,native_entries,interpreter_entries,steps,warm_frames,warm_frame_mean_ms,warm_frame_p95_ms,warm_fps,compilations,native_code_bytes,region_linking,interpreter_instructions,async_compilation,pending_compilations,stale_compilations,compile_failures,peak_pending_compilations"
     );
     println!(
-        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.4},{:.4},{:.2},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.4},{:.4},{:.2},{},{},{},{},{},{},{},{},{}",
         backend,
         if !jit {
             "-"
@@ -204,7 +204,6 @@ fn run() -> Result<(), String> {
         stats.compilations,
         stats.native_code_bytes,
         jit && region_linking && !profile,
-        stats.linked_entries,
         stats.interpreter_instructions,
         jit && async_compilation,
         stats.pending_compilations,

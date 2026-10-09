@@ -219,7 +219,8 @@ fn jit(program: &Program) -> Result<Trace, String> {
             executor.stats
         ));
     }
-    if program.require_link && executor.stats.linked_entries == 0 {
+    // Unlinked, every call and return of the loop re-enters from Rust.
+    if program.require_link && executor.stats.native_entries >= u64::from(ITERATIONS) {
         return Err(format!(
             "region linking did not execute: {:?}",
             executor.stats
@@ -238,7 +239,6 @@ fn jit(program: &Program) -> Result<Trace, String> {
             "native_code_bytes": stats.native_code_bytes,
             "native_entries": stats.native_entries,
             "native_blocks": stats.native_blocks,
-            "linked_entries": stats.linked_entries,
             "interpreter_instructions": stats.interpreter_instructions,
             "interpreter_entries": stats.interpreter_entries,
         }),

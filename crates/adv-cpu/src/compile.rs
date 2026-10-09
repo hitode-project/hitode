@@ -174,7 +174,7 @@ impl Compiled {
         memory: &mut Memory,
         bridge: &mut crate::trap::Bridge<'_>,
         controls: NativeRun<'_>,
-    ) -> (u32, u64) {
+    ) -> u32 {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         crate::jit_memory_macos::synchronize_execution();
         #[cfg(target_arch = "aarch64")]
@@ -206,7 +206,6 @@ impl Compiled {
             interrupt: controls.interrupt,
             slots,
             mask,
-            remaining: crate::linking::CHAIN_LIMIT,
             stop: controls.stop,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
@@ -229,11 +228,11 @@ impl Compiled {
                 memory.ptr.as_ptr(),
             )
         {
-            return (result, context.linked());
+            return result;
         }
         let memory_pointer = memory.ptr.as_ptr();
         let result = unsafe { (self.entry)(&mut context, memory_pointer) };
-        (result, context.linked())
+        result
     }
 
     // Keep TLS/metadata validation and its large stack frame out of the normal

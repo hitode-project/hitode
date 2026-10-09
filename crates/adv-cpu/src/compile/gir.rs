@@ -202,7 +202,7 @@ mod tests {
             cliffs: Default::default(),
         };
         let interrupt = AtomicBool::new(false);
-        let (exit, _) = compiled.run(
+        let exit = compiled.run(
             state,
             memory,
             &mut bridge,

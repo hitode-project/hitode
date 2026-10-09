@@ -647,7 +647,6 @@ fn execute(batch: &Batch) {
             interrupt: &NO_INTERRUPT,
             slots: crate::linking::unlinked().0,
             mask: 0,
-            remaining: 0,
             stop: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
@@ -1107,7 +1106,6 @@ mod tests {
                 interrupt: &interrupt,
                 slots: crate::linking::unlinked().0,
                 mask: 0,
-                remaining: 0,
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,
@@ -1192,7 +1190,6 @@ mod tests {
                 interrupt: &interrupt,
                 slots: crate::linking::unlinked().0,
                 mask: 0,
-                remaining: 0,
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,

@@ -2,7 +2,6 @@
 //! retires code, between native calls. Generated tail calls never own code pages.
 
 pub(crate) const PROBES: usize = 8;
-pub(crate) const CHAIN_LIMIT: u32 = 1024;
 
 pub(crate) fn hash(pc: u32) -> u32 {
     let mixed = (pc ^ (pc >> 16)).wrapping_mul(0x9e37_79b1);

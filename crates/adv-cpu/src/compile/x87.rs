@@ -941,19 +941,17 @@ pub(crate) mod testing {
             cliffs: Default::default(),
         };
         let interrupt = std::sync::atomic::AtomicBool::new(false);
-        compiled
-            .run(
-                state,
-                memory,
-                &mut bridge,
-                NativeRun {
-                    links: None,
-                    rows: None,
-                    stop: 0,
-                    interrupt: &interrupt,
-                },
-            )
-            .0
+        compiled.run(
+            state,
+            memory,
+            &mut bridge,
+            NativeRun {
+                links: None,
+                rows: None,
+                stop: 0,
+                interrupt: &interrupt,
+            },
+        )
     }
 }
 

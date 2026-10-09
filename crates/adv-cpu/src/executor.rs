@@ -55,9 +55,8 @@ pub struct Stats {
     pub native_regions: usize,
     pub cache_evictions: u64,
     pub cache_rejections: u64,
+    /// Native chains entered from run_inner; generated tail links are not counted.
     pub native_entries: u64,
-    /// Entries reached by a generated tail call without returning to run_inner.
-    pub linked_entries: u64,
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
@@ -1576,7 +1575,7 @@ impl Executor {
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
-                let (result, linked) = native.run(
+                let result = native.run(
                     &mut self.state,
                     &mut self.memory,
                     bridge,
@@ -1602,8 +1601,7 @@ impl Executor {
                     p.native_entries += 1;
                     p.native_ns += timer.elapsed().as_nanos() as u64;
                 }
-                self.stats.native_entries += 1 + linked;
-                self.stats.linked_entries += linked;
+                self.stats.native_entries += 1;
                 let completed = before - self.state.fuel;
                 if let Some((_, now)) = timed
                     && reserved != 0
@@ -1992,7 +1990,7 @@ mod responsive_compile_tests {
         );
         assert_eq!(m.state.regs[1], 0);
         assert_eq!(m.state.regs[4], STACK + 4);
-        assert!(m.stats.linked_entries > 0);
+        assert!(m.stats.native_blocks > m.stats.native_entries);
         // Patch an instruction in the last fragment; no old piece may execute.
         let mut patched = bytes.clone();
         let position = patched
@@ -2128,7 +2126,7 @@ mod responsive_compile_tests {
                     cold.push(begun.elapsed().as_secs_f64() * 1000.0);
                     compilation.push(m.stats.compile_time.as_secs_f64() * 1000.0);
                     sizes = (m.code.compiled.len(), m.stats.native_code_bytes);
-                    let before_linked = m.stats.linked_entries;
+                    let before_entries = m.stats.native_entries;
                     for _ in 0..7 {
                         seed(&mut m, 20_000);
                         let begun = Instant::now();
@@ -2145,7 +2143,7 @@ mod responsive_compile_tests {
                             );
                         }
                     }
-                    linked = (m.stats.linked_entries - before_linked) as f64 / 140_000.0;
+                    linked = (m.stats.native_entries - before_entries) as f64 / 140_000.0;
                     assert!(m.stats.interpreter_instructions == 0);
                     if limit != 0 {
                         assert!(m.stats.max_compile_work <= limit);
@@ -2489,7 +2487,8 @@ mod topology_tests {
         assert_eq!(m.code.compiled[&0x1300].tail_entry, old_entry);
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 4);
-        assert_eq!(m.stats.linked_entries, 1);
+        // One Rust entry: the new fragment tail-links to the old one.
+        assert_eq!(m.stats.native_entries, 1);
         assert_eq!(m.stats.interpreter_instructions, 0);
     }
 
@@ -3117,7 +3116,9 @@ mod tiering_tests {
         assert!(!merged.code.regions[&0x1100].frontier.contains(&0x1180));
         assert!(separate.code.regions[&0x1100].frontier.contains(&0x1180));
         assert_eq!(merged.code.entry_owner.get(&0x1180), Some(&0x1180));
+        // Rust entries count region transfers only while linking is off.
         for m in [&mut merged, &mut separate] {
+            m.set_region_linking(false);
             seed_direct_leaf(m, 1000);
         }
         let before_merged = merged.stats.native_entries;

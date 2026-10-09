@@ -63,6 +63,7 @@ fn host_patch_of_a_linked_target_retires_its_slot_before_the_next_call() {
         a.mov(eax, 1).unwrap();
         a.ret().unwrap();
     });
+    let mut entries = Vec::new();
     for links in [false, true] {
         let mut m = blank();
         region(&mut m, MAIN, &main, false);
@@ -78,10 +79,9 @@ fn host_patch_of_a_linked_target_retires_its_slot_before_the_next_call() {
         assert_eq!(m.stats.trap_calls, 1);
         assert!(m.stats.invalidations >= 1);
         assert_eq!(m.stats.interpreter_entries, 0);
-        if links {
-            assert!(m.stats.linked_entries >= 4);
-        }
+        entries.push(m.stats.native_entries);
     }
+    assert!(entries[1] < entries[0]);
 }
 
 #[test]
@@ -98,6 +98,7 @@ fn guest_patch_of_a_linked_target_rebuilds_slots_before_reentry() {
         a.mov(eax, 1).unwrap();
         a.ret().unwrap();
     });
+    let mut entries = Vec::new();
     for links in [false, true] {
         let mut m = blank();
         region(&mut m, MAIN, &main, false);
@@ -107,9 +108,10 @@ fn guest_patch_of_a_linked_target_rebuilds_slots_before_reentry() {
         assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 43);
         assert!(m.stats.invalidations >= 1);
-        assert_eq!(m.stats.linked_entries >= 2, links);
         assert_eq!(m.memory().read(TARGET + 1, 4).unwrap(), 42u32.to_le_bytes());
+        entries.push(m.stats.native_entries);
     }
+    assert!(entries[1] < entries[0]);
 }
 
 #[test]
@@ -154,6 +156,7 @@ fn long_pure_native_tail_chain_checks_wall_deadline_without_losing_resume_state(
         );
         assert!(cpu.reg(Reg::Eip) == MAIN || cpu.reg(Reg::Eip) == TARGET);
     }
-    assert!(cpu.stats().linked_entries > 1024);
+    // Only fuel and the wall deadline end this pure native chain.
+    assert!(cpu.reg(Reg::Eax) > 1024);
     assert_eq!(cpu.stats().interpreter_entries, 0);
 }

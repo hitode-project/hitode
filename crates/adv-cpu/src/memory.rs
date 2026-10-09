@@ -1675,7 +1675,8 @@ mod linear_audio_tests {
             );
             assert_eq!(executor.stats.interpreter_instructions, 0);
             if linked {
-                assert_eq!(executor.stats.linked_entries, u64::from(!verifying));
+                // Verification enters each region from Rust instead of linking.
+                assert_eq!(executor.stats.native_entries, 1 + u64::from(verifying));
             }
         }
     }

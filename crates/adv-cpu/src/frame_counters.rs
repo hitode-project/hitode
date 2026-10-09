@@ -28,9 +28,8 @@ pub struct FrameCounters {
     pub tier2_blocks: u64,
     /// Confirmed retired Tier 0 instructions only; never present this as all tiers.
     pub retired_tier0_instructions: u64,
+    /// Native chains entered from Rust; generated tail links are not counted.
     pub native_entries: u64,
-    /// Generated tail links, an inclusive subset of native_entries.
-    pub linked_entries: u64,
     pub interpreter_entries: u64,
     pub sync_compile_ns: u64,
     /// Execution in a missing-code lane while compilation is pending, not worker time.
@@ -67,7 +66,6 @@ impl FrameCounters {
             tier2_blocks,
             retired_tier0_instructions,
             native_entries,
-            linked_entries,
             interpreter_entries,
             sync_compile_ns,
             compile_wait_execution_ns,
@@ -97,7 +95,7 @@ impl FrameCounters {
         format!(
             concat!(
                 "{{\"tier0_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
-                "\"native_entries\":{},\"linked_entries\":{},\"interpreter_entries\":{},\"sync_compile_ns\":{},",
+                "\"native_entries\":{},\"interpreter_entries\":{},\"sync_compile_ns\":{},",
                 "\"compile_wait_execution_ns\":{},\"compile_wait_stage_ns\":{:?},\"compile_worker_ns\":{},\"publication_ns\":{},\"compile_wait_units\":{},\"invalidations\":{},",
                 "\"recompilations\":{},\"compilations\":{},\"x87_helpers\":{},\"softfloat_calls\":{},\"reasons\":{{{}}},\"reason_ns\":{{{}}}}}"
             ),
@@ -105,7 +103,6 @@ impl FrameCounters {
             self.tier2_blocks,
             self.retired_tier0_instructions,
             self.native_entries,
-            self.linked_entries,
             self.interpreter_entries,
             self.sync_compile_ns,
             self.compile_wait_execution_ns,
@@ -146,7 +143,6 @@ impl Executor {
             tier2_blocks: s.native_blocks,
             retired_tier0_instructions: s.frame_retired_tier0,
             native_entries: s.native_entries,
-            linked_entries: s.linked_entries,
             interpreter_entries: s.interpreter_entries,
             sync_compile_ns: s.sync_compile_time.as_nanos() as u64,
             compile_wait_execution_ns: s.compile_wait_execution_ns,
