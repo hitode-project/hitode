@@ -11,8 +11,8 @@ Reads native-dumps.json and pc-samples.tsv written by pc_sample.py (with
 one region's machine code, each instruction prefixed by its sample count.
 
 --summary splits every host instruction of the dumped regions (or of the one
-given) by the JIT part that emitted it (check, body, pure, slow, entry, ...;
-see docs/performance/jit-attribution.md) and by guest instruction class, and
+given) by the JIT part that emitted it (check, body, pure, slow, entry, ...)
+and by guest instruction class, and
 counts host instructions per guest instruction. It needs the insn-*.tsv and
 jit-*.tsv tables the runner writes under ADV_JIT_MAP_DIR. Each figure is given
 twice: static (every instruction counts once) and sampled (weighted by
