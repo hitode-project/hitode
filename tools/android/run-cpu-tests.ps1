@@ -3,12 +3,12 @@
 Build and run synthetic adv-cpu tests on an authorized Android ARM64 device.
 .DESCRIPTION
 Inputs are integration target names and unit-test filters, never game assets.
-ExecutionExperiments selects A/B/C/D. WhatIf prints the build/device plan as
+ExecutionExperiments selects A/B/D. WhatIf prints the build/device plan as
 JSON without tools, files or a device; BuildOnly cross-links without adb.
 Device runs retain build/test logs, hashes and result counts in Output.
 AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. JitVerify
-configure the CPU; Tier1 records the shell selector (fixtures select their modes).
+configures the CPU.
 CodeValidity selects legacy/event code-cache validation on the device.
 Features adds explicit Cargo features. Tier 2 uses the default GIR frontend.
 .EXAMPLE
@@ -34,7 +34,6 @@ param(
     [switch]$SkipBuild,
     [switch]$WhatIf,
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
-    [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
     [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [string[]]$Features = @()
 )
@@ -54,8 +53,8 @@ if ($ExecutionExperiments) {
     if ($PSBoundParameters.ContainsKey('TestName') -or $PSBoundParameters.ContainsKey('UnitFilter')) {
         throw '-ExecutionExperiments cannot be combined with -TestName or -UnitFilter.'
     }
-    $TestName = @('tier1')
-    $UnitFilter = @('virtual_memory', 'fault_recovery', 'tier1::native::publication_tests', 'compile::x87::tests')
+    $TestName = @()
+    $UnitFilter = @('virtual_memory', 'fault_recovery', 'compile::x87::tests')
 }
 $UnitFilter = @($UnitFilter | Where-Object { $AllTests -or $_ -ne '' } | Select-Object -Unique)
 $TestName = @($TestName | Select-Object -Unique)
@@ -84,16 +83,16 @@ $runs = @(
 function Get-DeviceCommand($remote, $run) {
     # Parent tests exec their own deployed ELF and validate each child's status.
     # Never carry a host runner or an individual fault case into the parent.
-    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_TIER1 ADV_GIR'
+    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_GIR'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_TIER1=$Tier1 ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
         mode = 'dry-run'; build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs; targets = $targets
         build_environment = @{ ANDROID_NDK_HOME = $Ndk; CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake'); CARGO_BUILD_JOBS = '2' }
-        serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; tier1 = $Tier1; all_tests = [bool]$AllTests
+        serial = $Serial; adb_port = $AdbPort; jit_verify = $JitVerify; all_tests = [bool]$AllTests
         features = $Features
         runs = @($runs | ForEach-Object { [ordered]@{ id = $_.id; target = $_.target; filter = $_.filter; shell = (Get-DeviceCommand '/data/local/tmp/adv-host-cpu-DRYRUN' $_) } })
     } | ConvertTo-Json -Depth 6
@@ -178,7 +177,6 @@ try {
         "CMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE"
         "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
         "ADV_JIT_VERIFY=$JitVerify (device only)"
-        "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
         $manifest | ForEach-Object { "$($_.target)_sha256=$($_.sha256)" }
@@ -231,7 +229,7 @@ try {
             test = $test; filter = $filter; binary = $binary; sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
             exit_code = $code; passed = $passed; failed = $failed; ignored = $ignored; skipped_empty_target = $empty; ok = $ok; failed_names = $failedNames; summary = $summary.Value; log = $log
         })
-        [ordered]@{ context = 'adb-shell'; remote_directory = $remote; jit_verify = $JitVerify; tier1 = $Tier1; bridge_scope = 'Explicit tier1_bridge fixtures; environment does not override Executor policies'; results = $results.ToArray() } |
+        [ordered]@{ context = 'adb-shell'; remote_directory = $remote; jit_verify = $JitVerify; results = $results.ToArray() } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Output 'results.json') -Encoding utf8
         if (-not $ok -and -not $NoFailFast) { throw "Device test failed ($code): $test $filter; evidence: $Output" }
         if ($empty) { Write-Output "Skipped empty platform target: $test" }

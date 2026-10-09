@@ -16,7 +16,6 @@ mod schedule;
 pub use schedule::CompilationSchedule;
 mod aot;
 mod persistent;
-mod tier1;
 mod verify;
 mod warm;
 pub use aot::{AotImage, AotStats};
@@ -122,8 +121,6 @@ pub struct Executor {
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     pub(crate) interpreter: crate::interpreter::Interpreter,
-    tier1: Option<crate::tier1::Engine>,
-    tier1_mode: crate::Tier1Mode,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -363,8 +360,6 @@ impl Executor {
             region_linking: true,
             shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
-            tier1: None,
-            tier1_mode: crate::Tier1Mode::Off,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -486,7 +481,6 @@ impl Executor {
         self.async_compilation = parent.async_compilation;
         self.persistent_cache = parent.persistent_cache.clone();
         self.set_aot_enabled(parent.aot.enabled);
-        self.set_tier1_mode(parent.tier1_mode)?;
         self.region_linking = parent.region_linking;
         self.profiling = parent.profiling;
         self.cache_region_limit = parent.cache_region_limit;
@@ -1562,11 +1556,7 @@ impl Executor {
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
             let pending_fpu = self.state.x87.status & 0x80 != 0;
-            if !interpreter_only
-                && !single_step
-                && !pending_fpu
-                && self.tier1_mode != crate::Tier1Mode::Exclusive
-            {
+            if !interpreter_only && !single_step && !pending_fpu {
                 self.discover(stop)?;
             }
             // Publications and queued regions can change the ranges during this
@@ -1584,7 +1574,6 @@ impl Executor {
             }
             let native = native.filter(|(_, code)| {
                 !interpreter_only
-                    && self.tier1_mode != crate::Tier1Mode::Exclusive
                     && !single_step
                     && !pending_fpu
                     && code.entries.contains(&self.state.eip)
@@ -1774,9 +1763,6 @@ impl Executor {
                 crate::InterpreterReason::Uncovered | crate::InterpreterReason::Rejected
             )
             .then(|| self.interpreter_detail(pc));
-            if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
-                self.interpreter.census = Some(Default::default());
-            }
             let waiting = matches!(
                 detail,
                 Some(
@@ -1785,18 +1771,7 @@ impl Executor {
             );
             let wait_timer = self.frame_timing.then(Instant::now);
             let retired_before = self.interpreter.frame_retired;
-            let tier1 = self.run_tier1(
-                stop,
-                units,
-                interpreter_only
-                    || single_step
-                    || pending_fpu
-                    || (self.tier1_mode == crate::Tier1Mode::Bridge
-                        && self.deferred_fallback == Some(pc)),
-            )?;
-            let (execution, last_units) = if let Some(result) = &tier1 {
-                (result.execution, result.last_units)
-            } else if self.profiling || single_step || observed.is_some() {
+            let (execution, last_units) = if self.profiling || single_step || observed.is_some() {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1814,19 +1789,8 @@ impl Executor {
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
-            if let Some(entry) = self.interpreter.census.take() {
-                bridge
-                    .cliffs
-                    .tier1_census
-                    .get_or_insert_with(Default::default)
-                    .record(reason, detail.unwrap(), entry);
-            }
-            let interpreted_units = tier1
-                .as_ref()
-                .map_or(execution.units, |r| r.interpreted_units);
-            if tier1.is_none()
-                && let Some(before) = retired_before
-            {
+            let interpreted_units = execution.units;
+            if let Some(before) = retired_before {
                 self.stats.frame_retired_tier0 += self
                     .interpreter
                     .frame_retired
@@ -1835,8 +1799,6 @@ impl Executor {
             }
             let elapsed = wait_timer.map_or(0, |timer| timer.elapsed().as_nanos() as u64);
             if wait_timer.is_some() {
-                // Tier 1 bridge time remains inclusive; frame reports identify
-                // that configuration rather than claiming pure Tier 0 time.
                 let index = crate::frame_counters::reason_index(if waiting {
                     crate::InterpreterReason::Pending
                 } else {
@@ -1848,26 +1810,17 @@ impl Executor {
                     self.stats.compile_wait_units += u64::from(execution.units);
                 }
             }
-            let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
-            if self.tier1_mode == crate::Tier1Mode::Bridge && tier1.is_some() {
-                let native_units = execution.units - interpreted_units;
-                if native_units != 0 {
-                    bridge.cliffs.bridged(reason, detail, native_units);
-                }
-            }
-            self.stats.interpreter_entries += u64::from(interpreted);
+            self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(interpreted_units);
-            if interpreted {
-                if waiting || reason == crate::InterpreterReason::Pending {
-                    self.schedule_interpreted(pc, interpreted_units, elapsed);
-                }
-                bridge.cliffs.interpreted(reason, interpreted_units);
-                if let Some(detail) = detail {
-                    bridge.cliffs.detail(reason, detail, interpreted_units);
-                }
-                if let Some(profile) = &mut self.interpreter_profile {
-                    profile.record(pc, interpreted_units, reason, &self.memory);
-                }
+            if waiting || reason == crate::InterpreterReason::Pending {
+                self.schedule_interpreted(pc, interpreted_units, elapsed);
+            }
+            bridge.cliffs.interpreted(reason, interpreted_units);
+            if let Some(detail) = detail {
+                bridge.cliffs.detail(reason, detail, interpreted_units);
+            }
+            if let Some(profile) = &mut self.interpreter_profile {
+                profile.record(pc, interpreted_units, reason, &self.memory);
             }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
                 if self.demand.len() >= 65_536 {
@@ -1878,14 +1831,9 @@ impl Executor {
             self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
-                p.interpreter_entries += u64::from(interpreted);
+                p.interpreter_entries += 1;
                 p.interpreter_instructions += u64::from(interpreted_units);
-                if tier1.is_some() {
-                    p.native_entries += 1;
-                    p.native_ns += timer.elapsed().as_nanos() as u64;
-                } else {
-                    p.interpreter_ns += timer.elapsed().as_nanos() as u64;
-                }
+                p.interpreter_ns += timer.elapsed().as_nanos() as u64;
             }
             self.deferred_fallback = None;
             let step = match execution.step {

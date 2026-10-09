@@ -488,9 +488,6 @@ fn setup(case: &Case, tier: u8) -> Result<Executor, String> {
     m.enable_auto_jit(false);
     m.set_async_compilation(false);
     m.set_tiered_compilation(false);
-    if tier == 1 {
-        m.set_arm64_tier1(true)?;
-    }
     if tier >= 2 {
         m.add_region(Region::new(CODE, case.bytes.len()))?;
     }
@@ -571,18 +568,7 @@ fn main() {
         HostFeatures::get(),
         cpu()
     );
-    let mut tiers: Vec<u8> = if cfg!(all(
-        target_arch = "aarch64",
-        any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos"
-        )
-    )) {
-        vec![0, 1, 2]
-    } else {
-        vec![0, 2]
-    };
+    let mut tiers: Vec<u8> = vec![0, 2];
     if std::env::var("ADV_REGION_BENCH_TIER0_ONLY").as_deref() == Ok("1") {
         tiers = vec![0];
     }
@@ -695,11 +681,10 @@ fn main() {
             );
             let m = &ready.executors[index].1;
             println!(
-                "# execution category={} ordinal={} tier={tier} native_code_bytes={} tier1_code_bytes={} native_entries_measured={} memory_movs_per_run={} measured_runs={}",
+                "# execution category={} ordinal={} tier={tier} native_code_bytes={} native_entries_measured={} memory_movs_per_run={} measured_runs={}",
                 ready.case.category,
                 ready.case.ordinal,
                 m.stats.native_code_bytes,
-                m.tier1_stats().code_bytes,
                 m.stats.native_entries - native_before[index],
                 ready.case.memory_movs,
                 samples * ready.case.repeats

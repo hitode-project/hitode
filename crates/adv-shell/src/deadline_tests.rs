@@ -82,11 +82,3 @@ fn host_time_limit_keeps_live_guest_status_and_api_eligibility() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
-
-#[test]
-fn bridge_report_has_an_explicit_zero_and_no_sample_metadata() {
-    let c = adv_runtime::Cliffs::default();
-    let report = cliffs_report(&c);
-    assert!(report.contains(r#""tier1_bridge":{"entries":0,"instructions":0,"details":{}}"#));
-    assert!(report.contains(r#""tier1_census":null"#));
-}

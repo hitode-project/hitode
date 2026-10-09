@@ -9,10 +9,6 @@
 //! back edge, so that PC names a single interpreted state. Native writes
 //! outside the interpreted footprint go unseen. Strict mode turns a mismatch
 //! into a run error, so a bisection stops at the first divergent region.
-//!
-//! ARM64 Tier 1 counts every retired instruction, so its exit is compared
-//! with the interpreted state after the same number of steps instead of the
-//! first state at the exit PC; its internal loops stay enabled.
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -47,10 +43,6 @@ pub(crate) struct Verifier {
     pub strict: bool,
     /// Published regions and how many of their next native entries to verify.
     pub pending: HashMap<u32, u8>,
-    /// Tier 1 entry PCs and how many of their entries were verified since the
-    /// engine's last compilation, which any replaced code requires.
-    tier1: HashMap<u32, u8>,
-    tier1_generation: u64,
     factory: InstructionInfoFactory,
 }
 
@@ -64,17 +56,6 @@ pub(crate) struct Trace {
     /// The interpreter stopped before an instruction it could not trace, which
     /// native code may have executed; a difference is then inconclusive.
     cut: bool,
-    /// Tier 1 promises exact sticky flags; Cranelift retains its diagnostic allowance.
-    exact_mxcsr: bool,
-    exact_flags: bool,
-    /// A zero-retirement trap can still commit status (for example #XM).
-    stopped: Option<Stopped>,
-}
-
-struct Stopped {
-    steps: usize,
-    step: Step,
-    state: (ArchitecturalState, usize, u32),
 }
 
 struct Written {
@@ -96,8 +77,6 @@ impl Verifier {
         Self {
             strict,
             pending: HashMap::new(),
-            tier1: HashMap::new(),
-            tier1_generation: 0,
             factory: InstructionInfoFactory::new(),
         }
     }
@@ -111,21 +90,6 @@ impl Verifier {
         }
     }
 
-    /// Whether this Tier 1 entry is among the first `ENTRIES` at its PC since
-    /// the engine's compilation count was `generation`. Every instruction is a
-    /// Tier 1 entry, so the count is per PC rather than per published region.
-    pub(crate) fn take_tier1(&mut self, pc: u32, generation: u64) -> bool {
-        if generation != self.tier1_generation {
-            self.tier1.clear();
-            self.tier1_generation = generation;
-        }
-        let seen = self.tier1.entry(pc).or_default();
-        *seen < ENTRIES && {
-            *seen += 1;
-            true
-        }
-    }
-
     /// Interpret from the current state, then restore the state and memory.
     pub(crate) fn record(
         &mut self,
@@ -135,32 +99,6 @@ impl Verifier {
         state: &mut CpuState,
         memory: &mut Memory,
     ) -> Result<Trace, String> {
-        self.record_units(owner, stop, interpreter, state, memory, false, MAX_STEPS)
-    }
-
-    /// Tier 1 retires each REP element separately, so its trace can undo and
-    /// compare one MOVS/STOS/LODS element at each repeated PC.
-    pub(crate) fn record_tier1(
-        &mut self,
-        owner: u32,
-        stop: u32,
-        interpreter: &mut Interpreter,
-        state: &mut CpuState,
-        memory: &mut Memory,
-    ) -> Result<Trace, String> {
-        self.record_units(owner, stop, interpreter, state, memory, true, MAX_STEPS)
-    }
-
-    fn record_units(
-        &mut self,
-        owner: u32,
-        stop: u32,
-        interpreter: &mut Interpreter,
-        state: &mut CpuState,
-        memory: &mut Memory,
-        elements: bool,
-        limit: usize,
-    ) -> Result<Trace, String> {
         let start = state.clone();
         let mut trace = Trace {
             owner,
@@ -168,25 +106,22 @@ impl Verifier {
             states: Vec::new(),
             writes: Vec::new(),
             cut: true,
-            exact_mxcsr: elements,
-            exact_flags: false,
-            stopped: None,
         };
         let mut undefined = 0;
-        for step in 0..=limit {
+        for step in 0..=MAX_STEPS {
             trace.states.push((
                 state.clone().capture_architecture(),
                 trace.writes.len(),
                 undefined,
             ));
-            if step == limit || state.eip == stop {
+            if step == MAX_STEPS || state.eip == stop {
                 trace.cut = false;
                 break;
             }
             let Some(i) = decode(memory, state.eip) else {
                 break;
             };
-            let Some(footprint) = writes(&mut self.factory, &i, state, memory, elements) else {
+            let Some(footprint) = writes(&mut self.factory, &i, state, memory) else {
                 break;
             };
             let Some(old) = footprint
@@ -203,17 +138,6 @@ impl Verifier {
                 for (&(address, len), old) in footprint.iter().zip(old) {
                     let new = memory.read_data(address, len)?.into_owned();
                     trace.writes.push(Written { address, old, new });
-                }
-                if elements && execution.units == 0 {
-                    trace.stopped = Some(Stopped {
-                        steps: step,
-                        step: execution.step,
-                        state: (
-                            state.clone().capture_architecture(),
-                            trace.writes.len(),
-                            undefined,
-                        ),
-                    });
                 }
                 break;
             }
@@ -232,32 +156,6 @@ impl Verifier {
 }
 
 impl Trace {
-    /// Compare the delivered trap as well as any status committed without
-    /// retirement. A normal exit still compares the pre-trap retired prefix.
-    pub(crate) fn check_tier1(
-        &self,
-        steps: usize,
-        step: Step,
-        state: &CpuState,
-        memory: &Memory,
-    ) -> Option<Result<Check, String>> {
-        if step == Step::Executed {
-            return self.check_at(steps, state, memory);
-        }
-        let stopped = self.stopped.as_ref().filter(|s| s.steps == steps)?;
-        if stopped.step != step {
-            return Some(Err(format!(
-                "Tier 1 trap differs: {:?} versus {:?}",
-                step, stopped.step
-            )));
-        }
-        let native = state.clone().capture_architecture();
-        Some(
-            self.compare(&stopped.state, &native, memory)
-                .map_err(|diff| self.report(&native, &diff)),
-        )
-    }
-
     /// Compare the native exit with interpreted states at its PC. `None` when
     /// no interpreted state reached it, or none matched a cut trace.
     pub(crate) fn check(&self, state: &CpuState, memory: &Memory) -> Option<Result<Check, String>> {
@@ -277,24 +175,6 @@ impl Trace {
         Some(Err(self.report(&native, &diff)))
     }
 
-    /// Compare a native exit after exactly `steps` guest instructions with the
-    /// interpreted state after the same count. Lanes that count every retired
-    /// instruction use this, so a loop revisiting a PC cannot match an earlier
-    /// iteration. `None` when the trace stopped before that many steps.
-    pub(crate) fn check_at(
-        &self,
-        steps: usize,
-        state: &CpuState,
-        memory: &Memory,
-    ) -> Option<Result<Check, String>> {
-        let recorded = self.states.get(steps)?;
-        let native = state.clone().capture_architecture();
-        Some(
-            self.compare(recorded, &native, memory)
-                .map_err(|diff| self.report(&native, &diff)),
-        )
-    }
-
     fn compare(
         &self,
         (interpreted, logged, undefined): &(ArchitecturalState, usize, u32),
@@ -302,12 +182,9 @@ impl Trace {
         memory: &Memory,
     ) -> Result<Check, Vec<String>> {
         let mut interpreted = interpreted.clone();
-        if !self.exact_flags {
-            interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
-        }
+        interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
         let mut mxcsr = false;
-        if !self.exact_mxcsr
-            && interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
+        if interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
             && interpreted.mxcsr != native.mxcsr
         {
             interpreted.mxcsr = native.mxcsr;
@@ -468,41 +345,15 @@ fn decode(memory: &Memory, pc: u32) -> Option<Instruction> {
 
 /// Bytes the instruction may write, or `None` when the trace must stop:
 /// Unresolved addresses, code pages and memory shared with host threads cannot
-/// be restored privately. Only counted Tier 1 traces admit REP elements.
+/// be restored privately.
 fn writes(
     factory: &mut InstructionInfoFactory,
     i: &Instruction,
     state: &CpuState,
     memory: &Memory,
-    elements: bool,
 ) -> Option<Vec<(u32, usize)>> {
     if i.is_string_instruction() && (i.has_rep_prefix() || i.has_repne_prefix()) {
-        use iced_x86::{Code, OpKind};
-        if !elements
-            || !matches!(
-                i.code(),
-                Code::Movsb_m8_m8
-                    | Code::Movsw_m16_m16
-                    | Code::Movsd_m32_m32
-                    | Code::Stosb_m8_AL
-                    | Code::Stosw_m16_AX
-                    | Code::Stosd_m32_EAX
-                    | Code::Lodsb_AL_m8
-                    | Code::Lodsw_AX_m16
-                    | Code::Lodsd_EAX_m32
-            )
-            || (0..i.op_count())
-                .any(|n| matches!(i.op_kind(n), OpKind::MemorySegSI | OpKind::MemoryESDI))
-        {
-            return None;
-        }
-        if state.regs[1] == 0 {
-            return Some(Vec::new());
-        }
-        let mut element = *i;
-        element.set_has_rep_prefix(false);
-        element.set_has_repne_prefix(false);
-        return writes(factory, &element, state, memory, false);
+        return None;
     }
     let value = |r: Register, _: usize, _: usize| -> Option<u64> {
         if r == Register::FS {
@@ -634,23 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn counted_exits_compare_with_the_state_after_the_same_steps() {
-        let (trace, state, memory) = traced(&CODE_BYTES);
-        assert!(matches!(
-            trace.check_at(3, &state, &memory),
-            Some(Ok(Check::Equal))
-        ));
-        let report = trace.check_at(2, &state, &memory).unwrap().unwrap_err();
-        assert!(report.contains("eip native="), "{report}");
-        assert!(
-            trace.check_at(4, &state, &memory).is_none(),
-            "the trace stopped before UD2 executed"
-        );
-    }
-
-    #[test]
-    fn counted_x87_verification_detects_raw80_top_tags_and_every_status_bit() {
-        let (trace, state, memory) = traced(&CODE_BYTES);
+    fn x87_verification_detects_raw80_top_tags_and_every_status_bit() {
+        let (mut trace, state, memory) = traced(&CODE_BYTES);
+        trace.cut = false;
         for part in 0..27 {
             let mut changed = state.clone();
             let expected = match part {
@@ -675,7 +512,7 @@ mod tests {
                     "status"
                 }
             };
-            let report = trace.check_at(3, &changed, &memory).unwrap().unwrap_err();
+            let report = trace.check(&changed, &memory).unwrap().unwrap_err();
             assert!(report.contains(expected), "{report}");
         }
     }
@@ -699,122 +536,5 @@ mod tests {
             trace.check(&state, &memory),
             Some(Ok(Check::MxcsrFlags))
         ));
-    }
-
-    #[test]
-    fn tier1_mxcsr_sticky_bits_are_architectural_mismatches() {
-        let (mut trace, state, memory) = traced(&CODE_BYTES);
-        trace.cut = false;
-        trace.exact_mxcsr = true;
-        for bit in 0..6 {
-            let mut changed = state.clone();
-            changed.mxcsr ^= 1 << bit;
-            assert!(trace.check(&changed, &memory).unwrap().is_err());
-            assert!(
-                trace
-                    .check_at(trace.states.len() - 1, &changed, &memory)
-                    .unwrap()
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn tier1_verifies_status_committed_by_an_unretired_sse_trap() {
-        use iced_x86::code_asm::*;
-        let mut a = CodeAssembler::new(32).unwrap();
-        a.comiss(xmm0, xmm1).unwrap();
-        let code = a.assemble(u64::from(CODE)).unwrap();
-        let mut memory = Memory::new(CODE, 4096).unwrap();
-        memory.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
-        memory.write(CODE, &code).unwrap();
-        let mut state = CpuState {
-            eip: CODE,
-            mxcsr: 0x1f00,
-            ..Default::default()
-        };
-        state.xmm[0][..4].copy_from_slice(&0x7fc12345u32.to_le_bytes());
-        let trace = Verifier::new(true)
-            .record_tier1(CODE, 0, &mut Interpreter::new(), &mut state, &mut memory)
-            .unwrap();
-        assert_eq!(state.mxcsr, 0x1f00);
-        let execution = Interpreter::new().run_chunk(&mut state, &mut memory, 1);
-        assert_eq!(execution.units, 0);
-        assert_eq!(state.mxcsr, 0x1f01);
-        assert!(matches!(
-            trace.check_tier1(0, execution.step, &state, &memory),
-            Some(Ok(Check::Equal))
-        ));
-        state.mxcsr ^= 1;
-        assert!(
-            trace
-                .check_tier1(0, execution.step, &state, &memory)
-                .unwrap()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn counted_rep_trace_restores_overlap_and_checks_each_element() {
-        use iced_x86::code_asm::CodeAssembler;
-        for kind in 0..3 {
-            for count in [0, 3] {
-                for reverse in [false, true] {
-                    let mut a = CodeAssembler::new(32).unwrap();
-                    match kind {
-                        0 => a.rep().movsd(),
-                        1 => a.rep().stosd(),
-                        _ => a.rep().lodsd(),
-                    }
-                    .unwrap();
-                    let code = a.assemble(u64::from(CODE)).unwrap();
-                    let stop = CODE + code.len() as u32;
-                    let mut memory = Memory::new(CODE, 0x2000).unwrap();
-                    memory.protect(CODE, 0x2000, READ | WRITE).unwrap();
-                    memory.write(CODE, &code).unwrap();
-                    memory.protect(CODE, 4096, READ | EXEC).unwrap();
-                    let original: Vec<_> = (0..128).collect();
-                    memory.write(DATA, &original).unwrap();
-                    let mut state = CpuState {
-                        eip: CODE,
-                        regs: [
-                            0x12345678,
-                            count,
-                            0,
-                            0,
-                            DATA + 1024,
-                            0,
-                            DATA + 64,
-                            if reverse { DATA + 60 } else { DATA + 68 },
-                        ],
-                        eflags: 0x8d7 | u32::from(reverse) * 0x400,
-                        ..Default::default()
-                    };
-                    let before = state.clone();
-                    let mut interpreter = Interpreter::new();
-                    let trace = Verifier::new(true)
-                        .record_tier1(CODE, stop, &mut interpreter, &mut state, &mut memory)
-                        .unwrap();
-                    assert_eq!(state, before);
-                    assert_eq!(memory.read(DATA, 128).unwrap(), original);
-                    for steps in 1..=count.max(1) {
-                        assert_eq!(interpreter.run_chunk(&mut state, &mut memory, 1).units, 1);
-                        assert!(matches!(
-                            trace.check_at(steps as usize, &state, &memory),
-                            Some(Ok(Check::Equal))
-                        ));
-                        state.regs[1] ^= 1;
-                        assert!(
-                            trace
-                                .check_at(steps as usize, &state, &memory)
-                                .unwrap()
-                                .is_err()
-                        );
-                        state.regs[1] ^= 1;
-                    }
-                    assert_eq!(state.eip, stop);
-                }
-            }
-        }
     }
 }

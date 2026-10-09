@@ -21,11 +21,10 @@ pub(crate) fn reason_index(reason: InterpreterReason) -> usize {
     }
 }
 
-/// Units differ by tier: Tier 0/1 retire instruction/REP units; Tier 2 retires blocks.
+/// Units differ by tier: Tier 0 retires instruction/REP units; Tier 2 retires blocks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameCounters {
     pub tier0_units: u64,
-    pub tier1_units: u64,
     pub tier2_blocks: u64,
     /// Confirmed retired Tier 0 instructions only; never present this as all tiers.
     pub retired_tier0_instructions: u64,
@@ -49,7 +48,7 @@ pub struct FrameCounters {
     pub softfloat_calls: u64,
     pub reasons: [u64; 6],
     /// Pending includes queued/deferred compilation even without entry ownership.
-    /// All six timing lanes are disjoint; Tier 1 fallback/bridge is inclusive.
+    /// All six timing lanes are disjoint.
     pub reason_ns: [u64; 6],
 }
 
@@ -65,7 +64,6 @@ impl FrameCounters {
         }
         delta!(
             tier0_units,
-            tier1_units,
             tier2_blocks,
             retired_tier0_instructions,
             native_entries,
@@ -98,13 +96,12 @@ impl FrameCounters {
             .join(",");
         format!(
             concat!(
-                "{{\"tier0_units\":{},\"tier1_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
+                "{{\"tier0_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
                 "\"native_entries\":{},\"linked_entries\":{},\"interpreter_entries\":{},\"sync_compile_ns\":{},",
                 "\"compile_wait_execution_ns\":{},\"compile_wait_stage_ns\":{:?},\"compile_worker_ns\":{},\"publication_ns\":{},\"compile_wait_units\":{},\"invalidations\":{},",
                 "\"recompilations\":{},\"compilations\":{},\"x87_helpers\":{},\"softfloat_calls\":{},\"reasons\":{{{}}},\"reason_ns\":{{{}}}}}"
             ),
             self.tier0_units,
-            self.tier1_units,
             self.tier2_blocks,
             self.retired_tier0_instructions,
             self.native_entries,
@@ -135,7 +132,6 @@ impl Executor {
     }
     pub fn frame_counters(&self) -> FrameCounters {
         let s = &self.stats;
-        let t = self.tier1_stats();
         let reasons = [
             InterpreterReason::Uncovered,
             InterpreterReason::Rejected,
@@ -147,21 +143,20 @@ impl Executor {
         .map(|r| s.cliffs.interpreter.get(&r).map_or(0, |n| n.entries));
         FrameCounters {
             tier0_units: s.interpreter_instructions,
-            tier1_units: t.native_instructions,
             tier2_blocks: s.native_blocks,
             retired_tier0_instructions: s.frame_retired_tier0,
             native_entries: s.native_entries,
             linked_entries: s.linked_entries,
             interpreter_entries: s.interpreter_entries,
-            sync_compile_ns: (s.sync_compile_time + t.compile_time).as_nanos() as u64,
+            sync_compile_ns: s.sync_compile_time.as_nanos() as u64,
             compile_wait_execution_ns: s.compile_wait_execution_ns,
             compile_wait_stage_ns: s.compile_wait_stage_ns,
             compile_worker_ns: s.compile_time.as_nanos() as u64,
             publication_ns: s.publication_ns,
             compile_wait_units: s.compile_wait_units,
-            invalidations: s.invalidations + t.invalidations,
+            invalidations: s.invalidations,
             recompilations: s.tier_up_publications,
-            compilations: s.compilations + t.compilations,
+            compilations: s.compilations,
             x87_helpers: s.cliffs.x87_helper_calls,
             softfloat_calls: s.cliffs.x87_exact.values().sum(),
             reasons,

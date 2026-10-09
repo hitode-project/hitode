@@ -26,20 +26,6 @@ fn backends() -> Vec<Backend> {
         strategy: CompileStrategy::Speed,
         linked: false,
     }];
-    if cfg!(all(
-        target_arch = "aarch64",
-        any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos"
-        )
-    )) {
-        result.push(Backend {
-            tier: 1,
-            strategy: CompileStrategy::Speed,
-            linked: false,
-        });
-    }
     for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
         for linked in [false, true] {
             result.push(Backend {
@@ -67,9 +53,6 @@ fn machine(programs: &[(u32, Vec<u8>)], backend: Backend) -> Executor {
     m.set_tier_verification(None);
     m.set_region_linking(backend.linked);
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
-    if backend.tier == 1 {
-        m.set_arm64_tier1(true).unwrap();
-    }
     for (at, bytes) in programs {
         m.write(*at, bytes).unwrap();
         m.protect(*at, 4096, READ | EXEC).unwrap();
@@ -211,10 +194,8 @@ fn checkpoint(m: &Executor, outcome: &RunOutcome) {
     let slot = digest(m.memory().read(SLOT, 64).unwrap());
     let stack = digest(m.memory().read(STACK - 1024, 1028).unwrap());
     println!(
-        "SPT_DIGEST {state:016x} {data:016x} {slot:016x} {stack:016x} {} {} {}",
-        m.stats.native_blocks,
-        m.stats.interpreter_instructions,
-        m.tier1_stats().native_instructions
+        "SPT_DIGEST {state:016x} {data:016x} {slot:016x} {stack:016x} {} {}",
+        m.stats.native_blocks, m.stats.interpreter_instructions
     );
 }
 
@@ -534,10 +515,7 @@ fn cyclic_shapes_interrupt_at_an_exact_replayable_prefix() {
             );
             let consumed = budget - m.state.fuel;
             assert!(
-                consumed
-                    == m.stats.native_blocks
-                        + m.stats.interpreter_instructions
-                        + m.tier1_stats().native_instructions,
+                consumed == m.stats.native_blocks + m.stats.interpreter_instructions,
                 "retired accounting changed: {case}"
             );
             let mut replay = machine(&programs, backend);

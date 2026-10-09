@@ -111,7 +111,6 @@ def report_config(report: dict) -> dict:
         "codec_provider": report["codec"]["provider"], "codec_kernel_mode": report["codec_kernels"]["mode"],
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,
         "time_skip_enabled": report.get("time_skip", {}).get("enabled"),
-        "tier1_mode": report.get("tier1", {}).get("mode", "off"),
         "compile_threads": report.get("compilation_schedule", {}).get("compile_threads"),
         "available_cores": report.get("compilation_schedule", {}).get("available_cores")}
 
@@ -119,9 +118,8 @@ def report_config(report: dict) -> dict:
 def execution_metrics(report: dict) -> dict:
     """Keep aggregate execution counters and compiler histograms per observation."""
     cliffs = report.get("cpu_cliffs", {})
-    return {"tier1": report.get("tier1"), "compilation_schedule": report.get("compilation_schedule"),
-            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details"),
-            "tier1_bridge": cliffs.get("tier1_bridge")}
+    return {"compilation_schedule": report.get("compilation_schedule"),
+            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details")}
 
 
 def condition_identity(metadata: dict) -> dict | None:

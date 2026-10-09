@@ -55,7 +55,7 @@ BUDGET_NS = 33_300_000
 SCENES = ("title", "normal", "ctrl", "transition")
 REASONS = ("uncovered", "rejected", "pending", "interior", "fallback", "forced")
 HLE_GROUPS = ("graphics", "file", "audio", "other")
-CPU_FIELDS = ("tier0_units", "tier1_units", "tier2_blocks", "native_entries", "linked_entries", "interpreter_entries",
+CPU_FIELDS = ("tier0_units", "tier2_blocks", "native_entries", "linked_entries", "interpreter_entries",
               "sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "invalidations",
               "recompilations", "compilations", "x87_helpers", "softfloat_calls", "retired_tier0_instructions")
 
@@ -89,7 +89,6 @@ def clean_row(row: dict) -> dict:
 
 def execution_metrics(report: dict) -> dict:
     raw = baseline.execution_metrics(report)
-    tier1 = raw.get("tier1") or {}
     schedule = raw.get("compilation_schedule") or {}
     cache = report.get("code_cache") or {}
     aot = report.get("aot") or {}
@@ -98,9 +97,6 @@ def execution_metrics(report: dict) -> dict:
             ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "evicted", "entries", "bytes")),
         "aot": numeric_fields(aot, ("images", "image_rejections", "candidates", "decoded_instructions", "budget_exhaustions",
             "compile_requests", "private_completions", "publications", "stale_candidates", "ready_regions", "ready_bytes")),
-        "tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
-        "fallback_instructions", "native_entries", "bridge_entries", "bridge_units", "invalidations",
-        "publication_revisions", "publication_flushes", "cache_evictions", "compile_misses", "resident_bytes")),
         "compilation_schedule": numeric_fields(schedule, ("compile_threads", "available_cores", "duplicate_requests",
             "capacity_rejections", "window_deferrals", "worker_full"))}
 
@@ -607,7 +603,7 @@ def markdown(rows: list[dict]) -> str:
     for row in rows:
         for api in row.get("metrics", {}).get("top_apis_retained", []):
             text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {api['api']} | {api['ns']/1e6:.3f} | {api['calls']} |")
-    text += ["", "## 原生部分估算", "", "仅 Tier 0 已确认退休指令；Tier 1/2 未计。使用最快合成 x64 速率的条件下界估算，不排除任何帧。", "",
+    text += ["", "## 原生部分估算", "", "仅 Tier 0 已确认退休指令；Tier 2 未计。使用最快合成 x64 速率的条件下界估算，不排除任何帧。", "",
              "| 游戏 | 场景 | 冷/热 | native_over_budget_estimate（保留 serial） |", "|---|---|---|---|"]
     for row in rows:
         reference = row.get("metrics", {}).get("native_reference", {})

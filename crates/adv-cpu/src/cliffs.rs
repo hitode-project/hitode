@@ -63,7 +63,6 @@ pub enum InterpreterReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum InterpreterDetail {
     AutoJitDisabled,
-    Tier1,
     NonExecutable,
     BelowThreshold,
     PendingCompilation,
@@ -90,11 +89,7 @@ pub struct Count {
 
 #[derive(Default, Clone, Debug)]
 pub struct Cliffs {
-    /// Actual Tier 1 bridge retirements, disjoint from interpreter counters.
-    pub tier1_bridge: Count,
-    pub(crate) tier1_bridge_details: HashMap<(InterpreterReason, Option<InterpreterDetail>), Count>,
     pub(crate) x87_forms: crate::floating::fast::diagnostics::Census,
-    pub tier1_census: Option<crate::Tier1Census>,
     pub x87_helper_calls: u64,
     /// Helper calls completed by the host-double fast path.
     pub x87_fast: u64,
@@ -120,44 +115,6 @@ impl Cliffs {
         let count = self.interpreter.entry(reason).or_default();
         count.entries += 1;
         count.instructions += u64::from(units);
-    }
-
-    pub(crate) fn bridged(
-        &mut self,
-        reason: InterpreterReason,
-        detail: Option<InterpreterDetail>,
-        units: u32,
-    ) {
-        self.tier1_bridge.entries += 1;
-        self.tier1_bridge.instructions += u64::from(units);
-        let count = self
-            .tier1_bridge_details
-            .entry((reason, detail))
-            .or_default();
-        count.entries += 1;
-        count.instructions += u64::from(units);
-    }
-
-    /// Complete, bounded entry-state labels for work taken from Tier 0.
-    /// A bridge batch and its residual fallback can share an entry-state label,
-    /// but their retirement units never overlap.
-    pub fn tier1_bridge_rows(&self) -> Vec<(String, Count)> {
-        let mut rows: Vec<_> = self
-            .tier1_bridge_details
-            .iter()
-            .map(|(&(reason, detail), &n)| {
-                let label = match detail {
-                    Some(InterpreterDetail::Unsupported(code)) => {
-                        format!("{reason:?}/Unsupported/{:?}/{code:?}", code.mnemonic())
-                    }
-                    Some(detail) => format!("{reason:?}/{detail:?}"),
-                    None => format!("{reason:?}"),
-                };
-                (label, n)
-            })
-            .collect();
-        rows.sort_unstable_by(|a, b| b.1.instructions.cmp(&a.1.instructions).then(a.0.cmp(&b.0)));
-        rows
     }
 
     pub(crate) fn detail(

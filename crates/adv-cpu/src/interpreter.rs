@@ -130,8 +130,6 @@ pub struct Interpreter {
     capacity: usize,
     decodes: u64,
     pub(crate) frame_retired: Option<u64>,
-    pub(crate) census_enabled: bool,
-    pub(crate) census: Option<crate::tier1::census::Entry>,
 }
 
 impl Default for Interpreter {
@@ -155,8 +153,6 @@ impl Interpreter {
             capacity,
             decodes: 0,
             frame_retired: None,
-            census_enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
-            census: None,
         }
     }
 
@@ -218,25 +214,16 @@ impl Interpreter {
         }
         self.refresh(memory);
         let pc = state.eip;
-        let (decoded, form) = if let Some(entry) = self
+        let decoded = if let Some(entry) = self
             .cache
             .get(&pc)
             .filter(|e| self.event_validity || e.valid(memory))
         {
-            (
-                entry.decoded,
-                self.census.as_ref().map(|_| {
-                    crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize])
-                }),
-            )
+            entry.decoded
         } else {
             self.decodes += 1;
             let entry = fetch(memory, pc);
             let decoded = entry.decoded;
-            let form = self
-                .census
-                .as_ref()
-                .map(|_| crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize]));
             if self.capacity != 0 && (!self.event_validity || entry.cacheable(memory)) {
                 if self.cache.len() >= self.capacity {
                     if self.event_validity {
@@ -254,14 +241,11 @@ impl Interpreter {
                 }
                 self.cache.insert(pc, entry);
             }
-            (decoded, form)
+            decoded
         };
         let execution = execute_decoded(decoded, state, memory, max_units, None);
         if let Some(retired) = &mut self.frame_retired {
             *retired += retired_instruction(decoded, execution, state, pc);
-        }
-        if let (Some(census), Some(form)) = (&mut self.census, form) {
-            census.record(form, execution.units);
         }
         execution
     }
@@ -296,7 +280,6 @@ impl Interpreter {
                 memory,
                 max_units,
                 stop,
-                self.census.as_mut(),
                 self.frame_retired.as_mut(),
             );
         }
@@ -308,7 +291,6 @@ impl Interpreter {
                 memory,
                 max_units,
                 stop,
-                self.census.as_mut(),
                 self.frame_retired.as_mut(),
             );
         }
@@ -334,7 +316,6 @@ impl Interpreter {
             memory,
             max_units,
             stop,
-            self.census.as_mut(),
             self.frame_retired.as_mut(),
         )
     }
@@ -660,7 +641,6 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
-    forms: Option<Vec<crate::tier1::census::Form>>,
 }
 
 impl DecodedBlock {
@@ -697,7 +677,6 @@ impl DecodedBlock {
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
-            forms: None,
         };
         let mut pc = start;
         while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
@@ -770,56 +749,15 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        census: Option<&mut crate::tier1::census::Entry>,
         retired: Option<&mut u64>,
     ) -> (Execution, u32) {
-        if census.is_some() {
-            self.forms.get_or_insert_with(|| {
-                self.instructions
-                    .iter()
-                    .map(|(pc, _)| {
-                        let offset = pc.wrapping_sub(self.pc) as usize;
-                        crate::tier1::census::Form::decode(&self.bytes[offset..])
-                    })
-                    .collect()
-            });
-        }
         // Specialize the ordinary block loop: disabled diagnostics must not
         // add a retirement branch to every interpreted instruction.
-        match (census, retired) {
-            (Some(census), Some(retired)) => {
-                let forms = self.forms.as_ref().unwrap().as_slice();
-                self.execute(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    |n, units| census.record(forms[n], units),
-                    |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
-                )
-            }
-            (Some(census), None) => {
-                let forms = self.forms.as_ref().unwrap().as_slice();
-                self.execute(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    |n, units| census.record(forms[n], units),
-                    |_, _, _, _| {},
-                )
-            }
-            (None, Some(retired)) => self.execute(
-                state,
-                memory,
-                max_units,
-                stop,
-                |_, _| {},
-                |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
-            ),
-            (None, None) => {
-                self.execute(state, memory, max_units, stop, |_, _| {}, |_, _, _, _| {})
-            }
+        match retired {
+            Some(retired) => self.execute(state, memory, max_units, stop, |d, e, s, pc| {
+                *retired += retired_instruction(d, e, s, pc)
+            }),
+            None => self.execute(state, memory, max_units, stop, |_, _, _, _| {}),
         }
     }
 
@@ -829,7 +767,6 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut observe: impl FnMut(usize, u32),
         mut retire: impl FnMut(Decoded, Execution, &CpuState, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
@@ -839,7 +776,7 @@ impl DecodedBlock {
         };
         let mut last_units = 0;
         let mut deferred_mmx = false;
-        for (n, &(pc, decoded)) in self.instructions.iter().enumerate() {
+        for &(pc, decoded) in &self.instructions {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
@@ -863,7 +800,6 @@ impl DecodedBlock {
                     Some(&mut deferred_mmx),
                 )
             };
-            observe(n, execution.units);
             retire(decoded, execution, state, pc);
             result.units += execution.units;
             result.step = execution.step;

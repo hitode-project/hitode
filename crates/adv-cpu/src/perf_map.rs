@@ -10,14 +10,12 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Category {
-    Tier1,
     Tier2,
 }
 
 impl Category {
     fn name(self) -> &'static str {
         match self {
-            Self::Tier1 => "adv-jit-tier1",
             Self::Tier2 => "adv-jit-tier2",
         }
     }
@@ -170,7 +168,7 @@ mod tests {
         let range = std::mem::ManuallyDrop::new(Registration {
             base: 0x1000,
             size: 4,
-            category: Category::Tier1,
+            category: Category::Tier2,
         });
         let mut writer = Writer {
             map: io::Cursor::new([]),

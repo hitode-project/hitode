@@ -754,24 +754,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{}}}",
             r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns))
         .collect::<Vec<_>>().join(",");
-    let tier1 = runtime.machine.cpu.executor().tier1_stats();
-    let tier1_json = format!(
-        "{{\"mode\":{},\"compilations\":{},\"compile_seconds\":{:.9},\"publication_revisions\":{},\"publication_flushes\":{},\"cache_evictions\":{},\"compile_misses\":{},\"fallback_entries\":{},\"fallback_units\":{},\"native_entries\":{},\"bridge_entries\":{},\"bridge_units\":{},\"invalidations\":{},\"resident_bytes\":{}}}",
-        json(&format!("{:?}", runtime.machine.cpu.executor().tier1_mode()).to_lowercase()),
-        tier1.compilations,
-        tier1.compile_time.as_secs_f64(),
-        tier1.publication_revisions,
-        tier1.publication_flushes,
-        tier1.cache_evictions,
-        tier1.compile_misses,
-        tier1.fallback_entries,
-        tier1.fallback_instructions,
-        tier1.native_entries,
-        tier1.bridge_entries,
-        tier1.bridge_units,
-        tier1.invalidations,
-        tier1.resident_bytes
-    );
     // Snapshot the existing cumulative service counters, without the per-frame
     // top-five truncation. Checkpoint differences delimit a fixed scene.
     let host_services = if options.frame_budget || options.host_profile.is_some() {
@@ -795,7 +777,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
             "  \"code_cache\": {},\n  \"aot\": {},\n",
-            "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"wait_diagnostics\": {},\n",
@@ -834,7 +816,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         verification_report(&stats.verification),
         runtime.machine.cpu.executor().persistent_code_cache_json(),
         stats.aot.json(),
-        tier1_json,
         runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
         options.jit && options.async_compilation,
@@ -1278,18 +1259,6 @@ fn run_execution(
         .machine
         .cpu
         .set_async_compilation(options.jit && options.async_compilation);
-    if let Ok(value) = std::env::var("ADV_TIER1") {
-        let mode: adv_runtime::Tier1Mode = value.parse()?;
-        if cfg!(all(
-            target_arch = "aarch64",
-            any(target_os = "linux", target_os = "android")
-        )) {
-            runtime.machine.cpu.executor_mut().set_tier1_mode(mode)?;
-        } else if mode != adv_runtime::Tier1Mode::Off {
-            static NOTICE: std::sync::Once = std::sync::Once::new();
-            NOTICE.call_once(|| eprintln!("ADV_TIER1 ignored: requires aarch64 Linux or Android"));
-        }
-    }
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
@@ -1305,10 +1274,7 @@ fn run_execution(
             .executor_mut()
             .set_persistent_code_cache(&options.data_dir.join("jit-code.bin"))?;
     }
-    if options.jit
-        && options.async_compilation
-        && runtime.machine.cpu.executor_mut().tier1_mode() != adv_runtime::Tier1Mode::Exclusive
-    {
+    if options.jit && options.async_compilation {
         // Leave cores for the guest, presentation and audio threads.
         let threads = std::thread::available_parallelism()
             .map_or(1, |cores| compile_thread_count(cores.get()));
@@ -2167,23 +2133,6 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let bridge_details = c
-        .tier1_bridge_rows()
-        .into_iter()
-        .map(|(label, n)| {
-            format!(
-                "{}:{{\"entries\":{},\"instructions\":{}}}",
-                json(&label),
-                n.entries,
-                n.instructions
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let tier1_bridge = format!(
-        "{{\"entries\":{},\"instructions\":{},\"details\":{{{bridge_details}}}}}",
-        c.tier1_bridge.entries, c.tier1_bridge.instructions
-    );
     let detail_rows = c.interpreter_detail_rows();
     let omitted_rows = detail_rows.len().saturating_sub(ROWS);
     let details = detail_rows
@@ -2215,22 +2164,8 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
             )
         })
         .join(",");
-    let census = c.tier1_census.as_ref().map_or_else(|| "null".to_owned(), |census| {
-        let groups = ["PendingCompilation", "Uncovered", "Rejected"].into_iter()
-            .zip(&census.groups).map(|(name, c)| {
-                let rows = c.unsupported_rows();
-                let omitted_rows = rows.len().saturating_sub(ROWS);
-                let omitted_units: u64 = rows.iter().skip(ROWS).map(|(_, n)| n).sum();
-                let unsupported = counts(rows, ROWS);
-                let histogram = |values: &[u64]| values.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-                format!("{}:{{\"entries\":{},\"instructions\":{},\"supported_units\":{},\"unsupported_units\":{},\"prefix_units\":{},\"blocked_prefixes\":[{}],\"censored_prefixes\":[{}],\"unsupported\":{{{unsupported}}},\"omitted_rows\":{omitted_rows},\"omitted_units\":{omitted_units}}}",
-                    json(name), c.entries, c.instructions, c.supported_units, c.unsupported_units, c.prefix_units,
-                    histogram(&c.blocked_prefixes), histogram(&c.censored_prefixes))
-            }).collect::<Vec<_>>().join(",");
-        format!("{{{groups}}}")
-    });
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census},\"tier1_bridge\":{tier1_bridge}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),

@@ -1,5 +1,5 @@
-//! Forms with no binary64 lane. These remain helper calls in Cranelift and
-//! outside Tier 1's independent form table. Rejection is atomic.
+//! Forms with no binary64 lane. These remain helper calls in Cranelift.
+//! Rejection is atomic.
 use super::*;
 use raw::{compare, operand, ordinary};
 use std::cmp::Ordering;

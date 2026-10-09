@@ -317,7 +317,7 @@ class FrameBudgetTests(unittest.TestCase):
     def test_android_switches_reuse_existing_runner(self):
         args = Mock(exe_relative="fixture.exe", codepage=932, codec="native", codec_kernels="native",
                     frame_budget=True, perf_map=True, no_tiering=False, schedule_profile=False,
-                    auto_dialog_ms=50, tier1="off", compile_threads=None, font_diagnostics=False,
+                    auto_dialog_ms=50, compile_threads=None, font_diagnostics=False,
                     font_profile=None, capture_pcm=False, cpu_mask=None)
         command = budget.replay.runner_command(args, "/private/run", "/readonly/game", 30)
         self.assertIn("--frame-budget", command)

@@ -292,7 +292,7 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
         command.extend(["--schedule-profile", remote + "/schedule.tsv"])
     if args.auto_dialog_ms is not None:
         command.extend(["--auto-dialog-ms", str(args.auto_dialog_ms)])
-    environment = ["ADV_TIER1=" + getattr(args, "tier1", "off")]
+    environment = []
     if getattr(args, "no_code_cache", False):
         command.append("--no-code-cache")
     if getattr(args, "perf_map", False):
@@ -767,7 +767,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     parser.add_argument("--perf-map", action="store_true", help="local-only HP JIT symbol map and publication events")
     parser.add_argument("--no-tiering", action="store_true")
-    parser.add_argument("--tier1", choices=("off", "bridge"), default="off")
     parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
     parser.add_argument("--record-device-state", action="store_true",
                         help="record battery temperature, screen, foreground and CPU affinity before/after execution")

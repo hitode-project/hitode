@@ -24,7 +24,6 @@ import re
 import sys
 
 JIT_CATEGORIES = {
-    "adv-jit-tier1": "Tier 1",
     "adv-jit-tier2": "Tier 2 Cranelift",
     "adv-jit-direct-memory": "Direct memory stubs",
 }
@@ -135,21 +134,17 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
     if re.search(r"(?:memcpy|memmove|memset|bzero|copy_nonoverlapping)", name):
         return "Memory copy/set"
     if ("cranelift_" in name or "regalloc2" in name
-            or any(token in name for token in ("adv_cpu::compile::compile", "adv_cpu::tier1::emit",
-                                               "adv_cpu::discovery"))):
+            or any(token in name for token in ("adv_cpu::compile::compile", "adv_cpu::discovery"))):
         return "Compilation"
     if any(token in name for token in ("adv_cpu::floating", "adv_cpu::compile::x87",
-                                       "adv_cpu::tier1::x87", "softfloat", "extf80", "f128_")):
+                                       "softfloat", "extf80", "f128_")):
         return "JIT helper x87"
-    if any(token in name for token in ("adv_cpu::compile::sse", "adv_cpu::tier1::sse",
-                                       "adv_cpu::interpreter::sse")):
+    if any(token in name for token in ("adv_cpu::compile::sse", "adv_cpu::interpreter::sse")):
         return "JIT helper SSE"
     if any(token in name for token in ("adv_cpu::memory", "adv_cpu::direct_memory",
                                        "adv_cpu::fault_recovery", "adv_cpu::file_memory",
                                        "adv_cpu::shared_memory", "adv_cpu::compile::loops::range_ok",
-                                       "adv_cpu::tier1::native::load", "adv_cpu::tier1::native::store",
-                                       "adv_cpu::tier1::native::stack_all",
-                                       "adv_cpu::tier1::simd", "adv_cpu::strings",
+                                       "adv_cpu::strings",
                                        "adv_cpu::atomic_memory", "adv_cpu::virtual_memory")):
         return "JIT helper memory"
     if "adv_cpu::trap" in name:
