@@ -25,7 +25,6 @@ import sys
 
 JIT_CATEGORIES = {
     "adv-jit-tier2": "Tier 2 Cranelift",
-    "adv-jit-direct-memory": "Direct memory stubs",
 }
 CATEGORIES = (
     "Tier 0 interpreter", *JIT_CATEGORIES.values(), "JIT helper x87",
@@ -141,7 +140,7 @@ def classify(symbol: str, dso: str, jit: str | None) -> str:
         return "JIT helper x87"
     if any(token in name for token in ("adv_cpu::compile::sse", "adv_cpu::interpreter::sse")):
         return "JIT helper SSE"
-    if any(token in name for token in ("adv_cpu::memory", "adv_cpu::direct_memory",
+    if any(token in name for token in ("adv_cpu::memory",
                                        "adv_cpu::fault_recovery", "adv_cpu::file_memory",
                                        "adv_cpu::shared_memory", "adv_cpu::compile::loops::range_ok",
                                        "adv_cpu::strings",
