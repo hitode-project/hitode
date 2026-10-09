@@ -480,9 +480,7 @@ impl Cached {
 
     fn revalidate(&self, memory: &Memory) -> bool {
         self.pages.iter().flatten().all(|p| p.matches(memory))
-            && memory
-                .read_data(self.pc, self.len as usize)
-                .is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
+            && memory.matches(self.pc, &self.bytes[..self.len as usize])
     }
 }
 
@@ -496,7 +494,10 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         pages: [None; 2],
     };
     let mut denied = None;
-    for offset in 0..15u32 {
+    // Mapping and permissions are per page: one check and one copy cover
+    // every byte a page contributes, at most two pages per instruction.
+    let mut offset = 0u32;
+    while offset < 15 {
         let Some(address) = pc.checked_add(offset) else {
             denied = Some(pc.wrapping_add(offset));
             break;
@@ -504,23 +505,21 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         let page = Page::at(memory, address);
         if entry.pages[0].is_none() {
             entry.pages[0] = Some(page);
-        } else if entry.pages[0].unwrap().address != page.address {
+        } else {
             entry.pages[1] = Some(page);
         }
         if !page.mapped || page.permissions & EXEC == 0 {
             denied = Some(address);
             break;
         }
-        match memory.read_data(address, 1) {
-            Ok(byte) => {
-                entry.bytes[offset as usize] = byte[0];
-                entry.len += 1;
-            }
-            Err(_) => {
-                denied = Some(address);
-                break;
-            }
+        let len = (PAGE_SIZE as u32 - (address - page.address)).min(15 - offset);
+        let bytes = &mut entry.bytes[offset as usize..(offset + len) as usize];
+        if memory.read_into(address, bytes).is_err() {
+            denied = Some(address);
+            break;
         }
+        entry.len += len as u8;
+        offset += len;
     }
     let mut decoder = Decoder::with_ip(
         32,
@@ -588,10 +587,7 @@ impl DecodedBlock {
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
-        self.pages.iter().all(|page| page.matches(memory))
-            && memory
-                .read_data(self.pc, self.bytes.len())
-                .is_ok_and(|bytes| bytes == self.bytes)
+        self.pages.iter().all(|page| page.matches(memory)) && memory.matches(self.pc, &self.bytes)
     }
 
     fn fetch(

@@ -580,6 +580,30 @@ impl Memory {
         }))
     }
 
+    /// Whether committed guest bytes at `addr` equal `expected`. Ordinary
+    /// storage is compared in place; overlays go through a stack buffer, so
+    /// code validation never allocates.
+    pub(crate) fn matches(&self, addr: u32, expected: &[u8]) -> bool {
+        let Ok(range) = self.committed(addr, expected.len()) else {
+            return false;
+        };
+        if !self.overlays(&range) && !self.host_copy_required(&range) {
+            // SAFETY: bounds checked, allocation alive, shared borrow prevents executor writes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len())
+            };
+            return bytes == expected;
+        }
+        let mut buffer = [0; PAGE_SIZE];
+        let mut at = addr;
+        expected.chunks(PAGE_SIZE).all(|chunk| {
+            let bytes = &mut buffer[..chunk.len()];
+            let same = self.read_into(at, bytes).is_ok() && bytes == chunk;
+            at = at.wrapping_add(chunk.len() as u32);
+            same
+        })
+    }
+
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
         #[cfg(windows)]
@@ -1960,6 +1984,20 @@ mod file_page_tests {
         assert_eq!(memory.file_page_copy_on_write(0x10000), None);
         memory.fill(0x10000, &[0x63], PAGE_SIZE).unwrap();
         assert_eq!(memory.read(0x10000, 4).unwrap(), [0x63; 4]);
+    }
+
+    #[test]
+    fn code_bytes_match_across_ordinary_and_copy_pages() {
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        memory.map(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+        memory
+            .map_private_copy_pages(0x11000, &[0x29; PAGE_SIZE], READ | EXEC)
+            .unwrap();
+        memory.write(0x10ffe, &[0x17; 2]).unwrap();
+        assert!(memory.matches(0x10ffe, &[0x17, 0x17, 0x29, 0x29]));
+        assert!(memory.matches(0x11000, &[0x29; PAGE_SIZE]));
+        assert!(!memory.matches(0x10ffe, &[0x17, 0x17, 0x29, 0x2a]));
+        assert!(!memory.matches(0x11ffe, &[0x29; 4]));
     }
 
     #[test]

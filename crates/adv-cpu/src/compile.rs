@@ -496,16 +496,13 @@ impl Snapshot {
                     && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
             })
             && self.covered.as_ref().map_or_else(
-                || {
-                    memory
-                        .read_data(self.origin, self.bytes.len())
-                        .is_ok_and(|bytes| bytes == self.bytes)
-                },
+                || memory.matches(self.origin, &self.bytes),
                 |ranges| {
                     ranges.iter().all(|&(offset, len)| {
-                        memory
-                            .read_data(self.origin + offset as u32, len)
-                            .is_ok_and(|bytes| bytes == &self.bytes[offset..offset + len])
+                        memory.matches(
+                            self.origin + offset as u32,
+                            &self.bytes[offset..offset + len],
+                        )
                     })
                 },
             )
