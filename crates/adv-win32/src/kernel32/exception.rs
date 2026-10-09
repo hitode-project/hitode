@@ -199,16 +199,7 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint
             adv_abi::warn_unavailable(env, "Win32 exception mapping", &reason);
             return Outcome::Fail(reason);
         }
-        // This native x86 OS profile publishes an empty numeric directory. Keep
-        // the retired PC and every other register; never dereference EDX or
-        // borrow a host thunk token to guess a service implementation.
-        adv_abi::warn_unavailable(
-            env,
-            "native x86 INT 2E",
-            "direct-service numeric directory has no registered services in the native x86 guest profile",
-        );
-        checkpoint.state.regs[0] = system_service::failure(checkpoint.state.regs[0]);
-        return Outcome::ResumeExecution(checkpoint);
+        return system_service::dispatch(env, checkpoint);
     }
     let record = match mapping::map(env.cpu, &event, &checkpoint.state) {
         Ok(record) => record,
