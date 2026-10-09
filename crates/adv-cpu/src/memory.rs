@@ -1845,6 +1845,8 @@ mod linear_audio_tests {
         const CALLEE: u32 = 0x12000;
         const DATA: u32 = 0x20000;
         const STOP: u32 = 0x11000;
+        let verifying =
+            std::env::var("ADV_JIT_VERIFY").is_ok_and(|mode| !matches!(mode.as_str(), "" | "0"));
         for linked in [false, true] {
             let mut executor = crate::Executor::address_space().unwrap();
             executor.map(CODE, PAGE_SIZE, READ | EXEC).unwrap();
@@ -1900,11 +1902,27 @@ mod linear_audio_tests {
                     address: DATA + PAGE_SIZE as u32
                 }
             );
-            assert_eq!(crate::host_fault::recipe_recoveries(), recoveries);
+            // Verification splits the loop/tail transfer into fresh C entries,
+            // which establish their own hardware-read recovery sessions.
+            assert_eq!(
+                crate::host_fault::recipe_recoveries() - recoveries,
+                u64::from(verifying)
+            );
             assert_eq!(executor.state.regs[0], if linked { 0x917a } else { 0x9177 });
+            assert_eq!(executor.state.regs[1], if linked { 2 } else { 1 });
+            assert_eq!(executor.state.regs[2], 0);
+            assert_eq!(executor.state.regs[3], if linked { 7 } else { 0 });
+            assert_eq!(
+                executor.state.regs[6],
+                if linked {
+                    DATA
+                } else {
+                    DATA + PAGE_SIZE as u32
+                }
+            );
             assert_eq!(executor.stats.interpreter_instructions, 0);
             if linked {
-                assert_eq!(executor.stats.linked_entries, 1);
+                assert_eq!(executor.stats.linked_entries, u64::from(!verifying));
             }
         }
     }
