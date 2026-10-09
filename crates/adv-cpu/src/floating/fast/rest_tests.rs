@@ -207,7 +207,7 @@ fn matrix(mode: u8) {
                             mem.watch_code(CODE, bytes.len());
                         }
                     }
-                    let epoch = actual_memory.epoch;
+                    let epoch = actual_memory.epochs();
                     let original_bytes = actual_memory.read_data(BASE, 0x3000).unwrap().to_vec();
                     let mut expected = initial.clone();
                     let step = crate::floating::execute(
@@ -223,7 +223,8 @@ fn matrix(mode: u8) {
                         let result = testing::run(compiled, &mut actual, &mut actual_memory);
                         let exit = match step {
                             Step::Executed
-                                if reference.epoch != epoch || expected.x87.status & 0x80 != 0 =>
+                                if reference.epochs() != epoch
+                                    || expected.x87.status & 0x80 != 0 =>
                             {
                                 crate::Exit::Fallback
                             }
@@ -251,7 +252,7 @@ fn matrix(mode: u8) {
                         };
                         if result.is_none() {
                             assert_eq!(actual, initial);
-                            assert_eq!(actual_memory.epoch, epoch);
+                            assert_eq!(actual_memory.epochs(), epoch);
                             assert_eq!(
                                 actual_memory.read_data(BASE, 0x3000).unwrap().as_ref(),
                                 original_bytes
@@ -262,7 +263,7 @@ fn matrix(mode: u8) {
                         assert_eq!(step, Step::Executed);
                         assert_eq!(
                             result,
-                            Some(if reference.epoch != epoch {
+                            Some(if reference.epochs() != epoch {
                                 X87_EXIT
                             } else {
                                 X87_DONE
@@ -273,7 +274,7 @@ fn matrix(mode: u8) {
                         actual, expected,
                         "form {form}, PC {pc}, RC {rc}, case {case}"
                     );
-                    assert_eq!(actual_memory.epoch, reference.epoch);
+                    assert_eq!(actual_memory.epochs(), reference.epochs());
                     assert_eq!(
                         actual_memory.read_data(BASE, 0x3000).unwrap(),
                         reference.read_data(BASE, 0x3000).unwrap()

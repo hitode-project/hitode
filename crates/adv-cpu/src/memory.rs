@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 mod fast;
 mod locks;
@@ -12,6 +12,14 @@ mod locks;
 pub(crate) use fast::FastPermissions;
 
 pub const PAGE_SIZE: usize = 4096;
+
+/// Each window counts epochs in a private range, so a version stamped in one
+/// window never matches another, even one at a reused host address.
+fn epoch_origin() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed) << EPOCH_BITS
+}
+const EPOCH_BITS: u32 = 40;
 pub const READ: u8 = 1;
 pub const WRITE: u8 = 2;
 pub const EXEC: u8 = 4;
@@ -360,14 +368,15 @@ impl Memory {
         let layout = Layout::from_size_align(len, PAGE_SIZE).map_err(|e| e.to_string())?;
         // SAFETY: nonzero, valid layout; Memory exclusively owns this allocation.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
+        let origin = epoch_origin();
         Ok(Self {
             base,
             len,
             ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            epoch: 0,
-            versions: vec![0; len / PAGE_SIZE],
+            epoch: origin,
+            versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
@@ -402,14 +411,15 @@ impl Memory {
         #[cfg(not(windows))]
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
+        let origin = epoch_origin();
         Ok(Self {
             base,
             len,
             ptr: reservation.ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            epoch: 0,
-            versions: vec![0; len / PAGE_SIZE],
+            epoch: origin,
+            versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
@@ -523,6 +533,12 @@ impl Memory {
         Arc::make_mut(&mut self.perms)[pages].fill(0);
         self.touch(addr, len);
         Ok(())
+    }
+
+    /// Epochs this window has counted, comparable across windows.
+    #[cfg(test)]
+    pub(crate) fn epochs(&self) -> u64 {
+        self.epoch & ((1 << EPOCH_BITS) - 1)
     }
 
     pub(crate) fn touch(&mut self, addr: u32, len: usize) {

@@ -300,14 +300,14 @@ fn code_observation_epoch_precedes_x87_instruction_effects() {
     };
     let mut native = unobserved();
     let mut reference = unobserved();
-    let before = native.epoch;
+    let before = native.epochs();
     let compiled = compile(&Region::new(CODE, code.len()), &mut native, false).unwrap();
     assert_eq!(
-        native.epoch,
+        native.epochs(),
         before + 1,
         "compile observes the previously unwatched code page"
     );
-    assert_eq!(reference.epoch, before);
+    assert_eq!(reference.epochs(), before);
     // Matching code observation removes the epoch discrepancy before either
     // execution path runs; x87 loading itself does not change this epoch.
     reference.watch_code(CODE, code.len());
@@ -323,8 +323,8 @@ fn code_observation_epoch_precedes_x87_instruction_effects() {
     );
     expected.fuel = actual.fuel;
     assert_eq!(actual, expected);
-    assert_eq!(native.epoch, before + 1);
-    assert_eq!(native.epoch, reference.epoch);
+    assert_eq!(native.epochs(), before + 1);
+    assert_eq!(native.epochs(), reference.epochs());
 }
 
 #[test]
@@ -677,7 +677,7 @@ fn lane_matches_single(code: &[u8]) {
                 let data = m.read_data(DATA, 64).unwrap().to_vec();
                 let code = m.read_data(DATA + 0x2000, 64).unwrap().to_vec();
                 let shared = m.read_data(DATA + 0x3000, 64).unwrap().to_vec();
-                (exit, s, data, code, shared, m.epoch)
+                (exit, s, data, code, shared, m.epochs())
             });
             let (single_run, lane_run) = (runs[1].clone(), &mut runs[0]);
             assert_eq!(

@@ -95,7 +95,7 @@ fn compare(bytes: &[u8], initial: CpuState, setup: impl Fn(&mut Memory), calls: 
     }
     expected.fuel = actual.fuel;
     assert_eq!(actual, expected, "{bytes:02x?}");
-    assert_eq!(actual_memory.epoch, reference_memory.epoch);
+    assert_eq!(actual_memory.epochs(), reference_memory.epochs());
     for page in 0..6 {
         let address = CODE + page * 4096;
         if let Ok(expected) = reference_memory.read_data(address, 4096) {
@@ -752,7 +752,7 @@ fn x87_fault_and_budget_exits_restore_the_callers_host_floating_environment() {
         assert_eq!(after_host, caller_host);
         expected.fuel = actual.fuel;
         assert_eq!(actual, expected);
-        assert_eq!(actual_memory.epoch, expected_memory.epoch);
+        assert_eq!(actual_memory.epochs(), expected_memory.epochs());
     }
 }
 
