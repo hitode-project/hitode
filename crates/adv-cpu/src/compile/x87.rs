@@ -107,10 +107,11 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eip) as i32,
         );
+        let bridge = self.bridge();
         let call = self
             .b
             .ins()
-            .call(self.x87_ref, &[self.bridge, self.state, operation]);
+            .call(self.x87_ref, &[bridge, self.state, operation]);
         let result = self.b.inst_results(call)[0];
         let mut switch = Switch::new();
         let done = self.b.create_block();
@@ -939,6 +940,7 @@ pub(crate) mod testing {
             bulk_calls: 0,
             bulk_bytes: 0,
             cliffs: Default::default(),
+            scratch: Default::default(),
         };
         let interrupt = std::sync::atomic::AtomicBool::new(false);
         compiled.run(

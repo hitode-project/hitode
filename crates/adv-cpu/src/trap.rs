@@ -39,7 +39,14 @@ pub(crate) struct Bridge<'a> {
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
     pub cliffs: crate::Cliffs,
+    /// Operand buffer of the file-memory helpers; generated code reads and
+    /// writes it around one synchronous call.
+    pub scratch: Scratch,
 }
+
+#[derive(Default)]
+#[repr(C, align(16))]
+pub(crate) struct Scratch(pub [u8; 16]);
 
 // Bulk work between wall-clock checks: tens of microseconds at memcpy rates.
 const CLOCK_BYTES: u64 = 256 << 10;

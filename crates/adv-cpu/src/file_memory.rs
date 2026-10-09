@@ -5,7 +5,7 @@ unsafe fn memory<'a>(bridge: *mut u8) -> &'a mut crate::Memory {
     unsafe { &mut *(*bridge.cast::<crate::trap::Bridge<'_>>()).memory }
 }
 
-// Buffers are bounded private native stack temporaries, never guest slices.
+// Buffers are the bridge's bounded scratch, never guest slices.
 pub(crate) unsafe extern "C" fn read(
     bridge: *mut u8,
     address: u32,

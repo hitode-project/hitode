@@ -242,6 +242,7 @@ impl Executor {
             bulk_calls: 0,
             bulk_bytes: 0,
             cliffs: std::mem::take(&mut self.stats.cliffs),
+            scratch: Default::default(),
         };
         // Diagnostics use only the explicitly selected interpreter backend.
         // Disabled runs retain block execution and its instruction hot path.

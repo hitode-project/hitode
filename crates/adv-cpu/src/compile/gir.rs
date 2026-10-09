@@ -200,6 +200,7 @@ mod tests {
             bulk_calls: 0,
             bulk_bytes: 0,
             cliffs: Default::default(),
+            scratch: Default::default(),
         };
         let interrupt = AtomicBool::new(false);
         let exit = compiled.run(

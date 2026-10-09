@@ -1120,12 +1120,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             params[0],
             offset_of!(NativeContext, perms) as i32,
         );
-        let bridge = b.ins().load(
-            ptr_ty,
-            MemFlags::trusted(),
-            params[0],
-            offset_of!(NativeContext, bridge) as i32,
-        );
         let interrupt = b.ins().load(
             ptr_ty,
             MemFlags::trusted(),
@@ -1340,7 +1334,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let mut e = Emitter {
             b,
             optimizing: opt_level == "speed",
-            memory_scratch: None,
             invariant_plan: invariant_plan.clone(),
             invariant_body,
             invariant_gate,
@@ -1390,7 +1383,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             direct_footers: BTreeMap::new(),
             write_summary,
             hot_exits,
-            bridge,
             trap_ref,
             repeat_ref,
             x87_ref,
@@ -2663,7 +2655,6 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
-    memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,
     invariant_body: bool,
     invariant_gate: Option<(ir::FuncRef, Variable)>,
@@ -2733,7 +2724,6 @@ struct Emitter<'a> {
     hot_exits: bool,
     direct_footers: BTreeMap<u32, ir::Block>,
     write_summary: Option<write_summary::Summary>,
-    bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
     x87_ref: ir::FuncRef,
@@ -2779,6 +2769,15 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
+    /// Only helper calls need the bridge: load it there, not on every entry.
+    fn bridge(&mut self) -> Value {
+        self.b.ins().load(
+            self.ptr_ty,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, bridge) as i32,
+        )
+    }
     fn constant(&mut self, value: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(value))
     }
@@ -2840,10 +2839,11 @@ impl Emitter<'_> {
             self.save_state(pc);
         }
         let operation = self.b.ins().func_addr(self.ptr_ty, operation);
+        let bridge = self.bridge();
         let call = self
             .b
             .ins()
-            .call(self.x87_ref, &[self.bridge, self.state, operation]);
+            .call(self.x87_ref, &[bridge, self.state, operation]);
         let result = self.b.inst_results(call)[0];
         if let Some(effects) = &effects {
             for index in 0..8 {
@@ -3218,10 +3218,8 @@ impl Emitter<'_> {
         let pc = self.constant(next);
         self.save_state(pc);
         let pc = self.constant(self.pc);
-        let call = self
-            .b
-            .ins()
-            .call(self.trap_ref, &[self.bridge, self.state, pc]);
+        let bridge = self.bridge();
+        let call = self.b.ins().call(self.trap_ref, &[bridge, self.state, pc]);
         let result = self.b.inst_results(call)[0];
         self.reload_state();
         let done = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
@@ -4188,10 +4186,11 @@ impl Emitter<'_> {
         self.b.ins().jump(done, &[no_file.into()]);
         self.b.switch_to_block(prepare);
         let width = self.constant(size as u32);
+        let bridge = self.bridge();
         let call = self
             .b
             .ins()
-            .call(self.file_prepare_ref, &[self.bridge, addr, width]);
+            .call(self.file_prepare_ref, &[bridge, addr, width]);
         let failed = self.b.inst_results(call)[0];
         self.guard(failed, Exit::WriteFault, Some(addr));
         self.b.set_cold_block(self.b.current_block().unwrap());
@@ -4692,26 +4691,23 @@ impl Emitter<'_> {
         } else {
             Exit::ReadFault
         };
-        let slot = self.memory_buffer();
-        let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let bridge = self.bridge();
+        let buffer = self.b.ins().iadd_imm(bridge, SCRATCH);
         let width = self.constant(ty.bytes());
         let function = if let Some(value) = value {
-            self.b.ins().stack_store(value, slot, 0);
+            self.b.ins().store(MemFlags::trusted(), value, buffer, 0);
             self.file_write_ref
         } else {
             self.file_read_ref
         };
-        let call = self
-            .b
-            .ins()
-            .call(function, &[self.bridge, addr, buffer, width]);
+        let call = self.b.ins().call(function, &[bridge, addr, buffer, width]);
         let failed = self.b.inst_results(call)[0];
         self.guard(failed, reason, Some(addr));
         self.b.set_cold_block(self.b.current_block().unwrap());
         if write {
             self.b.ins().jump(done, &[]);
         } else {
-            let result = self.b.ins().stack_load(ty, slot, 0);
+            let result = self.b.ins().load(ty, MemFlags::trusted(), buffer, 0);
             self.b.ins().jump(done, &[result.into()]);
         }
     }
@@ -4795,21 +4791,6 @@ impl Emitter<'_> {
         let ty = self.b.func.dfg.value_type(value);
         self.memory_access(addr, ty, Some(value));
     }
-    /// Synchronous memory helpers borrow at most 16 bytes until they return.
-    /// Consume a read immediately into SSA; no buffer pointer escapes or is
-    /// live across another helper. One slot therefore serves the whole function.
-    fn memory_buffer(&mut self) -> ir::StackSlot {
-        if let Some(slot) = self.memory_scratch {
-            return slot;
-        }
-        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
-            ir::StackSlotKind::ExplicitSlot,
-            16,
-            4,
-        ));
-        self.memory_scratch = Some(slot);
-        slot
-    }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
         if let Some(slot) = self.slot(self.b.func.dfg.value_type(value)) {
             self.b.def_var(slot, value);
@@ -4842,13 +4823,13 @@ impl Emitter<'_> {
         self.store_atomic(pointer.address, value);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(overlay);
-        let slot = self.memory_buffer();
-        self.b.ins().stack_store(value, slot, 0);
-        let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let bridge = self.bridge();
+        let buffer = self.b.ins().iadd_imm(bridge, SCRATCH);
+        self.b.ins().store(MemFlags::trusted(), value, buffer, 0);
         let width = self.constant(self.b.func.dfg.value_type(value).bytes());
         self.b.ins().call(
             self.file_prepared_ref,
-            &[self.bridge, pointer.guest, buffer, width],
+            &[bridge, pointer.guest, buffer, width],
         );
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
@@ -5294,10 +5275,11 @@ impl Emitter<'_> {
             let pc = self.constant(i.ip32());
             self.save_state(pc);
             let operation = self.constant(operation);
+            let bridge = self.bridge();
             let call = self
                 .b
                 .ins()
-                .call(self.repeat_ref, &[self.bridge, self.state, operation]);
+                .call(self.repeat_ref, &[bridge, self.state, operation]);
             let result = self.b.inst_results(call)[0];
             self.reload_state();
             let done = self.b.create_block();
@@ -5373,7 +5355,8 @@ impl Emitter<'_> {
             }
             M::Nop => {}
             M::Rdtsc => {
-                let call = self.b.ins().call(self.timestamp_ref, &[self.bridge]);
+                let bridge = self.bridge();
+                let call = self.b.ins().call(self.timestamp_ref, &[bridge]);
                 let ticks = self.b.inst_results(call)[0];
                 let low = self.b.ins().ireduce(types::I32, ticks);
                 let shifted = self.b.ins().ushr_imm(ticks, 32);
@@ -5584,6 +5567,9 @@ fn integer_type(size: usize) -> ir::Type {
         _ => unreachable!(),
     }
 }
+
+/// Offset of the file-memory helper buffer inside the bridge.
+const SCRATCH: i64 = std::mem::offset_of!(crate::trap::Bridge<'static>, scratch) as i64;
 
 /// Lazy kind meaning the recipe still stands in CpuState::lazy_flags: exits
 /// skip it and only a flag reader loads it (realize_flags).
