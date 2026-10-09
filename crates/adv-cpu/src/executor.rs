@@ -70,8 +70,9 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    /// Slow-path counters by instruction and reason.
-    pub cliffs: crate::Cliffs,
+    /// Slow-path counters by instruction and reason. Boxed: every run lends
+    /// them to its bridge, and a pointer moves for free.
+    pub cliffs: Box<crate::Cliffs>,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
 }
@@ -111,6 +112,8 @@ pub struct Executor {
     rows: Option<Box<crate::rows::RowPool>>,
     code: CodeStore,
     pub(crate) memory: Memory,
+    /// Stands in for `stats.cliffs` while a run's bridge holds them.
+    spare_cliffs: Option<Box<crate::Cliffs>>,
     region_linking: bool,
     pub(crate) interpreter: crate::interpreter::Interpreter,
     auto_jit: bool,
@@ -228,6 +231,7 @@ impl Executor {
         handler: Option<&mut dyn ExecutionTrap>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
+        let spare = self.spare_cliffs.take().unwrap_or_default();
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,
@@ -241,7 +245,7 @@ impl Executor {
             unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
-            cliffs: std::mem::take(&mut self.stats.cliffs),
+            cliffs: std::mem::replace(&mut self.stats.cliffs, spare),
             scratch: Default::default(),
         };
         // Diagnostics use only the explicitly selected interpreter backend.
@@ -268,7 +272,7 @@ impl Executor {
         self.stats.trap_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
-        self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
+        self.spare_cliffs = Some(std::mem::replace(&mut self.stats.cliffs, bridge.cliffs));
         self.timestamp = bridge.timestamp;
         result
     }
@@ -377,6 +381,7 @@ impl Executor {
             demand: HashMap::new(),
             warm: None,
             aot: aot::State::default(),
+            spare_cliffs: Some(Box::default()),
             persistent_cache: None,
             cached_pending: None,
             cache_images: Vec::new(),

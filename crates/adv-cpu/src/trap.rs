@@ -38,7 +38,7 @@ pub(crate) struct Bridge<'a> {
     pub unclocked_bytes: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    pub cliffs: crate::Cliffs,
+    pub cliffs: Box<crate::Cliffs>,
     /// Operand buffer of the file-memory helpers; generated code reads and
     /// writes it around one synchronous call.
     pub scratch: Scratch,
