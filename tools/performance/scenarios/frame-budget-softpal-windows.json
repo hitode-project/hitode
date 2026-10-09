@@ -1,0 +1,154 @@
+{
+  "schema": "adv-frame-budget-scenario-v1",
+  "id": "softpal-windows",
+  "game_dir": "七色★星露",
+  "exe": "nana_chs.exe",
+  "codepage": 936,
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "Windows headless GPU system-font gates; Ctrl-assisted intro to body, fixed body-to-choice Ctrl, and choice steady-state observation.",
+    "timeout_seconds": 180,
+    "steps": [
+      {
+        "delay_ms": 4000
+      },
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "59d66396fce144f3",
+          "timeout_ms": 90000,
+          "probes": [
+            {
+              "x": 638,
+              "y": 506,
+              "bgra": [
+                246,
+                218,
+                204,
+                255
+              ]
+            },
+            {
+              "x": 80,
+              "y": 538,
+              "bgra": [
+                253,
+                253,
+                253,
+                255
+              ]
+            },
+            {
+              "x": 111,
+              "y": 538,
+              "bgra": [
+                201,
+                166,
+                243,
+                255
+              ]
+            }
+          ],
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "mouse-down 650 410"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 650 410"
+      },
+      {
+        "checkpoint": "body",
+        "await": {
+          "frame_fnv1a64": "56c5b22334a1fa5e",
+          "timeout_ms": 45000,
+          "hold_key": 17
+        },
+        "reset_metrics": true
+      },
+      {
+        "checkpoint": "ctrl",
+        "await": {
+          "frame_fnv1a64": "590b32909bb9c5a5",
+          "timeout_ms": 45000,
+          "hold_key": 17,
+          "probes": [
+            {
+              "x": 400,
+              "y": 330,
+              "bgra": [
+                133,
+                110,
+                157,
+                255
+              ]
+            },
+            {
+              "x": 400,
+              "y": 363,
+              "bgra": [
+                114,
+                79,
+                140,
+                255
+              ]
+            }
+          ]
+        },
+        "reset_metrics": true
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "normal",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "key-down 13"
+      },
+      {
+        "delay_ms": 500
+      },
+      {
+        "command": "key-up 13"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "transition",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
+  "scenes": {
+    "title": {
+      "checkpoint": "title",
+      "measurement": "gated"
+    },
+    "normal": {
+      "checkpoint": "normal",
+      "measurement": "timed_observation"
+    },
+    "ctrl": {
+      "checkpoint": "ctrl",
+      "measurement": "gated",
+      "start_checkpoint": "body"
+    },
+    "transition": {
+      "checkpoint": "transition",
+      "measurement": "timed_observation"
+    }
+  }
+}

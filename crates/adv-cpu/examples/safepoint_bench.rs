@@ -1,5 +1,5 @@
 //! Synthetic polling benchmark: `cargo run -p adv-cpu --release --example safepoint_bench`.
-//! Inputs: ADV_SAFEPOINT (unset or poll), ADV_SAFEPOINT_BENCH_TIER (0/1/2),
+//! Inputs: ADV_SAFEPOINT_BENCH_TIER (0/1/2),
 //! ADV_SAFEPOINT_BENCH_LOOPS (default 200000), ADV_SAFEPOINT_BENCH_SAMPLES
 //! (default 7). Tier 1 requires a supported ARM64 host; the default tier is 2.
 //! Output: anonymous CSV ns/loop and notification-to-return median/max us.
@@ -181,11 +181,7 @@ fn main() {
         .map_or(2, |s| s.parse::<u8>().expect("integer tier"));
     let loops = option("ADV_SAFEPOINT_BENCH_LOOPS", 200_000, 10_000_000);
     let samples = option("ADV_SAFEPOINT_BENCH_SAMPLES", 7, 31) as usize;
-    let mode = if std::env::var("ADV_SAFEPOINT").is_ok_and(|s| s == "poll") {
-        "poll"
-    } else {
-        "off"
-    };
+    let mode = "default";
     let mut m = machine(tier);
     m.set_host_interrupt_flag(Arc::new(AtomicBool::new(false)));
     reset(&mut m, 32);

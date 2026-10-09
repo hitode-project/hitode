@@ -7,8 +7,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use iced_x86::{
-    Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic as M, OpKind,
-    Register as R,
+    Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic as M, OpKind, Register as R,
 };
 
 use crate::linking::{NativeContext, Slot, Table};
@@ -16,18 +15,10 @@ use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 mod cache;
+pub(crate) mod contract;
 pub(crate) mod coverage;
 pub(crate) use cache::restore_snapshot;
 mod diagnostics;
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "android",
-        all(target_os = "macos", target_arch = "aarch64")
-    ),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-mod direct;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 #[cfg(target_arch = "aarch64")]
@@ -43,7 +34,6 @@ mod nest_emit;
 // Retain the analysis tests; observable exits cannot discard guest state.
 #[cfg(test)]
 mod register_liveness;
-mod safepoints;
 mod scalar;
 mod shadow;
 mod simd;
@@ -72,9 +62,6 @@ pub(crate) struct NativeRun<'a> {
 }
 
 pub(crate) struct Compiled {
-    /// Immutable absolute checked entry, initialized before publication. Code
-    /// mappings need not be in ADRP/rel32 reach of the polling body.
-    _poll_target: Option<Box<usize>>,
     perf_ranges: Vec<crate::perf_map::Registration>,
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
@@ -104,17 +91,6 @@ pub(crate) struct Compiled {
     pub gir_opaque_instructions: usize,
     pub decoded_bytes: usize,
     ir_counts: Option<ir_counts::Summary>,
-    pub direct_sites: usize,
-    pub direct_inline_fallbacks: u64,
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    inline_registration: Option<crate::fault_recovery::inline::Registration>,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     _nests: Box<[crate::rows::Descriptor]>,
@@ -134,15 +110,6 @@ pub(crate) struct Compiled {
 impl Drop for Compiled {
     fn drop(&mut self) {
         self.perf_ranges.clear();
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        self.inline_registration.take();
         // SAFETY: the entry pointer is private, run borrows self, and no generated
         // code can still be executing while this exclusive drop runs.
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -186,9 +153,7 @@ impl Compiled {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
     }
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.input.direct_memory == memory.direct_memory_enabled()
-            && self.input.direct_inline == memory.direct_memory_inline()
-            && memory.base == self.window_base
+        memory.base == self.window_base
             && memory.len == self.window_len
             && self
                 .pages
@@ -216,11 +181,6 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
-        if self.input.direct_memory != memory.direct_memory_enabled()
-            || self.input.direct_inline != memory.direct_memory_inline()
-        {
-            return (Exit::Fallback as u32, 0);
-        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         crate::jit_memory_macos::synchronize_execution();
         #[cfg(target_arch = "aarch64")]
@@ -259,9 +219,10 @@ impl Compiled {
             stop: controls.stop,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            recovery_slot: std::ptr::null(),
             linked_entries: 0,
             shadow,
-            direct: memory.direct_engine_pointer(),
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Checked accesses retain their guards; verified ordinary reads
@@ -285,29 +246,7 @@ impl Compiled {
             return (result, context.linked_entries);
         }
         let memory_pointer = memory.ptr.as_ptr();
-        let mut run = || unsafe { (self.entry)(&mut context, memory_pointer) };
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        let result = if self.input.direct_memory {
-            unsafe { crate::direct_memory::run_inline(state, memory, bridge, &permissions, run) }
-        } else {
-            run()
-        };
-        #[cfg(not(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )))]
-        let result = run();
+        let result = unsafe { (self.entry)(&mut context, memory_pointer) };
         if let Some(stack) = controls.shadow {
             stack.clear();
         }
@@ -336,13 +275,23 @@ impl Compiled {
             )
         }
         .ok()?;
+        let recovery_slot = std::cell::Cell::new(0);
+        context.recovery_slot = &recovery_slot;
         let result = unsafe {
-            crate::host_fault::with_native_session(state, &[region], window, guest_base, |state| {
-                context.state = state;
-                context.fault_reads = 1;
-                (self.entry)(context, pointer)
-            })
+            crate::host_fault::with_native_session(
+                state,
+                &[region],
+                window,
+                guest_base,
+                &recovery_slot,
+                |state| {
+                    context.state = state;
+                    context.fault_reads = 1;
+                    (self.entry)(context, pointer)
+                },
+            )
         };
+        context.recovery_slot = std::ptr::null();
         match result {
             Ok((result, _)) => Some(result),
             Err(_) => {
@@ -389,12 +338,9 @@ pub(crate) struct Snapshot {
     pub(crate) cache_capture: bool,
     pub(crate) cache_location: Option<(u32, u32, [u8; 32])>,
     pub(crate) cache_guest: Option<[u8; 32]>,
-    pub(crate) gir_frontend: bool,
     parallel: bool,
-    direct_memory: bool,
-    direct_inline: bool,
     pub region: Box<Region>,
-    base: u32,
+    pub(crate) base: u32,
     len: usize,
     /// Guest address of `bytes[0]`: the region start, or a callee below it.
     origin: u32,
@@ -451,10 +397,7 @@ impl Snapshot {
                 .cache_location
                 .map(|(base, _, identity)| (base, region.start - base, identity)),
             cache_guest: self.cache_guest,
-            gir_frontend: self.gir_frontend,
             parallel: self.parallel,
-            direct_memory: self.direct_memory,
-            direct_inline: self.direct_inline,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -522,10 +465,7 @@ impl Snapshot {
             cache_capture: false,
             cache_location: None,
             cache_guest: None,
-            gir_frontend: gir::selected()?,
             parallel: memory.is_parallel(),
-            direct_memory: memory.direct_memory_enabled(),
-            direct_inline: memory.direct_memory_inline(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -549,9 +489,7 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.direct_memory == memory.direct_memory_enabled()
-            && self.direct_inline == memory.direct_memory_inline()
-            && self.parallel == memory.is_parallel()
+        self.parallel == memory.is_parallel()
             && memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
@@ -770,7 +708,7 @@ impl Snapshot {
         code.into_values().collect()
     }
 
-    fn page_index(&self, address: u32) -> Option<usize> {
+    pub(crate) fn page_index(&self, address: u32) -> Option<usize> {
         let offset = address.checked_sub(self.base)? as usize;
         (offset < self.len).then_some(offset / 4096)
     }
@@ -810,33 +748,6 @@ fn callee_origin(region: &mut Region, memory: &Memory) -> u32 {
     origin
 }
 
-fn record_tail_dependencies(
-    region: &Region,
-    snapshot: &Snapshot,
-    bytes: &[u8],
-    offset: usize,
-    decoder: &Decoder<'_>,
-    instruction: &Instruction,
-    pages: &mut BTreeSet<usize>,
-) {
-    let start = (snapshot.origin - snapshot.base) as usize;
-    let read_start = (instruction.ip32() - snapshot.base) as usize;
-    let read_end = start + offset + decoder.position();
-    pages.extend(read_start / 4096..=(read_end - 1) / 4096);
-    if region.complete_tail && decoder.last_error() == DecoderError::NoMoreBytes {
-        // The next page's mapping/EXEC permission can make a previously
-        // truncated instruction compilable, even if none of its bytes
-        // could be read. Keep that negative dependency in the cache.
-        if let Some(address) = u64::from(snapshot.origin)
-            .checked_add(bytes.len() as u64)
-            .and_then(|address| u32::try_from(address).ok())
-            && let Some(page) = snapshot.page_index(address)
-        {
-            pages.insert(page);
-        }
-    }
-}
-
 pub(crate) fn compile(
     region: &Region,
     memory: &mut Memory,
@@ -851,167 +762,24 @@ pub(crate) fn compile(
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
-    compile_snapshot_with_inline(snapshot, snapshot.direct_inline)
-}
-
-fn compile_snapshot_with_inline(
-    snapshot: &Snapshot,
-    _inline_enabled: bool,
-) -> Result<Compiled, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let _write = crate::jit_memory_macos::WriteScope::new();
     let ir_counts =
         ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
+    #[cfg(feature = "gir-capture")]
     let bytes = &snapshot.bytes;
-    let first_page = (region.start - snapshot.base) as usize / 4096;
-    let mut pages: BTreeSet<usize> = if region.reachable {
-        BTreeSet::new()
-    } else {
-        (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096).collect()
-    };
-    let mut instructions = BTreeMap::new();
-    if !region.reachable {
-        let mut decoder =
-            Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
-        while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64 {
-            let instruction = decoder.decode();
-            record_tail_dependencies(
-                region,
-                snapshot,
-                bytes,
-                0,
-                &decoder,
-                &instruction,
-                &mut pages,
-            );
-            instructions.insert(instruction.ip32(), instruction);
-        }
-    }
-    // Entry points can follow padding/data or overlap an earlier linear decode.
-    // Decode direct targets independently, as the CPU would at the actual target PC.
-    let private_callee = |pc: u32| {
-        region.reachable
-            && region.callees.contains(&pc)
-            && pc != region.start
-            && !region.entries.contains(&pc)
-    };
-    let mut pending: Vec<u32> = region.entries.clone();
-    if region.reachable && pending.is_empty() {
-        pending.push(region.start);
-    }
-    if !region.reachable {
-        pending.extend(
-            instructions
-                .values()
-                .filter(|i| i.op0_kind() == OpKind::NearBranch32)
-                .map(Instruction::near_branch32),
-        );
-    }
-    while let Some(target) = pending.pop() {
-        if instructions.contains_key(&target)
-            || region.frontier.contains(&target)
-            || private_callee(target)
-        {
-            continue;
-        }
-        let Some(offset) = target
-            .checked_sub(region.start)
-            .map(|n| n as usize)
-            .filter(|&n| n < region.len)
-        else {
-            continue;
-        };
-        let offset = offset + (region.start - snapshot.origin) as usize;
-        let mut decoder = Decoder::with_ip(
-            32,
-            &bytes[offset..],
-            u64::from(target),
-            DecoderOptions::NONE,
-        );
-        while decoder.can_decode()
-            && decoder.ip() < u64::from(region.start) + region.len as u64
-            && !instructions.contains_key(&(decoder.ip() as u32))
-            && !region.frontier.contains(&(decoder.ip() as u32))
-            && !private_callee(decoder.ip() as u32)
-        {
-            let i = decoder.decode();
-            record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &i, &mut pages);
-            if i.op0_kind() == OpKind::NearBranch32 {
-                pending.push(i.near_branch32());
-            }
-            instructions.insert(i.ip32(), i);
-            if region.reachable
-                && (i.is_invalid()
-                    || matches!(
-                        i.flow_control(),
-                        FlowControl::UnconditionalBranch
-                            | FlowControl::IndirectBranch
-                            | FlowControl::Return
-                            | FlowControl::Exception
-                    ))
-            {
-                break;
-            }
-        }
-    }
-    let mut callee_code = BTreeSet::new();
-    for i in snapshot.callee_code(&instructions) {
-        callee_code.insert(i.ip32());
-        let first = (i.ip32() - snapshot.base) as usize / 4096;
-        let last = (i.ip32() - snapshot.base) as usize + i.len() - 1;
-        pages.extend(first..=last / 4096);
-        instructions.insert(i.ip32(), i);
-    }
+    let crate::gir::cfg::Native {
+        instructions,
+        pages,
+        callee_code,
+        mut entries,
+        returns,
+    } = crate::gir::cfg::Native::decode(snapshot)?;
     // x87 stays in the region: guarded scalar lowering handles the exact subset,
     // and the remaining cases call the interpreter's transaction in place.
     let x87 = cache::x87_operations(snapshot, &instructions);
     let x87_segments = x87::segments(&instructions, &region.entries);
-    let mut entries = BTreeSet::from([region.start]);
-    for instruction in instructions.values() {
-        if crate::strings::operation(instruction).is_some()
-            || string::repeated(instruction)
-            || (!supported(instruction) && crate::floating::native_x87(instruction))
-        {
-            entries.insert(instruction.ip32());
-            entries.insert(instruction.next_ip32());
-        }
-        if instruction.flow_control() != FlowControl::Next {
-            entries.insert(instruction.next_ip32());
-        }
-        // An interpreted instruction returns with canonical state. Publish its
-        // decoded continuation so a cold form does not strand the supported
-        // remainder of this block in the interpreter on every execution.
-        if !supported(instruction) && !crate::floating::native_x87(instruction) {
-            entries.insert(instruction.next_ip32());
-        }
-        if matches!(
-            instruction.op0_kind(),
-            OpKind::NearBranch16 | OpKind::NearBranch32
-        ) {
-            entries.insert(instruction.near_branch_target() as u32);
-        }
-    }
-    // A matching indirect call dispatches to a decoded callee internally.
-    entries.extend(region.callees.iter().copied());
-    for &entry in &region.entries {
-        if !instructions.contains_key(&entry) {
-            return Err(format!("entry {entry:#x} is not an instruction boundary"));
-        }
-        entries.insert(entry);
-    }
-    entries.retain(|pc| instructions.contains_key(pc));
-    let returns: BTreeSet<_> = instructions
-        .values()
-        .filter(|i| {
-            matches!(
-                i.flow_control(),
-                FlowControl::Call | FlowControl::IndirectCall
-            )
-        })
-        .map(Instruction::next_ip32)
-        .filter(|pc| entries.contains(pc))
-        .collect();
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_pc = snapshot
         .native_fault_reads
@@ -1101,7 +869,7 @@ fn compile_snapshot_with_inline(
                     .collect();
                 write_summary::Summary::for_region(&scope).is_some()
             });
-    let gir = if snapshot.gir_frontend {
+    let gir = {
         let mut opaque = BTreeSet::new();
         for plan in &plans {
             opaque.extend(
@@ -1119,18 +887,21 @@ fn compile_snapshot_with_inline(
         }
         opaque.extend(x87_segments.interiors.iter().copied());
         opaque.extend(x87_segments.integers.iter().copied());
-        Some(
-            crate::gir::lift::tier2(&instructions, &entries, &opaque, snapshot.direct_memory)
-                .map_err(|e| e.to_string())?,
-        )
-    } else {
-        None
+        crate::gir::lift::tier2(&instructions, &entries, &opaque).map_err(|e| e.to_string())?
     };
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let recovery_cfg = snapshot.native_fault_reads;
+    #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+    let recovery_cfg = false;
     let backend_flags = [
         ("opt_level", opt_level),
         ("preserve_frame_pointers", "true"),
+        (
+            "machine_code_cfg_info",
+            if recovery_cfg { "true" } else { "false" },
+        ),
         (
             "enable_verifier",
             if verifier_enabled() { "true" } else { "false" },
@@ -1182,39 +953,11 @@ fn compile_snapshot_with_inline(
     }
     #[cfg(all(test, target_arch = "x86_64"))]
     ctx.set_disasm(true);
-    ctx.func.signature = module.make_signature();
-    ctx.func.signature.call_conv = cranelift_codegen::isa::CallConv::Tail;
-    ctx.func.signature.params.extend([AbiParam::new(ptr_ty); 2]);
-    ctx.func.signature.returns.push(AbiParam::new(types::I32));
+    ctx.func.signature = contract::signature(&module);
     let tail_signature = ctx.func.signature.clone();
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
-    // Stateful helpers and existing loop kernels keep their established fuel
-    // and recovery contracts. Direct recovery metadata describes one body,
-    // so it cannot yet be shared by the checked and polling copies.
-    // Recompute the plan from the final region CFG.
-    let poll_plan = (crate::safepoint::enabled()
-        && !snapshot.direct_memory
-        && !snapshot.parallel
-        && plans.is_empty()
-        && invariant_plan.is_none()
-        && versioned
-        && write_summary::Summary::for_region(&instructions).is_some())
-    .then(|| safepoints::Plan::new(&instructions, &entries))
-    .flatten();
-    let mut poll_target = poll_plan.as_ref().map(|_| Box::new(0usize));
-    let poll_cell = poll_target
-        .as_deref()
-        .map(|target| std::ptr::from_ref(target) as usize);
-    let poll_id = poll_plan
-        .as_ref()
-        .map(|_| {
-            module
-                .declare_function("guest_poll", Linkage::Local, &tail_signature)
-                .map_err(|e| e.to_string())
-        })
-        .transpose()?;
     let invariant_id = invariant_plan
         .as_ref()
         .map(|_| {
@@ -1223,28 +966,6 @@ fn compile_snapshot_with_inline(
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let direct_ids = if snapshot.direct_memory {
-        Some(direct::declare(&mut module)?)
-    } else {
-        None
-    };
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let mut inline_drafts = Vec::new();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -1366,14 +1087,7 @@ fn compile_snapshot_with_inline(
                     kernels: &[usize],
                     track_writes: bool,
                     descriptors: &[usize],
-                    invariant_body: bool,
-                    polling_body: bool| {
-        let poll = polling_body.then(|| {
-            (
-                poll_plan.as_ref().expect("poll body has a bounded plan"),
-                poll_cell.expect("poll body owns an absolute target cell"),
-            )
-        });
+                    invariant_body: bool| {
         // Shadow returns always target the checked entry. An external callee
         // can change a base register, invalidating the old invocation's proof.
         let shadow_ref = (snapshot.shadow_returns && kernel.is_none())
@@ -1437,10 +1151,8 @@ fn compile_snapshot_with_inline(
         };
         let scoped_instructions = scope.iter().map(|&i| (i.ip32(), *i)).collect();
         let write_summary = write_summary::Summary::for_region(&scoped_instructions);
-        // CpuState stays canonical at every region boundary. A pure region
-        // cannot change unreferenced GPRs, so do not load them or keep them
-        // alive through its fault guards. Include write-only GPRs: a budget
-        // exit or fault may precede their first write, including side entries.
+        // Unused GPRs remain canonical in memory. Written GPRs must still
+        // load their prefix for guards and alternate native entries.
         let footprint = write_summary.filter(|_| {
             opt_level == "speed" && kernel.is_none() && !snapshot.parallel && nests.is_empty()
         });
@@ -1556,9 +1268,6 @@ fn compile_snapshot_with_inline(
             b.def_var(attempted, zero);
             (entry, attempted)
         });
-        for var in lazy {
-            b.def_var(var, zero);
-        }
         let written = track_writes.then(|| {
             let var = b.declare_var(types::I32);
             b.def_var(var, zero);
@@ -1588,6 +1297,9 @@ fn compile_snapshot_with_inline(
             Vec::new()
         };
         let fuel = b.declare_var(types::I64);
+        for var in lazy {
+            b.def_var(var, zero);
+        }
         for (i, reg) in regs.iter().enumerate() {
             if footprint.is_some_and(|summary| summary.gpr_used & (1 << i) == 0) {
                 b.def_var(*reg, zero);
@@ -1720,25 +1432,7 @@ fn compile_snapshot_with_inline(
                             && blocks.contains_key(&i.near_branch32())
                     })
         });
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        let direct_refs = direct_ids
-            .filter(|_| kernel.is_none() && !invariant_body)
-            .map(|(access, checked)| {
-                (
-                    module.declare_func_in_func(access, b.func),
-                    module.declare_func_in_func(checked, b.func),
-                )
-            });
         let mut e = Emitter {
-            poll,
-            poll_block: region.start,
             b,
             optimizing: opt_level == "speed",
             memory_scratch: None,
@@ -1821,26 +1515,6 @@ fn compile_snapshot_with_inline(
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            direct_refs,
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            inline: direct_refs
-                .filter(|_| _inline_enabled)
-                .map(|_| direct::Inline::new()),
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1861,12 +1535,10 @@ fn compile_snapshot_with_inline(
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_return: None,
         };
-        // The initial entry carries canonical flags, whereas runtime indirect
-        // transfers carry the guest instruction's lazy flags. Do not merge the
-        // two paths before a normal exit: that would force every return through
-        // a generic flags materialization.
+        // Incoming flags are canonical; local transfers retain lazy recipes.
+        // Keep their dispatches separate so a known local recipe is not widened
+        // before a normal exit.
         if hot_exits {
-            e.interrupt_at(pc, true);
             let entry_miss = e.b.create_block();
             e.b.set_cold_block(entry_miss);
             let mut switch = Switch::new();
@@ -1899,7 +1571,6 @@ fn compile_snapshot_with_inline(
             }
             e.b.switch_to_block(block);
             e.pc = start;
-            e.poll_block = start;
             if kernel.is_some() && fast.is_none() {
                 e.begin_mmx_block();
                 e.exit_const(Exit::Dispatch, start);
@@ -1936,10 +1607,8 @@ fn compile_snapshot_with_inline(
             }
             // A kernel charges its blocks when it leaves (`settle_fuel`).
             if fast.is_none() {
-                if e.poll.is_none() {
-                    let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
-                    e.guard(zero, Exit::Budget, None);
-                }
+                let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
+                e.guard(zero, Exit::Budget, None);
                 let remaining = e.b.ins().iadd_imm(budget, -1);
                 e.b.def_var(e.fuel, remaining);
                 if let Some(heat) = e.heat {
@@ -1985,23 +1654,15 @@ fn compile_snapshot_with_inline(
                     e.canonical_x87_instruction(instruction);
                     break;
                 }
-                if let Some(gir) = &gir {
-                    let operation = gir
-                        .operations
-                        .get(&pc)
-                        .expect("GIR covers every native entry");
-                    let (finished, next) = e.gir_operation(operation);
-                    if finished {
-                        break;
-                    }
-                    pc = next;
-                } else {
-                    e.precheck(instruction);
-                    if e.instruction(instruction) {
-                        break;
-                    }
-                    pc = instruction.next_ip32();
+                let operation = gir
+                    .operations
+                    .get(&pc)
+                    .expect("GIR covers every native entry");
+                let (finished, next) = e.gir_operation(operation);
+                if finished {
+                    break;
                 }
+                pc = next;
             }
         }
         if let Some(index) = kernel {
@@ -2106,7 +1767,7 @@ fn compile_snapshot_with_inline(
             e.b.switch_to_block(block);
             e.mmx_effects = None;
             let pc = e.constant(target);
-            e.save_hot_state(pc);
+            e.save_link_state(pc);
             let hash = e.constant(crate::linking::hash(target));
             if shadow_ref.is_some() {
                 let absent = e.b.ins().iconst(ptr_ty, 0);
@@ -2120,7 +1781,7 @@ fn compile_snapshot_with_inline(
             e.b.switch_to_block(hot_dispatch);
             e.mmx_effects = None;
             let pc = e.b.block_params(hot_dispatch)[0];
-            e.save_hot_state(pc);
+            e.save_link_state(pc);
             let high = e.b.ins().ushr_imm(pc, 16);
             let mixed = e.b.ins().bxor(pc, high);
             let mixed = e.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
@@ -2141,27 +1802,13 @@ fn compile_snapshot_with_inline(
         }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if let Some(block) = e.fault_return {
-            e.b.switch_to_block(block);
-            e.b.set_srcloc(ir::SourceLoc::new(fault::RETURN_SOURCE));
-            let reason = e.constant(Exit::ReadFault as u32);
-            e.b.ins().return_(&[reason]);
-            e.b.set_srcloc(ir::SourceLoc::default());
+            block.emit(&mut e.b, ptr_ty);
             fault_draft = e.fault_draft.take();
-        }
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        if let Some(inline) = e.finish_inline() {
-            inline_drafts = inline;
         }
         e.b.seal_all_blocks();
         e.b.finalize();
         ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
+        hot_exits
     };
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
@@ -2191,7 +1838,6 @@ fn compile_snapshot_with_inline(
             &[],
             row,
             &[],
-            false,
             false,
         );
         let kernel_id = module
@@ -2284,7 +1930,6 @@ fn compile_snapshot_with_inline(
             false,
             &addresses,
             true,
-            false,
         );
         #[cfg(feature = "cross-dump")]
         let cross = dump_dir.as_ref().map(|_| invariant_ctx.func.clone());
@@ -2306,7 +1951,7 @@ fn compile_snapshot_with_inline(
         // body's absolute func_addr references must both be defined first.
         kernel_functions.push((id, invariant_ctx));
     }
-    emit(
+    let hot_entry = emit(
         &mut module,
         &mut ctx.func,
         &mut fb_ctx,
@@ -2315,27 +1960,7 @@ fn compile_snapshot_with_inline(
         false,
         &addresses,
         false,
-        false,
     );
-    if let Some(poll_id) = poll_id {
-        let mut poll_ctx = module.make_context();
-        poll_ctx.func.signature = tail_signature.clone();
-        emit(
-            &mut module,
-            &mut poll_ctx.func,
-            &mut fb_ctx,
-            None,
-            &kernels,
-            false,
-            &addresses,
-            false,
-            true,
-        );
-        module
-            .define_function(poll_id, &mut poll_ctx)
-            .map_err(|e| format!("{e:?}"))?;
-        kernel_functions.push((poll_id, poll_ctx));
-    }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     #[cfg(feature = "cross-dump")]
@@ -2383,36 +2008,7 @@ fn compile_snapshot_with_inline(
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let body_entry = module.get_finalized_function(id) as usize;
-    if let Some(target) = poll_target.as_deref_mut() {
-        *target = body_entry;
-    }
-    let tail_entry = module.get_finalized_function(poll_id.unwrap_or(id)) as usize;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let inline_registration =
-        direct::publish(ctx.compiled_code().unwrap(), body_entry, &inline_drafts)?;
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    if !inline_drafts.is_empty() && inline_registration.is_none() {
-        // No entry or recovery table has escaped. Release the rejected body
-        // and regenerate this region using the existing scalar helper lane.
-        unsafe { module.free_memory() };
-        let mut compiled = compile_snapshot_with_inline(snapshot, false)?;
-        compiled.direct_inline_fallbacks += 1;
-        return Ok(compiled);
-    }
+    let tail_entry = body_entry;
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
@@ -2468,9 +2064,12 @@ fn compile_snapshot_with_inline(
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let args = b.block_params(entry).to_vec();
+        let params = b.block_params(entry).to_vec();
+        if hot_entry {
+            contract::guard_entry(&mut b, ptr_ty, params[0]);
+        }
         let address = b.ins().func_addr(ptr_ty, cached_tail_ref);
-        let call = b.ins().call_indirect(callee, address, &args);
+        let call = b.ins().call_indirect(callee, address, &params);
         let result = b.inst_results(call)[0];
         b.ins().return_(&[result]);
         b.seal_all_blocks();
@@ -2600,7 +2199,7 @@ fn compile_snapshot_with_inline(
     #[cfg(feature = "gir-lift")]
     crate::gir::diagnostics::record(&instructions, region.start);
     let cache_image = cache::capture_enabled(snapshot).then(|| {
-        let absolute = !descriptors.is_empty() || poll_target.is_some() || coverage::enabled();
+        let absolute = !descriptors.is_empty() || coverage::enabled();
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let absolute = absolute || !fault_sites.is_empty();
         if absolute {
@@ -2619,34 +2218,9 @@ fn compile_snapshot_with_inline(
             &entries,
             &excluded_entries,
             code_size,
-            {
-                #[cfg(all(
-                    any(
-                        target_os = "linux",
-                        target_os = "android",
-                        all(target_os = "macos", target_arch = "aarch64")
-                    ),
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ))]
-                {
-                    direct::cache_sites(ctx.compiled_code().unwrap(), &inline_drafts)
-                }
-                #[cfg(not(all(
-                    any(
-                        target_os = "linux",
-                        target_os = "android",
-                        all(target_os = "macos", target_arch = "aarch64")
-                    ),
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                )))]
-                {
-                    Ok::<_, String>(Vec::new())
-                }
-            }?,
         )
     });
     Ok(Compiled {
-        _poll_target: poll_target,
         perf_ranges,
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(
@@ -2660,9 +2234,9 @@ fn compile_snapshot_with_inline(
         }),
         instruction_count: instructions.len(),
         #[cfg(test)]
-        gir_ssa_instructions: gir.as_ref().map_or(0, |gir| gir.ssa_instructions),
+        gir_ssa_instructions: gir.ssa_instructions,
         #[cfg(test)]
-        gir_opaque_instructions: gir.as_ref().map_or(0, |gir| gir.opaque_instructions),
+        gir_opaque_instructions: gir.opaque_instructions,
         decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
         cache_image,
@@ -2685,47 +2259,6 @@ fn compile_snapshot_with_inline(
         window_len: snapshot.len,
         entries,
         excluded_entries,
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        inline_registration,
-        direct_inline_fallbacks: 0,
-        direct_sites: {
-            #[cfg(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
-            {
-                if snapshot.direct_memory {
-                    instructions
-                        .values()
-                        .filter(|i| direct::candidate(i))
-                        .count()
-                } else {
-                    0
-                }
-            }
-            #[cfg(not(all(
-                any(
-                    target_os = "linux",
-                    target_os = "android",
-                    all(target_os = "macos", target_arch = "aarch64")
-                ),
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            )))]
-            {
-                0
-            }
-        },
         code_size,
         _x87: x87,
         _nests: descriptors,
@@ -3210,6 +2743,16 @@ fn exclusive(i: &Instruction) -> bool {
         || i.mnemonic() == M::Xchg && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
 }
 
+/// Boundaries required by opaque operations and interpreter continuations.
+pub(crate) fn opaque_boundaries(i: &Instruction) -> (bool, bool) {
+    let native = supported(i);
+    let floating = !native && crate::floating::native_x87(i);
+    (
+        crate::strings::operation(i).is_some() || string::repeated(i) || floating,
+        !native && !floating,
+    )
+}
+
 pub(crate) fn supported(i: &Instruction) -> bool {
     if crate::strings::operation(i).is_some() || string::supported(i) {
         return true;
@@ -3340,8 +2883,6 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
-    poll: Option<(&'a safepoints::Plan, usize)>,
-    poll_block: u32,
     memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,
     invariant_body: bool,
@@ -3443,24 +2984,6 @@ struct Emitter<'a> {
     timestamp_ref: ir::FuncRef,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    inline: Option<direct::Inline>,
     source_map: bool,
     source_origin: u32,
     source: ir::SourceLoc,
@@ -3475,191 +2998,10 @@ struct Emitter<'a> {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fault_draft: Option<fault::Pending>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    fault_return: Option<ir::Block>,
+    fault_return: Option<contract::RecoveryExit>,
 }
 
 impl Emitter<'_> {
-    fn chain_or_return(
-        &mut self,
-        pc: Value,
-        target_hash: Option<Value>,
-        reason: Option<Value>,
-        prediction: Option<Value>,
-    ) {
-        let returned = self.b.create_block();
-        if let Some(reason) = reason {
-            let candidate = self.b.create_block();
-            let dispatch = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
-            self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
-            self.b.switch_to_block(candidate);
-        }
-        let slots = self.b.ins().load(
-            self.ptr_ty,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, slots) as i32,
-        );
-        let remaining = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let stop = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, stop) as i32,
-        );
-        let fuel = self.b.use_var(self.fuel);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
-        let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
-        let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
-        let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
-        let bad = self.b.ins().bor(none, limit);
-        let bad = self.b.ins().bor(bad, is_stop);
-        let bad = self.b.ins().bor(bad, empty);
-        let prepare = self.b.create_block();
-        self.b.ins().brif(bad, returned, &[], prepare, &[]);
-        self.b.switch_to_block(prepare);
-        // State was saved before reaching the chain candidate. Return directly
-        // so an interrupt never charges the next region or grows the Rust stack.
-        let pending = self
-            .b
-            .ins()
-            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
-        let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let search_ready = self.b.create_block();
-        self.b
-            .ins()
-            .brif(pending, interrupted, &[], search_ready, &[]);
-        self.b.switch_to_block(interrupted);
-        let interrupted_reason = self.constant(Exit::Interrupted as u32);
-        self.b.ins().return_(&[interrupted_reason]);
-        self.b.switch_to_block(search_ready);
-        let hit = self.b.create_block();
-        self.b.append_block_param(hit, self.ptr_ty);
-        if let Some(prediction) = prediction {
-            let valid = self.b.ins().icmp_imm(IntCC::NotEqual, prediction, 0);
-            let predicted = self.b.create_block();
-            let search_only = self.b.create_block();
-            self.b.ins().brif(valid, predicted, &[], search_only, &[]);
-            self.b.switch_to_block(predicted);
-            self.shadow_hit();
-            self.b.ins().jump(hit, &[prediction.into()]);
-            self.b.switch_to_block(search_only);
-        }
-        let mask = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, mask) as i32,
-        );
-        let hashed = if let Some(hash) = target_hash {
-            hash
-        } else {
-            let high = self.b.ins().ushr_imm(pc, 16);
-            let mixed = self.b.ins().bxor(pc, high);
-            let mixed = self.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
-            let high = self.b.ins().ushr_imm(mixed, 16);
-            self.b.ins().bxor(mixed, high)
-        };
-        let index = self.b.ins().band(hashed, mask);
-        let search = self.b.create_block();
-        self.b.append_block_param(search, types::I32);
-        self.b.append_block_param(search, types::I32);
-        let zero = self.constant(0);
-        self.b.ins().jump(search, &[index.into(), zero.into()]);
-        self.b.switch_to_block(search);
-        let index = self.b.block_params(search)[0];
-        let probes = self.b.block_params(search)[1];
-        let offset = self.b.ins().uextend(self.ptr_ty, index);
-        let offset = self
-            .b
-            .ins()
-            .imul_imm(offset, std::mem::size_of::<Slot>() as i64);
-        let address = self.b.ins().iadd(slots, offset);
-        let entry_address = self
-            .b
-            .ins()
-            .iadd_imm(address, offset_of!(Slot, entry) as i64);
-        let entry = self
-            .b
-            .ins()
-            .atomic_load(self.ptr_ty, MemFlags::trusted(), entry_address);
-        let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
-        let occupied = self.b.create_block();
-        self.b.ins().brif(absent, returned, &[], occupied, &[]);
-        self.b.switch_to_block(occupied);
-        let key = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            address,
-            offset_of!(Slot, pc) as i32,
-        );
-        let found = self.b.ins().icmp(IntCC::Equal, pc, key);
-        let advance = self.b.create_block();
-        self.b.ins().brif(found, hit, &[entry.into()], advance, &[]);
-        self.b.switch_to_block(advance);
-        let next = self.b.ins().iadd_imm(index, 1);
-        let next = self.b.ins().band(next, mask);
-        let probes = self.b.ins().iadd_imm(probes, 1);
-        let exhausted = self.b.ins().icmp_imm(
-            IntCC::UnsignedGreaterThanOrEqual,
-            probes,
-            crate::linking::PROBES as i64,
-        );
-        self.b.ins().brif(
-            exhausted,
-            returned,
-            &[],
-            search,
-            &[next.into(), probes.into()],
-        );
-        self.b.switch_to_block(hit);
-        let entry = self.b.block_params(hit)[0];
-        let remaining = self.b.ins().iadd_imm(remaining, -1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            remaining,
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let linked = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        let linked = self.b.ins().iadd_imm(linked, 1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            linked,
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        if self.fault_mode.is_some() {
-            let disabled = self.b.ins().iconst(types::I8, 0);
-            self.b.ins().store(
-                MemFlags::trusted(),
-                disabled,
-                self.context,
-                offset_of!(NativeContext, fault_reads) as i32,
-            );
-        }
-        self.b
-            .ins()
-            .return_call_indirect(self.tail_ref, entry, &[self.context, self.mem]);
-        self.b.switch_to_block(returned);
-        let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
-        self.b.ins().return_(&[reason]);
-    }
     fn constant(&mut self, value: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(value))
     }
@@ -3879,9 +3221,7 @@ impl Emitter<'_> {
             self.b.ins().brif(dispatch, resume, &[], returned, &[]);
             self.b.switch_to_block(resume);
             let address = self.b.ins().func_addr(self.ptr_ty, entry);
-            self.b
-                .ins()
-                .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+            self.tail_to(address);
             self.b.switch_to_block(returned);
             self.b.ins().return_(&[reason]);
         } else if terminal {
@@ -3893,7 +3233,7 @@ impl Emitter<'_> {
     fn save_state(&mut self, pc: Value) {
         self.save_state_with_flags(pc, None);
     }
-    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+    fn save_extended_state(&mut self) {
         self.flush_mmx_effects();
         for (index, var) in self.mmx.iter().enumerate() {
             if let Some(var) = var {
@@ -3932,14 +3272,17 @@ impl Emitter<'_> {
                 );
             }
         }
+    }
+    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+        self.save_extended_state();
         for (i, reg) in self.regs.iter().enumerate() {
-            if self.unchanged & 1 << i != 0 {
+            if self.unchanged & (1 << i) != 0 {
                 continue;
             }
-            let v = self.b.use_var(*reg);
+            let value = self.b.use_var(*reg);
             self.b
                 .ins()
-                .store(MemFlags::trusted(), v, self.state, (i * 4) as i32);
+                .store(MemFlags::trusted(), value, self.state, (i * 4) as i32);
         }
         let flags = flags.unwrap_or_else(|| self.materialize_flags());
         self.b.ins().store(
@@ -3962,7 +3305,7 @@ impl Emitter<'_> {
             offset_of!(CpuState, eip) as i32,
         );
     }
-    fn save_hot_state(&mut self, pc: Value) {
+    fn save_link_state(&mut self, pc: Value) {
         let Some(summary) = self.write_summary else {
             self.save_state(pc);
             return;
@@ -4166,11 +3509,7 @@ impl Emitter<'_> {
             .fast
             .and_then(|index| self.fast_blocks[index].get(&pc).copied());
         if let Some(block) = clone.or_else(|| self.blocks.get(&pc).copied()) {
-            if self
-                .poll
-                .is_some_and(|(plan, _)| plan.crosses(self.poll_block, pc))
-                || pc <= self.pc
-            {
+            if pc <= self.pc {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
                 if self.kernel.is_none()
@@ -4246,9 +3585,7 @@ impl Emitter<'_> {
         let target = self.constant(pc);
         self.save_state(target);
         let address = self.b.ins().func_addr(self.ptr_ty, entry);
-        self.b
-            .ins()
-            .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        self.tail_to(address);
         true
     }
 
@@ -4592,7 +3929,6 @@ impl Emitter<'_> {
         self.b.def_var(stop_var, stop);
         self.kernel = Some((index, stop_var, entry));
         let plan = &self.plans[index];
-        self.unchanged = plan.invariant;
         let bases: BTreeSet<usize> = plan
             .proven
             .values()
@@ -4861,37 +4197,6 @@ impl Emitter<'_> {
                 .store(MemFlags::trusted(), value, self.state, base + offset as i32);
         }
     }
-    fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
-        self.poll_budget(pc);
-        let pending = self
-            .b
-            .ins()
-            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
-        let mut pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        // A clone checks interrupts after funding its next iteration.
-        if self.fast.is_none() {
-            let fuel = self.b.use_var(self.fuel);
-            let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-            pending = self.b.ins().band(pending, work);
-        }
-        if respect_stops {
-            let stop = self.b.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                self.context,
-                offset_of!(NativeContext, stop) as i32,
-            );
-            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
-            pending = self.b.ins().band(pending, ordinary);
-        }
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let continued = self.b.create_block();
-        self.b.ins().brif(pending, interrupted, &[], continued, &[]);
-        self.b.switch_to_block(interrupted);
-        self.exit(Exit::Interrupted, pc);
-        self.b.switch_to_block(continued);
-    }
     fn address(&mut self, i: &Instruction) -> Value {
         if let Some((pc, addr, _)) = self.site
             && pc == self.pc
@@ -5138,7 +4443,7 @@ impl Emitter<'_> {
     /// page-guard cold path. No classification branch runs after an ordinary
     /// guard succeeds. RMW stores retain pointer()'s early prevalidation because
     /// their flags and value are computed between validation and writeback.
-    fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
+    fn memory_access(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
         // A forwarded slot loads its value; stores also write memory below.
@@ -5481,7 +4786,7 @@ impl Emitter<'_> {
             self.b.append_block_param(done, ty);
         }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        if let Some((enabled, _)) = hardware {
+        if let Some((enabled, recovery)) = hardware {
             let classify = self.b.create_block();
             let checked = self.b.create_block();
             let raw = self.b.create_block();
@@ -5497,6 +4802,7 @@ impl Emitter<'_> {
                 .band_imm(combined, i64::from(crate::memory::SHARED));
             self.b.ins().brif(shared, checked, &[], raw, &[]);
             self.b.switch_to_block(raw);
+            recovery.publish(&mut self.b, self.ptr_ty, self.context);
             self.b.set_srcloc(ir::SourceLoc::new(fault::LOAD_SOURCE));
             let result = self.b.ins().load(
                 ty,
@@ -5658,14 +4964,14 @@ impl Emitter<'_> {
         self.b.block_params(done)[0]
     }
     fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
-        self.direct_memory(addr, ty, None).unwrap()
+        self.memory_access(addr, ty, None).unwrap()
     }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fn capture_hardware_read(
         &mut self,
         address: Value,
         width: usize,
-    ) -> Option<(Value, ir::Block)> {
+    ) -> Option<(Value, contract::RecoveryExit)> {
         let variable = self.fault_mode?;
         let outputs = std::array::from_fn(|index| match index {
             0..=7 => self.b.use_var(self.regs[index]),
@@ -5674,6 +4980,7 @@ impl Emitter<'_> {
             16 => self.b.use_var(self.fuel),
             _ => address,
         });
+        let recovery = contract::RecoveryExit::new(&mut self.b);
         let draft = fault::Draft::capture(
             &mut self.b,
             &self.fault_seeds,
@@ -5682,18 +4989,17 @@ impl Emitter<'_> {
             self.fault_entry,
             self.pc,
             width,
+            recovery,
         )?;
         let enabled = self.b.use_var(variable);
         let disabled = self.b.ins().iconst(types::I8, 0);
         self.b.def_var(variable, disabled);
-        let recovery = self.b.create_block();
-        self.b.set_cold_block(recovery);
         self.fault_return = Some(recovery);
         self.fault_draft = Some(draft);
         Some((enabled, recovery))
     }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    fn checked_read_guard(&mut self, bad: Value, address: Value, recovery: ir::Block) {
+    fn checked_read_guard(&mut self, bad: Value, address: Value, recovery: contract::RecoveryExit) {
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
         let continued = self.b.create_block();
@@ -5707,12 +5013,12 @@ impl Emitter<'_> {
         );
         let pc = self.constant(self.pc);
         self.save_state(pc);
-        self.b.ins().jump(recovery, &[]);
+        recovery.jump(&mut self.b);
         self.b.switch_to_block(continued);
     }
     fn direct_store(&mut self, addr: Value, value: Value) {
         let ty = self.b.func.dfg.value_type(value);
-        self.direct_memory(addr, ty, Some(value));
+        self.memory_access(addr, ty, Some(value));
     }
     /// Synchronous memory helpers borrow at most 16 bytes until they return.
     /// Consume a read immediately into SSA; no buffer pointer escapes or is
@@ -6200,25 +5506,6 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        if self.direct_refs.is_some() {
-            if self.lane.is_none() && direct::candidate(i) {
-                self.direct_mov(i);
-                return false;
-            }
-            if (0..i.op_count()).any(|operand| i.op_kind(operand) == OpKind::Memory) {
-                self.b
-                    .ins()
-                    .call(self.direct_refs.unwrap().1, &[self.bridge]);
-            }
-        }
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;

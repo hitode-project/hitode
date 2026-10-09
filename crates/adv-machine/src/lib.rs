@@ -1284,6 +1284,13 @@ impl Dispatch<'_> {
         cpu: &mut dyn Guest,
         event: exception::Exception,
     ) -> Result<(), Parked> {
+        // A backend fault is an input event, not a completed host call. Emit it
+        // before unwinding or invoking handlers; traps already have raw_interrupt.
+        if let exception::Exception::Fault(fault) = &event {
+            self.sys
+                .trace
+                .cpu_fault(self.sys.current, self.sys.frame, fault);
+        }
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(cpu, |frame| esp >= frame.stack, "exception")?;
         // Retain the original stop before a personality can edit registers or
@@ -2722,6 +2729,7 @@ impl<B: Backend> Machine<B> {
 
     /// Close the stats row when the presentation sequence moves on.
     fn note_frame(&mut self) {
+        let guest_us = self.sys.clock.now_us();
         if self
             .sys
             .stats
@@ -2730,7 +2738,12 @@ impl<B: Backend> Machine<B> {
             .is_some_and(|b| b.pending())
         {
             let cpu = self.cpu.frame_counters();
-            let total = self.sys.stats.total;
+            // Stats' CSV clock is optional; frame diagnostics need the current
+            // clock even when only --frame-budget is collecting timings.
+            let total = crate::stats::FrameRow {
+                guest_us,
+                ..self.sys.stats.total
+            };
             self.sys
                 .stats
                 .frame_budget
@@ -2739,9 +2752,7 @@ impl<B: Backend> Machine<B> {
                 .finish(total, cpu);
         }
         let blocks = self.cpu.executed_blocks();
-        self.sys
-            .stats
-            .note_frame(self.sys.frame, self.sys.clock.now_us(), blocks);
+        self.sys.stats.note_frame(self.sys.frame, guest_us, blocks);
     }
 
     /// Count executed translation blocks for [`Stats`] (a measurement mode; it slows guest

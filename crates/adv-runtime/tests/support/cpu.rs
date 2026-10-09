@@ -79,6 +79,12 @@ impl Cpu {
     }
 }
 impl Guest for Cpu {
+    fn wants_code_images(&self) -> bool {
+        self.guest().wants_code_images()
+    }
+    fn register_code_image(&mut self, image: adv_cpu::AotImage) {
+        self.guest_mut().register_code_image(image);
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         self.guest_mut().capture_architecture()
     }
@@ -90,6 +96,17 @@ impl Guest for Cpu {
     }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.guest().file_page_copy_on_write(addr)
+    }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.guest_mut().map_private_copy_pages(addr, bytes, prot)
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        self.guest_mut().privatize_copy_pages(addr, len)
     }
     fn map_file_pages(
         &mut self,

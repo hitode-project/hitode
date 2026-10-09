@@ -38,6 +38,7 @@ struct Active {
 }
 const LIMIT: usize = 1024;
 const EXCEPTION_NESTED_CALL: u32 = 0x10;
+const EXCEPTION_STACK_INVALID: u32 = 0x8;
 const CONTEXT: u32 = 0x50;
 const POINTERS: u32 = 0x320;
 const DISPATCHER: u32 = 0x330;
@@ -233,6 +234,7 @@ struct Search {
     record: Record,
     vectored: VecDeque<Identity<VectoredHandler>>,
     frame: Option<u32>,
+    stack_bounds: Option<(u32, u32)>,
     searched: usize,
     // Survives vectored/frame callbacks, and expires on resume or nonlocal exit.
     _phase: Rc<phase::Phase>,
@@ -338,6 +340,7 @@ fn dispatch_origin(
             record,
             vectored,
             frame: None,
+            stack_bounds: None,
             searched: 0,
             _phase: active,
             outer: outer.into(),
@@ -433,23 +436,53 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
     if frame == u32::MAX {
         return native::unhandled(env, search);
     }
-    if search.searched >= LIMIT
-        || frame & 3 != 0
-        || frame < env.ctx().stack_lo
-        || frame
-            .checked_add(8)
-            .is_none_or(|end| end > env.ctx().stack_hi)
+    // Bound malformed chains instead of repeatedly calling their handlers.
+    if search.searched >= LIMIT {
+        return Outcome::Fail(format!("cyclic SEH chain at {frame:#x}"));
+    }
+    // RtlDispatchException checks each registration against the TEB stack
+    // limits and alignment only; it does not require the chain to ascend. A
+    // registration outside them marks the record EXCEPTION_STACK_INVALID and
+    // ends dispatch as unhandled.
+    // Sample after the vectored handlers, once for this dispatch. A frame
+    // handler can edit the TEB without changing the ongoing native search.
+    let (high, low) = match search.stack_bounds {
+        Some(bounds) => bounds,
+        None => {
+            let teb = env.ctx().teb;
+            let bounds = match (
+                env.cpu.read_u32(teb + adv_machine::layout::teb::STACK_BASE),
+                env.cpu
+                    .read_u32(teb + adv_machine::layout::teb::STACK_LIMIT),
+            ) {
+                (Ok(high), Ok(low)) => (high, low),
+                _ => return Outcome::Fail("TEB stack limits read failed".into()),
+            };
+            search.stack_bounds = Some(bounds);
+            bounds
+        }
+    };
+    if frame & 3 != 0
+        || frame < low
+        || frame.checked_add(8).is_none_or(|end| end > high)
         || !env.cpu.accessible(frame, 8, Prot::READ)
     {
-        return Outcome::Fail(format!("invalid or cyclic SEH chain at {frame:#x}"));
+        let address = search.scratch + 4;
+        match env.cpu.read_u32(address) {
+            Ok(flags) => {
+                search.record.flags = flags | EXCEPTION_STACK_INVALID;
+                if let Err(error) = env.cpu.write_u32(address, search.record.flags) {
+                    return Outcome::Fail(format!("exception record write failed: {error}"));
+                }
+            }
+            Err(error) => return Outcome::Fail(format!("exception record read failed: {error}")),
+        }
+        return native::unhandled(env, search);
     }
     let next = match env.cpu.read_u32(frame) {
         Ok(value) => value,
         Err(error) => return Outcome::Fail(format!("SEH chain read failed: {error}")),
     };
-    if next != u32::MAX && next <= frame {
-        return Outcome::Fail("SEH chain is not ascending".into());
-    }
     let handler = match env.cpu.read_u32(frame + 4) {
         Ok(value) => value,
         Err(error) => return Outcome::Fail(format!("SEH handler read failed: {error}")),
