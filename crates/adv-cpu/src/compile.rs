@@ -158,6 +158,19 @@ impl Compiled {
                 .iter()
                 .all(|&(page, version)| memory.versions.get(page) == Some(&version))
     }
+    /// Mark exactly the bytes `revalidate` compares, so stores to data between
+    /// or after the instructions never change a code version.
+    pub fn watch(&self, memory: &mut Memory) {
+        match &self.input.covered {
+            Some(ranges) => {
+                for &(offset, len) in ranges {
+                    memory.watch_code(self.input.origin + offset as u32, len);
+                }
+            }
+            None => memory.watch_code(self.input.origin, self.input.bytes.len()),
+        }
+        self.watched_in.set(memory.identity() + 1);
+    }
     /// A write to mutable data on an executable page is not necessarily a code
     /// change. On the cold invalidation path, compare the immutable input before
     /// discarding native code. Mapping/permission changes still invalidate, as do
@@ -185,10 +198,8 @@ impl Compiled {
         let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
         // window. Establish that owner's code barriers before its first entry.
-        let window = memory.identity() + 1;
-        if self.watched_in.get() != window {
-            memory.watch_code(self.input.origin, self.input.bytes.len());
-            self.watched_in.set(window);
+        if self.watched_in.get() != memory.identity() + 1 {
+            self.watch(memory);
         }
         bridge.memory = memory;
         assert!(!self.input.shadow_returns || controls.shadow.is_some());
@@ -422,8 +433,8 @@ impl Snapshot {
         }
         let mut region = region.clone();
         let origin = callee_origin(&mut region, memory);
-        let extent = (region.start - origin) as usize + region.len;
-        memory.watch_code(origin, extent + if region.complete_tail { 15 } else { 0 });
+        // Capture does not mark code bytes: publication marks what the result
+        // compares, then compares it against this snapshot.
         let mut bytes = memory
             .read_data(origin, (region.start - origin) as usize + region.len)?
             .to_vec();
@@ -2283,14 +2294,20 @@ mod snapshot_tests {
         let old = Snapshot::capture(&region, &mut memory).unwrap();
         assert_eq!(old.bytes.len(), 20);
         assert!(old.valid(&memory));
-        // The compiler receives only the immutable old bytes, not this write.
+        // The compiler receives only the immutable old bytes, not this write;
+        // publication marks and compares them.
         memory.write(0x10001, &73u32.to_le_bytes()).unwrap();
-        assert!(!old.valid(&memory));
         assert_eq!(old.bytes[1], 1);
-        let old_result = compile_snapshot(&old).unwrap();
-        assert!(!old_result.valid(&memory));
+        let mut old_result = compile_snapshot(&old).unwrap();
+        old_result.watch(&mut memory);
+        assert!(!old_result.revalidate(&memory));
         let fresh = Snapshot::capture(&region, &mut memory).unwrap();
-        assert!(compile_snapshot(&fresh).unwrap().valid(&memory));
+        let mut fresh_result = compile_snapshot(&fresh).unwrap();
+        fresh_result.watch(&mut memory);
+        assert!(fresh_result.revalidate(&memory));
+        memory.write(0x10001, &74u32.to_le_bytes()).unwrap();
+        assert!(!fresh_result.valid(&memory));
+        let fresh = Snapshot::capture(&region, &mut memory).unwrap();
         memory.protect(0x10000, 4096, READ).unwrap();
         assert!(!fresh.valid(&memory));
         assert!(Snapshot::capture(&region, &mut memory).is_err());

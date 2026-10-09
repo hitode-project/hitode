@@ -304,9 +304,11 @@ fn code_observation_epoch_precedes_x87_instruction_effects() {
     let compiled = compile(&Region::new(CODE, code.len()), &mut native, false).unwrap();
     assert_eq!(
         native.epochs(),
-        before + 1,
-        "compile observes the previously unwatched code page"
+        before,
+        "compile leaves code observation to publication"
     );
+    compiled.watch(&mut native);
+    assert_eq!(native.epochs(), before + 1);
     assert_eq!(reference.epochs(), before);
     // Matching code observation removes the epoch discrepancy before either
     // execution path runs; x87 loading itself does not change this epoch.

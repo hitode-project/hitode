@@ -507,7 +507,6 @@ impl Cached {
 }
 
 fn fetch(memory: &mut Memory, pc: u32) -> Cached {
-    memory.watch_code(pc, 15);
     let mut entry = Cached {
         decoded: Decoded::Stop(Step::InvalidInstruction { pc }),
         pc,
@@ -550,6 +549,12 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         DecoderOptions::NONE,
     );
     let instruction = decoder.decode();
+    // A decoded instruction depends on its own bytes; a failed decode on every
+    // byte it saw.
+    if !instruction.is_invalid() {
+        entry.len = instruction.len() as u8;
+    }
+    memory.watch_code(pc, entry.len as usize);
     entry.decoded = if instruction.is_invalid() {
         if decoder.last_error() == DecoderError::NoMoreBytes
             && let Some(address) = denied

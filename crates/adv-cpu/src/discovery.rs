@@ -33,7 +33,6 @@ pub(crate) fn discover(
                 frontier.insert(pc);
                 break;
             }
-            memory.watch_code(pc, 15);
             let mut bytes = [0; 15];
             let mut available = 0;
             for offset in 0..15u32 {
@@ -57,6 +56,14 @@ pub(crate) fn discover(
             let instruction =
                 Decoder::with_ip(32, &bytes[..available], u64::from(pc), DecoderOptions::NONE)
                     .decode();
+            memory.watch_code(
+                pc,
+                if instruction.is_invalid() {
+                    available
+                } else {
+                    instruction.len()
+                },
+            );
             let candidate_start = start.min(pc);
             let candidate_end = end.max(u64::from(pc) + instruction.len() as u64);
             let len = (candidate_end - u64::from(candidate_start)) as usize;
