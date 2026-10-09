@@ -645,7 +645,7 @@ fn execute(batch: &Batch) {
             perms: batch.permissions as *const u8,
             bridge: std::ptr::null_mut(),
             interrupt: &NO_INTERRUPT,
-            slots: std::ptr::null(),
+            slots: crate::linking::unlinked().0,
             mask: 0,
             remaining: 0,
             stop: 0,
@@ -653,7 +653,6 @@ fn execute(batch: &Batch) {
             fault_reads: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             recovery_slot: std::ptr::null(),
-            linked_entries: 0,
             rows: std::ptr::null(),
             written: 0,
         };
@@ -1106,7 +1105,7 @@ mod tests {
                 perms: permissions.as_ptr(),
                 bridge: std::ptr::null_mut(),
                 interrupt: &interrupt,
-                slots: std::ptr::null(),
+                slots: crate::linking::unlinked().0,
                 mask: 0,
                 remaining: 0,
                 stop: 0,
@@ -1114,7 +1113,6 @@ mod tests {
                 fault_reads: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
-                linked_entries: 0,
                 rows: &pool,
                 written: 0,
             };
@@ -1192,7 +1190,7 @@ mod tests {
                 perms: permissions.as_ptr(),
                 bridge: std::ptr::null_mut(),
                 interrupt: &interrupt,
-                slots: std::ptr::null(),
+                slots: crate::linking::unlinked().0,
                 mask: 0,
                 remaining: 0,
                 stop: 0,
@@ -1200,7 +1198,6 @@ mod tests {
                 fault_reads: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
-                linked_entries: 0,
                 rows: &pool,
                 written: 0,
             };

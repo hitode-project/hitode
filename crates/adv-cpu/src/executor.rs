@@ -3280,9 +3280,6 @@ mod publication_tests {
 
     fn targets(table: &crate::linking::Table) -> BTreeMap<u32, usize> {
         let (pointer, mask) = table.parts();
-        if pointer.is_null() {
-            return BTreeMap::new();
-        }
         // SAFETY: parts belongs to this borrowed immutable table generation.
         unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
             .iter()

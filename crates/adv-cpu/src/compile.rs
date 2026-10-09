@@ -185,7 +185,12 @@ impl Compiled {
             memory.watch_code(self.window_base + (page * 4096) as u32, 4096);
         }
         bridge.memory = memory;
-        let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
+        // Generated edges do not compare against the stop PC. A table naming it
+        // (possible only for code compiled under another stop) is not linked.
+        let (slots, mask) = controls
+            .links
+            .filter(|links| !links.contains(controls.stop))
+            .map_or_else(crate::linking::unlinked, Table::parts);
         // Helpers may promote file pages before this chain returns. Keep one
         // immutable metadata snapshot; raw Memory permissions remain free to
         // change without cloning a megabyte on each first-touch promotion.
@@ -207,7 +212,6 @@ impl Compiled {
             fault_reads: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             recovery_slot: std::ptr::null(),
-            linked_entries: 0,
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Checked accesses retain their guards; verified ordinary reads
@@ -225,11 +229,11 @@ impl Compiled {
                 memory.ptr.as_ptr(),
             )
         {
-            return (result, context.linked_entries);
+            return (result, context.linked());
         }
         let memory_pointer = memory.ptr.as_ptr();
         let result = unsafe { (self.entry)(&mut context, memory_pointer) };
-        (result, context.linked_entries)
+        (result, context.linked())
     }
 
     // Keep TLS/metadata validation and its large stack frame out of the normal

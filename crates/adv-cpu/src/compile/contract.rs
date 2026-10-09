@@ -186,7 +186,13 @@ pub(crate) struct NativeContext {
     /// Private session cell receiving the IR-owned recovery stack address.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub recovery_slot: *const std::cell::Cell<usize>,
-    pub linked_entries: u64,
+}
+
+impl NativeContext {
+    /// Tail calls taken by this chain: each consumed one `remaining` unit.
+    pub fn linked(&self) -> u64 {
+        u64::from(crate::linking::CHAIN_LIMIT - self.remaining)
+    }
 }
 
 impl Emitter<'_> {
@@ -207,47 +213,14 @@ impl Emitter<'_> {
             self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
             self.b.switch_to_block(candidate);
         }
+        // The table always has at least one slot and never names the caller's
+        // stop PC, so a miss returns before reading chain or fuel state.
         let slots = self.b.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
             self.context,
             offset_of!(NativeContext, slots) as i32,
         );
-        let remaining = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let stop = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, stop) as i32,
-        );
-        let fuel = self.b.use_var(self.fuel);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
-        let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
-        let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
-        let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
-        let bad = self.b.ins().bor(none, limit);
-        let bad = self.b.ins().bor(bad, is_stop);
-        let bad = self.b.ins().bor(bad, empty);
-        let prepare = self.b.create_block();
-        self.b.ins().brif(bad, returned, &[], prepare, &[]);
-        self.b.switch_to_block(prepare);
-        // Both hot footers and cold exits have published canonical state.
-        let pending = requested(&mut self.b, self.interrupt);
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let search_ready = self.b.create_block();
-        self.b
-            .ins()
-            .brif(pending, interrupted, &[], search_ready, &[]);
-        self.b.switch_to_block(interrupted);
-        let interrupted_reason = self.constant(Exit::Interrupted as u32);
-        self.b.ins().return_(&[interrupted_reason]);
-        self.b.switch_to_block(search_ready);
         let hit = self.b.create_block();
         self.b.append_block_param(hit, self.ptr_ty);
         let mask = self.b.ins().load(
@@ -323,25 +296,40 @@ impl Emitter<'_> {
         );
         self.b.switch_to_block(hit);
         let entry = self.b.block_params(hit)[0];
+        let remaining = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, remaining) as i32,
+        );
+        let exhausted = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
+        let budgeted = self.b.create_block();
+        self.b.ins().brif(exhausted, returned, &[], budgeted, &[]);
+        self.b.switch_to_block(budgeted);
+        // Both hot footers and cold exits have published canonical state.
+        let pending = requested(&mut self.b, self.interrupt);
+        let interrupted = self.b.create_block();
+        self.b.set_cold_block(interrupted);
+        let linked = self.b.create_block();
+        self.b.ins().brif(pending, interrupted, &[], linked, &[]);
+        self.b.switch_to_block(interrupted);
+        // Exhausted fuel takes precedence, as at a Rust entry. Without an
+        // interrupt, the linked target's own block budget check reports it.
+        let fuel = self.b.use_var(self.fuel);
+        let interrupted_reason = self.constant(Exit::Interrupted as u32);
+        let dispatch_reason = self.constant(Exit::Dispatch as u32);
+        let interrupted_reason = self
+            .b
+            .ins()
+            .select(fuel, interrupted_reason, dispatch_reason);
+        self.b.ins().return_(&[interrupted_reason]);
+        self.b.switch_to_block(linked);
         let remaining = self.b.ins().iadd_imm(remaining, -1);
         self.b.ins().store(
             MemFlags::trusted(),
             remaining,
             self.context,
             offset_of!(NativeContext, remaining) as i32,
-        );
-        let linked = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        let linked = self.b.ins().iadd_imm(linked, 1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            linked,
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
         );
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if self.fault_mode.is_some() {

@@ -15,6 +15,14 @@ pub(crate) struct Slot {
     pub entry: usize,
 }
 
+/// One absent slot: generated probes need no null or empty-table check.
+static EMPTY: [Slot; 1] = [Slot { pc: 0, entry: 0 }];
+
+/// Probe operands for a chain that links nothing.
+pub(crate) fn unlinked() -> (*const Slot, u32) {
+    (EMPTY.as_ptr(), 0)
+}
+
 #[derive(Default)]
 pub(crate) struct Table {
     slots: Vec<Slot>,
@@ -120,10 +128,22 @@ impl Table {
     /// Parallel workers borrow an immutable image; all updates require &mut.
     pub fn parts(&self) -> (*const Slot, u32) {
         if self.slots.is_empty() {
-            (std::ptr::null(), 0)
+            unlinked()
         } else {
             (self.slots.as_ptr(), (self.slots.len() - 1) as u32)
         }
+    }
+
+    /// Whether the generated probe would find `pc`.
+    pub fn contains(&self, pc: u32) -> bool {
+        let Some(mask) = self.slots.len().checked_sub(1) else {
+            return false;
+        };
+        let first = hash(pc) as usize & mask;
+        (0..PROBES)
+            .map(|offset| &self.slots[(first + offset) & mask])
+            .take_while(|slot| slot.entry != 0)
+            .any(|slot| slot.pc == pc)
     }
 }
 
@@ -143,9 +163,6 @@ mod tests {
     /// The probe generated code performs.
     fn lookup(table: &Table, pc: u32) -> Option<usize> {
         let (slots, mask) = table.parts();
-        if slots.is_null() {
-            return None;
-        }
         // SAFETY: parts belongs to this borrowed table.
         let slots = unsafe { std::slice::from_raw_parts(slots, mask as usize + 1) };
         (0..PROBES)
