@@ -15,6 +15,7 @@ use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[path = "support/cpu.rs"]
@@ -226,24 +227,105 @@ fn seconds() -> u64 {
     );
     value
 }
+fn public_call(module: &str, name: &str) -> Option<String> {
+    static EXPORTS: OnceLock<std::collections::BTreeSet<(&str, &str)>> = OnceLock::new();
+    let exports = EXPORTS.get_or_init(|| {
+        include_str!("../../../data/abi/system-exports.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let module = fields.next()?;
+                let name = fields.nth(1)?;
+                (!name.is_empty()).then_some((module, name))
+            })
+            .collect()
+    });
+    let mut module = module.to_ascii_lowercase();
+    if !module.ends_with(".dll") {
+        module.push_str(".dll");
+    }
+    exports
+        .contains(&(module.as_str(), name))
+        .then(|| format!("{module}!{name}"))
+}
 fn statistics(runtime: &Runtime<backend::Cpu>, outcome: &str, exit: Option<u32>) -> String {
-    // MachineError/recent calls can contain guest addresses and private names.
+    let sys = &runtime.machine.sys;
+    let (first, latest, source) = if sys.first_cpu_fault.is_some() {
+        (
+            sys.first_cpu_fault.as_ref(),
+            sys.latest_cpu_fault.as_ref(),
+            "live",
+        )
+    } else if let Some(process) = runtime
+        .process_statuses()
+        .iter()
+        .find(|p| p.failure.is_some() && p.first_cpu_fault.is_some())
+    {
+        (
+            process.first_cpu_fault.as_ref(),
+            process.latest_cpu_fault.as_ref(),
+            "retained",
+        )
+    } else {
+        (None, None, "none")
+    };
+    let null_access = first
+        .and_then(|fault| fault.access())
+        .map_or_else(|| "none".into(), |(_, address)| (address == 0).to_string());
+    let same_pc = first.zip(latest).map_or_else(
+        || "none".into(),
+        |(first, latest)| (first.fault.pc == latest.fault.pc).to_string(),
+    );
+    // Resolve only fixed public exports; do not format caller addresses,
+    // arguments, private handlers, MachineError or fault-reason strings.
+    let calls = sys
+        .recent
+        .iter()
+        .filter_map(|&(_, thunk, _)| {
+            let thunk = sys.thunks.get(thunk);
+            public_call(&thunk.module, &thunk.name)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "worker_stage={} guest_outcome={outcome} frames={} host_calls={} failure_code={} exit_code={}\n",
+        concat!(
+            "worker_stage={} guest_outcome={outcome} frames={} host_calls={} failure_code={} exit_code={} ",
+            "first_fault_source={source} first_fault_kind={} first_fault_null_access={null_access} ",
+            "first_fault_pc_equal_latest={same_pc} recent_public_calls={}\n"
+        ),
         if outcome == "running" {
             "step"
         } else {
             "finished"
         },
-        runtime.machine.sys.completed_frames,
-        runtime.machine.sys.host_calls,
-        runtime
-            .machine
-            .sys
-            .guest_failure_code
+        sys.completed_frames,
+        sys.host_calls,
+        sys.guest_failure_code
             .map_or_else(|| "none".into(), |code| code.to_string()),
-        exit.map_or_else(|| "none".into(), |code| code.to_string())
+        exit.map_or_else(|| "none".into(), |code| code.to_string()),
+        first.map_or("none", |fault| fault.kind_name()),
+        if calls.is_empty() { "none" } else { &calls },
+        source = source,
+        outcome = outcome,
+        null_access = null_access,
+        same_pc = same_pc,
     )
+}
+
+#[test]
+fn public_call_filter_excludes_private_names_and_keeps_native_exports() {
+    assert_eq!(
+        public_call("kernel32", "Sleep"),
+        Some("kernel32.dll!Sleep".into())
+    );
+    assert_eq!(
+        public_call("ntdll.dll", "NtRaiseException"),
+        Some("ntdll.dll!NtRaiseException".into())
+    );
+    assert_eq!(public_call("<win32>", "thread_exception_handler"), None);
+    assert_eq!(public_call("private.dll", "Sleep"), None);
+    assert_eq!(public_call("kernel32.dll", "private_handler"), None);
 }
 #[test]
 #[ignore = "needs ADV_BISECT_EXE"]

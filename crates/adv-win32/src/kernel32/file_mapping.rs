@@ -492,7 +492,15 @@ pub(crate) fn map_section(
             None => return fail(env, 8),
         }
     } else {
-        if !env.sys.vm.reserve_at(base, reserved as u32) {
+        // Keep the entire last granule unavailable to a conflicting owner, but
+        // publish only the page-rounded view extent to VirtualQuery.
+        if env
+            .sys
+            .vm
+            .next_region(base)
+            .is_some_and(|next| u64::from(next) < u64::from(base) + reserved)
+            || !env.sys.vm.reserve_at(base, span as u32)
+        {
             return fail(env, 487);
         }
         base

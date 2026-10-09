@@ -88,6 +88,40 @@ impl<'a> Engine<'a> {
         // SAFETY: `Engine` and `Guarded` are `repr(transparent)` wrappers around `Unicorn`.
         unsafe { &mut *(uc as *mut Unicorn<'a, HookData>).cast::<Self>() }
     }
+
+    /// Physical runs are separated only by file pages not yet materialized.
+    /// Keep lazy runs in order so metadata follows each successful native call.
+    fn mapping_spans(&self, addr: u32, size: u32) -> Vec<(u64, u64, bool)> {
+        let end = u64::from(addr) + u64::from(size);
+        let mut cursor = u64::from(addr);
+        let mut spans: Vec<(u64, u64, bool)> = Vec::new();
+        for (&page, binding) in self
+            .get_data()
+            .file_pages
+            .range(addr..)
+            .take_while(|(page, _)| u64::from(**page) < end)
+        {
+            if binding.mapped {
+                continue;
+            }
+            let page = u64::from(page);
+            if cursor < page {
+                spans.push((cursor, page - cursor, true));
+            }
+            if let Some((start, len, false)) = spans.last_mut()
+                && *start + *len == page
+            {
+                *len += 4096;
+            } else {
+                spans.push((page, 4096, false));
+            }
+            cursor = page + 4096;
+        }
+        if cursor < end {
+            spans.push((cursor, end - cursor, true));
+        }
+        spans
+    }
 }
 
 impl<'a> Deref for Engine<'a> {
@@ -701,21 +735,20 @@ impl Guest for Engine<'_> {
         {
             return Err(fault);
         }
-        for i in 0..size / 4096 {
-            let page = addr + i * 4096;
-            if let Some(binding) = self.get_data().file_pages.get(&page) {
-                if binding.mapped {
-                    self.mem_protect(page.into(), 4096, uc_prot(prot))
-                        .map_err(|_| fault)?;
-                }
-                self.get_data_mut()
-                    .file_pages
-                    .get_mut(&page)
-                    .unwrap()
-                    .protection = prot;
-            } else {
-                self.mem_protect(page.into(), 4096, uc_prot(prot))
+        for (start, len, mapped) in self.mapping_spans(addr, size) {
+            // Repeated page-sized calls make Unicorn split and copy the rest
+            // of a large region for every page, even for identical protection.
+            if mapped {
+                self.mem_protect(start, len, uc_prot(prot))
                     .map_err(|_| fault)?;
+            }
+            for (_, binding) in self
+                .get_data_mut()
+                .file_pages
+                .range_mut((start as u32)..)
+                .take_while(|(page, _)| u64::from(**page) < start + len)
+            {
+                binding.protection = prot;
             }
         }
         Ok(())
@@ -729,17 +762,30 @@ impl Guest for Engine<'_> {
         {
             return Err(fault);
         }
-        for i in 0..size / 4096 {
-            let page = addr + i * 4096;
-            if let Some(binding) = self.get_data().file_pages.get(&page) {
-                if binding.mapped {
-                    self.mem_unmap(page.into(), 4096).map_err(|_| fault)?;
-                }
-                self.get_data_mut().file_pages.remove(&page);
-            } else {
-                self.mem_unmap(page.into(), 4096).map_err(|_| fault)?;
+        for (start, len, mapped) in self.mapping_spans(addr, size) {
+            if mapped {
+                self.mem_unmap(start, len).map_err(|_| fault)?;
             }
-            self.get_data_mut().private_copy_pages.remove(&page);
+            let pages: Vec<_> = self
+                .get_data()
+                .file_pages
+                .range((start as u32)..)
+                .take_while(|(page, _)| u64::from(**page) < start + len)
+                .map(|(&page, _)| page)
+                .collect();
+            for page in pages {
+                self.get_data_mut().file_pages.remove(&page);
+            }
+            let copies: Vec<_> = self
+                .get_data()
+                .private_copy_pages
+                .range((start as u32)..)
+                .take_while(|(page, _)| u64::from(**page) < start + len)
+                .map(|(&page, _)| page)
+                .collect();
+            for page in copies {
+                self.get_data_mut().private_copy_pages.remove(&page);
+            }
         }
         Ok(())
     }
@@ -1029,6 +1075,91 @@ impl Backend for UnicornCpu {
 mod file_page_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn mixed_materialized_and_lazy_ranges_preserve_copy_and_failure_semantics() {
+        use adv_cpu::backend::asm::Asm;
+        struct Park;
+        impl TrapHandler for Park {
+            fn on_trap(&mut self, _: &mut dyn Guest, _: u8) -> TrapAction {
+                TrapAction::Park
+            }
+        }
+        const BASE: u32 = 0x10000;
+        const CODE: u32 = 0x400000;
+        for copy in [false, true] {
+            let reads = Rc::new(Cell::new(0));
+            let lazy = || {
+                let reads = reads.clone();
+                FilePage::lazy(move || {
+                    reads.set(reads.get() + 1);
+                    Err("unused lazy page must remain unloaded".into())
+                })
+            };
+            let first = FilePage::new([0x19; 4096]);
+            let last = FilePage::new([0x31; 4096]);
+            let mut cpu = UnicornCpu::new(CODE + 0xf00).unwrap();
+            cpu.map(CODE, 4096, Prot::RX).unwrap();
+            cpu.map_private_copy_pages(BASE, &[0x37; 4096], Prot::RW)
+                .unwrap();
+            cpu.map_file_pages(
+                BASE + 4096,
+                &[first.clone(), lazy(), lazy(), last.clone()],
+                Prot::RW,
+                copy,
+            )
+            .unwrap();
+            cpu.map_private_copy_pages(BASE + 5 * 4096, &[0x52; 8192], Prot::RW)
+                .unwrap();
+            let mut code = Asm::new(CODE);
+            code.mov_eax_mem(BASE + 4096)
+                .mov_eax_mem(BASE + 4 * 4096)
+                .trap();
+            cpu.write(CODE, &code.bytes).unwrap();
+            cpu.set_reg(Reg::Eip, CODE);
+            assert_eq!(cpu.run(&mut Park), Exit::Parked);
+            assert_eq!(cpu.reg(Reg::Eax), 0x3131_3131);
+            assert_eq!(reads.get(), 0);
+            for page in 1..=4 {
+                assert_eq!(
+                    cpu.uc.get_data().file_pages[&(BASE + page * 4096)].mapped,
+                    page == 1 || page == 4
+                );
+            }
+            cpu.protect(BASE, 7 * 4096, Prot::READ).unwrap();
+            assert!(cpu.accessible(BASE, 7 * 4096, Prot::READ));
+            assert!(!cpu.accessible(BASE, 7 * 4096, Prot::WRITE));
+            assert_eq!(reads.get(), 0);
+            assert_eq!(cpu.file_page_copy_on_write(BASE), Some(true));
+            for page in 1..=4 {
+                assert_eq!(cpu.file_page_copy_on_write(BASE + page * 4096), Some(copy));
+                assert_eq!(
+                    cpu.uc.get_data().file_pages[&(BASE + page * 4096)].mapped,
+                    page == 1 || page == 4
+                );
+            }
+            assert!(cpu.protect(BASE, 7 * 4096, Prot::RX).is_err());
+            assert!(cpu.unmap(BASE, 8 * 4096).is_err());
+            assert!(cpu.accessible(BASE, 7 * 4096, Prot::READ));
+            assert!(!cpu.accessible(BASE, 7 * 4096, Prot::EXEC));
+            assert_eq!(reads.get(), 0);
+            let mut byte = [0];
+            cpu.read(BASE + 4096, &mut byte).unwrap();
+            assert_eq!(byte, [0x19]);
+            cpu.read(BASE + 4 * 4096, &mut byte).unwrap();
+            assert_eq!(byte, [0x31]);
+            assert!(!first.dirty());
+            assert!(!last.dirty());
+            cpu.unmap(BASE, 7 * 4096).unwrap();
+            for page in 0..7 {
+                assert_eq!(cpu.file_page_copy_on_write(BASE + page * 4096), None);
+                assert!(!cpu.accessible(BASE + page * 4096, 1, Prot::default()));
+            }
+            assert_eq!(reads.get(), 0);
+            cpu.map(BASE, 7 * 4096, Prot::RW).unwrap();
+            assert!(cpu.accessible(BASE, 7 * 4096, Prot::RW));
+        }
+    }
 
     #[test]
     fn private_copy_pages_allow_execution_and_track_host_stores_per_page() {
