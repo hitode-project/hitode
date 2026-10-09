@@ -80,6 +80,135 @@ pub(super) fn unary(flags: &mut u32, kind: M, value: u32, width: u8) -> u32 {
     }
 }
 
+pub(super) fn shift(flags: &mut u32, kind: M, value: u32, count: u32, width: u8) -> u32 {
+    let bits = u32::from(width) * 8;
+    let value = value & mask(width);
+    let sign = value & (1 << (bits - 1)) != 0;
+    let old_cf = *flags & CF != 0;
+    match kind {
+        M::Shl => {
+            if count <= bits {
+                flag(flags, CF, value & (1 << (bits - count)) != 0);
+            }
+            let result = (u64::from(value) << count) as u32 & mask(width);
+            if count == 1 {
+                flag(
+                    flags,
+                    OF,
+                    (result & (1 << (bits - 1)) != 0) != (*flags & CF != 0),
+                );
+            }
+            szp(flags, result, width);
+            result
+        }
+        M::Shr => {
+            if count <= bits {
+                flag(flags, CF, value & (1 << (count - 1)) != 0);
+            }
+            let result = value >> count;
+            if count == 1 {
+                flag(flags, OF, sign);
+            }
+            szp(flags, result, width);
+            result
+        }
+        M::Sar => {
+            flag(
+                flags,
+                CF,
+                if count >= bits {
+                    sign
+                } else {
+                    value & (1 << (count - 1)) != 0
+                },
+            );
+            let result = (signed(value, width) >> count) as u32 & mask(width);
+            if count == 1 {
+                flag(flags, OF, false);
+            }
+            szp(flags, result, width);
+            result
+        }
+        M::Rol | M::Ror => {
+            let n = count % bits;
+            let result = if n == 0 {
+                value
+            } else if kind == M::Rol {
+                (value << n) | (value >> (bits - n))
+            } else {
+                (value >> n) | (value << (bits - n))
+            } & mask(width);
+            flag(
+                flags,
+                CF,
+                if kind == M::Rol {
+                    result & 1 != 0
+                } else {
+                    result & (1 << (bits - 1)) != 0
+                },
+            );
+            if count == 1 {
+                flag(
+                    flags,
+                    OF,
+                    if kind == M::Rol {
+                        (result & (1 << (bits - 1)) != 0) != (*flags & CF != 0)
+                    } else {
+                        (result >> (bits - 1)) ^ (result >> (bits - 2)) & 1 != 0
+                    },
+                );
+            }
+            result
+        }
+        M::Rcl | M::Rcr => {
+            let n = count % (bits + 1);
+            if n == 0 {
+                return value;
+            }
+            let extended = (u64::from(old_cf) << bits) | u64::from(value);
+            let all = (1u64 << (bits + 1)) - 1;
+            let extended = if kind == M::Rcl {
+                ((extended << n) | (extended >> (bits + 1 - n))) & all
+            } else {
+                ((extended >> n) | (extended << (bits + 1 - n))) & all
+            };
+            let result = extended as u32 & mask(width);
+            flag(flags, CF, extended & (1u64 << bits) != 0);
+            if count == 1 {
+                flag(
+                    flags,
+                    OF,
+                    if kind == M::Rcl {
+                        (result & (1 << (bits - 1)) != 0) != (*flags & CF != 0)
+                    } else {
+                        ((result >> (bits - 1)) ^ (result >> (bits - 2))) & 1 != 0
+                    },
+                );
+            }
+            result
+        }
+        _ => unreachable!(),
+    }
+}
+
+pub(super) fn product(flags: &mut u32, a: u32, b: u32, width: u8, signed_form: bool) -> u64 {
+    let product = if signed_form {
+        (signed(a, width) * signed(b, width)) as u64
+    } else {
+        u64::from(a) * u64::from(b)
+    };
+    let bits = u32::from(width) * 8;
+    let low = product as u32 & mask(width);
+    let overflow = if signed_form {
+        product as i64 != signed(low, width)
+    } else {
+        product >> bits != 0
+    };
+    flag(flags, CF, overflow);
+    flag(flags, OF, overflow);
+    product
+}
+
 fn read(operand: Operand, regs: &[u32; 8]) -> u32 {
     match operand {
         Operand::Register(r) => r.read(regs),
@@ -251,6 +380,7 @@ mod tests {
                 next: i.next_ip32(),
                 exclusive: false,
                 register_only: eligible(predecode(&i).unwrap()),
+                checked_scalar: false,
             };
             assert!(instruction.register_only, "{:?}", i.code());
             for &value in &values {

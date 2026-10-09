@@ -16,6 +16,7 @@ use iced_x86::{
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
+mod scalar;
 mod simd;
 mod strings;
 #[cfg(test)]
@@ -362,7 +363,9 @@ fn execute_decoded(
             units: 1,
         };
     }
-    if instruction.register_only && registers::execute(instruction, state) {
+    if instruction.register_only && registers::execute(instruction, state)
+        || instruction.checked_scalar && scalar::execute(instruction, state, memory).is_some()
+    {
         return Execution {
             step: if debug {
                 Step::Trap { pc, vector: 1 }
@@ -464,6 +467,7 @@ struct Predecoded {
     next: u32,
     exclusive: bool,
     register_only: bool,
+    checked_scalar: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -571,6 +575,7 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
             action,
             next: instruction.next_ip32(),
             register_only: registers::eligible(action),
+            checked_scalar: !instruction.has_lock_prefix() && scalar::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg
@@ -775,11 +780,12 @@ impl DecodedBlock {
                 break;
             }
             let execution = if let Decoded::Ready(instruction) = decoded
-                && instruction.register_only
                 && !instruction.exclusive
                 && state.rep.is_none()
                 && state.eflags & 0x100 == 0
-                && registers::execute(instruction, state)
+                && (instruction.register_only && registers::execute(instruction, state)
+                    || instruction.checked_scalar
+                        && scalar::execute(instruction, state, memory).is_some())
             {
                 Execution {
                     step: Step::Executed,
@@ -1609,7 +1615,8 @@ impl Transaction {
                 let count = self.read(memory, count)? & 31;
                 self.check_write(memory, dst)?;
                 if count != 0 {
-                    let result = self.shift(kind, value, count, dst.width().unwrap());
+                    let result =
+                        registers::shift(&mut self.flags, kind, value, count, dst.width().unwrap());
                     self.store(memory, dst, result)?;
                 }
             }
@@ -1970,20 +1977,9 @@ impl Transaction {
         } else {
             (self.regs[0] & mask(width), self.read(memory, dst)?)
         };
-        let product = if signed_form {
-            (signed(a, width) * signed(b, width)) as u64
-        } else {
-            u64::from(a) * u64::from(b)
-        };
+        let product = registers::product(&mut self.flags, a, b, width, signed_form);
         let bits = u32::from(width) * 8;
         let low = product as u32 & mask(width);
-        let overflow = if signed_form {
-            product as i64 != signed(low, width)
-        } else {
-            product >> bits != 0
-        };
-        self.flag(CF, overflow);
-        self.flag(OF, overflow);
         if src.is_some() {
             self.store(memory, dst, low)?;
         } else if width == 1 {
@@ -2065,111 +2061,6 @@ impl Transaction {
             .write(&mut self.regs, remainder);
         }
         Ok(())
-    }
-    fn shift(&mut self, kind: M, value: u32, count: u32, width: u8) -> u32 {
-        let bits = u32::from(width) * 8;
-        let value = value & mask(width);
-        let sign = value & (1 << (bits - 1)) != 0;
-        let old_cf = self.flags & CF != 0;
-        match kind {
-            M::Shl => {
-                if count <= bits {
-                    self.flag(CF, value & (1 << (bits - count)) != 0);
-                }
-                let result = (u64::from(value) << count) as u32 & mask(width);
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0),
-                    );
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Shr => {
-                if count <= bits {
-                    self.flag(CF, value & (1 << (count - 1)) != 0);
-                }
-                let result = value >> count;
-                if count == 1 {
-                    self.flag(OF, sign);
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Sar => {
-                self.flag(
-                    CF,
-                    if count >= bits {
-                        sign
-                    } else {
-                        value & (1 << (count - 1)) != 0
-                    },
-                );
-                let result = (signed(value, width) >> count) as u32 & mask(width);
-                if count == 1 {
-                    self.flag(OF, false);
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Rol | M::Ror => {
-                let n = count % bits;
-                let result = if n == 0 {
-                    value
-                } else if kind == M::Rol {
-                    (value << n) | (value >> (bits - n))
-                } else {
-                    (value >> n) | (value << (bits - n))
-                } & mask(width);
-                self.flag(
-                    CF,
-                    if kind == M::Rol {
-                        result & 1 != 0
-                    } else {
-                        result & (1 << (bits - 1)) != 0
-                    },
-                );
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        if kind == M::Rol {
-                            (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0)
-                        } else {
-                            (result >> (bits - 1)) ^ (result >> (bits - 2)) & 1 != 0
-                        },
-                    );
-                }
-                result
-            }
-            M::Rcl | M::Rcr => {
-                let n = count % (bits + 1);
-                if n == 0 {
-                    return value;
-                }
-                let extended = (u64::from(old_cf) << bits) | u64::from(value);
-                let all = (1u64 << (bits + 1)) - 1;
-                let extended = if kind == M::Rcl {
-                    ((extended << n) | (extended >> (bits + 1 - n))) & all
-                } else {
-                    ((extended >> n) | (extended << (bits + 1 - n))) & all
-                };
-                let result = extended as u32 & mask(width);
-                self.flag(CF, extended & (1u64 << bits) != 0);
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        if kind == M::Rcl {
-                            (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0)
-                        } else {
-                            ((result >> (bits - 1)) ^ (result >> (bits - 2))) & 1 != 0
-                        },
-                    );
-                }
-                result
-            }
-            _ => unreachable!(),
-        }
     }
 }
 
