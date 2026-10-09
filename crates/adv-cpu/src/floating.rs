@@ -4,6 +4,7 @@ use iced_x86::{Instruction, Mnemonic as M, Register as R};
 pub(crate) mod fast;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod native_x87;
+pub(crate) mod packed;
 mod simd;
 mod softfloat;
 mod transcendental;
@@ -288,6 +289,35 @@ impl Snapshot {
     }
 }
 
+pub(crate) fn check_access(
+    memory: &Memory,
+    pc: u32,
+    address: u32,
+    len: usize,
+    write: bool,
+) -> Result<(), Step> {
+    let fault = |address| {
+        if write {
+            Step::WriteFault { pc, address }
+        } else {
+            Step::ReadFault { pc, address }
+        }
+    };
+    if u64::from(address) + len as u64 > 1 << 32 {
+        return Err(fault(address));
+    }
+    let mut offset = 0;
+    while offset < len {
+        let at = address + offset as u32;
+        let range = memory.committed(at, 1).map_err(|_| fault(at))?;
+        if memory.perms[range.start / PAGE_SIZE] & if write { WRITE } else { READ } == 0 {
+            return Err(fault(at));
+        }
+        offset += (PAGE_SIZE - at as usize % PAGE_SIZE).min(len - offset);
+    }
+    Ok(())
+}
+
 struct PendingWrite {
     address: u32,
     len: usize,
@@ -336,32 +366,7 @@ impl Transaction<'_> {
         Ok(address)
     }
     fn check(&self, memory: &Memory, address: u32, len: usize, write: bool) -> Result<(), Step> {
-        let fault = |address| {
-            if write {
-                Step::WriteFault {
-                    pc: self.pc,
-                    address,
-                }
-            } else {
-                Step::ReadFault {
-                    pc: self.pc,
-                    address,
-                }
-            }
-        };
-        if u64::from(address) + len as u64 > 1 << 32 {
-            return Err(fault(address));
-        }
-        let mut offset = 0;
-        while offset < len {
-            let at = address + offset as u32;
-            let range = memory.committed(at, 1).map_err(|_| fault(at))?;
-            if memory.perms[range.start / PAGE_SIZE] & if write { WRITE } else { READ } == 0 {
-                return Err(fault(at));
-            }
-            offset += (PAGE_SIZE - at as usize % PAGE_SIZE).min(len - offset);
-        }
-        Ok(())
+        check_access(memory, self.pc, address, len, write)
     }
     fn read<'a>(
         &self,

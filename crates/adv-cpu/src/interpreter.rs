@@ -16,6 +16,7 @@ use iced_x86::{
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
+mod simd;
 mod strings;
 #[cfg(test)]
 mod window_tests;
@@ -293,6 +294,24 @@ fn execute_decoded(
                 units: 0,
             };
         }
+        Decoded::Simd(plan) => {
+            if let Some(dirty) = deferred_mmx {
+                if *dirty {
+                    state.refresh_mmx();
+                }
+                *dirty = false;
+            }
+            let step = plan.execute(state, memory);
+            let completed = step == Step::Executed;
+            return Execution {
+                step: if completed && debug {
+                    Step::Trap { pc, vector: 1 }
+                } else {
+                    step
+                },
+                units: u32::from(completed),
+            };
+        }
         Decoded::Extended(i, operation, opcode) => {
             let x87 = operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
@@ -411,6 +430,7 @@ fn execute_decoded(
 enum Decoded {
     Ready(Predecoded),
     Extended(Instruction, crate::floating::Operation, Option<u16>),
+    Simd(simd::Plan),
     Stop(Step),
 }
 
@@ -557,6 +577,8 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
                     && (instruction.op0_kind() == OpKind::Memory
                         || instruction.op1_kind() == OpKind::Memory),
         })
+    } else if let Some(plan) = simd::Plan::decode(&instruction) {
+        Decoded::Simd(plan)
     } else if let Some(operation) = crate::floating::operation(&instruction) {
         // Preserve the original prefix/opcode scan in the decoded entry. Its
         // code bytes share the same validation as the instruction itself.
@@ -662,6 +684,7 @@ impl DecodedBlock {
                         || !block.local_branches
                             && matches!(instruction.action, Action::Branch(..) | Action::Loop(..)),
                 ),
+                Decoded::Simd(plan) => (plan.next, false),
                 Decoded::Extended(instruction, _, _) => (
                     instruction.next_ip32(),
                     instruction.flow_control() != iced_x86::FlowControl::Next,
