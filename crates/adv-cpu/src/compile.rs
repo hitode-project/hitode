@@ -1250,7 +1250,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .load(types::I32, MemFlags::trusted(), state, (i * 4) as i32);
             b.def_var(*reg, v);
         }
-        load_flags(&mut b, state, flags, lazy);
+        load_flags(&mut b, state, flags, lazy, fault_pc.is_some());
         let f = b.ins().load(
             types::I64,
             MemFlags::trusted(),
@@ -1416,6 +1416,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             },
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_pc,
+            realized: None,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_mode,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2763,6 +2764,8 @@ struct Emitter<'a> {
     source: ir::SourceLoc,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fault_pc: Option<u32>,
+    /// The kind value a realize_flags call produced in the current block.
+    realized: Option<Value>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fault_mode: Option<Variable>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2792,6 +2795,7 @@ impl Emitter<'_> {
                 None
             };
             if let Some(block) = block {
+                self.publish_link_flags();
                 self.b.ins().jump(block, &[]);
             } else {
                 let target = self.constant(pc);
@@ -2906,6 +2910,7 @@ impl Emitter<'_> {
         // handler can observe EFLAGS even when the next guest instruction
         // would overwrite them, so keep the lazy prefix for save_state.
         if reason == Exit::Dispatch && self.hot_exits {
+            self.publish_link_flags();
             self.b.ins().jump(self.hot_dispatch, &[pc.into()]);
             return;
         }
@@ -3017,6 +3022,14 @@ impl Emitter<'_> {
         );
         self.mark_source(source);
     }
+    /// Hot footers are shared, so their predecessors publish flags while
+    /// the recipe is still a compile-time constant there.
+    fn publish_link_flags(&mut self) {
+        if self.write_summary.is_some_and(|summary| summary.flags) {
+            self.store_flags();
+        }
+    }
+    /// Flags were already published by publish_link_flags.
     fn save_link_state(&mut self, pc: Value) {
         let Some(summary) = self.write_summary else {
             self.save_state(pc);
@@ -3045,9 +3058,7 @@ impl Emitter<'_> {
                 );
             }
         }
-        if summary.flags {
-            self.store_flags();
-        }
+
         let fuel = self.b.use_var(self.fuel);
         self.b.ins().store(
             MemFlags::trusted(),
@@ -3121,9 +3132,48 @@ impl Emitter<'_> {
         self.begin_mmx_block();
     }
     fn reload_flags(&mut self) {
-        load_flags(&mut self.b, self.state, self.flags, self.lazy);
+        load_flags(
+            &mut self.b,
+            self.state,
+            self.flags,
+            self.lazy,
+            self.fault_pc.is_some(),
+        );
     }
-    /// Publish flags as their lazy recipe: four stores, never the full word.
+    /// Load the recipe a PUBLISHED kind stands for, before reading flags.
+    /// Hardware fault recipes keep every input eager, so they never see it.
+    fn realize_flags(&mut self) {
+        let kind = self.b.use_var(self.lazy[3]);
+        if self.fault_pc.is_some() || self.realized == Some(kind) {
+            return;
+        }
+        let known = self.known(kind);
+        if known.is_some_and(|kind| kind != PUBLISHED) {
+            return;
+        }
+        let published = known
+            .is_none()
+            .then(|| self.b.ins().icmp_imm(IntCC::Equal, kind, PUBLISHED as i64));
+        for (index, var) in self.lazy[..4].iter().enumerate() {
+            let loaded = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.state,
+                (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
+            );
+            let value = match published {
+                Some(published) => {
+                    let current = self.b.use_var(*var);
+                    self.b.ins().select(published, loaded, current)
+                }
+                None => loaded,
+            };
+            self.b.def_var(*var, value);
+        }
+        self.realized = Some(self.b.use_var(self.lazy[3]));
+    }
+    /// Publish flags as their lazy recipe. A recipe still standing in
+    /// CpuState costs one EFLAGS store; any other costs four more.
     fn store_flags(&mut self) {
         let old = self.b.use_var(self.flags);
         let carry = self.b.use_var(self.lazy[4]);
@@ -3135,6 +3185,20 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eflags) as i32,
         );
+        let kind = self.b.use_var(self.lazy[3]);
+        let known = self.known(kind);
+        if known == Some(PUBLISHED) && self.fault_pc.is_none() {
+            return;
+        }
+        let skip = (known.is_none() && self.fault_pc.is_none()).then(|| {
+            let published = self.b.ins().icmp_imm(IntCC::Equal, kind, PUBLISHED as i64);
+            let store = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.ins().brif(published, done, &[], store, &[]);
+            self.b.seal_block(store);
+            self.b.switch_to_block(store);
+            done
+        });
         for (index, var) in self.lazy[..4].iter().enumerate() {
             let value = self.b.use_var(*var);
             self.b.ins().store(
@@ -3143,6 +3207,11 @@ impl Emitter<'_> {
                 self.state,
                 (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
             );
+        }
+        if let Some(done) = skip {
+            self.b.ins().jump(done, &[]);
+            self.b.seal_block(done);
+            self.b.switch_to_block(done);
         }
     }
     fn trap_call(&mut self, next: u32) {
@@ -4910,7 +4979,11 @@ impl Emitter<'_> {
         } else {
             1
         });
-        for (var, value) in self.lazy[..4].iter().zip([a, b, result, kind]) {
+        // Logical recipes read neither operand. Zero matches a PUBLISHED entry,
+        // so a loop header merging the two needs no phi for them.
+        let zero = self.constant(0);
+        let (a_kept, b_kept) = if logical { (zero, zero) } else { (a, b) };
+        for (var, value) in self.lazy[..4].iter().zip([a_kept, b_kept, result, kind]) {
             self.b.def_var(*var, value);
         }
         if !keep_cf {
@@ -4933,6 +5006,7 @@ impl Emitter<'_> {
         if bit == 0 {
             return self.b.use_var(self.lazy[4]);
         }
+        self.realize_flags();
         let old = self.b.use_var(self.flags);
         let old = self.b.ins().ushr_imm(old, i64::from(bit));
         let old = self.b.ins().band_imm(old, 1);
@@ -5011,6 +5085,7 @@ impl Emitter<'_> {
     fn materialize_flags(&mut self) -> Value {
         let source = self.source;
         self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Flags));
+        self.realize_flags();
         if self.optimizing {
             // Speed already folds individual constant recipes. Keeping that
             // shape avoids extending shared-expression live ranges at exits.
@@ -5510,8 +5585,18 @@ fn integer_type(size: usize) -> ir::Type {
     }
 }
 
-/// Entry and helper returns take the published lazy recipe as it stands.
-fn load_flags(b: &mut FunctionBuilder<'_>, state: Value, flags: Variable, lazy: [Variable; 5]) {
+/// Lazy kind meaning the recipe still stands in CpuState::lazy_flags: exits
+/// skip it and only a flag reader loads it (realize_flags).
+const PUBLISHED: u32 = 0x4000_0000;
+
+/// Entry and helper returns: EFLAGS (with exact CF) now, the recipe on demand.
+fn load_flags(
+    b: &mut FunctionBuilder<'_>,
+    state: Value,
+    flags: Variable,
+    lazy: [Variable; 5],
+    eager: bool,
+) {
     let word = b.ins().load(
         types::I32,
         MemFlags::trusted(),
@@ -5519,13 +5604,21 @@ fn load_flags(b: &mut FunctionBuilder<'_>, state: Value, flags: Variable, lazy: 
         offset_of!(CpuState, eflags) as i32,
     );
     b.def_var(flags, word);
+    let zero = b.ins().iconst(types::I32, 0);
+    let published = b.ins().iconst(types::I32, i64::from(PUBLISHED));
     for (index, var) in lazy[..4].iter().enumerate() {
-        let value = b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            state,
-            (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
-        );
+        let value = if eager {
+            b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                state,
+                (offset_of!(CpuState, lazy_flags) + index * 4) as i32,
+            )
+        } else if index == 3 {
+            published
+        } else {
+            zero
+        };
         b.def_var(*var, value);
     }
     let carry = b.ins().band_imm(word, 1);

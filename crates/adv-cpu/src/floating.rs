@@ -86,7 +86,9 @@ pub(crate) unsafe extern "C" fn x87_call(
             &*operation,
         )
     };
-    state.settle_flags();
+    if x87_effects(&operation.instruction).is_none_or(|e| e.read_flags || e.write_flags) {
+        state.settle_flags();
+    }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the bridge's memory is the executor's exclusively borrowed Memory.
         let memory = unsafe { &mut *bridge.memory };
