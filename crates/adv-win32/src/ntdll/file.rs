@@ -25,6 +25,8 @@ const SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 const INSUFFICIENT_RESOURCES: i32 = 0xc000_009au32 as i32;
 const FILE_IS_A_DIRECTORY: i32 = 0xc000_00bau32 as i32;
 const NOT_SUPPORTED: i32 = 0xc000_00bbu32 as i32;
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const OBJ_OPENIF: u32 = 0x80;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -409,11 +411,15 @@ impl ObjectAttributes {
                 )
             });
         }
-        if self.0[3] != 0x40 || self.0[4] != 0 || self.0[5] != 0 {
+        // File objects are looked up case-insensitively under the default
+        // ObCaseInsensitive policy whether or not OBJ_CASE_INSENSITIVE is set, and
+        // OBJ_OPENIF does not change how an existing file is opened.
+        if self.0[3] & !(OBJ_CASE_INSENSITIVE | OBJ_OPENIF) != 0 || self.0[4] != 0 || self.0[5] != 0
+        {
             return Err(unavailable_for(
                 env,
                 api,
-                "only OBJ_CASE_INSENSITIVE with default object security and no inheritance",
+                "only OBJ_CASE_INSENSITIVE or OBJ_OPENIF with default object security and no inheritance",
             ));
         }
         Ok(())
