@@ -60,7 +60,7 @@ pub(super) struct Batch {
 
 impl Batch {
     pub(super) fn copies(&self) -> bool {
-        self.copy.is_some()
+        self.copy.is_some_and(|copy| copy.load.is_some())
     }
     fn width(&self) -> i64 {
         if let Some(copy) = self.copy {
@@ -82,19 +82,35 @@ fn copy_batch(plan: &loops::Plan, body: &[&Instruction]) -> Option<CopyBatch> {
         [store] => (None, *store),
         _ => return None,
     };
-    let register = store.op1_register();
+    let register = if store.op1_kind() == OpKind::Register {
+        store.op1_register()
+    } else {
+        R::None
+    };
     let size = store.memory_size().size() as u32;
-    let plain = store.mnemonic() == M::Mov && register.is_gpr32() && size == 4;
-    let packed = mmx::register(register).is_some()
+    let plain = store.mnemonic() == M::Mov
+        && match store.op1_kind() {
+            OpKind::Register => {
+                reg_index(register.full_register32()).is_some()
+                    && register.size() as u32 == size
+                    && matches!(size, 1 | 2 | 4)
+            }
+            OpKind::Immediate8 => size == 1,
+            OpKind::Immediate16 => size == 2,
+            OpKind::Immediate32 => size == 4,
+            _ => false,
+        };
+    let packed = store.op1_kind() == OpKind::Register
+        && mmx::register(register).is_some()
         && matches!((store.mnemonic(), size), (M::Movd, 4) | (M::Movq, 8));
-    if !(plain || packed)
-        || store.op0_kind() != OpKind::Memory
-        || store.op1_kind() != OpKind::Register
-    {
+    if !(plain || packed) || store.op0_kind() != OpKind::Memory {
         return None;
     }
     if let Some(load) = load {
-        if load.mnemonic() != store.mnemonic()
+        // Partial-register copies still use the scalar path. Their preserved
+        // upper bits need a separate loop-carried register proof.
+        if plain && (size != 4 || !register.is_gpr32())
+            || load.mnemonic() != store.mnemonic()
             || load.op0_kind() != OpKind::Register
             || load.op1_kind() != OpKind::Memory
             || load.op0_register() != register
@@ -102,7 +118,10 @@ fn copy_batch(plan: &loops::Plan, body: &[&Instruction]) -> Option<CopyBatch> {
         {
             return None;
         }
-    } else if plain && plan.invariant & (1 << reg_index(register)?) == 0 {
+    } else if plain
+        && store.op1_kind() == OpKind::Register
+        && plan.invariant & (1 << reg_index(register.full_register32())?) == 0
+    {
         return None;
     }
     for pc in load
@@ -859,10 +878,12 @@ impl Emitter<'_> {
         let updates = plan.updates.clone();
         let width = 16 / i64::from(copy.size);
         let shift = width.trailing_zeros() as i64;
-        let ty = if copy.size == 8 {
-            types::I64X2
-        } else {
-            types::I32X4
+        let ty = match copy.size {
+            1 => types::I8X16,
+            2 => types::I16X8,
+            4 => types::I32X4,
+            8 => types::I64X2,
+            _ => unreachable!(),
         };
         self.fast = Some(index);
         self.b.switch_to_block(entry);
@@ -875,13 +896,19 @@ impl Emitter<'_> {
                 let value = self.mmx_cast(value, ty);
                 self.b.ins().extractlane(value, 0)
             } else {
-                self.b.use_var(self.regs[reg_index(copy.register).unwrap()])
+                let value = self.read(&instructions[&copy.store], 1);
+                if copy.size < 4 {
+                    self.b
+                        .ins()
+                        .ireduce(integer_type(copy.size as usize), value)
+                } else {
+                    value
+                }
             };
             Some(self.b.ins().splat(ty, value))
         } else {
             None
         };
-        let source = source.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
         let destination = self.copy_address(index, copy.store);
         let count = self.b.use_var(self.regs[counter]);
         let (_, stop, _) = self.kernel.unwrap();
@@ -889,20 +916,26 @@ impl Emitter<'_> {
         let available = self.counter_steps(index, count, stop);
         let batches = self.b.ins().ushr_imm(available, shift);
         let body = self.b.create_block();
-        self.b.append_block_param(body, self.ptr_ty);
+        if source.is_some() {
+            self.b.append_block_param(body, self.ptr_ty);
+        }
         self.b.append_block_param(body, self.ptr_ty);
         self.b.append_block_param(body, types::I32);
         let cleanup = self.b.create_block();
         self.b.append_block_param(cleanup, types::I8);
         self.b.set_cold_block(cleanup);
-        self.b
-            .ins()
-            .jump(body, &[source.into(), destination.into(), batches.into()]);
+        let mut args: Vec<ir::BlockArg> = source.into_iter().map(Into::into).collect();
+        args.push(destination.into());
+        args.push(batches.into());
+        self.b.ins().jump(body, &args);
         self.b.switch_to_block(body);
-        let source = self.b.block_params(body)[0];
-        let destination = self.b.block_params(body)[1];
-        let remaining = self.b.block_params(body)[2];
-        let value = fill.unwrap_or_else(|| self.b.ins().load(ty, MemFlags::new(), source, 0));
+        // Do not create a dummy source induction for a fill: the optimizer
+        // retains a self-referential block parameter even with no loads.
+        let source = source.map(|_| self.b.block_params(body)[0]);
+        let destination = self.b.block_params(body)[usize::from(source.is_some())];
+        let remaining = self.b.block_params(body)[usize::from(source.is_some()) + 1];
+        let value =
+            fill.unwrap_or_else(|| self.b.ins().load(ty, MemFlags::new(), source.unwrap(), 0));
         self.b.ins().store(MemFlags::new(), value, destination, 0);
         let remaining = self.b.ins().iadd_imm(remaining, -1);
         let again = self.b.create_block();
@@ -920,11 +953,12 @@ impl Emitter<'_> {
             .ins()
             .brif(pending, cleanup, &[pending.into()], advance, &[]);
         self.b.switch_to_block(advance);
-        let source = self.b.ins().iadd_imm(source, 16);
+        let source = source.map(|source| self.b.ins().iadd_imm(source, 16));
         let destination = self.b.ins().iadd_imm(destination, 16);
-        self.b
-            .ins()
-            .jump(body, &[source.into(), destination.into(), remaining.into()]);
+        let mut args: Vec<ir::BlockArg> = source.into_iter().map(Into::into).collect();
+        args.push(destination.into());
+        args.push(remaining.into());
+        self.b.ins().jump(body, &args);
 
         self.b.switch_to_block(cleanup);
         if self.written.is_some() {

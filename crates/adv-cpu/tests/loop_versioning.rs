@@ -378,6 +378,109 @@ fn loop_batches_reconstruct_body_flags_before_budget_and_fault_exits() {
 }
 
 #[test]
+fn packed_scalar_fills_preserve_width_sources_tails_and_faults() {
+    for width in [1, 2, 4] {
+        for source in 0..3 {
+            let bytes = code(|a| {
+                let mut top = a.create_label();
+                a.set_label(&mut top).unwrap();
+                a.add(edi, width).unwrap();
+                if source == 2 {
+                    // A changing full register must not be hoisted, even
+                    // when the store reads only its high byte or low word.
+                    a.add(eax, 0x101).unwrap();
+                }
+                match (width, source) {
+                    (1, 0) => a.mov(byte_ptr(edi - width), 0xb3),
+                    (2, 0) => a.mov(word_ptr(edi - width), 0xbeef),
+                    (4, 0) => a.mov(dword_ptr(edi - width), 0xdead_beefu32),
+                    (1, _) => a.mov(byte_ptr(edi - width), ah),
+                    (2, _) => a.mov(word_ptr(edi - width), ax),
+                    _ => a.mov(dword_ptr(edi - width), eax),
+                }
+                .unwrap();
+                a.loop_(top).unwrap();
+                a.ret().unwrap();
+            });
+            let seed = |m: &mut Executor| {
+                m.state.regs[0] = 0x2468_acdf;
+                m.state.eflags = 0xad7;
+            };
+            for count in [1, 15, 16, 17, 129] {
+                for slice in [7, 1 << 30] {
+                    differential(
+                        "scalar-fill",
+                        &bytes,
+                        regs(count, SRC, DST + 3),
+                        seed,
+                        slice,
+                    );
+                }
+            }
+            differential_with_oracle_slice(
+                "scalar-fill-fault",
+                &bytes,
+                regs(29, SRC, DST + 4096 - width as u32),
+                |m| {
+                    seed(m);
+                    m.protect(DST + 4096, 4096, READ).unwrap();
+                },
+                1 << 30,
+                1,
+            );
+            // For a straddling fault Unicorn reports the first inaccessible
+            // byte; the executor reports the operand start. Compare this
+            // transactional contract with our instruction interpreter.
+            let fault_machine = |strategy| {
+                let mut m = machine(&bytes, strategy);
+                m.state.regs = regs(29, SRC, DST + 4093);
+                seed(&mut m);
+                m.protect(DST + 4096, 4096, READ).unwrap();
+                m
+            };
+            let mut interpreted = fault_machine(None);
+            let expected = interpreted.run(STOP, 1000).unwrap();
+            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+                let mut jit = fault_machine(Some(strategy));
+                assert_eq!(jit.run(STOP, 1000).unwrap(), expected);
+                assert_eq!(jit.state.regs, interpreted.state.regs);
+                assert_eq!(jit.state.eflags, interpreted.state.eflags);
+                assert_eq!(
+                    jit.memory().read(DST, 8192).unwrap(),
+                    interpreted.memory().read(DST, 8192).unwrap()
+                );
+            }
+            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+                for fuel in [1, 7, 8, 15, 16, 17, 31, 32, 33] {
+                    let mut jit = machine(&bytes, Some(strategy));
+                    let mut uc = machine(&bytes, None);
+                    for m in [&mut jit, &mut uc] {
+                        m.state.regs = regs(200, SRC, DST + 3);
+                        seed(m);
+                    }
+                    assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
+                    let done = 200 - jit.state.regs[1];
+                    let instructions = 3 + u32::from(source == 2);
+                    assert_eq!(
+                        uc.run_unicorn(STOP, (done * instructions) as usize)
+                            .unwrap(),
+                        RunOutcome::Budget
+                    );
+                    assert_eq!(jit.state.eip, uc.state.eip);
+                    assert_eq!(jit.state.regs, uc.state.regs);
+                    assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+                    assert_eq!(jit.state.x87, uc.state.x87);
+                    assert_eq!(
+                        jit.memory().read(DST, 804).unwrap(),
+                        uc.memory().read(DST, 804).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn versioned_loops_with_negative_steps_narrow_counters_and_skips_match_unicorn() {
     let backwards = counted(false, |a| {
         a.movd(mm0, dword_ptr(esi - 4)).unwrap();
@@ -1665,19 +1768,39 @@ fn compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state() {
 
 #[test]
 fn compact_copy_interrupt_publishes_progress_and_resumes() {
-    transfer_interrupt(false, false, false);
+    transfer_interrupt(4, false, false);
 }
 
 #[test]
 fn packed_loop_interrupt_publishes_progress_and_resumes() {
-    for (wide, fill) in [(false, false), (true, false), (false, true), (true, true)] {
-        transfer_interrupt(wide, fill, true);
+    for (width, fill) in [
+        (4, false),
+        (8, false),
+        (4, true),
+        (8, true),
+        (1, true),
+        (2, true),
+    ] {
+        transfer_interrupt(width, fill, true);
     }
 }
 
-fn transfer_interrupt(wide: bool, fill: bool, looping: bool) {
-    let bytes = if looping {
-        packed_loop(wide, fill)
+fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
+    let bytes = if width < 4 {
+        code(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            if width == 1 {
+                a.mov(byte_ptr(edi), ah).unwrap();
+            } else {
+                a.mov(word_ptr(edi), ax).unwrap();
+            }
+            a.add(edi, width as i32).unwrap();
+            a.loop_(top).unwrap();
+            a.ret().unwrap();
+        })
+    } else if looping {
+        packed_loop(width == 8, fill)
     } else {
         counted(false, |a| {
             a.movd(mm0, dword_ptr(esi)).unwrap();
@@ -1686,7 +1809,6 @@ fn transfer_interrupt(wide: bool, fill: bool, looping: bool) {
             a.add(edi, 4).unwrap();
         })
     };
-    let width = if wide { 8 } else { 4 };
     // A sufficiently long in-place copy allows an asynchronous interrupt;
     // one zero-filled allocation, without a second large oracle allocation.
     let count = 64_000_000 / width;
