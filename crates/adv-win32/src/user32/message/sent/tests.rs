@@ -100,57 +100,55 @@ fn fixture() -> Machine<JitCpu> {
 }
 
 #[test]
-fn sent_callbacks_reenter_the_sender_and_keep_owning_context_in_both_modes() {
-    {
-        let mut m = fixture();
-        let setup = m.resolve_import("sent-test", "setup").unwrap();
-        let done = m.resolve_import("sent-test", "finish").unwrap();
-        let send = m.resolve_import(USER32, "SendMessageA").unwrap();
-        let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
-        let mut a = Asm::new(CODE);
-        a.call(setup).mov_mem_eax(DATA);
-        let wait = a.here();
-        a.cmp_mem_imm8(DATA + 4, 0).jz(wait);
-        a.push_imm(0)
-            .push_imm(0)
-            .push_imm(APP)
-            .mov_eax_mem(DATA + 4)
-            .push_eax()
-            .call(send);
-        a.mov_mem_eax(DATA + 8)
-            .mov_mem_imm(DATA + 12, 1)
-            .call(done)
-            .hlt();
-        let mut b = Asm::new(CODE + 0x200);
-        b.call(setup).mov_mem_eax(DATA + 4);
-        let poll = b.here();
-        b.push_imm(1)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(DATA + 64)
-            .call(peek);
-        b.cmp_mem_imm8(DATA + 12, 0).jz(poll).call(done).hlt();
-        for (pc, code) in [(CODE, a), (CODE + 0x200, b)] {
-            m.cpu.write(pc, &code.bytes).unwrap();
-            m.cpu
-                .executor_mut()
-                .add_region(Region::new(pc, code.bytes.len()))
-                .unwrap();
-            m.spawn("sent", pc, &[], 65536).unwrap();
-        }
-        run(&mut m);
-        assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 17);
-        assert_eq!(m.ext.get::<Observed>().0, [1, 0]);
-        assert!(
-            m.ext
-                .get::<Win32>()
-                .user
-                .queues
-                .values()
-                .all(|q| q.sent.pending.is_empty() && q.sent.active.is_empty())
-        );
+fn sent_callbacks_reenter_the_sender_and_keep_owning_context() {
+    let mut m = fixture();
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageA").unwrap();
+    let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
+    let mut a = Asm::new(CODE);
+    a.call(setup).mov_mem_eax(DATA);
+    let wait = a.here();
+    a.cmp_mem_imm8(DATA + 4, 0).jz(wait);
+    a.push_imm(0)
+        .push_imm(0)
+        .push_imm(APP)
+        .mov_eax_mem(DATA + 4)
+        .push_eax()
+        .call(send);
+    a.mov_mem_eax(DATA + 8)
+        .mov_mem_imm(DATA + 12, 1)
+        .call(done)
+        .hlt();
+    let mut b = Asm::new(CODE + 0x200);
+    b.call(setup).mov_mem_eax(DATA + 4);
+    let poll = b.here();
+    b.push_imm(1)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(DATA + 64)
+        .call(peek);
+    b.cmp_mem_imm8(DATA + 12, 0).jz(poll).call(done).hlt();
+    for (pc, code) in [(CODE, a), (CODE + 0x200, b)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("sent", pc, &[], 65536).unwrap();
     }
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 17);
+    assert_eq!(m.ext.get::<Observed>().0, [1, 0]);
+    assert!(
+        m.ext
+            .get::<Win32>()
+            .user
+            .queues
+            .values()
+            .all(|q| q.sent.pending.is_empty() && q.sent.active.is_empty())
+    );
 }
 
 fn run(m: &mut Machine<JitCpu>) {
@@ -172,60 +170,58 @@ fn run(m: &mut Machine<JitCpu>) {
 
 #[test]
 fn timed_out_send_is_removed_before_receiver_pumps_and_preserves_output() {
-    {
-        let mut m = fixture();
-        let setup = m.resolve_import("sent-test", "setup").unwrap();
-        let done = m.resolve_import("sent-test", "finish").unwrap();
-        let send = m.resolve_import(USER32, "SendMessageTimeoutA").unwrap();
-        let error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
-        let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
-        m.cpu.write_u32(DATA + 8, 0x12345678).unwrap();
-        let mut a = Asm::new(CODE);
-        a.call(setup).mov_mem_eax(DATA);
-        let wait = a.here();
-        a.cmp_mem_imm8(DATA + 4, 0).jz(wait);
-        a.push_imm(DATA + 8)
-            .push_imm(2)
-            .push_imm(1)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(APP)
-            .mov_eax_mem(DATA + 4)
-            .push_eax()
-            .call(send);
-        a.mov_mem_eax(DATA + 12)
-            .call(error)
-            .mov_mem_eax(DATA + 16)
-            .mov_mem_imm(DATA + 20, 1)
-            .call(done)
-            .hlt();
-        let mut b = Asm::new(CODE + 0x200);
-        b.call(setup).mov_mem_eax(DATA + 4);
-        let wait = b.here();
-        b.cmp_mem_imm8(DATA + 20, 0).jz(wait);
-        b.push_imm(1)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(DATA + 64)
-            .call(peek)
-            .call(done)
-            .hlt();
-        for (pc, code) in [(CODE, a), (CODE + 0x200, b)] {
-            m.cpu.write(pc, &code.bytes).unwrap();
-            m.cpu
-                .executor_mut()
-                .add_region(Region::new(pc, code.bytes.len()))
-                .unwrap();
-            m.spawn("timeout", pc, &[], 65536).unwrap();
-        }
-        run(&mut m);
-        assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0x12345678);
-        assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 0);
-        assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), ERROR_TIMEOUT);
-        assert!(
-            m.ext.get::<Observed>().0.is_empty(),
-            "cancelled WndProc was invoked"
-        );
+    let mut m = fixture();
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageTimeoutA").unwrap();
+    let error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
+    m.cpu.write_u32(DATA + 8, 0x12345678).unwrap();
+    let mut a = Asm::new(CODE);
+    a.call(setup).mov_mem_eax(DATA);
+    let wait = a.here();
+    a.cmp_mem_imm8(DATA + 4, 0).jz(wait);
+    a.push_imm(DATA + 8)
+        .push_imm(2)
+        .push_imm(1)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(APP)
+        .mov_eax_mem(DATA + 4)
+        .push_eax()
+        .call(send);
+    a.mov_mem_eax(DATA + 12)
+        .call(error)
+        .mov_mem_eax(DATA + 16)
+        .mov_mem_imm(DATA + 20, 1)
+        .call(done)
+        .hlt();
+    let mut b = Asm::new(CODE + 0x200);
+    b.call(setup).mov_mem_eax(DATA + 4);
+    let wait = b.here();
+    b.cmp_mem_imm8(DATA + 20, 0).jz(wait);
+    b.push_imm(1)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(DATA + 64)
+        .call(peek)
+        .call(done)
+        .hlt();
+    for (pc, code) in [(CODE, a), (CODE + 0x200, b)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("timeout", pc, &[], 65536).unwrap();
     }
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0x12345678);
+    assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), ERROR_TIMEOUT);
+    assert!(
+        m.ext.get::<Observed>().0.is_empty(),
+        "cancelled WndProc was invoked"
+    );
 }

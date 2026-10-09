@@ -404,16 +404,15 @@ mod critical_tests {
                 Outcome::block(Wait::Yield, |env, _| hold_until_waiters(env))
             }
         }
-        {
-            let mut registry = Registry::default();
-            register(&mut registry);
-            registry.add(
-                "test",
-                "hold",
-                Conv::Stdcall { argc: 0 },
-                hold_until_waiters,
-            );
-            registry.add("test", "probe", Conv::Stdcall { argc: 0 }, |e| {
+        let mut registry = Registry::default();
+        register(&mut registry);
+        registry.add(
+            "test",
+            "hold",
+            Conv::Stdcall { argc: 0 },
+            hold_until_waiters,
+        );
+        registry.add("test", "probe", Conv::Stdcall { argc: 0 }, |e| {
                 let wait = &e.ext.get_or_default::<CriticalWaits>().0[&CS];
                 assert_eq!(wait.pending.get(), 2);
                 let event = wait.event;
@@ -422,84 +421,83 @@ mod critical_tests {
                 e.ext.get_mut::<Observed>().event = event;
                 Outcome::Return(0)
             });
-            registry.add("test", "acquired", Conv::Stdcall { argc: 0 }, |e| {
-                assert_eq!(e.cpu.read_u32(CS + CS_OWNER).unwrap(), e.ctx().tid);
-                e.ext.get_mut::<Observed>().acquired.push(e.context);
-                Outcome::Return(0)
-            });
-            registry.add("test", "cleanup", Conv::Stdcall { argc: 0 }, |e| {
-                if e.ext.get::<Observed>().acquired.len() == 2 {
-                    release_cs_wait(e, CS).unwrap();
-                }
-                Outcome::ExitThread(0)
-            });
-            registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
-                Outcome::ExitThread(0)
-            });
-            let cpu = JitCpu::new(PARK_ADDR, true).unwrap();
-            let mut m = Machine::new(cpu, registry, Clock::real()).unwrap();
-            m.ext.insert(Observed::default());
-            m.cpu.map(CODE, 4096, Prot::RX).unwrap();
-            m.cpu.map(CS, 4096, Prot::RW).unwrap();
-            m.set_frame_handoff(false);
-            let init = m.resolve_import(K32, "InitializeCriticalSection").unwrap();
-            let enter = m.resolve_import(K32, "EnterCriticalSection").unwrap();
-            let leave = m.resolve_import(K32, "LeaveCriticalSection").unwrap();
-            let hold = m.resolve_import("test", "hold").unwrap();
-            let probe = m.resolve_import("test", "probe").unwrap();
-            let acquired = m.resolve_import("test", "acquired").unwrap();
-            let cleanup = m.resolve_import("test", "cleanup").unwrap();
-            let done = m.resolve_import("test", "done").unwrap();
-            let mut owner = Asm::new(CODE);
-            owner
-                .push_imm(CS)
-                .call(init)
+        registry.add("test", "acquired", Conv::Stdcall { argc: 0 }, |e| {
+            assert_eq!(e.cpu.read_u32(CS + CS_OWNER).unwrap(), e.ctx().tid);
+            e.ext.get_mut::<Observed>().acquired.push(e.context);
+            Outcome::Return(0)
+        });
+        registry.add("test", "cleanup", Conv::Stdcall { argc: 0 }, |e| {
+            if e.ext.get::<Observed>().acquired.len() == 2 {
+                release_cs_wait(e, CS).unwrap();
+            }
+            Outcome::ExitThread(0)
+        });
+        registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+            Outcome::ExitThread(0)
+        });
+        let cpu = JitCpu::new(PARK_ADDR, true).unwrap();
+        let mut m = Machine::new(cpu, registry, Clock::real()).unwrap();
+        m.ext.insert(Observed::default());
+        m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+        m.cpu.map(CS, 4096, Prot::RW).unwrap();
+        m.set_frame_handoff(false);
+        let init = m.resolve_import(K32, "InitializeCriticalSection").unwrap();
+        let enter = m.resolve_import(K32, "EnterCriticalSection").unwrap();
+        let leave = m.resolve_import(K32, "LeaveCriticalSection").unwrap();
+        let hold = m.resolve_import("test", "hold").unwrap();
+        let probe = m.resolve_import("test", "probe").unwrap();
+        let acquired = m.resolve_import("test", "acquired").unwrap();
+        let cleanup = m.resolve_import("test", "cleanup").unwrap();
+        let done = m.resolve_import("test", "done").unwrap();
+        let mut owner = Asm::new(CODE);
+        owner
+            .push_imm(CS)
+            .call(init)
+            .push_imm(CS)
+            .call(enter)
+            .push_imm(CS)
+            .call(enter)
+            .call(hold)
+            .push_imm(CS)
+            .call(leave)
+            .call(probe)
+            .push_imm(CS)
+            .call(leave)
+            .call(done)
+            .hlt();
+        m.cpu.write(CODE, &owner.bytes).unwrap();
+        m.spawn("owner", CODE, &[], 65536).unwrap();
+        for index in 1..=2 {
+            let address = CODE + index * 256;
+            let mut waiter = Asm::new(address);
+            waiter
                 .push_imm(CS)
                 .call(enter)
-                .push_imm(CS)
-                .call(enter)
-                .call(hold)
+                .call(acquired)
                 .push_imm(CS)
                 .call(leave)
-                .call(probe)
-                .push_imm(CS)
-                .call(leave)
-                .call(done)
+                .call(cleanup)
                 .hlt();
-            m.cpu.write(CODE, &owner.bytes).unwrap();
-            m.spawn("owner", CODE, &[], 65536).unwrap();
-            for index in 1..=2 {
-                let address = CODE + index * 256;
-                let mut waiter = Asm::new(address);
-                waiter
-                    .push_imm(CS)
-                    .call(enter)
-                    .call(acquired)
-                    .push_imm(CS)
-                    .call(leave)
-                    .call(cleanup)
-                    .hlt();
-                m.cpu.write(address, &waiter.bytes).unwrap();
-                m.spawn("waiter", address, &[], 65536).unwrap();
-            }
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                assert!(Instant::now() < deadline);
-                match m.run_slice(Duration::from_millis(8)) {
-                    SliceResult::Complete(RunResult::Exited(_)) => break,
-                    SliceResult::Complete(RunResult::Failed(error)) => panic!("{error}"),
-                    SliceResult::Complete(RunResult::Idle { .. }) => {
-                        std::thread::sleep(Duration::from_millis(1))
-                    }
-                    _ => {}
-                }
-            }
-            let observed = m.ext.get::<Observed>();
-            assert_eq!(observed.acquired.len(), 2);
-            assert_ne!(observed.acquired[0], observed.acquired[1]);
-            assert!(m.sys.objects.get(observed.event).is_none());
-            assert!(m.ext.get::<CriticalWaits>().0.is_empty());
+            m.cpu.write(address, &waiter.bytes).unwrap();
+            m.spawn("waiter", address, &[], 65536).unwrap();
         }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline);
+            match m.run_slice(Duration::from_millis(8)) {
+                SliceResult::Complete(RunResult::Exited(_)) => break,
+                SliceResult::Complete(RunResult::Failed(error)) => panic!("{error}"),
+                SliceResult::Complete(RunResult::Idle { .. }) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                _ => {}
+            }
+        }
+        let observed = m.ext.get::<Observed>();
+        assert_eq!(observed.acquired.len(), 2);
+        assert_ne!(observed.acquired[0], observed.acquired[1]);
+        assert!(m.sys.objects.get(observed.event).is_none());
+        assert!(m.ext.get::<CriticalWaits>().0.is_empty());
     }
 }
 
