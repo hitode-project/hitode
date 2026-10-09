@@ -10,7 +10,7 @@ fn error(env: &mut Env<'_>, status: u32) -> Outcome {
     let code = match status {
         0x8000000d => 299,
         0xc0000018 | 0xc0000019 | 0xc00000a0 => 487,
-        0xc0000045 => 87,
+        0xc0000045 | 0xc00000f2 => 87,
         _ => crate::kernel32::file::native::win32_error(status),
     };
     set_last_error(env, code);

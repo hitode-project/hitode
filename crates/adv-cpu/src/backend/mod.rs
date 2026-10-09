@@ -312,6 +312,25 @@ pub trait Guest {
     fn file_page_copy_on_write(&self, _addr: u32) -> Option<bool> {
         None
     }
+    /// Map an owned prepared snapshot with a per-page first-write barrier.
+    /// Unlike file aliases these private pages may execute, and their source
+    /// cannot be changed externally. Protection changes never reset the barrier.
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        _prot: Prot,
+    ) -> Result<(), MemFault> {
+        Err(MemFault {
+            addr,
+            len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        })
+    }
+    /// Convert prepared snapshot pages to ordinary private ownership without
+    /// writing bytes; protection changes do not perform this conversion.
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        Err(MemFault { addr, len })
+    }
     /// Optional stable shared bytes while this guest borrow is alive. Software devices
     /// can consume frames without a second guest-to-host copy; other backends return None.
     fn shared_bytes(&self, _addr: u32, _len: usize) -> Option<&[u8]> {

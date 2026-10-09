@@ -5,7 +5,8 @@ use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
 use adv_machine::exception::{Checkpoint, Exception};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, Wait};
+use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, Trace, Wait};
+use std::{cell::RefCell, io::Write, rc::Rc};
 
 const CODE: u32 = 0x400000;
 const HANDLER: u32 = CODE + 0x200;
@@ -13,7 +14,30 @@ const PEER: u32 = CODE + 0x300;
 const DATA: u32 = 0x500000;
 const SEEN: u32 = DATA + 0x1000;
 
+struct CapturedTrace(Rc<RefCell<Vec<u8>>>);
+impl Write for CapturedTrace {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn tracing(machine: &mut Machine<JitCpu>) -> Rc<RefCell<Vec<u8>>> {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    machine.sys.trace = Trace::to_writer(Box::new(CapturedTrace(bytes.clone())));
+    machine.sys.trace.all = true;
+    bytes
+}
+
 fn deliver(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) -> Outcome {
+    // Fault input is already observable while this handler is still active.
+    let trace = String::from_utf8(env.ext.get::<CapturedTrace>().0.borrow().clone()).unwrap();
+    assert!(trace.contains(
+        "# cpu_fault\t0\t7\tKind=\"read\"\tPc=00400000\tAccess=\"read\"\tAddress=00500000\n"
+    ));
+    assert!(!trace.contains("\ttest!yield\t"));
     assert!(matches!(
         event,
         Exception::Fault(adv_cpu::backend::Fault {
@@ -62,6 +86,9 @@ fn handler_can_yield_to_peer_then_retry_precise_fault_without_losing_outer_callb
         )
         .unwrap();
         machine.sys.exception_handler = Some(deliver);
+        let trace = tracing(&mut machine);
+        machine.ext.insert(CapturedTrace(trace.clone()));
+        machine.sys.frame = 7;
         machine.cpu.map(CODE, 4096, Prot::RWX).unwrap();
         machine.cpu.map(DATA, 4096, Prot(0)).unwrap();
         machine.cpu.map(SEEN, 4096, Prot::RW).unwrap();
@@ -82,6 +109,20 @@ fn handler_can_yield_to_peer_then_retry_precise_fault_without_losing_outer_callb
         let time = machine.sys.clock.now_us();
         assert!(matches!(machine.run_virtual(100000), RunResult::Exited(0)));
         assert_eq!(machine.sys.clock.now_us(), time);
+        let trace = String::from_utf8(trace.borrow().clone()).unwrap();
+        let fault = trace.find("# cpu_fault\t").unwrap();
+        let yield_api = trace.find("0\t7\ttest!yield\t\t0\n").unwrap();
+        assert!(
+            fault < yield_api,
+            "fault input must precede the handler's API completion"
+        );
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| line.starts_with("# cpu_fault\t"))
+                .count(),
+            1
+        );
     }
 }
 
@@ -313,6 +354,7 @@ fn unhandled_interrupt_keeps_original_registers_and_stack_before_parking() {
                 env.cpu.set_reg(Reg::Edx, 0);
                 Outcome::Fail("personality declined the interrupt".into())
             });
+            let trace = tracing(&mut machine);
             machine.spawn("main", CODE, &[], 0x10000).unwrap();
             let RunResult::Failed(error) = machine.run_virtual(100000) else {
                 panic!("unhandled interrupt must keep its original failure semantics")
@@ -330,6 +372,15 @@ fn unhandled_interrupt_keeps_original_registers_and_stack_before_parking() {
             assert!(original.registers.contains(&(Reg::Edx, 0x2468_1357)));
             assert_eq!(original.stack[0], 0xdead_beef);
             assert_eq!(machine.sys.latest_cpu_fault.as_ref(), Some(original));
+            let trace = String::from_utf8(trace.borrow().clone()).unwrap();
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(|line| line.starts_with("# raw_interrupt\t"))
+                    .count(),
+                1
+            );
+            assert!(!trace.contains("# cpu_fault\t"));
         }
     }
 }
@@ -352,9 +403,19 @@ fn handled_interrupt_does_not_publish_a_fault_snapshot() {
         machine.cpu.write(CODE, &code.bytes).unwrap();
         machine.sys.exception_handler =
             Some(|_, _, checkpoint| Outcome::ResumeExecution(checkpoint));
+        let trace = tracing(&mut machine);
         machine.spawn("main", CODE, &[], 0x10000).unwrap();
         assert!(matches!(machine.run_virtual(100000), RunResult::Exited(17)));
         assert!(machine.sys.first_cpu_fault.is_none());
         assert!(machine.sys.latest_cpu_fault.is_none());
+        let trace = String::from_utf8(trace.borrow().clone()).unwrap();
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| line.starts_with("# raw_interrupt\t"))
+                .count(),
+            1
+        );
+        assert!(!trace.contains("# cpu_fault\t"));
     }
 }

@@ -142,16 +142,21 @@ impl Memory {
         let alias = window.checked_pointer().unwrap();
         let mut first = 0;
         while first < self.mapped.len() {
-            if !self.mapped[first] || self.perms[first] & SHARED != 0 {
+            if !self.mapped[first]
+                || (self.perms[first] & SHARED != 0
+                    && !self.private_copy_pages.contains_key(&first))
+            {
                 first += 1;
                 continue;
             }
-            let permissions = self.perms[first];
+            let permissions = self.perms[first] & 7;
             let mut end = first + 1;
             while end < self.mapped.len()
                 && self.mapped[end]
-                && self.perms[end] == permissions
+                && self.perms[end] & 7 == permissions
                 && self.watched[end] == self.watched[first]
+                && self.private_copy_pages.get(&end) == self.private_copy_pages.get(&first)
+                && (self.perms[end] & SHARED == 0 || self.private_copy_pages.contains_key(&end))
             {
                 end += 1;
             }
@@ -162,7 +167,8 @@ impl Memory {
                 len,
                 GuestPageProtection::new(
                     permissions,
-                    permissions & EXEC != 0 && self.watched[first],
+                    (permissions & EXEC != 0 && self.watched[first])
+                        || self.private_copy_pages.get(&first) == Some(&true),
                 )?,
             )?;
             // The old owner is software checked and quiescent. Its private
@@ -210,12 +216,13 @@ impl Memory {
             for page in pages {
                 // Shared overlays have no private direct mapping. Their checked
                 // helpers retain the existing visibility and COW contracts.
-                if self.perms[page] & SHARED != 0 {
+                if self.perms[page] & SHARED != 0 && !self.private_copy_pages.contains_key(&page) {
                     continue;
                 }
                 let protection = GuestPageProtection::new(
                     permissions,
-                    permissions & EXEC != 0 && self.watched[page],
+                    (permissions & EXEC != 0 && self.watched[page])
+                        || self.private_copy_pages.get(&page) == Some(&true),
                 )?;
                 if let Err(error) = window.protect_direct(page * PAGE_SIZE, PAGE_SIZE, protection) {
                     for previous in changed {
@@ -225,8 +232,9 @@ impl Memory {
                                 previous * PAGE_SIZE,
                                 PAGE_SIZE,
                                 GuestPageProtection::new(
-                                    old,
-                                    old & EXEC != 0 && self.watched[previous],
+                                    old & 7,
+                                    (old & EXEC != 0 && self.watched[previous])
+                                        || self.private_copy_pages.get(&previous) == Some(&true),
                                 )?,
                             )
                             .is_err()
@@ -261,14 +269,117 @@ impl Memory {
         }
         #[cfg(unix)]
         for page in pages {
-            if self.mapped[page] && self.perms[page] & (EXEC | SHARED) == EXEC {
+            if self.mapped[page]
+                && self.perms[page] & EXEC != 0
+                && (self.perms[page] & SHARED == 0 || self.private_copy_pages.contains_key(&page))
+            {
                 self.reservation.as_ref().unwrap().protect_direct(
                     page * PAGE_SIZE,
                     PAGE_SIZE,
-                    crate::virtual_memory::GuestPageProtection::new(self.perms[page], true)?,
+                    crate::virtual_memory::GuestPageProtection::new(self.perms[page] & 7, true)?,
                 )?;
             }
         }
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn restore_private_copy_direct(&self, pages: &[usize]) -> Result<(), String> {
+        if !self.direct_memory_enabled() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use crate::virtual_memory::GuestPageProtection;
+            let window = self.reservation.as_ref().unwrap();
+            let mut restored = Vec::new();
+            for &page in pages {
+                let permissions = self.perms[page] & 7;
+                let protection = GuestPageProtection::new(
+                    permissions,
+                    permissions & EXEC != 0 && self.watched[page],
+                )?;
+                if let Err(error) = window.protect_direct(page * PAGE_SIZE, PAGE_SIZE, protection) {
+                    for previous in restored {
+                        if window
+                            .protect_direct(
+                                previous * PAGE_SIZE,
+                                PAGE_SIZE,
+                                GuestPageProtection::new(self.perms[previous] & 7, true)?,
+                            )
+                            .is_err()
+                        {
+                            std::process::abort();
+                        }
+                    }
+                    return Err(error);
+                }
+                restored.push(page);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod private_copy_tests {
+    use super::*;
+    use crate::virtual_memory::{FaultClassification, GuestAccess};
+    #[test]
+    fn private_copy_direct_migration_preserves_bytes_and_retires_store_barriers() {
+        for enable_first in [false, true] {
+            let mut memory = Memory::reserve(0x10000, 2 * PAGE_SIZE).unwrap();
+            if enable_first {
+                memory.enable_direct_memory().unwrap();
+            }
+            memory
+                .map_private_copy_pages(0x10000, &[0x19; 2 * PAGE_SIZE], READ | WRITE)
+                .unwrap();
+            if !enable_first {
+                memory.enable_direct_memory().unwrap();
+            }
+            let mut bytes = [0; 4];
+            memory.read_into(0x10000, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x19; 4]);
+            let address = memory.direct_window().ptr.as_ptr() as usize;
+            assert_eq!(
+                memory
+                    .direct_window()
+                    .direct_fault_view()
+                    .unwrap()
+                    .classify(address, GuestAccess::Write),
+                FaultClassification::CodeWriteProtection
+            );
+            memory.write(0x10000, &[0x27]).unwrap();
+            assert_eq!(
+                memory
+                    .direct_window()
+                    .direct_fault_view()
+                    .unwrap()
+                    .classify(address, GuestAccess::Write),
+                FaultClassification::Accessible
+            );
+            memory.protect(0x11000, PAGE_SIZE, 0).unwrap();
+            memory.privatize_copy_pages(0x11000, PAGE_SIZE).unwrap();
+            assert_eq!(
+                memory
+                    .direct_window()
+                    .direct_fault_view()
+                    .unwrap()
+                    .classify(address + PAGE_SIZE, GuestAccess::Read),
+                FaultClassification::AccessViolation
+            );
+            memory.read_into(0x11000, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x19; 4]);
+            assert_eq!(memory.file_page_copy_on_write(0x11000), Some(false));
+        }
     }
 }
