@@ -31,6 +31,18 @@ struct Delivery {
 #[derive(Default)]
 struct Deliveries(BTreeMap<adv_machine::CtxId, Vec<Delivery>>);
 
+/// Process-wide filter used by the outer RTL thread-start exception frame.
+/// It is independent of the filter installed through kernel32.
+#[derive(Default)]
+struct RuntimeFilter(u32);
+
+// PHNT ntrtl.h declares VOID NTAPI RtlSetUnhandledExceptionFilter(pointer).
+// The SDK metadata does not currently carry this declaration.
+fn set_runtime_filter(env: &mut Env<'_>) -> Outcome {
+    env.ext.get_or_default::<RuntimeFilter>().0 = env.arg(0);
+    Outcome::Return(0)
+}
+
 fn retain(
     env: &mut Env<'_>,
     kind: Kind,
@@ -83,6 +95,13 @@ static JUMP: GuestCode = GuestCode {
     links: &[],
 };
 pub(super) fn register(reg: &mut Registry) {
+    crate::stdcall(
+        reg,
+        "ntdll.dll",
+        "RtlSetUnhandledExceptionFilter",
+        1,
+        set_runtime_filter,
+    );
     reg.add(
         "<win32>",
         "<exception_jump>",
@@ -299,6 +318,29 @@ fn terminal(env: &mut Env<'_>, record: &Record) -> Outcome {
         "unhandled Windows exception {:#010x} at {:#010x} (second chance)",
         record.code, record.address
     ))
+}
+
+/// Reaching the valid end of the guest SEH chain reaches the RTL startup
+/// boundary. A malformed chain or an explicit second chance must not call it.
+pub(super) fn thread_unhandled(env: &mut Env<'_>, search: Search) -> Outcome {
+    let filter = env.ext.get_or_default::<RuntimeFilter>().0;
+    if filter == 0 {
+        return unhandled(env, search);
+    }
+    Outcome::call_on_stack(
+        filter,
+        [search.scratch + POINTERS],
+        search.scratch.min(env.cpu.reg(Reg::Esp)),
+        move |env, result| match result.value() {
+            u32::MAX => super::resume(env, search),
+            0 => unhandled(env, search),
+            1 => terminal(env, &search.record),
+            value => Outcome::Fail(format!(
+                "invalid RTL exception filter disposition {value:#x}"
+            )),
+        },
+    )
+    .unwindable()
 }
 
 /// Exhausted first-chance search reaches the same live NT service, with FALSE.

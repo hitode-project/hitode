@@ -106,6 +106,7 @@ pub struct Thunk {
     /// Registered host transport identity, distinct from a numeric system service.
     pub transport_token: Option<TransportToken>,
     pristine: Vec<u8>,
+    export_entry: Option<Vec<u8>>,
 }
 
 /// Opaque word transported on the guest stack. Its identity survives ordinary
@@ -189,6 +190,7 @@ impl ThunkTable {
             requested: false,
             guest_slot: None,
             transport_token: None,
+            export_entry: None,
             pristine: {
                 let mut pad = Asm::new(thunk_addr(RETURN_PAD));
                 pad.trap().hlt();
@@ -215,6 +217,7 @@ impl ThunkTable {
                     guest_slot: None,
                     transport_token: None,
                     pristine: Vec::new(),
+                    export_entry: None,
                 },
             ],
             by_name: HashMap::new(),
@@ -237,6 +240,31 @@ impl ThunkTable {
     /// Borrow the encoding retained when this binding was first published.
     pub fn pristine_entry_bytes(&self, index: u32) -> &[u8] {
         &self.get(index).pristine
+    }
+
+    /// Personality-owned public veneer, independent of the private host transport.
+    pub fn set_export_entry(&mut self, index: u32, bytes: Vec<u8>) {
+        assert!(!bytes.is_empty() && bytes.len() <= THUNK_STRIDE as usize);
+        self.thunks[index as usize].export_entry = Some(bytes);
+    }
+
+    pub fn export_entry_bytes(&self, index: u32) -> &[u8] {
+        self.get(index)
+            .export_entry
+            .as_deref()
+            .unwrap_or_else(|| self.pristine_entry_bytes(index))
+    }
+
+    pub fn export_entry_matches(
+        &self,
+        cpu: &dyn Guest,
+        index: u32,
+        address: u32,
+    ) -> Result<bool, MemFault> {
+        let expected = self.export_entry_bytes(index);
+        let mut live = [0; THUNK_STRIDE as usize];
+        cpu.read(address, &mut live[..expected.len()])?;
+        Ok(&live[..expected.len()] == expected)
     }
 
     /// Inspect current bytes without allocating or trusting the mutable thunk page.
@@ -444,6 +472,7 @@ impl ThunkTable {
             guest_slot,
             transport_token: Some(token),
             pristine,
+            export_entry: None,
         });
         self.by_name.entry(key.0).or_default().insert(key.1, index);
         self.by_transport.insert(token, index);

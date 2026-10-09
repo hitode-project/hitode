@@ -10,6 +10,63 @@ use adv_machine::{
 
 mod win7;
 
+/// Publish callable native service veneers only for existing implementations.
+/// They execute the native x86 EAX/EDX ABI directly and need no shared-data page.
+/// Unimplemented named exports retain the existing strict/discovery policy.
+pub(crate) fn install<B: adv_cpu::backend::Backend>(
+    m: &mut adv_machine::Machine<B>,
+) -> Result<(), adv_cpu::backend::MemFault> {
+    let profile = m.ext.get::<crate::Win32>().cfg.personality;
+    if (profile.major, profile.minor, profile.build) != (6, 1, 7601) {
+        return Ok(());
+    }
+    let entries: Vec<_> = win7::WIN7_SP1
+        .iter()
+        .enumerate()
+        .filter_map(|(id, &name)| {
+            let resolver = m.sys.thunks.resolver();
+            if !resolver.implemented("ntdll.dll", name) {
+                return None;
+            }
+            let function = resolver.host_fn("ntdll.dll", name)?;
+            let adv_machine::Conv::Stdcall { argc } = function.conv else {
+                return None;
+            };
+            Some((id as u32, name, argc, function))
+        })
+        .collect();
+    for (id, name, argc, function) in entries {
+        let alias = format!("Zw{}", &name[2..]);
+        // Nt/Zw user-mode exports identify the same service. Reuse the exact
+        // implementation and opaque binding data, including declarations whose
+        // Zw signature is absent from the SDK metadata set.
+        if let Some(registry) = m.sys.thunks.resolver_mut::<adv_abi::Registry>() {
+            registry.add_with_data(
+                "ntdll.dll",
+                &alias,
+                function.conv,
+                function.handler,
+                function.data,
+            );
+            registry.set_trace("ntdll.dll", &alias, function.trace);
+        }
+        let mut code = adv_cpu::backend::asm::Asm::new(0);
+        code.bytes.push(0xb8);
+        code.bytes.extend(id.to_le_bytes());
+        code.bytes.extend([0x8d, 0x54, 0x24, 0x04]);
+        code.trap().ret_n(u16::from(argc) * 4);
+        for export in [name, &alias] {
+            if !m.sys.thunks.resolver().implemented("ntdll.dll", export) {
+                continue;
+            }
+            let entry = m.sys.thunks.publish(&mut m.cpu, "ntdll.dll", export)?;
+            let index = (entry - THUNK_BASE) / THUNK_STRIDE;
+            m.sys.thunks.set_export_entry(index, code.bytes.clone());
+        }
+    }
+    Ok(())
+}
+
 const INVALID_SYSTEM_SERVICE: u32 = 0xc000_001c;
 const NOT_IMPLEMENTED: u32 = 0xc000_0002;
 const ACCESS_VIOLATION: u32 = 0xc000_0005;

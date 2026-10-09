@@ -4,7 +4,7 @@ pub(super) mod context;
 mod mapping;
 mod native;
 pub(super) mod phase;
-mod system_service;
+pub(super) mod system_service;
 pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
@@ -430,7 +430,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
     }
     if frame == u32::MAX {
-        return native::unhandled(env, search);
+        return native::thread_unhandled(env, search);
     }
     // Bound malformed chains instead of repeatedly calling their handlers.
     if search.searched >= LIMIT {
