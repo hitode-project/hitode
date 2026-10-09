@@ -205,9 +205,9 @@ impl Interpreter {
             }
             decoded
         };
-        let execution = execute_decoded(decoded, state, memory, max_units, None);
+        let execution = execute_decoded(&decoded, state, memory, max_units, None);
         if let Some(retired) = &mut self.frame_retired {
-            *retired += retired_instruction(decoded, execution, state, pc);
+            *retired += retired_instruction(&decoded, execution, state, pc);
         }
         execution
     }
@@ -283,7 +283,7 @@ enum MmxCache {
 }
 
 fn execute_decoded(
-    decoded: Decoded,
+    decoded: &Decoded,
     state: &mut CpuState,
     memory: &mut Memory,
     max_units: u32,
@@ -298,7 +298,7 @@ fn execute_decoded(
         Decoded::Ready(i) => i,
         Decoded::Stop(result) => {
             return Execution {
-                step: result,
+                step: *result,
                 units: 0,
             };
         }
@@ -330,7 +330,7 @@ fn execute_decoded(
             };
         }
         Decoded::Extended(i, operation, opcode) => {
-            let x87 = operation == crate::floating::Operation::X87;
+            let x87 = *operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
             if let Some(dirty) = deferred_mmx.as_deref()
                 && *dirty == MmxCache::Deferred
@@ -340,7 +340,7 @@ fn execute_decoded(
                 // aliases. Materialize the completed x87 prefix before it runs.
                 state.refresh_mmx();
             }
-            let step = crate::floating::execute(&i, operation, opcode, state, memory, !defer);
+            let step = crate::floating::execute(i, *operation, *opcode, state, memory, !defer);
             let completed = step == Step::Executed;
             if let Some(cache) = deferred_mmx {
                 if completed {
@@ -459,7 +459,7 @@ enum Decoded {
     Stop(Step),
 }
 
-fn retired_instruction(decoded: Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
+fn retired_instruction(decoded: &Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
     if execution.units == 0 {
         return 0;
     }
@@ -829,7 +829,7 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut retire: impl FnMut(Decoded, Execution, &CpuState, u32),
+        mut retire: impl FnMut(&Decoded, Execution, &CpuState, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -839,7 +839,8 @@ impl DecodedBlock {
         let mut last_units = 0;
         let mut deferred_mmx = MmxCache::Unknown;
         let mut index = 0;
-        while let Some(&(pc, decoded)) = self.instructions.get(index) {
+        while let Some((pc, decoded)) = self.instructions.get(index) {
+            let pc = *pc;
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }

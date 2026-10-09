@@ -129,7 +129,7 @@ impl Plan {
     }
 
     fn read(
-        self,
+        &self,
         from: Location,
         width: u8,
         address: u32,
@@ -164,7 +164,12 @@ impl Plan {
         Ok(bytes)
     }
 
-    pub(super) fn execute(self, state: &mut CpuState, memory: &mut Memory, coherent: bool) -> Step {
+    pub(super) fn execute(
+        &self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        coherent: bool,
+    ) -> Step {
         let pc = state.eip;
         // MMX checks the pending x87 exception before alignment or memory.
         if self.mmx && state.x87.status & 0x80 != 0 {

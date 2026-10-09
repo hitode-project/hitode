@@ -120,16 +120,16 @@ fn checked_scalar_forms_match_transactions_and_decline_without_effects() {
                         let before = actual.clone();
                         let mut probe = actual.clone();
                         let mut probe_memory = Memory::new(0x10000, PAGE_SIZE).unwrap();
-                        if execute(fast, &mut probe, &mut probe_memory).is_none() {
+                        if execute(&fast, &mut probe, &mut probe_memory).is_none() {
                             assert_eq!(probe, before, "{:?}", i.code());
                             declines += 1;
                         } else {
                             successes += 1;
                         }
                         let got =
-                            execute_decoded(Decoded::Ready(fast), &mut actual, &mut a, 1, None);
+                            execute_decoded(&Decoded::Ready(fast), &mut actual, &mut a, 1, None);
                         let want = execute_decoded(
-                            Decoded::Ready(reference),
+                            &Decoded::Ready(reference),
                             &mut expected,
                             &mut b,
                             1,

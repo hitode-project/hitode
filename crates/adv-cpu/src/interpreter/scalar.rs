@@ -88,7 +88,7 @@ pub(super) fn eligible(action: Action) -> bool {
 /// Decline without changing state or memory. Shared, executable writes,
 /// cross-page and denied ranges retain the full checked transaction, including
 /// its fault priority. Every successful arm validates before its first commit.
-pub(super) fn execute(i: Predecoded, state: &mut CpuState, memory: &mut Memory) -> Option<()> {
+pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory) -> Option<()> {
     let mut next = i.next;
     match i.action {
         Action::Mov(dst, src, extend) => {

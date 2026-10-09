@@ -235,7 +235,7 @@ pub(super) fn eligible(action: Action) -> bool {
 
 /// The eligibility bit is cached during predecode so other forms never need
 /// this second dispatch. Keep a defensive rejection before any state mutation.
-pub(super) fn execute(instruction: Predecoded, state: &mut CpuState) -> bool {
+pub(super) fn execute(instruction: &Predecoded, state: &mut CpuState) -> bool {
     use Operand::{Immediate, Register};
     let mut next = instruction.next;
     match instruction.action {
@@ -418,7 +418,7 @@ mod tests {
                     expected.regs = tx.regs;
                     expected.eflags = tx.flags;
                     expected.eip = tx.eip;
-                    assert!(execute(instruction, &mut state), "{:?}", i.code());
+                    assert!(execute(&instruction, &mut state), "{:?}", i.code());
                     assert_eq!(
                         state,
                         expected,
