@@ -104,7 +104,7 @@ fn arithmetic_then_wait_matches_hardware_across_controls_and_special_values() {
             a.wait().unwrap();
         });
         let mut mem = memory(&code);
-        let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut mem).unwrap();
         for pc in [0, 2, 3] {
             for rc in 0..4 {
                 let control = 0x7f | pc << 8 | rc << 10;
@@ -173,7 +173,7 @@ fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 .unwrap();
             });
             let mut mem = memory(&code);
-            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem).unwrap();
             let mut seed = 0xd93f_517a_982b_410du64;
             let random = (0..8192).map(|_| (bounded(&mut seed), bounded(&mut seed)));
             let edges = edge.iter().flat_map(|&a| edge.iter().map(move |&b| (a, b)));
@@ -269,7 +269,7 @@ fn single_precision_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 .unwrap();
             });
             let mut mem = memory(&code);
-            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem).unwrap();
             let mut seed = 0x6a09_e667_f3bc_c909u64;
             // Nearby exponents make sums with exact, halfway and carrying tails.
             let random = (0..8192).map(|n| {

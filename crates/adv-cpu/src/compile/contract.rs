@@ -187,9 +187,6 @@ pub(crate) struct NativeContext {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub recovery_slot: *const std::cell::Cell<usize>,
     pub linked_entries: u64,
-    /// Exclusive metadata borrowed for this chain. Cleared before/after native
-    /// execution, so it cannot retain a target across publication or retirement.
-    pub shadow: *mut crate::linking::shadow::Stack,
 }
 
 impl Emitter<'_> {
@@ -198,7 +195,6 @@ impl Emitter<'_> {
         pc: Value,
         target_hash: Option<Value>,
         reason: Option<Value>,
-        prediction: Option<Value>,
     ) {
         self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Link));
         let returned = self.b.create_block();
@@ -254,16 +250,6 @@ impl Emitter<'_> {
         self.b.switch_to_block(search_ready);
         let hit = self.b.create_block();
         self.b.append_block_param(hit, self.ptr_ty);
-        if let Some(prediction) = prediction {
-            let valid = self.b.ins().icmp_imm(IntCC::NotEqual, prediction, 0);
-            let predicted = self.b.create_block();
-            let search_only = self.b.create_block();
-            self.b.ins().brif(valid, predicted, &[], search_only, &[]);
-            self.b.switch_to_block(predicted);
-            self.shadow_hit();
-            self.b.ins().jump(hit, &[prediction.into()]);
-            self.b.switch_to_block(search_only);
-        }
         let mask = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),

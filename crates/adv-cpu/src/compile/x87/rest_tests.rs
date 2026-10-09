@@ -119,7 +119,7 @@ fn raw80_and_division_recoveries_keep_every_budget_prefix_and_entry() {
                     let mut actual_memory = memory(&code);
                     let mut reference = memory(&code);
                     let region = Region::new(CODE, code.len());
-                    let compiled = compile(&region, &mut actual_memory, false).unwrap();
+                    let compiled = compile(&region, &mut actual_memory).unwrap();
                     let mut actual = input(value, ext(3.0));
                     actual.x87.control = control;
                     actual.x87.status &= !0x3f;

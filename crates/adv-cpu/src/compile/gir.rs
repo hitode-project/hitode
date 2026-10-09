@@ -211,7 +211,6 @@ mod tests {
                 links: None,
                 stop: 0,
                 interrupt: &interrupt,
-                shadow: None,
             },
         );
         (compiled, exit)

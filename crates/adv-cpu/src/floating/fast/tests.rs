@@ -315,12 +315,8 @@ fn differential(compiled: bool) {
         let before = testing::calls();
         let result = if compiled {
             let code = cache.entry(bytes.clone()).or_insert_with(|| {
-                crate::compile::compile(
-                    &crate::Region::new(CODE, bytes.len()),
-                    &mut fast_memory,
-                    false,
-                )
-                .unwrap_or_else(|error| panic!("compile {:?}: {error}", instruction.mnemonic()))
+                crate::compile::compile(&crate::Region::new(CODE, bytes.len()), &mut fast_memory)
+                    .unwrap_or_else(|error| panic!("compile {:?}: {error}", instruction.mnemonic()))
             });
             testing::run(code, &mut actual, &mut fast_memory)
         } else {

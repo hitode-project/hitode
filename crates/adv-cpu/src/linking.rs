@@ -1,6 +1,5 @@
 //! Versioned native entry slots. Only the owning execution thread publishes or
 //! retires code, between native calls. Generated tail calls never own code pages.
-pub(crate) mod shadow;
 
 pub(crate) const PROBES: usize = 8;
 pub(crate) const CHAIN_LIMIT: u32 = 1024;

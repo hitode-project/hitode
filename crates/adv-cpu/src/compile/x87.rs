@@ -136,14 +136,7 @@ impl Emitter<'_> {
         self.exit(Exit::Fallback, next);
         self.b.switch_to_block(done);
         self.b.seal_block(done);
-        if self.shadow_ref.is_some() {
-            let absent = self.b.ins().iconst(self.ptr_ty, 0);
-            self.b
-                .ins()
-                .jump(self.dispatch, &[next.into(), absent.into()]);
-        } else {
-            self.b.ins().jump(self.dispatch, &[next.into()]);
-        }
+        self.b.ins().jump(self.dispatch, &[next.into()]);
     }
 
     /// Emit an admitted operation plus a cold, in-region helper continuation.
@@ -958,7 +951,6 @@ pub(crate) mod testing {
                     rows: None,
                     stop: 0,
                     interrupt: &interrupt,
-                    shadow: None,
                 },
             )
             .0

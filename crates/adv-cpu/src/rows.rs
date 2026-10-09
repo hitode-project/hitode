@@ -654,7 +654,6 @@ fn execute(batch: &Batch) {
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             recovery_slot: std::ptr::null(),
             linked_entries: 0,
-            shadow: std::ptr::null_mut(),
             rows: std::ptr::null(),
             written: 0,
         };
@@ -1116,7 +1115,6 @@ mod tests {
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
                 linked_entries: 0,
-                shadow: std::ptr::null_mut(),
                 rows: &pool,
                 written: 0,
             };
@@ -1203,7 +1201,6 @@ mod tests {
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
                 linked_entries: 0,
-                shadow: std::ptr::null_mut(),
                 rows: &pool,
                 written: 0,
             };

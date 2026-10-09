@@ -282,9 +282,9 @@ mod tests {
         machine.write(0x10000, &bytes).unwrap();
         machine.protect(0x10000, 4096, READ | EXEC).unwrap();
         let region = Region::new(0x10000, bytes.len());
-        let plain = super::super::compile(&region, &mut machine.memory, false).unwrap();
+        let plain = super::super::compile(&region, &mut machine.memory).unwrap();
         testing::FORCE.set(true);
-        let tagged = super::super::compile(&region, &mut machine.memory, false);
+        let tagged = super::super::compile(&region, &mut machine.memory);
         testing::FORCE.set(false);
         let tagged = tagged.unwrap();
         // Only per-compilation heap pointers (x87 operation descriptors) may

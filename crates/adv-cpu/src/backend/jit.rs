@@ -51,9 +51,6 @@ impl JitCpu {
     pub fn set_region_linking(&mut self, enabled: bool) {
         self.inner.set_region_linking(enabled);
     }
-    pub fn set_shadow_returns(&mut self, enabled: bool) -> Result<(), String> {
-        self.inner.set_shadow_returns(enabled)
-    }
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.inner.set_async_compilation(enabled);
     }
