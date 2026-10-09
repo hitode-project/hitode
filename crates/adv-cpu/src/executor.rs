@@ -46,6 +46,9 @@ pub struct Stats {
     pub compile_time: Duration,
     pub sync_compile_time: Duration,
     pub compile_wait_execution_ns: u64,
+    /// Opt-in chunk timings: deferred, queued, compiling, completed.
+    pub compile_wait_stage_ns: [u64; 4],
+    pub publication_ns: u64,
     /// Opt-in fallback lane timings, split by the existing entry reason.
     pub frame_reason_ns: [u64; 6],
     pub compile_wait_units: u64,
@@ -648,6 +651,7 @@ impl Executor {
             }
             return;
         }
+        let timer = self.frame_timing.then(Instant::now);
         self.native_heat.remove(&region.start);
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
@@ -688,6 +692,9 @@ impl Executor {
             .collect();
         self.index_region_with_pages(region, Some(pages));
         self.code.cache_revision += 1;
+        if let Some(timer) = timer {
+            self.stats.publication_ns += timer.elapsed().as_nanos() as u64;
+        }
     }
 
     fn retire_compiled(&mut self, start: u32) {
@@ -1904,8 +1911,8 @@ impl Executor {
                     .unwrap()
                     .saturating_sub(before);
             }
-            if let Some(timer) = wait_timer {
-                let elapsed = timer.elapsed().as_nanos() as u64;
+            let elapsed = wait_timer.map_or(0, |timer| timer.elapsed().as_nanos() as u64);
+            if wait_timer.is_some() {
                 // Tier 1 bridge time remains inclusive; frame reports identify
                 // that configuration rather than claiming pure Tier 0 time.
                 let index = crate::frame_counters::reason_index(if waiting {
@@ -1929,14 +1936,8 @@ impl Executor {
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
             if interpreted {
-                if matches!(
-                    detail,
-                    Some(
-                        InterpreterDetail::PendingCompilation
-                            | InterpreterDetail::DeferredCompilation
-                    )
-                ) {
-                    self.schedule_interpreted(pc, interpreted_units);
+                if waiting || reason == crate::InterpreterReason::Pending {
+                    self.schedule_interpreted(pc, interpreted_units, elapsed);
                 }
                 bridge.cliffs.interpreted(reason, interpreted_units);
                 if let Some(detail) = detail {
