@@ -11,6 +11,11 @@ ADV_DEVICE_TASK selects the shared broker task name (default bud).
 Output: summary.json/summary.md contain statistics only. Reports, actions, hashes,
 perf maps and failure logs stay under the explicit local artifact root. No APK,
 foreground change, server management, or native Windows comparison is performed.
+UX summaries use a complete ordered sequence for continuous presentation windows,
+estimated loss relative to authored cadence_ms or an explicitly labelled p20
+proxy, Ctrl commits/second, and cold title-gate time with inclusive cost subsets.
+Possible loading gaps and observer freezes are kept separate; a presentation
+candidate is not proof of animation, native cadence, or title interactivity.
 """
 from __future__ import annotations
 
@@ -50,7 +55,7 @@ BUDGET_NS = 33_300_000
 SCENES = ("title", "normal", "ctrl", "transition")
 REASONS = ("uncovered", "rejected", "pending", "interior", "fallback", "forced")
 HLE_GROUPS = ("graphics", "file", "audio", "other")
-CPU_FIELDS = ("tier0_units", "tier1_units", "tier2_blocks", "native_entries", "interpreter_entries",
+CPU_FIELDS = ("tier0_units", "tier2_blocks", "native_entries", "linked_entries", "interpreter_entries",
               "sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "invalidations",
               "recompilations", "compilations", "x87_helpers", "softfloat_calls", "retired_tier0_instructions")
 
@@ -65,13 +70,16 @@ def clean_row(row: dict) -> dict:
     result = numeric_fields(row, ("serial", "wall_ns", "active_ns", "guest_exec_ns", "present_call_ns",
                                  "wait_ns", "wait_overshoot_ns", "wait_timeouts", "core", "frequency_khz",
                                  "scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
-                                 "service_audio_ns", "service_graphics_ns", "scene_check_ns"))
+                                 "service_audio_ns", "service_graphics_ns", "scene_check_ns",
+                                 "present_interval_ns", "guest_delta_us", "file_read_bytes"))
     result.update(startup=row.get("startup") is True,
                   hle_ns=numeric_fields(row.get("hle_ns", {}), HLE_GROUPS),
                   native_reference="unmeasured")
+    result["operation_ns"] = numeric_fields(row.get("operation_ns", {}), ("text", "image_decode", "audio_decode"))
     cpu = row.get("cpu")
     result["cpu"] = None if cpu is None else numeric_fields(cpu, CPU_FIELDS) | {
-        "reasons": numeric_fields(cpu.get("reasons", {}), REASONS)}
+        "reasons": numeric_fields(cpu.get("reasons", {}), REASONS),
+        "reason_ns": numeric_fields(cpu.get("reason_ns", {}), REASONS)}
     result["top_apis"] = [dict(api=item["api"], **numeric_fields(item, ("ns", "calls")))
                           for item in row.get("top_apis", [])[:5]
                           if isinstance(item, dict) and isinstance(item.get("api"), str)
@@ -81,7 +89,6 @@ def clean_row(row: dict) -> dict:
 
 def execution_metrics(report: dict) -> dict:
     raw = baseline.execution_metrics(report)
-    tier1 = raw.get("tier1") or {}
     schedule = raw.get("compilation_schedule") or {}
     cache = report.get("code_cache") or {}
     aot = report.get("aot") or {}
@@ -90,9 +97,6 @@ def execution_metrics(report: dict) -> dict:
             ("hits", "misses", "rejected", "corrupt", "stored", "unsupported", "restore_ns", "evicted", "entries", "bytes")),
         "aot": numeric_fields(aot, ("images", "image_rejections", "candidates", "decoded_instructions", "budget_exhaustions",
             "compile_requests", "private_completions", "publications", "stale_candidates", "ready_regions", "ready_bytes")),
-        "tier1": numeric_fields(tier1, ("compilations", "compile_seconds", "fallback_entries",
-        "fallback_instructions", "native_entries", "bridge_entries", "bridge_units", "invalidations",
-        "publication_revisions", "publication_flushes", "cache_evictions", "compile_misses", "resident_bytes")),
         "compilation_schedule": numeric_fields(schedule, ("compile_threads", "available_cores", "duplicate_requests",
             "capacity_rejections", "window_deferrals", "worker_full"))}
 
@@ -152,6 +156,10 @@ def classify(row: dict) -> dict:
         candidates.append((cpu["sync_compile_ns"], "cold.sync_compile", "measured"))
     if cpu.get("compile_wait_execution_ns", 0) >= threshold:
         candidates.append((cpu["compile_wait_execution_ns"], "cold.compile_pending_execution", "measured_overlap"))
+    lane_times = cpu.get("reason_ns", {})
+    for name, duration in lane_times.items():
+        if name != "pending" and duration >= threshold:
+            candidates.append((duration, "execution.interpreter_" + name, "measured_overlap"))
     if hle:
         group, duration = max(hle.items(), key=lambda x: x[1])
         if duration >= threshold:
@@ -172,6 +180,10 @@ def classify(row: dict) -> dict:
             candidates.append((duration, cause, "measured"))
     if candidates:
         _, cause, confidence = max(candidates)
+    elif (lane_times and active > BUDGET_NS and cpu.get("tier2_blocks", 0)
+          and row.get("guest_exec_ns", 0) - sum(lane_times.values()) - cpu.get("sync_compile_ns", 0) >= active * .6):
+        # Entry/helper counts cannot outrank a measured small fallback lane.
+        cause, confidence = "structure.tier2_execution", "residual_hint"
     elif active > BUDGET_NS and cpu.get("softfloat_calls", 0) >= 1000:
         cause, confidence = "pathological.softfloat", "count_hint"
     elif active > BUDGET_NS and cpu.get("invalidations", 0) >= 8 and cpu.get("compilations", 0) >= 8:
@@ -200,7 +212,7 @@ def classify(row: dict) -> dict:
     for key in ("sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "softfloat_calls",
                 "interpreter_entries", "invalidations", "recompilations", "tier2_blocks"):
         evidence[key] = cpu.get(key)
-    evidence.update(hle_ns=hle, wait_ns=row.get("wait_ns"), wait_overshoot_ns=overshoot,
+    evidence.update(reason_ns=lane_times, hle_ns=hle, wait_ns=row.get("wait_ns"), wait_overshoot_ns=overshoot,
                     core=row.get("core"), frequency_khz=row.get("frequency_khz"), top_apis=row.get("top_apis", []),
                     **numeric_fields(row, ("scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
                                            "service_audio_ns", "service_graphics_ns", "scene_check_ns")))
@@ -253,6 +265,161 @@ def top_apis(rows: list[dict]) -> list[dict]:
     return [dict(api=api, ns=ns, calls=calls[api]) for api, ns in times.most_common(5)]
 
 
+def distribution(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    values = sorted(values)
+    return {"count": len(values), **{name: values[max(0, math.ceil(len(values) * p) - 1)]
+            for name, p in (("p20", .2), ("p50", .5), ("p95", .95), ("p99", .99), ("max", 1))}}
+
+
+def cost_totals(rows: list[dict]) -> dict:
+    """Disjoint wall lanes; compiler/fallback and operations are inclusive subsets."""
+    fields = ("wall_ns", "active_ns", "guest_exec_ns", "wait_ns", "wait_overshoot_ns",
+              "scheduler_ns", "frontend_ns", "control_pause_ns", "scene_check_ns",
+              "service_audio_ns", "service_graphics_ns", "file_read_bytes")
+    total = {key: sum(row.get(key, 0) for row in rows) for key in fields}
+    for key, names in (("hle_ns", HLE_GROUPS), ("operation_ns", ("text", "image_decode", "audio_decode"))):
+        total[key] = {name: sum(row.get(key, {}).get(name, 0) for row in rows) for name in names}
+    total["cpu"] = {key: sum((row.get("cpu") or {}).get(key, 0) for row in rows) for key in CPU_FIELDS}
+    for key in ("reasons", "reason_ns"):
+        total["cpu"][key] = {name: sum((row.get("cpu") or {}).get(key, {}).get(name, 0) for row in rows)
+                              for name in REASONS}
+    fallback_ns = sum(total["cpu"]["reason_ns"].values())
+    total["cpu"]["fallback_lane_ns"] = fallback_ns
+    total["cpu"]["native_dispatch_residual_ns"] = max(0, total["guest_exec_ns"]
+                                                       - total["cpu"]["sync_compile_ns"] - fallback_ns)
+    total["cpu"]["native_dispatch_entries"] = (max(0, total["cpu"]["native_entries"] - total["cpu"]["linked_entries"])
+        if all("linked_entries" in (row.get("cpu") or {}) for row in rows) else None)
+    total["top_apis_subset"] = top_apis(rows)
+    return total
+
+
+def animation_windows(rows: list[dict], cadence_ms: float | None = None) -> dict:
+    """Find continuous presentation windows, preserving uncertain load boundaries.
+
+    A provided cadence is an authored scene reference. Otherwise p20 of the
+    observed continuous intervals is only a self-cadence proxy, never a native
+    reference. IO-bearing gaps >=500ms separate *possible* loading; long compute
+    frames remain in animation windows. Diagnostic freezes split windows too.
+    """
+    if cadence_ms is not None and (type(cadence_ms) not in (int, float)
+            or not math.isfinite(cadence_ms) or cadence_ms <= 0):
+        raise ValueError("cadence_ms must be positive and finite")
+    chunks, chunk, boundaries = [], [], []
+    for row in rows:
+        interval = row.get("present_interval_ns")
+        if row.get("startup") or interval is None:
+            continue
+        observer = row.get("control_pause_ns", 0) + row.get("scene_check_ns", 0)
+        boundary = ("observer" if observer >= max(20_000_000, interval * .5) else
+                    "possible_loading" if interval >= 500_000_000 and row.get("file_read_bytes", 0) else
+                    "idle_or_loading_unknown" if interval >= 500_000_000 and row.get("wait_ns", 0) >= interval * .8 else None)
+        if boundary:
+            if chunk:
+                chunks.append(chunk)
+                chunk = []
+            boundaries.append({"serial": row["serial"], "kind": boundary,
+                               "interval_ms": interval / 1e6, "attribution": classify(row)})
+        else:
+            chunk.append(row)
+    if chunk:
+        chunks.append(chunk)
+    phases = []
+    for chunk in chunks:
+        # A sustained switch between work and waiting is a cadence boundary,
+        # not hundreds of lost animation frames inferred from an earlier burst.
+        modes = [r.get("wait_ns", 0) >= r.get("wall_ns", 0) * .7 for r in chunk]
+        begin = 0
+        mode = modes[0]
+        for i in range(8, len(chunk) - 7):
+            following = modes[i:i + 8]
+            if all(m == following[0] for m in following) and following[0] != mode:
+                phases.append(chunk[begin:i])
+                boundaries.append({"serial": chunk[i]["serial"], "kind": "cadence_phase_change",
+                                   "interval_ms": chunk[i]["present_interval_ns"] / 1e6})
+                begin, mode = i, following[0]
+        phases.append(chunk[begin:])
+    chunks = phases
+    windows = []
+    for chunk in chunks:
+        intervals = [r["present_interval_ns"] / 1e6 for r in chunk]
+        stats = distribution(intervals)
+        if len(chunk) < 8:
+            continue
+        cadence = cadence_ms if cadence_ms is not None else stats["p20"]
+        if cadence <= 0:
+            continue
+        missed = [max(0, math.floor(t / cadence + .5) - 1) for t in intervals]
+        runs, run = [], 0
+        for count in missed + [0]:
+            if count:
+                run += count
+            elif run:
+                runs.append(run)
+                run = 0
+        stalls = [r for r, count in zip(chunk, missed) if count]
+        windows.append({"start_serial": chunk[0]["serial"], "end_serial": chunk[-1]["serial"],
+            "interval_ms": stats, "cadence_ms": cadence,
+            "observed_frequency_hz": 1000 / stats["p50"] if stats["p50"] else None,
+            "cadence_reference": "scene_reference" if cadence_ms is not None else "observed_p20_proxy",
+            "waiting_dominated": sum(r.get("wait_ns", 0) >= r.get("wall_ns", 0) * .7 for r in chunk) >= len(chunk) * .7,
+            "estimated_missed_presents": sum(missed),
+            "gaps_missing_at_least_two": sum(count >= 2 for count in missed),
+            "consecutive_loss_events_at_least_two": sum(count >= 2 for count in runs),
+            "longest_consecutive_loss": max(runs, default=0),
+            "stalled_present_intervals": len(stalls), "costs": cost_totals(chunk),
+            "stall_costs": cost_totals(stalls),
+            "tier_up_publication_frames": sum((r.get("cpu") or {}).get("recompilations", 0) > 0 for r in chunk),
+            "stall_causes": dict(Counter(classify(r)["cause"] for r in stalls)),
+            "longest": dict(clean_row(max(chunk, key=lambda r: r["present_interval_ns"])),
+                            attribution=classify(max(chunk, key=lambda r: r["present_interval_ns"])))})
+    return {"scope": "continuous_presentation_candidates", "native_reference": "unmeasured",
+            "unclassified_frames": len(rows) - sum(w["interval_ms"]["count"] for w in windows)
+                - sum(b["kind"] != "cadence_phase_change" for b in boundaries),
+            "windows": windows, "boundaries": sorted(boundaries, key=lambda b: b["serial"])}
+
+
+def ux_metrics(budget: dict, definition: dict) -> dict:
+    """Reject sparse/evicted sequences for cadence and whole-window cost totals."""
+    rows = [clean_row(row) for row in budget.get("sequence", [])]
+    serials = [row.get("serial") for row in rows]
+    complete = (len(rows) == budget.get("frames") and bool(rows)
+                and budget.get("sequence_dropped", 0) == 0
+                and budget.get("coalesced_frames", 0) == 0
+                and all(type(s) is int for s in serials)
+                and all(b == a + 1 for a, b in zip(serials, serials[1:])))
+    result = {"sequence_complete": complete, "retained_frames": len(rows),
+              "dropped_frames": budget.get("sequence_dropped"),
+              "file_read_scope": "ReadFile_returned_bytes_including_live_NT_bridge",
+              "image_decode_scope": "recognized_HLE_APIs_only_guest_decode_unmeasured"}
+    if complete:
+        result.update(costs=cost_totals(rows), animation=animation_windows(rows, definition.get("cadence_ms")))
+    else:
+        result["reason"] = "full_contiguous_sequence_required"
+    return result
+
+
+def first_entry(directory: Path, checkpoint: str, cold: bool, ux: dict, gated: bool) -> dict:
+    """Cold title gate elapsed time includes authored startup delays and input."""
+    if not cold or not gated:
+        return {"status": "unmeasured", "reason": "cold_verified_title_gate_required"}
+    actions = load_json(directory / "actions.json", [])
+    report = next((a for a in actions if a.get("command", "").endswith("/" + checkpoint + ".json")
+                   or a.get("command", "").endswith("\\" + checkpoint + ".json")), None)
+    # The acknowledgement, rather than a wall-clock frame total, observes title
+    # arrival; the later checkpoint serialization is outside this upper bound.
+    title = next((a for a in reversed(actions[:actions.index(report)])
+                  if a.get("command", "").startswith("await-frame ")) if report else None, None)
+    elapsed = title.get("ack_seconds") if title else None
+    valid = type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed > 0
+    return {"status": "observed_upper_bound" if valid else "unmeasured",
+            "seconds": elapsed if valid else None, "includes_authored_delays_and_input": True,
+            "cache_state": "empty_overlay_and_discovery_profile_caller_required",
+            "title_interactivity": "title_pixels_only_following_input_requires_review", "costs": ux.get("costs"),
+            "cost_scope": "completed_present_intervals_tail_not_included"}
+
+
 def load_json(path: Path, default=None):
     return json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else default
 
@@ -293,9 +460,57 @@ def fixed_segment(directory: Path, scenario: dict, checkpoint: str) -> dict | No
             return {"seconds": elapsed,
                     "start_frame": start["frames"], "end_frame": end["frames"],
                     "advanced_frames": end["frames"] - start["frames"],
+                    "commits_per_second": (end["frames"] - start["frames"]) / elapsed,
+                    "time_skip_delta": {key: end["time_skip"][key] - start["time_skip"][key]
+                        for key in ("jumps", "skipped_guest_us")
+                        if type((end.get("time_skip") or {}).get(key)) is int
+                        and type((start.get("time_skip") or {}).get(key)) is int
+                        and end["time_skip"][key] >= start["time_skip"][key]},
                     "endpoint_hashes_matched": True, "independent_reference": False,
                     "includes_input_delivery": True}
     return None
+
+
+def timed_ctrl_segment(directory: Path, scenario: dict, checkpoint: str) -> dict | None:
+    """Verified held Ctrl from a frozen start, with an explicit timed-work scope."""
+    definition = scenario["scenes"]["ctrl"]
+    start_name = definition.get("start_checkpoint")
+    start, end = (load_json(directory / f"{name}.json", {}) for name in (start_name, checkpoint))
+    if (not start or not end or start.get("scene_gate", {}).get("frozen") is not True
+            or start.get("scene_gate", {}).get("pending") is not False):
+        return None
+    try:
+        baseline.valid_report(start, "timed Ctrl start")
+        baseline.valid_report(end, "timed Ctrl end")
+    except (ValueError, RuntimeError, TypeError, KeyError):
+        return None
+    steps = scenario["schedule"].get("steps", [])
+    step = next((s for s in steps if s.get("checkpoint") == start_name), {})
+    if start.get("frame_fnv1a64") != step.get("await", {}).get("frame_fnv1a64"):
+        return None
+    actions = load_json(directory / "actions.json", [])
+    name_matches = lambda a: a.get("command", "").replace("\\", "/").endswith("/" + checkpoint + ".json")
+    end_index = next((i for i, a in enumerate(actions) if a.get("command", "").startswith("report ") and name_matches(a)), None)
+    if end_index is None:
+        return None
+    down_index = next((i for i in range(end_index - 1, -1, -1) if actions[i].get("command") == "key-down 17"), None)
+    if down_index is None or any(a.get("command") == "key-up 17" for a in actions[down_index + 1:end_index]):
+        return None
+    down = actions[down_index]
+    release = next((a for a in actions[end_index + 1:] if a.get("command") == "key-up 17"), None)
+    if not release or any(not replay.valid_acknowledgement(a["command"], a.get("ack") or a.get("reply") or "") for a in (down, release)):
+        return None
+    seconds = actions[end_index]["sent_seconds"] - down["ack_seconds"]
+    frames = end["frames"] - start["frames"]
+    if not math.isfinite(seconds) or seconds <= 0 or frames <= 0:
+        return None
+    return {"seconds": seconds, "advanced_frames": frames, "commits_per_second": frames / seconds,
+            "start_hash_matched": True, "held_key_verified": True, "fixed_workload": False,
+            "includes_input_delivery": True, "reference": "fixed_start_timed_observation",
+            "time_skip_delta": {key: end["time_skip"][key] - start["time_skip"][key]
+                for key in ("jumps", "skipped_guest_us") if type((end.get("time_skip") or {}).get(key)) is int
+                and type((start.get("time_skip") or {}).get(key)) is int
+                and end["time_skip"][key] >= start["time_skip"][key]}}
 
 
 def summarize_run(directory: Path, scenario: dict, heat: str, platform: str, native_rate: int | None = None) -> list[dict]:
@@ -346,13 +561,21 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str, nat
                            execution=execution_metrics(report), config=baseline.report_config(report),
                            wait_diagnostics=wait_metrics(report),
                            time_skip=numeric_fields(report.get("time_skip") or {}, ("jumps", "skipped_guest_us")))
+                row["ux"] = ux_metrics(report["frame_budget"], definition)
+                if name == "title":
+                    row["ux"]["first_entry"] = first_entry(directory, checkpoint, heat == "cold", row["ux"], "await" in step)
                 if name == "ctrl":
                     row["fixed_segment"] = fixed_segment(directory, scenario, checkpoint)
                     if row["fixed_segment"] is None:
-                        row.update(status="skipped", reason="fixed_endpoint_not_verified")
+                        row["ctrl_segment"] = timed_ctrl_segment(directory, scenario, checkpoint) if definition.get("measurement") == "held_observation" else None
+                        if row["ctrl_segment"] is None:
+                            row.update(status="skipped", reason="ctrl_window_not_verified")
             except (ValueError, RuntimeError, KeyError, TypeError, AssertionError) as error:
                 reason = "pcm_incomplete" if "missing PCM frames" in str(error) else "checkpoint_validation_failed"
                 row.update(status="blocked", reason=reason)
+                if reason == "pcm_incomplete" and report.get("frame_budget"):
+                    # Retain diagnostic statistics without changing acceptance.
+                    row["rejected_ux"] = ux_metrics(report["frame_budget"], definition)
         result.append(row)
     # Keep startup failures useful without promoting their frames to a reached scene.
     fallback = load_json(directory / "blocked.json") or load_json(directory / "final.json")
@@ -371,7 +594,7 @@ def markdown(rows: list[dict]) -> str:
         metrics = row.get("metrics", {})
         number = lambda key: f"{metrics[key] / 1e6:.2f}" if metrics.get(key) is not None else "—"
         counts = f"{metrics['over_budget_frames']}/{metrics['frames']}" if metrics else "—"
-        segment = row.get("fixed_segment")
+        segment = row.get("fixed_segment") or row.get("ctrl_segment")
         elapsed = f"{segment['seconds']:.3f}" if segment else "—"
         causes = ", ".join(f"{k}:{v}" for k, v in metrics.get("cause_distribution_retained", {}).items()) or "—"
         text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {row['status']} | {counts} | {number('max_wall_ns')} | {number('max_active_ns')} | {number('p99_wall_ns')} | {elapsed} | {causes} |")
@@ -380,13 +603,27 @@ def markdown(rows: list[dict]) -> str:
     for row in rows:
         for api in row.get("metrics", {}).get("top_apis_retained", []):
             text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {api['api']} | {api['ns']/1e6:.3f} | {api['calls']} |")
-    text += ["", "## 原生部分估算", "", "仅 Tier 0 已确认退休指令；Tier 1/2 未计。使用最快合成 x64 速率的条件下界估算，不排除任何帧。", "",
+    text += ["", "## 原生部分估算", "", "仅 Tier 0 已确认退休指令；Tier 2 未计。使用最快合成 x64 速率的条件下界估算，不排除任何帧。", "",
              "| 游戏 | 场景 | 冷/热 | native_over_budget_estimate（保留 serial） |", "|---|---|---|---|"]
     for row in rows:
         reference = row.get("metrics", {}).get("native_reference", {})
         if reference.get("status") == "partial_estimate":
             serials = reference["over_budget_estimate_retained"]
             text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {', '.join(map(str, serials)) or '无'} |")
+    text += ["", "## 体验诊断", "", "连续呈现候选段；p20 自节奏仅为估计，未经原生节奏验证。读取量为 ReadFile 返回字节，含缓存。", "",
+             "| 游戏 | 场景 | 冷/热 | 连续段 | p50/p95/最长 ms | 自节奏 ms | 估计丢呈现 | 连丢≥2事件 |", "|---|---|---|---:|---|---:|---:|---:|"]
+    for row in rows:
+        for index, window in enumerate(row.get("ux", {}).get("animation", {}).get("windows", []), 1):
+            d = window["interval_ms"]
+            text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {index} | {d['p50']:.2f}/{d['p95']:.2f}/{d['max']:.2f} | {window['cadence_ms']:.2f} | {window['estimated_missed_presents']} | {window['consecutive_loss_events_at_least_two']} |")
+    text += ["", "| 游戏 | 冷/热 | Ctrl 提交/s | 冷到标题门控上界 s |", "|---|---|---:|---:|"]
+    for row in rows:
+        segment = row.get("fixed_segment") or row.get("ctrl_segment") or {}
+        first = row.get("ux", {}).get("first_entry", {})
+        if row["scene"] in ("title", "ctrl"):
+            rate, elapsed = segment.get("commits_per_second"), first.get("seconds")
+            text.append(f"| {row['game']} | {row['heat']} | {rate:.2f}" if rate is not None else f"| {row['game']} | {row['heat']} | —")
+            text[-1] += f" | {elapsed:.3f} |" if elapsed is not None else " | — |"
     return "\n".join(text) + "\n"
 
 
@@ -568,7 +805,7 @@ def run(args) -> None:
     binary = frozen / binary.name
     scenarios = []
     for name in args.games:
-        path = SCENARIOS / f"frame-budget-{name}.json"
+        path = getattr(args, "scenario_dir", SCENARIOS) / f"frame-budget-{name}.json"
         scenario = load_json(path)
         scenario["scenario_sha256"] = digest(path)
         game = (samples / scenario["game_dir"]).resolve(strict=True)
@@ -725,6 +962,7 @@ def main() -> None:
     execute.add_argument("--retry-undeployed", action="store_true", help="with resume, retain then retry attempts that never launched a replay session")
     execute.add_argument("--binary-source-revision", help="explicit source revision of the supplied runner, if known")
     execute.add_argument("--games", nargs="+", default=["majiro", "bgi", "softpal", "kirikiri", "himawari"])
+    execute.add_argument("--scenario-dir", type=Path, default=SCENARIOS, help="local platform-specific gates derived from the existing scenarios")
     execute.add_argument("--heats", nargs="+", choices=("cold", "warm"), default=["cold", "warm"])
     execute.add_argument("--seed-root", type=Path)
     execute.add_argument("--font-profile-source", type=Path)

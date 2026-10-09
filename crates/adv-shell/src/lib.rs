@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 
 struct Options {
-    guest_workers: usize,
     row_workers: Option<usize>,
     row_batching: bool,
     exe: PathBuf,
@@ -63,7 +62,6 @@ struct Options {
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
-  --guest-workers 1|2     default: 1; experimental 2 requires Windows x64/Fast\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
@@ -112,7 +110,6 @@ impl Options {
         let mut exe = None;
         let mut data_dir = None;
         let mut options = Self {
-            guest_workers: 1,
             row_workers: None,
             row_batching: true,
             exe: PathBuf::new(),
@@ -201,13 +198,6 @@ impl Options {
                         "936" => 936,
                         _ => return Err("--codepage must be 932 or 936".into()),
                     };
-                }
-                "--guest-workers" => {
-                    options.guest_workers =
-                        value()?.parse().map_err(|_| "invalid guest worker count")?;
-                    if !matches!(options.guest_workers, 1 | 2) {
-                        return Err("--guest-workers must be 1 or 2".into());
-                    }
                 }
                 "--row-workers" => {
                     let workers: usize =
@@ -312,14 +302,6 @@ impl Options {
         }
         if options.frames == Some(0) {
             return Err("--frames must be positive".into());
-        }
-        if options.guest_workers > 1
-            && (!options.jit
-                || options.compile_strategy != CompileStrategy::Fast
-                || options.profile
-                || !options.async_compilation)
-        {
-            return Err("two guest workers require JIT, Fast and asynchronous compilation; per-PC profiling is not yet supported".into());
         }
         Ok(Some(options))
     }
@@ -668,8 +650,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
     );
     let stats = runtime.machine.cpu.stats();
-    let parallel = runtime.machine.cpu.parallel_stats();
-    let parallel_json = parallel_report(&parallel);
     #[cfg(feature = "gpu")]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
@@ -771,42 +751,38 @@ fn build_report(context: ReportContext<'_>) -> String {
         json(&module.name), json(&format!("{:?}", module.kind)), module.base, module.size, module.exports_by_name.len()
     )).collect::<Vec<_>>().join(", ");
     let context_runs = runtime.machine.sys.scheduling.contexts.iter().enumerate()
-        .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{},\"parallel_dispatches\":{}}}",
-            r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns, r.parallel_dispatches))
+        .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{}}}",
+            r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns))
         .collect::<Vec<_>>().join(",");
-    let tier1 = runtime.machine.cpu.executor().tier1_stats();
-    let tier1_json = format!(
-        "{{\"mode\":{},\"compilations\":{},\"compile_seconds\":{:.9},\"publication_revisions\":{},\"publication_flushes\":{},\"cache_evictions\":{},\"compile_misses\":{},\"fallback_entries\":{},\"fallback_units\":{},\"native_entries\":{},\"bridge_entries\":{},\"bridge_units\":{},\"invalidations\":{},\"resident_bytes\":{}}}",
-        json(&format!("{:?}", runtime.machine.cpu.executor().tier1_mode()).to_lowercase()),
-        tier1.compilations,
-        tier1.compile_time.as_secs_f64(),
-        tier1.publication_revisions,
-        tier1.publication_flushes,
-        tier1.cache_evictions,
-        tier1.compile_misses,
-        tier1.fallback_entries,
-        tier1.fallback_instructions,
-        tier1.native_entries,
-        tier1.bridge_entries,
-        tier1.bridge_units,
-        tier1.invalidations,
-        tier1.resident_bytes
-    );
+    // Snapshot the existing cumulative service counters, without the per-frame
+    // top-five truncation. Checkpoint differences delimit a fixed scene.
+    let host_services = if options.frame_budget || options.host_profile.is_some() {
+        let mut csv = Vec::new();
+        runtime
+            .machine
+            .sys
+            .stats
+            .write_host_csv(&runtime.machine.sys.thunks, &mut csv)
+            .unwrap();
+        json(std::str::from_utf8(&csv).unwrap())
+    } else {
+        "null".into()
+    };
     format!(
         concat!(
             "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
-            "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n  \"direct_memory\": {},\n",
+            "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
             "  \"code_cache\": {},\n  \"aot\": {},\n",
-            "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"wait_diagnostics\": {},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {},\n  \"host_services_csv\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -831,29 +807,15 @@ fn build_report(context: ReportContext<'_>) -> String {
         idle_waits,
         wait_time.as_secs_f64(),
         inputs,
-        parallel_json,
         context_runs,
-        options.jit
-            && options.async_compilation
-            && options.tiered_compilation
-            && options.guest_workers == 1,
+        options.jit && options.async_compilation && options.tiered_compilation,
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
         cliffs_report(&stats.cliffs),
         verification_report(&stats.verification),
-        format!(
-            "{{\"sites\":{},\"accesses\":{},\"recoveries\":{},\"violations\":{},\"checked_fallbacks\":{},\"code_writes\":{}}}",
-            stats.direct_memory.sites,
-            stats.direct_memory.accesses,
-            stats.direct_memory.recoveries,
-            stats.direct_memory.violations,
-            stats.direct_memory.checked_fallbacks,
-            stats.direct_memory.code_writes
-        ),
         runtime.machine.cpu.executor().persistent_code_cache_json(),
         stats.aot.json(),
-        tier1_json,
         runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
         options.jit && options.async_compilation,
@@ -905,7 +867,8 @@ fn build_report(context: ReportContext<'_>) -> String {
             .stats
             .frame_budget
             .as_ref()
-            .map_or_else(|| "null".into(), |b| b.json())
+            .map_or_else(|| "null".into(), |b| b.json()),
+        host_services
     )
 }
 
@@ -928,6 +891,33 @@ fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> 
     }
     let _ = wake;
     runtime.capture_latest_frame().map(|_| ())
+}
+
+fn observe_scene_gate(
+    runtime: &mut Runtime,
+    wake: &window::WakeEvent,
+    gate: &mut control::SceneGate,
+) -> Result<Option<control::GateCompletion>, String> {
+    let before = gate.check_duration();
+    if gate.needs_frame_pixels(runtime.presented_frames(), runtime.frame().frames) {
+        // Both software composition and native presentation can defer CPU
+        // pixels until a diagnostic capture. Materialize the current frame
+        // before hashing; ordinary execution never asks for this readback.
+        let started = Instant::now();
+        let result = capture_diagnostic_frame(runtime, wake);
+        gate.frame_capture(started.elapsed());
+        result?;
+    }
+    let completion = gate.observe(
+        runtime.presented_frames(),
+        runtime.frame().width,
+        &runtime.frame().bgra,
+        Instant::now(),
+    );
+    if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
+        budget.scene_check(gate.check_duration().saturating_sub(before));
+    }
+    Ok(completion)
 }
 
 fn acknowledge_scene_gate(
@@ -1031,8 +1021,8 @@ fn capture_native_after_stop(
 }
 
 fn run(options: Options) -> Result<u8, String> {
-    if options.frame_budget && (!options.headless || options.guest_workers != 1) {
-        return Err("--frame-budget requires headless execution with one guest worker".into());
+    if options.frame_budget && !options.headless {
+        return Err("--frame-budget requires headless execution".into());
     }
     #[cfg(not(feature = "gpu"))]
     if options.gpu_software {
@@ -1114,7 +1104,7 @@ fn run(options: Options) -> Result<u8, String> {
     result?
 }
 
-fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
+fn compile_thread_count(cores: usize) -> usize {
     // Keep the small-host policy. Larger desktop hosts can serve another
     // compile without consuming the cores reserved for execution, audio and
     // presentation. Phone SoCs count efficiency cores toward eight, so Android
@@ -1124,9 +1114,7 @@ fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
     } else {
         3
     };
-    cores
-        .saturating_sub(guest_workers.saturating_add(1))
-        .clamp(1, cap)
+    cores.saturating_sub(2).clamp(1, cap)
 }
 
 fn compile_thread_override(value: Option<&str>, default: usize) -> Result<usize, String> {
@@ -1156,20 +1144,17 @@ fn experimental_compile_threads_preserve_default_and_reject_invalid_values() {
 
 #[test]
 fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
-    for guests in [1, 2] {
-        for cores in 0usize..8 {
-            assert_eq!(
-                compile_thread_count(cores, guests),
-                cores.saturating_sub(guests + 1).clamp(1, 3)
-            );
-        }
-        for cores in [8, 10, 16, 128] {
-            let cap = if cfg!(target_os = "android") { 3 } else { 4 };
-            assert_eq!(compile_thread_count(cores, guests), cap);
-            assert!(compile_thread_count(cores, guests) + guests + 1 <= cores);
-        }
+    for cores in 0usize..8 {
+        assert_eq!(
+            compile_thread_count(cores),
+            cores.saturating_sub(2).clamp(1, 3)
+        );
     }
-    assert_eq!(compile_thread_count(0, usize::MAX), 1);
+    for cores in [8, 10, 16, 128] {
+        let cap = if cfg!(target_os = "android") { 3 } else { 4 };
+        assert_eq!(compile_thread_count(cores), cap);
+        assert!(compile_thread_count(cores) + 2 <= cores);
+    }
 }
 
 #[test]
@@ -1204,11 +1189,7 @@ fn run_execution(
     for (drive, image) in &options.cdroms {
         runtime.mount_iso(*drive, image)?;
     }
-    runtime
-        .machine
-        .cpu
-        .set_guest_workers(options.guest_workers)?;
-    if !options.row_batching || !options.jit || options.guest_workers > 1 {
+    if !options.row_batching || !options.jit {
         runtime.machine.cpu.disable_row_batching();
     } else if let Some(workers) = options.row_workers {
         runtime.machine.cpu.set_row_workers(workers)?;
@@ -1278,18 +1259,6 @@ fn run_execution(
         .machine
         .cpu
         .set_async_compilation(options.jit && options.async_compilation);
-    if let Ok(value) = std::env::var("ADV_TIER1") {
-        let mode: adv_runtime::Tier1Mode = value.parse()?;
-        if cfg!(all(
-            target_arch = "aarch64",
-            any(target_os = "linux", target_os = "android")
-        )) {
-            runtime.machine.cpu.executor_mut().set_tier1_mode(mode)?;
-        } else if mode != adv_runtime::Tier1Mode::Off {
-            static NOTICE: std::sync::Once = std::sync::Once::new();
-            NOTICE.call_once(|| eprintln!("ADV_TIER1 ignored: requires aarch64 Linux or Android"));
-        }
-    }
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
@@ -1305,14 +1274,10 @@ fn run_execution(
             .executor_mut()
             .set_persistent_code_cache(&options.data_dir.join("jit-code.bin"))?;
     }
-    if options.jit
-        && options.async_compilation
-        && runtime.machine.cpu.executor_mut().tier1_mode() != adv_runtime::Tier1Mode::Exclusive
-    {
+    if options.jit && options.async_compilation {
         // Leave cores for the guest, presentation and audio threads.
-        let threads = std::thread::available_parallelism().map_or(1, |cores| {
-            compile_thread_count(cores.get(), options.guest_workers)
-        });
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |cores| compile_thread_count(cores.get()));
         let threads = compile_thread_override(
             std::env::var("ADV_COMPILE_THREADS").ok().as_deref(),
             threads,
@@ -1693,11 +1658,8 @@ fn run_execution(
                         Ok(format!("reset-metrics start_frame={serial}"))
                     }
                     control::Command::AwaitFrame(spec) => {
-                        if !options.headless || options.guest_workers != 1 {
-                            Err(
-                                "await-frame requires headless execution with one guest worker"
-                                    .into(),
-                            )
+                        if !options.headless {
+                            Err("await-frame requires headless execution".into())
                         } else {
                             let hold = spec.hold;
                             if hold.is_some() && runtime.guest_window_count() == 0 {
@@ -1763,29 +1725,7 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            runtime.presented_frames(),
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
@@ -1883,29 +1823,7 @@ fn run_execution(
         {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            presented,
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
@@ -2127,14 +2045,11 @@ fn run_execution(
         std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }
     let stats = runtime.machine.cpu.stats();
-    let parallel = runtime.machine.cpu.parallel_stats();
-    let parallel_json = parallel_report(&parallel);
     println!(
-        "{stop_reason}: exit={} frames={} elapsed={:.3}s parallel={} host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
+        "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
         exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
         runtime.presented_frames(),
         started.elapsed().as_secs_f64(),
-        parallel_json,
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
@@ -2218,23 +2133,6 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let bridge_details = c
-        .tier1_bridge_rows()
-        .into_iter()
-        .map(|(label, n)| {
-            format!(
-                "{}:{{\"entries\":{},\"instructions\":{}}}",
-                json(&label),
-                n.entries,
-                n.instructions
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let tier1_bridge = format!(
-        "{{\"entries\":{},\"instructions\":{},\"details\":{{{bridge_details}}}}}",
-        c.tier1_bridge.entries, c.tier1_bridge.instructions
-    );
     let detail_rows = c.interpreter_detail_rows();
     let omitted_rows = detail_rows.len().saturating_sub(ROWS);
     let details = detail_rows
@@ -2266,22 +2164,8 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
             )
         })
         .join(",");
-    let census = c.tier1_census.as_ref().map_or_else(|| "null".to_owned(), |census| {
-        let groups = ["PendingCompilation", "Uncovered", "Rejected"].into_iter()
-            .zip(&census.groups).map(|(name, c)| {
-                let rows = c.unsupported_rows();
-                let omitted_rows = rows.len().saturating_sub(ROWS);
-                let omitted_units: u64 = rows.iter().skip(ROWS).map(|(_, n)| n).sum();
-                let unsupported = counts(rows, ROWS);
-                let histogram = |values: &[u64]| values.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-                format!("{}:{{\"entries\":{},\"instructions\":{},\"supported_units\":{},\"unsupported_units\":{},\"prefix_units\":{},\"blocked_prefixes\":[{}],\"censored_prefixes\":[{}],\"unsupported\":{{{unsupported}}},\"omitted_rows\":{omitted_rows},\"omitted_units\":{omitted_units}}}",
-                    json(name), c.entries, c.instructions, c.supported_units, c.unsupported_units, c.prefix_units,
-                    histogram(&c.blocked_prefixes), histogram(&c.censored_prefixes))
-            }).collect::<Vec<_>>().join(",");
-        format!("{{{groups}}}")
-    });
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census},\"tier1_bridge\":{tier1_bridge}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),
@@ -2290,30 +2174,5 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         counts(c.x87_pc64_rows(), usize::MAX),
         counts(c.fallback_rows(), ROWS),
         interpreter
-    )
-}
-
-fn parallel_report(p: &adv_runtime::ParallelStats) -> String {
-    format!(
-        "{{\"workers\":{},\"submitted\":{},\"completed\":{},\"worker_run_ns\":{},\"queue_wait_ns\":{},\"queue_wait_max_ns\":{},\"image_builds\":{},\"image_build_ns\":{},\"empty_jobs\":{},\"short_traps\":{},\"overlap_ns\":{},\"max_running\":{},\"traps\":{},\"cold_retries\":{},\"cache_misses\":{},\"quantum_returns\":{},\"quiescence_waits\":{},\"quiescence_wait_ns\":{},\"quiescence_wait_max_ns\":{}}}",
-        p.workers,
-        p.submitted,
-        p.completed,
-        p.worker_run_ns,
-        p.queue_wait_ns,
-        p.queue_wait_max_ns,
-        p.image_builds,
-        p.image_build_ns,
-        p.empty_jobs,
-        p.short_traps,
-        p.overlap_ns,
-        p.max_running,
-        p.traps,
-        p.cold_retries,
-        p.cache_misses,
-        p.quantum_returns,
-        p.quiescence_waits,
-        p.quiescence_wait_ns,
-        p.quiescence_wait_max_ns
     )
 }

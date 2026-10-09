@@ -42,6 +42,10 @@ struct Row {
     serial: u64,
     startup: bool,
     wall_ns: u64,
+    present_interval_ns: Option<u64>,
+    guest_delta_us: u64,
+    file_read_bytes: u64,
+    operation_ns: [u64; 3],
     active_ns: u64,
     guest_exec_ns: u64,
     service_audio_ns: u64,
@@ -67,6 +71,8 @@ impl Row {
         format!(
             concat!(
                 "{{\"serial\":{},\"startup\":{},\"wall_ns\":{},\"active_ns\":{},\"guest_exec_ns\":{},",
+                "\"present_interval_ns\":{},\"guest_delta_us\":{},\"file_read_bytes\":{},",
+                "\"operation_ns\":{{\"text\":{},\"image_decode\":{},\"audio_decode\":{}}},",
                 "\"service_audio_ns\":{},\"service_graphics_ns\":{},",
                 "\"scheduler_ns\":{},\"frontend_ns\":{},\"control_pause_ns\":{},\"scene_check_ns\":{},\"accounting_excess_ns\":{},",
                 "\"hle_ns\":{{\"graphics\":{},\"file\":{},\"audio\":{},\"other\":{}}},\"top_apis\":[{}],",
@@ -78,6 +84,12 @@ impl Row {
             self.wall_ns,
             self.active_ns,
             self.guest_exec_ns,
+            optional(self.present_interval_ns),
+            self.guest_delta_us,
+            self.file_read_bytes,
+            self.operation_ns[0],
+            self.operation_ns[1],
+            self.operation_ns[2],
             self.service_audio_ns,
             self.service_graphics_ns,
             self.scheduler_ns,
@@ -107,10 +119,12 @@ impl Row {
 
 pub struct FrameBudget {
     last: Instant,
+    last_present: Option<Instant>,
     pending: Option<(u64, Instant)>,
     previous: FrameRow,
     previous_cpu: Option<FrameCounters>,
     classes: Vec<usize>,
+    operations: Vec<Option<usize>>,
     apis: Vec<Api>,
     touched: Vec<usize>,
     scheduler_started: Option<Instant>,
@@ -118,6 +132,8 @@ pub struct FrameBudget {
     control_pause_ns: u64,
     scene_check_ns: u64,
     hle_ns: [u64; 4],
+    operation_ns: [u64; 3],
+    file_read_bytes: u64,
     present_call_ns: u64,
     wait_ns: u64,
     overshoot_ns: u64,
@@ -135,16 +151,19 @@ pub struct FrameBudget {
     rows: VecDeque<Row>,
     normal: VecDeque<Row>,
     percentiles: VecDeque<(u64, u64)>,
+    sequence: VecDeque<Row>,
     longest: Option<Row>,
 }
 impl FrameBudget {
     pub fn new(previous: FrameRow, cpu: Option<FrameCounters>) -> Self {
         Self {
             last: Instant::now(),
+            last_present: None,
             pending: None,
             previous,
             previous_cpu: cpu,
             classes: Vec::new(),
+            operations: Vec::new(),
             apis: Vec::new(),
             touched: Vec::new(),
             scheduler_started: None,
@@ -152,6 +171,8 @@ impl FrameBudget {
             control_pause_ns: 0,
             scene_check_ns: 0,
             hle_ns: [0; 4],
+            operation_ns: [0; 3],
+            file_read_bytes: 0,
             present_call_ns: 0,
             wait_ns: 0,
             overshoot_ns: 0,
@@ -169,6 +190,7 @@ impl FrameBudget {
             rows: VecDeque::new(),
             normal: VecDeque::new(),
             percentiles: VecDeque::new(),
+            sequence: VecDeque::new(),
             longest: None,
         }
     }
@@ -189,6 +211,7 @@ impl FrameBudget {
         while self.classes.len() <= index {
             let f = thunks.get(self.classes.len() as u32);
             self.classes.push(classify(&f.module, &f.name));
+            self.operations.push(operation(&f.module, &f.name));
             self.apis.push(Api {
                 name: format!("{}!{}", f.module, f.name),
                 ..Default::default()
@@ -201,6 +224,9 @@ impl FrameBudget {
         api.ns += ns;
         api.calls += 1;
         self.hle_ns[self.classes[index]] += ns;
+        if let Some(operation) = self.operations[index] {
+            self.operation_ns[operation] += ns;
+        }
         // The full presenting handler/continuation is an inclusive subset of HLE.
         if self.pending.is_some() {
             self.present_call_ns += ns;
@@ -209,6 +235,10 @@ impl FrameBudget {
     pub fn enter_scheduler(&mut self) {
         debug_assert!(self.scheduler_started.is_none());
         self.scheduler_started = Some(Instant::now());
+    }
+    /// ReadFile bytes including the live NT bridge, not physical disk IO.
+    pub fn file_read(&mut self, bytes: u64) {
+        self.file_read_bytes += bytes;
     }
     pub fn leave_scheduler(&mut self) {
         if let Some(started) = self.scheduler_started.take() {
@@ -233,7 +263,7 @@ impl FrameBudget {
         }
     }
     pub fn finish(&mut self, total: FrameRow, cpu: Option<FrameCounters>) {
-        let Some((serial, _presented_at)) = self.pending.take() else {
+        let Some((serial, presented_at)) = self.pending.take() else {
             return;
         };
         let observer = Instant::now();
@@ -271,6 +301,12 @@ impl FrameBudget {
             serial,
             startup: self.previous.frame == u32::MAX && !self.skipped_partial,
             wall_ns,
+            present_interval_ns: self
+                .last_present
+                .map(|last| presented_at.saturating_duration_since(last).as_nanos() as u64),
+            guest_delta_us: total.guest_us.saturating_sub(self.previous.guest_us),
+            file_read_bytes: self.file_read_bytes,
+            operation_ns: self.operation_ns,
             active_ns,
             guest_exec_ns: delta.run_ns.saturating_sub(delta.hook_ns),
             service_audio_ns: delta.frontend_audio_ns,
@@ -293,12 +329,15 @@ impl FrameBudget {
             frequency_khz: None,
         };
         self.last = at;
+        self.last_present = Some(presented_at);
         self.previous = FrameRow {
             frame: serial as u32,
             ..total
         };
         self.previous_cpu = cpu;
         self.hle_ns = [0; 4];
+        self.operation_ns = [0; 3];
+        self.file_read_bytes = 0;
         self.present_call_ns = 0;
         self.wait_ns = 0;
         self.overshoot_ns = 0;
@@ -324,6 +363,11 @@ impl FrameBudget {
             self.percentiles.pop_front();
         }
         self.percentiles.push_back((row.wall_ns, row.active_ns));
+        // Preserve the ordered fast frames too: sparse long-frame rows cannot
+        // establish cadence, adjacency, loading boundaries or consecutive loss.
+        if self.sequence.len() == PERCENTILE_CAPACITY {
+            self.sequence.pop_front();
+        }
         if row.wall_ns > BUDGET_NS || row.active_ns > BUDGET_NS {
             // sysfs is never read on an ordinary frame or when disabled.
             (row.core, row.frequency_khz) = platform_sample();
@@ -340,6 +384,7 @@ impl FrameBudget {
             }
             self.normal.push_back(row.clone());
         }
+        self.sequence.push_back(row.clone());
         if self
             .longest
             .as_ref()
@@ -371,7 +416,8 @@ impl FrameBudget {
                 "\"over_budget_frames\":{},\"active_over_budget_frames\":{},\"max_wall_ns\":{},\"max_active_ns\":{},",
                 "\"wall_total_ns\":{},\"active_total_ns\":{},\"p95_wall_ns\":{},\"p99_wall_ns\":{},\"p99_active_ns\":{},",
                 "\"percentile_window\":{},\"percentile_capacity\":{},\"over_capacity\":{},\"coalesced_frames\":{},",
-                "\"observer_ns\":{},\"longest\":{},\"rows\":[{}]}}"
+                "\"observer_ns\":{},\"longest\":{},\"rows\":[{}],",
+                "\"sequence_capacity\":{},\"sequence_dropped\":{},\"sequence\":[{}]}}"
             ),
             BUDGET_NS,
             self.frames,
@@ -392,8 +438,35 @@ impl FrameBudget {
             self.longest
                 .as_ref()
                 .map_or_else(|| "null".into(), Row::json),
-            rows
+            rows,
+            PERCENTILE_CAPACITY,
+            self.frames.saturating_sub(self.sequence.len() as u64),
+            self.sequence
+                .iter()
+                .map(Row::json)
+                .collect::<Vec<_>>()
+                .join(",")
         )
+    }
+}
+
+fn operation(module: &str, name: &str) -> Option<usize> {
+    if name.contains("Glyph")
+        || name.contains("TextOut")
+        || name.contains("DrawText")
+        || name.contains("TextExtent")
+        || name.contains("TextMetrics")
+    {
+        Some(0)
+    } else if module.to_ascii_lowercase().starts_with("d3dx") && name.contains("From")
+        || name.contains("GdipLoadImage")
+        || name.contains("GdipCreateBitmapFrom")
+    {
+        Some(1)
+    } else if name == "ov_read" || module.starts_with("adv-codec-kernel") {
+        Some(2)
+    } else {
+        None
     }
 }
 
@@ -534,6 +607,7 @@ mod tests {
         }
         assert_eq!((b.frames, b.over, b.active_over), (2200, 2200, 0));
         assert_eq!(b.rows.len(), CAPACITY);
+        assert_eq!(b.sequence.len(), 2200);
         let row = b.rows.back().unwrap();
         assert_eq!((row.active_ns, row.guest_exec_ns), (8_000_000, 6_000_000));
         assert_eq!(
@@ -546,12 +620,14 @@ mod tests {
     fn reset_discards_partial_frame_and_bounds_normal_controls() {
         let mut b = FrameBudget::new(FrameRow::default(), None);
         b.reset(FrameRow::default(), None);
-        for serial in 1..=3000 {
+        for serial in 1..=5000 {
             b.mark_frame(serial);
             b.last = Instant::now() - Duration::from_millis(16);
             b.finish(FrameRow::default(), None);
         }
-        assert_eq!((b.frames, b.over), (2999, 0));
+        assert_eq!((b.frames, b.over), (4999, 0));
+        assert_eq!(b.sequence.len(), PERCENTILE_CAPACITY);
+        assert!(b.json().contains("\"sequence_dropped\":903"));
         assert_eq!(b.normal.len(), NORMAL_CAPACITY);
         assert!(b.rows.is_empty());
     }
@@ -561,6 +637,13 @@ mod tests {
         assert_eq!(classify("kernel32.dll", "ReadFile"), 1);
         assert_eq!(classify("dsound.dll", "Unlock"), 2);
         assert_eq!(classify("user32.dll", "PeekMessageW"), 3);
+        assert_eq!(operation("gdi32.dll", "GetGlyphOutlineA"), Some(0));
+        assert_eq!(
+            operation("d3dx9.dll", "D3DXCreateTextureFromFileA"),
+            Some(1)
+        );
+        assert_eq!(operation("d3d9.dll", "UpdateTexture"), None);
+        assert_eq!(operation("vorbisfile.dll", "ov_read"), Some(2));
     }
 
     #[test]

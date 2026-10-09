@@ -4,28 +4,98 @@
   "game_dir": "Himawari - The Sunflower -",
   "exe": "Himawari.exe",
   "codepage": 932,
-  "schedule": [
-    {
-      "at": 30,
-      "checkpoint": "startup"
-    },
-    {
-      "at": 31,
-      "command": "close"
-    }
-  ],
+  "schedule": {
+    "schema": "adv-scene-v1",
+    "description": "Himawari headless title and full first dialogue gate, then verified held Ctrl observation and post-Ctrl transition observation. Mouse holds accommodate polling menus.",
+    "timeout_seconds": 180,
+    "steps": [
+      {
+        "checkpoint": "title",
+        "await": {
+          "frame_fnv1a64": "f71fbef84079a8b6",
+          "timeout_ms": 60000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "move 330 890"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-down 330 890"
+      },
+      {
+        "delay_ms": 2000
+      },
+      {
+        "command": "mouse-up 330 890"
+      },
+      {
+        "delay_ms": 3000
+      },
+      {
+        "command": "key-down 13"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "key-up 13"
+      },
+      {
+        "checkpoint": "body",
+        "await": {
+          "frame_fnv1a64": "9de902094841d561",
+          "timeout_ms": 60000
+        },
+        "reset_metrics": true
+      },
+      {
+        "command": "key-down 17"
+      },
+      {
+        "delay_ms": 15000
+      },
+      {
+        "checkpoint": "ctrl",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "key-up 17"
+      },
+      {
+        "delay_ms": 5000
+      },
+      {
+        "checkpoint": "transition",
+        "observe": true,
+        "reset_metrics": true
+      },
+      {
+        "command": "close"
+      }
+    ]
+  },
   "scenes": {
     "title": {
-      "unavailable": "android_d3d_scene_gate_unavailable"
+      "checkpoint": "title",
+      "measurement": "gated"
     },
     "normal": {
-      "unavailable": "scene_not_gated"
+      "checkpoint": "body",
+      "measurement": "gated"
     },
     "ctrl": {
-      "unavailable": "no_fixed_endpoint"
+      "checkpoint": "ctrl",
+      "measurement": "held_observation",
+      "start_checkpoint": "body"
     },
     "transition": {
-      "unavailable": "scene_not_gated"
+      "checkpoint": "transition",
+      "measurement": "timed_observation"
     }
   }
 }

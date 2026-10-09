@@ -63,7 +63,6 @@ pub enum InterpreterReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum InterpreterDetail {
     AutoJitDisabled,
-    Tier1,
     NonExecutable,
     BelowThreshold,
     PendingCompilation,
@@ -90,11 +89,7 @@ pub struct Count {
 
 #[derive(Default, Clone, Debug)]
 pub struct Cliffs {
-    /// Actual Tier 1 bridge retirements, disjoint from interpreter counters.
-    pub tier1_bridge: Count,
-    pub(crate) tier1_bridge_details: HashMap<(InterpreterReason, Option<InterpreterDetail>), Count>,
     pub(crate) x87_forms: crate::floating::fast::diagnostics::Census,
-    pub tier1_census: Option<crate::Tier1Census>,
     pub x87_helper_calls: u64,
     /// Helper calls completed by the host-double fast path.
     pub x87_fast: u64,
@@ -112,46 +107,6 @@ pub struct Cliffs {
 }
 
 impl Cliffs {
-    pub(crate) fn merge(&mut self, other: Cliffs) {
-        self.tier1_bridge.entries += other.tier1_bridge.entries;
-        self.tier1_bridge.instructions += other.tier1_bridge.instructions;
-        for (key, n) in other.tier1_bridge_details {
-            let count = self.tier1_bridge_details.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-        self.x87_forms.merge(other.x87_forms);
-        if let Some(census) = other.tier1_census {
-            self.tier1_census
-                .get_or_insert_with(Default::default)
-                .merge(census);
-        }
-        self.x87_helper_calls += other.x87_helper_calls;
-        self.x87_fast += other.x87_fast;
-        for (key, n) in other.x87_exact {
-            *self.x87_exact.entry(key).or_default() += n;
-        }
-        for (key, n) in other.x87_control {
-            *self.x87_control.entry(key).or_default() += n;
-        }
-        for (key, n) in other.x87_pc64 {
-            *self.x87_pc64.entry(key).or_default() += n;
-        }
-        for (key, n) in other.fallbacks {
-            *self.fallbacks.entry(key).or_default() += n;
-        }
-        for (key, n) in other.interpreter {
-            let count = self.interpreter.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-        for (key, n) in other.interpreter_details {
-            let count = self.interpreter_details.entry(key).or_default();
-            count.entries += n.entries;
-            count.instructions += n.instructions;
-        }
-    }
-
     pub(crate) fn fallback(&mut self, memory: &Memory, pc: u32) {
         *self.fallbacks.entry(mnemonic_at(memory, pc)).or_default() += 1;
     }
@@ -160,44 +115,6 @@ impl Cliffs {
         let count = self.interpreter.entry(reason).or_default();
         count.entries += 1;
         count.instructions += u64::from(units);
-    }
-
-    pub(crate) fn bridged(
-        &mut self,
-        reason: InterpreterReason,
-        detail: Option<InterpreterDetail>,
-        units: u32,
-    ) {
-        self.tier1_bridge.entries += 1;
-        self.tier1_bridge.instructions += u64::from(units);
-        let count = self
-            .tier1_bridge_details
-            .entry((reason, detail))
-            .or_default();
-        count.entries += 1;
-        count.instructions += u64::from(units);
-    }
-
-    /// Complete, bounded entry-state labels for work taken from Tier 0.
-    /// A bridge batch and its residual fallback can share an entry-state label,
-    /// but their retirement units never overlap.
-    pub fn tier1_bridge_rows(&self) -> Vec<(String, Count)> {
-        let mut rows: Vec<_> = self
-            .tier1_bridge_details
-            .iter()
-            .map(|(&(reason, detail), &n)| {
-                let label = match detail {
-                    Some(InterpreterDetail::Unsupported(code)) => {
-                        format!("{reason:?}/Unsupported/{:?}/{code:?}", code.mnemonic())
-                    }
-                    Some(detail) => format!("{reason:?}/{detail:?}"),
-                    None => format!("{reason:?}"),
-                };
-                (label, n)
-            })
-            .collect();
-        rows.sort_unstable_by(|a, b| b.1.instructions.cmp(&a.1.instructions).then(a.0.cmp(&b.0)));
-        rows
     }
 
     pub(crate) fn detail(
@@ -318,25 +235,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detail_merge_and_ranking_preserve_whole_batch_units() {
+    fn detail_ranking_preserves_whole_batch_units() {
         let mut first = Cliffs::default();
         first.detail(
             InterpreterReason::Rejected,
             InterpreterDetail::Unsupported(Code::Cbw),
             9,
         );
-        let mut second = Cliffs::default();
-        second.detail(
+        first.detail(
             InterpreterReason::Rejected,
             InterpreterDetail::Unsupported(Code::Cbw),
             11,
         );
-        second.detail(
+        first.detail(
             InterpreterReason::Uncovered,
             InterpreterDetail::BelowThreshold,
             20,
         );
-        first.merge(second);
         let rows = first.interpreter_detail_rows();
         assert_eq!(
             rows,
@@ -360,16 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn control_distribution_merges_and_counts_overlapping_guards() {
+    fn control_distribution_counts_overlapping_guards() {
         let mut a = Cliffs::default();
-        a.x87_control.insert(0x033f, 10);
-        a.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 10);
-        let mut b = Cliffs::default();
-        b.x87_control.insert(0x033f, 2);
-        b.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 2);
-        b.x87_control.insert(0x0b3e, 3);
-        b.x87_control.insert(0x063f, 5);
-        a.merge(b);
+        a.x87_control.insert(0x033f, 12);
+        a.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 12);
+        a.x87_control.insert(0x0b3e, 3);
+        a.x87_control.insert(0x063f, 5);
         assert_eq!(a.x87_pc64_rows(), vec![("Fadd/Exact".into(), 12)]);
         assert_eq!(
             a.x87_control_rows(),

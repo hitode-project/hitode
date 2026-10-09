@@ -73,6 +73,18 @@ mod tests {
         assert_eq!(second.stats.native_entries, 1);
         assert!(second.set_shadow_returns(true).is_err());
 
+        let (mut full, cached_region) = fixture(7);
+        full.set_persistent_code_cache(&path).unwrap();
+        for index in 0..crate::compiler::CAPACITY {
+            full.pending_regions
+                .insert(0x2000 + index as u32, index as u64);
+        }
+        assert!(full.queue_region(cached_region).unwrap());
+        assert_eq!(full.stats.compile_requests, 0);
+        assert_eq!(full.pending_regions.len(), crate::compiler::CAPACITY);
+        assert!(full.code.compiled.contains_key(&region.start));
+        drop(full);
+
         let (changed, _) = fixture(9);
         let bytes = changed.memory.read(0x1000, region.len).unwrap().to_vec();
         second.write(0x1000, &bytes).unwrap();
@@ -212,10 +224,7 @@ impl Executor {
                 continue;
             };
             input.shadow_returns = self.shadow_returns.is_some();
-            if self.tiered_compilation
-                && self.parallel.is_none()
-                && region.compile_strategy == CompileStrategy::Fast
-            {
+            if self.tiered_compilation && region.compile_strategy == CompileStrategy::Fast {
                 input.profile = Some(Arc::default());
             }
             self.locate_cache_input(&mut input);

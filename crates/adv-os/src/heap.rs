@@ -3,18 +3,17 @@
 //! Metadata lives on the host: blocks never carry headers in guest memory, so guest
 //! overruns can't corrupt the allocator. Each heap owns arenas from the VM; free space is
 //! indexed by address (for coalescing) and by size (best fit). Blocks are 8-byte aligned
-//! like the x86 Windows heap. Large blocks get their own VM region; one recently
-//! freed region per heap is retained for equal-capacity reuse, bounded to 16 MiB.
+//! like the x86 Windows heap. Large blocks get their own zeroed VM region and
+//! release it on free, preserving fresh committed-page contents on each allocation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use adv_cpu::backend::{Guest, MemFault, Prot};
-use adv_machine::{Vm, layout::GRANULE};
+use adv_machine::Vm;
 
 const ALIGN: u32 = 8;
 const ARENA: u32 = 0x10_0000;
 const LARGE: u32 = 0x8_0000;
-const LARGE_REUSE_LIMIT: u32 = 16 * ARENA;
 
 fn round(size: u32) -> Option<u32> {
     size.max(1)
@@ -44,8 +43,6 @@ pub struct Heap {
     used: HashMap<u32, (u32, u32)>,
     /// Blocks with their own VM region.
     large: HashMap<u32, u32>,
-    /// One free large region (address, VM capacity), outside the live block index.
-    spare_large: Option<(u32, u32)>,
     arenas: Vec<u32>,
 }
 
@@ -103,25 +100,10 @@ impl Heap {
 
     fn grow(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, need: u32) -> Result<(), MemFault> {
         let size = need.max(ARENA);
-        let a = self.map_region(cpu, vm, size)?;
+        let a = vm.alloc(cpu, size, self.protection())?;
         self.arenas.push(a);
         self.insert_free(a, vm.region(a).unwrap_or(size));
         Ok(())
-    }
-
-    fn map_region(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, size: u32) -> Result<u32, MemFault> {
-        match vm.alloc(cpu, size, self.protection()) {
-            Ok(addr) => Ok(addr),
-            Err(error) => {
-                // Reclaim the spare before reporting memory pressure to the guest.
-                let Some((spare, _)) = self.spare_large else {
-                    return Err(error);
-                };
-                vm.free(cpu, spare)?;
-                self.spare_large = None;
-                vm.alloc(cpu, size, self.protection())
-            }
-        }
     }
 }
 
@@ -237,12 +219,7 @@ impl Heaps {
         let Some(h) = self.heaps.remove(&handle) else {
             return false;
         };
-        for a in h
-            .arenas
-            .into_iter()
-            .chain(h.large.into_keys())
-            .chain(h.spare_large.map(|(addr, _)| addr))
-        {
+        for a in h.arenas.into_iter().chain(h.large.into_keys()) {
             let _ = vm.free(cpu, a);
         }
         true
@@ -269,21 +246,8 @@ impl Heaps {
         let rsize = round(size)?;
         let mut freshly_mapped = false;
         let addr = if rsize >= LARGE {
-            let capacity = rsize.checked_add(GRANULE - 1)? & !(GRANULE - 1);
-            let a = if h.spare_large.is_some_and(|(_, len)| len == capacity) {
-                let (a, _) = h.spare_large.take().unwrap();
-                // VirtualProtect may have changed a previous caller's pages.
-                // Restore this heap's policy before publishing reused storage.
-                if cpu.protect(a, capacity, h.protection()).is_err() {
-                    let _ = vm.free(cpu, a);
-                    return None;
-                }
-                a
-            } else {
-                let a = h.map_region(cpu, vm, rsize).ok()?;
-                freshly_mapped = true; // Guest::map guarantees zeroed memory.
-                a
-            };
+            let a = vm.alloc(cpu, rsize, h.protection()).ok()?;
+            freshly_mapped = true; // Guest::map guarantees zeroed memory, even without ZERO_MEMORY.
             h.large.insert(a, rsize);
             a
         } else {
@@ -297,24 +261,13 @@ impl Heaps {
         };
         h.used.insert(addr, (rsize, size));
         if zero && !freshly_mapped && zero_memory(cpu, addr, rsize).is_err() {
-            self.release(cpu, vm, handle, addr, false);
+            self.free(cpu, vm, handle, addr);
             return None;
         }
         Some(addr)
     }
 
     pub fn free(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32, addr: u32) -> bool {
-        self.release(cpu, vm, handle, addr, true)
-    }
-
-    fn release(
-        &mut self,
-        cpu: &mut dyn Guest,
-        vm: &mut Vm,
-        handle: u32,
-        addr: u32,
-        retain_large: bool,
-    ) -> bool {
         let Some(h) = self.heap(handle) else {
             return false;
         };
@@ -322,22 +275,7 @@ impl Heaps {
             return false;
         };
         if h.large.remove(&addr).is_some() {
-            let capacity = vm.region(addr).unwrap_or(rsize);
-            if retain_large
-                && capacity <= LARGE_REUSE_LIMIT
-                && !cpu.has_locked_pages(addr, capacity)
-            {
-                if h.spare_large
-                    .is_none_or(|(previous, _)| vm.free(cpu, previous).is_ok())
-                {
-                    h.spare_large = Some((addr, capacity));
-                } else {
-                    // Keep ownership of a spare whose pins could not retire.
-                    let _ = vm.free(cpu, addr);
-                }
-            } else {
-                let _ = vm.free(cpu, addr);
-            }
+            let _ = vm.free(cpu, addr);
         } else {
             h.insert_free(addr, rsize);
         }
@@ -411,7 +349,7 @@ impl Heaps {
                 || cpu.write(new + offset, &buf[..n as usize]).is_err()
             {
                 // Failed reallocations must release speculative VM storage.
-                self.release(cpu, vm, handle, new, false);
+                self.free(cpu, vm, handle, new);
                 return None;
             }
             offset += n;
@@ -425,6 +363,7 @@ impl Heaps {
 mod tests {
     use super::*;
     use adv_cpu::backend::Reg;
+    use adv_machine::layout::GRANULE;
     use std::cell::Cell;
 
     #[derive(Default)]
@@ -438,11 +377,6 @@ mod tests {
         fail_write_call: Option<usize>,
         last_map: u32,
         map_calls: usize,
-        protections: Vec<(u32, u32, Prot)>,
-        fail_protect: bool,
-        fail_next_map: bool,
-        locked: bool,
-        pinned_region: Option<u32>,
     }
     impl MemoryGuest {
         fn bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
@@ -493,35 +427,16 @@ mod tests {
         }
         fn map(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
             self.map_calls += 1;
-            if std::mem::take(&mut self.fail_next_map) {
-                return Err(MemFault { addr, len });
-            }
             self.last_map = addr;
             self.memory.insert(addr, vec![0; len as usize]);
             Ok(())
         }
-        fn protect(&mut self, addr: u32, len: u32, prot: Prot) -> Result<(), MemFault> {
-            self.protections.push((addr, len, prot));
-            if self.fail_protect {
-                Err(MemFault { addr, len })
-            } else {
-                Ok(())
-            }
-        }
-        fn unmap(&mut self, addr: u32, _: u32) -> Result<(), MemFault> {
-            if self
-                .memory
-                .range(..=addr)
-                .next_back()
-                .is_some_and(|(&base, _)| self.pinned_region == Some(base))
-            {
-                return Err(MemFault { addr, len: 4096 });
-            }
-            self.memory.remove(&addr);
+        fn protect(&mut self, _: u32, _: u32, _: Prot) -> Result<(), MemFault> {
             Ok(())
         }
-        fn has_locked_pages(&self, addr: u32, _: u32) -> bool {
-            self.locked || self.pinned_region == Some(addr)
+        fn unmap(&mut self, addr: u32, _: u32) -> Result<(), MemFault> {
+            self.memory.remove(&addr);
+            Ok(())
         }
     }
     fn heap() -> (MemoryGuest, Vm, Heaps) {
@@ -531,165 +446,111 @@ mod tests {
     }
 
     #[test]
-    fn large_reuse_matches_vm_capacity_and_clears_only_when_requested() {
+    fn large_zero_allocation_after_free_without_zero_memory() {
         let (mut guest, mut vm, mut heaps) = heap();
         let size = LARGE + 13;
-        let block = heaps.alloc(&mut guest, &mut vm, 0, size, true).unwrap();
-        let maps = guest.map_calls;
-        assert_eq!(guest.write_calls, 0, "a new mapping is already zeroed");
-        guest.write(block, &[0xa5; 32]).unwrap();
+        let block = heaps.alloc(&mut guest, &mut vm, 0, size, false).unwrap();
+        guest.write(block, &vec![0xa5; size as usize]).unwrap();
         assert!(heaps.free(&mut guest, &mut vm, 0, block));
-        assert_eq!(heaps.owner(block), None);
-        assert_eq!(heaps.size(0, block), None);
-        assert!(!heaps.free(&mut guest, &mut vm, 0, block));
-        guest.reset_counts();
-        let reused = heaps
-            .alloc(&mut guest, &mut vm, 0, size + 9, false)
-            .unwrap();
-        assert_eq!(reused, block);
-        assert_eq!(guest.map_calls, maps);
-        assert_eq!(guest.write_calls, 0);
-        assert_eq!(guest.bytes(reused, 32).unwrap(), [0xa5; 32]);
-        assert_eq!(heaps.size(0, reused), Some(size + 9));
-        assert!(heaps.free(&mut guest, &mut vm, 0, reused));
-        let cleared = heaps.alloc(&mut guest, &mut vm, 0, size, true).unwrap();
-        assert_eq!(cleared, block);
+        let next = heaps.alloc(&mut guest, &mut vm, 0, size, false).unwrap();
+        assert_eq!(heaps.size(0, next), Some(size));
         assert!(
             guest
-                .bytes(cleared, size as usize)
+                .bytes(next, size as usize)
                 .unwrap()
                 .iter()
-                .all(|&b| b == 0)
+                .all(|&b| b == 0),
+            "large allocations must retain fresh committed-page contents"
         );
-        assert_eq!(guest.map_calls, maps);
-        assert_eq!(guest.protections, [(block, LARGE + GRANULE, Prot::RW); 2]);
-        assert!(guest.max_write <= 4096);
     }
 
     #[test]
-    fn large_reuse_is_bounded_retires_the_previous_spare_and_destroys_all_regions() {
+    fn large_zero_moving_realloc_preserves_data_and_zeroes_growth() {
+        for zero in [false, true] {
+            let (mut guest, mut vm, mut heaps) = heap();
+            let old_size = LARGE + 1;
+            let new_size = LARGE + GRANULE + 13;
+            let old = heaps
+                .alloc(&mut guest, &mut vm, 0, old_size, false)
+                .unwrap();
+            let pattern: Vec<_> = (0..old_size).map(|i| (i % 251) as u8).collect();
+            guest.write(old, &pattern).unwrap();
+            let spare = heaps
+                .alloc(&mut guest, &mut vm, 0, new_size, false)
+                .unwrap();
+            guest.write(spare, &vec![0xa5; new_size as usize]).unwrap();
+            assert!(heaps.free(&mut guest, &mut vm, 0, spare));
+            let new = heaps
+                .realloc(&mut guest, &mut vm, 0, old, new_size, zero, false)
+                .unwrap();
+            assert_ne!(new, old);
+            assert_eq!(heaps.size(0, old), None);
+            assert_eq!(heaps.size(0, new), Some(new_size));
+            assert_eq!(guest.bytes(new, old_size as usize).unwrap(), pattern);
+            assert!(
+                guest
+                    .bytes(new + old_size, (new_size - old_size) as usize)
+                    .unwrap()
+                    .iter()
+                    .all(|&b| b == 0),
+                "moving large realloc must expose zeroed growth even without ZERO_MEMORY"
+            );
+        }
+    }
+
+    #[test]
+    fn large_mappings_are_zero_without_redundant_writes_and_retire_on_free() {
+        for zero in [false, true] {
+            let (mut guest, mut vm, mut heaps) = heap();
+            let maps = guest.map_calls;
+            let size = LARGE + 13;
+            guest.fail_write_call = Some(1);
+            for requested in [size, size + 9] {
+                let block = heaps
+                    .alloc(&mut guest, &mut vm, 0, requested, zero)
+                    .unwrap();
+                assert_eq!(guest.write_calls, 0, "a new mapping is already zeroed");
+                assert!(
+                    guest
+                        .bytes(block, requested as usize)
+                        .unwrap()
+                        .iter()
+                        .all(|&b| b == 0)
+                );
+                assert_eq!(heaps.size(0, block), Some(requested));
+                assert!(heaps.free(&mut guest, &mut vm, 0, block));
+                assert_eq!(heaps.owner(block), None);
+                assert_eq!(heaps.size(0, block), None);
+                assert_eq!(vm.region(block), None);
+                assert!(!guest.memory.contains_key(&block));
+                assert!(!heaps.free(&mut guest, &mut vm, 0, block));
+            }
+            assert_eq!(guest.map_calls, maps + 2);
+        }
+    }
+
+    #[test]
+    fn large_mapping_ownership_is_per_heap_and_destroy_retires_live_regions() {
         let (mut guest, mut vm, mut heaps) = heap();
         let other = heaps.create(&mut guest, &mut vm).unwrap();
         let first = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
-        let recent = heaps
+        let live = heaps
             .alloc(&mut guest, &mut vm, 0, LARGE + 8, false)
             .unwrap();
         let foreign = heaps
             .alloc(&mut guest, &mut vm, other, LARGE, false)
             .unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, other, foreign));
         assert!(heaps.free(&mut guest, &mut vm, 0, first));
-        assert!(heaps.free(&mut guest, &mut vm, 0, recent));
-        assert_eq!(
-            vm.region(first),
-            None,
-            "only the most recent spare survives"
-        );
-        assert_eq!(vm.region(recent), Some(LARGE + GRANULE));
-        assert_eq!(vm.region(foreign), Some(LARGE));
-        let mismatch = heaps
-            .alloc(&mut guest, &mut vm, 0, LARGE + GRANULE + 8, false)
-            .unwrap();
-        assert_ne!(
-            mismatch, recent,
-            "different capacities must not consume the spare"
-        );
-        let huge = heaps
-            .alloc(&mut guest, &mut vm, 0, 16 * ARENA + 1, false)
-            .unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, 0, huge));
-        assert_eq!(vm.region(huge), None);
-        assert_eq!(vm.region(recent), Some(LARGE + GRANULE));
+        assert_eq!(vm.region(first), None);
+        assert!(!guest.memory.contains_key(&first));
         assert!(heaps.destroy(&mut guest, &mut vm, heaps.process_heap));
-        for block in [recent, mismatch] {
-            assert_eq!(vm.region(block), None);
-            assert!(!guest.memory.contains_key(&block));
-        }
+        assert_eq!(vm.region(live), None);
+        assert!(!guest.memory.contains_key(&live));
         assert_eq!(vm.region(foreign), Some(LARGE));
+        assert_eq!(heaps.owner(foreign), Some(other));
         assert!(heaps.destroy(&mut guest, &mut vm, other));
+        assert_eq!(vm.region(foreign), None);
         assert!(guest.memory.is_empty());
-    }
-
-    #[test]
-    fn large_reuse_releases_failed_protection_and_does_not_retain_pinned_pages() {
-        let (mut guest, mut vm, mut heaps) = heap();
-        let block = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, 0, block));
-        guest.fail_protect = true;
-        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, LARGE, false), None);
-        assert_eq!(vm.region(block), None);
-        assert_eq!(heaps.owner(block), None);
-        guest.fail_protect = false;
-        let pinned = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
-        guest.locked = true;
-        assert!(heaps.free(&mut guest, &mut vm, 0, pinned));
-        assert_eq!(vm.region(pinned), None);
-    }
-
-    #[test]
-    fn large_reuse_limit_is_inclusive_and_memory_pressure_reclaims_the_spare() {
-        let (mut guest, mut vm, mut heaps) = heap();
-        let limit = 16 * ARENA;
-        let block = heaps.alloc(&mut guest, &mut vm, 0, limit, false).unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, 0, block));
-        let maps = guest.map_calls;
-        assert_eq!(
-            heaps.alloc(&mut guest, &mut vm, 0, limit, false),
-            Some(block)
-        );
-        assert_eq!(guest.map_calls, maps);
-        assert!(heaps.free(&mut guest, &mut vm, 0, block));
-        guest.fail_next_map = true;
-        let smaller = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
-        assert_eq!(
-            guest.map_calls,
-            maps + 2,
-            "retry once after retiring the spare"
-        );
-        assert_eq!(vm.region(block), Some(LARGE));
-        assert_eq!(smaller, block);
-        assert_eq!(heaps.size(0, smaller), Some(LARGE));
-    }
-
-    #[test]
-    fn large_reuse_keeps_ownership_when_spare_eviction_cannot_retire_pins() {
-        let (mut guest, mut vm, mut heaps) = heap();
-        let spare = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, 0, spare));
-        guest.pinned_region = Some(spare);
-        let next = heaps
-            .alloc(&mut guest, &mut vm, 0, LARGE + 8, false)
-            .unwrap();
-        assert!(heaps.free(&mut guest, &mut vm, 0, next));
-        assert_eq!(vm.region(next), None);
-        assert_eq!(vm.region(spare), Some(LARGE));
-        guest.pinned_region = None;
-        assert!(heaps.destroy(&mut guest, &mut vm, heaps.process_heap));
-        assert!(guest.memory.is_empty());
-        assert_eq!(vm.region(spare), None);
-    }
-
-    #[test]
-    fn large_reuse_restores_guest_permissions_for_plain_and_executable_heaps() {
-        use adv_cpu::JitCpu;
-        let mut cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
-        let (mut vm, mut heaps) = (Vm::new(), Heaps::default());
-        for executable in [false, true] {
-            let heap = heaps
-                .create_with_execute(&mut cpu, &mut vm, executable)
-                .unwrap();
-            let block = heaps.alloc(&mut cpu, &mut vm, heap, LARGE, false).unwrap();
-            cpu.protect(block, LARGE, Prot::READ).unwrap();
-            assert!(heaps.free(&mut cpu, &mut vm, heap, block));
-            assert_eq!(
-                heaps.alloc(&mut cpu, &mut vm, heap, LARGE, true),
-                Some(block)
-            );
-            assert!(cpu.accessible(block, LARGE, Prot::RW));
-            assert_eq!(cpu.accessible(block, LARGE, Prot::EXEC), executable);
-            assert!(heaps.destroy(&mut cpu, &mut vm, heap));
-            assert!(!cpu.accessible(block, 1, Prot::READ));
-        }
     }
 
     #[test]
@@ -881,20 +742,17 @@ mod tests {
             None
         );
         assert_eq!(heaps.size(0, old), Some(16));
-        // New VM mappings cannot fail a redundant clear; exercise reused bytes.
-        let spare = heaps.alloc(&mut guest, &mut vm, 0, LARGE, false).unwrap();
+        // New VM mappings cannot fail a redundant clear; exercise reused arena bytes.
+        let spare = heaps.alloc(&mut guest, &mut vm, 0, 5000, false).unwrap();
         assert!(heaps.free(&mut guest, &mut vm, 0, spare));
         guest.reset_counts();
         guest.fail_write_call = Some(1);
-        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, LARGE, true), None);
-        let failed = guest.last_map;
-        assert_eq!(vm.region(failed), None);
-        assert_eq!(heaps.owner(failed), None);
+        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), None);
+        assert_eq!(heaps.owner(spare), None);
+        assert_eq!(heaps.size(0, old), Some(16));
         guest.fail_write_call = None;
-        assert_eq!(
-            heaps.alloc(&mut guest, &mut vm, 0, LARGE, true),
-            Some(failed)
-        );
+        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), Some(spare));
+        assert!(guest.bytes(spare, 5000).unwrap().iter().all(|&b| b == 0));
         assert!(guest.max_write <= 4096);
     }
 }

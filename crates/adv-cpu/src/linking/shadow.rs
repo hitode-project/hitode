@@ -102,6 +102,7 @@ mod tests {
         m.add_region(Region::new(BODY + 7, 1)).unwrap();
         assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 1);
+        assert_eq!(m.state.regs[4], STACK + 4);
         assert_eq!(m.stats.shadow_hits, 0);
         assert!(m.stats.shadow_misses >= 1);
         assert_eq!(std::mem::size_of::<Stack>(), 1064);

@@ -12,12 +12,10 @@ mod code_store;
 mod coverage;
 mod instruction_trace;
 mod interpreter_profile;
-mod parallel;
 mod schedule;
 pub use schedule::CompilationSchedule;
 mod aot;
 mod persistent;
-mod tier1;
 mod verify;
 mod warm;
 pub use aot::{AotImage, AotStats};
@@ -46,6 +44,11 @@ pub struct Stats {
     pub compile_time: Duration,
     pub sync_compile_time: Duration,
     pub compile_wait_execution_ns: u64,
+    /// Opt-in chunk timings: deferred, queued, compiling, completed.
+    pub compile_wait_stage_ns: [u64; 4],
+    pub publication_ns: u64,
+    /// Opt-in fallback lane timings, split by the existing entry reason.
+    pub frame_reason_ns: [u64; 6],
     pub compile_wait_units: u64,
     pub compilation_schedule: CompilationSchedule,
     pub native_code_bytes: usize,
@@ -78,20 +81,6 @@ pub struct Stats {
     pub cliffs: crate::Cliffs,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
-    pub direct_memory: DirectMemoryStats,
-}
-
-/// Direct scalar site publications and dynamic access outcomes.
-#[derive(Default, Clone, Debug)]
-pub struct DirectMemoryStats {
-    pub sites: u64,
-    /// Regions recompiled with legacy scalar helpers after epilogue rejection.
-    pub inline_fallbacks: u64,
-    pub accesses: u64,
-    pub recoveries: u64,
-    pub violations: u64,
-    pub checked_fallbacks: u64,
-    pub code_writes: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -105,34 +94,15 @@ pub struct ProfileSample {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// The controller found a compiled entry; a native worker must execute it.
-    NativeReady,
     ReachedStop,
     Budget,
     Interrupted,
-    ReadFault {
-        pc: u32,
-        address: u32,
-    },
-    WriteFault {
-        pc: u32,
-        address: u32,
-    },
-    FetchFault {
-        pc: u32,
-        address: u32,
-    },
-    InvalidInstruction {
-        pc: u32,
-    },
-    UnsupportedInstruction {
-        pc: u32,
-        code: iced_x86::Code,
-    },
-    Trap {
-        pc: u32,
-        vector: u8,
-    },
+    ReadFault { pc: u32, address: u32 },
+    WriteFault { pc: u32, address: u32 },
+    FetchFault { pc: u32, address: u32 },
+    InvalidInstruction { pc: u32 },
+    UnsupportedInstruction { pc: u32, code: iced_x86::Code },
+    Trap { pc: u32, vector: u8 },
     Parked,
 }
 
@@ -146,18 +116,11 @@ const SCAN_BLOCKS: u64 = 1 << 18;
 pub struct Executor {
     pub(crate) frame_timing: bool,
     rows: Option<Box<crate::rows::RowPool>>,
-    parallel: Option<crate::parallel::Pool>,
-    parallel_image: Option<(u64, Arc<crate::parallel::Image>)>,
-    parallel_stop: Option<crate::parallel::Stop>,
-    admission: crate::parallel::Admission,
-    pub(crate) parallel_demand: bool,
     code: CodeStore,
     pub(crate) memory: Memory,
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     pub(crate) interpreter: crate::interpreter::Interpreter,
-    tier1: Option<crate::tier1::Engine>,
-    tier1_mode: crate::Tier1Mode,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -226,8 +189,6 @@ pub struct Executor {
 pub struct ExecutionContext {
     cpu: CpuState,
     deferred_fallback: Option<u32>,
-    parallel_stop: Option<crate::parallel::Stop>,
-    admission: crate::parallel::Admission,
 }
 
 impl ExecutionContext {
@@ -247,16 +208,12 @@ impl Executor {
         Ok(ExecutionContext {
             cpu,
             deferred_fallback: self.deferred_fallback,
-            parallel_stop: self.parallel_stop.clone(),
-            admission: self.admission,
         })
     }
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
         self.deferred_fallback = context.deferred_fallback;
-        self.parallel_stop = context.parallel_stop.clone();
-        self.admission = context.admission;
         Ok(())
     }
 
@@ -279,9 +236,6 @@ impl Executor {
         handler: Option<&mut dyn ExecutionTrap>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        let started = Instant::now();
-        let interpreted_before = self.stats.interpreter_entries;
-        let native_before = self.stats.native_blocks;
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,
@@ -315,18 +269,6 @@ impl Executor {
         if interpreter_only {
             self.instruction_trace = instruction_trace;
         }
-        if self.parallel.is_some() {
-            if self.stats.interpreter_entries != interpreted_before {
-                self.admission.cold();
-            } else if bridge.calls == 0
-                && self.stats.native_blocks != native_before
-                && matches!(result, Ok(RunOutcome::Budget))
-            {
-                self.admission.inline_native(started.elapsed());
-            } else {
-                self.admission.inline_boundary();
-            }
-        }
         // Export canonical floating state at every public CPU boundary. Context
         // saves can then borrow immutably without hiding MMX updates in RefCell.
         self.state.refresh_mmx();
@@ -334,22 +276,6 @@ impl Executor {
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        if let Some(engine) = &self.memory.direct_engine {
-            let stats = &mut self.stats.direct_memory;
-            stats.accesses = engine.accesses.get();
-            stats.recoveries = engine.recoveries.get();
-            stats.violations = engine.violations.get();
-            stats.checked_fallbacks = engine.checked.get();
-            stats.code_writes = engine.code_writes.get();
-        }
         self.timestamp = bridge.timestamp;
         result
     }
@@ -391,9 +317,6 @@ impl Executor {
         if self.stats.native_entries != 0 || self.stats.interpreter_entries != 0 {
             return Err("row workers must be selected before execution".into());
         }
-        if self.parallel.is_some() {
-            return Err("row batching is disabled with multiple guest workers".into());
-        }
         self.rows = Some(Box::new(crate::rows::RowPool::new(count)?));
         Ok(())
     }
@@ -411,27 +334,6 @@ impl Executor {
             .as_ref()
             .map_or_else(Default::default, |pool| pool.stats())
     }
-    /// Choose before compiling or executing. The default remains checked.
-    /// Disabling after reservation requires a fresh owner, so outstanding host
-    /// aliases can never silently move to a different allocation.
-    pub fn set_direct_memory(&mut self, enabled: bool) -> Result<(), String> {
-        if enabled == self.memory.direct_memory_enabled() {
-            return Ok(());
-        }
-        if !enabled {
-            return Err("create a fresh executor to disable direct memory".into());
-        }
-        if self.stats.native_entries != 0
-            || self.stats.interpreter_entries != 0
-            || !self.code.compiled.is_empty()
-            || !self.pending_regions.is_empty()
-            || !self.deferred_compilations.is_empty()
-        {
-            return Err("direct memory must be selected before compilation and execution".into());
-        }
-        self.memory.enable_direct_memory()
-    }
-
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Self::create(Memory::new(base, len)?)
     }
@@ -450,21 +352,14 @@ impl Executor {
                 None
             }
         };
-        let mut executor = Self {
+        let executor = Self {
             frame_timing: false,
             rows,
-            parallel: None,
-            parallel_image: None,
-            parallel_stop: None,
-            admission: crate::parallel::Admission::default(),
-            parallel_demand: true,
             code: CodeStore::default(),
             memory,
             region_linking: true,
             shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
-            tier1: None,
-            tier1_mode: crate::Tier1Mode::Off,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -516,13 +411,6 @@ impl Executor {
             state: CpuState::default(),
             stats: Stats::default(),
         };
-        if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
-            executor.set_direct_memory(true)?;
-        }
-        match std::env::var("ADV_GIR").as_deref() {
-            Ok("off" | "" | "0") | Err(_) => {}
-            Ok(_) => return Err("ADV_GIR execution has been removed; use the default GIR frontend or ADV_TIER2_FRONTEND=legacy for comparison".into()),
-        }
         Ok(executor)
     }
 
@@ -574,7 +462,6 @@ impl Executor {
     /// A new guest process shares policy and the bounded disk archive, never
     /// execution contexts or published native code. Its image identity is new.
     pub(crate) fn inherit_process_policy(&mut self, parent: &Self) -> Result<(), String> {
-        self.set_guest_workers(parent.guest_workers())?;
         self.background_service = parent.background_service.clone();
         self.auto_jit = parent.auto_jit;
         self.auto_compile_strategy = parent.auto_compile_strategy;
@@ -582,7 +469,6 @@ impl Executor {
         self.async_compilation = parent.async_compilation;
         self.persistent_cache = parent.persistent_cache.clone();
         self.set_aot_enabled(parent.aot.enabled);
-        self.set_tier1_mode(parent.tier1_mode)?;
         self.region_linking = parent.region_linking;
         self.profiling = parent.profiling;
         self.cache_region_limit = parent.cache_region_limit;
@@ -631,7 +517,6 @@ impl Executor {
 
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
-        self.memory.quiesce_workers();
         self.code.clear_links();
         self.code.cache_revision += 1;
         self.code.compiled.clear();
@@ -643,7 +528,6 @@ impl Executor {
         self.code.region_pages.clear();
         self.code.entry_owner.clear();
         self.code.fast_regions.clear();
-        self.code.parallel_entries.clear();
         self.pending_regions.clear();
         self.deferred_compilations.clear();
         self.stats.deferred_compilations = 0;
@@ -692,6 +576,7 @@ impl Executor {
             }
             return;
         }
+        let timer = self.frame_timing.then(Instant::now);
         self.native_heat.remove(&region.start);
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
@@ -706,15 +591,8 @@ impl Executor {
         for &pc in &compiled.entries {
             self.code.entry_owner.insert(pc, region.start);
             self.code.link(pc, compiled.tail_entry);
-            if self.parallel.is_some() {
-                self.code
-                    .parallel_entries
-                    .insert(pc, compiled.parallel_entry());
-            }
             self.demand.remove(&pc);
         }
-        self.stats.direct_memory.sites += compiled.direct_sites as u64;
-        self.stats.direct_memory.inline_fallbacks += compiled.direct_inline_fallbacks;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));
@@ -734,18 +612,16 @@ impl Executor {
             .collect();
         self.index_region_with_pages(region, Some(pages));
         self.code.cache_revision += 1;
+        if let Some(timer) = timer {
+            self.stats.publication_ns += timer.elapsed().as_nanos() as u64;
+        }
     }
 
     fn retire_compiled(&mut self, start: u32) {
-        if self.code.compiled.contains_key(&start) {
-            self.memory.quiesce_workers();
-        }
         if let Some(old) = self.code.compiled.remove(&start) {
             // Only the execution owner reaches this path, after every generated
             // call has returned. Remove all published raw targets before Drop
-            // unregisters unwind tables and releases executable memory. A stale
-            // worker image would keep the table shared and force a rebuild.
-            self.parallel_image = None;
+            // unregisters unwind tables and releases executable memory.
             self.code.retire_links();
             self.code.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
@@ -754,7 +630,6 @@ impl Executor {
                 if self.code.entry_owner.get(entry) == Some(&start) {
                     self.code.entry_owner.remove(entry);
                     self.code.unlink(*entry);
-                    self.code.parallel_entries.remove(entry);
                 }
             }
             self.stats.native_regions = self.code.compiled.len();
@@ -868,10 +743,6 @@ impl Executor {
         // optimize an already admitted whole loop under a separate finite cap;
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
-        if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
-            self.stats.compilation_schedule.capacity_rejections += 1;
-            return Ok(false);
-        }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         self.locate_cache_input(&mut snapshot);
@@ -918,7 +789,7 @@ impl Executor {
             return Ok(false);
         }
         self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
-        if self.tiered_compilation && self.parallel.is_none() {
+        if self.tiered_compilation {
             for fragment in &mut fragments {
                 if fragment.region.compile_strategy == CompileStrategy::Fast {
                     fragment.profile = Some(Arc::default());
@@ -942,6 +813,12 @@ impl Executor {
                     self.publish(region, compiled);
                 }
                 continue;
+            }
+            // A native-cache hit needs no compiler permit. Only an actual miss
+            // is subject to the unrestricted queue's admission limit.
+            if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
+                self.stats.compilation_schedule.capacity_rejections += 1;
+                return Ok(false);
             }
             if !self.pending_regions.contains_key(&fragment.region.start) {
                 self.schedule_deferred(fragment.region.start);
@@ -1212,12 +1089,9 @@ impl Executor {
     /// only submits bounded asynchronous work; explicit regions are never tiered.
     /// Disabling prevents new promotions; in-flight compilation may still publish.
     pub fn set_tiered_compilation(&mut self, enabled: bool) {
-        self.tiered_compilation = enabled && self.parallel.is_none();
+        self.tiered_compilation = enabled;
     }
     pub fn set_region_linking(&mut self, enabled: bool) {
-        if self.region_linking != enabled {
-            self.parallel_image = None;
-        }
         self.region_linking = enabled;
     }
 
@@ -1225,9 +1099,6 @@ impl Executor {
     /// Hints are private to one bounded native chain and never enter a saved CPU
     /// context. Default false preserves the existing checked CALL/RET path.
     pub fn set_shadow_returns(&mut self, enabled: bool) -> Result<(), String> {
-        if enabled && self.parallel.is_some() {
-            return Err("parallel return-stack hints are not enabled in this release".into());
-        }
         if self.shadow_returns.is_some() == enabled {
             return Ok(());
         }
@@ -1483,10 +1354,6 @@ impl Executor {
     }
 
     fn refresh_links(&mut self) {
-        if self.code.links_revision != self.code.cache_revision {
-            // Rebuilt on the next parallel dispatch; dropping it lets the table update in place.
-            self.parallel_image = None;
-        }
         self.code.refresh_links();
     }
 
@@ -1521,6 +1388,21 @@ impl Executor {
         let hits = self.hits.entry(pc).or_default();
         *hits = hits.saturating_add(1);
         if *hits < 32 {
+            return Ok(());
+        }
+        // An unrestricted queue cannot retain this discovery until a permit is
+        // free. Avoid rebuilding the same CFG on every interpreter chunk.
+        // Persistent entries have already been offered by apply_code_cache.
+        if self.async_compilation
+            && self.pending_regions.len() >= crate::compiler::CAPACITY
+            && self
+                .background_sender()?
+                .borrow()
+                .work_policy()
+                .background_limit()
+                .is_none()
+        {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(());
         }
         // The interpreter keeps running a loop while its region compiles. Its
@@ -1665,11 +1547,7 @@ impl Executor {
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
             let pending_fpu = self.state.x87.status & 0x80 != 0;
-            if !interpreter_only
-                && !precise_flags
-                && !pending_fpu
-                && self.tier1_mode != crate::Tier1Mode::Exclusive
-            {
+            if !interpreter_only && !precise_flags && !pending_fpu {
                 self.discover(stop)?;
             }
             // Publications and queued regions can change the ranges during this
@@ -1687,32 +1565,18 @@ impl Executor {
             }
             let native = native.filter(|(_, code)| {
                 !interpreter_only
-                    && self.tier1_mode != crate::Tier1Mode::Exclusive
                     && !precise_flags
                     && !pending_fpu
                     && code.entries.contains(&self.state.eip)
                     && self.deferred_fallback != Some(self.state.eip)
             });
             let native = native.map(|(owner, _)| owner);
-            if native.is_some()
-                && self.parallel.is_some()
-                && self.parallel_demand
-                && self.admission.ready()
-                && self.has_parallel_capacity()
-                && self.deadline.is_none_or(|deadline| {
-                    deadline.saturating_duration_since(Instant::now()) >= Duration::from_micros(100)
-                })
-            {
-                return Ok(RunOutcome::NativeReady);
-            }
             if let Some(owner) = native {
                 if self.region_linking && !self.profiling {
                     self.refresh_links();
                 }
-                // Parallel workers share memory, so a private undo is not possible.
-                let serial = self.parallel.is_none();
                 let trace = match self.verifier.as_deref_mut() {
-                    Some(verifier) if serial && verifier.pending.contains_key(&owner) => {
+                    Some(verifier) if verifier.pending.contains_key(&owner) => {
                         verifier.take(owner);
                         Some(verifier.record(
                             owner,
@@ -1749,11 +1613,7 @@ impl Executor {
                     &mut self.memory,
                     bridge,
                     compile::NativeRun {
-                        rows: if self.parallel.is_none() {
-                            self.rows.as_deref()
-                        } else {
-                            None
-                        },
+                        rows: self.rows.as_deref(),
                         // A verified entry stops at the region boundary.
                         links: (self.region_linking && !self.profiling && trace.is_none())
                             .then_some(&self.code.links),
@@ -1763,10 +1623,10 @@ impl Executor {
                         } else {
                             &self.inactive_interrupt
                         },
-                        shadow: self
-                            .shadow_returns
-                            .as_deref_mut()
-                            .filter(|_| trace.is_none()),
+                        // Compiled shadow operations require their owner stack,
+                        // even for a verified block. Native entry/exit clears it;
+                        // the one-block allowance still bounds verification.
+                        shadow: self.shadow_returns.as_deref_mut(),
                     },
                 );
                 if let Some(trace) = &trace {
@@ -1894,29 +1754,15 @@ impl Executor {
                 crate::InterpreterReason::Uncovered | crate::InterpreterReason::Rejected
             )
             .then(|| self.interpreter_detail(pc));
-            if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
-                self.interpreter.census = Some(Default::default());
-            }
             let waiting = matches!(
                 detail,
                 Some(
                     InterpreterDetail::PendingCompilation | InterpreterDetail::DeferredCompilation
                 )
             );
-            let wait_timer = (self.frame_timing && waiting).then(Instant::now);
+            let wait_timer = self.frame_timing.then(Instant::now);
             let retired_before = self.interpreter.frame_retired;
-            let tier1 = self.run_tier1(
-                stop,
-                units,
-                interpreter_only
-                    || precise_flags
-                    || pending_fpu
-                    || (self.tier1_mode == crate::Tier1Mode::Bridge
-                        && (self.parallel.is_some() || self.deferred_fallback == Some(pc))),
-            )?;
-            let (execution, last_units) = if let Some(result) = &tier1 {
-                (result.execution, result.last_units)
-            } else if self.profiling || precise_flags || observed.is_some() {
+            let (execution, last_units) = if self.profiling || precise_flags || observed.is_some() {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1934,55 +1780,38 @@ impl Executor {
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
-            if let Some(entry) = self.interpreter.census.take() {
-                bridge
-                    .cliffs
-                    .tier1_census
-                    .get_or_insert_with(Default::default)
-                    .record(reason, detail.unwrap(), entry);
-            }
-            let interpreted_units = tier1
-                .as_ref()
-                .map_or(execution.units, |r| r.interpreted_units);
-            if tier1.is_none()
-                && let Some(before) = retired_before
-            {
+            let interpreted_units = execution.units;
+            if let Some(before) = retired_before {
                 self.stats.frame_retired_tier0 += self
                     .interpreter
                     .frame_retired
                     .unwrap()
                     .saturating_sub(before);
             }
-            if let Some(timer) = wait_timer {
-                self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
-                self.stats.compile_wait_units += u64::from(execution.units);
-            }
-            let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
-            if self.tier1_mode == crate::Tier1Mode::Bridge && tier1.is_some() {
-                let native_units = execution.units - interpreted_units;
-                if native_units != 0 {
-                    bridge.cliffs.bridged(reason, detail, native_units);
+            let elapsed = wait_timer.map_or(0, |timer| timer.elapsed().as_nanos() as u64);
+            if wait_timer.is_some() {
+                let index = crate::frame_counters::reason_index(if waiting {
+                    crate::InterpreterReason::Pending
+                } else {
+                    reason
+                });
+                self.stats.frame_reason_ns[index] += elapsed;
+                if waiting || reason == crate::InterpreterReason::Pending {
+                    self.stats.compile_wait_execution_ns += elapsed;
+                    self.stats.compile_wait_units += u64::from(execution.units);
                 }
             }
-            self.stats.interpreter_entries += u64::from(interpreted);
+            self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(interpreted_units);
-            if interpreted {
-                if matches!(
-                    detail,
-                    Some(
-                        InterpreterDetail::PendingCompilation
-                            | InterpreterDetail::DeferredCompilation
-                    )
-                ) {
-                    self.schedule_interpreted(pc, interpreted_units);
-                }
-                bridge.cliffs.interpreted(reason, interpreted_units);
-                if let Some(detail) = detail {
-                    bridge.cliffs.detail(reason, detail, interpreted_units);
-                }
-                if let Some(profile) = &mut self.interpreter_profile {
-                    profile.record(pc, interpreted_units, reason, &self.memory);
-                }
+            if waiting || reason == crate::InterpreterReason::Pending {
+                self.schedule_interpreted(pc, interpreted_units, elapsed);
+            }
+            bridge.cliffs.interpreted(reason, interpreted_units);
+            if let Some(detail) = detail {
+                bridge.cliffs.detail(reason, detail, interpreted_units);
+            }
+            if let Some(profile) = &mut self.interpreter_profile {
+                profile.record(pc, interpreted_units, reason, &self.memory);
             }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
                 if self.demand.len() >= 65_536 {
@@ -1993,14 +1822,9 @@ impl Executor {
             self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
-                p.interpreter_entries += u64::from(interpreted);
+                p.interpreter_entries += 1;
                 p.interpreter_instructions += u64::from(interpreted_units);
-                if tier1.is_some() {
-                    p.native_entries += 1;
-                    p.native_ns += timer.elapsed().as_nanos() as u64;
-                } else {
-                    p.interpreter_ns += timer.elapsed().as_nanos() as u64;
-                }
+                p.interpreter_ns += timer.elapsed().as_nanos() as u64;
             }
             self.deferred_fallback = None;
             let step = match execution.step {
@@ -3240,15 +3064,21 @@ mod tiering_tests {
         let region = &m.code.regions[&0x1100];
         assert_eq!(region.callees, [0x1000]);
         assert_eq!(region.compile_strategy, CompileStrategy::Speed);
-        // Finish post-publication oracle samples before measuring steady-state
-        // entries: verification intentionally returns after each native block.
+        // Let pending publications progress before measuring the optimized unit.
         assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
         // The call and its return no longer leave the unit.
         let entries = m.stats.native_entries;
         assert_eq!(m.run(0x3000, 3000).unwrap(), RunOutcome::Budget);
-        assert!(m.stats.native_entries - entries <= 2);
+        // Late publications can start fresh one-block verification samples,
+        // so entry counts do not describe steady-state fusion in that mode.
+        if m.verifier.is_none() {
+            assert!(m.stats.native_entries - entries <= 2);
+        }
         assert_eq!(m.run(0x3000, u64::MAX).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[3], 100_000);
+        assert_eq!(m.state.regs[1], 0);
+        assert_eq!(m.state.regs[4], 0x4f04);
+        assert_eq!(m.state.regs[6], 0x1000);
     }
 
     fn direct_leaf_machine(leaf: &[u8], tiering: bool) -> Executor {
@@ -3472,32 +3302,6 @@ mod tiering_tests {
 }
 
 #[cfg(test)]
-mod removed_selector_tests {
-    use super::Executor;
-
-    #[test]
-    fn legacy_gir_execution_selector_fails_explicitly() {
-        if std::env::var("ADV_GIR").as_deref() != Ok("state-ssa") {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "executor::removed_selector_tests::legacy_gir_execution_selector_fails_explicitly",
-                ])
-                .env("ADV_GIR", "state-ssa")
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
-        }
-        let error = Executor::new(0x10000, 4096)
-            .err()
-            .expect("removed execution selector must reject construction");
-        assert!(error.contains("ADV_GIR execution has been removed"));
-        assert!(error.contains("ADV_TIER2_FRONTEND=legacy"));
-    }
-}
-
-#[cfg(test)]
 mod publication_tests {
     use super::*;
 
@@ -3525,7 +3329,7 @@ mod publication_tests {
         unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
             .iter()
             .filter_map(|slot| {
-                let entry = slot.entry.load(Ordering::Acquire);
+                let entry = slot.entry;
                 (entry != 0).then_some((slot.pc, entry))
             })
             .collect()
@@ -3637,28 +3441,6 @@ mod native_deadline_tests {
         m.state.regs[4] = 0x5f00;
         m.write(0x5f00, &0x4000u32.to_le_bytes()).unwrap();
         m
-    }
-
-    #[test]
-    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    fn native_time_slice_exhaustion_qualifies_for_parallel_execution() {
-        let mut m = Executor::new(0x1000, 0x5000).unwrap();
-        m.set_guest_workers(2).unwrap();
-        m.protect(0x1000, 0x5000, READ | WRITE).unwrap();
-        let code = [0x40, 0x83, 0xc3, 3, 0xeb, 0xfa];
-        m.write(0x1000, &code).unwrap();
-        m.protect(0x1000, 0x1000, READ | EXEC).unwrap();
-        m.add_region(Region::new(0x1000, code.len())).unwrap();
-        m.state.eip = 0x1000;
-        m.parallel_demand = false;
-        m.deadline = Some(Instant::now() + Duration::from_millis(5));
-        assert_eq!(m.run(0x4000, u64::MAX).unwrap(), RunOutcome::Budget);
-        assert!(m.stats.native_blocks > 0);
-        assert_eq!(m.stats.interpreter_entries, 0);
-        assert!(
-            m.admission.ready(),
-            "wall-time exhaustion must qualify just like instruction fuel"
-        );
     }
 
     #[test]

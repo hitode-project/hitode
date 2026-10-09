@@ -37,6 +37,15 @@ class FakeProcess:
 
 
 class PlaySessionTests(unittest.TestCase):
+    def test_failure_preserves_the_frozen_scene_before_final_close(self):
+        commands = []
+        play_session.preserve_failure(commands.append, Path("fixture"))
+        self.assertEqual(commands[0], "key-up 17")
+        self.assertTrue(commands[1].startswith("report "))
+        self.assertTrue(commands[1].endswith("blocked.json"))
+        self.assertTrue(commands[2].endswith("blocked.png"))
+        self.assertNotIn("close", commands)
+
     def test_native_cache_import_and_switches_use_only_the_new_overlay(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,7 +93,7 @@ class PlaySessionTests(unittest.TestCase):
         values = dict(binary=binary, exe=game, schedule=schedule, output=root / "output",
                       seed_data=None, audio=True, mute_audio=False, capture_audio=False,
                       mode="hidden", tail_seconds=0, codepage=932, codec="native",
-                      guest_workers=1, sync_compilation=False, no_tiering=False, trace=False)
+                      sync_compilation=False, no_tiering=False, trace=False)
         values.update(changes)
         return argparse.Namespace(**values)
 
@@ -181,7 +190,7 @@ class ReplayDiagnosticsTest(unittest.TestCase):
                 args = argparse.Namespace(binary=binary, exe=game, schedule=schedule,
                     output=output, seed_data=None, mode="hidden", codepage=932,
                     audio=False, capture_audio=False, trace=trace, tail_seconds=0,
-                    codec="native", guest_workers=1, sync_compilation=False, no_tiering=False)
+                    codec="native", sync_compilation=False, no_tiering=False)
 
                 class Runner:
                     returncode = None

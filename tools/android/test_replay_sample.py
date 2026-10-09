@@ -206,7 +206,7 @@ class ReplayTests(unittest.TestCase):
                                       auto_dialog_ms=None, tail_seconds=3,
                                       timeout_grace=15, ack_timeout=1, transfer_timeout=1)
             if experimental:
-                args.tier1, args.compile_threads, args.cpu_mask = "bridge", 4, "7f"
+                args.compile_threads, args.cpu_mask = 4, "7f"
             operations = []
             hashes = [replay.sha256(binary), replay.sha256(game / "game.exe")]
             good_report = {"frames": 4, "failure": None, "api": {"mode": "strict", "stub_calls": 0,
@@ -273,7 +273,7 @@ class ReplayTests(unittest.TestCase):
             self.assertIn("-T", launch)
             self.assertIn("timeout -s KILL 30", launch[-1])
             if experimental:
-                self.assertIn("taskset 7f env ADV_TIER1=bridge ADV_COMPILE_THREADS=4", launch[-1])
+                self.assertIn("taskset 7f env ADV_COMPILE_THREADS=4", launch[-1])
             if font_diagnostics:
                 self.assertIn("ADV_TEXT_DIAGNOSTICS=1", launch[-1])
             else:

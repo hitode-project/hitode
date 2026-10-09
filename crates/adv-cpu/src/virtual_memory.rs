@@ -209,6 +209,15 @@ mod os {
         // guarantee independently of whether the OS retained these bytes.
         unsafe { libc::madvise(p.cast(), size, libc::MADV_DONTNEED) };
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub unsafe fn zero(p: *mut u8, size: usize) {
+        // Linux guarantees zero-fill on demand after successful DONTNEED on
+        // private anonymous pages. Failed calls still clear explicitly.
+        if unsafe { libc::madvise(p.cast(), size, libc::MADV_DONTNEED) == 0 } {
+            return;
+        }
+        unsafe { std::ptr::write_bytes(p, 0, size) };
+    }
     pub unsafe fn release(p: *mut u8, size: usize) {
         unsafe {
             libc::munmap(p.cast(), size);
@@ -241,7 +250,7 @@ struct PagePlan {
     guest_pages: Range<usize>,
     // Whole host pages whose accessibility changes in this operation.
     host_spans: Vec<Range<usize>>,
-    // Decommitted bytes in host pages that must stay RW for live neighbours.
+    // Guest bytes in host pages that must stay RW for live neighbours.
     clear_spans: Vec<Range<usize>>,
     protection_changes: Vec<direct::HostChange>,
 }
@@ -299,6 +308,11 @@ impl UnixPages {
             if commit {
                 if !has_live_pages {
                     Self::push_span(&mut plan.host_spans, host_start..host_end);
+                } else {
+                    Self::push_span(
+                        &mut plan.clear_spans,
+                        offset.max(host_start)..end.min(host_end),
+                    );
                 }
             } else {
                 let retains_live_pages = pages
@@ -469,9 +483,21 @@ impl Reservation {
         let mut pages = self.pages.borrow_mut();
         let plan = pages.plan(offset, end, true)?;
         self.change_host_spans(&plan.host_spans, true)?;
-        // A newly committed guest page is always zero-filled, even when its
-        // host page stayed RW for another guest page or the OS retained bytes.
-        unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(offset), 0, len) };
+        // Only wholly empty host pages can be reset without touching live
+        // neighbours. Partial host pages retain explicit guest-range clearing.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            for span in &plan.host_spans {
+                unsafe { os::zero(self.ptr.as_ptr().add(span.start), span.len()) };
+            }
+            for span in &plan.clear_spans {
+                unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(span.start), 0, span.len()) };
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        unsafe {
+            std::ptr::write_bytes(self.ptr.as_ptr().add(offset), 0, len)
+        };
         pages.apply(&plan, true);
         Ok(())
     }
@@ -491,7 +517,7 @@ impl Reservation {
         for span in &plan.host_spans {
             // Only wholly empty host pages may be discarded. Failure of this
             // advisory call cannot expose bytes: the span is already NONE and
-            // every future guest commit explicitly initializes its own bytes.
+            // every future guest commit initializes its own bytes again.
             unsafe { os::discard(self.ptr.as_ptr().add(span.start), span.len()) };
         }
         Ok(())
@@ -1060,6 +1086,7 @@ mod tests {
         // inside the operation are all empty; it needs no host transition.
         let plan = commit(&mut pages, HOST_16K + GUEST, len);
         assert_eq!(plan.host_spans, [2 * HOST_16K..len]);
+        assert_eq!(plan.clear_spans, [HOST_16K + GUEST..2 * HOST_16K]);
         assert!(pages.committed[HOST_16K / GUEST]);
     }
 
@@ -1123,6 +1150,41 @@ mod tests {
             assert!(reservation.commit(offset, len).is_err());
             assert!(reservation.decommit(offset, len).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mixed_host_recommit_zeroes_slots_and_preserves_boundary_neighbours() {
+        let host = os::page_size().unwrap().max(HOST_16K);
+        let len = 3 * host;
+        let reservation = Reservation::new(len).unwrap();
+        // Exercise the mixed-host policy on 4 KiB machines as well as native
+        // larger-page hosts; all syscall spans remain native-page aligned.
+        *reservation.pages.borrow_mut() = UnixPages::new(len, host).unwrap();
+        reservation.commit(0, len).unwrap();
+        unsafe { std::ptr::write_bytes(reservation.ptr.as_ptr(), 0x5a, len) };
+        reservation.decommit(GUEST, len - 2 * GUEST).unwrap();
+        reservation.commit(GUEST, len - 2 * GUEST).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(reservation.ptr.as_ptr(), len) };
+        assert!(bytes[..GUEST].iter().all(|&byte| byte == 0x5a));
+        assert!(bytes[GUEST..len - GUEST].iter().all(|&byte| byte == 0));
+        assert!(bytes[len - GUEST..].iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn unix_failed_zero_reset_falls_back_to_exact_byte_clearing() {
+        let host = os::page_size().unwrap();
+        let reservation = Reservation::new(host).unwrap();
+        reservation.commit(0, host).unwrap();
+        unsafe { std::ptr::write_bytes(reservation.ptr.as_ptr(), 0x5a, host) };
+        // An unaligned address makes DONTNEED fail; the fallback must clear
+        // exactly the requested bytes and leave both sentinels unchanged.
+        unsafe { os::zero(reservation.ptr.as_ptr().add(1), host - 2) };
+        let bytes = unsafe { std::slice::from_raw_parts(reservation.ptr.as_ptr(), host) };
+        assert_eq!(bytes[0], 0x5a);
+        assert!(bytes[1..host - 1].iter().all(|&byte| byte == 0));
+        assert_eq!(bytes[host - 1], 0x5a);
     }
 
     #[cfg(unix)]

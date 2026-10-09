@@ -1,7 +1,7 @@
 //! Synthetic polling benchmark: `cargo run -p adv-cpu --release --example safepoint_bench`.
-//! Inputs: ADV_SAFEPOINT (unset or poll), ADV_SAFEPOINT_BENCH_TIER (0/1/2),
+//! Inputs: ADV_SAFEPOINT_BENCH_TIER (0/2),
 //! ADV_SAFEPOINT_BENCH_LOOPS (default 200000), ADV_SAFEPOINT_BENCH_SAMPLES
-//! (default 7). Tier 1 requires a supported ARM64 host; the default tier is 2.
+//! (default 7). The default tier is 2.
 //! Output: anonymous CSV ns/loop and notification-to-return median/max us.
 //! Compilation, warmup, producer sleep, and result validation are not timed.
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
@@ -59,9 +59,8 @@ fn machine(tier: u8) -> Executor {
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     match tier {
         0 => {}
-        1 => m.set_arm64_tier1(true).expect("Tier 1 host support"),
         2 => m.add_region(Region::new(CODE, bytes.len())).unwrap(),
-        _ => panic!("tier must be 0, 1, or 2"),
+        _ => panic!("tier must be 0 or 2"),
     }
     m
 }
@@ -154,8 +153,8 @@ fn latency(m: &mut Executor, tier: u8, samples: usize) -> (f64, f64) {
             elapsed < Duration::from_secs(2),
             "notification exceeded functional bound"
         );
-        // Tier 1 may pause inside the logical loop. Replay the exact charged
-        // prefix in the same tier instead of equating block/instruction fuel.
+        // Replay the exact charged prefix in the same tier instead of
+        // equating block/instruction fuel.
         let consumed = u64::MAX - m.state.fuel;
         reset(&mut replay, u32::MAX);
         assert!(
@@ -181,11 +180,7 @@ fn main() {
         .map_or(2, |s| s.parse::<u8>().expect("integer tier"));
     let loops = option("ADV_SAFEPOINT_BENCH_LOOPS", 200_000, 10_000_000);
     let samples = option("ADV_SAFEPOINT_BENCH_SAMPLES", 7, 31) as usize;
-    let mode = if std::env::var("ADV_SAFEPOINT").is_ok_and(|s| s == "poll") {
-        "poll"
-    } else {
-        "off"
-    };
+    let mode = "default";
     let mut m = machine(tier);
     m.set_host_interrupt_flag(Arc::new(AtomicBool::new(false)));
     reset(&mut m, 32);

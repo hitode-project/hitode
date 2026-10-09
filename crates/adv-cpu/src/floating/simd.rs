@@ -491,9 +491,37 @@ fn float_supported(m: M) -> bool {
     )
 }
 fn bits(bytes: &[u8]) -> u64 {
-    let mut out = [0; 8];
-    out[..bytes.len()].copy_from_slice(bytes);
-    u64::from_le_bytes(out)
+    // Fixed-width lanes avoid a variable-size memcpy for every packed element.
+    // Keep the fallback for callers that need a partial, zero-extended value.
+    match bytes.len() {
+        1 => u64::from(bytes[0]),
+        2 => u64::from(u16::from_le_bytes(bytes.try_into().unwrap())),
+        4 => u64::from(u32::from_le_bytes(bytes.try_into().unwrap())),
+        8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+        _ => {
+            let mut out = [0; 8];
+            out[..bytes.len()].copy_from_slice(bytes);
+            u64::from_le_bytes(out)
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn packed_lane_reads_preserve_width_endianness_and_unaligned_input() {
+    for len in 0..=8 {
+        for offset in 0..16 {
+            for seed in [0u8, 1, 0x7f, 0x80, 0xff] {
+                let bytes: [u8; 24] = std::array::from_fn(|n| seed.wrapping_add((n * 37) as u8));
+                let lane = &bytes[offset..offset + len];
+                let expected = lane
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |v, (n, b)| v | (u64::from(*b) << (n * 8)));
+                assert_eq!(bits(lane), expected);
+            }
+        }
+    }
 }
 fn nan(a: u64, width: usize) -> bool {
     if width == 4 {

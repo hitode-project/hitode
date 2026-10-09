@@ -107,13 +107,10 @@ def report_config(report: dict) -> dict:
             "missing codec provider")
     require(isinstance(report.get("codec_kernels"), dict) and report["codec_kernels"].get("mode") in ("guest", "native"),
             "Verify or unknown kernel mode cannot be a performance baseline")
-    require(isinstance(report.get("parallel"), dict) and report["parallel"].get("workers") == 1,
-            "expected one guest worker")
     return {name: report[name] for name in REPORT_CONFIG} | {
         "codec_provider": report["codec"]["provider"], "codec_kernel_mode": report["codec_kernels"]["mode"],
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,
         "time_skip_enabled": report.get("time_skip", {}).get("enabled"),
-        "tier1_mode": report.get("tier1", {}).get("mode", "off"),
         "compile_threads": report.get("compilation_schedule", {}).get("compile_threads"),
         "available_cores": report.get("compilation_schedule", {}).get("available_cores")}
 
@@ -121,9 +118,8 @@ def report_config(report: dict) -> dict:
 def execution_metrics(report: dict) -> dict:
     """Keep aggregate execution counters and compiler histograms per observation."""
     cliffs = report.get("cpu_cliffs", {})
-    return {"tier1": report.get("tier1"), "compilation_schedule": report.get("compilation_schedule"),
-            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details"),
-            "tier1_bridge": cliffs.get("tier1_bridge")}
+    return {"compilation_schedule": report.get("compilation_schedule"),
+            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details")}
 
 
 def condition_identity(metadata: dict) -> dict | None:

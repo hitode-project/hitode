@@ -1,7 +1,7 @@
 //! Process-owned translated code and lookup metadata. No guest register state lives here.
 //! Publication stays on the controller; retirement drains native leases first.
 use crate::{Region, compile::Compiled};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub(super) struct CodeStore {
@@ -17,7 +17,6 @@ pub(super) struct CodeStore {
     /// Only resident Fast code can acquire promotion heat.
     pub(super) fast_regions: BTreeSet<u32>,
     pub(super) links: Arc<crate::linking::Table>,
-    pub(super) parallel_entries: HashMap<u32, crate::parallel::Entry>,
     pub(super) links_revision: u64,
     pub(super) cache_revision: u64,
     // Queuing a region changes the range index before native publication changes
@@ -40,7 +39,6 @@ impl Default for CodeStore {
             link_updates: Some(BTreeSet::new()),
             fast_regions: BTreeSet::new(),
             links: Arc::default(),
-            parallel_entries: HashMap::new(),
             links_revision: 0,
             cache_revision: 1,
             regions_revision: 1,

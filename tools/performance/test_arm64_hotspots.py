@@ -14,11 +14,11 @@ from arm64_hotspots import RangeEvent, Ranges, classify, host_symbol, load_range
 
 class HotspotsTests(unittest.TestCase):
     def test_range_boundaries_retirement_and_reuse(self):
-        ranges = Ranges([RangeEvent(10, "load", 4096, 16, "Tier 1"),
-                         RangeEvent(20, "unload", 4096, 16, "Tier 1"),
+        ranges = Ranges([RangeEvent(10, "load", 4096, 16, "Tier 2 Cranelift"),
+                         RangeEvent(20, "unload", 4096, 16, "Tier 2 Cranelift"),
                          RangeEvent(30, "load", 4096, 8, "Tier 2 Cranelift")])
         self.assertIsNone(ranges.lookup(4096, 9))
-        self.assertEqual(ranges.lookup(4096, 10), "Tier 1")
+        self.assertEqual(ranges.lookup(4096, 10), "Tier 2 Cranelift")
         self.assertIsNone(ranges.lookup(4112, 10))
         self.assertIsNone(ranges.lookup(4096, 20))
         self.assertEqual(ranges.lookup(4103, 30), "Tier 2 Cranelift")
@@ -29,7 +29,7 @@ class HotspotsTests(unittest.TestCase):
     def test_static_map_rejects_reuse(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "perf.map"
-            path.write_text("1000 20 adv-jit-tier1\n1000 10 adv-jit-tier2\n", encoding="utf-8")
+            path.write_text("1000 20 adv-jit-tier2\n1000 10 adv-jit-tier2\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "overlapping"):
                 load_ranges(path, static=True)
 
@@ -42,15 +42,15 @@ class HotspotsTests(unittest.TestCase):
 
     def test_invalid_lifetime_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "retirement"):
-            Ranges([RangeEvent(0, "unload", 4096, 8, "Tier 1")]).lookup(4096, 1)
+            Ranges([RangeEvent(0, "unload", 4096, 8, "Tier 2 Cranelift")]).lookup(4096, 1)
         with self.assertRaisesRegex(ValueError, "overlapping"):
-            Ranges([RangeEvent(0, "load", 4096, 16, "Tier 1"),
-                    RangeEvent(1, "load", 4100, 8, "Tier 1")]).lookup(4096, 1)
+            Ranges([RangeEvent(0, "load", 4096, 16, "Tier 2 Cranelift"),
+                    RangeEvent(1, "load", 4100, 8, "Tier 2 Cranelift")]).lookup(4096, 1)
 
     def test_leaf_jit_and_host_helpers_do_not_double_count(self):
-        self.assertEqual(classify("memcpy", "libc.so", "Tier 1"), "Tier 1")
+        self.assertEqual(classify("memcpy", "libc.so", "Tier 2 Cranelift"), "Tier 2 Cranelift")
         self.assertEqual(classify("memcpy", "libc.so", None), "Memory copy/set")
-        self.assertEqual(classify("adv_cpu::tier1::sse::call", "adv-run", None), "JIT helper SSE")
+        self.assertEqual(classify("adv_cpu::compile::sse::call", "adv-run", None), "JIT helper SSE")
         self.assertEqual(classify("cranelift_codegen::compile", "adv-run", None), "Compilation")
         self.assertEqual(classify("adv_cpu::fault_recovery::recover_current", "adv-run", None), "JIT helper memory")
         self.assertEqual(classify("<adv_device::ring::RingVoice>::render", "adv-run", None), "Audio mixing")

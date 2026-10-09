@@ -1,6 +1,5 @@
 //! Native Windows oracle for independent address spaces and loader handoff.
 #![cfg(windows)]
-use adv_cpu::backend::Backend;
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
 use std::os::windows::process::CommandExt;
@@ -46,15 +45,9 @@ fn isolated_processes_match_windows_and_survive_loader_exit() {
         .iter()
         .map(|name| std::fs::read(directory.join(name)).unwrap())
         .collect();
-    for name in ["interpreter", "jit", "unicorn", "jit2"] {
+    for name in ["interpreter", "jit", "unicorn"] {
         let data = directory.join(format!("{name}-{}", std::process::id()));
-        let mut cpu = backend::Cpu::new(if name == "jit2" { "jit" } else { name }).unwrap();
-        if name == "jit2" {
-            if !cfg!(all(target_arch = "x86_64", target_env = "msvc")) {
-                continue;
-            }
-            cpu.jit_mut().unwrap().set_guest_workers(2).unwrap();
-        }
+        let cpu = backend::Cpu::new(name).unwrap();
         let mut runtime = Runtime::with_cpu(
             directory.join("fixture_guest_parent.exe"),
             &data,
@@ -103,10 +96,6 @@ fn isolated_processes_match_windows_and_survive_loader_exit() {
             };
             assert_eq!(words(&actual), words(expected), "{name} {file}");
         }
-        assert_eq!(
-            runtime.machine.cpu.guest_workers(),
-            if name == "jit2" { 2 } else { 1 }
-        );
         let statuses = runtime.process_statuses();
         assert_eq!(statuses.len(), 3, "{name}: {statuses:?}");
         assert_eq!(

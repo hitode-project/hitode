@@ -16,28 +16,19 @@ Assert ($plan.adb_port -eq 5037)
 Assert ($plan.cargo_arguments -contains 'host_region_bench')
 Assert ($plan.cargo_arguments -contains '--locked')
 Assert ($plan.cpu_mask -eq 'auto')
-Assert ($plan.shell.Contains('ADV_SAFEPOINT=off'))
-$poll = & $runner @arguments -Safepoint poll -LockOwner spt | ConvertFrom-Json
-Assert ($poll.shell.Contains('ADV_SAFEPOINT=poll'))
-$event = & $runner @arguments -CodeValidity event -CompileBench | ConvertFrom-Json
-Assert ($event.shell.Contains('ADV_CODE_VALIDITY=event'))
+Assert (-not $plan.shell.Contains('ADV_SAFEPOINT'))
+$event = & $runner @arguments -CompileBench | ConvertFrom-Json
 Assert ($event.shell.Contains('ADV_REGION_BENCH_COMPILE=1'))
 Assert (-not $event.shell.Contains('taskset'))
-Assert ($plan.shell.Contains('ADV_CODE_VALIDITY=legacy'))
 $plan = & $runner @arguments -SkipBuild -CpuMask 40 -Corpus 'local-corpus' | ConvertFrom-Json
 Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))
 Assert ($plan.shell.Contains('ADV_GIR_LIFT_CORPUS='))
-Assert ($plan.shell.Contains('unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES'))
+Assert ($plan.shell.Contains('unset ADV_JIT_VERIFY ADV_HOST_FEATURES'))
 Assert ($plan.shell.Contains('ADV_PERF_MAP_DIR;'))
 Assert ($plan.cooldown_seconds -eq 60 -and $plan.cleanup)
-$plan = & $runner @arguments -SkipBuild -DirectMemory off,legacy,inline -LockOwner dmem | ConvertFrom-Json
-Assert ($plan.lock_owner -eq 'dmem')
-Assert (($plan.direct_memory -join ',') -eq 'off,legacy,inline')
-Assert ($plan.commands.Count -eq 3)
-foreach ($mode in @('off', 'legacy', 'inline')) {
-    Assert (@($plan.commands | Where-Object { $_.Contains("ADV_REGION_BENCH_DIRECT=$mode ") }).Count -eq 1)
-}
+Assert ($plan.commands.Count -eq 1)
+Assert (-not $plan.shell.Contains('ADV_REGION_BENCH_DIRECT'))
 $rejected = $false
 try { & $runner @arguments -LockOwner 'bad;owner' | Out-Null } catch { $rejected = $true }
 Assert $rejected

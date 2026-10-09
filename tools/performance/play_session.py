@@ -94,6 +94,13 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
     return environment, removed
 
 
+def preserve_failure(send, output: Path) -> None:
+    """Capture a frozen failed gate before close handlers change the scene."""
+    send("key-up 17")
+    send(f"report {output / 'blocked.json'}")
+    send(f"capture {output / 'blocked.png'}")
+
+
 def run(args: argparse.Namespace) -> None:
     scene = load_scene(args.schedule)
     steps = scene["steps"] if scene else load_schedule(args.schedule)
@@ -126,7 +133,6 @@ def run(args: argparse.Namespace) -> None:
     if args.audio:
         command.append("--audio")
     command.extend(["--codec", args.codec])
-    command.extend(["--guest-workers", str(args.guest_workers)])
     if args.sync_compilation:
         command.append("--sync-compilation")
     if args.no_tiering:
@@ -255,6 +261,11 @@ def run(args: argparse.Namespace) -> None:
             metadata["completed"] = False
             metadata["suitable_for_performance_comparison"] = False
             metadata["error"] = str(error)
+            if process.poll() is None:
+                try:
+                    preserve_failure(send, output)
+                except (RuntimeError, OSError, queue.Empty) as capture_error:
+                    metadata["failure_capture_error"] = type(capture_error).__name__
             raise
         finally:
             if process.poll() is None:
@@ -282,7 +293,6 @@ if __name__ == "__main__":
     parser.add_argument("--auto-dialog-ms", type=int, default=50,
                         help="automatic dialog delay; zero leaves dialogs pending")
     parser.add_argument("--seed-data", type=Path, help="copy an existing runtime data root into the isolated overlay")
-    parser.add_argument("--guest-workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--mode", choices=("headless", "hidden", "window"), default="headless")
     parser.add_argument("--codepage", choices=(932, 936), type=int, default=936)
     parser.add_argument("--audio", action="store_true")

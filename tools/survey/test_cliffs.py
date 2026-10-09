@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from cliffs import (aggregate, empty_census, main, markdown, read_reports, SCHEDULE_HISTOGRAMS,
+from cliffs import (aggregate, main, markdown, read_reports, SCHEDULE_HISTOGRAMS,
                     SCHEDULE_GLOBALS, SCHEDULE_COUNTERS)
 
 
@@ -43,95 +43,6 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
-    def test_bridge_retirements_are_separate_and_old_reports_unmeasured(self):
-        report = fixture()
-        report["cpu_cliffs"]["tier1_bridge"] = {
-            "entries": 2, "instructions": 500,
-            "details": {"Rejected/PendingCompilation": {"entries": 1, "instructions": 256},
-                        "Interior": {"entries": 1, "instructions": 244}}}
-        result = aggregate([report, fixture(), report])
-        c = result["cpu_cliffs"]
-        self.assertEqual(c["tier1_bridge"]["instructions"], 1000)
-        self.assertEqual(c["tier1_bridge_reports"], 2)
-        self.assertEqual(c["tier1_bridge_unmeasured_reports"], 1)
-        self.assertEqual(c["interpreter_total"]["instructions"], 360)
-        self.assertIn("1000", markdown(result))
-        self.assertNotIn("private", markdown(result))
-
-    def test_bridge_rejects_bad_totals_and_private_labels(self):
-        for label, units in [("Uncovered/BelowThreshold", 9), ("private/path", 10),
-                             ("Forced", 10), ("Fallback", 10)]:
-            report = fixture()
-            report["cpu_cliffs"]["tier1_bridge"] = {
-                "entries": 1, "instructions": 10,
-                "details": {label: {"entries": 1, "instructions": units}}}
-            with self.assertRaises(ValueError) as caught:
-                aggregate([report])
-            self.assertNotIn("private", str(caught.exception))
-
-    def census_fixture(self):
-        report = empty_fixture()
-        c = report["cpu_cliffs"]
-        c["interpreter"] = {"Uncovered": {"entries": 2, "instructions": 20}}
-        c["tier1_census"] = empty_census()
-        row = c["tier1_census"]["PendingCompilation"]
-        row.update(entries=2, instructions=4, supported_units=18, unsupported_units=2,
-                   prefix_units=17, unsupported={"Fld1": 2})
-        row["blocked_prefixes"][1] = 1
-        row["censored_prefixes"][1] = 1
-        return report
-
-    def test_census_merges_rep_units_prefixes_and_unknown_reports(self):
-        result = aggregate([self.census_fixture(), empty_fixture(), self.census_fixture()])
-        cliffs = result["cpu_cliffs"]
-        self.assertEqual(cliffs["tier1_census_reports"], 2)
-        row = cliffs["tier1_census"]["PendingCompilation"]
-        self.assertEqual(row["supported_units"], 36)
-        self.assertEqual(row["unsupported"], {"Fld1": 4})
-        self.assertEqual(row["blocked_prefixes"][1], 2)
-        self.assertNotIn("private", markdown(result))
-
-    def test_census_and_pc64_distributions_coexist(self):
-        report = fixture()
-        report["cpu_cliffs"].update({
-            key: value for key, value in self.census_fixture()["cpu_cliffs"].items()
-            if key in ("interpreter", "tier1_census")})
-        report["cpu_cliffs"].update(
-            x87_control={"PC=64/RC=nearest/masks=3f": 8},
-            x87_control_rejections={"PC": 8, "RC": 0, "Masks": 0},
-            x87_pc64={"Fadd/Exact": 3, "Fadd/Inexact": 5})
-        counters = aggregate([report])["cpu_cliffs"]
-        self.assertEqual(counters["x87_pc64"], {"Fadd/Inexact": 5, "Fadd/Exact": 3})
-        self.assertEqual(counters["tier1_census"]["PendingCompilation"]["supported_units"], 18)
-
-    def test_census_truncation_and_bucket_reconciliation(self):
-        report = self.census_fixture()
-        row = report["cpu_cliffs"]["tier1_census"]["PendingCompilation"]
-        row.update(unsupported={f"Form{n}_rm32": 1 for n in range(24)},
-                   unsupported_units=27, omitted_rows=2, omitted_units=3)
-        report["cpu_cliffs"]["interpreter"]["Uncovered"]["instructions"] = 45
-        self.assertEqual(aggregate([report])["cpu_cliffs"]["tier1_census"]["PendingCompilation"]["omitted_units"], 3)
-        row["omitted_units"] = 2
-        with self.assertRaisesRegex(ValueError, "reconcile"):
-            aggregate([report])
-
-    def test_census_rejects_private_labels_bad_histograms_and_partial_fields(self):
-        for key, value in (("unsupported", {"Mov_0x1234": 2}),
-                           ("unsupported", {"private/path": 2}),
-                           ("blocked_prefixes", [True] * 8),
-                           ("censored_prefixes", [0]),
-                           ("entries", 3), ("instructions", 100),
-                           ("prefix_units", 19), ("omitted_rows", 1)):
-            report = self.census_fixture()
-            report["cpu_cliffs"]["tier1_census"]["PendingCompilation"][key] = value
-            with self.assertRaises(ValueError) as caught:
-                aggregate([report])
-            self.assertNotIn("private", str(caught.exception))
-        report = self.census_fixture()
-        del report["cpu_cliffs"]["tier1_census"]["Rejected"]
-        with self.assertRaises(ValueError):
-            aggregate([report])
-
     def schedule_fixture(self):
         report = empty_fixture()
         histogram = {"count": 1, "sum": 3, "max": 3, "log2_bins": [0, 0, 1] + [0] * 62}

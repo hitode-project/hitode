@@ -508,20 +508,6 @@ fn unaligned_sse2_rows_preserve_complete_xmm_state() {
 }
 
 #[test]
-#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-fn two_guest_workers_disable_the_row_pool() {
-    let mut m = adv_cpu::Executor::new(CODE, 4096).unwrap();
-    m.set_row_workers(3).unwrap();
-    assert_eq!(m.row_parallel_stats().workers, 3);
-    m.set_guest_workers(2).unwrap();
-    assert_eq!(m.guest_workers(), 2);
-    let stats = m.row_parallel_stats();
-    assert_eq!(stats.workers, 0);
-    assert_eq!(stats.batches, 0);
-    assert!(m.set_row_workers(1).is_err());
-}
-
-#[test]
 fn budget_slices_preserve_the_complete_serial_state_and_eventually_admit_rows() {
     let body = Body::Mix;
     let bytes = nested(body);

@@ -44,7 +44,6 @@ pub(super) struct Lease<'a> {
 }
 impl<'a> Lease<'a> {
     pub fn new(memory: &'a mut Memory) -> Self {
-        assert!(!memory.is_parallel() && !memory.foreign_access_required());
         Self {
             epoch: memory.epoch,
             memory,

@@ -323,7 +323,6 @@ pub fn run(
     startup(session, data, "runtime-config")?;
     runtime.set_codepage(codepage)?;
     runtime.set_api_mode(RunMode::Strict);
-    runtime.machine.cpu.set_guest_workers(1)?;
     runtime.machine.cpu.set_waker(session.wake.clone())?;
     runtime
         .machine

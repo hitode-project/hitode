@@ -37,7 +37,7 @@ impl Allowance {
 }
 
 /// Owner-lane service per guest context. Includes inline native/interpreted work,
-/// synchronous API handlers and dispatch setup; excludes background worker time
+/// synchronous API handlers; excludes background worker time
 /// and continuations resumed outside Backend::run. Not CPU utilization.
 #[derive(Clone, Debug, Default)]
 pub struct ContextRunStats {
@@ -45,7 +45,6 @@ pub struct ContextRunStats {
     pub owner_wall_ns: u64,
     pub host_calls: u64,
     pub competing_wall_ns: u64,
-    pub parallel_dispatches: u64,
 }
 
 /// Cheap cumulative diagnostics. Wake lateness is sampled when the scheduler observes
@@ -90,14 +89,7 @@ pub(crate) fn reschedule_after(
 }
 
 impl SchedulingStats {
-    pub(crate) fn context_run(
-        &mut self,
-        id: usize,
-        wall: Duration,
-        calls: u64,
-        competing: bool,
-        dispatched: bool,
-    ) {
+    pub(crate) fn context_run(&mut self, id: usize, wall: Duration, calls: u64, competing: bool) {
         self.contexts
             .resize_with(self.contexts.len().max(id + 1), Default::default);
         let row = &mut self.contexts[id];
@@ -108,7 +100,6 @@ impl SchedulingStats {
         row.competing_wall_ns =
             row.competing_wall_ns
                 .saturating_add(if competing { ns } else { 0 });
-        row.parallel_dispatches += u64::from(dispatched);
     }
 
     pub(crate) fn dispatch(

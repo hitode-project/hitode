@@ -13,6 +13,15 @@ def request(ir=2, service=10, strategy="fast"):
 
 
 class CompileIrTests(unittest.TestCase):
+    def test_state_and_link_parts_reconcile_ir_and_native_bytes(self):
+        for part in ("state-read", "state-write", "link", "tail"):
+            raw = request()
+            raw["rows"][0][:3] = ["Overhead", "overhead", part]
+            raw.update(version=2, native_rows=[["Overhead", "overhead", part, 16]])
+            result = aggregate([[PREFIX + json.dumps(raw)]])["fast"]
+            self.assertEqual(result["native_rows"][f"Overhead/overhead/{part}"], 16)
+            self.assertEqual(result["rows"][f"Overhead/overhead/{part}"]["ir"], 2)
+
     def test_native_bytes_and_legacy_absence(self):
         raw = request()
         raw.update(version=2, native_rows=[["Mov", "int.mem", "check", 12],

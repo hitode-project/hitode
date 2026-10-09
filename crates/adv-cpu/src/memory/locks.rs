@@ -7,9 +7,6 @@ use super::{Memory, PAGE_SIZE};
 
 impl Memory {
     pub fn retire_locked_pages(&mut self) -> Result<(), PageLockError> {
-        if !self.locked_pages.is_empty() {
-            self.quiesce_workers();
-        }
         self.retire_page_locks(0..self.len / PAGE_SIZE).map(|_| ())
     }
 
@@ -26,7 +23,7 @@ impl Memory {
 
     #[cfg(windows)]
     fn pinnable_pages(&self, addr: u32, len: u32) -> Result<Range<usize>, PageLockError> {
-        if self.parallel_view || self.reservation.is_none() {
+        if self.reservation.is_none() {
             return Err(PageLockError::Unsupported);
         }
         let pages = self
@@ -47,7 +44,6 @@ impl Memory {
         #[cfg(windows)]
         {
             let pages = self.pinnable_pages(addr, len)?;
-            self.quiesce_workers();
             if self.committed(addr, len as usize).is_err()
                 || self.perms[pages.clone()].iter().any(|p| p & 7 == 0)
             {
@@ -101,7 +97,6 @@ impl Memory {
         #[cfg(windows)]
         {
             let pages = self.pinnable_pages(addr, len)?;
-            self.quiesce_workers();
             // Do not require READ access: NOACCESS/uncommitted and unlocked
             // pages report NOT_LOCKED. The host owns this entire address range.
             match self.reservation.as_ref().unwrap().unlock_pages(

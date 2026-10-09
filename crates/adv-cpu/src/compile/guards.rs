@@ -1,7 +1,7 @@
 //! Share compatible cold guard footers while retaining each SSA state prefix.
 use super::*;
 
-pub(super) type Key = (u32, bool, Option<(u32, u32)>);
+pub(super) type Key = (u32, bool, Option<u32>);
 
 impl Emitter<'_> {
     pub(super) fn shared_guard(&mut self, bad: Value, reason: Exit, addr: Option<Value>) -> bool {
@@ -21,8 +21,7 @@ impl Emitter<'_> {
         // increases register-allocation spills and final code size.
         let recipe = if self.optimizing {
             let kind = self.b.use_var(self.lazy[3]);
-            let carry = self.b.use_var(self.lazy[6]);
-            self.known(kind).zip(self.known(carry))
+            self.known(kind)
         } else {
             None
         };
@@ -56,11 +55,9 @@ impl Emitter<'_> {
             self.b.switch_to_block(block);
             self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
             self.mmx_effects = None;
-            if let Some((kind, carry)) = recipe {
+            if let Some(kind) = recipe {
                 let kind = self.constant(kind);
-                let carry = self.constant(carry);
                 self.b.def_var(self.lazy[3], kind);
-                self.b.def_var(self.lazy[6], carry);
             }
             let pc = self.b.block_params(block)[0];
             if address {

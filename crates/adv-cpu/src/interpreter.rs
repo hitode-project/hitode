@@ -1,8 +1,9 @@
 //! Bounded predecoded x86-32 integer execution on the shared CPU and memory.
 //!
-//! Each supported instruction stages its integer state and its memory
-//! write. All guest accesses are checked before that write and the CPU commit;
-//! faults and unsupported forms therefore leave the instruction restartable.
+//! Potentially faulting instructions stage integer state and memory writes.
+//! Infallible register forms commit directly at the same instruction boundary.
+//! Guest accesses are checked before the write and CPU commit, keeping faults
+//! and unsupported forms restartable.
 //! Undefined arithmetic flags are preserved rather than borrowed from the host.
 //! GS, segment/control registers and far transfers remain outside the flat model.
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +14,8 @@ use iced_x86::{
 };
 
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
+
+mod registers;
 
 const CF: u32 = 1;
 const PF: u32 = 1 << 2;
@@ -122,13 +125,9 @@ impl RepContinuation {
 pub struct Interpreter {
     cache: HashMap<u32, Cached>,
     blocks: HashMap<u32, DecodedBlock>,
-    validity: crate::code_validity::CodeValidity<(bool, u32)>,
-    event_validity: bool,
     capacity: usize,
     decodes: u64,
     pub(crate) frame_retired: Option<u64>,
-    pub(crate) census_enabled: bool,
-    pub(crate) census: Option<crate::tier1::census::Entry>,
 }
 
 impl Default for Interpreter {
@@ -147,45 +146,15 @@ impl Interpreter {
         Self {
             cache: HashMap::new(),
             blocks: HashMap::new(),
-            validity: Default::default(),
-            event_validity: crate::code_validity::enabled(),
             capacity,
             decodes: 0,
             frame_retired: None,
-            census_enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
-            census: None,
         }
     }
 
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.blocks.clear();
-        self.validity.clear();
-    }
-
-    fn refresh(&mut self, memory: &mut Memory) {
-        if !self.event_validity {
-            return;
-        }
-        for (block, pc) in self.validity.refresh(memory) {
-            let valid = if block {
-                self.blocks
-                    .get(&pc)
-                    .is_some_and(|entry| entry.cacheable(memory) && entry.revalidate(memory))
-            } else {
-                self.cache
-                    .get(&pc)
-                    .is_some_and(|entry| entry.cacheable(memory) && entry.revalidate(memory))
-            };
-            if !valid {
-                if block {
-                    self.blocks.remove(&pc);
-                } else {
-                    self.cache.remove(&pc);
-                }
-                self.validity.remove((block, pc));
-            }
-        }
     }
 
     /// Number of decodes, including invalid, unsupported and inaccessible code.
@@ -213,52 +182,24 @@ impl Interpreter {
                 units: 0,
             };
         }
-        self.refresh(memory);
         let pc = state.eip;
-        let (decoded, form) = if let Some(entry) = self
-            .cache
-            .get(&pc)
-            .filter(|e| self.event_validity || e.valid(memory))
-        {
-            (
-                entry.decoded,
-                self.census.as_ref().map(|_| {
-                    crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize])
-                }),
-            )
+        let decoded = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
+            entry.decoded
         } else {
             self.decodes += 1;
             let entry = fetch(memory, pc);
             let decoded = entry.decoded;
-            let form = self
-                .census
-                .as_ref()
-                .map(|_| crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize]));
-            if self.capacity != 0 && (!self.event_validity || entry.cacheable(memory)) {
+            if self.capacity != 0 {
                 if self.cache.len() >= self.capacity {
-                    if self.event_validity {
-                        self.clear_cache();
-                    } else {
-                        self.cache.clear();
-                    }
-                }
-                if self.event_validity {
-                    self.validity.insert(
-                        (false, pc),
-                        entry.pages.iter().flatten().map(|page| page.address),
-                        memory,
-                    );
+                    self.cache.clear();
                 }
                 self.cache.insert(pc, entry);
             }
-            (decoded, form)
+            decoded
         };
         let execution = execute_decoded(decoded, state, memory, max_units, None);
         if let Some(retired) = &mut self.frame_retired {
             *retired += retired_instruction(decoded, execution, state, pc);
-        }
-        if let (Some(census), Some(form)) = (&mut self.census, form) {
-            census.record(form, execution.units);
         }
         execution
     }
@@ -282,48 +223,42 @@ impl Interpreter {
                 0,
             );
         }
-        self.refresh(memory);
         let pc = state.eip;
         let revision = native.map(|(_, revision)| revision);
-        if !self.blocks.get(&pc).is_some_and(|block| {
-            block.revision == revision && (self.event_validity || block.valid(memory))
-        }) {
-            let mut block =
-                DecodedBlock::fetch(memory, pc, native, &mut self.decodes, self.event_validity);
-            if self.capacity == 0 || (self.event_validity && !block.cacheable(memory)) {
-                return block.execute_observed(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    self.census.as_mut(),
-                    self.frame_retired.as_mut(),
-                );
-            }
-            // Bound each independent cache in entries. A larger block working set
-            // avoids flushing hot floating fallback sequences during discovery.
-            if self.blocks.len() >= self.capacity {
-                if self.event_validity {
-                    self.clear_cache();
-                } else {
-                    self.blocks.clear();
-                }
-            }
-            if self.event_validity {
-                self.validity.insert(
-                    (true, pc),
-                    block.pages.iter().map(|page| page.address),
-                    memory,
-                );
-            }
-            self.blocks.insert(pc, block);
+        if let Some(block) = self
+            .blocks
+            .get_mut(&pc)
+            .filter(|block| block.revision == revision && block.valid(memory))
+        {
+            return block.execute_observed(
+                state,
+                memory,
+                max_units,
+                stop,
+                self.frame_retired.as_mut(),
+            );
         }
+        let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
+        if self.capacity == 0 {
+            return block.execute_observed(
+                state,
+                memory,
+                max_units,
+                stop,
+                self.frame_retired.as_mut(),
+            );
+        }
+        // Bound each independent cache in entries. A larger block working set
+        // avoids flushing hot floating fallback sequences during discovery.
+        if self.blocks.len() >= self.capacity {
+            self.blocks.clear();
+        }
+        self.blocks.insert(pc, block);
         self.blocks.get_mut(&pc).unwrap().execute_observed(
             state,
             memory,
             max_units,
             stop,
-            self.census.as_mut(),
             self.frame_retired.as_mut(),
         )
     }
@@ -355,9 +290,6 @@ fn execute_decoded(
             };
         }
         Decoded::Extended(i, operation, opcode) => {
-            // Extended interpreter transactions remain conservative until their
-            // full memory protocol is independently covered in parallel tests.
-            memory.quiesce_workers();
             let x87 = operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
             if let Some(dirty) = deferred_mmx.as_deref()
@@ -387,12 +319,6 @@ fn execute_decoded(
             };
         }
     };
-    if instruction.exclusive {
-        // LOCK and implicit atomic RMW execute as one transaction relative to
-        // native workers. Ordinary scalar instructions use Memory's audited
-        // foreign loads/stores and do not stop unrelated native execution.
-        memory.quiesce_workers();
-    }
     if let Action::String(operation) = instruction.action {
         return run_string(
             state,
@@ -409,6 +335,16 @@ fn execute_decoded(
             step: Step::ReadTimestamp {
                 pc,
                 next: instruction.next,
+            },
+            units: 1,
+        };
+    }
+    if instruction.register_only && registers::execute(instruction, state) {
+        return Execution {
+            step: if debug {
+                Step::Trap { pc, vector: 1 }
+            } else {
+                Step::Executed
             },
             units: 1,
         };
@@ -503,6 +439,7 @@ struct Predecoded {
     action: Action,
     next: u32,
     exclusive: bool,
+    register_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -544,13 +481,6 @@ impl Cached {
             memory.watch_code(page.address, PAGE_SIZE);
         }
         self.revalidate(memory)
-    }
-
-    fn cacheable(&self, memory: &Memory) -> bool {
-        self.pages
-            .iter()
-            .flatten()
-            .all(|page| !memory.externally_mutable_code(page.address, PAGE_SIZE))
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
@@ -616,6 +546,7 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
+            register_only: registers::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg
@@ -651,7 +582,6 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
-    forms: Option<Vec<crate::tier1::census::Form>>,
 }
 
 impl DecodedBlock {
@@ -660,12 +590,6 @@ impl DecodedBlock {
             memory.watch_code(page.address, PAGE_SIZE);
         }
         self.revalidate(memory)
-    }
-
-    fn cacheable(&self, memory: &Memory) -> bool {
-        self.pages
-            .iter()
-            .all(|page| !memory.externally_mutable_code(page.address, PAGE_SIZE))
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
@@ -680,7 +604,6 @@ impl DecodedBlock {
         start: u32,
         native: Option<(&BTreeMap<u32, u32>, u64)>,
         decodes: &mut u64,
-        event_validity: bool,
     ) -> Self {
         let mut block = Self {
             pc: start,
@@ -688,7 +611,6 @@ impl DecodedBlock {
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
-            forms: None,
         };
         let mut pc = start;
         while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
@@ -702,13 +624,6 @@ impl DecodedBlock {
             }
             *decodes += 1;
             let entry = fetch(memory, pc);
-            // Aliased writers need not advance this owner's epoch. Keep these
-            // instructions uncached and return after one instruction so a store
-            // through another view cannot leave a stale decoded suffix.
-            let volatile = event_validity && !entry.cacheable(memory);
-            if volatile && !block.instructions.is_empty() {
-                break;
-            }
             let (next, terminates) = match entry.decoded {
                 Decoded::Ready(instruction) => (
                     instruction.next,
@@ -747,7 +662,7 @@ impl DecodedBlock {
                 }
             }
             block.instructions.push((pc, entry.decoded));
-            if terminates || next <= pc || volatile {
+            if terminates || next <= pc {
                 break;
             }
             pc = next;
@@ -761,56 +676,15 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        census: Option<&mut crate::tier1::census::Entry>,
         retired: Option<&mut u64>,
     ) -> (Execution, u32) {
-        if census.is_some() {
-            self.forms.get_or_insert_with(|| {
-                self.instructions
-                    .iter()
-                    .map(|(pc, _)| {
-                        let offset = pc.wrapping_sub(self.pc) as usize;
-                        crate::tier1::census::Form::decode(&self.bytes[offset..])
-                    })
-                    .collect()
-            });
-        }
         // Specialize the ordinary block loop: disabled diagnostics must not
         // add a retirement branch to every interpreted instruction.
-        match (census, retired) {
-            (Some(census), Some(retired)) => {
-                let forms = self.forms.as_ref().unwrap().as_slice();
-                self.execute(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    |n, units| census.record(forms[n], units),
-                    |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
-                )
-            }
-            (Some(census), None) => {
-                let forms = self.forms.as_ref().unwrap().as_slice();
-                self.execute(
-                    state,
-                    memory,
-                    max_units,
-                    stop,
-                    |n, units| census.record(forms[n], units),
-                    |_, _, _, _| {},
-                )
-            }
-            (None, Some(retired)) => self.execute(
-                state,
-                memory,
-                max_units,
-                stop,
-                |_, _| {},
-                |d, e, s, pc| *retired += retired_instruction(d, e, s, pc),
-            ),
-            (None, None) => {
-                self.execute(state, memory, max_units, stop, |_, _| {}, |_, _, _, _| {})
-            }
+        match retired {
+            Some(retired) => self.execute(state, memory, max_units, stop, |d, e, s, pc| {
+                *retired += retired_instruction(d, e, s, pc)
+            }),
+            None => self.execute(state, memory, max_units, stop, |_, _, _, _| {}),
         }
     }
 
@@ -820,7 +694,6 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut observe: impl FnMut(usize, u32),
         mut retire: impl FnMut(Decoded, Execution, &CpuState, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
@@ -830,18 +703,30 @@ impl DecodedBlock {
         };
         let mut last_units = 0;
         let mut deferred_mmx = false;
-        for (n, &(pc, decoded)) in self.instructions.iter().enumerate() {
+        for &(pc, decoded) in &self.instructions {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
-            let execution = execute_decoded(
-                decoded,
-                state,
-                memory,
-                max_units - result.units,
-                Some(&mut deferred_mmx),
-            );
-            observe(n, execution.units);
+            let execution = if let Decoded::Ready(instruction) = decoded
+                && instruction.register_only
+                && !instruction.exclusive
+                && state.rep.is_none()
+                && state.eflags & 0x100 == 0
+                && registers::execute(instruction, state)
+            {
+                Execution {
+                    step: Step::Executed,
+                    units: 1,
+                }
+            } else {
+                execute_decoded(
+                    decoded,
+                    state,
+                    memory,
+                    max_units - result.units,
+                    Some(&mut deferred_mmx),
+                )
+            };
             retire(decoded, execution, state, pc);
             result.units += execution.units;
             result.step = execution.step;
@@ -949,17 +834,20 @@ impl Address {
         })
     }
     fn resolve(self, tx: &Transaction) -> u32 {
+        self.resolve_regs(&tx.regs, tx.fs_base)
+    }
+    fn resolve_regs(self, regs: &[u32; 8], fs_base: u32) -> u32 {
         let mut offset = self.displacement;
         if let Some(r) = self.base {
-            offset = offset.wrapping_add(r.read(&tx.regs));
+            offset = offset.wrapping_add(r.read(regs));
         }
         if let Some(r) = self.index {
-            offset = offset.wrapping_add(r.read(&tx.regs).wrapping_mul(u32::from(self.scale)));
+            offset = offset.wrapping_add(r.read(regs).wrapping_mul(u32::from(self.scale)));
         }
         if self.word {
             offset &= 0xffff;
         }
-        offset.wrapping_add(if self.fs { tx.fs_base } else { 0 })
+        offset.wrapping_add(if self.fs { fs_base } else { 0 })
     }
 }
 
@@ -1721,37 +1609,10 @@ impl Transaction {
         self.flags = (self.flags & !bit) | if value { bit } else { 0 };
     }
     fn szp(&mut self, value: u32, width: u8) {
-        let value = value & mask(width);
-        self.flag(ZF, value == 0);
-        self.flag(SF, value & (1 << (u32::from(width) * 8 - 1)) != 0);
-        self.flag(PF, (value as u8).count_ones().is_multiple_of(2));
+        registers::szp(&mut self.flags, value, width);
     }
     fn arithmetic(&mut self, a: u32, b: u32, carry: u32, width: u8, subtract: bool) -> u32 {
-        let a = a & mask(width);
-        let b = b & mask(width);
-        let result = if subtract {
-            a.wrapping_sub(b).wrapping_sub(carry)
-        } else {
-            a.wrapping_add(b).wrapping_add(carry)
-        } & mask(width);
-        let wide = if subtract {
-            signed(a, width) - signed(b, width) - i64::from(carry)
-        } else {
-            signed(a, width) + signed(b, width) + i64::from(carry)
-        };
-        let limit = 1i64 << (u32::from(width) * 8 - 1);
-        self.flag(
-            CF,
-            if subtract {
-                u64::from(a) < u64::from(b) + u64::from(carry)
-            } else {
-                u64::from(a) + u64::from(b) + u64::from(carry) > u64::from(mask(width))
-            },
-        );
-        self.flag(OF, wide < -limit || wide >= limit);
-        self.flag(AF, (a ^ b ^ result) & 0x10 != 0);
-        self.szp(result, width);
-        result
+        registers::arithmetic(&mut self.flags, a, b, carry, width, subtract)
     }
     fn execute(&mut self, action: Action, memory: &Memory) -> Result<Option<u8>, Step> {
         match action {
@@ -1812,22 +1673,7 @@ impl Transaction {
             Action::Binary(kind, dst, src) => {
                 let (a, b) = (self.read(memory, dst)?, self.read(memory, src)?);
                 let width = dst.width().unwrap();
-                let carry = u32::from(self.flags & CF != 0 && matches!(kind, M::Adc | M::Sbb));
-                let value = match kind {
-                    M::Add | M::Adc => self.arithmetic(a, b, carry, width, false),
-                    M::Sub | M::Sbb | M::Cmp => self.arithmetic(a, b, carry, width, true),
-                    _ => {
-                        let value = match kind {
-                            M::And | M::Test => a & b,
-                            M::Or => a | b,
-                            M::Xor => a ^ b,
-                            _ => unreachable!(),
-                        };
-                        self.flags &= !(CF | OF);
-                        self.szp(value, width);
-                        value
-                    }
-                };
+                let value = registers::binary(&mut self.flags, kind, a, b, width);
                 if !matches!(kind, M::Cmp | M::Test) {
                     self.store(memory, dst, value)?;
                 }
@@ -1835,16 +1681,7 @@ impl Transaction {
             Action::Unary(kind, dst) => {
                 let value = self.read(memory, dst)?;
                 let width = dst.width().unwrap();
-                let result = match kind {
-                    M::Not => !value,
-                    M::Neg => self.arithmetic(0, value, 0, width, true),
-                    _ => {
-                        let carry = self.flags & CF;
-                        let result = self.arithmetic(value, 1, 0, width, kind == M::Dec);
-                        self.flags = (self.flags & !CF) | carry;
-                        result
-                    }
-                };
+                let result = registers::unary(&mut self.flags, kind, value, width);
                 self.store(memory, dst, result)?;
             }
             Action::Shift(kind, dst, count) => {
@@ -2522,126 +2359,6 @@ mod tests {
     }
 
     #[test]
-    fn event_blocks_keep_same_page_data_and_detect_consumed_smc_events() {
-        let mut memory = Memory::new(0x10000, 3 * PAGE_SIZE).unwrap();
-        memory
-            .protect(0x10000, 3 * PAGE_SIZE, READ | WRITE | EXEC)
-            .unwrap();
-        for pc in [0x10000, 0x11000] {
-            memory.write(pc, &[0xb8, 7, 0, 0, 0, 0xeb, 0xf9]).unwrap();
-        }
-        let mut interpreter = Interpreter::new();
-        interpreter.event_validity = true;
-        let mut state = CpuState::default();
-        for pc in [0x10000, 0x11000] {
-            state.eip = pc;
-            assert_eq!(
-                interpreter
-                    .run_block(&mut state, &mut memory, 64, 0, None)
-                    .0
-                    .units,
-                2
-            );
-        }
-        let decodes = interpreter.decode_count();
-        let other = interpreter.blocks[&0x11000].instructions.as_ptr();
-        memory.write(0x10080, &[42]).unwrap();
-        memory.dirty_pages.clear(); // Tier 2 may consume this before Tier 0 runs.
-        state.eip = 0x10000;
-        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
-        assert_eq!(interpreter.decode_count(), decodes);
-        memory.write(0x10001, &[9]).unwrap();
-        memory.dirty_pages.clear();
-        state.eip = 0x10000;
-        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
-        assert_eq!(state.regs[0], 9);
-        assert_eq!(interpreter.decode_count(), decodes + 2);
-        assert_eq!(interpreter.blocks[&0x11000].instructions.as_ptr(), other);
-        state.eip = 0x10000;
-        memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
-        let before = state.clone();
-        let result = interpreter
-            .run_block(&mut state, &mut memory, 64, 0, None)
-            .0;
-        assert_eq!(result.units, 0);
-        assert_eq!(
-            result.step,
-            Step::FetchFault {
-                pc: 0x10000,
-                address: 0x10000
-            }
-        );
-        assert_eq!(state, before);
-    }
-
-    #[test]
-    fn event_blocks_exit_after_self_modifying_prefix() {
-        let mut memory = Memory::new(0x10000, PAGE_SIZE).unwrap();
-        memory
-            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
-            .unwrap();
-        // MOV byte [next immediate],9; MOV EAX,7; JMP header.
-        memory
-            .write(
-                0x10000,
-                &[0xc6, 0x05, 8, 0, 1, 0, 9, 0xb8, 7, 0, 0, 0, 0xeb, 0xf2],
-            )
-            .unwrap();
-        let mut interpreter = Interpreter::new();
-        interpreter.event_validity = true;
-        let mut state = CpuState {
-            eip: 0x10000,
-            ..Default::default()
-        };
-        assert_eq!(
-            interpreter
-                .run_block(&mut state, &mut memory, 64, 0, None)
-                .0
-                .units,
-            1
-        );
-        assert_eq!(state.eip, 0x10007);
-        assert_eq!(state.regs[0], 0);
-        interpreter.run_block(&mut state, &mut memory, 64, 0, None);
-        assert_eq!(state.regs[0], 9);
-    }
-
-    #[test]
-    fn event_shared_code_is_uncached_without_owner_epoch_events() {
-        let mut memory = Memory::reserve(0, 0x30000).unwrap();
-        let storage = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
-        storage.store_bytes(0, &[0xb8, 7, 0, 0, 0, 0x43]);
-        memory
-            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
-            .unwrap();
-        let mut interpreter = Interpreter::new();
-        interpreter.event_validity = true;
-        let mut state = CpuState {
-            eip: 0x10000,
-            ..Default::default()
-        };
-        assert_eq!(
-            interpreter
-                .run_block(&mut state, &mut memory, 64, 0, None)
-                .0
-                .units,
-            1
-        );
-        assert!(interpreter.blocks.is_empty());
-        let epoch = memory.epoch;
-        storage.store_bytes(1, &[9]);
-        assert_eq!(
-            memory.epoch, epoch,
-            "aliased data writes have no code event"
-        );
-        state.eip = 0x10000;
-        assert_eq!(interpreter.step(&mut state, &mut memory), Step::Executed);
-        assert_eq!(state.regs[0], 9);
-        assert!(interpreter.cache.is_empty());
-        assert!(interpreter.blocks.is_empty());
-    }
-
-    #[test]
     fn first_fetch_and_cross_memory_cache_hits_watch_all_code_pages() {
         const CODE: u32 = 0x10ffc;
         fn memory() -> Memory {
@@ -2720,55 +2437,6 @@ mod tests {
         watched(&mut fourth);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn scalar_interpreter_does_not_park_native_peers_but_atomic_operations_do() {
-        use std::sync::{Arc, atomic::Ordering};
-        let mut memory = crate::Memory::new(0x1000, 0x2000).unwrap();
-        memory
-            .protect(0x1000, 0x2000, crate::READ | crate::WRITE)
-            .unwrap();
-        // inc eax; mov [0x2000],eax; lock inc [0x2000]; xchg eax,[0x2000]
-        let code = [
-            0x40, 0xa3, 0, 0x20, 0, 0, 0xf0, 0xff, 0x05, 0, 0x20, 0, 0, 0x87, 0x05, 0, 0x20, 0, 0,
-        ];
-        memory.write(0x1000, &code).unwrap();
-        memory
-            .protect(0x1000, 4096, crate::READ | crate::EXEC)
-            .unwrap();
-        let fence = Arc::new(crate::parallel_memory::Fence::default());
-        memory.parallel = Some(fence.clone());
-        let mut state = crate::CpuState {
-            eip: 0x1000,
-            ..Default::default()
-        };
-        let mut interpreter = super::Interpreter::new();
-        let permit = fence.enter();
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(!fence.stop.load(Ordering::Acquire));
-        assert!(!fence.is_idle());
-        drop(permit);
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(fence.stop.load(Ordering::Acquire));
-        fence.stop.store(false, Ordering::Release);
-        assert_eq!(
-            interpreter.step(&mut state, &mut memory),
-            super::Step::Executed
-        );
-        assert!(fence.stop.load(Ordering::Acquire));
-        assert_eq!(state.regs[0], 2);
-        assert_eq!(&*memory.read_data(0x2000, 4).unwrap(), &1u32.to_le_bytes());
-    }
     #[test]
     fn stable_native_revision_reuses_blocks_and_publication_rebuilds_the_boundary() {
         let code = 0x10000;

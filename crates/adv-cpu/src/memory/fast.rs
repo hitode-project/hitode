@@ -6,7 +6,10 @@
 //! that invocation's table immutable: stale grants take the precise slow path,
 //! and the next invocation publishes the newly ordinary page. Revocations go
 //! through the existing epoch/trap exit and worker quiescence protocol.
+//! The serial software-checked owner exposes linear COPY reads while retaining
+//! EXEC as a first-store barrier. This never grants guest execute permission.
 use super::{EXEC, READ, SHARED, WRITE};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -46,6 +49,7 @@ impl FastPermissions {
         &mut self,
         permissions: &[u8],
         watched: Option<&[bool]>,
+        private_copies: &BTreeMap<usize, bool>,
     ) -> Arc<Vec<u8>> {
         debug_assert_eq!(permissions.len(), self.bytes.len());
         debug_assert!(watched.is_none_or(|pages| pages.len() == permissions.len()));
@@ -54,12 +58,25 @@ impl FastPermissions {
             self.invalidate(0..permissions.len());
         }
         let permission = |page: usize| {
-            let permissions = permissions[page];
+            let mut permissions = permissions[page];
             if watched.is_some_and(|pages| !pages[page]) {
-                permissions & !EXEC
-            } else {
-                permissions
+                permissions &= !EXEC;
             }
+            // Owned COPY snapshots already have initialized linear bytes and
+            // no external alias. Reads can use ordinary native loads. EXEC is
+            // a store barrier in this derived table, so the first store still
+            // falls back to the owner to retire COPY before committing bytes.
+            // Keep guest READ/WRITE bits intact: missing bits signal faults,
+            // whereas the store barrier requests a restartable fallback.
+            // Hardware fault classification and foreign owners retain their
+            // original shared-page contract, just like conservative code writes.
+            if watched.is_some()
+                && permissions & SHARED != 0
+                && private_copies.get(&page) == Some(&true)
+            {
+                permissions = (permissions & !SHARED) | EXEC;
+            }
+            permissions
         };
         if let Some(pages) = self.dirty.take() {
             let bytes = Arc::make_mut(&mut self.bytes);
@@ -87,6 +104,78 @@ impl FastPermissions {
 mod tests {
     use super::*;
     use crate::memory::AUDIO;
+
+    #[test]
+    fn owned_copy_grants_preserve_access_bits_and_never_grant_stores() {
+        for protection in 0..8 {
+            for watched in [None, Some([false, false].as_slice())] {
+                let permissions = [protection | SHARED, READ | WRITE];
+                let copies = BTreeMap::from([(0, true)]);
+                let mut table = FastPermissions::new(2);
+                table.invalidate(0..2);
+                let snapshot = table.snapshot(&permissions, watched, &copies);
+                assert_eq!(snapshot[0] & (READ | WRITE), protection & (READ | WRITE));
+                if watched.is_none() {
+                    assert_eq!(snapshot[0], permissions[0]);
+                    continue;
+                }
+                assert_eq!(snapshot[0] & SHARED, 0);
+                assert_ne!(snapshot[0] & EXEC, 0, "COPY retains its store barrier");
+                assert_eq!(snapshot[0] & (READ << 5), (protection & READ) << 5);
+                assert_eq!(snapshot[0] & (WRITE << 5), 0);
+                assert_eq!(permissions[0], protection | SHARED);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_copy_reads_revoke_when_the_owner_leaves_software_checked_mode() {
+        use crate::Memory;
+        let mut memory = Memory::reserve(0x10000, 4096).unwrap();
+        memory
+            .map_private_copy_pages(0x10000, &[0x37; 4096], READ | WRITE)
+            .unwrap();
+        let serial = memory.native_permissions();
+        assert_eq!(serial[0], READ | WRITE | EXEC);
+        #[cfg(windows)]
+        {
+            memory.protect(0x10000, 4096, 0).unwrap();
+            memory.enable_native_protection().unwrap();
+            assert_eq!(memory.native_permissions()[0], SHARED);
+            assert!(memory.prepare_native_access(0x10000, 1, false).is_err());
+        }
+    }
+
+    #[test]
+    fn owned_copy_retirement_and_protection_publish_immutable_snapshots() {
+        use crate::{Memory, memory::FAST_READ};
+        let mut memory = Memory::reserve(0x10000, 2 * 4096).unwrap();
+        memory
+            .map_private_copy_pages(0x10000, &[0x37; 8192], READ | WRITE)
+            .unwrap();
+        let old = memory.native_permissions();
+        assert_eq!(
+            &**old,
+            &[READ | WRITE | EXEC | FAST_READ, READ | WRITE | EXEC]
+        );
+        assert_eq!(&**memory.perms, &[READ | WRITE | SHARED; 2]);
+        memory.prepare_native_access(0x10ffe, 4, false).unwrap();
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        memory.write(0x10000, &[0x19]).unwrap();
+        let retired = memory.native_permissions();
+        assert_eq!(retired[0], READ | WRITE | FAST_READ);
+        assert_eq!(retired[1], READ | WRITE | EXEC);
+        assert_ne!(old[0] & EXEC, 0);
+        memory.protect(0x11000, 4096, 0).unwrap();
+        let protected = memory.native_permissions();
+        assert_eq!(&**protected, &[READ | WRITE, EXEC]);
+        assert_eq!(retired[0] & FAST_READ, FAST_READ);
+        assert!(memory.prepare_native_access(0x10ffe, 4, false).is_err());
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        memory.unmap(0x11000, 4096).unwrap();
+        assert_eq!(memory.native_permissions()[1], 0);
+        assert_eq!(protected[1], EXEC);
+    }
 
     #[test]
     fn rwx_data_grants_revoke_monotonically_without_changing_guest_permissions() {
@@ -119,15 +208,6 @@ mod tests {
         );
         memory.write(0x11010, &[8]).unwrap();
         assert_eq!(memory.epoch, epoch + 2, "code writes keep the SMC barrier");
-        // Switching to the parallel policy revokes the entire old table, even
-        // when no guest page permissions changed since its last snapshot.
-        memory.parallel = Some(Arc::default());
-        let conservative = memory.native_permissions();
-        assert_eq!(&**conservative, &[39, 39, 7]);
-        assert_eq!(&**watched, &[35, 39, 3]);
-        let epoch = memory.epoch;
-        memory.write(0x12010, &[9]).unwrap();
-        assert_eq!(memory.epoch, epoch + 1);
     }
 
     #[test]
@@ -136,7 +216,7 @@ mod tests {
             for second in 0..32 {
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&[first, second], None);
+                let snapshot = table.snapshot(&[first, second], None, &BTreeMap::new());
                 let readable = [first, second].iter().all(|p| p & (READ | SHARED) == READ);
                 let writable = [first, second]
                     .iter()
@@ -159,15 +239,15 @@ mod tests {
         let mut permissions = [READ | WRITE; 4];
         let mut table = FastPermissions::new(4);
         table.invalidate(0..4);
-        let old = table.snapshot(&permissions, None);
+        let old = table.snapshot(&permissions, None, &BTreeMap::new());
         permissions[2] = READ | SHARED | AUDIO;
         table.invalidate(2..3);
         assert_eq!(&**old, &[99, 99, 99, 3]);
-        let new = table.snapshot(&permissions, None);
+        let new = table.snapshot(&permissions, None, &BTreeMap::new());
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
         permissions[2] = READ;
         table.invalidate(2..3);
-        let promoted = table.snapshot(&permissions, None);
+        let promoted = table.snapshot(&permissions, None, &BTreeMap::new());
         assert_eq!(&**promoted, &[99, 35, 33, 3]);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
     }

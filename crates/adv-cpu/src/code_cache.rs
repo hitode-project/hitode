@@ -113,6 +113,7 @@ struct Counters {
     stored: AtomicU64,
     unsupported: AtomicU64,
     restored_ns: AtomicU64,
+    load_ns: AtomicU64,
     evicted: AtomicU64,
 }
 
@@ -143,6 +144,7 @@ impl Cache {
             records: Mutex::default(),
             counters: Counters::default(),
         });
+        let started = std::time::Instant::now();
         match std::fs::File::open(path) {
             Ok(file) => {
                 let mut bytes = Vec::new();
@@ -162,6 +164,10 @@ impl Cache {
                 cache.counters.corrupt.fetch_add(1, Ordering::Relaxed);
             }
         }
+        cache.counters.load_ns.store(
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
         cache
     }
 
@@ -301,7 +307,7 @@ impl Cache {
         format!(
             concat!(
                 "{{\"enabled\":true,\"hits\":{},\"misses\":{},\"rejected\":{},",
-                "\"corrupt\":{},\"stored\":{},\"unsupported\":{},\"restore_ns\":{},\"evicted\":{},\"entries\":{},\"bytes\":{}}}"
+                "\"corrupt\":{},\"stored\":{},\"unsupported\":{},\"restore_ns\":{},\"load_ns\":{},\"evicted\":{},\"entries\":{},\"bytes\":{}}}"
             ),
             read(&self.counters.hits),
             read(&self.counters.misses),
@@ -310,6 +316,7 @@ impl Cache {
             read(&self.counters.stored),
             read(&self.counters.unsupported),
             read(&self.counters.restored_ns),
+            read(&self.counters.load_ns),
             read(&self.counters.evicted),
             records.entries.len(),
             records.bytes

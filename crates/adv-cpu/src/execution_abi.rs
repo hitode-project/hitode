@@ -6,7 +6,7 @@ pub const VERSION: u32 = 2;
 /// Owner-pinned request word shared by native lanes. Producers use Release
 /// stores; generated code uses atomic loads. Only the owner consumes requests.
 pub type PollWord = std::sync::atomic::AtomicBool;
-/// EAX, ECX, EDX, EBX, ESP, EBP, ESI and EDI in the ARM64 Tier 1 ABI.
+/// EAX, ECX, EDX, EBX, ESP, EBP, ESI and EDI in the ARM64 native ABI.
 pub const ARM64_GPRS: [u8; 8] = [19, 20, 21, 22, 23, 24, 25, 26];
 pub const ARM64_FLAGS: u8 = 8;
 pub const ARM64_CONTEXT: u8 = 27;
@@ -98,31 +98,6 @@ pub struct NativeRecoveryPoint {
     pub committed_units: u32,
 }
 
-/// Fixed ARM64 entry frame. Floating state remains canonical in CpuState;
-/// extension templates reach it through the exclusive owner Entry, without
-/// changing these fixed GPR offsets. Unsupported forms leave for Tier 0.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(
-    not(all(target_arch = "aarch64", target_os = "linux")),
-    allow(dead_code)
-)]
-pub(crate) struct Tier1Frame {
-    pub regs: [u32; 8],
-    pub flags: u32,
-    pub pc: u32,
-    pub remaining: u64,
-    pub stop: u32,
-    pub reason: u32,
-    pub links: u64,
-    pub address: u32,
-    pub value: u32,
-    pub fs_base: u32,
-    pub operand: u32,
-    /// Borrowed AtomicBool address, valid for the entire native entry.
-    pub poll: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,19 +105,6 @@ mod tests {
 
     #[test]
     fn entry_frame_and_signal_snapshot_have_fixed_c_layouts() {
-        assert_eq!(size_of::<Tier1Frame>(), 88);
-        assert_eq!(offset_of!(Tier1Frame, regs), 0);
-        assert_eq!(offset_of!(Tier1Frame, flags), 32);
-        assert_eq!(offset_of!(Tier1Frame, pc), 36);
-        assert_eq!(offset_of!(Tier1Frame, remaining), 40);
-        assert_eq!(offset_of!(Tier1Frame, stop), 48);
-        assert_eq!(offset_of!(Tier1Frame, reason), 52);
-        assert_eq!(offset_of!(Tier1Frame, links), 56);
-        assert_eq!(offset_of!(Tier1Frame, address), 64);
-        assert_eq!(offset_of!(Tier1Frame, value), 68);
-        assert_eq!(offset_of!(Tier1Frame, fs_base), 72);
-        assert_eq!(offset_of!(Tier1Frame, operand), 76);
-        assert_eq!(offset_of!(Tier1Frame, poll), 80);
         assert_eq!(offset_of!(HostContextSnapshot, sp), 256);
         assert_eq!(offset_of!(HostContextSnapshot, simd), 280);
         assert_eq!(offset_of!(HostContextSnapshot, fpcr), 792);

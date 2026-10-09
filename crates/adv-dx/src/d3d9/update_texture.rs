@@ -8,6 +8,22 @@ use std::collections::VecDeque;
 #[derive(Default)]
 struct Transfers {
     active: Vec<Transfer>,
+    scratch: Scratch,
+}
+// Retain at most two initialized CPU buffers, independently of live transfers.
+// Larger updates still work, but do not leave their allocations in the cache.
+const MAX_SCRATCH: usize = 8 * 1024 * 1024;
+#[derive(Default)]
+struct Scratch {
+    raw: Vec<u8>,
+    pixels: Vec<u8>,
+}
+impl Scratch {
+    fn keep(slot: &mut Vec<u8>, candidate: Vec<u8>) {
+        if candidate.capacity() <= MAX_SCRATCH && candidate.capacity() > slot.capacity() {
+            *slot = candidate;
+        }
+    }
 }
 struct Transfer {
     context: u32,
@@ -22,7 +38,7 @@ struct Transfer {
 struct Upload {
     level: u32,
     target: Target,
-    pixels: Vec<u8>,
+    pixels: Arc<Vec<u8>>,
     pitch: u32,
     rectangle: Rect,
     commit: Commit,
@@ -30,7 +46,8 @@ struct Upload {
 struct Commit {
     level: u32,
     address: Option<u32>,
-    raw: Vec<u8>,
+    raw: Arc<Vec<u8>>,
+    converted: Option<Arc<Vec<u8>>>,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(update_ABI);
@@ -67,7 +84,15 @@ fn update(
     else {
         return Outcome::Return(INVALID);
     };
-    let mut transfer = match prepare(env, device, source.addr(), destination.addr()) {
+    if env.ext.try_get::<Transfers>().is_none() {
+        env.ext.insert(Transfers::default());
+    }
+    let mut scratch = std::mem::take(&mut env.ext.get_mut::<Transfers>().scratch);
+    let prepared = prepare(env, device, source.addr(), destination.addr(), &mut scratch);
+    let cached = &mut env.ext.get_mut::<Transfers>().scratch;
+    Scratch::keep(&mut cached.raw, scratch.raw);
+    Scratch::keep(&mut cached.pixels, scratch.pixels);
+    let mut transfer = match prepared {
         Ok(Some(transfer)) => transfer,
         Ok(None) => return Outcome::Return(0),
         Err(error) => {
@@ -101,9 +126,6 @@ fn update(
     }
     transfer.context = env.context;
     let destination = transfer.destination;
-    if env.ext.try_get::<Transfers>().is_none() {
-        env.ext.insert(Transfers::default());
-    }
     env.ext.get_mut::<Transfers>().active.push(transfer);
     next(env, destination)
 }
@@ -113,6 +135,7 @@ fn prepare(
     device: Id,
     source: u32,
     destination: u32,
+    scratch: &mut Scratch,
 ) -> Result<Option<Transfer>, u32> {
     let src = resources::resource(env, source).ok_or(INVALID)?;
     let dst = resources::resource(env, destination).ok_or(INVALID)?;
@@ -169,17 +192,29 @@ fn prepare(
             .surface
             .and_then(|surface| (state.provider.target)(env.ext, surface))
             .ok_or(INVALID)?;
-        let mut raw = vec![0; length as usize];
+        let mut raw = std::mem::take(&mut scratch.raw);
+        raw.resize(length as usize, 0);
         env.cpu.read(source, &mut raw).map_err(|_| INVALID)?;
-        let (pixels, pitch) = format::upload(
-            s.desc.Format,
-            raw.clone(),
-            pitch,
-            s.desc.Width,
-            s.desc.Height,
-        )
-        .ok_or(INVALID)?;
+        let raw = Arc::new(raw);
+        let (pixels, pitch) = if s.desc.Format == 21 {
+            // BGRA8 already matches the GPU layout. Keep one immutable owned
+            // snapshot for both submission retries and guest shadow writeback.
+            (Arc::clone(&raw), pitch)
+        } else {
+            let input = if s.desc.Format == 22 {
+                let mut pixels = std::mem::take(&mut scratch.pixels);
+                pixels.clone_from(raw.as_ref());
+                pixels
+            } else {
+                raw.as_ref().clone()
+            };
+            let (pixels, pitch) =
+                format::upload(s.desc.Format, input, pitch, s.desc.Width, s.desc.Height)
+                    .ok_or(INVALID)?;
+            (Arc::new(pixels), pitch)
+        };
         let level = index as u32;
+        let converted = (s.desc.Format == 22).then(|| Arc::clone(&pixels));
         remaining.push_back(Upload {
             level,
             target,
@@ -195,6 +230,7 @@ fn prepare(
                 level,
                 address,
                 raw,
+                converted,
             },
         });
     }
@@ -279,7 +315,19 @@ fn uploaded(env: &mut Env<'_>, destination: Id, outcome: Outcome) -> Outcome {
             {
                 r.levels[level as usize].dirty = false;
             }
-            env.ext.get_mut::<Transfers>().active[index].current = None;
+            let commit = env.ext.get_mut::<Transfers>().active[index]
+                .current
+                .take()
+                .unwrap();
+            let scratch = &mut env.ext.get_mut::<Transfers>().scratch;
+            if let Ok(raw) = Arc::try_unwrap(commit.raw) {
+                Scratch::keep(&mut scratch.raw, raw);
+            }
+            if let Some(converted) = commit.converted
+                && let Ok(pixels) = Arc::try_unwrap(converted)
+            {
+                Scratch::keep(&mut scratch.pixels, pixels);
+            }
             next(env, destination)
         }
         Outcome::Block {

@@ -29,6 +29,7 @@ PREFIX = "compile-ir: "
 CLASSES = {"int", "int.mem", "control", "control.mem", "string", "x87", "x87.mem",
            "sse", "sse.mem", "mmx", "mmx.mem", "overhead"}
 PARTS = {"body", "check", "slow", "flags", "entry", "budget", "transfer", "exit",
+         "state-read", "state-write", "link", "tail",
          "x87-recovery", "untagged", "fault", "unknown"}
 COUNTERS = ("guest", "ir", "blocks", "functions", "native_bytes", "service_us")
 

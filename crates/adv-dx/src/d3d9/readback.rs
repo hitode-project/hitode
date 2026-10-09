@@ -390,7 +390,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
             resource: id,
             level: None,
             target,
-            pixels,
+            pixels: Arc::new(pixels),
             pitch,
             rectangle: lock.rectangle,
         },

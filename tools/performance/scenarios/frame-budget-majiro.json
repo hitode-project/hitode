@@ -22,7 +22,13 @@
         "reset_metrics": true
       },
       {
-        "command": "click 220 315"
+        "command": "mouse-down 220 315"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 220 315"
       },
       {
         "delay_ms": 300

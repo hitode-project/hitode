@@ -435,35 +435,3 @@ fn strict_tier_verification_covers_the_new_native_forms() {
         assert!(native.stats.cliffs.fallbacks.is_empty());
     }
 }
-
-#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-#[test]
-fn narrow_memory_exchange_and_locked_carry_keep_the_parallel_atomic_fallback() {
-    for width in [1, 2] {
-        let bytes = code(|a| {
-            if width == 1 {
-                a.lock().adc(byte_ptr(esi), ah).unwrap();
-                a.xchg(byte_ptr(esi), ah).unwrap();
-            } else {
-                a.lock().sbb(word_ptr(esi), ax).unwrap();
-                a.xchg(word_ptr(esi), ax).unwrap();
-            }
-        });
-        let mut native = machine(&bytes, None);
-        native.set_guest_workers(2).unwrap();
-        native.add_region(Region::new(CODE, bytes.len())).unwrap();
-        let mut interpreted = machine(&bytes, None);
-        for m in [&mut native, &mut interpreted] {
-            m.state = initial();
-            m.write(DATA, &[0x57; 8192]).unwrap();
-        }
-        let stop = CODE + bytes.len() as u32;
-        assert_eq!(native.run(stop, 1000).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(
-            interpreted.run(stop, 1000).unwrap(),
-            RunOutcome::ReachedStop
-        );
-        equal(&native, &interpreted);
-        assert!(native.stats.interpreter_instructions >= 2);
-    }
-}

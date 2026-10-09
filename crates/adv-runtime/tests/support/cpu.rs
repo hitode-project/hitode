@@ -175,44 +175,6 @@ impl Backend for Cpu {
     }
 
     type Context = Context;
-    fn guest_workers(&self) -> usize {
-        backend!(self, guest_workers)
-    }
-    fn parallel_capacity_available(&self) -> bool {
-        backend!(self, parallel_capacity_available)
-    }
-    fn set_parallel_demand(&mut self, ready: bool) {
-        backend!(self, set_parallel_demand, ready);
-    }
-    fn wait_parallel(&mut self, duration: Duration) -> Result<(), String> {
-        backend!(self, wait_parallel, duration)
-    }
-    fn dispatch_ready_context(
-        &mut self,
-        context: &Context,
-        duration: Duration,
-        guest_us: u64,
-    ) -> Result<Option<u64>, String> {
-        match (self, context) {
-            (Self::Jit(cpu), Context::Jit(ctx)) => {
-                cpu.dispatch_ready_context(ctx, duration, guest_us)
-            }
-            (Self::Unicorn(cpu), Context::Unicorn(ctx)) => {
-                cpu.dispatch_ready_context(ctx, duration, guest_us)
-            }
-            _ => panic!("backend context mismatch"),
-        }
-    }
-    fn poll_parallel(&mut self) -> Option<(u64, Context)> {
-        match self {
-            Self::Jit(cpu) => cpu
-                .poll_parallel()
-                .map(|(token, context)| (token, Context::Jit(Box::new(context)))),
-            Self::Unicorn(cpu) => cpu
-                .poll_parallel()
-                .map(|(token, context)| (token, Context::Unicorn(context))),
-        }
-    }
     fn setup_segments(&mut self, setup: SegmentSetup) -> Result<(), MemFault> {
         backend!(self, setup_segments, setup)
     }

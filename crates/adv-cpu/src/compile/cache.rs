@@ -12,14 +12,12 @@ pub(super) struct Bindings {
     pub kernels: std::sync::Mutex<Vec<usize>>,
 }
 
-const MAGIC: &[u8; 8] = b"ADVNAT03";
+const MAGIC: &[u8; 8] = b"ADVNAT04";
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 65_536;
 const MAX_KEY: usize = 256 * 1024;
 const HELPER_NAMES: &[&str] = &[
     "adv_trap_call",
-    "adv_direct_scalar",
-    "adv_direct_checked",
     "adv_repeat",
     "adv_x87",
     "adv_atomic_store",
@@ -75,24 +73,6 @@ pub(super) fn builder(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    {
-        builder.symbol(
-            "adv_direct_scalar",
-            crate::direct_memory::access as *const u8,
-        );
-        builder.symbol(
-            "adv_direct_checked",
-            crate::direct_memory::checked as *const u8,
-        );
-    }
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
@@ -195,8 +175,7 @@ fn isa_key() -> Result<&'static [u8], String> {
 pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     let mut w = Writer::default();
     w.bytes(MAGIC);
-    w.bytes(b"tier2-semantics-v1");
-    w.bool(snapshot.gir_frontend);
+    w.bytes(b"gir-canonical-contract-v3");
     w.bytes(&crate::code_cache::host_build_identity()?);
     w.bytes(env!("ADV_CPU_CODE_CACHE_FINGERPRINT").as_bytes());
     w.bytes(isa_key()?);
@@ -205,13 +184,9 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     w.u32(std::mem::size_of::<usize>() as u32);
     w.u32(std::mem::size_of::<NativeContext>() as u32);
     w.u32(std::mem::size_of::<CpuState>() as u32);
-    w.u32(1); // Canonical exact-PC inline recovery format.
     w.u32(snapshot.base);
     w.u64(snapshot.len as u64);
     w.u32(snapshot.origin);
-    w.bool(snapshot.parallel);
-    w.bool(snapshot.direct_memory);
-    w.bool(snapshot.direct_inline);
     w.bool(snapshot.shadow_returns);
     w.bool(snapshot.profile.is_some());
     w.bool(cfg!(test));
@@ -219,7 +194,6 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     w.bool(snapshot.native_fault_reads);
     w.bool(verifier_enabled());
-    w.bool(crate::safepoint::enabled());
     w.bool(x87::enabled());
     w.bool(std::env::var_os("ADV_JIT_X87_SINGLE_ONLY").is_some_and(|value| value == "1"));
     w.bool(cfg!(feature = "gir-capture"));
@@ -261,16 +235,6 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     Ok(w.0)
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct InlineSite {
-    pub offset: u32,
-    pub recovery: u32,
-    pub guest_pc: u32,
-    pub next_pc: u32,
-    pub width: u8,
-    pub write: bool,
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture(
     snapshot: &Snapshot,
@@ -285,7 +249,6 @@ pub(super) fn capture(
     entries: &BTreeSet<u32>,
     excluded: &BTreeMap<u32, iced_x86::Code>,
     code_size: usize,
-    inline: Vec<InlineSite>,
 ) -> Result<Vec<u8>, String> {
     let mut w = Writer::default();
     w.bytes(MAGIC);
@@ -317,15 +280,6 @@ pub(super) fn capture(
     w.u32(pages.len() as u32);
     for page in pages {
         w.u64(*page as u64);
-    }
-    w.u32(inline.len() as u32);
-    for site in inline {
-        w.u32(site.offset);
-        w.u32(site.recovery);
-        w.u32(site.guest_pc);
-        w.u32(site.next_pc);
-        w.u8(site.width);
-        w.bool(site.write);
     }
     // All body/local functions form one batch; the wrapper is finalized after
     // its absolute tail symbol has been bound to that batch's restored entry.
@@ -408,7 +362,6 @@ struct Image {
     pages: BTreeSet<usize>,
     entries: BTreeSet<u32>,
     excluded: BTreeMap<u32, iced_x86::Code>,
-    inline: Vec<InlineSite>,
     blobs: Vec<Blob>,
 }
 
@@ -429,17 +382,6 @@ fn known_import(name: &str, profile: bool) -> bool {
         {
             return index < MAX_ITEMS;
         }
-    }
-    #[cfg(not(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    if matches!(name, "adv_direct_scalar" | "adv_direct_checked") {
-        return false;
     }
     HELPER_NAMES.contains(&name)
 }
@@ -520,26 +462,6 @@ fn parse(snapshot: &Snapshot, bytes: &[u8]) -> Result<Image, String> {
         if !snapshot.pages.iter().any(|stamp| stamp.page == page) || !pages.insert(page) {
             return Err("invalid native cache page dependency".into());
         }
-    }
-    let mut inline = Vec::new();
-    for _ in 0..r.count()? {
-        let site = InlineSite {
-            offset: r.u32()?,
-            recovery: r.u32()?,
-            guest_pc: r.u32()?,
-            next_pc: r.u32()?,
-            width: r.u8()?,
-            write: r.bool()?,
-        };
-        if !snapshot.direct_inline
-            || !matches!(site.width, 1 | 2 | 4)
-            || instructions
-                .get(&site.guest_pc)
-                .is_none_or(|i| i.next_ip32() != site.next_pc)
-        {
-            return Err("invalid native cache recovery site".into());
-        }
-        inline.push(site);
     }
     let mut blobs = Vec::new();
     let mut defined = BTreeSet::new();
@@ -661,21 +583,6 @@ fn parse(snapshot: &Snapshot, bytes: &[u8]) -> Result<Image, String> {
             }
         }
     }
-    let body_size = blobs
-        .iter()
-        .find(|blob| blob.id == body)
-        .unwrap()
-        .bytes
-        .len();
-    if inline
-        .iter()
-        .any(|site| site.offset as usize >= body_size || site.recovery as usize >= body_size)
-        || inline
-            .windows(2)
-            .any(|pair| pair[0].offset >= pair[1].offset)
-    {
-        return Err("native cache recovery offset is outside code".into());
-    }
     Ok(Image {
         body,
         wrapper,
@@ -685,7 +592,6 @@ fn parse(snapshot: &Snapshot, bytes: &[u8]) -> Result<Image, String> {
         pages,
         entries,
         excluded,
-        inline,
         blobs,
     })
 }
@@ -789,83 +695,7 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
             )
         }?);
     }
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let inline_registration = if image.inline.is_empty() {
-        None
-    } else {
-        let base = if cfg!(all(target_os = "android", target_arch = "aarch64")) {
-            body_entry & 0x00ff_ffff_ffff_ffff
-        } else {
-            body_entry
-        };
-        let sites = image
-            .inline
-            .iter()
-            .map(|site| crate::fault_recovery::inline::Site {
-                host_pc: base + site.offset as usize,
-                recovery_pc: base + site.recovery as usize,
-                guest_pc: site.guest_pc,
-                next_pc: site.next_pc,
-                width: site.width,
-                write: site.write,
-            })
-            .collect();
-        let len = image
-            .blobs
-            .iter()
-            .find(|blob| blob.id == image.body)
-            .unwrap()
-            .bytes
-            .len();
-        // SAFETY: checksummed machine code and the exact offset table are from
-        // one validated emitter image; retirement precedes executable storage.
-        Some(unsafe { crate::fault_recovery::inline::Registration::publish(base, len, sites) }?)
-    };
-    #[cfg(not(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    if !image.inline.is_empty() {
-        return Err("native cache recovery format unavailable".into());
-    }
     let input = snapshot.with_coverage(&image.instructions, &image.pages);
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let direct_sites = if snapshot.direct_memory {
-        image
-            .instructions
-            .values()
-            .filter(|i| direct::candidate(i))
-            .count()
-    } else {
-        0
-    };
-    #[cfg(not(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
-    let direct_sites = 0;
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let body_len = image
         .blobs
@@ -875,7 +705,6 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         .bytes
         .len();
     Ok(Compiled {
-        _poll_target: None,
         perf_ranges,
         module: owned.0.take(),
         cache_image: Some(Ok(bytes.to_vec())),
@@ -907,17 +736,6 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         gir_opaque_instructions: 0,
         decoded_bytes: image.instructions.values().map(Instruction::len).sum(),
         ir_counts: None,
-        direct_sites,
-        direct_inline_fallbacks: 0,
-        #[cfg(all(
-            any(
-                target_os = "linux",
-                target_os = "android",
-                all(target_os = "macos", target_arch = "aarch64")
-            ),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
-        inline_registration,
         _x87: x87,
         _nests: Box::new([]),
         cache_stamp: std::cell::Cell::new(0),
@@ -1269,26 +1087,13 @@ mod tests {
         );
     }
 
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
     #[test]
-    fn restored_inline_fault_table_uses_new_host_offsets() {
+    fn restored_checked_store_fault_keeps_the_committed_prefix() {
         let bytes = [0x83, 0xc3, 1, 0x89, 0x06];
-        let (mut memory, mut snapshot) = fixture(&bytes);
-        memory.enable_direct_memory().unwrap();
-        snapshot = Snapshot::capture(&snapshot.region, &mut memory).unwrap();
+        let (mut memory, snapshot) = fixture(&bytes);
         let compiled = compile_snapshot(&snapshot).unwrap();
         let image = compiled.cache_bytes().unwrap();
         let restored = restore_snapshot(&snapshot, &image).unwrap();
-        if snapshot.direct_inline {
-            assert!(restored.inline_registration.is_some());
-        }
         memory.protect(0x11000, 4096, READ).unwrap();
         let mut state = CpuState {
             eip: snapshot.region.start,
@@ -1360,15 +1165,6 @@ mod tests {
         assert!(restore_snapshot(&snapshot, &image[..image.len() - 1]).is_err());
         let mut changed = snapshot.clone();
         changed.shadow_returns = !changed.shadow_returns;
-        assert!(restore_snapshot(&changed, &image).is_err());
-        changed = snapshot.clone();
-        changed.parallel = !changed.parallel;
-        assert!(restore_snapshot(&changed, &image).is_err());
-        changed = snapshot.clone();
-        changed.gir_frontend = !changed.gir_frontend;
-        assert!(restore_snapshot(&changed, &image).is_err());
-        changed = snapshot.clone();
-        changed.direct_memory = !changed.direct_memory;
         assert!(restore_snapshot(&changed, &image).is_err());
         changed = snapshot.clone();
         changed.cache_location = Some((changed.base, 0, [1; 32]));

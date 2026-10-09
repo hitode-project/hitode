@@ -1,9 +1,7 @@
-//! Synthetic off/poll differential checkpoints and restartable interrupt prefixes.
-//! Run with `cargo test -p adv-cpu --test safepoints`. Each differential child
-//! owns a fresh environment because the polling switch is process-wide.
+//! Synthetic fuel, stop, fault and restartable interrupt prefix checks.
+//! Run with `cargo test -p adv-cpu --test safepoints`. No external inputs.
 use adv_cpu::{CompileStrategy, CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::{Decoder, DecoderOptions, OpKind, code_asm::*};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +12,6 @@ const STOP: u32 = 0x18000;
 const DATA: u32 = 0x20000;
 const SLOT: u32 = DATA + 4096;
 const STACK: u32 = 0x2f800;
-const CHILD: &str = "ADV_SAFEPOINT_TEST_CHILD";
 
 #[derive(Clone, Copy)]
 struct Backend {
@@ -29,20 +26,6 @@ fn backends() -> Vec<Backend> {
         strategy: CompileStrategy::Speed,
         linked: false,
     }];
-    if cfg!(all(
-        target_arch = "aarch64",
-        any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos"
-        )
-    )) {
-        result.push(Backend {
-            tier: 1,
-            strategy: CompileStrategy::Speed,
-            linked: false,
-        });
-    }
     for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
         for linked in [false, true] {
             result.push(Backend {
@@ -70,9 +53,6 @@ fn machine(programs: &[(u32, Vec<u8>)], backend: Backend) -> Executor {
     m.set_tier_verification(None);
     m.set_region_linking(backend.linked);
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
-    if backend.tier == 1 {
-        m.set_arm64_tier1(true).unwrap();
-    }
     for (at, bytes) in programs {
         m.write(*at, bytes).unwrap();
         m.protect(*at, 4096, READ | EXEC).unwrap();
@@ -214,10 +194,8 @@ fn checkpoint(m: &Executor, outcome: &RunOutcome) {
     let slot = digest(m.memory().read(SLOT, 64).unwrap());
     let stack = digest(m.memory().read(STACK - 1024, 1028).unwrap());
     println!(
-        "SPT_DIGEST {state:016x} {data:016x} {slot:016x} {stack:016x} {} {} {}",
-        m.stats.native_blocks,
-        m.stats.interpreter_instructions,
-        m.tier1_stats().native_instructions
+        "SPT_DIGEST {state:016x} {data:016x} {slot:016x} {stack:016x} {} {}",
+        m.stats.native_blocks, m.stats.interpreter_instructions
     );
 }
 
@@ -458,49 +436,12 @@ fn smc_case(backend: Backend) {
 }
 
 #[test]
-fn differential_child() {
-    if std::env::var_os(CHILD).is_none() {
-        return;
-    }
+fn exact_budget_stop_fault_and_smc_checkpoints() {
     for backend in backends() {
         fuel_cases(backend);
         stop_cases(backend);
         fault_cases(backend);
         smc_case(backend);
-    }
-}
-
-#[test]
-fn off_and_poll_preserve_exact_checkpoints() {
-    let executable = std::env::current_exe().unwrap();
-    let capture = |poll| {
-        let mut command = Command::new(&executable);
-        command
-            .args(["--exact", "differential_child", "--nocapture"])
-            .env(CHILD, "1")
-            .env_remove("ADV_SAFEPOINT");
-        if poll {
-            command.env("ADV_SAFEPOINT", "poll");
-        }
-        let output = command.output().unwrap();
-        // Failed children may contain diagnostic PCs; keep their output private.
-        assert!(
-            output.status.success(),
-            "anonymous differential child failed (poll={poll})"
-        );
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .filter(|line| line.starts_with("SPT_DIGEST "))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    let off = capture(false);
-    let poll = capture(true);
-    assert!(!off.is_empty(), "missing differential checkpoints");
-    assert!(off.len() == poll.len(), "checkpoint count changed");
-    for (index, (off, poll)) in off.iter().zip(&poll).enumerate() {
-        assert!(off == poll, "anonymous checkpoint {index} changed");
     }
 }
 
@@ -574,10 +515,7 @@ fn cyclic_shapes_interrupt_at_an_exact_replayable_prefix() {
             );
             let consumed = budget - m.state.fuel;
             assert!(
-                consumed
-                    == m.stats.native_blocks
-                        + m.stats.interpreter_instructions
-                        + m.tier1_stats().native_instructions,
+                consumed == m.stats.native_blocks + m.stats.interpreter_instructions,
                 "retired accounting changed: {case}"
             );
             let mut replay = machine(&programs, backend);
