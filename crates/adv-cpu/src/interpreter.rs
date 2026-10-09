@@ -16,6 +16,7 @@ use iced_x86::{
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
+mod strings;
 
 const CF: u32 = 1;
 const PF: u32 = 1 << 2;
@@ -315,7 +316,7 @@ fn execute_decoded(
         }
     };
     if let Action::String(operation) = instruction.action {
-        return run_string(
+        return strings::execute::<true>(
             state,
             memory,
             operation,
@@ -986,182 +987,6 @@ fn string_operation(i: &Instruction) -> Option<StringOp> {
         repeat: i.has_rep_prefix() || i.has_repne_prefix(),
         unequal: i.has_repne_prefix(),
     })
-}
-
-fn run_string(
-    state: &mut CpuState,
-    memory: &mut Memory,
-    operation: StringOp,
-    next: u32,
-    max_units: u32,
-    debug: bool,
-) -> Execution {
-    use StringKind::*;
-    let pc = state.eip;
-    let index_width = if operation.word { 2 } else { 4 };
-    let counter = Reg {
-        index: 1,
-        shift: 0,
-        width: index_width,
-    };
-    if operation.repeat && counter.read(&state.regs) == 0 {
-        state.eip = next;
-        state.rep = None;
-        return Execution {
-            step: if debug {
-                Step::Trap { pc, vector: 1 }
-            } else {
-                Step::Executed
-            },
-            units: 1,
-        };
-    }
-    let comparison = matches!(operation.kind, Cmps | Scas);
-    let had_continuation = state
-        .rep
-        .as_ref()
-        .is_some_and(|r| r.pc == pc && r.operation == operation);
-    let original_flags = if operation.repeat && comparison {
-        if !had_continuation {
-            state.rep = Some(RepContinuation {
-                pc,
-                flags: state.eflags,
-                operation,
-            });
-        }
-        state.rep.as_ref().unwrap().flags
-    } else {
-        state.rep = None;
-        state.eflags
-    };
-    let mut units = 0;
-    while units < if debug { 1 } else { max_units } {
-        let mut tx = Transaction {
-            regs: state.regs,
-            flags: state.eflags,
-            eip: pc,
-            fs_base: state.fs_base,
-            segments: state.segments,
-            pc,
-            write: None,
-            more_writes: Vec::new(),
-            indirect_branch: None,
-        };
-        let source_index = Reg {
-            index: 6,
-            shift: 0,
-            width: index_width,
-        };
-        let dest_index = Reg {
-            index: 7,
-            shift: 0,
-            width: index_width,
-        };
-        let source =
-            source_index
-                .read(&tx.regs)
-                .wrapping_add(if operation.fs { state.fs_base } else { 0 });
-        let destination = dest_index.read(&tx.regs);
-        let accumulator = Reg {
-            index: 0,
-            shift: 0,
-            width: operation.width,
-        };
-        let element = (|| -> Result<(), Step> {
-            match operation.kind {
-                Movs => {
-                    let value = tx.read_mem(memory, source, operation.width)?;
-                    tx.store(
-                        memory,
-                        Transaction::stack_operand_width(destination, operation.width),
-                        value,
-                    )?;
-                }
-                Stos => {
-                    let value = accumulator.read(&tx.regs);
-                    tx.store(
-                        memory,
-                        Transaction::stack_operand_width(destination, operation.width),
-                        value,
-                    )?;
-                }
-                Lods => {
-                    let value = tx.read_mem(memory, source, operation.width)?;
-                    accumulator.write(&mut tx.regs, value);
-                }
-                Cmps => {
-                    let a = tx.read_mem(memory, source, operation.width)?;
-                    let b = tx.read_mem(memory, destination, operation.width)?;
-                    tx.arithmetic(a, b, 0, operation.width, true);
-                }
-                Scas => {
-                    let a = accumulator.read(&tx.regs);
-                    let b = tx.read_mem(memory, destination, operation.width)?;
-                    tx.arithmetic(a, b, 0, operation.width, true);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(step) = element {
-            if operation.repeat && comparison {
-                state.eflags = original_flags;
-                // The fault exposes the architectural restart context. A handler
-                // may change EFLAGS before restarting the remaining elements;
-                // that context is the next instruction's input, not this origin.
-                state.rep = None;
-            }
-            return Execution { step, units };
-        }
-        let delta = if state.eflags & (1 << 10) != 0 {
-            0u32.wrapping_sub(u32::from(operation.width))
-        } else {
-            u32::from(operation.width)
-        };
-        if matches!(operation.kind, Movs | Cmps | Lods) {
-            let index = source_index.read(&tx.regs).wrapping_add(delta);
-            source_index.write(&mut tx.regs, index);
-        }
-        if operation.kind != Lods {
-            let index = dest_index.read(&tx.regs).wrapping_add(delta);
-            dest_index.write(&mut tx.regs, index);
-        }
-        if operation.repeat {
-            let count = counter.read(&tx.regs).wrapping_sub(1);
-            counter.write(&mut tx.regs, count);
-        }
-        if let Some((address, width, value)) = tx.write {
-            // This element's complete range and permissions have been checked.
-            memory
-                .write(address, &value.to_le_bytes()[..width as usize])
-                .expect("validated REP element write");
-        }
-        state.regs = tx.regs;
-        state.eflags = tx.flags;
-        units += 1;
-        let more = operation.repeat
-            && counter.read(&state.regs) != 0
-            && (!comparison || (state.eflags & ZF == 0) == operation.unequal);
-        if !more {
-            state.eip = next;
-            state.rep = None;
-        }
-        if debug {
-            // Unlike a scheduler chunk, a delivered debug exception exposes a
-            // restart context that its handler is allowed to change.
-            state.rep = None;
-            return Execution {
-                step: Step::Trap { pc, vector: 1 },
-                units,
-            };
-        }
-        if !more {
-            break;
-        }
-    }
-    Execution {
-        step: Step::Executed,
-        units,
-    }
 }
 
 fn same_width(dst: Operand, src: Operand) -> bool {
