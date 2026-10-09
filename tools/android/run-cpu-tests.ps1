@@ -83,7 +83,7 @@ $runs = @(
 function Get-DeviceCommand($remote, $run) {
     # Parent tests exec their own deployed ELF and validate each child's status.
     # Never carry a host runner or an individual fault case into the parent.
-    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY ADV_GIR'
+    $clear = 'unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY'
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
     "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"

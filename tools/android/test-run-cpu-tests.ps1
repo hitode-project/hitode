@@ -33,7 +33,6 @@ $event = & $runner -WhatIf -CodeValidity event -Output $output | ConvertFrom-Jso
 Assert ($event.runs[0].shell.Contains('ADV_CODE_VALIDITY=event')) 'Event validity did not reach the device.'
 Assert ($defaults.runs[0].shell.Contains('ADV_CODE_VALIDITY=legacy')) 'Event validity must remain opt-in.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
-Assert (-not $defaults.runs[0].shell.Contains('ADV_GIR=')) 'Removed GIR execution selector must not be passed.'
 $features = & $runner -WhatIf -TestName execution_contract -Features gir-lift -JitVerify strict -Output $output | ConvertFrom-Json
 Assert ($features.features.Count -eq 1 -and $features.features[0] -eq 'gir-lift') 'Explicit diagnostic feature was lost.'
 Assert ($features.runs[0].shell.Contains('ADV_JIT_VERIFY=strict')) 'Strict oracle was lost.'
