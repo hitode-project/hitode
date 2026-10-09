@@ -34,6 +34,20 @@ class ExceptionInitTests(unittest.TestCase):
         self.assertEqual(fixture.evaluate(5, values), [])
         self.assertEqual(fixture.evaluate(5, values[:2]), ["missing_results"])
 
+    def test_loader_boundary_rejects_outer_search_and_missing_unwind(self):
+        for case in (10, 11, 13):
+            values = fixture.expected(case)
+            self.assertEqual(values[8:11], [0x611, 2, 0xc0000027])
+            self.assertNotIn(0x701, values)
+            self.assertEqual(values.count(0x4100), 1)
+            self.assertTrue(fixture.evaluate(case, values[:8] + values[11:]))
+
+    def test_false_return_detaches_failed_instance_and_successful_retry(self):
+        values = fixture.expected(12)
+        self.assertEqual(values.count(0x4100), 2)
+        self.assertNotIn(0x601, values)
+        self.assertEqual(values[-7:], [0x400c, 1, 0x4100, 1, 1, 1, 0x3000])
+
 
 if __name__ == "__main__":
     unittest.main()

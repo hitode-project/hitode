@@ -19,6 +19,7 @@ use crate::{Win32, stdcall};
 
 mod datafile;
 mod guest_files;
+mod initializer;
 mod native_boundary;
 mod notifications;
 pub(crate) use notifications::prepare_system_env;
@@ -260,21 +261,38 @@ fn run_inits(
 ) -> Outcome {
     match inits.pop_front() {
         None => finished(env),
-        Some(c) => {
+        Some(mut c) => {
             log::debug!("LoadLibrary init: {}", c.what);
             let is_dllmain = c.failure_exit.is_some();
+            let module = c.args[0];
+            if is_dllmain && let Err(error) = initializer::prepare(env, &mut c) {
+                return Outcome::Fail(error);
+            }
             if let Some((begin, token)) = c.begin {
                 begin(env, token);
             }
             Outcome::call(c.target, c.args, move |env, resume| {
-                if is_dllmain && resume.value() == 0 {
+                if is_dllmain && resume.value() != 1 {
+                    let threw = resume.value() == initializer::EXCEPTION;
+                    if threw && let Some(id) = adv_os::modules(env.ext).by_handle(module) {
+                        // Native exception failure does not issue PROCESS_DETACH
+                        // for the interrupted DLL; a normal FALSE return does.
+                        adv_os::modules_mut(env.ext)
+                            .get_mut(id)
+                            .lifetime
+                            .attach_started = false;
+                    }
                     let caller = env.caller();
                     env.sys.trace.warning(
                         env.context,
                         env.sys.frame,
                         caller,
                         "<loader>",
-                        "DLL process initialization returned FALSE",
+                        if threw {
+                            "DLL process initialization raised an exception"
+                        } else {
+                            "DLL process initialization returned FALSE"
+                        },
                         None,
                     );
                     failed(env)
@@ -1247,6 +1265,7 @@ fn sizeof_resource(env: &mut Env<'_>, module: Handle, resource: Handle) -> u32 {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    initializer::register(reg);
     notifications::register_start_entries(reg);
     stdcall(
         reg,

@@ -8,6 +8,13 @@ static DWORD mode, fault_pc, resume_pc, saved_sp, saved_bp;
 static DWORD after_sp, after_bp, after_flags, after_eax, handler_flags;
 static DWORD nested, handlers;
 static volatile DWORD *page;
+static LONG __cdecl search(EXCEPTION_RECORD *r, void *f, CONTEXT *c, void *d) {
+    (void)f; (void)c; (void)d;
+    record((r->ExceptionFlags & 6) ? 0x611 : 0x610);
+    record(r->ExceptionFlags & 7);
+    record(r->ExceptionCode);
+    return 1;
+}
 
 static void observe(EXCEPTION_RECORD *r, CONTEXT *c, DWORD kind) {
     record(kind); record(r->ExceptionCode); record(r->ExceptionFlags);
@@ -75,10 +82,25 @@ __declspec(naked) static LONG __cdecl seh(EXCEPTION_RECORD *r, void *f, CONTEXT 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void *reserved) {
     DWORD old; void *vector; Registration registration;
     (void)module; (void)reserved;
-    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    if (reason != DLL_PROCESS_ATTACH) {
+        if (reason == DLL_PROCESS_DETACH && mode >= 10) record(0x4100);
+        return TRUE;
+    }
     record = (RECORDER)GetProcAddress(GetModuleHandleA(NULL), "Record");
     mode = ((CASE)GetProcAddress(GetModuleHandleA(NULL), "Case"))();
     record(0x4000 + mode);
+    if (mode >= 10) {
+        if (((CASE)GetProcAddress(GetModuleHandleA(NULL), "Attempt"))()) return TRUE;
+        if (mode == 12) return FALSE;
+        registration.handler = search;
+        __asm__ volatile("movl %%fs:0,%0" : "=r"(registration.previous) : : "memory");
+        __asm__ volatile("movl %0,%%fs:0" : : "r"(&registration) : "memory");
+        if (mode == 11) RaiseException(0xe0423142, EXCEPTION_NONCONTINUABLE, 0, NULL);
+        else __asm__ volatile("xorl %%eax,%%eax; movl %%eax,(%%eax)" : : : "eax", "memory");
+        __asm__ volatile("movl %0,%%fs:0" : : "r"(registration.previous) : "memory");
+        record(0xdead);
+        return TRUE;
+    }
     page = (volatile DWORD *)VirtualAlloc(NULL, 4096, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
     if (!page) return FALSE;
     *page = 0x76543210;

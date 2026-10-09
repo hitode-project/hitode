@@ -6,8 +6,8 @@ Inputs: exception-init.c, exception-init-dll.c, LLVM, Windows SDK, and runner.
 Outputs: isolated native/interpreter/JIT cases, frozen runner, command and
 SHA-256 records, and scalar summary.json. No game files or addresses are used.
 --baseline records known failures without returning a failing process status.
-The default nine cases recover inside DllMain. --case 5 separately probes an
-unhandled initializer fault and the native loader's ERROR_DLL_INIT_FAILED path.
+Fourteen cases cover local recovery, loader-owned unwind, failed initialization,
+detach policy and successful reload. --trace also tests host-routed guest APIs.
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ import struct
 
 from personality_contract import digest, run
 
-CASES = tuple(range(10))
-RECOVERABLE_CASES = tuple(case for case in CASES if case != 5)
+CASES = tuple(range(14))
+RECOVERABLE_CASES = tuple(case for case in range(10) if case != 5)
 
 
 def expected(case: int) -> list[int]:
@@ -30,6 +30,18 @@ def expected(case: int) -> list[int]:
         raise ValueError("unsupported fixture case")
     if case == 5:
         return [0x1005, 0x4005, 0x2000, 0, 1114, 0x3000]
+    if case >= 10:
+        values = [0x1000 + case, 0x4000 + case]
+        if case != 12:
+            flag = int(case == 11)
+            code = 0xe0423142 if flag else 0xc0000005
+            values += [0x601, code, flag, 0x610, flag, code, 0x611, 2, 0xc0000027]
+        else:
+            values += [0x4100]
+        if case == 13:
+            values += [0xc0000142]
+        return values + [0x2000, 0, 0 if case == 13 else 1114, 1,
+                         0x4000 + case, 1, 0x4100, 1, 1, 1, 0x3000]
     code = {4: 0x80000003, 6: 0xc0000096, 7: 0xc0000096,
             8: 0xc000001d, 9: 0xc0000094}.get(case, 0xc0000005)
     flags = 0xed5 if case == 4 else 0x10ed5
@@ -90,6 +102,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--trace", action="store_true")
     parser.add_argument("--case", type=int, choices=CASES, action="append")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -111,7 +124,7 @@ def main() -> int:
               "dll_sha256": digest(output / "exception-init.dll")}
     records = []
     for backend in ("native", "interpreter", "jit"):
-        for case in (args.case or RECOVERABLE_CASES):
+        for case in (args.case or CASES):
             directory = output / f"{backend}-{case}"
             directory.mkdir()
             executable = directory / f"case-{case}.exe"
@@ -124,6 +137,8 @@ def main() -> int:
                            "--seconds", "5", "--data-dir", str(directory / "data"),
                            "--report", str(directory / "report.json"), "--api-mode", "strict", "--sync-compilation"]
                 result = directory / "data/overlay/exception-init.bin"
+                if args.trace:
+                    command += ["--trace", str(directory / "api.log")]
             (directory / "cmd.txt").write_text(json.dumps({**hashes, "command": command,
                 "cwd": str(directory), "environment": {key: os.environ.get(key)
                     for key in ("TEMP", "TMP", "CARGO_TARGET_DIR")}}, indent=2), encoding="utf-8")
