@@ -6,13 +6,15 @@
 //! branch, so hot paths chain without even that call. Each unit's safepoint
 //! checks the countdown, which `run` sets from the fuel and `SLICE`, so a
 //! chain returns within its budget. A link is undone when its target is
-//! dropped. The shadow stack comes with a later M1 slice.
+//! dropped. Dynamic targets go through the indirect table, which the helper
+//! fills, and returns through the shadow stack; both are emptied whenever a
+//! unit is dropped, so they only ever lead to live units.
 //!
 //! Faults (§6.3, §6.4): every host instruction that may fault has a side-table
 //! site naming its guest instruction. The signal handler only checks that the
 //! PC is such a site, records it, and resumes at the fault stub. Because a
 //! translated instruction commits nothing before its last possible fault
-//! (§5.2), the owner then rebuilds the flags from the site's carry sense and
+//! (§5.2), the owner then rebuilds the flags from the site's carry and
 //! PF/AF recipe and interprets that one instruction from the exact prior
 //! state: the interpreter either completes it (a soft page) or reports the
 //! precise guest fault.
@@ -22,14 +24,14 @@
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
 
+use rustc_hash::FxHashMap;
 use std::cell::Cell;
-use std::collections::HashMap;
 
 use adv_cpu_core::CpuState;
 use adv_cpu_core::memory::Memory;
 
 use crate::cache::CodeCache;
-use crate::encode::b;
+use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
@@ -41,16 +43,33 @@ const SLICE: u64 = 1 << 16;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 
+/// An indirect table entry no EIP matches.
+const EMPTY: [u64; 2] = [u64::MAX, 0];
+
 /// What the signal handler may read while translated code runs.
 struct Faults {
     /// Executable range of translated code.
     start: usize,
     end: Cell<usize>,
-    /// Host PC of each site.
-    sites: HashMap<usize, Site>,
+    /// Host PC of each site, ascending: units are appended in address
+    /// order, and their sites in emission order.
+    sites: Vec<(usize, Site)>,
     stub: usize,
     /// The site that faulted, written in signal context.
     pc: Cell<usize>,
+    /// The shadow stack's guard pages.
+    guard: (usize, usize),
+    /// Where an overflow resumes, and the runtime field it reads the
+    /// faulting PC from.
+    reset: usize,
+    resume: *mut u64,
+}
+
+impl Faults {
+    fn site(&self, pc: usize) -> Option<Site> {
+        let index = self.sites.binary_search_by_key(&pc, |&(at, _)| at).ok()?;
+        Some(self.sites[index].1)
+    }
 }
 
 thread_local! {
@@ -59,7 +78,7 @@ thread_local! {
 }
 
 /// Runs in signal context: no allocation, no locks.
-unsafe fn on_fault(pc: usize, _: usize) -> usize {
+unsafe fn on_fault(pc: usize, address: usize) -> usize {
     ACTIVE
         .try_with(|slot| {
             let faults = slot.get();
@@ -69,13 +88,94 @@ unsafe fn on_fault(pc: usize, _: usize) -> usize {
             // SAFETY: `run` keeps the pointee alive and unmodified, apart
             // from the `pc` cell, until it clears the slot.
             let faults = unsafe { &*faults };
-            if !(faults.start..faults.end.get()).contains(&pc) || !faults.sites.contains_key(&pc) {
+            if !(faults.start..faults.end.get()).contains(&pc) {
+                return 0;
+            }
+            if (faults.guard.0..faults.guard.1).contains(&address) {
+                // A shadow push overflowed: empty the stack and retry it.
+                // SAFETY: the runtime outlives the run, and translated code
+                // is stopped here.
+                unsafe { faults.resume.write(pc as u64) };
+                return faults.reset;
+            }
+            if faults.site(pc).is_none() {
                 return 0;
             }
             faults.pc.set(pc);
             faults.stub
         })
         .unwrap_or(0)
+}
+
+/// The shadow return stack: entries of {host continuation, guest EIP}
+/// growing down from sentinels that never match, over guard pages.
+struct ShadowStack {
+    base: *mut libc::c_void,
+    len: usize,
+    guard: usize,
+}
+
+impl ShadowStack {
+    const ENTRIES: usize = 1 << 16;
+
+    fn new() -> Result<Self, String> {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let guard = page.max(16 << 10);
+        let len = guard + (Self::ENTRIES + runtime::SHADOW_SENTINELS) * 16;
+        let len = len.next_multiple_of(page);
+        // SAFETY: a fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err("cannot map the shadow stack".into());
+        }
+        let stack = Self { base, len, guard };
+        // SAFETY: inside the mapping just made.
+        let protected = unsafe {
+            libc::mprotect(
+                base.cast::<u8>().add(guard).cast(),
+                len - guard,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        if protected != 0 {
+            return Err("cannot protect the shadow stack".into());
+        }
+        let top = stack.top() as *mut u64;
+        for k in 0..runtime::SHADOW_SENTINELS {
+            // SAFETY: the sentinels are the last entries of the mapping.
+            unsafe {
+                top.add(2 * k).write(0);
+                top.add(2 * k + 1).write(u64::MAX);
+            }
+        }
+        Ok(stack)
+    }
+
+    /// The empty stack pointer, just below the sentinels.
+    fn top(&self) -> u64 {
+        (self.base as usize + self.len - runtime::SHADOW_SENTINELS * 16) as u64
+    }
+
+    fn guard(&self) -> (usize, usize) {
+        (self.base as usize, self.base as usize + self.guard)
+    }
+}
+
+impl Drop for ShadowStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made.
+        unsafe { libc::munmap(self.base, self.len) };
+    }
 }
 
 /// Host features from the OS.
@@ -150,6 +250,9 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
             return 0;
         }
     };
+    if point == 0 {
+        native.table[runtime::table_slot(eip)] = [u64::from(eip), unit as u64];
+    }
     owner.translated += native.cache.used().saturating_sub(before);
     native.cache.sync();
     native.faults.end.set(native.cache.next());
@@ -162,14 +265,23 @@ pub(crate) struct Native {
     stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     stub_len: usize,
-    units: HashMap<u32, Entry>,
+    units: FxHashMap<u32, Entry>,
     /// Unit entries by the guest pages their code came from.
-    pages: HashMap<u32, Vec<u32>>,
+    pages: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
-    /// branch to.
-    links: HashMap<u32, Vec<(usize, u32)>>,
+    /// branch to: the head of a list in `linked`.
+    links: FxHashMap<u32, u32>,
+    /// Link point, the word it held, and the next point to the same unit.
+    linked: Vec<(usize, u32, u32)>,
+    /// Link points of the units the current translation placed.
+    points: Vec<(usize, u32, bool)>,
+    /// Buffers of the last translation.
+    work: translate::Workspace,
     /// Counts cache clears, which invalidate link points.
     generation: u64,
+    /// The indirect table the runtime points at.
+    table: Box<[[u64; 2]]>,
+    shadow: ShadowStack,
     /// Stop addresses seen so far; units end before all of them.
     stops: Vec<u32>,
     pub(crate) features: Features,
@@ -188,28 +300,45 @@ impl Native {
         // SAFETY: `enter` follows the C calling convention with the
         // signature of `Enter`; see `runtime::emit_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
+        let mut table = vec![EMPTY; runtime::TABLE_LEN].into_boxed_slice();
+        let shadow = ShadowStack::new()?;
+        let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
+        runtime.table = table.as_mut_ptr() as u64;
+        runtime.shadow_top = shadow.top();
+        runtime.shadow = shadow.top();
         Ok(Self {
             stub_len: cache.used(),
             faults: Faults {
                 start: base,
                 end: Cell::new(cache.next()),
-                sites: HashMap::new(),
+                sites: Vec::new(),
                 stub: base + stubs.fault,
                 pc: Cell::new(0),
+                guard: shadow.guard(),
+                reset: base + stubs.shadow_reset,
+                resume: &raw mut runtime.resume,
             },
             cache,
             enter,
             stubs: Stubs {
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
+                lookup: base + stubs.lookup,
+                lookup_slow: base + stubs.lookup_slow,
+                ret_miss: base + stubs.ret_miss,
             },
-            units: HashMap::new(),
-            pages: HashMap::new(),
-            links: HashMap::new(),
+            units: FxHashMap::default(),
+            pages: FxHashMap::default(),
+            links: FxHashMap::default(),
+            linked: Vec::new(),
+            points: Vec::new(),
+            work: translate::Workspace::default(),
             generation: 0,
+            table,
+            shadow,
             stops: Vec::new(),
             features: features(),
-            runtime: Box::new(Runtime::new(std::ptr::null_mut(), window as u64)),
+            runtime,
         })
     }
 
@@ -280,9 +409,12 @@ impl Native {
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {
-            let site = self.faults.sites[&self.faults.pc.get()];
+            let site = self
+                .faults
+                .site(self.faults.pc.get())
+                .expect("faulting site");
             recover(cpu, site, self.runtime.temps);
-            retired += u64::from(site.retired);
+            retired -= u64::from(site.refund);
         }
         let retired = retired as u32;
         Ok(Some(Run {
@@ -303,12 +435,24 @@ impl Native {
         };
         // Translating may have cleared the cache and the link point with it.
         if point != 0 && self.generation == generation {
-            let word = self.cache.word(point);
-            self.cache
-                .patch(point, b((entry.unit as i64 - point as i64) as i32));
-            self.links.entry(eip).or_default().push((point, word));
+            self.patch(point, eip, entry.unit);
         }
         Ok(entry.unit)
+    }
+
+    /// Makes the link point at `point` branch to `unit`, the unit at `eip`.
+    fn patch(&mut self, point: usize, eip: u32, unit: usize) {
+        let word = self.cache.word(point);
+        let offset = (unit as i64 - point as i64) as i32;
+        // A real call's `bl` stays a call.
+        let link = if word & 0xFC00_0000 == 0x9400_0000 {
+            bl(offset)
+        } else {
+            b(offset)
+        };
+        self.cache.patch(point, link);
+        let next = self.links.insert(eip, self.linked.len() as u32);
+        self.linked.push((point, word, next.unwrap_or(u32::MAX)));
     }
 
     /// Drops units whose guest code changed, and restores the link points
@@ -317,14 +461,27 @@ impl Native {
         if memory.dirty_pages.is_empty() {
             return;
         }
+        let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
-                self.units.remove(&eip);
-                for (point, word) in self.links.remove(&eip).unwrap_or_default() {
+                dropped |= self.units.remove(&eip).is_some();
+                let mut next = self.links.remove(&eip).unwrap_or(u32::MAX);
+                while let Some(&(point, word, after)) = self.linked.get(next as usize) {
                     self.cache.patch(point, word);
+                    next = after;
                 }
             }
         }
+        if dropped {
+            self.forget_dynamic();
+        }
+    }
+
+    /// Empties the indirect table and the shadow stack, which may lead to
+    /// dropped units.
+    fn forget_dynamic(&mut self) {
+        self.table.fill(EMPTY);
+        self.runtime.shadow = self.shadow.top();
     }
 
     /// Units must not run past any stop; a new one clears them all.
@@ -342,35 +499,83 @@ impl Native {
         self.units.clear();
         self.pages.clear();
         self.links.clear();
+        self.linked.clear();
         self.generation += 1;
         self.faults.sites.clear();
+        self.forget_dynamic();
     }
 
+    /// Translates the unit at `eip`, and ahead of time the units its main
+    /// path leaves to, so they share one cache sync and link directly.
+    /// Every link point of these units to a unit that exists is patched.
     fn translate(&mut self, memory: &mut Memory, eip: u32) -> Result<Entry, String> {
-        if let Some(entry) = self.emit(memory, eip) {
-            return Ok(entry);
+        self.points.clear();
+        let entry = match self.emit(memory, eip) {
+            Some(entry) => entry,
+            None => {
+                self.clear();
+                self.points.clear();
+                self.emit(memory, eip)
+                    .ok_or("a64 unit does not fit an empty cache")?
+            }
+        };
+        // Only the first unit's main path is translated ahead: deeper
+        // successors are less certain to run.
+        let first = self.points.len();
+        let mut index = 0;
+        while let Some(&(point, target, main)) = self.points.get(index) {
+            index += 1;
+            // The owner must see stops.
+            if self.stops.contains(&target) {
+                continue;
+            }
+            let unit = match self.units.get(&target) {
+                Some(entry) => entry.unit,
+                // A full cache waits for the next miss to clear it.
+                None if main && index <= first => match self.emit(memory, target) {
+                    Some(entry) => entry.unit,
+                    None => break,
+                },
+                None => continue,
+            };
+            self.patch(point, target, unit);
         }
-        self.clear();
-        self.emit(memory, eip)
-            .ok_or_else(|| "a64 unit does not fit an empty cache".into())
+        Ok(entry)
     }
 
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
-        let unit = translate::translate(memory, eip, &self.stops, self.features, at, self.stubs);
-        let entry = self.place(eip, &unit.words, &unit.sites, unit.retired)?;
-        debug_assert_eq!(entry.unit, at);
-        let mut pages: Vec<u32> = unit
-            .code
-            .iter()
-            .flat_map(|&(start, len)| [start & !0xfff, (start + len - 1) & !0xfff])
-            .collect();
-        pages.sort_unstable();
-        pages.dedup();
-        for page in pages {
-            self.pages.entry(page).or_default().push(eip);
+        let mut work = std::mem::take(&mut self.work);
+        translate::translate(
+            &mut work,
+            memory,
+            eip,
+            &self.stops,
+            self.features,
+            at,
+            self.stubs,
+        );
+        let entry = self.place(eip, work.words(), work.sites(), work.retired());
+        if let Some(entry) = entry {
+            debug_assert_eq!(entry.unit, at);
+            let points = work
+                .links()
+                .iter()
+                .map(|link| (at + link.offset, link.eip, link.main));
+            self.points.extend(points);
+            // The spans are sorted, so a page repeats only next to itself.
+            let mut last = None;
+            for &(start, len) in work.code() {
+                for page in [start & !0xfff, (start + len - 1) & !0xfff] {
+                    if last != Some(page) {
+                        last = Some(page);
+                        self.pages.entry(page).or_default().push(eip);
+                    }
+                }
+            }
         }
-        Some(entry)
+        self.work = work;
+        entry
     }
 
     /// Appends a unit for `eip` whose `sites` are at byte offsets.
@@ -382,8 +587,12 @@ impl Native {
         retired: u32,
     ) -> Option<Entry> {
         let unit = self.cache.append(words)?;
-        for &(offset, site) in sites {
-            self.faults.sites.insert(unit + offset, site);
+        let from = self.faults.sites.len().saturating_sub(1);
+        self.faults
+            .sites
+            .extend(sites.iter().map(|&(offset, site)| (unit + offset, site)));
+        if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
+            self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
         self.units.insert(eip, entry);
@@ -395,15 +604,17 @@ impl Native {
 /// subtraction sense and canonical PF/AF sources.
 fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
     cpu.eip = site.eip;
-    if site.sense == Sense::Addition {
-        cpu.eflags ^= 1;
-    }
     let regs = cpu.regs;
     let value = |operand| match operand {
         Operand::Guest(index) => regs[usize::from(index)],
         Operand::Temp(index) => temps[usize::from(index)] as u32,
         Operand::Imm(value) => value,
     };
+    match site.carry.evaluate(value) {
+        Some(cf) => cpu.eflags = cpu.eflags & !1 | u32::from(cf),
+        None if site.sense == Sense::Addition => cpu.eflags ^= 1,
+        None => {}
+    }
     if let Some((parity, adjust)) = site.recipe.evaluate(value) {
         let pf = u32::from((parity as u8).count_ones().is_multiple_of(2));
         cpu.eflags = cpu.eflags & !0x04 | pf << 2;
@@ -420,7 +631,7 @@ mod tests {
     use super::*;
     use crate::encode::Size::{W, X};
     use crate::encode::{Reg, ldr, ldr_reg, ldur, movk, movz, sub_imm};
-    use crate::translate::Recipe;
+    use crate::translate::{Carry, Recipe};
 
     const X19: Reg = Reg::new(19);
     const X23: Reg = Reg::new(23);
@@ -440,10 +651,12 @@ mod tests {
     fn install(native: &mut Native, eip: u32, load: u32) {
         let at = native.cache.next();
         let next = eip + 3;
+        // Nothing is prepaid: the exit charges the countdown.
         let site = Site {
             eip,
-            retired: 0,
+            refund: 0,
             sense: Sense::Subtraction,
+            carry: Carry::Host,
             recipe: Recipe::Canonical,
         };
         let words = [
@@ -539,8 +752,9 @@ mod tests {
             &mut cpu,
             Site {
                 eip: 0x1234,
-                retired: 3,
+                refund: 3,
                 sense: Sense::Addition,
+                carry: Carry::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
             },
             [0; 2],

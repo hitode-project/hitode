@@ -82,6 +82,7 @@ dependencies = [
  "adv-cpu-core",
  "iced-x86",
  "libc",
+ "rustc-hash 2.1.3",
  "unicorn-engine",
 ]
 

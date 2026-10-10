@@ -103,12 +103,32 @@ impl Asm {
 
     /// Patches every reference; panics on an unbound label.
     pub fn finish(mut self) -> Vec<u32> {
-        for (at, label, fixup) in std::mem::take(&mut self.fixups) {
+        self.resolve();
+        self.words
+    }
+
+    /// Patches every reference so far, keeping the buffer.
+    pub fn resolve(&mut self) {
+        for (at, label, fixup) in self.fixups.drain(..) {
             let target = self.labels[label.0].expect("branch to an unbound label");
             let offset = (target as i64 - at as i64) * 4;
             self.words[at] = fixup.encode(offset as i32);
         }
-        self.words
+    }
+
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    pub fn words_mut(&mut self) -> &mut [u32] {
+        &mut self.words
+    }
+
+    /// Empties the buffer and forgets every label, keeping the memory.
+    pub fn reset(&mut self) {
+        self.words.clear();
+        self.labels.clear();
+        self.fixups.clear();
     }
 }
 

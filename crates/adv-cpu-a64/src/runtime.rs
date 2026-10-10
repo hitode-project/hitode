@@ -13,6 +13,13 @@
 //! and NZCV; the guest GPRs are callee-saved) and calls the owner's helper,
 //! which returns the unit to continue at, or 0 to leave through `exit`.
 //!
+//! Dynamic transfers carry the guest EIP in w16. `lookup` probes the
+//! indirect table (§7.3), which the helper fills, and `lookup_slow` asks
+//! the helper. Returns pop the shadow stack (§7.2) at x28, whose entries
+//! are {host continuation, guest return EIP} and grow down to a guard page;
+//! `ret_miss` resynchronizes with a few entries below the top before it
+//! looks up, and `shadow_reset` empties the stack after an overflow.
+//!
 //! XMM state stays in `CpuState` until a unit uses SSE (M2), so the stubs
 //! do not move it. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
@@ -47,6 +54,12 @@ pub struct Runtime {
     pub helper: u64,
     /// Owner data for `helper`.
     pub owner: u64,
+    /// The indirect table: 65536 entries of {guest EIP, unit}.
+    pub table: u64,
+    /// The empty shadow stack.
+    pub shadow_top: u64,
+    /// Where `shadow_reset` resumes.
+    pub resume: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -64,6 +77,9 @@ impl Runtime {
             host_sp: 0,
             helper: 0,
             owner: 0,
+            table: 0,
+            shadow_top: 0,
+            resume: 0,
             exit: 0,
             temps: [0; 2],
         }
@@ -104,7 +120,23 @@ pub struct Stubs {
     pub fault: usize,
     /// Where translated code dispatches without leaving.
     pub dispatch: usize,
+    pub lookup: usize,
+    pub lookup_slow: usize,
+    pub ret_miss: usize,
+    /// Where the fault handler resumes a shadow stack overflow.
+    pub shadow_reset: usize,
 }
+
+/// Indirect table entries; a guest EIP indexes them by bits 2 to 17.
+pub const TABLE_LEN: usize = 1 << 16;
+
+/// The indirect table slot of `eip`.
+pub const fn table_slot(eip: u32) -> usize {
+    (eip as usize >> 2) & (TABLE_LEN - 1)
+}
+
+/// Shadow entries above the top that never match, for `ret_miss` to read.
+pub const SHADOW_SENTINELS: usize = 4;
 
 const fn r(number: u8) -> Reg {
     Reg::new(number)
@@ -130,6 +162,9 @@ const COUNTDOWN: u32 = field(offset_of!(Runtime, countdown));
 const HOST_SP: u32 = field(offset_of!(Runtime, host_sp));
 const EXIT: u32 = field(offset_of!(Runtime, exit));
 const HELPER: u32 = field(offset_of!(Runtime, helper));
+pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
+const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
+const RESUME: u32 = field(offset_of!(Runtime, resume));
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 const EIP: u32 = field(offset_of!(CpuState, eip));
@@ -156,14 +191,73 @@ pub fn stubs() -> Stubs {
     let fault = asm.offset();
     asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
     asm.b(exit_label);
+    let dispatch_label = asm.label();
+    asm.bind(dispatch_label);
     let dispatch = asm.offset();
     emit_dispatch(&mut asm, exit_label);
+    let (lookup_label, slow_label) = (asm.label(), asm.label());
+    asm.bind(lookup_label);
+    let lookup = asm.offset();
+    emit_probe(&mut asm, slow_label);
+    asm.bind(slow_label);
+    let lookup_slow = asm.offset();
+    asm.emit_all(&[mov(W, r(1), r(16)), movz(X, r(2), 0, 0)]);
+    asm.b(dispatch_label);
+    let ret_miss = asm.offset();
+    emit_ret_miss(&mut asm, lookup_label);
+    let shadow_reset = asm.offset();
+    asm.emit_all(&[
+        ldr(X, r(28), RUNTIME, SHADOW_TOP),
+        ldr(X, Reg::LR, RUNTIME, RESUME),
+        br(Reg::LR),
+    ]);
     Stubs {
         code: asm.finish(),
         enter,
         exit,
         fault,
         dispatch,
+        lookup,
+        lookup_slow,
+        ret_miss,
+        shadow_reset,
+    }
+}
+
+/// The indirect table probe for the EIP in w16: branches to its unit, or to
+/// `miss` with w16 intact. Uses x6 and x17.
+fn emit_probe(asm: &mut Asm, miss: crate::asm::Label) {
+    asm.emit_all(&[
+        ldr(X, r(17), RUNTIME, TABLE),
+        ubfx(X, r(6), r(16), 2, 16),
+        add(X, r(17), r(17), r(6), Lsl, 4),
+        ldp(X, Offset, r(6), r(17), r(17), 0),
+        sub(X, r(6), r(6), r(16), Lsl, 0),
+    ]);
+    asm.cbz(X, true, r(6), miss);
+    asm.emit(br(r(17)));
+}
+
+/// A return to the EIP in w16 missed the top shadow entry: returns through
+/// the first of the next entries that matches, popping it and those above,
+/// or looks the EIP up and leaves the stack alone.
+fn emit_ret_miss(asm: &mut Asm, lookup: crate::asm::Label) {
+    let hits: Vec<_> = (1..SHADOW_SENTINELS).map(|_| asm.label()).collect();
+    for (depth, &hit) in (1u32..).zip(&hits) {
+        asm.emit_all(&[
+            ldr(X, r(17), r(28), 16 * depth + 8),
+            sub(X, r(17), r(17), r(16), Lsl, 0),
+        ]);
+        asm.cbz(X, false, r(17), hit);
+    }
+    asm.b(lookup);
+    for (depth, hit) in (1u32..).zip(hits) {
+        asm.bind(hit);
+        asm.emit_all(&[
+            ldr(X, Reg::LR, r(28), 16 * depth),
+            add_imm(X, r(28), r(28), 16 * (depth + 1), false),
+            ret(Reg::LR),
+        ]);
     }
 }
 
@@ -172,6 +266,8 @@ pub fn stubs() -> Stubs {
 /// `Exit::Dispatch` when it returns 0.
 fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
     asm.emit_all(&[
+        // The helper may empty the shadow stack.
+        str(X, r(28), RUNTIME, SHADOW),
         stp(X, Pre, r(1), r(2), SP, -80),
         stp(X, Offset, r(7), r(8), SP, 16),
         stp(X, Offset, r(9), r(10), SP, 32),
@@ -187,6 +283,7 @@ fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
         ldp(X, Offset, r(9), r(10), SP, 32),
         ldp(X, Offset, r(7), r(8), SP, 16),
         ldp(X, Post, r(1), r(2), SP, 80),
+        ldr(X, r(28), RUNTIME, SHADOW),
     ]);
     let leave = asm.label();
     asm.cbz(X, false, r(0), leave);

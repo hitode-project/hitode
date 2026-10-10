@@ -23,6 +23,8 @@ const DATA: u32 = 0x3_0000;
 const DATA_LEN: usize = 0x2000;
 const STACK: u32 = 0x4_8000;
 const STACK_TOP: u32 = 0x4_f000;
+/// A second stack inside the mapped one, for calls that switch to it.
+const ALT_STACK_TOP: u32 = STACK + 0x3000;
 /// Mapped but inaccessible: loads from it fault.
 const HOLE: u32 = 0x2_f000;
 
@@ -336,14 +338,82 @@ fn condition(a: &mut CodeAssembler, cc: usize, label: CodeLabel) {
     .unwrap();
 }
 
-fn program(seed: u64) -> Program {
+/// A function emitted after the stop.
+enum Function {
+    /// An ALU op on EAX, then `ret` or `ret 4` for a pushed argument; the
+    /// address request for it, if any.
+    Leaf(CodeLabel, bool, usize, i32, Option<usize>),
+    /// A few instructions around a call to a leaf.
+    Middle(CodeLabel, CodeLabel),
+    /// Drops its return address and jumps back to the label.
+    Escape(CodeLabel, CodeLabel),
+}
+
+/// Code addresses instructions need as immediates.
+struct Addresses<'a> {
+    /// From a first build; it uses placeholders.
+    known: &'a [u32],
+    /// The instruction index each request's label is set at.
+    marks: Vec<Option<usize>>,
+}
+
+impl Addresses<'_> {
+    /// A new request, and the address if the first build found it.
+    fn request(&mut self) -> (usize, i32) {
+        self.marks.push(None);
+        let n = self.marks.len() - 1;
+        (n, self.known.get(n).copied().unwrap_or(0x8000_0000) as i32)
+    }
+
+    /// Request `n` is at the next instruction.
+    fn mark(&mut self, n: usize, a: &CodeAssembler) {
+        self.marks[n] = Some(a.instructions().len());
+    }
+}
+
+/// Builds the program of `seed`. Code addresses an instruction needs as an
+/// immediate come from `addresses`, which a first build with none fills:
+/// their encodings have fixed lengths, so both builds lay out the same.
+fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let mut a = CodeAssembler::new(32).unwrap();
     let mut end = a.create_label();
-    let mut leaves = Vec::new();
+    let mut functions = Vec::new();
+    let mut wanted = Addresses {
+        known: addresses,
+        marks: Vec::new(),
+    };
+    let leaf = |rng: &mut Rng, a: &mut CodeAssembler, functions: &mut Vec<Function>, argument| {
+        let label = a.create_label();
+        functions.push(Function::Leaf(
+            label,
+            argument,
+            rng.below(7),
+            rng.imm(),
+            None,
+        ));
+        label
+    };
+    // A leaf whose address an instruction takes.
+    let addressed = |rng: &mut Rng,
+                     a: &mut CodeAssembler,
+                     functions: &mut Vec<Function>,
+                     wanted: &mut Addresses| {
+        let label = a.create_label();
+        let (n, address) = wanted.request();
+        functions.push(Function::Leaf(
+            label,
+            false,
+            rng.below(7),
+            rng.imm(),
+            Some(n),
+        ));
+        (label, address)
+    };
+    let mut recursive = None;
     let mut pushed = 0;
     for _ in 0..48 {
-        match rng.below(12) {
+        match rng.below(20) {
             0 => {
                 let mut skip = a.create_label();
                 condition(&mut a, rng.below(16), skip);
@@ -367,13 +437,12 @@ fn program(seed: u64) -> Program {
                 pushed -= 1;
             }
             3 => {
-                let leaf = a.create_label();
                 let argument = rng.below(2) == 0;
                 if argument {
                     a.push(rng.imm()).unwrap();
                 }
-                a.call(leaf).unwrap();
-                leaves.push((leaf, argument, rng.below(7), rng.imm()));
+                let label = leaf(&mut rng, &mut a, &mut functions, argument);
+                a.call(label).unwrap();
             }
             5 if rng.below(3) == 0 => {
                 // A counted loop: units that link to themselves and to each
@@ -385,6 +454,15 @@ fn program(seed: u64) -> Program {
                 for _ in 0..1 + rng.below(4) {
                     simple(&mut a, &mut rng);
                 }
+                if rng.below(2) == 0 {
+                    // A forward branch inside the loop body.
+                    let mut skip = a.create_label();
+                    condition(&mut a, rng.below(14), skip);
+                    simple(&mut a, &mut rng);
+                    a.set_label(&mut skip).unwrap();
+                    a.nop().unwrap();
+                    simple(&mut a, &mut rng);
+                }
                 a.sub(dword_ptr(esp), 1).unwrap();
                 a.jne(top).unwrap();
                 a.add(esp, 4).unwrap();
@@ -392,6 +470,75 @@ fn program(seed: u64) -> Program {
             4 if rng.below(40) == 0 => {
                 // A fault in the middle of a unit, with pending flags.
                 a.mov(eax, dword_ptr(ebx - (DATA - HOLE) as i32)).unwrap();
+            }
+            6 => {
+                let inner = leaf(&mut rng, &mut a, &mut functions, false);
+                let label = a.create_label();
+                functions.push(Function::Middle(label, inner));
+                a.call(label).unwrap();
+            }
+            7 => {
+                // Recursion deeper than units inline.
+                let label = *recursive.get_or_insert_with(|| a.create_label());
+                a.push(rng.below(13) as i32).unwrap();
+                a.call(label).unwrap();
+                a.add(esp, 4).unwrap();
+            }
+            8 => {
+                let (_, address) = addressed(&mut rng, &mut a, &mut functions, &mut wanted);
+                let target = rng.pick(&WRITABLE);
+                a.mov(target, address).unwrap();
+                a.call(target).unwrap();
+            }
+            9 => {
+                let (_, address) = addressed(&mut rng, &mut a, &mut functions, &mut wanted);
+                let slot = ebx + (4 * rng.below(0x1ff)) as i32;
+                a.mov(dword_ptr(slot), address).unwrap();
+                a.call(dword_ptr(slot)).unwrap();
+            }
+            10 => {
+                let (n, address) = wanted.request();
+                if rng.below(2) == 0 {
+                    let target = rng.pick(&WRITABLE);
+                    a.mov(target, address).unwrap();
+                    a.jmp(target).unwrap();
+                } else {
+                    // A return that no call matches.
+                    a.push(address).unwrap();
+                    a.ret().unwrap();
+                }
+                a.int3().unwrap();
+                wanted.mark(n, &a);
+                a.nop().unwrap();
+            }
+            11 => {
+                // `call $+5; pop`: the address of the code.
+                let mut next = a.create_label();
+                a.call(next).unwrap();
+                a.set_label(&mut next).unwrap();
+                a.pop(rng.pick(&WRITABLE)).unwrap();
+            }
+            12 => {
+                // Calls on another stack, which the shadow stack does not
+                // know about.
+                let slot = ebx + (4 * rng.below(0x1ff)) as i32;
+                let argument = rng.below(2) == 0;
+                let label = leaf(&mut rng, &mut a, &mut functions, argument);
+                a.mov(dword_ptr(slot), esp).unwrap();
+                a.mov(esp, ALT_STACK_TOP as i32).unwrap();
+                if argument {
+                    a.push(rng.imm()).unwrap();
+                }
+                a.call(label).unwrap();
+                a.mov(esp, dword_ptr(slot)).unwrap();
+            }
+            13 => {
+                let mut back = a.create_label();
+                let label = a.create_label();
+                functions.push(Function::Escape(label, back));
+                a.call(label).unwrap();
+                a.set_label(&mut back).unwrap();
+                a.nop().unwrap();
             }
             _ => simple(&mut a, &mut rng),
         }
@@ -401,14 +548,48 @@ fn program(seed: u64) -> Program {
     }
     a.set_label(&mut end).unwrap();
     a.nop().unwrap();
-    for (mut leaf, argument, op, imm) in leaves {
-        a.set_label(&mut leaf).unwrap();
-        alu_imm(&mut a, op, eax, imm);
-        if argument {
-            a.ret_1(4).unwrap();
-        } else {
-            a.ret().unwrap();
+    for function in functions {
+        match function {
+            Function::Leaf(mut label, argument, op, imm, request) => {
+                if let Some(n) = request {
+                    wanted.mark(n, &a);
+                }
+                a.set_label(&mut label).unwrap();
+                alu_imm(&mut a, op, eax, imm);
+                if argument {
+                    a.ret_1(4).unwrap();
+                } else {
+                    a.ret().unwrap();
+                }
+            }
+            Function::Middle(mut label, inner) => {
+                a.set_label(&mut label).unwrap();
+                simple(&mut a, &mut rng);
+                a.call(inner).unwrap();
+                simple(&mut a, &mut rng);
+                a.ret().unwrap();
+            }
+            Function::Escape(mut label, back) => {
+                a.set_label(&mut label).unwrap();
+                simple(&mut a, &mut rng);
+                a.add(esp, 4).unwrap();
+                a.jmp(back).unwrap();
+            }
         }
+    }
+    if let Some(mut label) = recursive {
+        // rec(n): n > 0 calls rec(n - 1) around a random instruction.
+        let mut done = a.create_label();
+        a.set_label(&mut label).unwrap();
+        a.cmp(dword_ptr(esp + 4), 0).unwrap();
+        a.je(done).unwrap();
+        a.push(dword_ptr(esp + 4)).unwrap();
+        a.sub(dword_ptr(esp), 1).unwrap();
+        a.call(label).unwrap();
+        a.add(esp, 4).unwrap();
+        simple(&mut a, &mut rng);
+        a.set_label(&mut done).unwrap();
+        a.ret().unwrap();
     }
     let result = a
         .assemble_options(
@@ -417,6 +598,12 @@ fn program(seed: u64) -> Program {
         )
         .unwrap();
     let stop = result.label_ip(&end).unwrap() as u32;
+    let offsets = &result.inner.new_instruction_offsets;
+    let found = wanted
+        .marks
+        .iter()
+        .map(|mark| CODE + offsets[mark.expect("every request is placed")])
+        .collect();
     let code = result.inner.code_buffer;
     let data = (0..DATA_LEN).map(|_| rng.next() as u8).collect();
     let mut state = CpuState {
@@ -432,12 +619,24 @@ fn program(seed: u64) -> Program {
             _ => rng.next() as u32,
         };
     }
-    Program {
+    let program = Program {
         code,
         stop,
         data,
         state,
-    }
+    };
+    (program, found)
+}
+
+fn program(seed: u64) -> Program {
+    let (first, addresses) = build(seed, &[]);
+    let (program, again) = build(seed, &addresses);
+    assert_eq!(
+        addresses, again,
+        "seed {seed}: both builds lay out the same"
+    );
+    assert_eq!(first.code.len(), program.code.len());
+    program
 }
 
 fn load(memory: &mut Memory, program: &Program) {
