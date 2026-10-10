@@ -522,9 +522,10 @@ impl Page {
             version: index.map_or(0, |p| memory.versions[p]),
         }
     }
-    /// Nothing about the page changed since it was stamped.
+    /// Nothing about the page changed since it was stamped. Another view
+    /// writes shared pages without bumping versions: compare their bytes.
     fn current(self, memory: &Memory) -> bool {
-        self == Self::at(memory, self.address)
+        self.permissions & crate::memory::SHARED == 0 && self == Self::at(memory, self.address)
     }
     fn matches(self, memory: &Memory) -> bool {
         let current = Self::at(memory, self.address);
@@ -584,7 +585,7 @@ fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Optio
         let page = Page::at(memory, address);
         if entry.pages[0].is_none() {
             entry.pages[0] = Some(page);
-        } else {
+        } else if entry.pages[0].unwrap().address != page.address {
             entry.pages[1] = Some(page);
         }
         if !page.mapped || page.permissions & EXEC == 0 {
