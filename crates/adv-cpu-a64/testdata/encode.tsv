@@ -75,3 +75,30 @@ b8305b61	str w1, [x27, w16, uxtw #2]
 b85fc2f3	ldur w19, [x23, #-4]
 f84ff300	ldur x0, [x24, #255]
 b81002f3	stur w19, [x23, #-256]
+2b140273	adds w19, w19, w20
+6b116210	subs w16, w16, w17, lsl #24
+6a1902d6	ands w22, w22, w25
+6a13027f	tst w19, w19
+31000694	adds w20, w20, #0x1
+714042b5	subs w21, w21, #0x10, lsl #12
+3100127f	cmn w19, #0x4
+72001e73	ands w19, w19, #0xff
+7201029f	tst w20, #0x80000000
+13001e70	sxtb w16, w19
+13083e70	sbfx w16, w19, #8, #8
+1a9f37f1	cset w17, hs
+9a82c420	csinc x0, x1, x2, gt
+1a933213	csel w19, w16, w19, lo
+d500401f	cfinv
+ba1f8622	rmif x17, #63, #0x2
+b84046f3	ldr w19, [x23], #4
+b81fcef0	str w16, [x23, #-4]!
+f8500f80	ldr x0, [x28, #-256]!
+f80ff781	str x1, [x28], #255
+2a3403f3	mvn w19, w20
+38704b73	ldrb w19, [x27, w16, uxtw]
+78704b66	ldrh w6, [x27, w16, uxtw]
+38f64b74	ldrsb w20, [x27, w22, uxtw]
+78f04b70	ldrsh w16, [x27, w16, uxtw]
+38304b66	strb w6, [x27, w16, uxtw]
+78394b73	strh w19, [x27, w25, uxtw]

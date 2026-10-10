@@ -9,9 +9,13 @@ description = "AArch64 thin translator over the adv-cpu core"
 
 [dependencies]
 adv-cpu-core = { path = "../adv-cpu-core" }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 # Android test binaries run translated code natively instead.
 [target.'cfg(not(target_os = "android"))'.dev-dependencies]

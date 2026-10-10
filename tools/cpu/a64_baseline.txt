@@ -36,5 +36,3 @@ rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration
 # code after every instruction and can stop there; these assert interrupts at
 # loop back edges, which a64 matches once units carry their safepoints (§7.4).
 # Hosts without translated code interpret whole blocks and pass.
-batched_loop_interrupts_and_resumes_exactly
-versioned_invariant_loop_interrupts_and_resumes_exactly

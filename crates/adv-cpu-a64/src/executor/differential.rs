@@ -1,0 +1,524 @@
+//! Random programs over the translated subset, run through translated code
+//! and through the interpreter alone: registers, EIP, EFLAGS, memory and
+//! the outcome must match exactly, at the stop and at budgets that end
+//! inside units. Programs mix in instructions units leave to the
+//! interpreter, so every exit form meets every flag state.
+
+use adv_cpu_core::CpuState;
+use adv_cpu_core::RunOutcome;
+use adv_cpu_core::interpreter::Interpreter;
+use adv_cpu_core::memory::Memory;
+use iced_x86::BlockEncoderOptions;
+use iced_x86::code_asm::*;
+
+#[cfg(native)]
+use super::Executor;
+#[cfg(native)]
+use crate::translate::Features;
+
+const BASE: u32 = 0x1_0000;
+const LEN: usize = 0x4_0000;
+const CODE: u32 = 0x1_0000;
+const DATA: u32 = 0x3_0000;
+const DATA_LEN: usize = 0x2000;
+const STACK: u32 = 0x4_8000;
+const STACK_TOP: u32 = 0x4_f000;
+/// Mapped but inaccessible: loads from it fault.
+const HOLE: u32 = 0x2_f000;
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len())]
+    }
+
+    fn imm(&mut self) -> i32 {
+        match self.below(5) {
+            0 => self.below(16) as i32,
+            1 => -(self.below(16) as i32),
+            2 => self.below(5000) as i32 - 2500,
+            3 => self.pick(&[
+                i32::MIN,
+                i32::MAX,
+                -1,
+                0x7f,
+                0x80,
+                0xff,
+                0x1000,
+                0x8000_0000u32 as i32,
+            ]),
+            _ => self.next() as i32,
+        }
+    }
+}
+
+const WRITABLE: [AsmRegister32; 5] = [eax, ecx, edx, edi, ebp];
+const READABLE: [AsmRegister32; 8] = [eax, ecx, edx, ebx, esp, ebp, esi, edi];
+const INDEXES: [AsmRegister32; 7] = [eax, ecx, edx, ebx, ebp, esi, edi];
+const BYTES: [AsmRegister8; 8] = [al, cl, dl, bl, ah, ch, dh, bh];
+const SET_BYTES: [AsmRegister8; 6] = [al, cl, dl, ah, ch, dh];
+const WORDS: [AsmRegister16; 8] = [ax, cx, dx, bx, sp, bp, si, di];
+
+struct Program {
+    code: Vec<u8>,
+    stop: u32,
+    data: Vec<u8>,
+    state: CpuState,
+}
+
+/// A data operand, and whether it indexes with ECX, which the caller masks
+/// first.
+fn memory_operand(rng: &mut Rng) -> (AsmMemoryOperand, bool) {
+    match rng.below(4) {
+        0 => (ebx + (rng.below(0x7fc) as i32), false),
+        1 => (esi - (rng.below(0x7fc) as i32), false),
+        2 => (ebx + (4 * rng.below(0x1ff)) as i32, false),
+        _ => (ebx + ecx * 4 + (rng.below(0x600) as i32), true),
+    }
+}
+
+fn alu(a: &mut CodeAssembler, op: usize, dst: AsmRegister32, src: AsmRegister32) {
+    match op {
+        0 => a.add(dst, src),
+        1 => a.sub(dst, src),
+        2 => a.and(dst, src),
+        3 => a.or(dst, src),
+        4 => a.xor(dst, src),
+        5 => a.cmp(dst, src),
+        _ => a.test(dst, src),
+    }
+    .unwrap();
+}
+
+fn alu_imm(a: &mut CodeAssembler, op: usize, dst: AsmRegister32, imm: i32) {
+    match op {
+        0 => a.add(dst, imm),
+        1 => a.sub(dst, imm),
+        2 => a.and(dst, imm),
+        3 => a.or(dst, imm),
+        4 => a.xor(dst, imm),
+        5 => a.cmp(dst, imm),
+        _ => a.test(dst, imm),
+    }
+    .unwrap();
+}
+
+/// One straight-line instruction, after the ECX mask an indexed memory
+/// operand needs.
+fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
+    let w = rng.pick(&WRITABLE);
+    let r = rng.pick(&READABLE);
+    let mem = |a: &mut CodeAssembler, rng: &mut Rng| {
+        let (operand, indexed) = memory_operand(rng);
+        if indexed {
+            a.and(ecx, 0x7f).unwrap();
+        }
+        operand
+    };
+    match rng.below(22) {
+        0 => a.mov(w, r).unwrap(),
+        1 => a.mov(w, rng.imm()).unwrap(),
+        2 => {
+            let m = mem(a, rng);
+            a.mov(w, dword_ptr(m)).unwrap()
+        }
+        3 => {
+            let m = mem(a, rng);
+            a.mov(dword_ptr(m), r).unwrap()
+        }
+        4 => {
+            let m = mem(a, rng);
+            a.mov(dword_ptr(m), rng.imm()).unwrap()
+        }
+        5 => a
+            .lea(
+                w,
+                ebx + rng.pick(&INDEXES) * rng.pick(&[1, 2, 4, 8]) + rng.imm(),
+            )
+            .unwrap(),
+        6 | 7 => alu(a, rng.below(7), w, r),
+        8 | 9 => alu_imm(a, rng.below(7), w, rng.imm()),
+        10 => {
+            let m = mem(a, rng);
+            match rng.below(7) {
+                0 => a.add(w, dword_ptr(m)),
+                1 => a.sub(w, dword_ptr(m)),
+                2 => a.and(w, dword_ptr(m)),
+                3 => a.or(w, dword_ptr(m)),
+                4 => a.xor(w, dword_ptr(m)),
+                5 => a.cmp(w, dword_ptr(m)),
+                _ => a.test(dword_ptr(m), w),
+            }
+            .unwrap()
+        }
+        11 => {
+            let m = mem(a, rng);
+            match rng.below(6) {
+                0 => a.add(dword_ptr(m), r),
+                1 => a.sub(dword_ptr(m), r),
+                2 => a.and(dword_ptr(m), r),
+                3 => a.or(dword_ptr(m), r),
+                4 => a.xor(dword_ptr(m), r),
+                _ => a.cmp(dword_ptr(m), r),
+            }
+            .unwrap()
+        }
+        12 => {
+            let m = mem(a, rng);
+            let imm = rng.imm();
+            match rng.below(7) {
+                0 => a.add(dword_ptr(m), imm),
+                1 => a.sub(dword_ptr(m), imm),
+                2 => a.and(dword_ptr(m), imm),
+                3 => a.or(dword_ptr(m), imm),
+                4 => a.xor(dword_ptr(m), imm),
+                5 => a.cmp(dword_ptr(m), imm),
+                _ => a.test(dword_ptr(m), imm),
+            }
+            .unwrap()
+        }
+        13 => match rng.below(4) {
+            0 => a.inc(w),
+            1 => a.dec(w),
+            2 => a.neg(w),
+            _ => a.not(w),
+        }
+        .unwrap(),
+        14 => match rng.below(4) {
+            0 => a.movzx(w, rng.pick(&BYTES)),
+            1 => a.movsx(w, rng.pick(&BYTES)),
+            2 => a.movzx(w, rng.pick(&WORDS)),
+            _ => a.movsx(w, rng.pick(&WORDS)),
+        }
+        .unwrap(),
+        15 => {
+            let m = mem(a, rng);
+            match rng.below(4) {
+                0 => a.movzx(w, byte_ptr(m)),
+                1 => a.movsx(w, byte_ptr(m)),
+                2 => a.movzx(w, word_ptr(m)),
+                _ => a.movsx(w, word_ptr(m)),
+            }
+            .unwrap()
+        }
+        16 => a.cdq().unwrap(),
+        17 => {
+            let t = rng.pick(&SET_BYTES);
+            match rng.below(14) {
+                0 => a.seto(t),
+                1 => a.setno(t),
+                2 => a.setb(t),
+                3 => a.setae(t),
+                4 => a.sete(t),
+                5 => a.setne(t),
+                6 => a.setbe(t),
+                7 => a.seta(t),
+                8 => a.sets(t),
+                9 => a.setns(t),
+                10 => a.setl(t),
+                11 => a.setge(t),
+                12 => a.setle(t),
+                _ => a.setg(t),
+            }
+            .unwrap()
+        }
+        18 => {
+            if rng.below(2) == 0 {
+                match rng.below(5) {
+                    0 => a.cmovb(w, r),
+                    1 => a.cmova(w, r),
+                    2 => a.cmovl(w, r),
+                    3 => a.cmovne(w, r),
+                    _ => a.cmovbe(w, r),
+                }
+                .unwrap()
+            } else {
+                let m = mem(a, rng);
+                match rng.below(3) {
+                    0 => a.cmovae(w, dword_ptr(m)),
+                    1 => a.cmovg(w, dword_ptr(m)),
+                    _ => a.cmove(w, dword_ptr(m)),
+                }
+                .unwrap()
+            }
+        }
+        // Left to the interpreter, between translated neighbours.
+        19 => match rng.below(6) {
+            0 => a.shl(w, 3),
+            1 => a.imul_2(w, r),
+            2 => a.adc(w, r),
+            3 => a.sbb(w, rng.imm()),
+            4 => a.bswap(w),
+            _ => a.add(al, 7),
+        }
+        .unwrap(),
+        20 => {
+            a.sub(esp, 8).unwrap();
+            a.mov(dword_ptr(esp + 4), r).unwrap();
+            a.add(esp, 8).unwrap();
+        }
+        _ => a.nop().unwrap(),
+    }
+}
+
+fn condition(a: &mut CodeAssembler, cc: usize, label: CodeLabel) {
+    match cc {
+        0 => a.jo(label),
+        1 => a.jno(label),
+        2 => a.jb(label),
+        3 => a.jae(label),
+        4 => a.je(label),
+        5 => a.jne(label),
+        6 => a.jbe(label),
+        7 => a.ja(label),
+        8 => a.js(label),
+        9 => a.jns(label),
+        10 => a.jl(label),
+        11 => a.jge(label),
+        12 => a.jle(label),
+        13 => a.jg(label),
+        14 => a.jp(label),
+        _ => a.jnp(label),
+    }
+    .unwrap();
+}
+
+fn program(seed: u64) -> Program {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut end = a.create_label();
+    let mut leaves = Vec::new();
+    let mut pushed = 0;
+    for _ in 0..48 {
+        match rng.below(12) {
+            0 => {
+                let mut skip = a.create_label();
+                condition(&mut a, rng.below(16), skip);
+                for _ in 0..1 + rng.below(3) {
+                    simple(&mut a, &mut rng);
+                }
+                a.set_label(&mut skip).unwrap();
+                // One label per instruction: the next jcc may target the next one.
+                a.nop().unwrap();
+            }
+            1 if pushed < 8 => {
+                match rng.below(3) {
+                    0 => a.push(rng.pick(&READABLE)).unwrap(),
+                    1 => a.push(rng.imm()).unwrap(),
+                    _ => a.push(dword_ptr(ebx + (rng.below(0x7fc) as i32))).unwrap(),
+                }
+                pushed += 1;
+            }
+            2 if pushed > 0 => {
+                a.pop(rng.pick(&WRITABLE)).unwrap();
+                pushed -= 1;
+            }
+            3 => {
+                let leaf = a.create_label();
+                let argument = rng.below(2) == 0;
+                if argument {
+                    a.push(rng.imm()).unwrap();
+                }
+                a.call(leaf).unwrap();
+                leaves.push((leaf, argument, rng.below(7), rng.imm()));
+            }
+            5 if rng.below(3) == 0 => {
+                // A counted loop: units that link to themselves and to each
+                // other, cut by the budget anywhere inside.
+                let mut top = a.create_label();
+                a.push(2 + rng.below(30) as i32).unwrap();
+                a.set_label(&mut top).unwrap();
+                a.nop().unwrap();
+                for _ in 0..1 + rng.below(4) {
+                    simple(&mut a, &mut rng);
+                }
+                a.sub(dword_ptr(esp), 1).unwrap();
+                a.jne(top).unwrap();
+                a.add(esp, 4).unwrap();
+            }
+            4 if rng.below(40) == 0 => {
+                // A fault in the middle of a unit, with pending flags.
+                a.mov(eax, dword_ptr(ebx - (DATA - HOLE) as i32)).unwrap();
+            }
+            _ => simple(&mut a, &mut rng),
+        }
+    }
+    for _ in 0..pushed {
+        a.pop(rng.pick(&WRITABLE)).unwrap();
+    }
+    a.set_label(&mut end).unwrap();
+    a.nop().unwrap();
+    for (mut leaf, argument, op, imm) in leaves {
+        a.set_label(&mut leaf).unwrap();
+        alu_imm(&mut a, op, eax, imm);
+        if argument {
+            a.ret_1(4).unwrap();
+        } else {
+            a.ret().unwrap();
+        }
+    }
+    let result = a
+        .assemble_options(
+            u64::from(CODE),
+            BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+        )
+        .unwrap();
+    let stop = result.label_ip(&end).unwrap() as u32;
+    let code = result.inner.code_buffer;
+    let data = (0..DATA_LEN).map(|_| rng.next() as u8).collect();
+    let mut state = CpuState {
+        eip: CODE,
+        eflags: 0x202 | (rng.next() as u32 & 0x8d5),
+        ..CpuState::default()
+    };
+    for (index, value) in state.regs.iter_mut().enumerate() {
+        *value = match index {
+            3 => DATA,
+            4 => STACK_TOP,
+            6 => DATA + 0x800,
+            _ => rng.next() as u32,
+        };
+    }
+    Program {
+        code,
+        stop,
+        data,
+        state,
+    }
+}
+
+fn load(memory: &mut Memory, program: &Program) {
+    memory.protect(CODE, 0x1_0000, 7).unwrap();
+    memory.write(CODE, &program.code).unwrap();
+    memory.protect(CODE, 0x1_0000, 5).unwrap();
+    memory.protect(DATA, DATA_LEN, 3).unwrap();
+    memory.write(DATA, &program.data).unwrap();
+    memory
+        .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
+        .unwrap();
+}
+
+/// What the interpreter alone does with `budget` instructions.
+fn reference(program: &Program, budget: u64) -> (RunOutcome, CpuState, Vec<u8>) {
+    let mut memory = Memory::new(BASE, LEN).unwrap();
+    load(&mut memory, program);
+    let mut state = program.state.clone();
+    let mut interpreter = Interpreter::new();
+    let mut left = budget;
+    let outcome = loop {
+        if state.eip == program.stop {
+            break RunOutcome::ReachedStop;
+        }
+        if left == 0 {
+            break RunOutcome::Budget;
+        }
+        let (execution, _) = interpreter.run_block(
+            &mut state,
+            &mut memory,
+            left.min(256) as u32,
+            program.stop,
+            None,
+        );
+        left -= u64::from(execution.units);
+        match execution.step {
+            adv_cpu_core::interpreter::Step::Executed => {}
+            adv_cpu_core::interpreter::Step::ReadFault { pc, address } => {
+                let address =
+                    adv_cpu_core::interpreter::fault_address(&memory, address, adv_cpu_core::READ);
+                break RunOutcome::ReadFault { pc, address };
+            }
+            other => panic!("unexpected step {other:?}"),
+        }
+    };
+    (outcome, state, snapshot(&memory))
+}
+
+fn snapshot(memory: &Memory) -> Vec<u8> {
+    let mut bytes = memory.read(DATA, DATA_LEN).unwrap().to_vec();
+    bytes.extend_from_slice(
+        memory
+            .read(STACK, (STACK_TOP + 0x1000 - STACK) as usize)
+            .unwrap(),
+    );
+    bytes
+}
+
+#[cfg(native)]
+fn translated(
+    program: &Program,
+    budget: u64,
+    features: Features,
+) -> (RunOutcome, CpuState, Vec<u8>, u64) {
+    let mut executor = Executor::new(BASE, LEN).unwrap();
+    executor.native.features = features;
+    load(executor.memory_mut(), program);
+    executor.state = program.state.clone();
+    let outcome = executor.run(program.stop, budget).unwrap();
+    let native = executor.stats.native_entries;
+    (
+        outcome,
+        executor.state.clone(),
+        snapshot(executor.memory()),
+        native,
+    )
+}
+
+#[cfg(native)]
+fn compare(seed: u64, budget: u64, features: Features) -> u64 {
+    let program = program(seed);
+    let (outcome, state, memory) = reference(&program, budget);
+    let (a64_outcome, a64_state, a64_memory, native) = translated(&program, budget, features);
+    let context = format!("seed {seed} budget {budget} {features:?}");
+    assert_eq!(a64_outcome, outcome, "{context}: outcome");
+    assert_eq!(a64_state.regs, state.regs, "{context}: registers");
+    assert_eq!(a64_state.eip, state.eip, "{context}: eip");
+    assert_eq!(
+        a64_state.eflags, state.eflags,
+        "{context}: eflags {:#x} != {:#x}",
+        a64_state.eflags, state.eflags
+    );
+    assert!(a64_memory == memory, "{context}: memory");
+    native
+}
+
+#[cfg(native)]
+#[test]
+fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
+    let mut native = 0;
+    for flagm in [true, false] {
+        let features = Features { flagm };
+        for seed in 1..=1000 {
+            native += compare(seed, u64::MAX >> 1, features);
+            for budget in [1, 5, 13, 40, 120, 400] {
+                compare(seed, budget + seed % 7, features);
+            }
+        }
+    }
+    assert!(native > 1000, "translated code ran: {native} entries");
+}
+
+#[test]
+fn random_programs_assemble_and_reach_the_stop_or_a_read_fault() {
+    let mut faults = 0;
+    for seed in 1..=300 {
+        let program = program(seed);
+        match reference(&program, u64::MAX >> 1).0 {
+            RunOutcome::ReachedStop => {}
+            RunOutcome::ReadFault { .. } => faults += 1,
+            other => panic!("seed {seed}: {other:?}"),
+        }
+    }
+    assert!((1..100).contains(&faults), "{faults} programs fault");
+}

@@ -104,6 +104,26 @@ pub const fn cmp(size: Size, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32
     shifted(0x6B00_0000, size, Reg::ZR, rn, rm, shift, amount)
 }
 
+/// `adds rd, rn, rm, <shift> #amount`, which sets NZCV in addition sense.
+pub const fn adds(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
+    shifted(0x2B00_0000, size, rd, rn, rm, shift, amount)
+}
+
+/// `subs rd, rn, rm, <shift> #amount`, which sets NZCV in subtraction sense.
+pub const fn subs(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
+    shifted(0x6B00_0000, size, rd, rn, rm, shift, amount)
+}
+
+/// `ands rd, rn, rm, <shift> #amount`, which clears C and V.
+pub const fn ands(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
+    shifted(0x6A00_0000, size, rd, rn, rm, shift, amount)
+}
+
+/// `tst rn, rm, <shift> #amount`.
+pub const fn tst(size: Size, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
+    ands(size, Reg::ZR, rn, rm, shift, amount)
+}
+
 /// `cmn rn, rm, <shift> #amount`.
 pub const fn cmn(size: Size, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
     shifted(0x2B00_0000, size, Reg::ZR, rn, rm, shift, amount)
@@ -129,6 +149,11 @@ pub const fn eor(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u3
     shifted(0x4A00_0000, size, rd, rn, rm, shift, amount)
 }
 
+/// `mvn rd, rm`.
+pub const fn mvn(size: Size, rd: Reg, rm: Reg) -> u32 {
+    shifted(0x2A20_0000, size, rd, Reg::ZR, rm, Shift::Lsl, 0)
+}
+
 /// `mov rd, rm` between general registers (not SP).
 pub const fn mov(size: Size, rd: Reg, rm: Reg) -> u32 {
     orr(size, rd, Reg::ZR, rm, Shift::Lsl, 0)
@@ -152,6 +177,21 @@ pub const fn sub_imm(size: Size, rd: Reg, rn: Reg, imm: u32, shift12: bool) -> u
 /// `cmp rn, #imm{, lsl #12}`.
 pub const fn cmp_imm(size: Size, rn: Reg, imm: u32, shift12: bool) -> u32 {
     immediate(0x7100_0000, size, Reg::ZR, rn, imm, shift12)
+}
+
+/// `adds rd, rn, #imm{, lsl #12}`.
+pub const fn adds_imm(size: Size, rd: Reg, rn: Reg, imm: u32, shift12: bool) -> u32 {
+    immediate(0x3100_0000, size, rd, rn, imm, shift12)
+}
+
+/// `subs rd, rn, #imm{, lsl #12}`.
+pub const fn subs_imm(size: Size, rd: Reg, rn: Reg, imm: u32, shift12: bool) -> u32 {
+    immediate(0x7100_0000, size, rd, rn, imm, shift12)
+}
+
+/// `cmn rn, #imm{, lsl #12}`.
+pub const fn cmn_imm(size: Size, rn: Reg, imm: u32, shift12: bool) -> u32 {
+    immediate(0x3100_0000, size, Reg::ZR, rn, imm, shift12)
 }
 
 /// Register extension of an extended-register operand.
@@ -248,6 +288,16 @@ pub const fn eor_imm(size: Size, rd: Reg, rn: Reg, imm: u64) -> u32 {
     logical(0x5200_0000, size, rd, rn, imm)
 }
 
+/// `ands rd, rn, #imm`; panics unless `imm` is a logical immediate.
+pub const fn ands_imm(size: Size, rd: Reg, rn: Reg, imm: u64) -> u32 {
+    logical(0x7200_0000, size, rd, rn, imm)
+}
+
+/// `tst rn, #imm`; panics unless `imm` is a logical immediate.
+pub const fn tst_imm(size: Size, rn: Reg, imm: u64) -> u32 {
+    ands_imm(size, Reg::ZR, rn, imm)
+}
+
 const fn bitfield(base: u32, size: Size, rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
     assert!(immr < size.bits() && imms < size.bits());
     let n = match size {
@@ -255,6 +305,12 @@ const fn bitfield(base: u32, size: Size, rd: Reg, rn: Reg, immr: u32, imms: u32)
         Size::X => 1 << 22,
     };
     base | size.sf() | n | immr << 16 | imms << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `sbfx rd, rn, #lsb, #width`.
+pub const fn sbfx(size: Size, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    assert!(width > 0 && lsb + width <= size.bits());
+    bitfield(0x1300_0000, size, rd, rn, lsb, lsb + width - 1)
 }
 
 /// `ubfx rd, rn, #lsb, #width`.
@@ -352,6 +408,30 @@ pub const fn str_reg(size: Size, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32
     register_offset(0xB820_4800, size, rt, rn, rm, scaled)
 }
 
+/// Narrow window accesses: `[rn, wm, uxtw]` with a byte or halfword.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Narrow {
+    /// `ldrb`/`strb`.
+    Byte = 0x3860_4800,
+    /// `ldrh`/`strh`.
+    Half = 0x7860_4800,
+    /// `ldrsb` to a W register.
+    SignedByte = 0x38E0_4800,
+    /// `ldrsh` to a W register.
+    SignedHalf = 0x78E0_4800,
+}
+
+/// `ldrb`/`ldrh`/`ldrsb`/`ldrsh` `wt, [rn, wm, uxtw]`.
+pub const fn ldr_narrow(narrow: Narrow, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    narrow as u32 | rm.number() << 16 | rn.number() << 5 | rt.number()
+}
+
+/// `strb`/`strh` `wt, [rn, wm, uxtw]`; panics on a signed form.
+pub const fn str_narrow(narrow: Narrow, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    assert!(matches!(narrow, Narrow::Byte | Narrow::Half));
+    (narrow as u32 & !(1 << 22)) | rm.number() << 16 | rn.number() << 5 | rt.number()
+}
+
 const fn register_offset(base: u32, size: Size, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
     let size = match size {
         Size::W => 0,
@@ -393,6 +473,30 @@ pub const fn str_v(size: VSize, rt: VReg, rn: Reg, offset: u32) -> u32 {
         VSize::D => unsigned_offset(0xFD00_0000, 8, rt.number(), rn, offset),
         VSize::Q => unsigned_offset(0x3D80_0000, 16, rt.number(), rn, offset),
     }
+}
+
+const fn indexed(base: u32, size: Size, index: Index, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    assert!(offset >= -256 && offset < 256);
+    let index = match index {
+        Index::Post => 1,
+        Index::Pre => 3,
+        Index::Offset => panic!("use the unsigned or unscaled offset forms"),
+    };
+    let size = match size {
+        Size::W => 0x8000_0000,
+        Size::X => 0xC000_0000,
+    };
+    base | size | (offset as u32 & 0x1ff) << 12 | index << 10 | rn.number() << 5 | rt.number()
+}
+
+/// `ldr rt, [rn], #offset` or `ldr rt, [rn, #offset]!`; `rn` 31 is SP.
+pub const fn ldr_indexed(size: Size, index: Index, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    indexed(0x3840_0000, size, index, rt, rn, offset)
+}
+
+/// `str rt, [rn], #offset` or `str rt, [rn, #offset]!`; `rn` 31 is SP.
+pub const fn str_indexed(size: Size, index: Index, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    indexed(0x3800_0000, size, index, rt, rn, offset)
 }
 
 /// Addressing of a register pair.
@@ -467,6 +571,29 @@ pub enum Cond {
     Le,
 }
 
+impl Cond {
+    /// The opposite condition.
+    pub const fn invert(self) -> Self {
+        // Conditions pair up by their low bit; `Le` + 1 would be `al`.
+        match self as u8 ^ 1 {
+            0 => Self::Eq,
+            1 => Self::Ne,
+            2 => Self::Hs,
+            3 => Self::Lo,
+            4 => Self::Mi,
+            5 => Self::Pl,
+            6 => Self::Vs,
+            7 => Self::Vc,
+            8 => Self::Hi,
+            9 => Self::Ls,
+            10 => Self::Ge,
+            11 => Self::Lt,
+            12 => Self::Gt,
+            _ => Self::Le,
+        }
+    }
+}
+
 const fn displacement(offset: i32, bits: u32) -> u32 {
     assert!(offset % 4 == 0);
     let words = offset / 4;
@@ -511,6 +638,41 @@ pub const fn adr(rd: Reg, offset: i32) -> u32 {
     assert!(offset >= -(1 << 20) && offset < 1 << 20);
     let imm = offset as u32;
     0x1000_0000 | (imm & 3) << 29 | (imm >> 2 & 0x7ffff) << 5 | rd.number()
+}
+
+/// `csinc rd, rn, rm, cond`.
+pub const fn csinc(size: Size, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0x1A80_0400
+        | size.sf()
+        | rm.number() << 16
+        | (cond as u32) << 12
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `cset rd, cond`.
+pub const fn cset(size: Size, rd: Reg, cond: Cond) -> u32 {
+    csinc(size, rd, Reg::ZR, Reg::ZR, cond.invert())
+}
+
+/// `csel rd, rn, rm, cond`.
+pub const fn csel(size: Size, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0x1A80_0000
+        | size.sf()
+        | rm.number() << 16
+        | (cond as u32) << 12
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `cfinv` (FEAT_FlagM): inverts C, which flips the carry sense.
+pub const CFINV: u32 = 0xD500_401F;
+
+/// `rmif xn, #rotate, #mask` (FEAT_FlagM): rotates `xn` right and inserts
+/// its low four bits into the NZCV bits selected by `mask`.
+pub const fn rmif(rn: Reg, rotate: u32, mask: u32) -> u32 {
+    assert!(rotate < 64 && mask < 16);
+    0xBA00_0400 | rotate << 15 | rn.number() << 5 | mask
 }
 
 /// `br rn`.
@@ -694,6 +856,72 @@ mod tests {
             (blr(r(16)), "blr x16"),
             (mrs_nzcv(r(1)), "mrs x1, NZCV"),
             (msr_nzcv(r(2)), "msr NZCV, x2"),
+            (adds(W, r(19), r(19), r(20), Lsl, 0), "adds w19, w19, w20"),
+            (
+                subs(W, r(16), r(16), r(17), Lsl, 24),
+                "subs w16, w16, w17, lsl #24",
+            ),
+            (ands(W, r(22), r(22), r(25), Lsl, 0), "ands w22, w22, w25"),
+            (tst(W, r(19), r(19), Lsl, 0), "tst w19, w19"),
+            (adds_imm(W, r(20), r(20), 1, false), "adds w20, w20, #0x1"),
+            (
+                subs_imm(W, r(21), r(21), 0x10, true),
+                "subs w21, w21, #0x10, lsl #12",
+            ),
+            (cmn_imm(W, r(19), 4, false), "cmn w19, #0x4"),
+            (ands_imm(W, r(19), r(19), 0xff), "ands w19, w19, #0xff"),
+            (tst_imm(W, r(20), 0x8000_0000), "tst w20, #0x80000000"),
+            (sbfx(W, r(16), r(19), 0, 8), "sxtb w16, w19"),
+            (sbfx(W, r(16), r(19), 8, 8), "sbfx w16, w19, #8, #8"),
+            (cset(W, r(17), Cond::Hs), "cset w17, hs"),
+            (csinc(X, r(0), r(1), r(2), Cond::Gt), "csinc x0, x1, x2, gt"),
+            (
+                csel(W, r(19), r(16), r(19), Cond::Lo),
+                "csel w19, w16, w19, lo",
+            ),
+            (CFINV, "cfinv"),
+            (mvn(W, r(19), r(20)), "mvn w19, w20"),
+            (
+                ldr_narrow(Narrow::Byte, r(19), r(27), r(16)),
+                "ldrb w19, [x27, w16, uxtw]",
+            ),
+            (
+                ldr_narrow(Narrow::Half, r(6), r(27), r(16)),
+                "ldrh w6, [x27, w16, uxtw]",
+            ),
+            (
+                ldr_narrow(Narrow::SignedByte, r(20), r(27), r(22)),
+                "ldrsb w20, [x27, w22, uxtw]",
+            ),
+            (
+                ldr_narrow(Narrow::SignedHalf, r(16), r(27), r(16)),
+                "ldrsh w16, [x27, w16, uxtw]",
+            ),
+            (
+                str_narrow(Narrow::Byte, r(6), r(27), r(16)),
+                "strb w6, [x27, w16, uxtw]",
+            ),
+            (
+                str_narrow(Narrow::Half, r(19), r(27), r(25)),
+                "strh w19, [x27, w25, uxtw]",
+            ),
+            (rmif(r(17), 63, 2), "rmif x17, #63, #0x2"),
+            (
+                ldr_indexed(W, Index::Post, r(19), r(23), 4),
+                "ldr w19, [x23], #4",
+            ),
+            (
+                str_indexed(W, Index::Pre, r(16), r(23), -4),
+                "str w16, [x23, #-4]!",
+            ),
+            (
+                ldr_indexed(X, Index::Pre, r(0), r(28), -256),
+                "ldr x0, [x28, #-256]!",
+            ),
+            (
+                str_indexed(X, Index::Post, r(1), r(28), 255),
+                "str x1, [x28], #255",
+            ),
         ]
     }
 
@@ -732,6 +960,19 @@ mod tests {
             (X, 0x5),
         ] {
             assert_eq!(bitmask(size, imm), None, "{imm:#x}");
+        }
+    }
+
+    #[test]
+    fn conditions_invert_in_pairs() {
+        for (cond, inverse) in [
+            (Cond::Eq, Cond::Ne),
+            (Cond::Hs, Cond::Lo),
+            (Cond::Hi, Cond::Ls),
+            (Cond::Gt, Cond::Le),
+        ] {
+            assert_eq!(cond.invert(), inverse);
+            assert_eq!(inverse.invert(), cond);
         }
     }
 

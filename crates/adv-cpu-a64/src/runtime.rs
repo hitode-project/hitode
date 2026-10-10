@@ -3,8 +3,10 @@
 //!
 //! `enter` saves the host's callee-saved registers, loads the guest and
 //! branches to translated code. Translated code leaves through `exit` with
-//! the exit reason in w0 and the guest EIP in w1; `exit` stores the guest
-//! back and returns to `enter`'s caller. Arithmetic flags cross the boundary
+//! the exit reason in w0, the guest EIP in w1 and in x2 the host address of
+//! a link point the owner may patch, or 0; `exit` stores the guest back and
+//! returns to `enter`'s caller. Translated code charges x9, the countdown,
+//! with the guest instructions it completes. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` until M2 maps it.
@@ -34,9 +36,12 @@ pub struct Runtime {
     pub countdown: u64,
     /// Host stack pointer inside `enter`'s frame, for helpers and `exit`.
     pub host_sp: u64,
+    /// The link point of the exit, or 0.
+    pub link: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
-    pad: u32,
+    /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
+    pub temps: [u64; 2],
 }
 
 impl Runtime {
@@ -48,8 +53,9 @@ impl Runtime {
             shadow: 0,
             countdown: u64::MAX >> 1,
             host_sp: 0,
+            link: 0,
             exit: 0,
-            pad: 0,
+            temps: [0; 2],
         }
     }
 }
@@ -111,6 +117,8 @@ const SHADOW: u32 = field(offset_of!(Runtime, shadow));
 const COUNTDOWN: u32 = field(offset_of!(Runtime, countdown));
 const HOST_SP: u32 = field(offset_of!(Runtime, host_sp));
 const EXIT: u32 = field(offset_of!(Runtime, exit));
+const LINK: u32 = field(offset_of!(Runtime, link));
+const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 const EIP: u32 = field(offset_of!(CpuState, eip));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
@@ -135,7 +143,11 @@ pub fn stubs() -> Stubs {
     let exit = asm.offset();
     emit_exit(&mut asm);
     let fault = asm.offset();
-    asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
+    asm.emit_all(&[
+        movz(W, r(0), Exit::Fault as u16, 0),
+        movz(W, r(1), 0, 0),
+        movz(X, r(2), 0, 0),
+    ]);
     asm.b(exit_label);
     Stubs {
         code: asm.finish(),
@@ -211,6 +223,8 @@ fn emit_enter(asm: &mut Asm) {
 fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[
         str(W, r(0), RUNTIME, EXIT),
+        str(X, r(2), RUNTIME, LINK),
+        stp(X, Offset, r(7), r(8), RUNTIME, TEMPS),
         ldr(X, r(0), RUNTIME, CPU),
         str(W, r(1), r(0), EIP),
     ]);

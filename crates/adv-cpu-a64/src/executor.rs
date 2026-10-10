@@ -230,18 +230,25 @@ impl Executor {
 
     /// Runs translated code from EIP; `None` where the host has none.
     #[cfg(native)]
-    fn run_native(&mut self) -> Result<Option<Exit>, String> {
-        let (exit, translated) = self.native.run(&mut self.state)?;
+    fn run_native(&mut self, stop: u32) -> Result<Option<Exit>, String> {
+        let fuel = self.state.fuel;
+        let Some(run) = self
+            .native
+            .run(&mut self.state, &mut self.memory, stop, fuel)?
+        else {
+            return Ok(None);
+        };
         self.stats.native_entries += 1;
-        if translated != 0 {
+        if run.translated != 0 {
             self.stats.compilations += 1;
-            self.stats.native_code_bytes += translated as u64;
+            self.stats.native_code_bytes += run.translated as u64;
         }
-        Ok(Some(exit))
+        self.state.fuel -= u64::from(run.retired);
+        Ok(Some(run.exit))
     }
 
     #[cfg(not(native))]
-    fn run_native(&mut self) -> Result<Option<Exit>, String> {
+    fn run_native(&mut self, _stop: u32) -> Result<Option<Exit>, String> {
         Ok(None)
     }
 
@@ -286,9 +293,11 @@ impl Executor {
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
                 (execution, execution.units)
-            } else if let Some(exit) = self.run_native()? {
+            } else if let Some(exit) = self.run_native(stop)? {
                 match exit {
                     Exit::Dispatch => continue,
+                    // The unit spent the budget; the instruction waits.
+                    Exit::Interpret | Exit::Fault if self.state.fuel == 0 => continue,
                     Exit::Interpret | Exit::Fault => {
                         let execution =
                             self.interpreter
@@ -363,3 +372,6 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+mod differential;

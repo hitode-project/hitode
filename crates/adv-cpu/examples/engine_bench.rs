@@ -5,6 +5,8 @@
 //! are compared on the same core. Inputs: optional `ADV_ENGINE_BENCH_SCALE`
 //! (percent of the default iteration counts, 1-1000) and
 //! `ADV_ENGINE_BENCH_INTERPRETER=0` to skip the interpreter reference.
+//! `ADV_ENGINE_BENCH_A64=0` skips the a64 executor, which runs through the
+//! interpreter on hosts without its native backend.
 //! Output: CSV rows of first-run milliseconds on a fresh CPU and steady-state
 //! nanoseconds per dynamic guest instruction. Workloads are self-authored; no
 //! game code or addresses are involved. Every engine's first run must match
@@ -252,6 +254,49 @@ fn cold(functions: u32) -> Workload {
     }
 }
 
+/// What `measure` drives: the facade's `Backend`, or the a64 executor.
+trait Engine {
+    fn load(&mut self, w: &Workload);
+    fn run(&mut self) -> [u32; 8];
+}
+
+struct Facade<B>(B);
+
+impl<B: Backend> Engine for Facade<B> {
+    fn load(&mut self, w: &Workload) {
+        load(&mut self.0, w);
+    }
+
+    fn run(&mut self) -> [u32; 8] {
+        run(&mut self.0)
+    }
+}
+
+impl Engine for adv_cpu_a64::Executor {
+    fn load(&mut self, w: &Workload) {
+        self.map(CODE, CODE_SIZE as usize, 3).unwrap();
+        self.write(CODE, &w.code).unwrap();
+        self.protect(CODE, CODE_SIZE as usize, 5).unwrap();
+        self.map(DATA, DATA_SIZE as usize, 3).unwrap();
+        for (addr, bytes) in &w.data {
+            self.write(*addr, bytes).unwrap();
+        }
+        self.map(STACK_BASE, (STACK - STACK_BASE) as usize, 3)
+            .unwrap();
+    }
+
+    fn run(&mut self) -> [u32; 8] {
+        self.state.regs = [0, 0, 0, 0, STACK, 0, 0, 0];
+        self.state.eip = CODE;
+        let outcome = adv_cpu_a64::Executor::run(self, PARK, u64::MAX >> 1).unwrap();
+        assert!(
+            matches!(outcome, adv_cpu::RunOutcome::Trap { vector: 0x2e, .. }),
+            "{outcome:?}"
+        );
+        self.state.regs
+    }
+}
+
 fn load<B: Backend>(cpu: &mut B, w: &Workload) {
     assert!(
         w.code.len() <= CODE_SIZE as usize,
@@ -291,17 +336,17 @@ fn run<B: Backend>(cpu: &mut B) -> [u32; 8] {
     .map(|reg| cpu.reg(reg))
 }
 
-fn measure<B: Backend>(
+fn measure<E: Engine>(
     engine: &str,
-    make: &dyn Fn() -> B,
+    make: &dyn Fn() -> E,
     w: &Workload,
     samples: usize,
     expected: Option<[u32; 8]>,
 ) -> [u32; 8] {
     let mut cpu = make();
-    load(&mut cpu, w);
+    cpu.load(w);
     let start = Instant::now();
-    let first = run(&mut cpu);
+    let first = cpu.run();
     let first_ms = start.elapsed().as_secs_f64() * 1e3;
     if let Some(expected) = expected {
         assert_eq!(first, expected, "{engine} {} diverged", w.name);
@@ -310,7 +355,7 @@ fn measure<B: Backend>(
     let warm = Instant::now();
     let mut runs = 0;
     while runs < 10 || warm.elapsed() < Duration::from_secs(1) {
-        run(&mut cpu);
+        cpu.run();
         runs += 1;
         if runs >= 10_000 {
             break;
@@ -321,7 +366,7 @@ fn measure<B: Backend>(
         .map(|_| {
             let start = Instant::now();
             for _ in 0..per_sample {
-                run(&mut cpu);
+                cpu.run();
             }
             start.elapsed().as_secs_f64() * 1e9 / (per_sample as f64 * w.instructions as f64)
         })
@@ -340,9 +385,9 @@ fn measure<B: Backend>(
 }
 
 /// Cold work only exists once per fresh CPU, so sample whole first runs.
-fn measure_cold<B: Backend>(
+fn measure_cold<E: Engine>(
     engine: &str,
-    make: &dyn Fn() -> B,
+    make: &dyn Fn() -> E,
     w: &Workload,
     samples: usize,
     expected: Option<[u32; 8]>,
@@ -351,9 +396,9 @@ fn measure_cold<B: Backend>(
     let mut first = None;
     for _ in 0..samples {
         let mut cpu = make();
-        load(&mut cpu, w);
+        cpu.load(w);
         let start = Instant::now();
-        let regs = run(&mut cpu);
+        let regs = cpu.run();
         timings.push(start.elapsed().as_secs_f64() * 1e3);
         if let Some(expected) = expected {
             assert_eq!(regs, expected, "{engine} {} diverged", w.name);
@@ -392,15 +437,23 @@ fn main() {
         dispatch(n(8_000)),
     ];
     let cold = cold(n(4_000));
-    let reference = || JitCpu::new(PARK, false).unwrap();
-    let jit = || JitCpu::new(PARK, true).unwrap();
+    let a64 = std::env::var("ADV_ENGINE_BENCH_A64").map_or(true, |v| v != "0");
+    let reference = || Facade(JitCpu::new(PARK, false).unwrap());
+    let jit = || Facade(JitCpu::new(PARK, true).unwrap());
+    let translated = || adv_cpu_a64::Executor::address_space().unwrap();
     println!(
         "engine,workload,guest_instructions,first_run_ms,median_ns_per_instruction,min_ns,max_ns,warm_runs"
     );
     for w in &workloads {
         let expected = interpreter.then(|| measure("interpreter", &reference, w, 3, None));
-        measure("cranelift", &jit, w, samples, expected);
+        let expected = Some(measure("cranelift", &jit, w, samples, expected));
+        if a64 {
+            measure("a64", &translated, w, samples, expected);
+        }
     }
     let expected = interpreter.then(|| measure_cold("interpreter", &reference, &cold, 3, None));
-    measure_cold("cranelift", &jit, &cold, samples, expected);
+    let expected = Some(measure_cold("cranelift", &jit, &cold, samples, expected));
+    if a64 {
+        measure_cold("a64", &translated, &cold, samples, expected);
+    }
 }

@@ -61,7 +61,6 @@ impl CodeCache {
     }
 
     /// Rewrites one word that is already in the cache.
-    #[cfg_attr(not(test), expect(dead_code, reason = "link stubs patch branches"))]
     pub fn patch(&mut self, address: usize, word: u32) {
         let offset = address
             .checked_sub(self.exec.as_ptr() as usize)
