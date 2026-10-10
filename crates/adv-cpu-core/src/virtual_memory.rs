@@ -920,7 +920,7 @@ impl Reservation {
     /// Add page-sized section views into the reserved linear guest addresses.
     /// 4 KB views let one guest page be unmapped without disturbing other pages
     /// or the independently retained callback mapping of the same section.
-    pub fn map_section(
+    pub(crate) fn map_section(
         &self,
         offset: usize,
         len: usize,
