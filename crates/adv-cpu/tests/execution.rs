@@ -158,9 +158,9 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
         a.inc(dword_ptr(edi)).unwrap();
-        // CBW stands in for any instruction the native compiler leaves to the
+        // PAUSE stands in for any instruction the native compiler leaves to the
         // interpreter; these tests need another one if it ever compiles.
-        a.cbw().unwrap();
+        a.pause().unwrap();
         a.add(eax, 1).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
@@ -393,7 +393,7 @@ fn interpreted_sse_state_survives_native_islands() {
         a.set_label(&mut top).unwrap();
         a.inc(eax).unwrap();
         a.paddd(xmm0, xmmword_ptr(esi)).unwrap();
-        a.cbw().unwrap();
+        a.pause().unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
@@ -420,13 +420,12 @@ fn interpreted_sse_state_survives_native_islands() {
 #[test]
 fn tiny_budget_can_advance_a_cold_entry() {
     let code = assemble(|a| {
-        a.cbw().unwrap();
+        a.pause().unwrap();
         a.ret().unwrap();
     });
     let mut jit = machine(&code, true);
-    jit.state.regs[0] = 0x1234_5687;
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.regs[0], 0x1234_ff87);
+    assert_eq!(jit.state.eip, CODE + 2);
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::ReachedStop);
 }
 
@@ -627,7 +626,7 @@ fn cliffs_count_native_fallbacks_by_instruction() {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
         a.inc(eax).unwrap();
-        a.cbw().unwrap();
+        a.pause().unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.ret().unwrap();
@@ -636,7 +635,7 @@ fn cliffs_count_native_fallbacks_by_instruction() {
     reset(&mut jit, [0, 9, 0, 0, 0, 0, 0, 0], 2);
     assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
     let cliffs = &jit.stats.cliffs;
-    assert!(cliffs.fallbacks[&iced_x86::Mnemonic::Cbw] >= 9);
+    assert!(cliffs.fallbacks[&iced_x86::Mnemonic::Pause] >= 9);
     let fallback = cliffs.interpreter[&adv_cpu::InterpreterReason::Fallback];
     assert!(fallback.entries >= 9);
     assert!(fallback.instructions >= fallback.entries);

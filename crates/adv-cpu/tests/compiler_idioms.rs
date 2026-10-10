@@ -248,7 +248,8 @@ fn word_leave_and_cwd_match_oracle_operand_size_semantics() {
                     );
                 }
             }
-            assert!(jit.stats.interpreter_entries > 0);
+            // Word LEAVE still interprets; CWD compiles.
+            assert_eq!(jit.stats.interpreter_entries > 0, leave);
         }
     }
 }

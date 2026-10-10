@@ -123,8 +123,8 @@ pub(super) fn supported(i: &Instruction) -> bool {
     if move_condition(i).is_some() {
         return i.op_count() == 2
             && i.op0_kind() == OpKind::Register
-            && i.op0_register().is_gpr32()
-            && source32(i, 1);
+            && (i.op0_register().is_gpr32() && source32(i, 1)
+                || i.op0_register().is_gpr16() && operand(i, 1, &[2]));
     }
     let count = |i: &Instruction| {
         i.op1_kind() == OpKind::Immediate8
@@ -149,26 +149,36 @@ pub(super) fn supported(i: &Instruction) -> bool {
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
             i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && count(i)
         }
-        // Only the one-bit form, which is the one compilers emit.
+        // A zero masked count writes nothing, so a memory destination needs
+        // a known nonzero count; registers take CL too.
         M::Rcl | M::Rcr => {
             i.op_count() == 2
                 && operand(i, 0, &[1, 2, 4])
-                && i.op1_kind() == OpKind::Immediate8
-                && i.immediate8() == 1
+                && if i.op0_kind() == OpKind::Register {
+                    count(i)
+                } else {
+                    i.op1_kind() == OpKind::Immediate8 && i.immediate8() & 31 != 0
+                }
         }
         // A register bit offset addresses memory outside the operand, which
         // loop versioning would not see; leave that form to the interpreter.
         M::Bt | M::Bts | M::Btr | M::Btc => {
             i.op_count() == 2
-                && operand(i, 0, &[4])
+                && operand(i, 0, &[2, 4])
                 && (i.op1_kind() == OpKind::Immediate8
                     || i.op0_kind() == OpKind::Register && register(i, 1))
+        }
+        M::Bsf | M::Bsr => {
+            i.op_count() == 2
+                && i.op0_kind() == OpKind::Register
+                && operand(i, 0, &[2, 4])
+                && operand(i, 1, &[operand_size(i, 0)])
         }
         M::Xlatb => i.code() == Code::Xlat_m8 && i.memory_base() == R::EBX,
         M::Xchg => i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && register(i, 1),
         M::Xadd | M::Cmpxchg => i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && register(i, 1),
         M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Lahf | M::Sahf => i.op_count() == 0,
-        M::Bswap => i.code() == Code::Bswap_r32,
+        M::Bswap => matches!(i.code(), Code::Bswap_r32 | Code::Bswap_r16),
         M::Pusha | M::Pushad | M::Popa | M::Popad => matches!(
             i.code(),
             Code::Pushaw | Code::Pushad | Code::Popaw | Code::Popad
@@ -178,6 +188,8 @@ pub(super) fn supported(i: &Instruction) -> bool {
             Code::Pushfw | Code::Pushfd | Code::Popfw | Code::Popfd
         ),
         M::Cdq => i.code() == Code::Cdq,
+        M::Cwd => i.code() == Code::Cwd,
+        M::Cbw => i.code() == Code::Cbw,
         M::Cwde => i.code() == Code::Cwde,
         M::Leave => i.code() == Code::Leaved,
         M::Adc | M::Sbb => {
@@ -390,6 +402,13 @@ impl Emitter<'_> {
             self.set_raw_flags(flags);
             return;
         }
+        if i.code() == Code::Bswap_r16 {
+            // Architecturally undefined; the interpreter follows observed
+            // Intel execution: the low word clears, the rest is kept.
+            let zero = self.constant(0);
+            self.write(i, None, zero);
+            return;
+        }
         if i.mnemonic() == M::Bswap {
             let index = reg_index(i.op0_register()).unwrap();
             let value = self.b.use_var(self.regs[index]);
@@ -444,6 +463,27 @@ impl Emitter<'_> {
             self.b.def_var(self.regs[2], sign);
             return;
         }
+        if i.code() == Code::Cwd {
+            let value = self.b.use_var(self.regs[0]);
+            let wide = self.b.ins().ishl_imm(value, 16);
+            let sign = self.b.ins().sshr_imm(wide, 31);
+            let sign = self.b.ins().band_imm(sign, 0xffff);
+            let edx = self.b.use_var(self.regs[2]);
+            let edx = self.b.ins().band_imm(edx, !0xffff_i64);
+            let edx = self.b.ins().bor(edx, sign);
+            self.b.def_var(self.regs[2], edx);
+            return;
+        }
+        if i.code() == Code::Cbw {
+            let value = self.b.use_var(self.regs[0]);
+            let low = self.b.ins().ireduce(types::I8, value);
+            let extended = self.b.ins().sextend(types::I32, low);
+            let extended = self.b.ins().band_imm(extended, 0xffff);
+            let high = self.b.ins().band_imm(value, !0xffff_i64);
+            let eax = self.b.ins().bor(high, extended);
+            self.b.def_var(self.regs[0], eax);
+            return;
+        }
         if i.code() == Code::Cwde {
             let value = self.b.use_var(self.regs[0]);
             let low = self.b.ins().ireduce(types::I16, value);
@@ -467,6 +507,7 @@ impl Emitter<'_> {
             M::Bt | M::Bts | M::Btr | M::Btc => return self.bit_test(i),
             M::Xlatb => return self.translate(i),
             M::Rcl | M::Rcr => return self.rotate_through_carry(i),
+            M::Bsf | M::Bsr => return self.bit_scan(i),
             _ => {}
         }
         if let Some(condition) = move_condition(i) {
@@ -958,8 +999,88 @@ impl Emitter<'_> {
         self.write(i, ptr, result);
     }
 
-    /// RCL/RCR by one: the carry rotates in and the bit leaving becomes CF.
+    /// RCL/RCR: the operand and CF rotate as one value of width + 1 bits.
+    /// The count keeps its low five bits; OF changes only for a count of one.
     fn rotate_through_carry(&mut self, i: &Instruction) {
+        let immediate = (i.op1_kind() == OpKind::Immediate8).then(|| i.immediate8() & 31);
+        match immediate {
+            Some(1) => return self.rotate_through_carry_once(i),
+            Some(0) => return,
+            _ => {}
+        }
+        let input = self.read(i, 0);
+        let ptr = self.destination(i);
+        let bits = (operand_size(i, 0) * 8) as i64;
+        let count = match immediate {
+            Some(count) => self.constant(u32::from(count)),
+            None => {
+                let cl = self.read_register(R::CL);
+                self.b.ins().band_imm(cl, 31)
+            }
+        };
+        let turn = self.b.ins().urem_imm(count, bits + 1);
+        let old_carry = self.flag(0);
+        let value = self.b.ins().uextend(types::I64, input);
+        let carry = self.b.ins().uextend(types::I64, old_carry);
+        let carry = self.b.ins().ishl_imm(carry, bits);
+        let joined = self.b.ins().bor(value, carry);
+        let turn = self.b.ins().uextend(types::I64, turn);
+        let width = self.b.ins().iconst(types::I64, bits + 1);
+        let back = self.b.ins().isub(width, turn);
+        let (head, tail) = if i.mnemonic() == M::Rcl {
+            (
+                self.b.ins().ishl(joined, turn),
+                self.b.ins().ushr(joined, back),
+            )
+        } else {
+            (
+                self.b.ins().ushr(joined, turn),
+                self.b.ins().ishl(joined, back),
+            )
+        };
+        let rotated = self.b.ins().bor(head, tail);
+        let carry = self.b.ins().ushr_imm(rotated, bits);
+        let carry = self.b.ins().ireduce(types::I32, carry);
+        let carry = self.b.ins().band_imm(carry, 1);
+        let result = self.b.ins().ireduce(types::I32, rotated);
+        let result = if bits < 32 {
+            self.b.ins().band_imm(result, (1 << bits) - 1)
+        } else {
+            result
+        };
+        let old_overflow = self.flag(11);
+        let overflow = if immediate.is_some() {
+            old_overflow
+        } else {
+            let once = self.carry_rotation_overflow(i, result, carry, bits);
+            let single = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
+            self.b.ins().select(single, once, old_overflow)
+        };
+        self.set_carry_overflow(carry, overflow);
+        self.write(i, ptr, result);
+    }
+
+    /// RCL: the new sign differs from CF; RCR: the top two result bits differ.
+    fn carry_rotation_overflow(
+        &mut self,
+        i: &Instruction,
+        result: Value,
+        carry: Value,
+        bits: i64,
+    ) -> Value {
+        let sign = self.b.ins().ushr_imm(result, bits - 1);
+        let sign = self.b.ins().band_imm(sign, 1);
+        if i.mnemonic() == M::Rcl {
+            self.b.ins().bxor(sign, carry)
+        } else {
+            let next = self.b.ins().ushr_imm(result, bits - 2);
+            let next = self.b.ins().band_imm(next, 1);
+            self.b.ins().bxor(sign, next)
+        }
+    }
+
+    /// RCL/RCR by one: the carry rotates in and the bit leaving becomes CF.
+    fn rotate_through_carry_once(&mut self, i: &Instruction) {
         let input = self.read(i, 0);
         let ptr = self.destination(i);
         let bits = (operand_size(i, 0) * 8) as i64;
@@ -975,15 +1096,12 @@ impl Emitter<'_> {
             let result = self.b.ins().bor(shifted, carry_in);
             (result, self.b.ins().band_imm(input, 1))
         };
-        let sign = self.b.ins().ushr_imm(result, bits - 1);
-        let sign = self.b.ins().band_imm(sign, 1);
-        let overflow = if i.mnemonic() == M::Rcl {
-            self.b.ins().bxor(sign, carry)
+        let result = if bits < 32 {
+            self.b.ins().band_imm(result, (1 << bits) - 1)
         } else {
-            let next = self.b.ins().ushr_imm(result, bits - 2);
-            let next = self.b.ins().band_imm(next, 1);
-            self.b.ins().bxor(sign, next)
+            result
         };
+        let overflow = self.carry_rotation_overflow(i, result, carry, bits);
         self.set_carry_overflow(carry, overflow);
         self.write(i, ptr, result);
     }
@@ -1102,7 +1220,8 @@ impl Emitter<'_> {
         self.write(i, ptr, stored);
     }
 
-    /// BT/BTS/BTR/BTC on a doubleword: only CF changes.
+    /// BT/BTS/BTR/BTC on a word or doubleword: only CF changes. The bit
+    /// offset is taken modulo the operand width.
     fn bit_test(&mut self, i: &Instruction) {
         let value = self.read(i, 0);
         let index = self.read(i, 1);
@@ -1111,7 +1230,10 @@ impl Emitter<'_> {
         } else {
             self.destination(i)
         };
-        let index = self.b.ins().band_imm(index, 31);
+        let index = self
+            .b
+            .ins()
+            .band_imm(index, (operand_size(i, 0) * 8 - 1) as i64);
         let carry = self.b.ins().ushr(value, index);
         let carry = self.b.ins().band_imm(carry, 1);
         let overflow = self.flag(11);
@@ -1126,6 +1248,29 @@ impl Emitter<'_> {
             _ => unreachable!(),
         };
         self.write(i, ptr, result);
+    }
+
+    /// BSF/BSR: ZF reports a zero source, which leaves the destination as it
+    /// was; the other flags are kept.
+    fn bit_scan(&mut self, i: &Instruction) {
+        let value = self.read(i, 1);
+        let old = self.read(i, 0);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, value, 0);
+        let index = if i.mnemonic() == M::Bsf {
+            self.b.ins().ctz(value)
+        } else {
+            let leading = self.b.ins().clz(value);
+            let top = self.constant(31);
+            self.b.ins().isub(top, leading)
+        };
+        let result = self.b.ins().select(empty, old, index);
+        self.write(i, None, result);
+        let zero = self.b.ins().uextend(types::I32, empty);
+        let zero = self.b.ins().ishl_imm(zero, 6);
+        let flags = self.materialize_flags();
+        let flags = self.b.ins().band_imm(flags, !0x40_i64);
+        let flags = self.b.ins().bor(flags, zero);
+        self.set_raw_flags(flags);
     }
 
     /// XLATB: AL = [EBX + AL].

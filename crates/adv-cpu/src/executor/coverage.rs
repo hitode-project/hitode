@@ -95,16 +95,17 @@ mod tests {
         let mut a = CodeAssembler::new(32).unwrap();
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
-        a.cbw().unwrap();
+        a.scasb().unwrap();
         a.inc(ebx).unwrap();
         a.jmp(top).unwrap();
         let mut m = machine();
         m.write(CODE, &a.assemble(CODE.into()).unwrap()).unwrap();
+        m.state.regs[7] = CODE;
         assert_eq!(m.run(STOP, 500).unwrap(), RunOutcome::Budget);
         assert!(m.stats.compilations > 0);
         assert_eq!(
             m.interpreter_detail(CODE),
-            Detail::Unsupported(iced_x86::Code::Cbw)
+            Detail::Unsupported(iced_x86::Code::Scasb_AL_m8)
         );
         assert!(
             m.stats
@@ -112,7 +113,7 @@ mod tests {
                 .interpreter_detail_rows()
                 .iter()
                 .any(|(label, n)| {
-                    label == "Rejected/Unsupported/Cbw/Cbw" && n.instructions > 0
+                    label == "Rejected/Unsupported/Scasb/Scasb_AL_m8" && n.instructions > 0
                 })
         );
         for reason in [InterpreterReason::Uncovered, InterpreterReason::Rejected] {

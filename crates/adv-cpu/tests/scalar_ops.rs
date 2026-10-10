@@ -559,3 +559,165 @@ fn conditional_moves_memory_shifts_bit_tests_and_exchanges_stay_native() {
         assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
     }
 }
+
+#[test]
+fn word_byte_bit_scans_and_sign_extensions_stay_native() {
+    let values = [
+        0,
+        1,
+        0x7f,
+        0x80,
+        0xffff,
+        0x8000_0000,
+        0xffff_ffff,
+        0x1234_5678,
+    ];
+    for form in 0..19 {
+        let bytes = assemble(|a| {
+            a.cmp(eax, edx).unwrap();
+            match form {
+                0 => a.not(bl),
+                1 => a.not(bx),
+                2 => a.not(word_ptr(edi)),
+                3 => a.not(byte_ptr(edi)),
+                4 => a.cmovl(bx, cx),
+                5 => a.cmovae(bx, word_ptr(edi)),
+                6 => a.bt(bx, cx),
+                7 => a.bts(bx, cx),
+                8 => a.btr(bx, cx),
+                9 => a.btc(bx, cx),
+                10 => a.bt(bx, 13),
+                11 => a.bsf(bx, cx),
+                12 => a.bsr(bx, cx),
+                13 => a.bsf(ebx, ecx),
+                14 => a.bsr(ebx, dword_ptr(edi)),
+                15 => a.bsf(bx, word_ptr(edi)),
+                16 => a.bswap(bx),
+                17 => a.cwd(),
+                _ => a.cbw(),
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&bytes, true);
+        let mut uc = machine(&bytes, false);
+        let mut interpreted = machine(&bytes, false);
+        for &left in &values {
+            for &right in &values {
+                for &stored in &values {
+                    let context = format!(
+                        "form {form}, eax {left:#x}, ecx/edx {right:#x}, memory {stored:#x}"
+                    );
+                    let regs = [left, right, right ^ 0x55, stored ^ 0x0f0f, 0, 0, 0, DATA];
+                    for m in [&mut jit, &mut uc, &mut interpreted] {
+                        reset(m, regs, 0x202);
+                        m.write(DATA, &stored.to_le_bytes()).unwrap();
+                    }
+                    assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(
+                        uc.run_unicorn(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    assert_eq!(
+                        interpreted.run(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    let memory = |m: &Executor| m.memory().read(DATA, 8).unwrap().to_vec();
+                    assert_eq!(jit.state.regs, uc.state.regs, "{context}");
+                    assert_eq!(memory(&jit), memory(&uc), "{context}");
+                    // BSF/BSR define only ZF; BT* only CF.
+                    let mask = match form {
+                        6..=10 => 0x1,
+                        11..=15 => 0x40,
+                        16..=18 => 0xfff,
+                        _ => 0x8d5,
+                    };
+                    assert_eq!(jit.state.eflags & mask, uc.state.eflags & mask, "{context}");
+                    interpreted.state.fuel = jit.state.fuel;
+                    assert_eq!(jit.state, interpreted.state, "{context}");
+                    assert_eq!(memory(&jit), memory(&interpreted), "{context}");
+                }
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
+    }
+}
+
+#[test]
+fn rotates_through_carry_match_unicorn_at_every_width_and_count() {
+    let values = [0, 1, 0x80, 0x8001, 0x8000_0000, 0xffff_ffff, 0x1234_5678];
+    let counts = [0u8, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 255];
+    for form in 0..16 {
+        for &count in &counts {
+            let immediate = count as i32;
+            if form >= 12 && count & 31 == 0 {
+                continue;
+            }
+            let bytes = assemble(|a| {
+                // The lazy compare supplies CF.
+                a.cmp(eax, edx).unwrap();
+                match form {
+                    0 => a.rcl(bl, cl),
+                    1 => a.rcr(bl, cl),
+                    2 => a.rcl(bx, cl),
+                    3 => a.rcr(bx, cl),
+                    4 => a.rcl(ebx, cl),
+                    5 => a.rcr(ebx, cl),
+                    6 => a.rcl(bl, immediate),
+                    7 => a.rcr(bl, immediate),
+                    8 => a.rcl(bx, immediate),
+                    9 => a.rcr(bx, immediate),
+                    10 => a.rcl(ebx, immediate),
+                    11 => a.rcr(ebx, immediate),
+                    12 => a.rcl(byte_ptr(edi), immediate),
+                    13 => a.rcr(word_ptr(edi), immediate),
+                    14 => a.rcl(dword_ptr(edi), immediate),
+                    _ => a.rcr(dword_ptr(edi), immediate),
+                }
+                .unwrap();
+                a.ret().unwrap();
+            });
+            let mut jit = machine(&bytes, true);
+            let mut uc = machine(&bytes, false);
+            let mut interpreted = machine(&bytes, false);
+            for &value in &values {
+                for carry in [false, true] {
+                    let context = format!("form {form}, count {count}, value {value:#x}");
+                    let regs = [
+                        u32::from(!carry),
+                        u32::from(count) | 0x1234_5600,
+                        1,
+                        value,
+                        0,
+                        0,
+                        0,
+                        DATA,
+                    ];
+                    for m in [&mut jit, &mut uc, &mut interpreted] {
+                        reset(m, regs, 0x202);
+                        m.write(DATA, &value.to_le_bytes()).unwrap();
+                    }
+                    assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(
+                        uc.run_unicorn(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    assert_eq!(
+                        interpreted.run(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    let memory = |m: &Executor| m.memory().read(DATA, 4).unwrap().to_vec();
+                    assert_eq!(jit.state.regs, uc.state.regs, "{context}");
+                    assert_eq!(memory(&jit), memory(&uc), "{context}");
+                    // OF is defined only for one-bit rotates.
+                    let mask = if count & 31 == 1 { 0x801 } else { 0x1 };
+                    assert_eq!(jit.state.eflags & mask, uc.state.eflags & mask, "{context}");
+                    interpreted.state.fuel = jit.state.fuel;
+                    assert_eq!(jit.state, interpreted.state, "{context}");
+                    assert_eq!(memory(&jit), memory(&interpreted), "{context}");
+                }
+            }
+            assert_eq!(jit.stats.interpreter_entries, 0, "{form} {count}");
+        }
+    }
+}

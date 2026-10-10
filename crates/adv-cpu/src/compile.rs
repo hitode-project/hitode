@@ -2619,7 +2619,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             || mmx::supported(i)
             || sse::supported(i);
     }
-    let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx)
+    let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx | M::Not)
         || narrow_alu(i.mnemonic())
         || word_stack(i);
     for n in 0..i.op_count() {

@@ -61,8 +61,8 @@ fn compare(machines: &mut [Executor; 3], expected: RunOutcome) {
 #[test]
 fn unsupported_sequence_returns_to_the_native_continuation() {
     let code = assemble(|a| {
-        a.cbw().unwrap();
-        a.cbw().unwrap();
+        a.pause().unwrap();
+        a.pause().unwrap();
         a.mov(dword_ptr(DATA), eax).unwrap();
         a.adc(eax, 0).unwrap();
         a.mov(dword_ptr(DATA + 4), eax).unwrap();
