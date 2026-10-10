@@ -295,10 +295,11 @@ fn a_w_create_dispositions_and_opaque_writes_keep_provider_state_and_errors() {
             (12, SENTINEL),
             (16, 0),
             (20, SENTINEL),
+            // Successful SetFilePointerEx leaves the last error unchanged.
             (24, 1),
-            (28, 0),
+            (28, SENTINEL),
             (32, 1),
-            (36, 0),
+            (36, SENTINEL),
             (40, 1),
             (44, SENTINEL),
             (48, 0),

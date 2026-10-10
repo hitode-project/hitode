@@ -520,6 +520,8 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
         return outcome;
     }
     let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    // The count is cleared before any work or error checking.
+    out_u32(env.cpu, read_out, 0);
     let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -554,6 +556,8 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
     {
         return outcome;
     }
+    // The count is cleared before any work or error checking.
+    out_u32(env.cpu, written, 0);
     let mut data = vec![0u8; n as usize];
     let _ = env.cpu.read(buf, &mut data);
     if matches!(h, STD_OUTPUT | STD_ERROR) {
@@ -661,19 +665,29 @@ fn seek(env: &mut Env<'_>, h: u32, dist: i64, method: u32) -> Option<u64> {
         return None;
     };
     let pos = match method {
-        0 => SeekFrom::Start(dist.max(0) as u64),
+        0 if dist < 0 => {
+            set_last_error(env, 131); // ERROR_NEGATIVE_SEEK
+            return None;
+        }
+        0 => SeekFrom::Start(dist as u64),
         1 => SeekFrom::Current(dist),
         _ => SeekFrom::End(dist),
     };
+    // A successful seek leaves the last error unchanged.
     match f.file.seek(pos) {
-        Ok(p) => {
-            set_last_error(env, 0);
-            Some(p)
-        }
+        Ok(p) => Some(p),
         Err(e) => {
             io_error(env, &e);
             None
         }
+    }
+}
+
+/// A successful SetFilePointer clears the last error only when the low position
+/// equals INVALID_SET_FILE_POINTER, so callers can tell it from a failure.
+fn clear_ambiguous_position(env: &mut Env<'_>, position: u64) {
+    if position as u32 == u32::MAX {
+        set_last_error(env, 0);
     }
 }
 
@@ -713,7 +727,7 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
                     set_last_error(env, 998);
                     return Outcome::Return(u32::MAX);
                 }
-                set_last_error(env, 0);
+                clear_ambiguous_position(env, position);
                 Outcome::Return(position as u32)
             }
             Err(error) => {
@@ -727,6 +741,7 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
     match seek(env, h, dist, method) {
         Some(p) => {
             out_u32(env.cpu, hi_p, (p >> 32) as u32);
+            clear_ambiguous_position(env, p);
             Outcome::Return(p as u32)
         }
         None => Outcome::Return(u32::MAX),
@@ -758,7 +773,6 @@ fn set_file_pointer_ex(env: &mut Env<'_>) -> Outcome {
                     set_last_error(env, 998);
                     return Outcome::Return(0);
                 }
-                set_last_error(env, 0);
                 Outcome::Return(1)
             }
             Err(error) => {
