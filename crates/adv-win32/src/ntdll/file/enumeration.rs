@@ -121,6 +121,9 @@ pub(crate) fn query(
     name: GuestPtr<()>,
     restart: u32,
 ) -> i32 {
+    // ReturnSingleEntry and RestartScan are BOOLEANs: callers push a full
+    // stack slot whose upper bytes are unspecified.
+    let (single, restart) = (single as u8 != 0, restart as u8 != 0);
     if event.0 != 0 || !apc.is_null() || !context.is_null() {
         return unavailable_for(
             env,
@@ -183,7 +186,7 @@ pub(crate) fn query(
         directory.entries = Some(entries);
     }
     let directory = env.sys.objects.host_mut::<DirectoryObj>(handle.0).unwrap();
-    if restart != 0 {
+    if restart {
         directory.next = 0;
     }
     let entries = directory.entries.as_ref().unwrap();
@@ -229,7 +232,7 @@ pub(crate) fn query(
         bytes.extend_from_slice(&record);
         previous = Some(start);
         next += 1;
-        if single != 0 {
+        if single {
             break;
         }
     }
