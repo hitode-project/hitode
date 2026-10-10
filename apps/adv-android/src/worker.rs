@@ -1,6 +1,8 @@
 use crate::{Frame, Packet, Session, held_key, packet_current, protocol, publish};
 use adv_machine::{RunResult, SliceResult};
-use adv_runtime::{DialogEvent, MenuEvent, MenuItem, RunMode, boot::Runtime};
+use adv_runtime::{
+    DialogEvent, Engine, EngineOptions, MenuEvent, MenuItem, RunMode, boot::Runtime,
+};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -328,15 +330,14 @@ pub fn run(
         .machine
         .cpu
         .set_background_sender(background.into_local())?;
-    runtime.machine.cpu.set_async_compilation(true);
-    runtime.machine.cpu.executor_mut().set_compile_threads(2)?;
-    if let Ok(profile) = std::fs::read(data.join("jit-warm.bin")) {
-        runtime
-            .machine
-            .cpu
-            .executor_mut()
-            .load_warm_profile(&profile);
-    }
+    // The application keeps no persistent native code; the warm profile
+    // lives in the data directory.
+    runtime.machine.cpu.configure(&EngineOptions {
+        compile_threads: Some(2),
+        artifacts: Some(data.to_path_buf()),
+        code_cache: false,
+        ..EngineOptions::default()
+    })?;
     startup(session, data, "codec-kernels")?;
     runtime.install_codec_kernels(
         adv_runtime::codec_kernels::Mode::Native,
@@ -691,11 +692,7 @@ pub fn run(
         });
     report["frame_fnv1a64"] = json!(format!("{hash:016x}"));
     save_report(data, &report)?;
-    std::fs::write(
-        data.join("jit-warm.bin"),
-        runtime.machine.cpu.executor().warm_profile(),
-    )
-    .map_err(|error| error.to_string())?;
+    runtime.machine.cpu.persist()?;
     drop(output);
     drop(runtime);
     service.shutdown();

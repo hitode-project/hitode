@@ -10,7 +10,7 @@ mod performance;
 pub mod window;
 
 use adv_machine::{RunResult, SliceResult};
-use adv_runtime::{CompileStrategy, Snapshot, boot::Runtime};
+use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -649,7 +649,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
     );
-    let stats = runtime.machine.cpu.stats();
     #[cfg(feature = "gpu")]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
@@ -775,9 +774,8 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
-            "  \"code_cache\": {},\n  \"aot\": {},\n",
-            "  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"host_calls\": {},\n  \"async_compilation\": {},\n  {},\n",
+            "  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"wait_diagnostics\": {},\n",
@@ -810,21 +808,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         context_runs,
         options.jit && options.async_compilation && options.tiered_compilation,
         runtime.machine.sys.host_calls,
-        stats.native_entries,
-        stats.interpreter_entries,
-        cliffs_report(&stats.cliffs),
-        verification_report(&stats.verification),
-        runtime.machine.cpu.executor().persistent_code_cache_json(),
-        stats.aot.json(),
-        runtime.machine.cpu.executor().compilation_schedule_json(),
-        stats.compilations,
         options.jit && options.async_compilation,
-        stats.compile_time.as_secs_f64(),
-        stats.compile_requests,
-        stats.pending_compilations,
-        stats.peak_pending_compilations,
-        stats.stale_compilations,
-        stats.compile_failures,
+        runtime.machine.cpu.report_fields(),
         runtime.machine.sys.contexts.len(),
         runtime.machine.sys.tls_images.len(),
         modules,
@@ -872,16 +857,12 @@ fn build_report(context: ReportContext<'_>) -> String {
     )
 }
 
-fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
+fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(path, report).map_err(|e| e.to_string())?;
-    // ADV_LOOP_COVERAGE: the loop table goes beside the report.
-    if let Some(loops) = adv_runtime::loop_coverage() {
-        std::fs::write(path.with_extension("loops.tsv"), loops).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    cpu.write_report_extras(path)
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
@@ -1104,59 +1085,6 @@ fn run(options: Options) -> Result<u8, String> {
     result?
 }
 
-fn compile_thread_count(cores: usize) -> usize {
-    // Keep the small-host policy. Larger desktop hosts can serve another
-    // compile without consuming the cores reserved for execution, audio and
-    // presentation. Phone SoCs count efficiency cores toward eight, so Android
-    // keeps three until headed device runs show a fourth worker helps there.
-    let cap = if cores >= 8 && !cfg!(target_os = "android") {
-        4
-    } else {
-        3
-    };
-    cores.saturating_sub(2).clamp(1, cap)
-}
-
-fn compile_thread_override(value: Option<&str>, default: usize) -> Result<usize, String> {
-    match value {
-        None => Ok(default),
-        Some(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|threads| (1..=8).contains(threads))
-            .ok_or_else(|| "ADV_COMPILE_THREADS must be an integer from 1 to 8".into()),
-    }
-}
-
-#[test]
-fn experimental_compile_threads_preserve_default_and_reject_invalid_values() {
-    assert_eq!(compile_thread_override(None, 3).unwrap(), 3);
-    for threads in 1..=8 {
-        assert_eq!(
-            compile_thread_override(Some(&threads.to_string()), 3).unwrap(),
-            threads
-        );
-    }
-    for value in ["", "0", "9", "-1", "auto"] {
-        assert!(compile_thread_override(Some(value), 3).is_err());
-    }
-}
-
-#[test]
-fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
-    for cores in 0usize..8 {
-        assert_eq!(
-            compile_thread_count(cores),
-            cores.saturating_sub(2).clamp(1, 3)
-        );
-    }
-    for cores in [8, 10, 16, 128] {
-        let cap = if cfg!(target_os = "android") { 3 } else { 4 };
-        assert_eq!(compile_thread_count(cores), cap);
-        assert!(compile_thread_count(cores) + 2 <= cores);
-    }
-}
-
 #[test]
 fn native_cache_is_default_and_has_one_diagnostic_bypass() {
     let parse = |values: &[&str]| {
@@ -1188,11 +1116,6 @@ fn run_execution(
     runtime.set_codepage(options.codepage)?;
     for (drive, image) in &options.cdroms {
         runtime.mount_iso(*drive, image)?;
-    }
-    if !options.row_batching || !options.jit {
-        runtime.machine.cpu.disable_row_batching();
-    } else if let Some(workers) = options.row_workers {
-        runtime.machine.cpu.set_row_workers(workers)?;
     }
     if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
         use std::io::Read;
@@ -1245,66 +1168,26 @@ fn run_execution(
         .audio_stream()
         .set_waker(wake.clone())
         .map_err(|_| "audio wake event was already registered".to_owned())?;
-    runtime
-        .machine
-        .cpu
-        .set_auto_compile_strategy(options.compile_strategy);
-    runtime
-        .machine
-        .cpu
-        .executor_mut()
-        .set_tiered_compilation(options.tiered_compilation);
-    runtime
-        .machine
-        .cpu
-        .set_region_linking(options.region_linking);
-    runtime
-        .machine
-        .cpu
-        .set_async_compilation(options.jit && options.async_compilation);
-    // Guest regions resident at the previous exit are compiled in the background
-    // as soon as identical code is mapped, before the guest reaches them.
-    let warm_path = options.data_dir.join("jit-warm.bin");
-    runtime
-        .machine
-        .cpu
-        .executor_mut()
-        .set_aot_enabled(options.jit && !options.no_code_cache);
-    if options.jit && !options.no_code_cache {
-        runtime
-            .machine
-            .cpu
-            .executor_mut()
-            .set_persistent_code_cache(&options.data_dir.join("jit-code.bin"))?;
-    }
-    if options.jit && options.async_compilation {
-        // Leave cores for the guest, presentation and audio threads.
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |cores| compile_thread_count(cores.get()));
-        let threads = compile_thread_override(
-            std::env::var("ADV_COMPILE_THREADS").ok().as_deref(),
-            threads,
-        )?;
-        runtime
-            .machine
-            .cpu
-            .executor_mut()
-            .set_compile_threads(threads)?;
-        if let Ok(profile) = std::fs::read(&warm_path) {
-            runtime
-                .machine
-                .cpu
-                .executor_mut()
-                .load_warm_profile(&profile);
-        }
-    }
+    runtime.machine.cpu.configure(&EngineOptions {
+        compile_strategy: options.compile_strategy,
+        tiered_compilation: options.tiered_compilation,
+        region_linking: options.region_linking,
+        async_compilation: options.async_compilation,
+        row_batching: options.row_batching,
+        row_workers: options.row_workers,
+        compile_threads: None,
+        artifacts: Some(options.data_dir.clone()),
+        code_cache: !options.no_code_cache,
+        precompile: !options.no_code_cache,
+        frame_timing: options.frame_budget,
+        profiling: options.profile,
+    })?;
     if options.frame_budget {
         runtime.machine.sys.stats.wait_diagnostics =
             Some(adv_machine::wait_diagnostics::WaitDiagnostics::default());
-        runtime.machine.cpu.executor_mut().enable_frame_timing(true);
         runtime.machine.sys.stats.frame_budget = Some(adv_machine::frame_budget::FrameBudget::new(
             runtime.machine.sys.stats.total,
-            Some(runtime.machine.cpu.executor().frame_counters()),
+            runtime.machine.cpu.frame_counters(),
         ));
     }
     runtime.set_frame_limit(options.frames);
@@ -1313,7 +1196,6 @@ fn run_execution(
     runtime.set_d3d9_shader_caps(options.d3d9_sm2, options.d3d9_sm3);
     #[cfg(feature = "gpu")]
     runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
-    runtime.machine.cpu.set_profiling(options.profile);
     runtime.machine.sys.stats.services_enabled =
         options.host_profile.is_some() || options.schedule_profile.is_some();
     if let Some(path) = &options.schedule_profile {
@@ -1642,7 +1524,8 @@ fn run_execution(
                             audio: &audio,
                             scene_gate: &scene_gate,
                         });
-                        write_report(&path, &snapshot).map(|_| format!("report {}", path.display()))
+                        write_report(&path, &snapshot, &runtime.machine.cpu)
+                            .map(|_| format!("report {}", path.display()))
                     }
                     control::Command::ResetMetrics => {
                         if let Some(diagnostics) = &mut runtime.machine.sys.stats.wait_diagnostics {
@@ -1650,10 +1533,7 @@ fn run_execution(
                         }
                         let total = runtime.machine.sys.stats.total;
                         if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
-                            budget.reset(
-                                total,
-                                Some(runtime.machine.cpu.executor().frame_counters()),
-                            );
+                            budget.reset(total, runtime.machine.cpu.frame_counters());
                         }
                         runtime.machine.sys.schedule_trace.event("mark", 0, 0, 0, 0);
                         let serial = runtime.presented_frames();
@@ -1987,13 +1867,8 @@ fn run_execution(
     let native_frame = runtime.has_native_frame();
     #[cfg(not(feature = "gpu"))]
     let native_frame = false;
-    if options.jit && options.async_compilation {
-        let profile = runtime.machine.cpu.executor().warm_profile();
-        let _ = std::fs::create_dir_all(&options.data_dir)
-            .and_then(|_| std::fs::write(&warm_path, profile));
-    }
-    if let Err(error) = runtime.machine.cpu.executor().save_persistent_code_cache() {
-        eprintln!("warning: native code cache save failed: {error}");
+    if let Err(error) = runtime.machine.cpu.persist() {
+        eprintln!("warning: {error}");
     }
     if native_frame {
         #[cfg(feature = "gpu")]
@@ -2031,7 +1906,7 @@ fn run_execution(
         scene_gate: &scene_gate,
     });
     if let Some(path) = &options.report {
-        write_report(path, &report)?;
+        write_report(path, &report, &runtime.machine.cpu)?;
     }
     if let Some(path) = &options.host_profile {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -2047,7 +1922,7 @@ fn run_execution(
             .map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }
-    let stats = runtime.machine.cpu.stats();
+    let stats = runtime.machine.cpu.counters();
     println!(
         "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
         exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
@@ -2095,87 +1970,3 @@ pub fn run_cli() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod deadline_tests;
-
-/// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
-/// `ADV_JIT_VERIFY` interpreter checks of newly published native code.
-fn verification_report(v: &adv_runtime::VerifyStats) -> String {
-    format!(
-        "{{\"verified\":{},\"inconclusive\":{},\"mismatches\":{},\"mxcsr_flags\":{},\"reports\":[{}]}}",
-        v.verified,
-        v.inconclusive,
-        v.mismatches,
-        v.mxcsr_flags,
-        v.reports
-            .iter()
-            .map(|r| json(r))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-/// Slow-path counters, each list cut to its most frequent entries.
-fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
-    const ROWS: usize = 24;
-    let counts = |rows: Vec<(String, u64)>, limit: usize| {
-        rows.into_iter()
-            .take(limit)
-            .map(|(key, n)| format!("{}:{n}", json(&key)))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let interpreter = c
-        .interpreter_rows()
-        .into_iter()
-        .map(|(reason, n)| {
-            format!(
-                "{}:{{\"entries\":{},\"instructions\":{}}}",
-                json(&reason),
-                n.entries,
-                n.instructions
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let detail_rows = c.interpreter_detail_rows();
-    let omitted_rows = detail_rows.len().saturating_sub(ROWS);
-    let details = detail_rows
-        .iter()
-        .take(ROWS)
-        .map(|(label, n)| {
-            format!(
-                "{}:{{\"entries\":{},\"instructions\":{}}}",
-                json(label),
-                n.entries,
-                n.instructions
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let omitted = ["Uncovered", "Rejected"]
-        .map(|reason| {
-            let mut entries = 0;
-            let mut instructions = 0;
-            for (label, n) in detail_rows.iter().skip(ROWS) {
-                if label.starts_with(&format!("{reason}/")) {
-                    entries += n.entries;
-                    instructions += n.instructions;
-                }
-            }
-            format!(
-                "{}:{{\"entries\":{entries},\"instructions\":{instructions}}}",
-                json(reason)
-            )
-        })
-        .join(",");
-    format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
-        c.x87_helper_calls,
-        c.x87_fast,
-        counts(c.x87_exact_rows(), ROWS),
-        counts(c.x87_control_rows(), usize::MAX),
-        counts(c.x87_control_rejections(), usize::MAX),
-        counts(c.x87_pc64_rows(), usize::MAX),
-        counts(c.fallback_rows(), ROWS),
-        interpreter
-    )
-}

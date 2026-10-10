@@ -13,8 +13,19 @@ pub struct JitCpu {
     park: u32,
     budget: Option<Duration>,
     jit: bool,
+    /// Startup artifact directory saved by `Engine::persist`.
+    artifacts: Option<std::path::PathBuf>,
 }
 impl JitCpu {
+    pub(super) fn native(&self) -> bool {
+        self.jit
+    }
+    pub(super) fn artifacts(&self) -> Option<&std::path::Path> {
+        self.artifacts.as_deref()
+    }
+    pub(super) fn set_artifacts(&mut self, dir: Option<std::path::PathBuf>) {
+        self.artifacts = dir;
+    }
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
         self.inner.set_row_workers(count)
     }
@@ -36,6 +47,7 @@ impl JitCpu {
             park,
             budget: Some(Duration::from_secs(5)),
             jit,
+            artifacts: None,
         })
     }
     pub fn stats(&self) -> Stats {

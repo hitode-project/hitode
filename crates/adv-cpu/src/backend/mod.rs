@@ -33,6 +33,7 @@ macro_rules! bitflags_lite {
 pub mod asm;
 pub mod file_page;
 pub mod jit;
+mod jit_engine;
 pub use file_page::FilePage;
 pub mod x87;
 pub use adv_sync::shared::{SharedReadView, SharedRegion};

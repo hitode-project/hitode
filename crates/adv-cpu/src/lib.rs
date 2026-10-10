@@ -9,6 +9,7 @@ mod compile_budget;
 mod compiler;
 mod cpu_profile;
 mod discovery;
+pub mod engine;
 pub mod execution_abi;
 mod executor;
 #[path = "host_fault/recipe.rs"]
@@ -63,6 +64,7 @@ pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use compile::coverage::report as loop_coverage;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::{PROCESSOR_IDENTITY, ProcessorIdentity, SegmentState};
+pub use engine::{Engine, EngineCounters, EngineOptions};
 pub use executor::{
     AotImage, AotStats, ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats,
 };
