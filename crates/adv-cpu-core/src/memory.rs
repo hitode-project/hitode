@@ -153,6 +153,10 @@ pub struct Memory {
     native_protection: bool,
     #[cfg(windows)]
     native_read_exceptions: usize,
+    /// The window `reservation` is placed in; declared after it so the
+    /// reservation hands its range back first.
+    #[cfg(unix)]
+    window: Option<crate::virtual_memory::GuestWindow>,
 }
 
 impl Memory {
@@ -205,11 +209,14 @@ impl Memory {
                 }));
             }
         }
-        if let Some(pages) = fresh
-            && self.selective_code_writes()
-        {
-            self.fast.invalidate(pages);
-            self.epoch += 1;
+        if let Some(pages) = fresh {
+            // Translated code must not store to observed code directly.
+            self.sync_window(pages.clone())
+                .expect("write-protect observed code in the guest window");
+            if self.selective_code_writes() {
+                self.fast.invalidate(pages);
+                self.epoch += 1;
+            }
         }
     }
 
@@ -455,6 +462,8 @@ impl Memory {
             native_protection: false,
             #[cfg(windows)]
             native_read_exceptions: 0,
+            #[cfg(unix)]
+            window: None,
         })
     }
 
@@ -500,7 +509,135 @@ impl Memory {
             native_protection: false,
             #[cfg(windows)]
             native_read_exceptions: 0,
+            #[cfg(unix)]
+            window: None,
         })
+    }
+
+    /// Guest memory placed in a 4 GiB-aligned `GuestWindow` at its guest
+    /// addresses (a64 workbook §6). `ptr` is the always accessible alias, so
+    /// every Rust and interpreter access is unchanged; the window view's host
+    /// protection follows the guest's for translated code. Pages the host
+    /// cannot protect exactly stay inaccessible there as soft pages.
+    #[cfg(unix)]
+    pub fn window(base: u32, len: usize) -> Result<Self, String> {
+        Self::window_at_host_size(base, len, crate::virtual_memory::host_page_size()?)
+    }
+
+    #[cfg(unix)]
+    fn window_at_host_size(base: u32, len: usize, host_size: usize) -> Result<Self, String> {
+        if !len.is_multiple_of(PAGE_SIZE) || len == 0 || u64::from(base) + len as u64 > 1 << 32 {
+            return Err("invalid guest window".into());
+        }
+        let mut memory = Self::reserve(base, PAGE_SIZE)?;
+        let window = crate::virtual_memory::GuestWindow::new()?;
+        // The placement starts on a host page; `slack` guest pages below
+        // `base` belong to it but never to the guest.
+        let slack = base as usize % host_size;
+        let reservation = crate::virtual_memory::Reservation::new_direct_in_at_host_size(
+            &window,
+            base as usize - slack,
+            slack + len,
+            host_size,
+        )?;
+        let origin = epoch_origin();
+        memory.len = len;
+        let alias = reservation
+            .alias()
+            .ok_or("direct reservation without alias")?;
+        // SAFETY: the alias spans `slack + len` bytes.
+        memory.ptr = unsafe { alias.add(slack) };
+        memory.perms = Arc::new(vec![0; len / PAGE_SIZE]);
+        memory.fast = FastPermissions::new(len / PAGE_SIZE);
+        memory.versions = vec![origin; len / PAGE_SIZE];
+        memory.watched = vec![false; len / PAGE_SIZE];
+        memory.mapped = Arc::new(vec![false; len / PAGE_SIZE]);
+        memory.reservation = Some(reservation);
+        memory.window = Some(window);
+        Ok(memory)
+    }
+
+    /// Host address of guest address 0 for memory made by `window`.
+    #[cfg(unix)]
+    pub fn window_base(&self) -> Option<usize> {
+        self.window.as_ref().map(|window| window.base())
+    }
+
+    /// Reservation offset of guest offset 0: nonzero only for a window whose
+    /// base is not host page aligned.
+    #[cfg(unix)]
+    fn window_slack(&self) -> usize {
+        let reservation = self.reservation.as_ref().unwrap();
+        self.window_base().unwrap() + self.base as usize - reservation.ptr.as_ptr() as usize
+    }
+
+    fn commit_pages(&self, offset: usize, len: usize) -> Result<(), String> {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .ok_or("mapping requires reserved address space")?;
+        #[cfg(unix)]
+        if self.window.is_some() {
+            return reservation.commit_direct(
+                self.window_slack() + offset,
+                len,
+                crate::virtual_memory::GuestPageProtection::NONE,
+            );
+        }
+        reservation.commit(offset, len)
+    }
+
+    fn decommit_pages(&self, offset: usize, len: usize) -> Result<(), String> {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .ok_or("unmapping requires reserved address space")?;
+        #[cfg(unix)]
+        if self.window.is_some() {
+            return reservation.decommit_direct(self.window_slack() + offset, len);
+        }
+        reservation.decommit(offset, len)
+    }
+
+    /// Makes the window view's protection of `pages` follow the guest's.
+    /// Only committed pages count: overlays (shared and file pages) live
+    /// outside the reservation and stay inaccessible in the window.
+    fn sync_window(&self, pages: std::ops::Range<usize>) -> Result<(), String> {
+        #[cfg(unix)]
+        if self.window.is_some() {
+            use crate::virtual_memory::GuestPageProtection;
+            let reservation = self.reservation.as_ref().unwrap();
+            let committed =
+                |page: usize| self.mapped[page] && !self.shared_pages.contains_key(&page);
+            let protection = |page: usize| {
+                if self.perms[page] & SHARED != 0 {
+                    GuestPageProtection::NONE
+                } else {
+                    GuestPageProtection::new(self.perms[page] & 7, self.watched[page])
+                        .expect("guest permissions")
+                }
+            };
+            let mut page = pages.start;
+            while page < pages.end {
+                if !committed(page) {
+                    page += 1;
+                    continue;
+                }
+                let wanted = protection(page);
+                let start = page;
+                while page < pages.end && committed(page) && protection(page) == wanted {
+                    page += 1;
+                }
+                reservation.protect_direct(
+                    self.window_slack() + start * PAGE_SIZE,
+                    (page - start) * PAGE_SIZE,
+                    wanted,
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pages;
+        Ok(())
     }
 
     pub fn pages(&self, addr: u32, len: usize) -> Result<std::ops::Range<usize>, String> {
@@ -528,16 +665,10 @@ impl Memory {
         if perms & !7 != 0 || self.mapped[pages.clone()].iter().any(|&v| v) {
             return Err("invalid or overlapping mapping".into());
         }
-        self.reservation
-            .as_ref()
-            .ok_or("mapping requires reserved address space")?
-            .commit(pages.start * PAGE_SIZE, len)?;
+        self.commit_pages(pages.start * PAGE_SIZE, len)?;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         if let Err(error) = self.protect(addr, len, perms) {
-            self.reservation
-                .as_ref()
-                .unwrap()
-                .decommit(pages.start * PAGE_SIZE, len)?;
+            self.decommit_pages(pages.start * PAGE_SIZE, len)?;
             Arc::make_mut(&mut self.mapped)[pages].fill(false);
             return Err(error);
         }
@@ -551,10 +682,9 @@ impl Memory {
         // Failure keeps the remaining ledger and mapping, so reuse cannot inherit it.
         self.retire_page_locks(pages.clone())
             .map_err(|error| format!("unpin before unmapping: {error:?}"))?;
-        let reservation = self
-            .reservation
-            .as_ref()
-            .ok_or("unmapping requires reserved address space")?;
+        if self.reservation.is_none() {
+            return Err("unmapping requires reserved address space".into());
+        }
         for page in pages.clone() {
             if let Some(file) = self.resident.remove(&page) {
                 file.evict();
@@ -581,7 +711,7 @@ impl Memory {
             {
                 end += 1;
             }
-            reservation.decommit(start * PAGE_SIZE, (end - start) * PAGE_SIZE)?;
+            self.decommit_pages(start * PAGE_SIZE, (end - start) * PAGE_SIZE)?;
             start = end;
         }
         for page in pages.clone() {
@@ -979,6 +1109,9 @@ impl Memory {
         if !changed.is_empty() {
             self.epoch += 1;
         }
+        for &page in &changed {
+            self.sync_window(page..page + 1)?;
+        }
         Ok(())
     }
 
@@ -1026,9 +1159,9 @@ impl Memory {
         if self.native_protection {
             return;
         }
-        let Some(reservation) = self.reservation.as_ref() else {
+        if self.reservation.is_none() {
             return;
-        };
+        }
         let Some(SharedPage::File {
             page: storage,
             copy_on_write: false,
@@ -1036,19 +1169,23 @@ impl Memory {
         else {
             return;
         };
-        if storage.resident() || reservation.commit(page * PAGE_SIZE, PAGE_SIZE).is_err() {
+        if storage.resident() || self.commit_pages(page * PAGE_SIZE, PAGE_SIZE).is_err() {
             return;
         }
         let storage = storage.clone();
         // SAFETY: the committed window page stays valid until unmap or drop
         // evicts it, and FilePage access is confined to this worker.
         if unsafe { storage.make_resident(self.ptr.as_ptr().add(page * PAGE_SIZE)) }.is_err() {
-            let _ = reservation.decommit(page * PAGE_SIZE, PAGE_SIZE);
+            let _ = self.decommit_pages(page * PAGE_SIZE, PAGE_SIZE);
             return;
         }
         self.shared_pages.remove(&page);
         self.resident.insert(page, storage);
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
+        if self.sync_window(page..page + 1).is_err() {
+            // Translated code then reaches the page as a soft page.
+            log::warn!("cannot open resident file page {page:#x} in the guest window");
+        }
         self.fast.invalidate(page..page + 1);
         self.touch(self.base + (page * PAGE_SIZE) as u32, PAGE_SIZE);
     }
@@ -1358,6 +1495,7 @@ impl Memory {
             }
             *page = perms | (*page & (SHARED | AUDIO));
         }
+        self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
         self.touch(addr, len);
         Ok(())
     }
@@ -2033,5 +2171,61 @@ mod file_page_tests {
         drop(memory);
         assert!(!page.dirty());
         assert_eq!(page.snapshot().unwrap(), [0x17; PAGE_SIZE]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod window_tests {
+    use super::*;
+    use crate::virtual_memory::GuestAccess::{Read, Write};
+
+    #[test]
+    fn the_guest_window_view_follows_guest_permissions_on_4k_and_16k_hosts() {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            // [0x3000, 0x10000): on 16K hosts the first host page also holds
+            // three slack pages below the guest base.
+            let mut memory = Memory::window_at_host_size(0x3000, 0xd000, host).unwrap();
+            memory.map(0x3000, 0xd000, 0).unwrap();
+            memory.write(0x8000, b"window").unwrap();
+            memory.protect(0x3000, 0x1000, 3).unwrap();
+            memory.protect(0x4000, 0x4000, 3).unwrap();
+            memory.protect(0x8000, 0x4000, 1).unwrap();
+            memory.protect(0xc000, 0x4000, 3).unwrap();
+            memory.watch_code(0xc000, 1);
+            let window = memory.window_base().unwrap();
+            let reservation = memory.reservation.as_ref().unwrap();
+            let start = reservation.ptr.as_ptr() as usize - window;
+            let view = reservation.direct_fault_view().unwrap();
+            let allows = |addr: usize, access| view.window_allows(addr - start, 0x1000, access);
+            assert_eq!(
+                allows(0x3000, Write),
+                host == 4096,
+                "{host}: a mixed host page is soft"
+            );
+            assert!(allows(0x4000, Write) && allows(0x7000, Write), "{host}");
+            assert!(allows(0x8000, Read) && !allows(0x8000, Write), "{host}");
+            assert!(
+                allows(0xc000, Read) && !allows(0xc000, Write),
+                "{host}: watched code"
+            );
+            // SAFETY: the page is readable in the window view.
+            let bytes = unsafe { std::slice::from_raw_parts((window + 0x8000) as *const u8, 6) };
+            assert_eq!(bytes, b"window");
+            drop(view);
+            memory.protect(0x4000, 0x4000, 0).unwrap();
+            memory.unmap(0x8000, 0x4000).unwrap();
+            let reservation = memory.reservation.as_ref().unwrap();
+            let view = reservation.direct_fault_view().unwrap();
+            assert!(!view.window_allows(0x4000 - start, 0x1000, Read), "{host}");
+            assert!(!view.window_allows(0x8000 - start, 0x1000, Read), "{host}");
+            drop(view);
+            memory.map(0x8000, 0x4000, 1).unwrap();
+            assert_eq!(
+                memory.read(0x8000, 6).unwrap(),
+                [0; 6],
+                "{host}: fresh pages are zero"
+            );
+        }
     }
 }

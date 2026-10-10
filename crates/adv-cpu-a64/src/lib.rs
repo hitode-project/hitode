@@ -13,8 +13,6 @@ mod executor;
 #[cfg(native)]
 mod native;
 pub mod runtime;
-#[cfg(native)]
-mod window;
 
 pub use adv_cpu_core::*;
 pub use executor::{ExecutionContext, Executor, Stats};

@@ -69,14 +69,32 @@ pub struct Executor {
 
 impl Executor {
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
-        Self::create(Memory::new(base, len)?)
+        #[cfg(native)]
+        let memory = {
+            let mut memory = Memory::window(base, len)?;
+            memory.map(base, len, 0)?;
+            memory
+        };
+        #[cfg(not(native))]
+        let memory = Memory::new(base, len)?;
+        Self::create(memory)
     }
 
     pub fn address_space() -> Result<Self, String> {
-        Self::create(Memory::reserve(0, 1usize << 32)?)
+        #[cfg(native)]
+        let memory = Memory::window(0, 1usize << 32)?;
+        #[cfg(not(native))]
+        let memory = Memory::reserve(0, 1usize << 32)?;
+        Self::create(memory)
     }
 
     fn create(memory: Memory) -> Result<Self, String> {
+        #[cfg(native)]
+        let native = crate::native::Native::new(
+            memory
+                .window_base()
+                .ok_or("a64 guest memory must live in a guest window")?,
+        )?;
         Ok(Self {
             state: CpuState::default(),
             stats: Stats::default(),
@@ -87,7 +105,7 @@ impl Executor {
             host_interrupts: true,
             deadline: None,
             #[cfg(native)]
-            native: crate::native::Native::new()?,
+            native,
         })
     }
 

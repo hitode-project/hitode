@@ -21,7 +21,6 @@ use crate::cache::CodeCache;
 use crate::encode::Size::W;
 use crate::encode::{Reg, b, movk, movz};
 use crate::runtime::{self, Exit, Runtime};
-use crate::window::Window;
 
 const CACHE_LEN: usize = 64 << 20;
 
@@ -73,15 +72,12 @@ pub(crate) struct Native {
     units: HashMap<u32, usize>,
     faults: Faults,
     runtime: Box<Runtime>,
-    /// Owns the reservation `runtime.window` points into. Guest memory moves
-    /// into it in M1; until then translated code only uses its base to bias
-    /// ESP and EBP.
-    #[cfg_attr(not(test), expect(dead_code, reason = "held for its reservation"))]
-    window: Window,
 }
 
 impl Native {
-    pub fn new() -> Result<Self, String> {
+    /// `window` is the host address of guest address 0 in the guest's
+    /// `GuestWindow`, which must outlive this.
+    pub fn new(window: usize) -> Result<Self, String> {
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
         let mut cache = CodeCache::new(CACHE_LEN)?;
         let stubs = runtime::stubs();
@@ -89,7 +85,6 @@ impl Native {
         // SAFETY: `enter` follows the C calling convention with the
         // signature of `Enter`; see `runtime::emit_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
-        let window = Window::new()?;
         Ok(Self {
             stub_len: cache.used(),
             faults: Faults {
@@ -103,8 +98,7 @@ impl Native {
             enter,
             exit: base + stubs.exit,
             units: HashMap::new(),
-            runtime: Box::new(Runtime::new(std::ptr::null_mut(), window.base() as u64)),
-            window,
+            runtime: Box::new(Runtime::new(std::ptr::null_mut(), window as u64)),
         })
     }
 
@@ -181,8 +175,9 @@ impl Native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adv_cpu_core::memory::Memory;
+
     use crate::encode::{ldr, ldr_reg, ldur};
-    use crate::window::GUARD;
 
     const X19: Reg = Reg::new(19);
     const X23: Reg = Reg::new(23);
@@ -209,32 +204,29 @@ mod tests {
         cpu
     }
 
+    /// Guest memory over the whole window and its translator.
+    fn native() -> (Memory, Native) {
+        let memory = Memory::window(0, 1 << 32).unwrap();
+        let native = Native::new(memory.window_base().unwrap()).unwrap();
+        (memory, native)
+    }
+
     #[test]
     fn the_window_is_aligned_and_biases_the_stack_registers() {
-        let native = Native::new().unwrap();
-        let base = native.window.base();
+        let (memory, native) = native();
+        let base = memory.window_base().unwrap();
         assert_eq!(base % (1 << 32), 0);
-        assert!(base >= GUARD);
+        assert!(base >= adv_cpu_core::virtual_memory::WINDOW_GUARD);
         assert_eq!(native.runtime.window, base as u64);
     }
 
     #[test]
-    fn a_committed_window_page_loads_directly() {
-        let mut native = Native::new().unwrap();
-        let page = native.window.base() + 0x2_0000;
-        // SAFETY: the page lies inside the window this test owns.
-        unsafe {
-            let mapped = libc::mmap(
-                page as *mut _,
-                0x4000,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
-                -1,
-                0,
-            );
-            assert_eq!(mapped as usize, page);
-            (page as *mut u32).add(1).write(0x1234_5678);
-        }
+    fn a_readable_guest_page_loads_directly() {
+        let (mut memory, mut native) = native();
+        memory.map(0x2_0000, 0x4000, 1).unwrap();
+        memory
+            .write(0x2_0004, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
         install(
             &mut native,
             0x1000,
@@ -248,8 +240,10 @@ mod tests {
 
     #[test]
     fn faults_in_guards_and_inaccessible_pages_resume_at_the_site() {
-        let mut native = Native::new().unwrap();
-        // push/pop past 0 and past 4 GiB, and an uncommitted window page.
+        let (mut memory, mut native) = native();
+        // A page the guest cannot read stays inaccessible in the window.
+        memory.map(0xa_0000, 0x1000, 0).unwrap();
+        // push/pop past 0 and past 4 GiB, an unmapped and an unreadable page.
         install(&mut native, 0x1000, ldur(W, X19, X23, -4));
         install(&mut native, 0x2000, ldr(W, X19, X23, 4));
         install(
@@ -261,6 +255,7 @@ mod tests {
             (0x1000, 0, 0),
             (0x2000, 0xffff_fffc, 0),
             (0x3000, 0x8000, 0x9_0000),
+            (0x3000, 0x8000, 0xa_0000),
         ] {
             let mut cpu = cpu(eip, esp, ecx);
             let before = cpu.clone();

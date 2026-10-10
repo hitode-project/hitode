@@ -361,7 +361,8 @@ impl SharedAlias {
         }
     }
 
-    fn new(len: usize) -> Result<(NonNull<u8>, Self), String> {
+    /// Maps the window view at `place` when given, replacing what is there.
+    fn new(len: usize, place: Option<NonNull<u8>>) -> Result<(NonNull<u8>, Self), String> {
         use std::os::fd::AsRawFd;
         let owned = Self::create_backing()?;
         let fd = owned.as_raw_fd();
@@ -373,27 +374,37 @@ impl SharedAlias {
                 std::io::Error::last_os_error()
             ));
         }
-        let map = |protection| unsafe {
+        let map = |address: *mut u8, protection, fixed| unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
+                address.cast(),
                 len,
                 protection,
-                libc::MAP_SHARED,
+                libc::MAP_SHARED | fixed,
                 fd,
                 0,
             )
         };
-        let window = map(libc::PROT_NONE);
+        let window = match place {
+            Some(place) => map(place.as_ptr(), libc::PROT_NONE, libc::MAP_FIXED),
+            None => map(std::ptr::null_mut(), libc::PROT_NONE, 0),
+        };
         if window == libc::MAP_FAILED {
             return Err(format!(
                 "map direct guest window: {}",
                 std::io::Error::last_os_error()
             ));
         }
-        let alias = map(libc::PROT_READ | libc::PROT_WRITE);
+        let alias = map(std::ptr::null_mut(), libc::PROT_READ | libc::PROT_WRITE, 0);
         if alias == libc::MAP_FAILED {
             let error = std::io::Error::last_os_error();
-            unsafe { libc::munmap(window, len) };
+            unsafe {
+                match place {
+                    Some(place) => super::window::vacate(place.as_ptr(), len),
+                    None => {
+                        libc::munmap(window, len);
+                    }
+                }
+            }
             return Err(format!("map checked guest alias: {error}"));
         }
         drop(owned);
@@ -571,22 +582,63 @@ impl Reservation {
     /// Explicit opt-in; existing Reservation::new and Memory constructors keep
     /// software permissions and their existing RW mapping behavior unchanged.
     pub fn new_direct(len: usize) -> Result<Self, String> {
-        Self::new_direct_at_host_size(len, super::os::page_size()?)
+        Self::new_direct_at_host_size(len, super::os::page_size()?, None)
     }
 
-    fn new_direct_at_host_size(len: usize, host_size: usize) -> Result<Self, String> {
+    /// A direct reservation whose guest view replaces `len` bytes at
+    /// `offset` past the base of `window`, which must outlive it.
+    pub fn new_direct_in(
+        window: &super::GuestWindow,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self, String> {
+        Self::new_direct_in_at_host_size(window, offset, len, super::os::page_size()?)
+    }
+
+    /// `new_direct_in` as on a host with `host_size` pages, a multiple of
+    /// the native size; tests use it to run 16K placement on 4K hosts.
+    pub(crate) fn new_direct_in_at_host_size(
+        window: &super::GuestWindow,
+        offset: usize,
+        len: usize,
+        host_size: usize,
+    ) -> Result<Self, String> {
+        if host_size == 0 || !host_size.is_multiple_of(super::os::page_size()?) {
+            return Err("host size must be a native-page multiple".into());
+        }
+        if !offset.is_multiple_of(host_size) {
+            return Err(format!(
+                "guest window offset {offset:#x} is not host page aligned"
+            ));
+        }
+        let place = window.place(offset, len.next_multiple_of(host_size))?;
+        Self::new_direct_at_host_size(len, host_size, Some(place))
+    }
+
+    fn new_direct_at_host_size(
+        len: usize,
+        host_size: usize,
+        place: Option<NonNull<u8>>,
+    ) -> Result<Self, String> {
         if len == 0 || !len.is_multiple_of(GUEST_PAGE_SIZE) {
             return Err("reservation must be page aligned and nonempty".into());
         }
         let mut pages = UnixPages::new(len, host_size)?;
         pages.enable_direct();
-        let (ptr, alias) = SharedAlias::new(pages.mapped_len)?;
+        let (ptr, alias) = SharedAlias::new(pages.mapped_len, place)?;
         Ok(Self {
             ptr,
             len,
             pages: std::cell::RefCell::new(pages),
             direct_alias: Some(alias),
+            placed: place.is_some(),
         })
+    }
+
+    /// The always-readable and writable view of committed guest bytes,
+    /// whatever the guest view's protection.
+    pub fn alias(&self) -> Option<NonNull<u8>> {
+        self.direct_alias.as_ref().map(|alias| alias.pointer)
     }
 
     #[cfg(test)]
@@ -597,7 +649,7 @@ impl Reservation {
         if host_size == 0 || !host_size.is_multiple_of(super::os::page_size()?) {
             return Err("simulated host size must be a native-page multiple".into());
         }
-        Self::new_direct_at_host_size(len, host_size)
+        Self::new_direct_at_host_size(len, host_size, None)
     }
 
     /// Acquire only outside asynchronous handlers. The returned lease blocks
@@ -637,7 +689,7 @@ impl Reservation {
     ) -> Result<(), String> {
         self.mutate_direct(offset, len, Mutation::Protect(protection))
     }
-    pub(super) fn decommit_direct(&self, offset: usize, len: usize) -> Result<(), String> {
+    pub fn decommit_direct(&self, offset: usize, len: usize) -> Result<(), String> {
         self.mutate_direct(offset, len, Mutation::Decommit)
     }
 

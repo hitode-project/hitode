@@ -11,9 +11,18 @@ const GUEST_PAGE_SIZE: usize = 4096;
 
 mod direct;
 #[cfg(unix)]
+mod window;
+#[cfg(unix)]
 pub use direct::DirectFaultView;
 #[cfg(unix)]
 pub use direct::{FaultClassification, GuestAccess, GuestPageProtection};
+#[cfg(unix)]
+pub use window::{GUARD as WINDOW_GUARD, GuestWindow};
+
+#[cfg(unix)]
+pub fn host_page_size() -> Result<usize, String> {
+    os::page_size()
+}
 
 #[cfg(windows)]
 mod os {
@@ -233,6 +242,9 @@ pub struct Reservation {
     pages: RefCell<UnixPages>,
     #[cfg(unix)]
     direct_alias: Option<direct::SharedAlias>,
+    /// Placed inside a `GuestWindow`, which owns the address range.
+    #[cfg(unix)]
+    placed: bool,
 }
 
 // Keep this planner independent of Unix syscalls so the mixed 4/16 KiB policy
@@ -411,6 +423,8 @@ impl Reservation {
             pages: RefCell::new(pages),
             #[cfg(unix)]
             direct_alias: None,
+            #[cfg(unix)]
+            placed: false,
         })
     }
     pub fn commit(&self, offset: usize, len: usize) -> Result<(), String> {
@@ -982,7 +996,14 @@ impl Drop for Reservation {
         }
         #[cfg(unix)]
         unsafe {
-            os::release(self.ptr.as_ptr(), self.pages.get_mut().mapped_len)
+            let len = self.pages.get_mut().mapped_len;
+            if self.placed {
+                // Hand the range back to the window as inaccessible
+                // reservation in one step, so no other mapping can land there.
+                window::vacate(self.ptr.as_ptr(), len);
+            } else {
+                os::release(self.ptr.as_ptr(), len)
+            }
         }
     }
 }
