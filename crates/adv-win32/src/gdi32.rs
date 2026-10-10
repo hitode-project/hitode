@@ -589,6 +589,35 @@ fn set_bk_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
     dc_field(env, dc.0, |_, _, m| std::mem::replace(m, mode as u32))
 }
 
+#[win32(gdi32, name = "GetTextColor", level = state)]
+fn get_text_color(env: &mut Env<'_>, dc: Handle) -> u32 {
+    match get(env, dc.0) {
+        Some(GdiObj::Dc { text_color, .. }) => *text_color,
+        _ => u32::MAX,
+    }
+}
+#[win32(gdi32, name = "GetBkColor", level = state)]
+fn get_bk_color(env: &mut Env<'_>, dc: Handle) -> u32 {
+    match get(env, dc.0) {
+        Some(GdiObj::Dc { bk_color, .. }) => *bk_color,
+        _ => u32::MAX,
+    }
+}
+#[win32(gdi32, name = "GetBkMode", level = state)]
+fn get_bk_mode(env: &mut Env<'_>, dc: Handle) -> i32 {
+    match get(env, dc.0) {
+        Some(GdiObj::Dc { bk_mode, .. }) => *bk_mode as i32,
+        _ => 0,
+    }
+}
+#[win32(gdi32, name = "GetStretchBltMode", level = state)]
+fn get_stretch_mode(env: &mut Env<'_>, dc: Handle) -> i32 {
+    match get(env, dc.0) {
+        Some(GdiObj::Dc { modes, .. }) => modes.stretch as i32,
+        _ => 0,
+    }
+}
+
 #[win32(gdi32, name = "SaveDC", level = implement)]
 fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
     if dc.0 == adv_os::gdi::WINDOW_DC {
@@ -1007,6 +1036,10 @@ pub fn register(reg: &mut Registry) {
         set_text_color_ABI,
         set_bk_color_ABI,
         set_bk_mode_ABI,
+        get_text_color_ABI,
+        get_bk_color_ABI,
+        get_bk_mode_ABI,
+        get_stretch_mode_ABI,
         save_dc_ABI,
         restore_dc_ABI,
         move_to_ex_ABI,

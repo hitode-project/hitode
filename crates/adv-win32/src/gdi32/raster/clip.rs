@@ -16,6 +16,7 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(rect_visible_ABI);
     reg.register(get_clip_box_ABI);
     reg.register(window_origin_ABI);
+    reg.register(viewport_origin_ABI);
     reg.register(set_window_origin_ABI);
     reg.register(set_viewport_origin_ABI);
 }
@@ -213,6 +214,15 @@ fn intersect(
 
 #[win32(gdi32, name="GetWindowOrgEx", level=state)]
 fn window_origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>) -> Outcome {
+    origin(env, dc, output, false)
+}
+
+#[win32(gdi32, name="GetViewportOrgEx", level=state)]
+fn viewport_origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>) -> Outcome {
+    origin(env, dc, output, true)
+}
+
+fn origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>, viewport: bool) -> Outcome {
     let Some(GdiObj::Dc { modes, .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
     else {
         // Native invalid-HDC query leaves both the POINT and LastError alone.
@@ -221,13 +231,21 @@ fn window_origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>) -> Outc
     if modes.map != 1 {
         adv_abi::warn_unavailable(
             env,
-            "gdi32.dll!GetWindowOrgEx",
+            if viewport {
+                "gdi32.dll!GetViewportOrgEx"
+            } else {
+                "gdi32.dll!GetWindowOrgEx"
+            },
             "only MM_TEXT window origins are available",
         );
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
-    let [x, y] = modes.window_origin;
+    let [x, y] = if viewport {
+        modes.viewport_origin
+    } else {
+        modes.window_origin
+    };
     if adv_abi::guest::check_range(env.cpu, output.addr(), 8, Prot::WRITE).is_err()
         || output.write(env.cpu, POINT { x, y }).is_err()
     {

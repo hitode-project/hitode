@@ -32,24 +32,11 @@ pub(crate) fn install<B: adv_cpu::backend::Backend>(
             let adv_machine::Conv::Stdcall { argc } = function.conv else {
                 return None;
             };
-            Some((id as u32, name, argc, function))
+            Some((id as u32, name, argc))
         })
         .collect();
-    for (id, name, argc, function) in entries {
+    for (id, name, argc) in entries {
         let alias = format!("Zw{}", &name[2..]);
-        // Nt/Zw user-mode exports identify the same service. Reuse the exact
-        // implementation and opaque binding data, including declarations whose
-        // Zw signature is absent from the SDK metadata set.
-        if let Some(registry) = m.sys.thunks.resolver_mut::<adv_abi::Registry>() {
-            registry.add_with_data(
-                "ntdll.dll",
-                &alias,
-                function.conv,
-                function.handler,
-                function.data,
-            );
-            registry.set_trace("ntdll.dll", &alias, function.trace);
-        }
         let mut code = adv_cpu::backend::asm::Asm::new(0);
         code.bytes.push(0xb8);
         code.bytes.extend(id.to_le_bytes());

@@ -1,10 +1,52 @@
 //! Caret creation currently reports the missing visual facility explicitly.
 use super::user;
 use crate::util::set_last_error;
-use adv_abi::{Env, Handle, Registry, win32};
+use adv_abi::{Env, GuestPtr, Handle, Registry, types::POINT, win32};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
+    registry.register(destroy_ABI);
+    registry.register(show_ABI);
+    registry.register(hide_ABI);
+    registry.register(set_position_ABI);
+    registry.register(get_position_ABI);
+}
+
+// CreateCaret cannot publish a caret yet, so these are ordinary missing-caret
+// results. Cleanup must not become a diagnostic stub or manufacture an owner.
+#[win32(user32, name = "DestroyCaret", level = state)]
+fn destroy(env: &mut Env<'_>) -> i32 {
+    absent(env, None)
+}
+#[win32(user32, name = "ShowCaret", level = state)]
+fn show(env: &mut Env<'_>, window: Handle) -> i32 {
+    absent(env, Some(window.0))
+}
+#[win32(user32, name = "HideCaret", level = state)]
+fn hide(env: &mut Env<'_>, window: Handle) -> i32 {
+    absent(env, Some(window.0))
+}
+#[win32(user32, name = "SetCaretPos", level = state)]
+fn set_position(env: &mut Env<'_>, _x: i32, _y: i32) -> i32 {
+    absent(env, None)
+}
+
+fn absent(env: &mut Env<'_>, window: Option<u32>) -> i32 {
+    let invalid = window
+        .is_some_and(|hwnd| hwnd != 0 && user(env).windows.get(&env.sys.objects, &hwnd).is_none());
+    set_last_error(env, if invalid { 1400 } else { 5 });
+    0
+}
+#[win32(user32, name = "GetCaretPos", level = state)]
+fn get_position(env: &mut Env<'_>, point: GuestPtr<POINT>) -> i32 {
+    // Native queues retain an initial (0,0) position even without a caret.
+    if adv_abi::guest::check_range(env.cpu, point.addr(), 8, adv_cpu::backend::Prot::WRITE).is_err()
+        || point.write(env.cpu, POINT { x: 0, y: 0 }).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    1
 }
 
 #[win32(user32, name = "CreateCaret", level = safe_fail)]

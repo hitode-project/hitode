@@ -204,29 +204,71 @@ impl Registry {
         name: &str,
         target: &'static str,
     ) -> Result<(), String> {
+        self.alias(module, name, target, false)
+    }
+
+    /// Declare a same-ABI public code alias when the SDK omits a declaration.
+    /// The personality owns that equivalence; both exports must be in the fixed
+    /// catalog, and every available SDK declaration is still checked. This does
+    /// not infer equivalence from names or permit aliases to another alias.
+    pub fn register_export_alias(
+        &mut self,
+        module: &str,
+        name: &str,
+        target: &'static str,
+    ) -> Result<(), String> {
+        self.alias(module, name, target, true)
+    }
+
+    fn alias(
+        &mut self,
+        module: &str,
+        name: &str,
+        target: &'static str,
+        public: bool,
+    ) -> Result<(), String> {
         let module = module.to_ascii_lowercase();
         let key = (module.clone(), name.to_owned());
         let valid = signature::lookup(&module, name)
             .zip(signature::lookup(&module, target))
-            .is_some_and(|(alias, original)| {
-                alias.data_size.is_none()
-                    && alias.conv.is_some()
-                    && alias.conv == original.conv
-                    && alias.return_kind == original.return_kind
-                    && alias.return_type == original.return_type
-                    && alias.parameters.len() == original.parameters.len()
-                    && alias
-                        .parameters
-                        .iter()
-                        .zip(&original.parameters)
-                        .all(|(a, b)| {
-                            a.kind == b.kind && a.words == b.words && a.type_name == b.type_name
+            .map_or_else(
+                || {
+                    public
+                        && [name, target].into_iter().all(|export| {
+                            system_exports::lookup(&module, export)
+                                .is_some_and(|e| e.kind == system_exports::Kind::Code)
                         })
-                    && self
-                        .fns
-                        .get(&(module.clone(), target.to_owned()))
-                        .is_some_and(|entry| Some(entry.host.conv) == original.conv)
-            });
+                        && self
+                            .fns
+                            .get(&(module.clone(), target.to_owned()))
+                            .is_some_and(|entry| {
+                                [name, target].into_iter().all(|export| {
+                                    signature::lookup(&module, export).is_none_or(|s| {
+                                        s.data_size.is_none() && s.conv == Some(entry.host.conv)
+                                    })
+                                })
+                            })
+                },
+                |(alias, original)| {
+                    alias.data_size.is_none()
+                        && alias.conv.is_some()
+                        && alias.conv == original.conv
+                        && alias.return_kind == original.return_kind
+                        && alias.return_type == original.return_type
+                        && alias.parameters.len() == original.parameters.len()
+                        && alias
+                            .parameters
+                            .iter()
+                            .zip(&original.parameters)
+                            .all(|(a, b)| {
+                                a.kind == b.kind && a.words == b.words && a.type_name == b.type_name
+                            })
+                        && self
+                            .fns
+                            .get(&(module.clone(), target.to_owned()))
+                            .is_some_and(|entry| Some(entry.host.conv) == original.conv)
+                },
+            );
         if name == target || !valid || self.data.contains_key(&key) {
             return Err(format!(
                 "invalid function alias: {module}!{name} -> {target}"
@@ -682,6 +724,40 @@ mod named_alias_tests {
         );
         assert_eq!(registry.canonical_name("kernel32.dll", "lstrcpy"), None);
         assert_eq!(registry.get("kernel32.dll", "lstrcpy").unwrap().data, 29);
+    }
+
+    #[test]
+    fn fixed_public_alias_requires_a_direct_target_and_checks_available_metadata() {
+        let mut registry = registry();
+        registry.add_with_data(
+            "ntdll.dll",
+            "NtCreateThreadEx",
+            Conv::Stdcall { argc: 11 },
+            |_| Outcome::Return(0),
+            37,
+        );
+        registry
+            .register_export_alias("ntdll.dll", "ZwCreateThreadEx", "NtCreateThreadEx")
+            .unwrap();
+        assert_eq!(
+            registry.get("ntdll.dll", "ZwCreateThreadEx").unwrap().data,
+            37
+        );
+        assert!(
+            registry
+                .register_export_alias("ntdll.dll", "ZwInvented", "NtCreateThreadEx")
+                .is_err()
+        );
+        assert!(
+            registry
+                .register_export_alias("ntdll.dll", "NtCreateThreadEx", "ZwCreateThreadEx")
+                .is_err()
+        );
+        assert!(
+            registry
+                .register_export_alias("kernel32.dll", "lstrcpyW", "lstrcpyA")
+                .is_err()
+        );
     }
 
     #[test]

@@ -297,4 +297,20 @@ pub fn register(reg: &mut Registry) {
         2,
         rtl_init_unicode_string,
     );
+    // Register before process installation: discovery and non-Win7 profiles
+    // must see the same implementations, without depending on numeric veneers.
+    for export in adv_abi::system_exports::exports(NTDLL) {
+        let Some(suffix) = export.name.strip_prefix("Zw") else {
+            continue;
+        };
+        let target = format!("Nt{suffix}");
+        if reg.is_implemented(NTDLL, export.name) || !reg.is_implemented(NTDLL, &target) {
+            continue;
+        }
+        let target = adv_abi::system_exports::lookup(NTDLL, &target)
+            .expect("native service has a fixed public export")
+            .name;
+        reg.register_export_alias(NTDLL, export.name, target)
+            .expect("user-mode Nt/Zw declarations share the complete ABI");
+    }
 }
