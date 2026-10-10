@@ -13,7 +13,188 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const READ_ONLY: u32 = 0x430000;
 const HKCU: u32 = 0x80000001;
+const HKLM: u32 = 0x80000002;
+const PROCESSOR_KEY: &str = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn processor_configuration_uses_shared_a_w_nt_handles_and_checked_query_sizes() {
+    let mut f = Fixture::new(932);
+    let path_a = f.a(&PROCESSOR_KEY.to_lowercase(), 932);
+    let path_w = f.w(PROCESSOR_KEY);
+    let a = f.word(0);
+    let w = f.word(0);
+    let nt = f.word(0);
+    let attributes = f.nt_attributes(I(0), &format!("\\Registry\\Machine\\{PROCESSOR_KEY}"));
+    let opened = [
+        f.call("RegOpenKeyA", &[I(HKLM), I(path_a), I(a)]),
+        f.call(
+            "RegOpenKeyExW",
+            &[I(HKLM), I(path_w), I(0), I(0x20019), I(w)],
+        ),
+        f.call_in("ntdll.dll", "NtOpenKey", &[I(nt), I(1), I(attributes)]),
+    ];
+    let mut checks = Vec::new();
+    for (key, wide) in [(a, false), (w, true), (nt, true)] {
+        let name = if wide { f.w("~MHz") } else { f.a("~mHz", 932) };
+        let api = if wide {
+            "RegQueryValueExW"
+        } else {
+            "RegQueryValueExA"
+        };
+        let kind = f.word(0);
+        let size = f.word(0);
+        let sized = f.call(api, &[L(key), I(name), I(0), I(kind), I(0), I(size)]);
+        let output = f.word(0xaabbccdd);
+        let small_size = f.word(2);
+        let small = f.call(
+            api,
+            &[L(key), I(name), I(0), I(kind), I(output), I(small_size)],
+        );
+        let preserved = f.word(0);
+        f.asm.mov_eax_mem(output).mov_mem_eax(preserved);
+        let full = f.call(
+            api,
+            &[L(key), I(name), I(0), I(kind), I(output), I(small_size)],
+        );
+        checks.push((
+            sized, size, small, small_size, preserved, full, output, kind,
+        ));
+    }
+    let vendor_name = f.a("VendorIdentifier", 932);
+    let vendor = f.blob(&[0xcc; 32]);
+    let vendor_size = f.word(32);
+    let vendor_read = f.call(
+        "RegQueryValueExA",
+        &[L(a), I(vendor_name), I(0), I(0), I(vendor), I(vendor_size)],
+    );
+    let next_cpu = f.w("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\1");
+    let absent = f.call("RegOpenKeyExW", &[I(HKLM), I(next_cpu), I(0), I(1), I(w)]);
+    f.run();
+    for result in opened {
+        assert_eq!(f.get(result), 0);
+    }
+    for (sized, size, small, small_size, preserved, full, output, kind) in checks {
+        assert_eq!(f.get(sized), 0);
+        assert_eq!(f.get(size), 4);
+        assert_eq!(f.get(small), 234);
+        assert_eq!(f.get(small_size), 4);
+        assert_eq!(f.get(preserved), 0xaabbccdd);
+        assert_eq!(f.get(full), 0);
+        assert_eq!(f.get(kind), 4);
+        assert_eq!(f.get(output), (adv_cpu::TSC_FREQ / 1_000_000) as u32);
+    }
+    assert_eq!(f.get(vendor_read), 0);
+    assert_eq!(
+        f.bytes(vendor, f.get(vendor_size) as usize),
+        b"GenuineIntel\0"
+    );
+    assert_eq!(f.get(absent), 2);
+    let state = f.machine.ext.get::<adv_os::registry::VirtualRegistry>();
+    assert!(!state.dirty);
+    assert!(!state.storage.as_ref().unwrap().exists());
+}
+
+#[test]
+fn processor_configuration_rejects_writes_creation_deletion_and_nt_write_opens() {
+    let mut f = Fixture::new(932);
+    let path = f.w(PROCESSOR_KEY);
+    let key = f.word(0);
+    let opened = f.call(
+        "RegOpenKeyExW",
+        &[I(HKLM), I(path), I(0), I(0x02000000), I(key)],
+    );
+    let mut denied = Vec::new();
+    for access in [2, 0x10000, 0xf003f, 0x40000000] {
+        let output = f.word(0xdeadbeef);
+        let result = f.call(
+            "RegOpenKeyExW",
+            &[I(HKLM), I(path), I(0), I(access), I(output)],
+        );
+        denied.push((result, output));
+    }
+    let name = f.w("~MHz");
+    let value = f.word(9999);
+    let set = f.call(
+        "RegSetValueExW",
+        &[L(key), I(name), I(0), I(4), I(value), I(4)],
+    );
+    let delete_value = f.call("RegDeleteValueW", &[L(key), I(name)]);
+    let delete_key = f.call("RegDeleteKeyW", &[I(HKLM), I(path)]);
+    let child = f.w("child");
+    let out = f.word(0xdeadbeef);
+    let disposition = f.word(0xdeadbeef);
+    let create = f.call(
+        "RegCreateKeyExW",
+        &[
+            L(key),
+            I(child),
+            I(0),
+            I(0),
+            I(1),
+            I(1),
+            I(0),
+            I(out),
+            I(disposition),
+        ],
+    );
+    let attributes = f.nt_attributes(I(0), &format!("\\Registry\\Machine\\{PROCESSOR_KEY}"));
+    let nt = f.word(0xdeadbeef);
+    let nt_write = f.call_in("ntdll.dll", "NtOpenKey", &[I(nt), I(2), I(attributes)]);
+    let size = f.word(4);
+    let query = f.call(
+        "RegQueryValueExW",
+        &[L(key), I(name), I(0), I(0), I(value), I(size)],
+    );
+    let user_path = f.w("Software\\SystemConfigurationFixture");
+    let (user_created, user_key, _) = f.create(user_path, true, 3);
+    let user_set = f.call(
+        "RegSetValueExW",
+        &[L(user_key), I(name), I(0), I(4), I(value), I(4)],
+    );
+    let flushed = f.call("RegFlushKey", &[L(user_key)]);
+    f.run();
+    assert_eq!(f.get(opened), 0);
+    for (result, output) in denied {
+        assert_eq!(f.get(result), 5);
+        assert_eq!(f.get(output), 0xdeadbeef);
+    }
+    for result in [set, delete_value, delete_key, create] {
+        assert_eq!(f.get(result), 5);
+    }
+    assert_eq!(f.get(out), 0xdeadbeef);
+    assert_eq!(f.get(disposition), 0xdeadbeef);
+    assert_eq!(f.get(nt_write), 0xc0000022);
+    assert_eq!(f.get(nt), 0);
+    assert_eq!(f.get(query), 0);
+    assert_eq!(f.get(value), 1000);
+    for result in [user_created, user_set, flushed] {
+        assert_eq!(f.get(result), 0);
+    }
+    let path = f
+        .machine
+        .ext
+        .get::<adv_os::registry::VirtualRegistry>()
+        .storage
+        .clone()
+        .unwrap();
+    drop(f);
+    let saved = adv_os::registry::load(path);
+    assert!(saved.load_error.is_none());
+    assert!(
+        saved
+            .keys
+            .keys()
+            .any(|k| k.root == HKCU && !k.path.is_empty())
+    );
+    let hardware: Vec<_> = "HARDWARE".encode_utf16().collect();
+    assert!(
+        !saved
+            .keys
+            .keys()
+            .any(|k| k.root == HKLM && k.path.starts_with(&hardware))
+    );
+}
 
 #[derive(Clone, Copy)]
 enum Arg {

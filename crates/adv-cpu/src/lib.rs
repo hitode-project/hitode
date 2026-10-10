@@ -62,7 +62,7 @@ pub use backend::jit::JitCpu;
 pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use compile::coverage::report as loop_coverage;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
-pub use cpu_profile::SegmentState;
+pub use cpu_profile::{PROCESSOR_IDENTITY, ProcessorIdentity, SegmentState};
 pub use executor::{
     AotImage, AotStats, ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats,
 };

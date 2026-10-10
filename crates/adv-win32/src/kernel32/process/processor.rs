@@ -69,7 +69,8 @@ fn set_thread(env: &mut Env<'_>, handle: Handle, mask: u32) -> u32 {
 }
 fn info(env: &mut Env<'_>, output: GuestPtr<[u32; 9]>) -> Result<(), MemFault> {
     let p = *env.ext.get_or_default::<Processors>();
-    // Family/model/revision follow the stable guest CPUID 0x00000690. The
+    let identity = adv_cpu::PROCESSOR_IDENTITY;
+    // Family/model/revision follow the shared guest CPUID identity. The
     // profile is x86 itself; there is no host WOW64/native-x64 exposure.
     output.write(
         env.cpu,
@@ -82,7 +83,7 @@ fn info(env: &mut Env<'_>, output: GuestPtr<[u32; 9]>) -> Result<(), MemFault> {
             p.count(),
             586,
             65536,
-            6 | (0x0900 << 16),
+            identity.family() | ((identity.model() << 8 | identity.stepping()) << 16),
         ],
     )
 }

@@ -7,6 +7,7 @@ mod scm;
 pub(crate) mod token;
 
 mod legacy;
+mod system;
 
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
@@ -24,7 +25,14 @@ pub(crate) fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
             .os
             .data_dir
             .join("registry/registry-v1.bin");
-        env.ext.insert(store::load(path));
+        let mut registry = store::load(path);
+        if registry.load_error.is_none() {
+            let modified = crate::kernel32::filetime_now(env);
+            if let Err(error) = system::install(&mut registry, modified) {
+                registry.load_error = Some(error);
+            }
+        }
+        env.ext.insert(registry);
     }
     env.ext.get_mut::<VirtualRegistry>()
 }
@@ -111,10 +119,7 @@ pub(crate) fn desired_access(mut access: u32) -> Result<u32, u32> {
     if access & 0x1000_0000 != 0 {
         access = (access & !0x1000_0000) | ALL_ACCESS
     }
-    if access & 0x0200_0000 != 0 {
-        access = (access & !0x0200_0000) | ALL_ACCESS
-    }
-    if access & !ALL_ACCESS != 0 {
+    if access & !(ALL_ACCESS | MAXIMUM_ALLOWED) != 0 {
         return Err(ACCESS_DENIED);
     }
     Ok(access)
@@ -123,7 +128,12 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
     let result = (|| -> Result<u32, u32> {
         let hkey = env.arg(0);
         let (options, access, out, disposition) = if legacy {
-            (0, ALL_ACCESS, env.arg(2), 0)
+            (
+                0,
+                if create { ALL_ACCESS } else { MAXIMUM_ALLOWED },
+                env.arg(2),
+                0,
+            )
         } else if create {
             if env.arg(2) != 0 {
                 return Err(INVALID_PARAMETER);
@@ -163,6 +173,9 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
         let existed = registry.keys.contains_key(&key);
         if !create && !existed {
             return Err(NOT_FOUND);
+        }
+        if create && !existed && registry.is_read_only(&key) {
+            return Err(ACCESS_DENIED);
         }
         if registry.handle_count(&env.sys.objects) >= MAX_HANDLES {
             return Err(NO_MEMORY);
@@ -270,7 +283,7 @@ fn set_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         let modified = crate::kernel32::filetime_now(env);
         let hkey = env.arg(0);
         let opened = opened(env, hkey)?;
-        if opened.access & SET == 0 {
+        if opened.access & SET == 0 || state(env).is_read_only(&opened.key) {
             return Err(ACCESS_DENIED);
         }
         let (kind, ptr, count) = (env.arg(3), env.arg(4), env.arg(5) as usize);

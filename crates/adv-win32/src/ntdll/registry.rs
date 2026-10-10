@@ -1,4 +1,4 @@
-//! NT key opens share the private Win32 registry and its Objects namespace.
+//! NT key opens share the virtual registry, runtime ACLs and Objects namespace.
 use adv_abi::{GuestPtr, Registry, guest::check_range, warn_unavailable, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
@@ -184,8 +184,8 @@ fn open(env: &mut Env<'_>, output: GuestPtr<u32>, access: u32, attributes: Guest
         if !registry.keys.contains_key(&key) {
             return Err(NAME_NOT_FOUND);
         }
-        // The provider's default ACL is shared with RegOpenKeyEx; the parent
-        // handle's access mask does not define the child's ACL.
+        // The owner applies the same runtime-configuration ACL as RegOpenKeyEx;
+        // the parent handle's access mask does not define the child's ACL.
         let handle = registry
             .allocate(&mut env.sys.objects, key, access)
             .map_err(status)?;
