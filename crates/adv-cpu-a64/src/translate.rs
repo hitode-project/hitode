@@ -31,7 +31,7 @@ use iced_x86::{ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, Op
 use crate::asm::{Asm, Label};
 use crate::encode::Extend::Uxtw;
 use crate::encode::Index::{Post, Pre};
-use crate::encode::Shift::Lsl;
+use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::Exit;
@@ -90,16 +90,22 @@ pub enum Recipe {
     Neg(Operand),
     /// `result = x + x`, whose AF is bit 4 of the result: x ^ x is 0.
     Doubled(Operand),
+    /// PF from the result; x11 holds AF, which the instruction kept.
+    Parity(Operand),
+    /// `result` and `left ^ right`, as after a carrying add or subtract.
+    Mixed(Operand, Operand),
 }
 
 impl Recipe {
     /// The PF source and the AF source, reading operands through `value`;
-    /// `None` when they are already canonical.
-    pub fn evaluate(self, value: impl Fn(Operand) -> u32) -> Option<(u32, u32)> {
+    /// `None` when they are already canonical, and no AF source when only
+    /// PF is pending.
+    pub fn evaluate(self, value: impl Fn(Operand) -> u32) -> Option<(u32, Option<u32>)> {
         use Recipe::*;
         let pair = |a: Operand, b: Operand| (value(a), value(b));
         Some(match self {
             Canonical => return None,
+            Parity(r) => return Some((value(r), None)),
             AddResult(r, b) => {
                 let (r, b) = pair(r, b);
                 (r, r.wrapping_sub(b) ^ b ^ r)
@@ -127,15 +133,29 @@ impl Recipe {
                 (r, r.wrapping_neg() ^ r)
             }
             Doubled(r) => (value(r), value(r)),
+            Mixed(r, t) => {
+                let (r, t) = pair(r, t);
+                (r, t ^ r)
+            }
         })
+        .map(|(parity, adjust)| (parity, Some(adjust)))
+    }
+
+    /// Whether AF is known to be clear.
+    fn clears_af(self) -> bool {
+        matches!(
+            self,
+            Recipe::Logic(_) | Recipe::And(..) | Recipe::Or(..) | Recipe::Xor(..)
+        )
     }
 
     fn operands(self) -> [Option<Operand>; 2] {
         use Recipe::*;
         match self {
             Canonical => [None, None],
-            Logic(a) | Neg(a) | Doubled(a) => [Some(a), None],
-            AddResult(a, b)
+            Logic(a) | Neg(a) | Doubled(a) | Parity(a) => [Some(a), None],
+            Mixed(a, b)
+            | AddResult(a, b)
             | SubResult(a, b)
             | Add(a, b)
             | Sub(a, b)
@@ -172,6 +192,9 @@ pub struct Unit {
 }
 
 const X6: Reg = Reg::new(6);
+/// Flag-building scratch without FlagM.
+const X13: Reg = Reg::new(13);
+const X14: Reg = Reg::new(14);
 const X9: Reg = Reg::new(9);
 const X10: Reg = Reg::new(10);
 const X11: Reg = Reg::new(11);
@@ -220,6 +243,15 @@ enum Alu {
     Test,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShiftKind {
+    Shl,
+    Shr,
+    Sar,
+    Rol,
+    Ror,
+}
+
 /// A narrow source of `movzx`/`movsx`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Narrow8or16 {
@@ -252,6 +284,12 @@ enum Op {
     CallIndirect(Src),
     Setcc(ConditionCode, u8),
     Cmov(ConditionCode, u8, Src),
+    /// A register shifted by a count of 1 to 31.
+    Shift(ShiftKind, u8, u32),
+    /// `imul dst, source` or `imul dst, source, imm`.
+    Imul(u8, Src, Option<u32>),
+    /// `adc` (false) or `sbb` (true) into a register.
+    Carry(bool, u8, Src),
 }
 
 fn gpr32(register: Register) -> Option<u8> {
@@ -356,6 +394,40 @@ fn plan(instruction: &Instruction) -> Option<Op> {
             Op::Extend(register(0)?, source, signed)
         }
         M::Cdq => Op::Cdq,
+        M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
+            let dst = register(0)?;
+            if instruction.op_kind(1) != OpKind::Immediate8 {
+                return None;
+            }
+            let kind = match mnemonic {
+                M::Shl | M::Sal => ShiftKind::Shl,
+                M::Shr => ShiftKind::Shr,
+                M::Sar => ShiftKind::Sar,
+                M::Rol => ShiftKind::Rol,
+                _ => ShiftKind::Ror,
+            };
+            // A zero count changes nothing, flags included.
+            match u32::from(instruction.immediate8()) & 31 {
+                0 => Op::Nop,
+                count => Op::Shift(kind, dst, count),
+            }
+        }
+        M::Imul => {
+            let dst = register(0)?;
+            let source = match operand(instruction, 1)? {
+                Src::Imm(_) => return None,
+                source => source,
+            };
+            match count {
+                2 => Op::Imul(dst, source, None),
+                3 => Op::Imul(dst, source, Some(instruction.immediate(2) as u32)),
+                _ => return None,
+            }
+        }
+        M::Adc | M::Sbb => match two()? {
+            (Src::Reg(dst), source) => Op::Carry(mnemonic == M::Sbb, dst, source),
+            _ => return None,
+        },
         M::Push if count == 1 => Op::Push(operand(instruction, 0)?),
         M::Pop => match register(0)? {
             ESP => return None,
@@ -677,6 +749,14 @@ impl Translator {
                 let r = value(self, r);
                 self.emit_all(&[mov(W, w10, r), mov(W, w11, r)]);
             }
+            Parity(r) => {
+                let r = value(self, r);
+                self.emit(mov(W, w10, r));
+            }
+            Mixed(r, t) => {
+                let (r, t) = (value(self, r), value(self, t));
+                self.emit_all(&[mov(W, w10, r), eor(W, w11, t, r, Lsl, 0)]);
+            }
         }
     }
 
@@ -702,7 +782,12 @@ impl Translator {
 
     /// Flips C to subtraction sense; uses x17.
     fn canonical_carry(&mut self) {
-        if self.sense == Sense::Subtraction {
+        self.set_sense(Sense::Subtraction);
+    }
+
+    /// Flips C to `sense`; uses x17.
+    fn set_sense(&mut self, sense: Sense) {
+        if self.sense == sense {
             return;
         }
         if self.features.flagm {
@@ -710,7 +795,29 @@ impl Translator {
         } else {
             self.emit_all(&[mrs_nzcv(X17), eor_imm(X, X17, X17, 1 << 29), msr_nzcv(X17)]);
         }
-        self.sense = Sense::Subtraction;
+        self.sense = sense;
+    }
+
+    /// Sets C to bit `carry.1` of `carry.0`, and V to bit `overflow.1` of
+    /// `overflow.0` if given, keeping the other flags; uses x13 and x14
+    /// without FlagM.
+    fn insert_flags(&mut self, carry: (Reg, u32), overflow: Option<(Reg, u32)>) {
+        if self.features.flagm {
+            self.emit(rmif(carry.0, (carry.1 + 63) % 64, 0b0010));
+            if let Some((reg, bit)) = overflow {
+                self.emit(rmif(reg, bit, 0b0001));
+            }
+            return;
+        }
+        self.emit_all(&[
+            mrs_nzcv(X13),
+            ubfx(X, X14, carry.0, carry.1, 1),
+            bfi(X, X13, X14, 29, 1),
+        ]);
+        if let Some((reg, bit)) = overflow {
+            self.emit_all(&[ubfx(X, X14, reg, bit, 1), bfi(X, X13, X14, 28, 1)]);
+        }
+        self.emit(msr_nzcv(X13));
     }
 
     /// Canonical flags, the charge for this path, then the exit.
@@ -1034,6 +1141,9 @@ impl Translator {
                 self.clobber(Operand::Guest(index));
                 self.emit_all(&[cset(W, X17, cond), bfi(W, host(index), X17, lsb, 8)]);
             }
+            Op::Shift(kind, dst, count) => self.shift(kind, dst, count),
+            Op::Imul(dst, source, imm) => self.imul(dst, source, imm),
+            Op::Carry(subtract, dst, source) => self.carry(subtract, dst, source),
             Op::Cmov(cc, dst, source) => {
                 let value = match source {
                     Src::Reg(index) => host(index),
@@ -1107,6 +1217,133 @@ impl Translator {
             }
         }
         self.commit(dst);
+    }
+
+    /// A register shifted or rotated by `count`, 1 to 31. Flags follow the
+    /// interpreter: OF only changes for a one-bit count, AF never does.
+    fn shift(&mut self, kind: ShiftKind, dst: u8, count: u32) {
+        use ShiftKind::*;
+        let guest = Operand::Guest(dst);
+        let (source, result) = (host(dst), Self::result(dst));
+        if matches!(kind, Rol | Ror) {
+            // Only CF and OF change; PF and AF keep their recipe.
+            self.clobber(guest);
+            let rotate = if kind == Rol { 32 - count } else { count };
+            self.emit(ror_imm(W, result, source, rotate));
+            // CF is the bit that wrapped around. OF for one bit is the new
+            // top bit XOR CF (rol) or XOR the next bit down (ror).
+            let carry = if kind == Rol { 0 } else { 31 };
+            let overflow = (count == 1).then(|| {
+                let shift = if kind == Rol { 31 } else { 1 };
+                self.emit(eor(W, X17, result, result, Lsl, shift));
+                (X17, 31)
+            });
+            self.insert_flags((result, carry), overflow);
+            self.commit(dst);
+            self.sense = Sense::Addition;
+            return;
+        }
+        // PF comes from the result and AF stays.
+        let recipe = if self.recipe.clears_af() {
+            Recipe::Logic(guest)
+        } else {
+            self.materialize();
+            Recipe::Parity(guest)
+        };
+        if kind == Shl && count == 1 {
+            // CF is the old top bit and OF the new top bit XOR CF.
+            self.emit(adds(W, result, source, source, Lsl, 0));
+        } else {
+            if count > 1 {
+                // Kept OF.
+                self.emit(cset(W, X17, Cond::Vs));
+            }
+            let shift = match kind {
+                Shl => Lsl,
+                Shr => Lsr,
+                _ => Asr,
+            };
+            // N and Z from the result, C and V clear.
+            self.emit(adds(W, X16, Reg::ZR, source, shift, count));
+            let carry = if kind == Shl { 32 - count } else { count - 1 };
+            let overflow = match kind {
+                _ if count > 1 => Some((X17, 0)),
+                Shr => Some((source, 31)),
+                _ => None,
+            };
+            self.insert_flags((source, carry), overflow);
+            if !biased(dst) {
+                self.emit(mov(W, source, X16));
+            }
+        }
+        self.commit(dst);
+        self.sense = Sense::Addition;
+        self.recipe = recipe;
+    }
+
+    /// `imul dst, source[, imm]`: CF and OF report a product that does not
+    /// fit; SF, ZF, AF and PF stay, as in the interpreter.
+    fn imul(&mut self, dst: u8, source: Src, imm: Option<u32>) {
+        self.clobber(Operand::Guest(dst));
+        let value = match source {
+            Src::Reg(index) => host(index),
+            Src::Mem(mem) => {
+                let addr = self.address(mem);
+                self.load(addr, X6);
+                X6
+            }
+            Src::Imm(_) => unreachable!(),
+        };
+        let (left, right) = match imm {
+            Some(imm) => (value, self.imm(imm, X17)),
+            None => (host(dst), value),
+        };
+        self.emit_all(&[
+            smull(X16, left, right),
+            // Nonzero when the product differs from its sign-extended low
+            // half; OR with its negation puts that in bit 63.
+            sub_ext(X, X17, X16, X16, Extend::Sxtw, 0),
+            sub(X, X6, Reg::ZR, X17, Lsl, 0),
+            orr(X, X17, X17, X6, Lsl, 0),
+        ]);
+        self.insert_flags((X17, 63), Some((X17, 63)));
+        if biased(dst) {
+            self.commit(dst);
+        } else {
+            self.emit(mov(W, host(dst), X16));
+        }
+        self.sense = Sense::Addition;
+    }
+
+    /// `adc` or `sbb` into a register: the host's carrying forms, with C in
+    /// the sense each reads.
+    fn carry(&mut self, subtract: bool, dst: u8, source: Src) {
+        self.set_sense(if subtract {
+            Sense::Subtraction
+        } else {
+            Sense::Addition
+        });
+        let (right, loaded) = match source {
+            Src::Reg(index) => (host(index), None),
+            Src::Imm(value) => (self.imm(value, X17), None),
+            Src::Mem(mem) => {
+                let t = self.take_temp();
+                let addr = self.address(mem);
+                self.load(addr, temp(t));
+                (temp(t), Some(t))
+            }
+        };
+        // No site follows, so the old recipe's temporaries are free.
+        let mixed = loaded.map_or_else(|| self.take_temp(), |t| 1 - t);
+        let (left, result) = (host(dst), Self::result(dst));
+        self.emit(eor(W, temp(mixed), left, right, Lsl, 0));
+        self.emit(if subtract {
+            sbcs(W, result, left, right)
+        } else {
+            adcs(W, result, left, right)
+        });
+        self.commit(dst);
+        self.recipe = Recipe::Mixed(Operand::Guest(dst), Operand::Temp(mixed));
     }
 
     /// `alu reg, source`.

@@ -102,3 +102,11 @@ f80ff781	str x1, [x28], #255
 78f04b70	ldrsh w16, [x27, w16, uxtw]
 38304b66	strb w6, [x27, w16, uxtw]
 78394b73	strh w19, [x27, w25, uxtw]
+3a150339	adcs w25, w25, w21
+7a110020	sbcs w0, w1, w17
+cb30c211	sub x17, x16, w16, sxtw
+9b267eb0	smull x16, w21, w6
+13077c70	asr w16, w3, #7
+13937673	ror w19, w19, #29
+93c2fc41	ror x1, x2, #63
+2b550ff0	adds w16, wzr, w21, lsr #3

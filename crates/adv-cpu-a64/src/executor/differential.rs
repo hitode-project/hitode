@@ -127,7 +127,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(22) {
+    match rng.below(25) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -255,12 +255,11 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
             }
         }
         // Left to the interpreter, between translated neighbours.
-        19 => match rng.below(6) {
-            0 => a.shl(w, 3),
-            1 => a.imul_2(w, r),
-            2 => a.adc(w, r),
-            3 => a.sbb(w, rng.imm()),
-            4 => a.bswap(w),
+        19 => match rng.below(5) {
+            0 => a.shl(w, cl),
+            1 => a.rcl(w, 1),
+            2 => a.imul(r),
+            3 => a.bswap(w),
             _ => a.add(al, 7),
         }
         .unwrap(),
@@ -268,6 +267,48 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
             a.sub(esp, 8).unwrap();
             a.mov(dword_ptr(esp + 4), r).unwrap();
             a.add(esp, 8).unwrap();
+        }
+        21 => {
+            // Counts are masked to 5 bits: 32 does nothing and 33 is 1.
+            let count = rng.pick(&[0u32, 1, 1, 2, 7, 31, 32, 33]);
+            match rng.below(5) {
+                0 => a.shl(w, count),
+                1 => a.shr(w, count),
+                2 => a.sar(w, count),
+                3 => a.rol(w, count),
+                _ => a.ror(w, count),
+            }
+            .unwrap()
+        }
+        22 => match rng.below(4) {
+            0 => a.imul_2(w, r).unwrap(),
+            1 => {
+                let m = mem(a, rng);
+                a.imul_2(w, dword_ptr(m)).unwrap()
+            }
+            2 => a.imul_3(w, r, rng.imm()).unwrap(),
+            _ => {
+                let m = mem(a, rng);
+                a.imul_3(w, dword_ptr(m), rng.imm()).unwrap()
+            }
+        },
+        23 => {
+            let sbb = rng.below(2) == 1;
+            match rng.below(3) {
+                0 if sbb => a.sbb(w, r),
+                0 => a.adc(w, r),
+                1 if sbb => a.sbb(w, rng.imm()),
+                1 => a.adc(w, rng.imm()),
+                _ => {
+                    let m = mem(a, rng);
+                    if sbb {
+                        a.sbb(w, dword_ptr(m))
+                    } else {
+                        a.adc(w, dword_ptr(m))
+                    }
+                }
+            }
+            .unwrap()
         }
         _ => a.nop().unwrap(),
     }

@@ -114,6 +114,20 @@ pub const fn subs(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u
     shifted(0x6B00_0000, size, rd, rn, rm, shift, amount)
 }
 
+const fn carrying(base: u32, size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    base | size.sf() | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `adcs rd, rn, rm`: `rn + rm + C`, in addition sense.
+pub const fn adcs(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    carrying(0x3A00_0000, size, rd, rn, rm)
+}
+
+/// `sbcs rd, rn, rm`: `rn - rm - !C`, in subtraction sense.
+pub const fn sbcs(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    carrying(0x7A00_0000, size, rd, rn, rm)
+}
+
 /// `ands rd, rn, rm, <shift> #amount`, which clears C and V.
 pub const fn ands(size: Size, rd: Reg, rn: Reg, rm: Reg, shift: Shift, amount: u32) -> u32 {
     shifted(0x6A00_0000, size, rd, rn, rm, shift, amount)
@@ -199,6 +213,7 @@ pub const fn cmn_imm(size: Size, rn: Reg, imm: u32, shift12: bool) -> u32 {
 pub enum Extend {
     Uxtw = 2,
     Uxtx = 3,
+    Sxtw = 6,
 }
 
 /// `add rd, rn, rm, <extend> #amount`, as in the window form
@@ -212,6 +227,16 @@ pub const fn add_ext(size: Size, rd: Reg, rn: Reg, rm: Reg, extend: Extend, amou
         | amount << 10
         | rn.number() << 5
         | rd.number()
+}
+
+/// `sub rd, rn, rm, <extend> #amount`. Register 31 is SP for `rd` and `rn`.
+pub const fn sub_ext(size: Size, rd: Reg, rn: Reg, rm: Reg, extend: Extend, amount: u32) -> u32 {
+    add_ext(size, rd, rn, rm, extend, amount) | 0x4000_0000
+}
+
+/// `smull xd, wn, wm`: the signed 64-bit product.
+pub const fn smull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9B20_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
 }
 
 /// `mov rd, rn` where either side may be SP.
@@ -343,6 +368,21 @@ pub const fn lsl_imm(size: Size, rd: Reg, rn: Reg, shift: u32) -> u32 {
 /// `lsr rd, rn, #shift`.
 pub const fn lsr_imm(size: Size, rd: Reg, rn: Reg, shift: u32) -> u32 {
     bitfield(0x5300_0000, size, rd, rn, shift, size.bits() - 1)
+}
+
+/// `asr rd, rn, #shift`.
+pub const fn asr_imm(size: Size, rd: Reg, rn: Reg, shift: u32) -> u32 {
+    bitfield(0x1300_0000, size, rd, rn, shift, size.bits() - 1)
+}
+
+/// `ror rd, rn, #shift`, which is `extr rd, rn, rn, #shift`.
+pub const fn ror_imm(size: Size, rd: Reg, rn: Reg, shift: u32) -> u32 {
+    assert!(shift < size.bits());
+    let n = match size {
+        Size::W => 0,
+        Size::X => 1 << 22,
+    };
+    0x1380_0000 | size.sf() | n | rn.number() << 16 | shift << 10 | rn.number() << 5 | rd.number()
 }
 
 /// A SIMD and floating-point register number.
@@ -906,6 +946,20 @@ mod tests {
                 "strh w19, [x27, w25, uxtw]",
             ),
             (rmif(r(17), 63, 2), "rmif x17, #63, #0x2"),
+            (adcs(W, r(25), r(25), r(21)), "adcs w25, w25, w21"),
+            (sbcs(W, r(0), r(1), r(17)), "sbcs w0, w1, w17"),
+            (
+                sub_ext(X, r(17), r(16), r(16), Extend::Sxtw, 0),
+                "sub x17, x16, w16, sxtw",
+            ),
+            (smull(r(16), r(21), r(6)), "smull x16, w21, w6"),
+            (asr_imm(W, r(16), r(3), 7), "asr w16, w3, #7"),
+            (ror_imm(W, r(19), r(19), 29), "ror w19, w19, #29"),
+            (ror_imm(X, r(1), r(2), 63), "ror x1, x2, #63"),
+            (
+                adds(W, r(16), Reg::ZR, r(21), Lsr, 3),
+                "adds w16, wzr, w21, lsr #3",
+            ),
             (
                 ldr_indexed(W, Index::Post, r(19), r(23), 4),
                 "ldr w19, [x23], #4",

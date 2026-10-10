@@ -406,7 +406,10 @@ fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
     };
     if let Some((parity, adjust)) = site.recipe.evaluate(value) {
         let pf = u32::from((parity as u8).count_ones().is_multiple_of(2));
-        cpu.eflags = cpu.eflags & !0x14 | pf << 2 | adjust & 0x10;
+        cpu.eflags = cpu.eflags & !0x04 | pf << 2;
+        if let Some(adjust) = adjust {
+            cpu.eflags = cpu.eflags & !0x10 | adjust & 0x10;
+        }
     }
 }
 

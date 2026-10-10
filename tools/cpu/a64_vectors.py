@@ -60,8 +60,9 @@ def assemble(lines: list[str]) -> list[str]:
         source = Path(tmp) / "v.s"
         obj, raw = source.with_suffix(".o"), source.with_suffix(".bin")
         source.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
-        subprocess.run([str(clang), f"--target={TARGET}", "-c", str(source), "-o", str(obj)],
-                       check=True)
+        # FEAT_FlagM (rmif, cfinv) is part of Armv8.4.
+        subprocess.run([str(clang), f"--target={TARGET}", "-march=armv8.4-a", "-c", str(source),
+                        "-o", str(obj)], check=True)
         subprocess.run([str(objcopy), "-O", "binary", "--only-section=.text", str(obj), str(raw)],
                        check=True)
         data = raw.read_bytes()
