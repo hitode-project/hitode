@@ -853,6 +853,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let backend_flags = [
         ("opt_level", opt_level),
         ("preserve_frame_pointers", "true"),
+        // A frame larger than the guard page must touch each page in order,
+        // or its first store lands past the guard and faults. Only such
+        // frames pay for the probe.
+        ("enable_probestack", "true"),
+        ("probestack_strategy", "inline"),
         (
             "machine_code_cfg_info",
             if recovery_cfg { "true" } else { "false" },
