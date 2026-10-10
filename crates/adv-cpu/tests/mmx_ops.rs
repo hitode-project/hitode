@@ -198,7 +198,8 @@ fn mmx_store_fault_checks_both_pages_before_writing() {
     jit.state.regs[7] = DATA + 4092;
     jit.write(DATA, &u64::MAX.to_le_bytes()).unwrap();
     assert!(
-        matches!(jit.run(STOP,100).unwrap(),RunOutcome::WriteFault{address,..}if address==DATA+4092)
+        // Hardware reports the first inaccessible byte and writes nothing.
+        matches!(jit.run(STOP,100).unwrap(),RunOutcome::WriteFault{address,..}if address==DATA+4096)
     );
     assert_eq!(jit.memory().read(DATA + 4092, 8).unwrap(), [0; 8]);
 }

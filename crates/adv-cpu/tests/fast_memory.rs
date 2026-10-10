@@ -71,36 +71,8 @@ fn operand(width: u32, write: bool) -> Vec<u8> {
 }
 
 fn compare(mut jit: Executor, mut reference: Executor, width: u32) {
-    let operand = jit.state.regs[6];
+    // Both engines report the first inaccessible byte, as hardware does.
     let expected = reference.run(STOP, 100).unwrap();
-    // The pre-existing SIMD interpreter reports the first inaccessible byte,
-    // whereas the JIT's scalar/vector guards report the operand's start.
-    // Assert the established JIT diagnostic explicitly, alongside identical
-    // instruction/state/memory effects. The unmodified baseline reproduces
-    // this convention difference for an eight-byte cross-page read.
-    let expected = match expected {
-        RunOutcome::ReadFault { pc, address } if width >= 8 && pc == CODE + 1 => {
-            assert!(
-                (u64::from(operand)..u64::from(operand) + u64::from(width))
-                    .contains(&u64::from(address))
-            );
-            RunOutcome::ReadFault {
-                pc,
-                address: operand,
-            }
-        }
-        RunOutcome::WriteFault { pc, address } if width >= 8 && pc == CODE + 1 => {
-            assert!(
-                (u64::from(operand)..u64::from(operand) + u64::from(width))
-                    .contains(&u64::from(address))
-            );
-            RunOutcome::WriteFault {
-                pc,
-                address: operand,
-            }
-        }
-        other => other,
-    };
     let actual = jit.run(STOP, 100).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(jit.state.eip, reference.state.eip);

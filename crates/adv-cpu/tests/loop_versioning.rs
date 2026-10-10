@@ -1137,7 +1137,7 @@ fn memory_bounds_crossing_page_permissions_match_unicorn() {
             jit.run(STOP, 100).unwrap(),
             RunOutcome::ReadFault {
                 pc: uc.state.eip,
-                address: BOUND,
+                address: END - 4096,
             }
         );
         assert_eq!(jit.state.eip, uc.state.eip);

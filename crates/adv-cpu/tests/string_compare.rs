@@ -310,7 +310,7 @@ fn unaligned_denied_page_faults_before_the_first_comparison_and_restarts() {
             jit.run(STOP, 1000).unwrap(),
             RunOutcome::ReadFault {
                 pc: CODE,
-                address: DST + 4095
+                address: DST + 4096
             }
         );
         assert_eq!(jit.state.regs, before.regs);

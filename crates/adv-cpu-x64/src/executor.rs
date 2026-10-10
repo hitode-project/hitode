@@ -1338,6 +1338,12 @@ impl Executor {
         self.code.refresh_links();
     }
 
+    /// Publishes the hardware fault address of an access starting at `start`.
+    fn fault_address(&mut self, start: u32, permission: u8) -> u32 {
+        let address = crate::interpreter::fault_address(&self.memory, start, permission);
+        self.state.fault_addr = address;
+        address
+    }
     fn validate_stop(&mut self, stop: u32) -> Result<(), String> {
         if self.code.stop_is_outside(stop) {
             Ok(())
@@ -1663,15 +1669,17 @@ impl Executor {
                         return Ok(RunOutcome::Budget);
                     }
                     n if n == Exit::ReadFault as u32 => {
+                        let address = self.fault_address(self.state.fault_addr, crate::READ);
                         return Ok(RunOutcome::ReadFault {
                             pc: self.state.eip,
-                            address: self.state.fault_addr,
+                            address,
                         });
                     }
                     n if n == Exit::WriteFault as u32 => {
+                        let address = self.fault_address(self.state.fault_addr, crate::WRITE);
                         return Ok(RunOutcome::WriteFault {
                             pc: self.state.eip,
-                            address: self.state.fault_addr,
+                            address,
                         });
                     }
                     n if n == Exit::Fallback as u32 => {
@@ -1829,11 +1837,11 @@ impl Executor {
                 Step::Executed => {}
                 Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
                 Step::ReadFault { pc, address } => {
-                    self.state.fault_addr = address;
+                    let address = self.fault_address(address, crate::READ);
                     return Ok(RunOutcome::ReadFault { pc, address });
                 }
                 Step::WriteFault { pc, address } => {
-                    self.state.fault_addr = address;
+                    let address = self.fault_address(address, crate::WRITE);
                     return Ok(RunOutcome::WriteFault { pc, address });
                 }
                 Step::FetchFault { pc, address } => {
@@ -2772,7 +2780,7 @@ mod permission_tests {
             m.run(0x4000, 100).unwrap(),
             RunOutcome::ReadFault {
                 pc: 0x1000,
-                address: 0x2ffe
+                address: 0x3000
             }
         );
         let mut m = machine(&code);

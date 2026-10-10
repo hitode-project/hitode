@@ -194,7 +194,7 @@ fn faulting_rmw_keeps_registers_flags_and_memory_before_the_instruction() {
     jit.protect(DATA + 4096, 4096, READ).unwrap();
     reset(&mut jit, [9, 0, 0, 0, 0, 0, 0, DATA + 4094], 2);
     let outcome = jit.run(STOP, 100).unwrap();
-    assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4094));
+    assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4096));
     assert_eq!(jit.state.regs[0], 16);
     assert_eq!(jit.memory().read(DATA + 4094, 4).unwrap(), [0; 4]);
 }
@@ -211,7 +211,7 @@ fn faults_keep_arithmetic_flags_that_later_code_can_read() {
     jit.protect(DATA + 4096, 4096, READ).unwrap();
     reset(&mut jit, [9, 0, 0, 0, 0, 0, 0, DATA + 4094], 2);
     let outcome = jit.run(STOP, 100).unwrap();
-    assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4094));
+    assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4096));
     assert_eq!(jit.state.regs[0], 16);
     // SETC still reads the ADD's flags after the store. Where every path
     // rewrites all six before reading any, as for the ADD to memory above,
@@ -439,8 +439,15 @@ fn accesses_outside_the_window_exit_without_touching_host_memory() {
         a.ret().unwrap();
     });
     let mut jit = machine(&code, true);
-    for address in [0, CODE - 1, 0x3fffd, 0xfffffffc, 0xffffffff] {
-        reset(&mut jit, [42, 0, 0, 0, 0, 0, 0, address], 2);
+    // A read straddling the window end faults at the end.
+    for (start, address) in [
+        (0, 0),
+        (CODE - 1, CODE - 1),
+        (0x3fffd, 0x40000),
+        (0xfffffffc, 0xfffffffc),
+        (0xffffffff, 0xffffffff),
+    ] {
+        reset(&mut jit, [42, 0, 0, 0, 0, 0, 0, start], 2);
         assert_eq!(
             jit.run(STOP, 100).unwrap(),
             RunOutcome::ReadFault { pc: CODE, address }
@@ -620,7 +627,8 @@ fn vector_store_fault_checks_both_pages_before_writing() {
     jit.write(DATA, &[0xa5; 16]).unwrap();
     reset(&mut jit, [0, 0, 0, 0, 0, 0, DATA, DATA + 4088], 2);
     assert!(
-        matches!(jit.run(STOP, 100).unwrap(), RunOutcome::WriteFault { address, .. } if address == DATA + 4088)
+        // Hardware reports the first inaccessible byte and writes nothing.
+        matches!(jit.run(STOP, 100).unwrap(), RunOutcome::WriteFault { address, .. } if address == DATA + 4096)
     );
     assert_eq!(jit.memory().read(DATA + 4088, 16).unwrap(), [0; 16]);
     assert_eq!(jit.state.xmm[0], [0xa5; 16]);

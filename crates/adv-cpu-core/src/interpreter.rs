@@ -1561,6 +1561,23 @@ struct Transaction {
     indirect_branch: Option<crate::IndirectBranch>,
 }
 
+/// The address a memory fault reports for an access starting at `start`.
+/// Hardware names the first inaccessible byte (measured on Intel): an access
+/// that starts on a permitted page and crosses into a denied one faults at
+/// the page boundary, with nothing written. No access spans more than two
+/// pages, so the start and its neighbouring page decide it without the width.
+pub fn fault_address(memory: &Memory, start: u32, permission: u8) -> u32 {
+    let next = (start | (PAGE_SIZE as u32 - 1)).wrapping_add(1);
+    if start as usize % PAGE_SIZE != 0
+        && accessible(memory, start, 1, permission)
+        && !accessible(memory, next, 1, permission)
+    {
+        next
+    } else {
+        start
+    }
+}
+
 pub fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
     memory
         .committed(address, width as usize)
@@ -2585,5 +2602,30 @@ mod fetch_tests {
         assert_eq!(bulk.bytes, bytes.bytes);
         assert_eq!(denied, other);
         drop(shared);
+    }
+}
+
+#[cfg(test)]
+mod fault_address_tests {
+    use super::fault_address;
+    use crate::{Memory, READ, WRITE};
+
+    #[test]
+    fn page_split_faults_name_the_first_inaccessible_byte() {
+        let mut memory = Memory::new(0x10000, 0x3000).unwrap();
+        memory.protect(0x10000, 0x1000, READ | WRITE).unwrap();
+        memory.protect(0x11000, 0x1000, READ).unwrap();
+        memory.protect(0x12000, 0x1000, 0).unwrap();
+        // Crossing from a writable page into a read-only one.
+        assert_eq!(fault_address(&memory, 0x10ff8, WRITE), 0x11000);
+        // Starting on the denied page itself.
+        assert_eq!(fault_address(&memory, 0x11004, WRITE), 0x11004);
+        assert_eq!(fault_address(&memory, 0x11000, WRITE), 0x11000);
+        // Reads cross from the read-only page into the inaccessible one.
+        assert_eq!(fault_address(&memory, 0x11ffe, READ), 0x12000);
+        // Both pages permitted: the fault had another cause; keep the start.
+        assert_eq!(fault_address(&memory, 0x10ffc, READ), 0x10ffc);
+        // Leaving the window counts as inaccessible.
+        assert_eq!(fault_address(&memory, 0x12ffc, READ), 0x12ffc);
     }
 }

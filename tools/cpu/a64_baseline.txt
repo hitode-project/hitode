@@ -31,9 +31,3 @@ packed_scalar_fills_preserve_width_sources_tails_and_faults
 read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_state
 repeated_guards_preserve_each_faulting_prefix
 rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration
-
-# Page-split store faults: these assert x64's access-start address. Intel
-# hardware, like the core interpreter, reports the first inaccessible byte;
-# the tests move with the x64 fix.
-mmx_store_fault_checks_both_pages_before_writing
-vector_store_fault_checks_both_pages_before_writing

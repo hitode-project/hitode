@@ -110,12 +110,12 @@ fn owned_copy_cross_page_permission_faults_preserve_the_uncommitted_operand() {
             let expected = if write {
                 RunOutcome::WriteFault {
                     pc: CODE,
-                    address: DATA + 4094,
+                    address: DATA + 4096,
                 }
             } else {
                 RunOutcome::ReadFault {
                     pc: CODE,
-                    address: DATA + 4094,
+                    address: DATA + 4096,
                 }
             };
             assert_eq!(cpu.executor_mut().run(STOP, 10000).unwrap(), expected);
@@ -326,7 +326,7 @@ fn denied_rmw_keeps_input_flags_and_cow_then_restarts_natively() {
         cpu.executor_mut().run(STOP, 100).unwrap(),
         RunOutcome::WriteFault {
             pc: CODE,
-            address: DATA + 4094
+            address: DATA + 4096
         }
     );
     assert_eq!(cpu.executor().state.regs, before.regs);
@@ -520,16 +520,15 @@ fn plain_operand_permission_faults_do_not_start_lazy_io_or_cow() {
                     )
                     .unwrap();
                     let before = cpu.executor().state.clone();
-                    let expected = if write {
-                        RunOutcome::WriteFault {
-                            pc: CODE,
-                            address: DATA + 4094,
-                        }
+                    let address = if blocked == 0 {
+                        DATA + 4094
                     } else {
-                        RunOutcome::ReadFault {
-                            pc: CODE,
-                            address: DATA + 4094,
-                        }
+                        DATA + 4096
+                    };
+                    let expected = if write {
+                        RunOutcome::WriteFault { pc: CODE, address }
+                    } else {
+                        RunOutcome::ReadFault { pc: CODE, address }
                     };
                     assert_eq!(cpu.executor_mut().run(STOP, 100).unwrap(), expected);
                     assert_eq!(calls.get(), 0);

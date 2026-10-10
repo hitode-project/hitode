@@ -313,7 +313,7 @@ fn multiplication_memory_fault_is_atomic_and_short_forms_fall_back() {
         jit.run(STOP, 100).unwrap(),
         RunOutcome::ReadFault {
             pc: CODE,
-            address: DATA + 4094
+            address: DATA + 4096
         }
     );
     assert_eq!(jit.state.regs, before.regs);

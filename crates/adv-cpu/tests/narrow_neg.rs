@@ -230,15 +230,16 @@ fn narrow_neg_memory_faults_preserve_prefix_flags_and_atomic_writes_then_resume(
                                 .unwrap();
                         }
                     }
+                    let fault_address = if fault == 2 { DATA + 4096 } else { address };
                     let expected = if fault == 1 {
                         RunOutcome::ReadFault {
                             pc: fault_pc,
-                            address,
+                            address: fault_address,
                         }
                     } else {
                         RunOutcome::WriteFault {
                             pc: fault_pc,
-                            address,
+                            address: fault_address,
                         }
                     };
                     assert_eq!(jit.run(STOP, 10000).unwrap(), expected);

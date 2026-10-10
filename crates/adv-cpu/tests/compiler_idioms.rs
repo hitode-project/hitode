@@ -131,15 +131,17 @@ fn leave32_read_fault_commits_neither_stack_register_and_restarts_after_repair()
             let mut jit = machine(&bytes, Some(strategy));
             seed(&mut jit, 0x7fff_ffff, 1, frame);
             jit.protect(blocked, 4096, 0).unwrap();
+            // A split frame faults at the first denied byte.
+            let address = frame.max(blocked);
             assert_eq!(
                 jit.run(STOP, 1000).unwrap(),
                 RunOutcome::ReadFault {
                     pc: leave_pc,
-                    address: frame
+                    address
                 }
             );
             equal_registers_and_flags(&jit, &reference);
-            assert_eq!(jit.state.fault_addr, frame);
+            assert_eq!(jit.state.fault_addr, address);
             support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
             let mut uc = machine(&bytes, None);
             uc.state = reference.state.clone();

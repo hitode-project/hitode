@@ -196,6 +196,13 @@ impl Executor {
         result
     }
 
+    /// Publishes the hardware fault address of an access starting at `start`.
+    fn fault_address(&mut self, start: u32, permission: u8) -> u32 {
+        let address = adv_cpu_core::interpreter::fault_address(&self.memory, start, permission);
+        self.state.fault_addr = address;
+        address
+    }
+
     fn run_inner(
         &mut self,
         stop: u32,
@@ -268,11 +275,11 @@ impl Executor {
                 Step::Executed => {}
                 Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
                 Step::ReadFault { pc, address } => {
-                    self.state.fault_addr = address;
+                    let address = self.fault_address(address, adv_cpu_core::READ);
                     return Ok(RunOutcome::ReadFault { pc, address });
                 }
                 Step::WriteFault { pc, address } => {
-                    self.state.fault_addr = address;
+                    let address = self.fault_address(address, adv_cpu_core::WRITE);
                     return Ok(RunOutcome::WriteFault { pc, address });
                 }
                 Step::FetchFault { pc, address } => {

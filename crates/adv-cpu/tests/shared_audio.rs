@@ -365,7 +365,7 @@ fn protected_read_modify_write_and_vector_store_preserve_instruction_state() {
             cpu.executor_mut().run(STOP, 100).unwrap(),
             RunOutcome::WriteFault {
                 pc: CODE,
-                address: DATA + 4094
+                address: DATA + 4096
             }
         );
         let after = &cpu.executor().state;
@@ -541,7 +541,7 @@ fn protected_cross_page_native_load_preserves_integer_and_vector_destinations() 
             cpu.executor_mut().run(STOP, 100).unwrap(),
             RunOutcome::ReadFault {
                 pc: CODE,
-                address: DATA + 4094
+                address: DATA + 4096
             }
         );
         assert_eq!(cpu.executor().state.regs, before.regs);
@@ -630,7 +630,7 @@ fn protected_cross_page_store_faults_without_partial_commit_then_restarts() {
         cpu.executor_mut().run(STOP, 100).unwrap(),
         RunOutcome::WriteFault {
             pc: CODE,
-            address: DATA + 4094
+            address: DATA + 4096
         }
     );
     assert_eq!(shared.read_alias.load_u8(4094), 0);

@@ -106,7 +106,7 @@ fn production_scalar_fault_recipes_restore_integer_prefix_flags_and_cross_page_o
                 executor.run(STOP, 1000).unwrap(),
                 crate::RunOutcome::ReadFault {
                     pc: fault_pc,
-                    address
+                    address: DATA + PAGE_SIZE as u32
                 }
             );
             assert_eq!(
