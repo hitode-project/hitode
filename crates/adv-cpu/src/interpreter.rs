@@ -16,6 +16,11 @@ use iced_x86::{
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
+mod scalar;
+mod simd;
+mod strings;
+#[cfg(test)]
+mod window_tests;
 
 const CF: u32 = 1;
 const PF: u32 = 1 << 2;
@@ -128,6 +133,8 @@ pub struct Interpreter {
     capacity: usize,
     decodes: u64,
     pub(crate) frame_retired: Option<u64>,
+    /// Discovery and tracing observe every transfer before windows may loop.
+    pub(crate) observe_transfers: bool,
 }
 
 impl Default for Interpreter {
@@ -149,6 +156,7 @@ impl Interpreter {
             capacity,
             decodes: 0,
             frame_retired: None,
+            observe_transfers: false,
         }
     }
 
@@ -197,14 +205,14 @@ impl Interpreter {
             }
             decoded
         };
-        let execution = execute_decoded(decoded, state, memory, max_units, None);
+        let execution = execute_decoded(&decoded, state, memory, max_units, None);
         if let Some(retired) = &mut self.frame_retired {
-            *retired += retired_instruction(decoded, execution, state, pc);
+            *retired += retired_instruction(&decoded, execution, state, pc);
         }
         execution
     }
 
-    /// Execute one bounded predecoded basic block. This is internal to Executor:
+    /// Execute a bounded predecoded window. This is internal to Executor:
     /// public step/run_chunk retain their single-instruction/REP contract.
     pub(crate) fn run_block(
         &mut self,
@@ -236,6 +244,7 @@ impl Interpreter {
                 max_units,
                 stop,
                 self.frame_retired.as_mut(),
+                self.observe_transfers,
             );
         }
         let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
@@ -246,6 +255,7 @@ impl Interpreter {
                 max_units,
                 stop,
                 self.frame_retired.as_mut(),
+                self.observe_transfers,
             );
         }
         // Bound each independent cache in entries. A larger block working set
@@ -260,16 +270,24 @@ impl Interpreter {
             max_units,
             stop,
             self.frame_retired.as_mut(),
+            self.observe_transfers,
         )
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MmxCache {
+    Unknown,
+    Coherent,
+    Deferred,
+}
+
 fn execute_decoded(
-    decoded: Decoded,
+    decoded: &Decoded,
     state: &mut CpuState,
     memory: &mut Memory,
     max_units: u32,
-    deferred_mmx: Option<&mut bool>,
+    deferred_mmx: Option<&mut MmxCache>,
 ) -> Execution {
     let pc = state.eip;
     if state.rep.as_ref().is_some_and(|r| r.pc != pc) {
@@ -280,28 +298,61 @@ fn execute_decoded(
         Decoded::Ready(i) => i,
         Decoded::Stop(result) => {
             return Execution {
-                step: result,
+                step: *result,
                 units: 0,
             };
         }
+        Decoded::Simd(plan) => {
+            let mut coherent = false;
+            if let Some(cache) = deferred_mmx.as_deref()
+                && *cache == MmxCache::Deferred
+            {
+                state.refresh_mmx();
+                coherent = true;
+            }
+            coherent |= deferred_mmx
+                .as_deref()
+                .is_some_and(|c| *c == MmxCache::Coherent);
+            let step = plan.execute(state, memory, coherent);
+            if let Some(cache) = deferred_mmx {
+                if coherent || step == Step::Executed {
+                    *cache = MmxCache::Coherent;
+                }
+            }
+            let completed = step == Step::Executed;
+            return Execution {
+                step: if completed && debug {
+                    Step::Trap { pc, vector: 1 }
+                } else {
+                    step
+                },
+                units: u32::from(completed),
+            };
+        }
         Decoded::Extended(i, operation, opcode) => {
-            let x87 = operation == crate::floating::Operation::X87;
+            let x87 = *operation == crate::floating::Operation::X87;
             let defer = x87 && deferred_mmx.is_some();
             if let Some(dirty) = deferred_mmx.as_deref()
-                && *dirty
+                && *dirty == MmxCache::Deferred
                 && !x87
             {
                 // A following SIMD/MMX instruction can read the physical x87
                 // aliases. Materialize the completed x87 prefix before it runs.
                 state.refresh_mmx();
             }
-            let step = crate::floating::execute(&i, operation, opcode, state, memory, !defer);
+            let step = crate::floating::execute(i, *operation, *opcode, state, memory, !defer);
             let completed = step == Step::Executed;
-            if let Some(dirty) = deferred_mmx {
-                if x87 {
-                    *dirty |= completed;
-                } else {
-                    *dirty = false;
+            if let Some(cache) = deferred_mmx {
+                if completed {
+                    *cache = if x87 {
+                        MmxCache::Deferred
+                    } else {
+                        MmxCache::Coherent
+                    };
+                } else if !x87 && *cache == MmxCache::Deferred {
+                    // The completed x87 prefix was materialized before the
+                    // faulting operation; its aliases remain canonical.
+                    *cache = MmxCache::Coherent;
                 }
             }
             return Execution {
@@ -315,7 +366,7 @@ fn execute_decoded(
         }
     };
     if let Action::String(operation) = instruction.action {
-        return run_string(
+        return strings::execute::<true>(
             state,
             memory,
             operation,
@@ -334,7 +385,9 @@ fn execute_decoded(
             units: 1,
         };
     }
-    if instruction.register_only && registers::execute(instruction, state) {
+    if instruction.register_only && registers::execute(instruction, state)
+        || instruction.checked_scalar && scalar::execute(instruction, state, memory).is_some()
+    {
         return Execution {
             step: if debug {
                 Step::Trap { pc, vector: 1 }
@@ -402,10 +455,11 @@ fn execute_decoded(
 enum Decoded {
     Ready(Predecoded),
     Extended(Instruction, crate::floating::Operation, Option<u16>),
+    Simd(simd::Plan),
     Stop(Step),
 }
 
-fn retired_instruction(decoded: Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
+fn retired_instruction(decoded: &Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
     if execution.units == 0 {
         return 0;
     }
@@ -435,6 +489,7 @@ struct Predecoded {
     next: u32,
     exclusive: bool,
     register_only: bool,
+    checked_scalar: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -486,7 +541,7 @@ impl Cached {
     }
 }
 
-fn fetch(memory: &mut Memory, pc: u32) -> Cached {
+fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Option<u32>) {
     memory.watch_code(pc, 15);
     let mut entry = Cached {
         decoded: Decoded::Stop(Step::InvalidInstruction { pc }),
@@ -496,9 +551,10 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         pages: [None; 2],
     };
     let mut denied = None;
-    for offset in 0..15u32 {
-        let Some(address) = pc.checked_add(offset) else {
-            denied = Some(pc.wrapping_add(offset));
+    while entry.len < 15 {
+        let offset = usize::from(entry.len);
+        let Some(address) = pc.checked_add(offset as u32) else {
+            denied = Some(pc.wrapping_add(offset as u32));
             break;
         };
         let page = Page::at(memory, address);
@@ -511,17 +567,38 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
             denied = Some(address);
             break;
         }
-        match memory.read_data(address, 1) {
-            Ok(byte) => {
-                entry.bytes[offset as usize] = byte[0];
-                entry.len += 1;
-            }
-            Err(_) => {
+        // Preserve the existing bytewise reads of concurrently shared code.
+        // Ordinary ranges require only one mapping/host-protection check per
+        // page, including execute-only pages (data READ is not required here).
+        let mut len = if BULK && page.permissions & crate::memory::SHARED == 0 {
+            (15 - offset).min(PAGE_SIZE - address as usize % PAGE_SIZE)
+        } else {
+            1
+        };
+        if memory
+            .read_into(address, &mut entry.bytes[offset..offset + len])
+            .is_err()
+        {
+            // Retain exact prefix/fault behavior for a partially available
+            // range or a host access failure, without assuming page alignment
+            // of the owning Memory's end.
+            if len == 1
+                || memory
+                    .read_into(address, &mut entry.bytes[offset..offset + 1])
+                    .is_err()
+            {
                 denied = Some(address);
                 break;
             }
+            len = 1;
         }
+        entry.len += len as u8;
     }
+    (entry, denied)
+}
+
+fn fetch(memory: &mut Memory, pc: u32) -> Cached {
+    let (mut entry, denied) = fetch_bytes::<true>(memory, pc);
     let mut decoder = Decoder::with_ip(
         32,
         &entry.bytes[..entry.len as usize],
@@ -542,12 +619,15 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
             action,
             next: instruction.next_ip32(),
             register_only: registers::eligible(action),
+            checked_scalar: !instruction.has_lock_prefix() && scalar::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg
                     && (instruction.op0_kind() == OpKind::Memory
                         || instruction.op1_kind() == OpKind::Memory),
         })
+    } else if let Some(plan) = simd::Plan::decode(&instruction) {
+        Decoded::Simd(plan)
     } else if let Some(operation) = crate::floating::operation(&instruction) {
         // Preserve the original prefix/opcode scan in the decoded entry. Its
         // code bytes share the same validation as the instruction itself.
@@ -568,12 +648,15 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
 const BLOCK_INSTRUCTIONS: usize = 64;
 const BLOCK_BYTES: usize = 512;
 
-/// A contiguous basic block, including its terminating instruction. Page
-/// subscriptions retain negative fetch dependencies and allocation ownership;
-/// bytes are compared only after a relevant event, before executing any prefix.
+/// A contiguous decode window with local branch targets indexed by byte offset.
+/// Validate bytes and all page dependencies at each entry. A store changing the
+/// code epoch ends execution before the cached suffix can run.
 struct DecodedBlock {
     pc: u32,
     instructions: Vec<(u32, Decoded)>,
+    offsets: Vec<u8>,
+    native_start: bool,
+    local_branches: bool,
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
@@ -603,11 +686,15 @@ impl DecodedBlock {
         let mut block = Self {
             pc: start,
             instructions: Vec::new(),
+            offsets: Vec::new(),
+            native_start: native.is_some_and(|(entries, _)| entries.contains_key(&start)),
+            local_branches: true,
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
         };
         let mut pc = start;
+        let mut furthest_target = start;
         while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
             // Published entries already exclude forms unsupported by native code.
             // Check all forms, including SSE/MMX, only while building the block.
@@ -619,23 +706,54 @@ impl DecodedBlock {
             }
             *decodes += 1;
             let entry = fetch(memory, pc);
+            let shared = entry
+                .pages
+                .iter()
+                .flatten()
+                .any(|p| p.permissions & crate::memory::SHARED != 0);
+            // Another view may change shared code without an owner epoch. Keep
+            // its original transfer boundaries; never cache it in a local loop.
+            if shared && block.local_branches && !block.instructions.is_empty() {
+                break;
+            }
+            block.local_branches &= !shared;
+            if let Decoded::Ready(instruction) = entry.decoded
+                && let Action::Call(Operand::Immediate(target))
+                | Action::Branch(Operand::Immediate(target), _) = instruction.action
+                && target > pc
+                && target.wrapping_sub(start) < BLOCK_BYTES as u32
+            {
+                furthest_target = furthest_target.max(target);
+            }
             let (next, terminates) = match entry.decoded {
                 Decoded::Ready(instruction) => (
                     instruction.next,
                     matches!(
                         instruction.action,
-                        Action::Branch(..)
-                            | Action::Loop(..)
-                            | Action::Call(..)
-                            | Action::Ret(..)
-                            | Action::Int(..)
+                        Action::Int(..)
                             | Action::Ud2
                             | Action::Privileged
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
-                    ),
+                    ) || match instruction.action {
+                        Action::Call(Operand::Immediate(target)) => {
+                            target.wrapping_sub(start) >= BLOCK_BYTES as u32
+                        }
+                        Action::Call(_) => true,
+                        // A forward local target can follow an earlier return
+                        // or backedge. Decode through it, but do not scan past
+                        // the final terminator of this bounded static frontier.
+                        Action::Ret(_) => pc >= furthest_target,
+                        Action::Branch(Operand::Immediate(target), ConditionCode::None)
+                            if target <= pc =>
+                        {
+                            pc >= furthest_target
+                        }
+                        _ => false,
+                    } || !block.local_branches && instruction.action.is_transfer(),
                 ),
+                Decoded::Simd(plan) => (plan.next, false),
                 Decoded::Extended(instruction, _, _) => (
                     instruction.next_ip32(),
                     instruction.flow_control() != iced_x86::FlowControl::Next,
@@ -656,6 +774,10 @@ impl DecodedBlock {
                     block.pages.push(page);
                 }
             }
+            block.offsets.resize(block.bytes.len(), u8::MAX);
+            if let Some(offset) = block.offsets.get_mut(pc.wrapping_sub(start) as usize) {
+                *offset = block.instructions.len() as u8;
+            }
             block.instructions.push((pc, entry.decoded));
             if terminates || next <= pc {
                 break;
@@ -672,24 +794,42 @@ impl DecodedBlock {
         max_units: u32,
         stop: u32,
         retired: Option<&mut u64>,
+        observe_transfers: bool,
     ) -> (Execution, u32) {
-        // Specialize the ordinary block loop: disabled diagnostics must not
-        // add a retirement branch to every interpreted instruction.
-        match retired {
-            Some(retired) => self.execute(state, memory, max_units, stop, |d, e, s, pc| {
-                *retired += retired_instruction(d, e, s, pc)
-            }),
-            None => self.execute(state, memory, max_units, stop, |_, _, _, _| {}),
+        if observe_transfers || !self.local_branches {
+            self.execute_mode::<true>(state, memory, max_units, stop, retired)
+        } else {
+            self.execute_mode::<false>(state, memory, max_units, stop, retired)
         }
     }
 
-    fn execute(
+    fn execute_mode<const OBSERVE: bool>(
         &self,
         state: &mut CpuState,
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut retire: impl FnMut(Decoded, Execution, &CpuState, u32),
+        retired: Option<&mut u64>,
+    ) -> (Execution, u32) {
+        // Specialize the ordinary block loop: disabled diagnostics must not
+        // add a retirement branch to every interpreted instruction.
+        match retired {
+            Some(retired) => {
+                self.execute::<OBSERVE>(state, memory, max_units, stop, |d, e, s, pc| {
+                    *retired += retired_instruction(d, e, s, pc)
+                })
+            }
+            None => self.execute::<OBSERVE>(state, memory, max_units, stop, |_, _, _, _| {}),
+        }
+    }
+
+    fn execute<const OBSERVE: bool>(
+        &self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        max_units: u32,
+        stop: u32,
+        mut retire: impl FnMut(&Decoded, Execution, &CpuState, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -697,17 +837,20 @@ impl DecodedBlock {
             units: 0,
         };
         let mut last_units = 0;
-        let mut deferred_mmx = false;
-        for &(pc, decoded) in &self.instructions {
+        let mut deferred_mmx = MmxCache::Unknown;
+        let mut index = 0;
+        while let Some((pc, decoded)) = self.instructions.get(index) {
+            let pc = *pc;
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
             let execution = if let Decoded::Ready(instruction) = decoded
-                && instruction.register_only
                 && !instruction.exclusive
                 && state.rep.is_none()
                 && state.eflags & 0x100 == 0
-                && registers::execute(instruction, state)
+                && (instruction.register_only && registers::execute(instruction, state)
+                    || instruction.checked_scalar
+                        && scalar::execute(instruction, state, memory).is_some())
             {
                 Execution {
                     step: Step::Executed,
@@ -731,11 +874,40 @@ impl DecodedBlock {
             if execution.step != Step::Executed
                 || memory.epoch != epoch
                 || state.eflags & 0x100 != 0
+                // Leave room for a full straight-line segment. Prefer a branch
+                // boundary for the owner's next interrupt/deadline poll, while
+                // retaining the hard instruction/REP allowance above.
+                || (OBSERVE || result.units >= max_units.saturating_sub(BLOCK_INSTRUCTIONS as u32))
+                    && matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
             {
                 break;
             }
+            if self
+                .instructions
+                .get(index + 1)
+                .is_some_and(|&(next, _)| state.eip == next)
+            {
+                index += 1;
+            } else {
+                // Transfers may stay only at decoded instruction boundaries;
+                // REP, published native entries and owner operations still exit.
+                if !matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
+                    || !self.local_branches
+                    || self.native_start && state.eip == self.pc
+                {
+                    break;
+                }
+                let Some(&next) = self
+                    .offsets
+                    .get(state.eip.wrapping_sub(self.pc) as usize)
+                    .filter(|&&next| next != u8::MAX)
+                else {
+                    break;
+                };
+                index = usize::from(next);
+            }
         }
-        if deferred_mmx {
+        if deferred_mmx == MmxCache::Deferred {
             // Every public/context/native boundary still exposes a coherent
             // MMX cache; only consecutive x87 instructions skip redundant work.
             state.refresh_mmx();
@@ -929,6 +1101,15 @@ enum Action {
     Privileged,
 }
 
+impl Action {
+    fn is_transfer(self) -> bool {
+        matches!(
+            self,
+            Self::Branch(..) | Self::Loop(..) | Self::Call(..) | Self::Ret(..)
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StringKind {
     Movs,
@@ -986,182 +1167,6 @@ fn string_operation(i: &Instruction) -> Option<StringOp> {
         repeat: i.has_rep_prefix() || i.has_repne_prefix(),
         unequal: i.has_repne_prefix(),
     })
-}
-
-fn run_string(
-    state: &mut CpuState,
-    memory: &mut Memory,
-    operation: StringOp,
-    next: u32,
-    max_units: u32,
-    debug: bool,
-) -> Execution {
-    use StringKind::*;
-    let pc = state.eip;
-    let index_width = if operation.word { 2 } else { 4 };
-    let counter = Reg {
-        index: 1,
-        shift: 0,
-        width: index_width,
-    };
-    if operation.repeat && counter.read(&state.regs) == 0 {
-        state.eip = next;
-        state.rep = None;
-        return Execution {
-            step: if debug {
-                Step::Trap { pc, vector: 1 }
-            } else {
-                Step::Executed
-            },
-            units: 1,
-        };
-    }
-    let comparison = matches!(operation.kind, Cmps | Scas);
-    let had_continuation = state
-        .rep
-        .as_ref()
-        .is_some_and(|r| r.pc == pc && r.operation == operation);
-    let original_flags = if operation.repeat && comparison {
-        if !had_continuation {
-            state.rep = Some(RepContinuation {
-                pc,
-                flags: state.eflags,
-                operation,
-            });
-        }
-        state.rep.as_ref().unwrap().flags
-    } else {
-        state.rep = None;
-        state.eflags
-    };
-    let mut units = 0;
-    while units < if debug { 1 } else { max_units } {
-        let mut tx = Transaction {
-            regs: state.regs,
-            flags: state.eflags,
-            eip: pc,
-            fs_base: state.fs_base,
-            segments: state.segments,
-            pc,
-            write: None,
-            more_writes: Vec::new(),
-            indirect_branch: None,
-        };
-        let source_index = Reg {
-            index: 6,
-            shift: 0,
-            width: index_width,
-        };
-        let dest_index = Reg {
-            index: 7,
-            shift: 0,
-            width: index_width,
-        };
-        let source =
-            source_index
-                .read(&tx.regs)
-                .wrapping_add(if operation.fs { state.fs_base } else { 0 });
-        let destination = dest_index.read(&tx.regs);
-        let accumulator = Reg {
-            index: 0,
-            shift: 0,
-            width: operation.width,
-        };
-        let element = (|| -> Result<(), Step> {
-            match operation.kind {
-                Movs => {
-                    let value = tx.read_mem(memory, source, operation.width)?;
-                    tx.store(
-                        memory,
-                        Transaction::stack_operand_width(destination, operation.width),
-                        value,
-                    )?;
-                }
-                Stos => {
-                    let value = accumulator.read(&tx.regs);
-                    tx.store(
-                        memory,
-                        Transaction::stack_operand_width(destination, operation.width),
-                        value,
-                    )?;
-                }
-                Lods => {
-                    let value = tx.read_mem(memory, source, operation.width)?;
-                    accumulator.write(&mut tx.regs, value);
-                }
-                Cmps => {
-                    let a = tx.read_mem(memory, source, operation.width)?;
-                    let b = tx.read_mem(memory, destination, operation.width)?;
-                    tx.arithmetic(a, b, 0, operation.width, true);
-                }
-                Scas => {
-                    let a = accumulator.read(&tx.regs);
-                    let b = tx.read_mem(memory, destination, operation.width)?;
-                    tx.arithmetic(a, b, 0, operation.width, true);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(step) = element {
-            if operation.repeat && comparison {
-                state.eflags = original_flags;
-                // The fault exposes the architectural restart context. A handler
-                // may change EFLAGS before restarting the remaining elements;
-                // that context is the next instruction's input, not this origin.
-                state.rep = None;
-            }
-            return Execution { step, units };
-        }
-        let delta = if state.eflags & (1 << 10) != 0 {
-            0u32.wrapping_sub(u32::from(operation.width))
-        } else {
-            u32::from(operation.width)
-        };
-        if matches!(operation.kind, Movs | Cmps | Lods) {
-            let index = source_index.read(&tx.regs).wrapping_add(delta);
-            source_index.write(&mut tx.regs, index);
-        }
-        if operation.kind != Lods {
-            let index = dest_index.read(&tx.regs).wrapping_add(delta);
-            dest_index.write(&mut tx.regs, index);
-        }
-        if operation.repeat {
-            let count = counter.read(&tx.regs).wrapping_sub(1);
-            counter.write(&mut tx.regs, count);
-        }
-        if let Some((address, width, value)) = tx.write {
-            // This element's complete range and permissions have been checked.
-            memory
-                .write(address, &value.to_le_bytes()[..width as usize])
-                .expect("validated REP element write");
-        }
-        state.regs = tx.regs;
-        state.eflags = tx.flags;
-        units += 1;
-        let more = operation.repeat
-            && counter.read(&state.regs) != 0
-            && (!comparison || (state.eflags & ZF == 0) == operation.unequal);
-        if !more {
-            state.eip = next;
-            state.rep = None;
-        }
-        if debug {
-            // Unlike a scheduler chunk, a delivered debug exception exposes a
-            // restart context that its handler is allowed to change.
-            state.rep = None;
-            return Execution {
-                step: Step::Trap { pc, vector: 1 },
-                units,
-            };
-        }
-        if !more {
-            break;
-        }
-    }
-    Execution {
-        step: Step::Executed,
-        units,
-    }
 }
 
 fn same_width(dst: Operand, src: Operand) -> bool {
@@ -1684,7 +1689,8 @@ impl Transaction {
                 let count = self.read(memory, count)? & 31;
                 self.check_write(memory, dst)?;
                 if count != 0 {
-                    let result = self.shift(kind, value, count, dst.width().unwrap());
+                    let result =
+                        registers::shift(&mut self.flags, kind, value, count, dst.width().unwrap());
                     self.store(memory, dst, result)?;
                 }
             }
@@ -2045,20 +2051,9 @@ impl Transaction {
         } else {
             (self.regs[0] & mask(width), self.read(memory, dst)?)
         };
-        let product = if signed_form {
-            (signed(a, width) * signed(b, width)) as u64
-        } else {
-            u64::from(a) * u64::from(b)
-        };
+        let product = registers::product(&mut self.flags, a, b, width, signed_form);
         let bits = u32::from(width) * 8;
         let low = product as u32 & mask(width);
-        let overflow = if signed_form {
-            product as i64 != signed(low, width)
-        } else {
-            product >> bits != 0
-        };
-        self.flag(CF, overflow);
-        self.flag(OF, overflow);
         if src.is_some() {
             self.store(memory, dst, low)?;
         } else if width == 1 {
@@ -2140,111 +2135,6 @@ impl Transaction {
             .write(&mut self.regs, remainder);
         }
         Ok(())
-    }
-    fn shift(&mut self, kind: M, value: u32, count: u32, width: u8) -> u32 {
-        let bits = u32::from(width) * 8;
-        let value = value & mask(width);
-        let sign = value & (1 << (bits - 1)) != 0;
-        let old_cf = self.flags & CF != 0;
-        match kind {
-            M::Shl => {
-                if count <= bits {
-                    self.flag(CF, value & (1 << (bits - count)) != 0);
-                }
-                let result = (u64::from(value) << count) as u32 & mask(width);
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0),
-                    );
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Shr => {
-                if count <= bits {
-                    self.flag(CF, value & (1 << (count - 1)) != 0);
-                }
-                let result = value >> count;
-                if count == 1 {
-                    self.flag(OF, sign);
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Sar => {
-                self.flag(
-                    CF,
-                    if count >= bits {
-                        sign
-                    } else {
-                        value & (1 << (count - 1)) != 0
-                    },
-                );
-                let result = (signed(value, width) >> count) as u32 & mask(width);
-                if count == 1 {
-                    self.flag(OF, false);
-                }
-                self.szp(result, width);
-                result
-            }
-            M::Rol | M::Ror => {
-                let n = count % bits;
-                let result = if n == 0 {
-                    value
-                } else if kind == M::Rol {
-                    (value << n) | (value >> (bits - n))
-                } else {
-                    (value >> n) | (value << (bits - n))
-                } & mask(width);
-                self.flag(
-                    CF,
-                    if kind == M::Rol {
-                        result & 1 != 0
-                    } else {
-                        result & (1 << (bits - 1)) != 0
-                    },
-                );
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        if kind == M::Rol {
-                            (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0)
-                        } else {
-                            (result >> (bits - 1)) ^ (result >> (bits - 2)) & 1 != 0
-                        },
-                    );
-                }
-                result
-            }
-            M::Rcl | M::Rcr => {
-                let n = count % (bits + 1);
-                if n == 0 {
-                    return value;
-                }
-                let extended = (u64::from(old_cf) << bits) | u64::from(value);
-                let all = (1u64 << (bits + 1)) - 1;
-                let extended = if kind == M::Rcl {
-                    ((extended << n) | (extended >> (bits + 1 - n))) & all
-                } else {
-                    ((extended >> n) | (extended << (bits + 1 - n))) & all
-                };
-                let result = extended as u32 & mask(width);
-                self.flag(CF, extended & (1u64 << bits) != 0);
-                if count == 1 {
-                    self.flag(
-                        OF,
-                        if kind == M::Rcl {
-                            (result & (1 << (bits - 1)) != 0) != (self.flags & CF != 0)
-                        } else {
-                            ((result >> (bits - 1)) ^ (result >> (bits - 2))) & 1 != 0
-                        },
-                    );
-                }
-                result
-            }
-            _ => unreachable!(),
-        }
     }
 }
 
@@ -2416,12 +2306,12 @@ mod tests {
         assert_eq!(interpreter.decode_count(), decodes + 1);
 
         let mut third = memory();
-        let (execution, _) = interpreter.run_block(&mut state(), &mut third, 64, 0, None);
+        let (execution, _) = interpreter.run_block(&mut state(), &mut third, 3, 0, None);
         assert_eq!(execution.units, 3);
         let decodes = interpreter.decode_count();
         let mut fourth = memory();
         let mut fourth_state = state();
-        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
+        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 3, 0, None);
         assert_eq!(execution.units, 3);
         assert_eq!(fourth_state.eip, CODE);
         assert_eq!(
@@ -2578,5 +2468,67 @@ mod tests {
         state.eip = code;
         assert_eq!(uncached.step(&mut state, &mut memory), Step::Executed);
         assert_eq!(uncached.cached_instructions(), 0);
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    #[test]
+    fn bulk_fetch_matches_bytewise_prefixes_permissions_and_wraparound() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.inc(eax).unwrap();
+        let first = a.assemble(0x10000).unwrap();
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.inc(ecx).unwrap();
+        let second = a.assemble(0x11000).unwrap();
+        assert_eq!((first.len(), second.len()), (1, 1));
+        for base in [0x10000, 0xffffe000] {
+            for permission in [0, READ, EXEC, READ | EXEC] {
+                for mapped in [false, true] {
+                    let mut memory = Memory::reserve(base, 2 * PAGE_SIZE).unwrap();
+                    memory.map(base, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+                    memory.write(base, &first.repeat(PAGE_SIZE)).unwrap();
+                    if mapped {
+                        memory
+                            .map(base + PAGE_SIZE as u32, PAGE_SIZE, READ | WRITE)
+                            .unwrap();
+                        memory
+                            .write(base + PAGE_SIZE as u32, &second.repeat(PAGE_SIZE))
+                            .unwrap();
+                        memory
+                            .protect(base + PAGE_SIZE as u32, PAGE_SIZE, permission)
+                            .unwrap();
+                    }
+                    for offset in [0, 4080, 4081, 4082, 4094, 4095, 4096, 8180, 8190, 8191] {
+                        let pc = base + offset;
+                        let (bulk, bulk_fault) = fetch_bytes::<true>(&mut memory, pc);
+                        let (bytes, byte_fault) = fetch_bytes::<false>(&mut memory, pc);
+                        assert_eq!(bulk.bytes, bytes.bytes);
+                        assert_eq!(bulk.len, bytes.len);
+                        assert_eq!(bulk_fault, byte_fault);
+                        for (a, b) in bulk.pages.into_iter().zip(bytes.pages) {
+                            assert_eq!(
+                                a.map(|p| (p.address, p.permissions, p.mapped)),
+                                b.map(|p| (p.address, p.permissions, p.mapped))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
+        let shared = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
+        memory
+            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.write(0x10000, &first.repeat(15)).unwrap();
+        let (bulk, denied) = fetch_bytes::<true>(&mut memory, 0x10000);
+        let (bytes, other) = fetch_bytes::<false>(&mut memory, 0x10000);
+        assert_eq!(bulk.bytes, bytes.bytes);
+        assert_eq!(denied, other);
+        drop(shared);
     }
 }

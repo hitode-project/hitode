@@ -901,31 +901,15 @@ fn integer(
     } else {
         read(i, 1, tx, memory, width)?
     };
+    if let Some(kernel) = packed::kernel(m) {
+        let mut right = right;
+        if i.op1_kind() == OpKind::Immediate8 {
+            right[0] = i.immediate8();
+        }
+        return write(i, tx, memory, &kernel(left, right), width);
+    }
     let mut out = [0; 16];
     if matches!(
-        m,
-        M::Xorps
-            | M::Xorpd
-            | M::Pxor
-            | M::Andps
-            | M::Andpd
-            | M::Pand
-            | M::Andnps
-            | M::Andnpd
-            | M::Pandn
-            | M::Orps
-            | M::Orpd
-            | M::Por
-    ) {
-        for n in 0..width {
-            out[n] = match m {
-                M::Xorps | M::Xorpd | M::Pxor => left[n] ^ right[n],
-                M::Andps | M::Andpd | M::Pand => left[n] & right[n],
-                M::Andnps | M::Andnpd | M::Pandn => !left[n] & right[n],
-                _ => left[n] | right[n],
-            };
-        }
-    } else if matches!(
         m,
         M::Punpcklbw
             | M::Punpckhbw
@@ -1043,104 +1027,17 @@ fn integer(
             &out,
             if i.op0_kind() == OpKind::Memory { 2 } else { 4 },
         );
-    } else {
-        let size = match m {
-            M::Paddb
-            | M::Psubb
-            | M::Paddusb
-            | M::Psubusb
-            | M::Paddsb
-            | M::Psubsb
-            | M::Pavgb
-            | M::Pcmpeqb
-            | M::Pcmpgtb
-            | M::Pminub
-            | M::Pmaxub => 1,
-            M::Paddd | M::Psubd | M::Pcmpeqd | M::Pcmpgtd | M::Pslld | M::Psrld | M::Psrad => 4,
-            M::Paddq | M::Psubq | M::Psllq | M::Psrlq => 8,
-            _ => 2,
-        };
-        let lane_bits = size * 8;
-        let max = if size == 8 {
-            u64::MAX
-        } else {
-            (1u64 << lane_bits) - 1
-        };
-        for lane in 0..width / size {
-            let n = lane * size;
-            let (a, b) = (bits(&left[n..n + size]), bits(&right[n..n + size]));
-            let (sa, sb) = (signed(a, size), signed(b, size));
-            let value = match m {
-                M::Paddb | M::Paddw | M::Paddd | M::Paddq => a.wrapping_add(b),
-                M::Psubb | M::Psubw | M::Psubd | M::Psubq => a.wrapping_sub(b),
-                M::Paddusb | M::Paddusw => (a + b).min(max),
-                M::Psubusb | M::Psubusw => a.saturating_sub(b),
-                M::Paddsb | M::Paddsw => (sa + sb)
-                    .clamp(-(1i64 << (lane_bits - 1)), (1i64 << (lane_bits - 1)) - 1)
-                    as u64,
-                M::Psubsb | M::Psubsw => (sa - sb)
-                    .clamp(-(1i64 << (lane_bits - 1)), (1i64 << (lane_bits - 1)) - 1)
-                    as u64,
-                M::Pavgb | M::Pavgw => (a + b + 1) >> 1,
-                M::Pcmpeqb | M::Pcmpeqw | M::Pcmpeqd => {
-                    if a == b {
-                        max
-                    } else {
-                        0
-                    }
-                }
-                M::Pcmpgtb | M::Pcmpgtw | M::Pcmpgtd => {
-                    if sa > sb {
-                        max
-                    } else {
-                        0
-                    }
-                }
-                M::Pmullw => a * b,
-                M::Pmulhw => ((sa * sb) >> 16) as u64,
-                M::Pmulhuw => (a * b) >> 16,
-                M::Pminub => a.min(b),
-                M::Pmaxub => a.max(b),
-                M::Pminsw => sa.min(sb) as u64,
-                M::Pmaxsw => sa.max(sb) as u64,
-                M::Psllw
-                | M::Pslld
-                | M::Psllq
-                | M::Psrlw
-                | M::Psrld
-                | M::Psrlq
-                | M::Psraw
-                | M::Psrad => {
-                    let count = if i.op1_kind() == OpKind::Immediate8 {
-                        i.immediate8() as u64
-                    } else {
-                        bits(&right[..8])
-                    };
-                    if matches!(m, M::Psraw | M::Psrad) {
-                        (sa >> count.min((lane_bits - 1) as u64)) as u64
-                    } else if count >= lane_bits as u64 {
-                        0
-                    } else if matches!(m, M::Psllw | M::Pslld | M::Psllq) {
-                        a << count
-                    } else {
-                        a >> count
-                    }
-                }
-                M::Pmaddwd => {
-                    if lane % 2 != 0 {
-                        continue;
-                    }
-                    let next = n + 2;
-                    let sa2 = signed(bits(&left[next..next + 2]), 2);
-                    let sb2 = signed(bits(&right[next..next + 2]), 2);
-                    let value = (sa * sb + sa2 * sb2) as i32;
-                    out[n..n + 4].copy_from_slice(&value.to_le_bytes());
-                    continue;
-                }
-                _ => return Err(tx.unsupported(i)),
-            };
-            out[n..n + size].copy_from_slice(&value.to_le_bytes()[..size]);
+    } else if m == M::Pmaddwd {
+        for n in (0..width).step_by(4) {
+            let a = signed(bits(&left[n..n + 2]), 2);
+            let b = signed(bits(&right[n..n + 2]), 2);
+            let c = signed(bits(&left[n + 2..n + 4]), 2);
+            let d = signed(bits(&right[n + 2..n + 4]), 2);
+            out[n..n + 4].copy_from_slice(&((a * b + c * d) as i32).to_le_bytes());
         }
+    } else {
+        return Err(tx.unsupported(i));
     }
+
     write(i, tx, memory, &out, width)
 }
