@@ -14,7 +14,7 @@ pub(crate) fn discover(
     entry: u32,
     stop: u32,
     strategy: CompileStrategy,
-    boundaries: &BTreeSet<u32>,
+    boundary: &dyn Fn(u32) -> bool,
 ) -> Result<Region, InterpreterDetail> {
     let mut pending = vec![entry];
     let mut instructions = BTreeSet::new();
@@ -29,7 +29,7 @@ pub(crate) fn discover(
             }
             // An already compiled entry, an in-flight entry, a caller stop,
             // or an exhausted discovery budget remains a real guest transfer.
-            if pc == stop || boundaries.contains(&pc) || instructions.len() == MAX_INSTRUCTIONS {
+            if pc == stop || boundary(pc) || instructions.len() == MAX_INSTRUCTIONS {
                 frontier.insert(pc);
                 break;
             }

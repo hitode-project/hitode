@@ -1424,23 +1424,19 @@ impl Executor {
             self.stats.compilation_schedule.window_deferrals += 1;
             return Ok(());
         }
-        let boundaries = self
-            .code
-            .entry_owner
+        // Published entries are looked up in place: copying every one into a
+        // set per discovery made each attempt cost the whole code cache.
+        let in_flight: BTreeSet<u32> = self
+            .pending_regions
             .keys()
-            .copied()
-            .chain(
-                self.pending_regions
-                    .keys()
-                    .filter_map(|owner| self.code.regions.get(owner))
-                    .flat_map(|region| {
-                        region
-                            .entries
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(region.start))
-                    }),
-            )
+            .filter_map(|owner| self.code.regions.get(owner))
+            .flat_map(|region| {
+                region
+                    .entries
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(region.start))
+            })
             .chain(
                 self.deferred_compilations
                     .values()
@@ -1455,12 +1451,14 @@ impl Executor {
                     }),
             )
             .collect();
+        let entries = &self.code.entry_owner;
+        let boundary = |pc: u32| entries.contains_key(&pc) || in_flight.contains(&pc);
         let region = match crate::discovery::discover(
             &mut self.memory,
             pc,
             stop,
             self.auto_compile_strategy,
-            &boundaries,
+            &boundary,
         ) {
             Ok(region) => region,
             Err(reason) => {
@@ -3259,7 +3257,7 @@ mod tiering_tests {
                 0x1100,
                 0x3000,
                 CompileStrategy::Fast,
-                &BTreeSet::new(),
+                &|_| false,
             )
             .unwrap();
             let input = compile::Snapshot::capture(&region, &mut m.memory).unwrap();
@@ -3276,7 +3274,7 @@ mod tiering_tests {
             0x1100,
             0x3000,
             CompileStrategy::Fast,
-            &BTreeSet::new(),
+            &|_| false,
         )
         .unwrap();
         assert!(region.start + region.len as u32 <= 0x1180);

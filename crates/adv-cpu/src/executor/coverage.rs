@@ -179,24 +179,16 @@ mod tests {
     fn discovery_reports_the_actual_empty_frontier() {
         let mut m = machine();
         assert!(matches!(
-            crate::discovery::discover(
-                &mut m.memory,
-                CODE,
-                CODE,
-                CompileStrategy::Fast,
-                &Default::default()
-            ),
+            crate::discovery::discover(&mut m.memory, CODE, CODE, CompileStrategy::Fast, &|_| {
+                false
+            }),
             Err(Detail::DiscoveryBoundary)
         ));
         m.protect(CODE, 4096, READ).unwrap();
         assert!(matches!(
-            crate::discovery::discover(
-                &mut m.memory,
-                CODE,
-                STOP,
-                CompileStrategy::Fast,
-                &Default::default()
-            ),
+            crate::discovery::discover(&mut m.memory, CODE, STOP, CompileStrategy::Fast, &|_| {
+                false
+            }),
             Err(Detail::DiscoveryMemory)
         ));
         assert_eq!(m.interpreter_detail(CODE), Detail::NonExecutable);
