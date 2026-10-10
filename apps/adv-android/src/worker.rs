@@ -365,12 +365,17 @@ pub fn run(
         .map_err(|_| "audio waker was already registered")?;
     let skip_keys = session.keys.clone();
     let interrupt = session.wake.interrupt_flag();
-    runtime.machine.set_time_skip_source(Some(Arc::new(move || {
-        !interrupt.load(Ordering::Acquire)
-            && [0x11, 0xa2, 0xa3]
-                .iter()
-                .any(|key| skip_keys.get(*key) & 0x80 != 0)
-    })));
+    runtime
+        .machine
+        .set_time_skip_source(Some(Arc::new(move |startup| {
+            // Before the first frame nothing is on screen to pace, so timed waits
+            // only delay first entry; afterwards skipping follows the Ctrl keys.
+            !interrupt.load(Ordering::Acquire)
+                && (startup
+                    || [0x11, 0xa2, 0xa3]
+                        .iter()
+                        .any(|key| skip_keys.get(*key) & 0x80 != 0))
+        })));
     startup(session, data, "audio-output")?;
     let mut output = adv_device::Output::new(runtime.audio_stream());
     startup(session, data, "first-step")?;
