@@ -1568,7 +1568,7 @@ struct Transaction {
 /// pages, so the start and its neighbouring page decide it without the width.
 pub fn fault_address(memory: &Memory, start: u32, permission: u8) -> u32 {
     let next = (start | (PAGE_SIZE as u32 - 1)).wrapping_add(1);
-    if start as usize % PAGE_SIZE != 0
+    if !(start as usize).is_multiple_of(PAGE_SIZE)
         && accessible(memory, start, 1, permission)
         && !accessible(memory, next, 1, permission)
     {

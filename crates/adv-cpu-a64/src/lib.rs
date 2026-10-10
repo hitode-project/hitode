@@ -5,8 +5,10 @@
 //! NDK clang vectors (`tools/cpu/a64_vectors.py`), and translated code runs
 //! under Unicorn arm64 in host tests, so most work needs no device.
 
+pub mod asm;
 pub mod encode;
 mod executor;
+pub mod runtime;
 
 pub use adv_cpu_core::*;
 pub use executor::{ExecutionContext, Executor, Stats};
