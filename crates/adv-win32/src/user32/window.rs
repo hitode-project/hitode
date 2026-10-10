@@ -827,13 +827,32 @@ fn register_class(env: &mut Env<'_>, f: &[u32], small_icon: u32, wide: bool) -> 
 }
 
 fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
+    unregister_class(env, false)
+}
+
+#[win32(user32, name = "UnregisterClassW", level = state)]
+fn unregister_class_w(env: &mut Env<'_>, _name: WideStr, _instance: AbiHandle) -> Outcome {
+    unregister_class(env, true)
+}
+
+fn unregister_class(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (name, inst) = (env.arg(0), env.arg(1));
-    let key = ClassKey::read(env, name);
+    let key = if wide && name >= 0x1_0000 {
+        ClassKey::Name(String::from_utf16_lossy(&crate::util::wstr(env.cpu, name)))
+    } else {
+        ClassKey::read(env, name)
+    };
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(i) = u.find_class(&key, inst) else {
+        crate::util::set_last_error(env, 1411); // ERROR_CLASS_DOES_NOT_EXIST
         return Outcome::Return(0);
     };
-    if u.classes[i].instance == 0 || u.windows.values(&env.sys.objects).any(|w| w.class == i) {
+    if u.classes[i].instance == 0 {
+        crate::util::set_last_error(env, 1411);
+        return Outcome::Return(0);
+    }
+    if u.windows.values(&env.sys.objects).any(|w| w.class == i) {
+        crate::util::set_last_error(env, 1412); // ERROR_CLASS_HAS_WINDOWS
         return Outcome::Return(0);
     }
     let strings = std::mem::take(&mut u.classes[i].menu_query_strings);
@@ -2842,6 +2861,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "RegisterClassA", 1, register_class_a);
     s(reg, "RegisterClassExA", 1, register_class_ex_a);
     s(reg, "UnregisterClassA", 2, unregister_class_a);
+    reg.register(unregister_class_w_ABI);
     s(reg, "GetClassInfoA", 3, get_class_info_a);
     reg.register(get_class_info_w_ABI);
     reg.register(get_class_info_ex_a_ABI);

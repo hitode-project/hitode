@@ -583,6 +583,71 @@ fn load_string_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(put_cstr(env.cpu, buf, cap, &bytes).unwrap_or(cap.saturating_sub(1)))
 }
 
+#[adv_abi::win32(user32, name = "LoadStringW", level = implement)]
+fn load_string_w(
+    env: &mut Env<'_>,
+    instance: adv_abi::Handle,
+    id: u32,
+    output: adv_abi::WideStr,
+    capacity: i32,
+) -> Outcome {
+    let missing = |env: &mut Env<'_>| {
+        if capacity > 0 {
+            let _ = env.cpu.write(output.0.addr(), &[0, 0]);
+        }
+        Outcome::Return(0)
+    };
+    if capacity < 0 {
+        return missing(env);
+    }
+    let block = ResId::Id(((id >> 4) + 1) as u16);
+    let Some((address, size)) =
+        crate::kernel32::find_resource_data(env, instance.0, &ResId::Id(RT_STRING), &block)
+    else {
+        return missing(env);
+    };
+    let Some(end) = address.checked_add(size) else {
+        return missing(env);
+    };
+    let mut pointer = address;
+    for index in 0..=(id & 15) {
+        if pointer.checked_add(2).is_none_or(|next| next > end) {
+            return missing(env);
+        }
+        let Ok(length) = env.cpu.read_u16(pointer) else {
+            return missing(env);
+        };
+        pointer += 2;
+        let next = pointer.checked_add(u32::from(length) * 2);
+        if next.is_none_or(|next| next > end) {
+            return missing(env);
+        }
+        if index != id & 15 {
+            pointer = next.unwrap();
+            continue;
+        }
+        if capacity == 0 {
+            return Outcome::Return(if env.cpu.write_u32(output.0.addr(), pointer).is_ok() {
+                u32::from(length)
+            } else {
+                0
+            });
+        }
+        let count = u32::from(length).min(capacity as u32 - 1);
+        let mut bytes = vec![0; count as usize * 2 + 2];
+        if env
+            .cpu
+            .read(pointer, &mut bytes[..count as usize * 2])
+            .is_err()
+            || env.cpu.write(output.0.addr(), &bytes).is_err()
+        {
+            return Outcome::Return(0);
+        }
+        return Outcome::Return(count);
+    }
+    missing(env)
+}
+
 fn put_empty(env: &mut Env<'_>, buf: u32, cap: u32) -> Outcome {
     if cap > 0 {
         let _ = env.cpu.write(buf, &[0]);
@@ -761,6 +826,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "DestroyIcon", 1, destroy_user_object);
     s(reg, "DestroyCursor", 1, destroy_user_object);
     s(reg, "LoadStringA", 4, load_string_a);
+    reg.register(load_string_w_ABI);
     s(reg, "SetCursor", 1, set_cursor);
     s(reg, "ShowCursor", 1, show_cursor);
     s(reg, "GetCursorPos", 1, get_cursor_pos);

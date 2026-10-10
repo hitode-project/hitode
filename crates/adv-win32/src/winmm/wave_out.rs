@@ -27,14 +27,43 @@ fn count(env: &mut Env<'_>) -> u32 {
 
 #[win32(winmm, name = "waveOutGetDevCapsA", level = safe_fail)]
 fn caps(env: &mut Env<'_>, device: u32, output: GuestPtr<()>, size: u32) -> u32 {
+    capabilities(env, device, output, size, false)
+}
+
+#[win32(winmm, name = "waveOutGetDevCapsW", level = safe_fail)]
+fn caps_w(env: &mut Env<'_>, device: u32, output: GuestPtr<()>, size: u32) -> u32 {
+    capabilities(env, device, output, size, true)
+}
+
+fn capabilities(
+    env: &mut Env<'_>,
+    device: u32,
+    output: GuestPtr<()>,
+    size: u32,
+    wide: bool,
+) -> u32 {
     // SDK explicitly defines a zero-byte capability copy as a successful no-op.
     if size == 0 {
         return 0;
     }
-    if check_range(env.cpu, output.addr(), size.min(52), Prot::WRITE).is_err() {
+    if check_range(
+        env.cpu,
+        output.addr(),
+        size.min(if wide { 84 } else { 52 }),
+        Prot::WRITE,
+    )
+    .is_err()
+    {
         return INVALID_PARAMETER;
     }
-    unavailable(env, "waveOutGetDevCapsA");
+    unavailable(
+        env,
+        if wide {
+            "waveOutGetDevCapsW"
+        } else {
+            "waveOutGetDevCapsA"
+        },
+    );
     if device == u32::MAX {
         NO_DRIVER
     } else {
@@ -130,6 +159,7 @@ fn close(env: &mut Env<'_>, _wave: Handle) -> u32 {
 pub(super) fn register(registry: &mut Registry) {
     registry.register(count_ABI);
     registry.register(caps_ABI);
+    registry.register(caps_w_ABI);
     registry.register(open_ABI);
     registry.register(prepare_ABI);
     registry.register(unprepare_ABI);

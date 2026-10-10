@@ -314,7 +314,7 @@ fn format_picture(pic: &[u16], st: [u16; 8]) -> Vec<u16> {
 
 /// Get{Date,Time}FormatW(lcid, flags, SYSTEMTIME* (NULL: now, local), picture*, buf, cap).
 /// Without a picture the user locale's defaults apply (short/long date, H:mm:ss).
-fn get_date_time_format_w(env: &mut Env<'_>, time: bool) -> Outcome {
+fn get_date_time_format(env: &mut Env<'_>, time: bool, wide: bool) -> Outcome {
     const DATE_LONGDATE: u32 = 2;
     const TIME_NOMINUTESORSECONDS: u32 = 1;
     const TIME_NOSECONDS: u32 = 2;
@@ -326,7 +326,14 @@ fn get_date_time_format_w(env: &mut Env<'_>, time: bool) -> Outcome {
         local_systemtime(env)
     };
     let pic: Vec<u16> = if pic_p != 0 {
-        crate::util::wstr(env.cpu, pic_p)
+        if wide {
+            crate::util::wstr(env.cpu, pic_p)
+        } else {
+            env.ext
+                .get::<crate::Win32>()
+                .codec
+                .to_utf16(0, &crate::util::cstr(env.cpu, pic_p))
+        }
     } else {
         let d = match (time, flags) {
             (true, f) if f & TIME_NOMINUTESORSECONDS != 0 => "H",
@@ -338,11 +345,21 @@ fn get_date_time_format_w(env: &mut Env<'_>, time: bool) -> Outcome {
         d.encode_utf16().collect()
     };
     let out = format_picture(&pic, st);
-    let n = out.len() as u32 + 1;
+    let ansi = (!wide).then(|| env.ext.get::<crate::Win32>().codec.from_utf16(0, &out).0);
+    let n = ansi.as_ref().map_or(out.len(), Vec::len) as u32 + 1;
     if cap == 0 {
         return Outcome::Return(n);
     }
-    if crate::util::put_wstr(env.cpu, buf, cap, &out).is_none() {
+    // Required size is measured in the caller's encoding, including NUL.
+    if cap < n {
+        crate::util::set_last_error(env, crate::util::err::INSUFFICIENT_BUFFER);
+        return Outcome::Return(0);
+    }
+    let written = match ansi {
+        Some(bytes) => crate::util::put_cstr(env.cpu, buf, cap, &bytes),
+        None => crate::util::put_wstr(env.cpu, buf, cap, &out),
+    };
+    if written.is_none() {
         crate::util::set_last_error(env, crate::util::err::INSUFFICIENT_BUFFER);
         return Outcome::Return(0);
     }
@@ -434,10 +451,16 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
     reg.register(get_tick_count_ABI);
     stdcall(reg, K32, "GetDateFormatW", 6, |e| {
-        get_date_time_format_w(e, false)
+        get_date_time_format(e, false, true)
     });
     stdcall(reg, K32, "GetTimeFormatW", 6, |e| {
-        get_date_time_format_w(e, true)
+        get_date_time_format(e, true, true)
+    });
+    stdcall(reg, K32, "GetDateFormatA", 6, |e| {
+        get_date_time_format(e, false, false)
+    });
+    stdcall(reg, K32, "GetTimeFormatA", 6, |e| {
+        get_date_time_format(e, true, false)
     });
     reg.register(query_performance_counter_ABI);
     reg.register(query_performance_frequency_ABI);

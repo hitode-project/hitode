@@ -926,10 +926,24 @@ fn global_memory_status_ex(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
+fn get_computer_name(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (buf, size_p) = (env.arg(0), env.arg(1));
     let cap = env.cpu.read_u32(size_p).unwrap_or(0);
-    match put_cstr(env.cpu, buf, cap, b"PAL-HLE") {
+    if cap < 8 {
+        out_u32(env.cpu, size_p, 8);
+        set_last_error(env, 111);
+        return Outcome::Return(0);
+    }
+    match if wide {
+        crate::util::put_wstr(
+            env.cpu,
+            buf,
+            cap,
+            &"PAL-HLE".encode_utf16().collect::<Vec<_>>(),
+        )
+    } else {
+        put_cstr(env.cpu, buf, cap, b"PAL-HLE")
+    } {
         Some(n) => {
             out_u32(env.cpu, size_p, n);
             Outcome::Return(1)
@@ -940,6 +954,20 @@ fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
             Outcome::Return(0)
         }
     }
+}
+
+fn read_console(env: &mut Env<'_>) -> Outcome {
+    let output = env.arg(3);
+    out_u32(env.cpu, output, 0);
+    set_last_error(env, err::INVALID_HANDLE);
+    Outcome::Return(0)
+}
+
+fn set_console_cp(env: &mut Env<'_>) -> Outcome {
+    // This personality has no console owner. ACP is process text configuration,
+    // not a console setting, and must not be changed by this failed operation.
+    set_last_error(env, err::INVALID_HANDLE);
+    Outcome::Return(0)
 }
 
 pub(super) fn register(reg: &mut Registry) {
@@ -954,12 +982,10 @@ pub(super) fn register(reg: &mut Registry) {
     });
     // There is no console: handlers never fire and reads fail.
     stdcall(reg, K32, "SetConsoleCtrlHandler", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "ReadConsoleW", 5, |e| {
-        let p = e.arg(3);
-        out_u32(e.cpu, p, 0);
-        set_last_error(e, err::INVALID_HANDLE);
-        Outcome::Return(0)
-    });
+    stdcall(reg, K32, "ReadConsoleW", 5, read_console);
+    stdcall(reg, K32, "ReadConsoleA", 5, read_console);
+    stdcall(reg, K32, "SetConsoleCP", 1, set_console_cp);
+    stdcall(reg, K32, "SetConsoleOutputCP", 1, set_console_cp);
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
     });
@@ -1064,5 +1090,10 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetLastError", 1, set_last_error_);
     stdcall(reg, K32, "GlobalMemoryStatus", 1, global_memory_status);
     stdcall(reg, K32, "GlobalMemoryStatusEx", 1, global_memory_status_ex);
-    stdcall(reg, K32, "GetComputerNameA", 2, get_computer_name_a);
+    stdcall(reg, K32, "GetComputerNameA", 2, |e| {
+        get_computer_name(e, false)
+    });
+    stdcall(reg, K32, "GetComputerNameW", 2, |e| {
+        get_computer_name(e, true)
+    });
 }

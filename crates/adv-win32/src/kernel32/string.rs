@@ -11,9 +11,54 @@ use crate::util::{cstr, put_cstr, put_wstr, wstr};
 
 fn lstrcpyn_a(env: &mut Env<'_>) -> Outcome {
     let (dst, src, n) = (env.arg(0), env.arg(1), env.arg(2));
-    let s = cstr(env.cpu, src);
-    put_cstr(env.cpu, dst, n, &s);
-    Outcome::Return(if n == 0 { 0 } else { dst })
+    Outcome::Return(if copy_counted(env.cpu, dst, src, n, false).is_ok() {
+        dst
+    } else {
+        0
+    })
+}
+
+fn copy_counted(
+    cpu: &mut dyn Guest,
+    dst: u32,
+    src: u32,
+    count: u32,
+    wide: bool,
+) -> Result<(), adv_cpu::backend::MemFault> {
+    // Native returns dst for a zero count without touching either pointer.
+    // Copy units incrementally: SEH catches access faults after a partial copy.
+    if count == 0 {
+        return Ok(());
+    }
+    let width = if wide { 2 } else { 1 };
+    let mut unit = [0; 2];
+    for index in 0..count {
+        let offset = index.checked_mul(width).ok_or(adv_cpu::backend::MemFault {
+            addr: dst,
+            len: width,
+        })?;
+        if index == count - 1 {
+            unit.fill(0);
+        } else {
+            cpu.read(src.wrapping_add(offset), &mut unit[..width as usize])?;
+        }
+        cpu.write(dst.wrapping_add(offset), &unit[..width as usize])?;
+        if unit[..width as usize].iter().all(|&byte| byte == 0) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[win32(kernel32, name = "lstrcpynW", level = implement)]
+fn lstrcpyn_w(env: &mut Env<'_>, dst: WideStr, src: WideStr, count: i32) -> Outcome {
+    Outcome::Return(
+        if copy_counted(env.cpu, dst.0.addr(), src.0.addr(), count as u32, true).is_ok() {
+            dst.0.addr()
+        } else {
+            0
+        },
+    )
 }
 
 fn lstrcat_a(env: &mut Env<'_>) -> Outcome {
@@ -104,6 +149,7 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(d)
     });
     stdcall(reg, K32, "lstrcpynA", 3, lstrcpyn_a);
+    reg.register(lstrcpyn_w_ABI);
     stdcall(reg, K32, "lstrcatA", 2, lstrcat_a);
     reg.register(lstrcat_w_ABI);
     stdcall(reg, K32, "lstrcmpA", 2, |e| {
@@ -117,6 +163,15 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "lstrcmpW", 2, |e| {
         Outcome::Return(sign(wstr(e.cpu, e.arg(0)).cmp(&wstr(e.cpu, e.arg(1)))))
+    });
+    stdcall(reg, K32, "lstrcmpiW", 2, |e| {
+        use adv_os::nls::unit_case;
+        Outcome::Return(sign(
+            wstr(e.cpu, e.arg(0))
+                .iter()
+                .map(|&u| unit_case(u, false))
+                .cmp(wstr(e.cpu, e.arg(1)).iter().map(|&u| unit_case(u, false))),
+        ))
     });
     stdcall(reg, K32, "MulDiv", 3, |e| {
         let (a, b, c) = (

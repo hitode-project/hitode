@@ -1351,6 +1351,10 @@ pub(super) fn register(reg: &mut Registry) {
         let (h, t, n, l) = (e.arg(0), e.arg(1), e.arg(2), e.arg(3));
         find_resource(e, h, n, t, Some(l as u16), false)
     });
+    stdcall(reg, K32, "FindResourceExW", 4, |e| {
+        let (h, t, n, l) = (e.arg(0), e.arg(1), e.arg(2), e.arg(3));
+        find_resource(e, h, n, t, Some(l as u16), true)
+    });
     reg.register(load_resource_ABI);
     stdcall(reg, K32, "LockResource", 1, |e| Outcome::Return(e.arg(0)));
     reg.register(sizeof_resource_ABI);
