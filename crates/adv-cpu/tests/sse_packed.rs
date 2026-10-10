@@ -180,6 +180,8 @@ fn mmx_xmm_moves_survive_native_dispatch_and_emms() {
         let mut jit = machine(&bytes, Some(strategy));
         let mut interpreter = machine(&bytes, None);
         let mut unicorn = machine(&bytes, None);
+        // Rust entries count region transfers only while linking is off.
+        jit.set_region_linking(false);
         let state = initial();
         for machine in [&mut jit, &mut interpreter, &mut unicorn] {
             machine.write(NEXT, &next).unwrap();

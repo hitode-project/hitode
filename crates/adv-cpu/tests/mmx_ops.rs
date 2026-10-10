@@ -220,6 +220,8 @@ fn mmx_values_survive_native_region_dispatch_and_x87_emms_boundary() {
     };
     let mut jit = machine(&bytes, true);
     let mut uc = machine(&bytes, false);
+    // Rust entries count region transfers only while linking is off.
+    jit.set_region_linking(false);
     for m in [&mut jit, &mut uc] {
         m.write(HELPER, &helper).unwrap();
         m.protect(HELPER, 4096, READ | EXEC).unwrap();

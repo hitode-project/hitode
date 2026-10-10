@@ -110,6 +110,8 @@ fn observed_callees_run_inside_the_caller_and_follow_their_own_code_pages() {
         let mut jit = machine(&leaf(ADD, false));
         let mut reference = machine(&leaf(ADD, false));
         jit.add_region(unit(ROOT, ROOT, 64, callees)).unwrap();
+        // Rust entries count region transfers only while linking is off.
+        jit.set_region_linking(false);
         for pc in [ADD, XOR, OTHER] {
             jit.add_region(unit(pc, pc, 16, &[])).unwrap();
         }

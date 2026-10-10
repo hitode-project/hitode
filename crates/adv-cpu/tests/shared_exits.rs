@@ -225,6 +225,8 @@ fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
     for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
         let mut jit = machine(&bytes, Some(strategy));
         jit.write(CONSUMER, &consumer).unwrap();
+        // Rust entries count region transfers only while linking is off.
+        jit.set_region_linking(false);
         let mut region = Region::new(CONSUMER, consumer.len());
         region.compile_strategy = strategy;
         jit.add_region(region).unwrap();
