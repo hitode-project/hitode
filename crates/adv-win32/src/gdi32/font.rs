@@ -48,6 +48,7 @@ pub fn register(registry: &mut Registry) {
         metrics_a_ABI,
         metrics_w_ABI,
         outline_metrics_a_ABI,
+        outline_metrics_w_ABI,
         set_map_mode_ABI,
         get_map_mode_ABI,
         set_poly_fill_ABI,
@@ -398,7 +399,7 @@ fn outline_metrics_a(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<
         }
         Err(_) => return Outcome::Return(0),
     };
-    let mut bytes = pack_outline_metrics(env, &metrics);
+    let mut bytes = pack_outline_metrics(env, &metrics, None);
     let required = bytes.len() as u32;
     if output.is_null() {
         return Outcome::Return(required);
@@ -447,12 +448,77 @@ fn outline_metrics_a(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<
     }
 }
 
-fn pack_outline_metrics(env: &Env<'_>, metrics: &text::OutlineMetrics) -> Vec<u8> {
+#[win32(gdi32, name = "GetOutlineTextMetricsW", level = implement)]
+fn outline_metrics_w(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<u8>) -> Outcome {
+    if reject_dc(env, dc.0) || (size == 0 && !output.is_null()) {
+        return Outcome::Return(0);
+    }
+    let request = font_request(env, dc.0);
+    let result = {
+        let provider = &mut env.ext.get_mut::<Fonts>().text;
+        provider.outline_metrics(&request).and_then(|metrics| {
+            provider
+                .unicode_metrics(&request)
+                .map(|(_, chars)| (metrics, chars))
+        })
+    };
+    let (metrics, chars) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            adv_abi::warn_unavailable(env, "gdi32.dll!GetOutlineTextMetricsW", &error.to_string());
+            set_last_error(env, 50);
+            return Outcome::Return(0);
+        }
+    };
+    let mut bytes = pack_outline_metrics(env, &metrics, Some(chars));
+    let required = bytes.len() as u32;
+    if output.is_null() {
+        return Outcome::Return(required);
+    }
+    // The W front keeps full otmSize in every prefix. Beyond the fixed x86
+    // structure, insufficient name storage fails without writes or LastError.
+    if size > 216 && size < required {
+        return Outcome::Return(0);
+    }
+    if size < required {
+        bytes[200..216].fill(0);
+    }
+    let copied = size.min(required) as usize;
+    if adv_abi::guest::check_range(
+        env.cpu,
+        output.addr(),
+        copied as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )
+    .is_err()
+        || env.cpu.write(output.addr(), &bytes[..copied]).is_err()
+    {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    Outcome::Return(copied as u32)
+}
+
+fn pack_outline_metrics(
+    env: &Env<'_>,
+    metrics: &text::OutlineMetrics,
+    characters: Option<[u16; 4]>,
+) -> Vec<u8> {
     // SDK x86 OUTLINETEXTMETRICA: the 56-byte TEXTMETRICA occupies 4..60,
     // PANOSE follows its filler, and typographic ascent starts at byte 96.
-    let mut bytes = vec![0; 212];
-    bytes[4..60].copy_from_slice(&pack_metrics(&metrics.text));
-    bytes[61..71].copy_from_slice(&metrics.panose);
+    let shift = usize::from(characters.is_some()) * 4;
+    let mut bytes = vec![0; 212 + shift];
+    let common = pack_metrics(&metrics.text);
+    if let Some(chars) = characters {
+        bytes[4..48].copy_from_slice(&common[..44]);
+        for (index, unit) in chars.into_iter().enumerate() {
+            bytes[48 + index * 2..50 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes[56..61].copy_from_slice(&common[48..53]);
+    } else {
+        bytes[4..60].copy_from_slice(&common);
+    }
+    bytes[61 + shift..71 + shift].copy_from_slice(&metrics.panose);
     for (index, value) in [
         metrics.selection,
         metrics.embedding,
@@ -489,15 +555,20 @@ fn pack_outline_metrics(env: &Env<'_>, metrics: &text::OutlineMetrics) -> Vec<u8
     .into_iter()
     .enumerate()
     {
-        let offset = 72 + index * 4;
+        let offset = 72 + shift + index * 4;
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     let codec = &env.ext.get::<Win32>().codec;
     for (index, name) in metrics.names.iter().enumerate() {
         let offset = bytes.len() as u32;
-        bytes[196 + index * 4..200 + index * 4].copy_from_slice(&offset.to_le_bytes());
-        bytes.extend(codec.encode(name));
-        bytes.push(0);
+        bytes[196 + shift + index * 4..200 + shift + index * 4]
+            .copy_from_slice(&offset.to_le_bytes());
+        if characters.is_some() {
+            bytes.extend(name.encode_utf16().chain([0]).flat_map(u16::to_le_bytes));
+        } else {
+            bytes.extend(codec.encode(name));
+            bytes.push(0);
+        }
     }
     let required = bytes.len() as u32;
     bytes[..4].copy_from_slice(&required.to_le_bytes());

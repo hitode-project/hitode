@@ -1,6 +1,8 @@
 use super::*;
 #[path = "tests/outline_metrics.rs"]
 mod outline_metrics;
+#[path = "tests/pairs.rs"]
+mod pairs;
 #[path = "tests/widths.rs"]
 mod widths;
 use crate as adv_win32;

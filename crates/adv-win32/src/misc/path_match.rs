@@ -1,11 +1,12 @@
 //! shlwapi wildcard matching of a whole path against a `;`-separated spec list.
-use adv_abi::{Registry, WideStr, warn_unavailable};
+use adv_abi::{AnsiStr, Registry, WideStr, warn_unavailable};
 use adv_machine::{Env, Outcome};
 
 use crate::util::set_last_error;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(path_match_spec_w_ABI);
+    registry.register(path_match_spec_a_ABI);
 }
 
 const STAR: u16 = b'*' as u16;
@@ -34,18 +35,54 @@ fn same(file: u16, spec: u16, ambiguous: &mut bool) -> bool {
 /// One spec: `*` matches any run (separators included) and `?` one unit. A
 /// single `?` that ends the spec also matches the end of the name.
 fn single(file: &[u16], spec: &[u16], ambiguous: &mut bool) -> bool {
-    match spec.split_first() {
-        None => file.is_empty(),
-        Some((&STAR, rest)) => {
-            let rest = &rest[rest.iter().take_while(|&&unit| unit == STAR).count()..];
-            (0..=file.len()).any(|skip| single(&file[skip..], rest, ambiguous))
+    let (mut at, mut pattern, mut retry) = (0, 0, None);
+    // Retain only the most recent wildcard; no recursive suffix expansion or
+    // guest-length host stack. The final '?' retains native's optional EOF unit.
+    while at < file.len() {
+        if spec.get(pattern) == Some(&STAR) {
+            pattern += 1;
+            retry = Some((pattern, at));
+        } else if spec
+            .get(pattern)
+            .is_some_and(|&unit| unit == QUESTION || same(file[at], unit, ambiguous))
+        {
+            at += 1;
+            pattern += 1;
+        } else if let Some((resume, consumed)) = retry {
+            at = consumed + 1;
+            pattern = resume;
+            retry = Some((resume, at));
+        } else {
+            return false;
         }
-        Some((&QUESTION, rest)) if file.is_empty() => rest.is_empty(),
-        Some((&QUESTION, rest)) => single(&file[1..], rest, ambiguous),
-        Some((&unit, rest)) => file.split_first().is_some_and(|(&first, tail)| {
-            same(first, unit, ambiguous) && single(tail, rest, ambiguous)
-        }),
     }
+    while spec.get(pattern) == Some(&STAR) {
+        pattern += 1;
+    }
+    pattern == spec.len() || spec.get(pattern..) == Some(&[QUESTION][..])
+}
+
+#[adv_abi::win32(shlwapi, name = "PathMatchSpecA", level = implement)]
+fn path_match_spec_a(env: &mut Env<'_>, file: AnsiStr, spec: AnsiStr) -> Outcome {
+    if file.0.is_null() || spec.0.is_null() {
+        return Outcome::Return(0);
+    }
+    let (Ok(file), Ok(spec)) = (file.read(env.cpu, 65536), spec.read(env.cpu, 65536)) else {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    };
+    let codec = env.ext.get::<crate::Win32>().codec;
+    let (file, spec) = (codec.to_utf16(0, &file), codec.to_utf16(0, &spec));
+    let mut ambiguous = false;
+    let matched = matches(&file, &spec, &mut ambiguous);
+    if !matched && ambiguous {
+        warn_unavailable(
+            env,
+            "shlwapi.dll!PathMatchSpecA",
+            "non-ASCII case folding differs between Windows releases and locales",
+        );
+    }
+    Outcome::Return(u32::from(matched))
 }
 
 /// An empty list matches every name. Each listed spec skips leading spaces
@@ -92,6 +129,15 @@ mod tests {
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn repeated_wildcard_failure_and_long_literals_do_not_expand_suffixes_or_stack() {
+        let file = wide(&"a".repeat(100));
+        let spec = wide(&("*a".repeat(24) + "b"));
+        assert!(!matches(&file, &spec, &mut false));
+        let file = wide(&"a".repeat(60000));
+        assert!(matches(&file, &file, &mut false));
     }
 
     #[test]

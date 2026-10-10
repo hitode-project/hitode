@@ -4,10 +4,23 @@ use adv_cpu::backend::Prot;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(pairs_w_ABI);
+    registry.register(pairs_a_ABI);
 }
 
 #[win32(gdi32, name = "GetKerningPairsW", level = implement)]
 fn pairs_w(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>) -> u32 {
+    pairs(env, dc, capacity, output, true)
+}
+#[win32(gdi32, name = "GetKerningPairsA", level = implement)]
+fn pairs_a(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>) -> u32 {
+    pairs(env, dc, capacity, output, false)
+}
+fn pairs(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>, wide: bool) -> u32 {
+    let api = if wide {
+        "gdi32.dll!GetKerningPairsW"
+    } else {
+        "gdi32.dll!GetKerningPairsA"
+    };
     // Authored native oracle: invalid/NULL HDC returns zero and preserves
     // LastError, unlike some other GDI queries in this personality.
     if !matches!(
@@ -25,7 +38,7 @@ fn pairs_w(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>) -
         if capacity > text::MAX_KERNING_PAIRS {
             adv_abi::warn_unavailable(
                 env,
-                "gdi32.dll!GetKerningPairsW",
+                api,
                 "kerning-pair output capacity exceeds the supported 1,048,576-entry budget",
             );
             set_last_error(env, 87);
@@ -39,8 +52,59 @@ fn pairs_w(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>) -
         }
     }
     let request = font_request(env, dc.0);
+    let codec = env.ext.get::<Win32>().codec;
+    let codepage = ansi_codepage(env, &request);
     let text = &mut env.ext.get_mut::<Fonts>().text;
-    let result = if output.is_null() {
+    let result = if !wide {
+        text.kerning_pairs(&request, text::MAX_KERNING_PAIRS)
+            .and_then(|pairs| {
+                if pairs.is_empty() {
+                    return Ok(0);
+                }
+                let codepage = codepage.ok_or_else(|| {
+                    TextError::Font("ANSI kerning charset has no supported mapping".into())
+                })?;
+                let encode = |unit: u16| {
+                    let (bytes, lossy) = codec.from_utf16(codepage, &[unit]);
+                    if lossy {
+                        return None;
+                    }
+                    match bytes.as_slice() {
+                        [byte] => Some(u16::from(*byte)),
+                        [lead, trail] => Some(u16::from_be_bytes([*lead, *trail])),
+                        _ => None,
+                    }
+                };
+                // Native A filters unencodable Unicode pairs, then applies capacity;
+                // DBCS words place the lead byte in the high byte, as glyph queries do.
+                let converted: Vec<_> = pairs
+                    .into_iter()
+                    .filter_map(|pair| {
+                        Some(text::KerningPair {
+                            first: encode(pair.first)?,
+                            second: encode(pair.second)?,
+                            adjustment: pair.adjustment,
+                        })
+                    })
+                    .collect();
+                if output.is_null() {
+                    return Ok(converted.len() as u32);
+                }
+                let count = converted.len().min(capacity as usize);
+                let mut bytes = Vec::with_capacity(count * 8);
+                for pair in converted.into_iter().take(count) {
+                    bytes.extend(pair.first.to_le_bytes());
+                    bytes.extend(pair.second.to_le_bytes());
+                    bytes.extend(pair.adjustment.to_le_bytes());
+                }
+                if !bytes.is_empty() && env.cpu.write(output.addr(), &bytes).is_err() {
+                    return Err(TextError::Font(
+                        "kerning-pair output became inaccessible".into(),
+                    ));
+                }
+                Ok(count as u32)
+            })
+    } else if output.is_null() {
         // The provider ignores capacity for count-only queries.
         text.kerning_pair_count(&request)
     } else {
@@ -63,7 +127,7 @@ fn pairs_w(env: &mut Env<'_>, dc: Handle, capacity: u32, output: GuestPtr<u8>) -
     match result {
         Ok(count) => count,
         Err(error) => {
-            adv_abi::warn_unavailable(env, "gdi32.dll!GetKerningPairsW", &error.to_string());
+            adv_abi::warn_unavailable(env, api, &error.to_string());
             set_last_error(env, 50);
             0
         }

@@ -307,6 +307,19 @@ fn decode_family(value: u8) -> Family {
     }
 }
 impl Font {
+    pub(super) fn encoded_character_width(&self, code: u16) -> Result<i32, TextError> {
+        let mut width = 0;
+        // SAFETY: the selected private font/DC belongs to this provider, and
+        // the initialized scalar covers the one-character output completely.
+        if unsafe { gdi::GetCharWidth32A(self.dc, u32::from(code), u32::from(code), &mut width) }
+            == 0
+        {
+            return Err(TextError::Font(
+                "encoded character width query failed".into(),
+            ));
+        }
+        Ok(width)
+    }
     pub(super) fn character_widths(&self, first: u16, last: u16) -> Result<Vec<i32>, TextError> {
         let mut widths = vec![0; usize::from(last) - usize::from(first) + 1];
         // SAFETY: private selected font/DC, and a writable allocation covering

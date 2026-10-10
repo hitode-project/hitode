@@ -25,13 +25,24 @@ fn structure(env: &Env<'_>, address: u32, sizes: &[u32]) -> Result<u32, u32> {
 
 #[win32(comctl32, name = "CreatePropertySheetPageA", level = safe_fail)]
 fn create_page(env: &mut Env<'_>, page: GuestPtr<u8>) -> Handle {
+    create_page_encoded(env, page, false)
+}
+#[win32(comctl32, name = "CreatePropertySheetPageW", level = safe_fail)]
+fn create_page_w(env: &mut Env<'_>, page: GuestPtr<u8>) -> Handle {
+    create_page_encoded(env, page, true)
+}
+fn create_page_encoded(env: &mut Env<'_>, page: GuestPtr<u8>, wide: bool) -> Handle {
     // SDK prsht.h's four x86 PROPSHEETPAGEA revisions are 40/48/52/56 bytes.
     let error = match structure(env, page.addr(), &[40, 48, 52, 56]) {
         Err(error) => error,
         Ok(_) => {
             adv_abi::warn_unavailable(
                 env,
-                "comctl32.dll!CreatePropertySheetPageA",
+                if wide {
+                    "comctl32.dll!CreatePropertySheetPageW"
+                } else {
+                    "comctl32.dll!CreatePropertySheetPageA"
+                },
                 "property sheet page ownership and callbacks are not implemented",
             );
             ERROR_CALL_NOT_IMPLEMENTED
@@ -43,6 +54,13 @@ fn create_page(env: &mut Env<'_>, page: GuestPtr<u8>) -> Handle {
 
 #[win32(comctl32, name = "PropertySheetA", level = safe_fail)]
 fn property_sheet(env: &mut Env<'_>, header: GuestPtr<u8>) -> i32 {
+    sheet_encoded(env, header, false)
+}
+#[win32(comctl32, name = "PropertySheetW", level = safe_fail)]
+fn property_sheet_w(env: &mut Env<'_>, header: GuestPtr<u8>) -> i32 {
+    sheet_encoded(env, header, true)
+}
+fn sheet_encoded(env: &mut Env<'_>, header: GuestPtr<u8>, wide: bool) -> i32 {
     // SDK x86 PROPSHEETHEADERA V1/V2; no guest callback is invoked on failure.
     let flags = match structure(env, header.addr(), &[40, 52]) {
         Err(error) => {
@@ -58,7 +76,11 @@ fn property_sheet(env: &mut Env<'_>, header: GuestPtr<u8>) -> i32 {
     }
     adv_abi::warn_unavailable(
         env,
-        "comctl32.dll!PropertySheetA",
+        if wide {
+            "comctl32.dll!PropertySheetW"
+        } else {
+            "comctl32.dll!PropertySheetA"
+        },
         "property sheet frame, page activation and modal/modeless lifecycle are not implemented",
     );
     set_last_error(env, ERROR_CALL_NOT_IMPLEMENTED);
@@ -67,5 +89,7 @@ fn property_sheet(env: &mut Env<'_>, header: GuestPtr<u8>) -> i32 {
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_page_ABI);
+    registry.register(create_page_w_ABI);
     registry.register(property_sheet_ABI);
+    registry.register(property_sheet_w_ABI);
 }

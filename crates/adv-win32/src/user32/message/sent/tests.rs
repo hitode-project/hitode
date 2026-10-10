@@ -46,6 +46,19 @@ fn setup(env: &mut Env<'_>) -> Outcome {
 fn procedure(env: &mut Env<'_>) -> Outcome {
     match env.arg(1) {
         window::wm::NCCREATE => Outcome::Return(1),
+        window::wm::SETTEXT => {
+            assert_eq!(env.context, 0);
+            assert_eq!(env.cpu.read_cstr(env.arg(3), 64).unwrap(), [0xd6, 0xd0]);
+            env.ext.get_mut::<Observed>().0.push(2);
+            Outcome::Return(1)
+        }
+        window::wm::CHAR => {
+            assert_eq!(env.context, 1);
+            assert_eq!(env.arg(2), 0x80); // U+20AC in guest CP1252.
+            assert!(matches!(in_send(env), Outcome::Return(1)));
+            env.ext.get_mut::<Observed>().0.push(3);
+            Outcome::Return(9)
+        }
         APP => {
             assert_eq!(env.context, 1);
             assert_eq!(
@@ -224,4 +237,148 @@ fn timed_out_send_is_removed_before_receiver_pumps_and_preserves_output() {
         m.ext.get::<Observed>().0.is_empty(),
         "cancelled WndProc was invoked"
     );
+}
+
+#[test]
+fn wide_timeout_value_and_text_sends_use_the_existing_callback_and_encoding_owner() {
+    let mut m = fixture();
+    m.ext.get_mut::<crate::Win32>().codec = adv_os::Codec::new(936);
+    m.cpu.write(DATA + 128, &[0x2d, 0x4e, 0, 0]).unwrap();
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageTimeoutW").unwrap();
+    let mut code = Asm::new(CODE);
+    code.call(setup).mov_mem_eax(DATA);
+    for (message, parameter, result, success) in [
+        (APP + 1, 0, DATA + 8, DATA + 12),
+        (window::wm::SETTEXT, DATA + 128, DATA + 16, DATA + 20),
+    ] {
+        code.push_imm(result)
+            .push_imm(0)
+            .push_imm(0)
+            .push_imm(parameter)
+            .push_imm(0)
+            .push_imm(message)
+            .mov_eax_mem(DATA)
+            .push_eax()
+            .call(send)
+            .mov_mem_eax(success);
+    }
+    code.call(done).hlt();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.cpu
+        .executor_mut()
+        .add_region(Region::new(CODE, code.bytes.len()))
+        .unwrap();
+    m.spawn("wide timeout", CODE, &[], 65536).unwrap();
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 7);
+    assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 1);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 1);
+    assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 1);
+    assert_eq!(m.ext.get::<Observed>().0, [0, 2]);
+}
+
+#[test]
+fn timed_cross_encoding_text_is_rejected_before_queueing_receiver_unsafe_storage() {
+    let mut m = fixture();
+    m.cpu.write(DATA + 128, &[0x2d, 0x4e, 0, 0]).unwrap();
+    m.cpu.write_u32(DATA + 8, 0x12345678).unwrap();
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageTimeoutW").unwrap();
+    let error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let mut sender = Asm::new(CODE);
+    let wait = sender.here();
+    sender.cmp_mem_imm8(DATA + 4, 0).jz(wait);
+    sender
+        .push_imm(DATA + 8)
+        .push_imm(20)
+        .push_imm(1)
+        .push_imm(DATA + 128)
+        .push_imm(0)
+        .push_imm(window::wm::SETTEXT)
+        .mov_eax_mem(DATA + 4)
+        .push_eax()
+        .call(send)
+        .mov_mem_eax(DATA + 12)
+        .call(error)
+        .mov_mem_eax(DATA + 16)
+        .mov_mem_imm(DATA + 20, 1)
+        .call(done)
+        .hlt();
+    let mut receiver = Asm::new(CODE + 0x200);
+    receiver.call(setup).mov_mem_eax(DATA + 4);
+    let wait = receiver.here();
+    receiver
+        .cmp_mem_imm8(DATA + 20, 0)
+        .jz(wait)
+        .call(done)
+        .hlt();
+    for (pc, code) in [(CODE, sender), (CODE + 0x200, receiver)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("timed encoding boundary", pc, &[], 65536).unwrap();
+    }
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0x12345678);
+    assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 50);
+    assert!(m.ext.get::<Observed>().0.is_empty());
+}
+
+#[test]
+fn timed_cross_thread_character_conversion_needs_no_temporary_storage() {
+    let mut m = fixture();
+    m.ext.get_mut::<crate::Win32>().codec = adv_os::Codec::new(1252);
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageTimeoutW").unwrap();
+    let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
+    let mut sender = Asm::new(CODE);
+    let wait = sender.here();
+    sender.cmp_mem_imm8(DATA + 4, 0).jz(wait);
+    sender
+        .push_imm(DATA + 8)
+        .push_imm(1000)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0x20ac)
+        .push_imm(window::wm::CHAR)
+        .mov_eax_mem(DATA + 4)
+        .push_eax()
+        .call(send)
+        .mov_mem_eax(DATA + 12)
+        .mov_mem_imm(DATA + 20, 1)
+        .call(done)
+        .hlt();
+    let mut receiver = Asm::new(CODE + 0x200);
+    receiver.call(setup).mov_mem_eax(DATA + 4);
+    let poll = receiver.here();
+    receiver
+        .push_imm(1)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(DATA + 64)
+        .call(peek)
+        .cmp_mem_imm8(DATA + 20, 0)
+        .jz(poll)
+        .call(done)
+        .hlt();
+    for (pc, code) in [(CODE, sender), (CODE + 0x200, receiver)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("timed character", pc, &[], 65536).unwrap();
+    }
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 9);
+    assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 1);
+    assert_eq!(m.ext.get::<Observed>().0, [3]);
 }

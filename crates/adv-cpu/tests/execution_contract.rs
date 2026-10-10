@@ -136,8 +136,10 @@ fn feature_queries_expose_reference_tsc_without_host_avx_or_rdtscp() {
                     .flat_map(|r| m.state.regs[r].to_le_bytes())
                     .collect();
                 assert_eq!(vendor, b"GenuineIntel");
+                assert_eq!(vendor, adv_cpu::PROCESSOR_IDENTITY.vendor.as_bytes());
             }
             1 => {
+                assert_eq!(m.state.regs[0], adv_cpu::PROCESSOR_IDENTITY.signature);
                 assert_eq!(m.state.regs[1], 0);
                 assert_ne!(m.state.regs[2] & (1 << 4), 0);
                 assert_ne!(m.state.regs[2] & (1 << 26), 0);

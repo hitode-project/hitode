@@ -209,6 +209,24 @@ fn search_a(
     set_last_error(env, 50); // ERROR_NOT_SUPPORTED
     0
 }
+#[win32(kernel32, name = "SearchPathW", level = safe_fail)]
+fn search_w(
+    env: &mut Env<'_>,
+    _path: WideStr,
+    _name: WideStr,
+    _extension: WideStr,
+    _cap: u32,
+    _output: WideStr,
+    _part: GuestPtr<u32>,
+) -> u32 {
+    adv_abi::warn_unavailable(
+        env,
+        "kernel32.dll!SearchPathW",
+        "guest path search is unavailable; caller outputs are retained",
+    );
+    set_last_error(env, 50);
+    0
+}
 #[win32(kernel32, name = "GetCurrentDirectoryA", level = implement)]
 fn current_a(env: &mut Env<'_>, cap: u32, output: AnsiStr) -> Result<u32, MemFault> {
     current(env, cap, output.0.addr(), false)
@@ -468,6 +486,7 @@ pub(super) fn register(reg: &mut Registry) {
         full_a_ABI,
         full_w_ABI,
         search_a_ABI,
+        search_w_ABI,
         current_a_ABI,
         current_w_ABI,
         set_a_ABI,

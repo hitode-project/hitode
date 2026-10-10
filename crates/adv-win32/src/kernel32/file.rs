@@ -1215,13 +1215,41 @@ impl Ini {
 }
 
 fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
+    write_private_profile_string(env, false)
+}
+
+fn write_private_profile_string(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (sec_p, key_p, val_p) = (env.arg(0), env.arg(1), env.arg(2));
-    let file = profile_path(env, env.arg(3));
+    let file = if wide {
+        let name = path_w(env, env.arg(3));
+        if name.contains(['\\', '/']) {
+            name
+        } else {
+            format!("C:\\Windows\\{name}")
+        }
+    } else {
+        profile_path(env, env.arg(3))
+    };
+    let encoded = |env: &Env<'_>, pointer| {
+        if wide {
+            env.ext
+                .get::<Win32>()
+                .codec
+                .from_utf16(0, &crate::util::wstr(env.cpu, pointer))
+                .0
+        } else {
+            cstr(env.cpu, pointer)
+        }
+    };
     let mut ini = match read_contents(env, &file) {
         Ok(bytes) if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) => {
             adv_abi::warn_unavailable(
                 env,
-                "kernel32.dll!WritePrivateProfileStringA",
+                if wide {
+                    "kernel32.dll!WritePrivateProfileStringW"
+                } else {
+                    "kernel32.dll!WritePrivateProfileStringA"
+                },
                 "Unicode profile-file writes are unavailable; preserving the existing encoded file",
             );
             set_last_error(env, 50);
@@ -1236,19 +1264,19 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     if ini.lines.last().is_some_and(Vec::is_empty) {
         ini.lines.pop();
     }
-    let sec = cstr(env.cpu, sec_p);
+    let sec = encoded(env, sec_p);
     match ini.section(&sec) {
         None if key_p == 0 || val_p == 0 => {}
         None => {
             ini.lines.push([b"[", &sec[..], b"]"].concat());
             ini.lines
-                .push([&cstr(env.cpu, key_p)[..], b"=", &cstr(env.cpu, val_p)[..]].concat());
+                .push([&encoded(env, key_p)[..], b"=", &encoded(env, val_p)[..]].concat());
         }
         Some((s, e)) if key_p == 0 => {
             ini.lines.drain(s - 1..e);
         }
         Some((s, e)) => {
-            let key = cstr(env.cpu, key_p);
+            let key = encoded(env, key_p);
             let existing = ini
                 .entries(&sec)
                 .into_iter()
@@ -1258,7 +1286,7 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
                 (Some(i), 0) => {
                     ini.lines.remove(i);
                 }
-                (Some(i), v) => ini.lines[i] = [&key[..], b"=", &cstr(env.cpu, v)[..]].concat(),
+                (Some(i), v) => ini.lines[i] = [&key[..], b"=", &encoded(env, v)[..]].concat(),
                 (None, 0) => {}
                 (None, v) => {
                     // Append after the section's last non-empty line.
@@ -1267,7 +1295,7 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
                         .find(|&i| !trim(&ini.lines[i]).is_empty())
                         .map_or(s, |i| i + 1);
                     ini.lines
-                        .insert(at, [&key[..], b"=", &cstr(env.cpu, v)[..]].concat());
+                        .insert(at, [&key[..], b"=", &encoded(env, v)[..]].concat());
                 }
             }
         }
@@ -1731,6 +1759,9 @@ pub(super) fn register(reg: &mut Registry) {
         4,
         write_private_profile_string_a,
     );
+    stdcall(reg, K32, "WritePrivateProfileStringW", 4, |env| {
+        write_private_profile_string(env, true)
+    });
     stdcall(reg, K32, "WriteConsoleA", 5, |e| {
         let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
         let mut data = vec![0u8; n as usize];

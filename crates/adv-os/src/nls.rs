@@ -233,6 +233,31 @@ pub fn unit_case(unit: u16, upper: bool) -> u16 {
     }
 }
 
+#[path = "nls/char_next_table.rs"]
+mod char_next_table;
+
+/// Units skipped after the first unit by legacy USER32 CharNextW. This includes
+/// leading surrogates; it is neither Unicode grapheme nor scalar segmentation.
+pub fn char_next_skips(unit: u16) -> bool {
+    let rows = char_next_table::RANGES;
+    let index = rows.partition_point(|&(_, last)| last < unit);
+    rows.get(index).is_some_and(|&(first, _)| first <= unit)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn char_next_suffixes_match_native_for_every_bmp_unit() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn CharNextW(text: *const u16) -> *const u16;
+    }
+    for unit in 1..=u16::MAX {
+        let text = [0x61, unit, 0x62, 0];
+        let skips = unsafe { CharNextW(text.as_ptr()) == text.as_ptr().add(2) };
+        assert_eq!(char_next_skips(unit), skips, "unit {unit:#x}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

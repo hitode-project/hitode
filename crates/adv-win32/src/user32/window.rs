@@ -827,13 +827,32 @@ fn register_class(env: &mut Env<'_>, f: &[u32], small_icon: u32, wide: bool) -> 
 }
 
 fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
+    unregister_class(env, false)
+}
+
+#[win32(user32, name = "UnregisterClassW", level = state)]
+fn unregister_class_w(env: &mut Env<'_>, _name: WideStr, _instance: AbiHandle) -> Outcome {
+    unregister_class(env, true)
+}
+
+fn unregister_class(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (name, inst) = (env.arg(0), env.arg(1));
-    let key = ClassKey::read(env, name);
+    let key = if wide && name >= 0x1_0000 {
+        ClassKey::Name(String::from_utf16_lossy(&crate::util::wstr(env.cpu, name)))
+    } else {
+        ClassKey::read(env, name)
+    };
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(i) = u.find_class(&key, inst) else {
+        crate::util::set_last_error(env, 1411); // ERROR_CLASS_DOES_NOT_EXIST
         return Outcome::Return(0);
     };
-    if u.classes[i].instance == 0 || u.windows.values(&env.sys.objects).any(|w| w.class == i) {
+    if u.classes[i].instance == 0 {
+        crate::util::set_last_error(env, 1411);
+        return Outcome::Return(0);
+    }
+    if u.windows.values(&env.sys.objects).any(|w| w.class == i) {
+        crate::util::set_last_error(env, 1412); // ERROR_CLASS_HAS_WINDOWS
         return Outcome::Return(0);
     }
     let strings = std::mem::take(&mut u.classes[i].menu_query_strings);
@@ -2384,12 +2403,49 @@ fn call_window_proc_w(
 }
 
 fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
+    get_class_long(env, false)
+}
+#[win32(user32, name = "GetClassLongW", level = state)]
+fn get_class_long_w(env: &mut Env<'_>, _hwnd: AbiHandle, _index: i32) -> Outcome {
+    get_class_long(env, true)
+}
+fn get_class_long(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (hwnd, idx) = (env.arg(0), env.arg(1) as i32);
     let u = user(env);
     let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
+        set_last_error(env, 1400);
         return Outcome::Return(0);
     };
-    let c = &u.classes[w.class];
+    let index = w.class;
+    let c = &u.classes[index];
+    let api = if wide {
+        "user32.dll!GetClassLongW"
+    } else {
+        "user32.dll!GetClassLongA"
+    };
+    if idx == -24 && c.unicode.is_some_and(|encoding| encoding != wide) {
+        return procedure_boundary(
+            env,
+            api,
+            "cross-encoding class procedure query requires an unavailable thunk",
+        );
+    }
+    if idx == -8
+        && let Some(text) = c.menu_text.clone()
+    {
+        let encoding = usize::from(wide);
+        let cached = c.menu_query_strings[encoding];
+        if cached != 0 {
+            return Outcome::Return(cached);
+        }
+        let pointer = super::message::guest_text(env, &text, wide);
+        if pointer == 0 {
+            set_last_error(env, 8);
+            return Outcome::Return(0);
+        }
+        user_mut(env).classes[index].menu_query_strings[encoding] = pointer;
+        return Outcome::Return(pointer);
+    }
     Outcome::Return(match idx {
         -24 => c.proc,
         -26 => c.style,
@@ -2407,14 +2463,61 @@ fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
 }
 
 fn set_class_long_a(env: &mut Env<'_>) -> Outcome {
+    set_class_long(env, false)
+}
+#[win32(user32, name = "SetClassLongW", level = state)]
+fn set_class_long_w(env: &mut Env<'_>, _hwnd: AbiHandle, _index: i32, _value: i32) -> Outcome {
+    set_class_long(env, true)
+}
+fn set_class_long(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (hwnd, idx, v) = (env.arg(0), env.arg(1) as i32, env.arg(2));
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(ci) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.class) else {
+        set_last_error(env, 1400);
         return Outcome::Return(0);
     };
-    let c = &mut u.classes[ci];
+    let api = if wide {
+        "user32.dll!SetClassLongW"
+    } else {
+        "user32.dll!SetClassLongA"
+    };
+    if idx == -24
+        && (u.classes[ci]
+            .unicode
+            .is_some_and(|encoding| encoding != wide)
+            || procedure_encoding(env, v).is_some_and(|encoding| encoding != wide))
+    {
+        return procedure_boundary(
+            env,
+            api,
+            "cross-encoding class procedure replacement requires an unavailable thunk",
+        );
+    }
+    if idx == -24 {
+        let previous = user(env).classes[ci].proc;
+        if !can_capture_procedures(user(env), &[previous, v]) {
+            return procedure_boundary(
+                env,
+                api,
+                "saved class procedure encoding metadata reached its bounded capacity",
+            );
+        }
+        let old_encoding = user(env).classes[ci].unicode;
+        let previous_is_stock = stock_procedure(user(env), previous);
+        let next_is_stock = stock_procedure(user(env), v);
+        let state = user_mut(env);
+        if !previous_is_stock && let Some(encoding) = old_encoding {
+            *state.saved_procedure_encodings.entry(previous).or_default() |=
+                if encoding { 2 } else { 1 };
+        }
+        if !next_is_stock {
+            *state.saved_procedure_encodings.entry(v).or_default() |= if wide { 2 } else { 1 };
+        }
+        state.classes[ci].unicode = if next_is_stock { None } else { Some(wide) };
+        return Outcome::Return(std::mem::replace(&mut state.classes[ci].proc, v));
+    }
+    let c = &mut user_mut(env).classes[ci];
     let slot = match idx {
-        -24 => &mut c.proc,
         -26 => &mut c.style,
         -14 => &mut c.icon,
         -34 => &mut c.small_icon,
@@ -2842,6 +2945,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "RegisterClassA", 1, register_class_a);
     s(reg, "RegisterClassExA", 1, register_class_ex_a);
     s(reg, "UnregisterClassA", 2, unregister_class_a);
+    reg.register(unregister_class_w_ABI);
     s(reg, "GetClassInfoA", 3, get_class_info_a);
     reg.register(get_class_info_w_ABI);
     reg.register(get_class_info_ex_a_ABI);
@@ -2885,7 +2989,9 @@ pub fn register(reg: &mut Registry) {
         set_layered_window_attributes,
     );
     s(reg, "GetClassLongA", 2, get_class_long_a);
+    reg.register(get_class_long_w_ABI);
     s(reg, "SetClassLongA", 3, set_class_long_a);
+    reg.register(set_class_long_w_ABI);
     s(reg, "GetParent", 1, get_parent);
     s(reg, "IsChild", 2, is_child);
     s(reg, "GetWindow", 2, get_window);

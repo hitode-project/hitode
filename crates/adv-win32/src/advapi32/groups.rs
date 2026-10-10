@@ -346,7 +346,7 @@ fn delete_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         let value_name = fold(&name(env, env.arg(1), wide, true)?);
         let modified = crate::kernel32::filetime_now(env);
         let opened = opened(env, hkey)?;
-        if opened.access & SET == 0 {
+        if opened.access & SET == 0 || state(env).is_read_only(&opened.key) {
             return Err(ACCESS_DENIED);
         }
         let registry = state(env);
@@ -383,6 +383,9 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
         let registry = state(env);
         if !registry.keys.contains_key(&key) {
             return Err(NOT_FOUND);
+        }
+        if registry.is_read_only(&key) {
+            return Err(ACCESS_DENIED);
         }
         if children(registry, &key).next().is_some() {
             return Err(ACCESS_DENIED);

@@ -1,5 +1,5 @@
 //! USER32 string traversal and case conversion, with ACP and DBCS boundaries.
-use adv_abi::{AnsiStr, GuestPtr, Registry, win32};
+use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, win32};
 use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::Codec;
@@ -26,6 +26,67 @@ fn next_ansi(cpu: &dyn Guest, codec: Codec, address: u32) -> Result<u32, MemFaul
 fn char_next(env: &mut Env<'_>, text: AnsiStr) -> Result<AnsiStr, MemFault> {
     next_ansi(env.cpu, env.ext.get::<Win32>().codec, text.0.addr())
         .map(|address| AnsiStr(GuestPtr::new(address)))
+}
+
+#[win32(user32, name = "CharNextW", level = implement)]
+fn char_next_w(env: &mut Env<'_>, text: WideStr) -> Result<WideStr, MemFault> {
+    let mut next = text.0;
+    if next.read(env.cpu)? == 0 {
+        return Ok(text);
+    }
+    next = next.offset(1)?;
+    while adv_os::nls::char_next_skips(next.read(env.cpu)?) {
+        next = next.offset(1)?;
+    }
+    Ok(WideStr(next))
+}
+
+#[win32(user32, name = "CharUpperW", level = implement)]
+fn char_upper_w(env: &mut Env<'_>, text: WideStr) -> Outcome {
+    wide_case(env, text, true)
+}
+
+#[win32(user32, name = "CharLowerW", level = implement)]
+fn char_lower_w(env: &mut Env<'_>, text: WideStr) -> Outcome {
+    wide_case(env, text, false)
+}
+
+fn wide_case(env: &mut Env<'_>, text: WideStr, upper: bool) -> Outcome {
+    let address = text.0.addr();
+    if address >> 16 == 0 {
+        return Outcome::Return(u32::from(unit_case(address as u16, upper)));
+    }
+    let Ok(units) = text.read(env.cpu, 16 * 1024 * 1024) else {
+        return Outcome::Fail("CharUpper/LowerW: invalid string".into());
+    };
+    let bytes: Vec<_> = units
+        .into_iter()
+        .flat_map(|u| unit_case(u, upper).to_le_bytes())
+        .collect();
+    match env.cpu.write(address, &bytes) {
+        Ok(()) => Outcome::Return(address),
+        Err(error) => Outcome::Fail(error.to_string()),
+    }
+}
+
+#[win32(user32, name = "OemToCharW", level = implement)]
+fn oem_to_char_w(
+    env: &mut Env<'_>,
+    source: AnsiStr,
+    destination: WideStr,
+) -> Result<i32, MemFault> {
+    let input = source.read(env.cpu, 16 * 1024 * 1024)?;
+    let mut units = env.ext.get::<Win32>().codec.to_utf16(CP_OEMCP, &input);
+    units.push(0);
+    let bytes: Vec<_> = units.into_iter().flat_map(u16::to_le_bytes).collect();
+    adv_abi::guest::check_range(
+        env.cpu,
+        destination.0.addr(),
+        bytes.len() as u32,
+        Prot::WRITE,
+    )?;
+    env.cpu.write(destination.0.addr(), &bytes)?;
+    Ok(1)
 }
 
 fn ansi_case(bytes: &mut [u8], codec: Codec, upper: bool) {
@@ -175,6 +236,10 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(char_upper_ABI);
     reg.register(char_lower_ABI);
     reg.register(oem_to_char_ABI);
+    reg.register(char_next_w_ABI);
+    reg.register(char_upper_w_ABI);
+    reg.register(char_lower_w_ABI);
+    reg.register(oem_to_char_w_ABI);
     for (name, handler) in [
         (
             "CharUpperBuffA",
