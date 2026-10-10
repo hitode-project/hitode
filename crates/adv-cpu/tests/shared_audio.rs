@@ -408,21 +408,28 @@ fn executable_audio_store_uses_the_self_modification_guard() {
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
     assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
 
-    // Once code on the page is observed, the store goes through the guard.
-    let (mut cpu, shared) = fixture(&code, true);
-    cpu.protect(DATA, 8192, Prot::RWX).unwrap();
-    cpu.write(DATA + 16, &[0xc3]).unwrap();
-    cpu.executor_mut()
-        .add_region(Region::new(DATA + 16, 1))
-        .unwrap();
-    assert_eq!(
-        cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
-        RunOutcome::ReachedStop,
-        "observed code on the audio page"
-    );
-    shared.read_alias.copy_into(0, &mut actual);
-    assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
-    assert!(cpu.executor().stats.interpreter_instructions > 0);
+    // Observed code beside the store leaves it native; a store over observed
+    // code bytes goes through the guard.
+    for (offset, guarded) in [(16, false), (2, true)] {
+        let (mut cpu, shared) = fixture(&code, true);
+        cpu.protect(DATA, 8192, Prot::RWX).unwrap();
+        cpu.write(DATA + offset, &[0xc3]).unwrap();
+        cpu.executor_mut()
+            .add_region(Region::new(DATA + offset, 1))
+            .unwrap();
+        assert_eq!(
+            cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
+            RunOutcome::ReachedStop,
+            "observed code at offset {offset}"
+        );
+        shared.read_alias.copy_into(0, &mut actual);
+        assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
+        assert_eq!(
+            cpu.executor().stats.interpreter_instructions > 0,
+            guarded,
+            "observed code at offset {offset}"
+        );
+    }
 }
 
 #[test]

@@ -24,6 +24,7 @@ const HELPER_NAMES: &[&str] = &[
     "adv_file_read",
     "adv_file_write",
     "adv_file_prepare",
+    "adv_code_store",
     "adv_file_write_prepared",
     "adv_range_ok",
     "adv_nest_run",
@@ -79,6 +80,10 @@ pub(super) fn builder(
     builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
     builder.symbol("adv_file_write", crate::file_memory::write as *const u8);
     builder.symbol("adv_file_prepare", crate::file_memory::prepare as *const u8);
+    builder.symbol(
+        "adv_code_store",
+        crate::file_memory::code_store as *const u8,
+    );
     builder.symbol(
         "adv_file_write_prepared",
         crate::file_memory::write_prepared as *const u8,
@@ -738,6 +743,7 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         _x87: x87,
         _nests: Box::new([]),
         cache_stamp: std::cell::Cell::new(0),
+        watched_in: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm: String::new(),
         #[cfg(all(test, target_arch = "x86_64"))]

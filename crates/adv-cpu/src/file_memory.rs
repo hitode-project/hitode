@@ -36,6 +36,12 @@ pub(crate) unsafe extern "C" fn write(
     .map_or(1, |result| u32::from(result.is_err()))
 }
 
+/// Whether a store would change observed code. Only such stores leave native
+/// code; other data on a code page is stored in place.
+pub(crate) unsafe extern "C" fn code_store(bridge: *mut u8, address: u32, width: u32) -> u32 {
+    u32::from(unsafe { memory(bridge) }.stores_code(address, width as usize))
+}
+
 /// Prepare an RMW destination before generated SSA flags/registers change.
 pub(crate) unsafe extern "C" fn prepare(bridge: *mut u8, address: u32, width: u32) -> u32 {
     catch_unwind(AssertUnwindSafe(|| {

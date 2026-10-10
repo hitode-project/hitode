@@ -219,7 +219,8 @@ fn unchanged_code_on_a_dirtied_executable_page_keeps_its_native_entry() {
     assert_eq!(m.state.regs[0], 32);
     assert_eq!(m.stats.compilations, 1);
     assert_eq!(m.stats.invalidations, 0);
-    assert_eq!(m.stats.code_revalidations, 32);
+    // Data beside code is not code: no region needs even a byte compare.
+    assert_eq!(m.stats.code_revalidations, 0);
     m.write(CODE, &[0x43]).unwrap();
     m.state.eip = CODE;
     m.state.regs[4] = STACK;

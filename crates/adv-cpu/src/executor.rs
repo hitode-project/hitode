@@ -557,7 +557,20 @@ impl Executor {
         Ok(())
     }
 
-    fn publish(&mut self, region: Region, compiled: Compiled) {
+    fn publish(&mut self, region: Region, mut compiled: Compiled) {
+        // Code bytes changed since an unmarked capture are found here, before
+        // any stamp can vouch for them.
+        compiled.watch(&mut self.memory);
+        if !compiled.revalidate(&self.memory) {
+            self.stats.stale_compilations += 1;
+            self.forget_aot_fragment(region.start);
+            self.tier_attempted.remove(&region.start);
+            self.native_heat.remove(&region.start);
+            for pc in &region.entries {
+                self.attempted.remove(pc);
+            }
+            return;
+        }
         if self.cache_region_limit == 0 || compiled.code_size > self.cache_byte_limit {
             self.stats.cache_rejections += 1;
             for &pc in region.entries.iter().chain(std::iter::once(&region.start)) {
@@ -2029,9 +2042,10 @@ mod responsive_compile_tests {
         assert!(!m.deferred_compilations.is_empty());
         m.write(CODE, &[0xb8, 42, 0, 0, 0, 0x90]).unwrap();
         drain(&mut m);
+        // Fragments whose bytes the write left intact still publish.
         assert!(
-            m.code.compiled.is_empty(),
-            "old deferred/active inputs must never publish"
+            !m.code.compiled.contains_key(&CODE),
+            "old deferred/active inputs must never publish changed bytes"
         );
         assert!(m.stats.stale_compilations > 0);
         assert!(m.queue_region(original.clone()).unwrap());
@@ -2679,7 +2693,7 @@ mod topology_tests {
     }
 
     #[test]
-    fn padding_on_a_used_page_revalidates_only_decoded_instruction_bytes() {
+    fn padding_on_a_used_page_is_data_and_code_rewrites_revalidate() {
         let mut m = machine();
         write(&mut m, 0x1000, |a| {
             a.inc(eax).unwrap();
@@ -2689,7 +2703,11 @@ mod topology_tests {
         discover(&mut m, 0x1000);
         m.refresh().unwrap();
         let entry = m.code.compiled[&0x1000].tail_entry;
+        let checks = m.stats.invalidation_candidates;
         m.write(0x1200, &[0xcc]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks);
+        m.write(0x1300, &[0xc3]).unwrap();
         m.refresh().unwrap();
         assert_eq!(m.stats.code_revalidations, 1);
         assert_eq!(m.stats.invalidations, 0);
@@ -3478,8 +3496,13 @@ mod native_deadline_tests {
         m.refresh().unwrap();
         assert_eq!(m.stats.invalidation_candidates, checks);
         assert_eq!(m.stats.compilations, compilations);
-        // Mutable data on a code page checks one region without recompiling it.
+        // Mutable data beside code on its page is ordinary data: no check.
         m.write(0x1080, &[42]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks);
+        assert_eq!(m.stats.compilations, compilations);
+        // Rewriting a code byte with its own value checks one region and keeps it.
+        m.write(0x1001, &[0xc3]).unwrap();
         m.refresh().unwrap();
         assert_eq!(m.stats.invalidation_candidates, checks + 1);
         assert_eq!(m.stats.code_revalidations, 1);

@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 mod fast;
 mod locks;
@@ -12,6 +12,39 @@ mod locks;
 pub(crate) use fast::FastPermissions;
 
 pub const PAGE_SIZE: usize = 4096;
+
+/// Each window counts epochs in a private range, so a version stamped in one
+/// window never matches another, even one at a reused host address.
+fn epoch_origin() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed) << EPOCH_BITS
+}
+const EPOCH_BITS: u32 = 40;
+
+/// Split a window range into (page, in-page byte range) pieces.
+fn page_spans(
+    range: std::ops::Range<usize>,
+) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> {
+    let mut at = range.start;
+    std::iter::from_fn(move || {
+        (at < range.end).then(|| {
+            let page = at / PAGE_SIZE;
+            let stop = range.end.min((page + 1) * PAGE_SIZE);
+            let span = (page, at % PAGE_SIZE..stop - page * PAGE_SIZE);
+            at = stop;
+            span
+        })
+    })
+}
+
+/// The (word, mask) pairs covering a byte range of a page's code bitmap.
+fn bit_words(bytes: std::ops::Range<usize>) -> impl Iterator<Item = (usize, u64)> {
+    (bytes.start / 64..bytes.end.div_ceil(64)).map(move |word| {
+        let low = bytes.start.max(word * 64) - word * 64;
+        let high = bytes.end.min((word + 1) * 64) - word * 64;
+        (word, (u64::MAX >> (64 - (high - low))) << low)
+    })
+}
 pub const READ: u8 = 1;
 pub const WRITE: u8 = 2;
 pub const EXEC: u8 = 4;
@@ -98,6 +131,8 @@ pub struct Memory {
     pub(crate) versions: Vec<u64>,
     /// Monotonic code observations owned by the controller, not guest protection.
     watched: Vec<bool>,
+    /// Bytes of each watched page that were fetched or captured as code.
+    code: BTreeMap<usize, Box<[u64; PAGE_SIZE / 64]>>,
     pub(crate) mapped: Arc<Vec<bool>>,
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
@@ -134,9 +169,10 @@ impl Memory {
             .snapshot(&self.perms, watched, &self.private_copy_pages)
     }
 
-    /// Register every sampled code page before reading or reusing its bytes.
-    /// This is monotonic, including negative tail dependencies and remappings.
-    /// The epoch revokes grants at a paused trap without changing byte stamps.
+    /// Register sampled code bytes before reading or reusing them. This is
+    /// monotonic, including negative tail dependencies and remappings. A
+    /// page's first observation makes it a store barrier: the epoch revokes
+    /// grants at a paused trap without changing byte stamps.
     pub(crate) fn watch_code(&mut self, address: u32, len: usize) {
         let begin = u64::from(address).max(u64::from(self.base));
         let end = (u64::from(address).saturating_add(len as u64))
@@ -144,26 +180,57 @@ impl Memory {
         if begin >= end {
             return;
         }
-        let first = ((begin - u64::from(self.base)) / PAGE_SIZE as u64) as usize;
-        let last = ((end - u64::from(self.base) - 1) / PAGE_SIZE as u64) as usize;
-        if self.watched[first..=last].iter().all(|&watched| watched) {
-            return;
+        let (begin, end) = (
+            (begin - u64::from(self.base)) as usize,
+            (end - u64::from(self.base)) as usize,
+        );
+        let mut fresh = None;
+        for (page, bytes) in page_spans(begin..end) {
+            let bits = self
+                .code
+                .entry(page)
+                .or_insert_with(|| Box::new([0; PAGE_SIZE / 64]));
+            for (word, mask) in bit_words(bytes) {
+                bits[word] |= mask;
+            }
+            if !self.watched[page] {
+                self.watched[page] = true;
+                fresh = Some(fresh.map_or(page..page + 1, |old: std::ops::Range<usize>| {
+                    old.start..page + 1
+                }));
+            }
         }
-        let selective = self.selective_code_writes();
-        self.watched[first..=last].fill(true);
-        if selective {
-            self.fast.invalidate(first..last + 1);
+        if let Some(pages) = fresh
+            && self.selective_code_writes()
+        {
+            self.fast.invalidate(pages);
             self.epoch += 1;
         }
     }
 
+    /// Software-checked memory changes code only when a store reaches bytes
+    /// observed as code; other data on a code page is ordinary data.
     fn writes_code(&self, range: &std::ops::Range<usize>) -> bool {
         if range.is_empty() {
             return false;
         }
-        let selective = self.selective_code_writes();
-        (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-            .any(|page| self.perms[page] & EXEC != 0 && (!selective || self.watched[page]))
+        if !self.selective_code_writes() {
+            return (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                .any(|page| self.perms[page] & EXEC != 0);
+        }
+        page_spans(range.clone()).any(|(page, bytes)| {
+            self.perms[page] & EXEC != 0
+                && self
+                    .code
+                    .get(&page)
+                    .is_some_and(|bits| bit_words(bytes).any(|(word, mask)| bits[word] & mask != 0))
+        })
+    }
+
+    /// Whether a store of `len` bytes at `addr` would change observed code.
+    pub(crate) fn stores_code(&self, addr: u32, len: usize) -> bool {
+        self.range(addr, len)
+            .is_ok_and(|range| self.writes_code(&range))
     }
 
     /// Search the existing page table in one bounded metadata slice pass. This
@@ -360,15 +427,17 @@ impl Memory {
         let layout = Layout::from_size_align(len, PAGE_SIZE).map_err(|e| e.to_string())?;
         // SAFETY: nonzero, valid layout; Memory exclusively owns this allocation.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
+        let origin = epoch_origin();
         Ok(Self {
             base,
             len,
             ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            epoch: 0,
-            versions: vec![0; len / PAGE_SIZE],
+            epoch: origin,
+            versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: None,
@@ -402,15 +471,17 @@ impl Memory {
         #[cfg(not(windows))]
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
+        let origin = epoch_origin();
         Ok(Self {
             base,
             len,
             ptr: reservation.ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
-            epoch: 0,
-            versions: vec![0; len / PAGE_SIZE],
+            epoch: origin,
+            versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
@@ -525,6 +596,17 @@ impl Memory {
         Ok(())
     }
 
+    /// Distinguishes live windows; epoch overflow only reads as a new one.
+    pub(crate) fn identity(&self) -> u64 {
+        self.epoch >> EPOCH_BITS
+    }
+
+    /// Epochs this window has counted, comparable across windows.
+    #[cfg(test)]
+    pub(crate) fn epochs(&self) -> u64 {
+        self.epoch & ((1 << EPOCH_BITS) - 1)
+    }
+
     pub(crate) fn touch(&mut self, addr: u32, len: usize) {
         if len == 0 {
             return;
@@ -578,6 +660,30 @@ impl Memory {
         Ok(Cow::Borrowed(unsafe {
             std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len())
         }))
+    }
+
+    /// Whether committed guest bytes at `addr` equal `expected`. Ordinary
+    /// storage is compared in place; overlays go through a stack buffer, so
+    /// code validation never allocates.
+    pub(crate) fn matches(&self, addr: u32, expected: &[u8]) -> bool {
+        let Ok(range) = self.committed(addr, expected.len()) else {
+            return false;
+        };
+        if !self.overlays(&range) && !self.host_copy_required(&range) {
+            // SAFETY: bounds checked, allocation alive, shared borrow prevents executor writes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len())
+            };
+            return bytes == expected;
+        }
+        let mut buffer = [0; PAGE_SIZE];
+        let mut at = addr;
+        expected.chunks(PAGE_SIZE).all(|chunk| {
+            let bytes = &mut buffer[..chunk.len()];
+            let same = self.read_into(at, bytes).is_ok() && bytes == chunk;
+            at = at.wrapping_add(chunk.len() as u32);
+            same
+        })
     }
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
@@ -1961,6 +2067,20 @@ mod file_page_tests {
         assert_eq!(memory.file_page_copy_on_write(0x10000), None);
         memory.fill(0x10000, &[0x63], PAGE_SIZE).unwrap();
         assert_eq!(memory.read(0x10000, 4).unwrap(), [0x63; 4]);
+    }
+
+    #[test]
+    fn code_bytes_match_across_ordinary_and_copy_pages() {
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        memory.map(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+        memory
+            .map_private_copy_pages(0x11000, &[0x29; PAGE_SIZE], READ | EXEC)
+            .unwrap();
+        memory.write(0x10ffe, &[0x17; 2]).unwrap();
+        assert!(memory.matches(0x10ffe, &[0x17, 0x17, 0x29, 0x29]));
+        assert!(memory.matches(0x11000, &[0x29; PAGE_SIZE]));
+        assert!(!memory.matches(0x10ffe, &[0x17, 0x17, 0x29, 0x2a]));
+        assert!(!memory.matches(0x11ffe, &[0x29; 4]));
     }
 
     #[test]

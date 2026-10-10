@@ -183,7 +183,11 @@ impl Interpreter {
             };
         }
         let pc = state.eip;
-        let decoded = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
+        let decoded = if let Some(entry) = self
+            .cache
+            .get_mut(&pc)
+            .and_then(|e| e.valid(memory).then_some(e))
+        {
             entry.decoded
         } else {
             self.decodes += 1;
@@ -228,7 +232,8 @@ impl Interpreter {
         if let Some(block) = self
             .blocks
             .get_mut(&pc)
-            .filter(|block| block.revision == revision && block.valid(memory))
+            .filter(|block| block.revision == revision)
+            .and_then(|block| block.valid(memory).then_some(block))
         {
             return block.execute_observed(
                 state,
@@ -437,11 +442,13 @@ struct Predecoded {
     register_only: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Page {
     address: u32,
     permissions: u8,
     mapped: bool,
+    /// Every write to a watched code page bumps its version.
+    version: u64,
 }
 
 impl Page {
@@ -452,7 +459,12 @@ impl Page {
             address,
             permissions: index.map_or(0, |p| memory.perms[p]),
             mapped: index.is_some_and(|p| memory.mapped[p]),
+            version: index.map_or(0, |p| memory.versions[p]),
         }
+    }
+    /// Nothing about the page changed since it was stamped.
+    fn current(self, memory: &Memory) -> bool {
+        self == Self::at(memory, self.address)
     }
     fn matches(self, memory: &Memory) -> bool {
         let current = Self::at(memory, self.address);
@@ -471,23 +483,30 @@ struct Cached {
 }
 
 impl Cached {
-    fn valid(&self, memory: &mut Memory) -> bool {
-        for page in self.pages.iter().flatten() {
-            memory.watch_code(page.address, PAGE_SIZE);
+    /// Unchanged page stamps need no byte compare: versions are private to
+    /// one window, so the fetch already watched these bytes in this one. A
+    /// changed or foreign stamp watches them here, then compares and restamps.
+    fn valid(&mut self, memory: &mut Memory) -> bool {
+        if self.pages.iter().flatten().all(|page| page.current(memory)) {
+            return true;
         }
-        self.revalidate(memory)
+        memory.watch_code(self.pc, self.len as usize);
+        if !self.revalidate(memory) {
+            return false;
+        }
+        for page in self.pages.iter_mut().flatten() {
+            *page = Page::at(memory, page.address);
+        }
+        true
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
         self.pages.iter().flatten().all(|p| p.matches(memory))
-            && memory
-                .read_data(self.pc, self.len as usize)
-                .is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
+            && memory.matches(self.pc, &self.bytes[..self.len as usize])
     }
 }
 
 fn fetch(memory: &mut Memory, pc: u32) -> Cached {
-    memory.watch_code(pc, 15);
     let mut entry = Cached {
         decoded: Decoded::Stop(Step::InvalidInstruction { pc }),
         pc,
@@ -496,7 +515,10 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         pages: [None; 2],
     };
     let mut denied = None;
-    for offset in 0..15u32 {
+    // Mapping and permissions are per page: one check and one copy cover
+    // every byte a page contributes, at most two pages per instruction.
+    let mut offset = 0u32;
+    while offset < 15 {
         let Some(address) = pc.checked_add(offset) else {
             denied = Some(pc.wrapping_add(offset));
             break;
@@ -504,23 +526,21 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         let page = Page::at(memory, address);
         if entry.pages[0].is_none() {
             entry.pages[0] = Some(page);
-        } else if entry.pages[0].unwrap().address != page.address {
+        } else {
             entry.pages[1] = Some(page);
         }
         if !page.mapped || page.permissions & EXEC == 0 {
             denied = Some(address);
             break;
         }
-        match memory.read_data(address, 1) {
-            Ok(byte) => {
-                entry.bytes[offset as usize] = byte[0];
-                entry.len += 1;
-            }
-            Err(_) => {
-                denied = Some(address);
-                break;
-            }
+        let len = (PAGE_SIZE as u32 - (address - page.address)).min(15 - offset);
+        let bytes = &mut entry.bytes[offset as usize..(offset + len) as usize];
+        if memory.read_into(address, bytes).is_err() {
+            denied = Some(address);
+            break;
         }
+        entry.len += len as u8;
+        offset += len;
     }
     let mut decoder = Decoder::with_ip(
         32,
@@ -529,6 +549,12 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         DecoderOptions::NONE,
     );
     let instruction = decoder.decode();
+    // A decoded instruction depends on its own bytes; a failed decode on every
+    // byte it saw.
+    if !instruction.is_invalid() {
+        entry.len = instruction.len() as u8;
+    }
+    memory.watch_code(pc, entry.len as usize);
     entry.decoded = if instruction.is_invalid() {
         if decoder.last_error() == DecoderError::NoMoreBytes
             && let Some(address) = denied
@@ -580,18 +606,23 @@ struct DecodedBlock {
 }
 
 impl DecodedBlock {
-    fn valid(&self, memory: &mut Memory) -> bool {
-        for page in &self.pages {
-            memory.watch_code(page.address, PAGE_SIZE);
+    /// As `Cached::valid`: watch and compare bytes only after a page changed.
+    fn valid(&mut self, memory: &mut Memory) -> bool {
+        if self.pages.iter().all(|page| page.current(memory)) {
+            return true;
         }
-        self.revalidate(memory)
+        memory.watch_code(self.pc, self.bytes.len());
+        if !self.revalidate(memory) {
+            return false;
+        }
+        for page in &mut self.pages {
+            *page = Page::at(memory, page.address);
+        }
+        true
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
-        self.pages.iter().all(|page| page.matches(memory))
-            && memory
-                .read_data(self.pc, self.bytes.len())
-                .is_ok_and(|bytes| bytes == self.bytes)
+        self.pages.iter().all(|page| page.matches(memory)) && memory.matches(self.pc, &self.bytes)
     }
 
     fn fetch(
@@ -2430,6 +2461,25 @@ mod tests {
             "reuse the full decoded block"
         );
         watched(&mut fourth);
+        // Data stored beside the block is not code: its page keeps the version.
+        let version = fourth.versions[1];
+        fourth.write(0x11800, &[1]).unwrap();
+        assert_eq!(fourth.versions[1], version);
+        // The same byte stored over code bumps the page; intact bytes restamp.
+        fourth.write(CODE + 5, &[0x43]).unwrap();
+        assert_ne!(fourth.versions[1], version);
+        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
+        assert_eq!(execution.units, 3);
+        assert_eq!(interpreter.decode_count(), decodes, "data is not code");
+        fourth.write(CODE + 1, &[9]).unwrap();
+        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
+        assert_eq!(execution.units, 3);
+        assert_eq!(fourth_state.regs[0], 9);
+        assert_eq!(
+            interpreter.decode_count(),
+            decodes + 3,
+            "patched block redecodes"
+        );
     }
 
     #[test]

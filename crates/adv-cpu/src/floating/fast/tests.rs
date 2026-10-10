@@ -388,7 +388,7 @@ fn differential(compiled: bool) {
                 "{context}"
             );
         }
-        assert_eq!(fast_memory.epoch, reference.epoch, "{context}");
+        assert_eq!(fast_memory.epochs(), reference.epochs(), "{context}");
     }
     eprintln!(
         "compiled={compiled} native_hits={} helper_fallbacks={fallbacks} faults={faults} PE={inexact} C1={rounded_up}",
