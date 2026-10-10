@@ -341,6 +341,44 @@ pub const fn str(size: Size, rt: Reg, rn: Reg, offset: u32) -> u32 {
     }
 }
 
+/// `ldr rt, [rn, wm, uxtw]`, or scaled by the access size with `scaled`:
+/// the window form of a guest access.
+pub const fn ldr_reg(size: Size, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
+    register_offset(0xB860_4800, size, rt, rn, rm, scaled)
+}
+
+/// `str rt, [rn, wm, uxtw]`, or scaled by the access size with `scaled`.
+pub const fn str_reg(size: Size, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
+    register_offset(0xB820_4800, size, rt, rn, rm, scaled)
+}
+
+const fn register_offset(base: u32, size: Size, rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
+    let size = match size {
+        Size::W => 0,
+        Size::X => 1 << 30,
+    };
+    base | size | rm.number() << 16 | (scaled as u32) << 12 | rn.number() << 5 | rt.number()
+}
+
+/// `ldur rt, [rn, #offset]` with an unscaled signed offset.
+pub const fn ldur(size: Size, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    unscaled(0xB840_0000, size, rt, rn, offset)
+}
+
+/// `stur rt, [rn, #offset]` with an unscaled signed offset.
+pub const fn stur(size: Size, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    unscaled(0xB800_0000, size, rt, rn, offset)
+}
+
+const fn unscaled(base: u32, size: Size, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    assert!(offset >= -256 && offset < 256);
+    let size = match size {
+        Size::W => 0,
+        Size::X => 1 << 30,
+    };
+    base | size | (offset as u32 & 0x1ff) << 12 | rn.number() << 5 | rt.number()
+}
+
 /// `ldr dt/qt, [rn, #offset]`.
 pub const fn ldr_v(size: VSize, rt: VReg, rn: Reg, offset: u32) -> u32 {
     match size {
@@ -543,6 +581,25 @@ mod tests {
             (brk(0), "brk #0x0"),
             (brk(0xf00d), "brk #0xf00d"),
             (NOP, "nop"),
+            (
+                ldr_reg(W, r(19), r(27), r(20), false),
+                "ldr w19, [x27, w20, uxtw]",
+            ),
+            (
+                ldr_reg(X, r(0), r(27), r(16), true),
+                "ldr x0, [x27, w16, uxtw #3]",
+            ),
+            (
+                str_reg(W, r(1), r(27), r(16), false),
+                "str w1, [x27, w16, uxtw]",
+            ),
+            (
+                str_reg(W, r(1), r(27), r(16), true),
+                "str w1, [x27, w16, uxtw #2]",
+            ),
+            (ldur(W, r(19), r(23), -4), "ldur w19, [x23, #-4]"),
+            (ldur(X, r(0), r(24), 255), "ldur x0, [x24, #255]"),
+            (stur(W, r(19), r(23), -256), "stur w19, [x23, #-256]"),
             (cmp(W, r(20), r(21), Lsl, 0), "cmp w20, w21"),
             (cmn(X, r(0), r(1), Lsl, 2), "cmn x0, x1, lsl #2"),
             (and(W, r(0), r(1), r(2), Lsl, 0), "and w0, w1, w2"),

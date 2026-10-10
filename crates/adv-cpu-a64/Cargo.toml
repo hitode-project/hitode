@@ -10,7 +10,11 @@ description = "AArch64 thin translator over the adv-cpu core"
 [dependencies]
 adv-cpu-core = { path = "../adv-cpu-core" }
 
-[dev-dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Android test binaries run translated code natively instead.
+[target.'cfg(not(target_os = "android"))'.dev-dependencies]
 unicorn-engine = { workspace = true, features = ["arch_aarch64"] }
 
 [lints]

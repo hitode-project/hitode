@@ -106,6 +106,9 @@ impl crate::backend::SharedReadView for SharedAllocation {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use os::create_backing;
+
 #[cfg(windows)]
 mod os {
     use super::*;
@@ -274,7 +277,7 @@ mod os {
                 .ok_or_else(|| format!("query shared PCM host page size: {page}"))?;
             let len = mapping_len(len, page)?;
             let size = libc::off_t::try_from(len).map_err(|_| "shared PCM backing is too large")?;
-            let fd = create_backing()?;
+            let fd = create_backing(c"adv-pcm")?;
             // SAFETY: this newly created private object has no other owner and
             // is sized before either alias is mapped. New backing bytes are zero.
             if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
@@ -306,24 +309,22 @@ mod os {
         Ok(len)
     }
 
+    /// A fresh, unnamed, zero-length memfd. The a64 code cache maps one twice,
+    /// as a writable and an executable view.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn create_backing() -> Result<OwnedFd, String> {
+    pub fn create_backing(name: &std::ffi::CStr) -> Result<OwnedFd, String> {
         // Android's libc memfd_create symbol requires API 30, while this project
         // also supports API 29. The kernel syscall avoids that loader dependency.
         // SAFETY: the name is NUL terminated and CLOEXEC is a supported flag.
         #[cfg(target_os = "android")]
         let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                c"adv-pcm".as_ptr(),
-                libc::MFD_CLOEXEC,
-            ) as libc::c_int
+            libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) as libc::c_int
         };
         #[cfg(target_os = "linux")]
-        let fd = unsafe { libc::memfd_create(c"adv-pcm".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return Err(format!(
-                "create shared PCM memfd: {}",
+                "create {name:?} memfd: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -332,7 +333,7 @@ mod os {
     }
 
     #[cfg(target_os = "macos")]
-    fn create_backing() -> Result<OwnedFd, String> {
+    fn create_backing(_: &std::ffi::CStr) -> Result<OwnedFd, String> {
         use std::ffi::CString;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_NAME: AtomicU64 = AtomicU64::new(0);

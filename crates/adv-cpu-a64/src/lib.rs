@@ -6,12 +6,18 @@
 //! under Unicorn arm64 in host tests, so most work needs no device.
 
 pub mod asm;
+#[cfg(native)]
+mod cache;
 pub mod encode;
 mod executor;
+#[cfg(native)]
+mod native;
 pub mod runtime;
+#[cfg(native)]
+mod window;
 
 pub use adv_cpu_core::*;
 pub use executor::{ExecutionContext, Executor, Stats};
 
-#[cfg(test)]
+#[cfg(all(test, emulator))]
 mod emulator;

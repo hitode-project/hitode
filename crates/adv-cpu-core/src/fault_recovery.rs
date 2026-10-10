@@ -288,7 +288,40 @@ unsafe fn capture(context: *const c_void, pc: usize) -> Option<HostContextSnapsh
     Some(snapshot)
 }
 
+/// Redirects a fault in another engine's translated code: returns the new PC,
+/// or 0 to leave the fault to the previous handler. Runs in signal context, so
+/// it must not allocate, lock or unwind.
+pub type TranslatedFault = unsafe fn(pc: usize, fault_address: usize) -> usize;
+
+static TRANSLATED: OnceLock<TranslatedFault> = OnceLock::new();
+
+/// Routes faults no recovery session claims to `handler`, through the same
+/// chained SIGSEGV/SIGBUS handlers. One engine registers per process.
+pub fn install_translated(handler: TranslatedFault) -> Result<(), String> {
+    let registered = *TRANSLATED.get_or_init(|| handler);
+    if !std::ptr::fn_addr_eq(registered, handler) {
+        return Err("another translated fault handler is registered".into());
+    }
+    install()
+}
+
 unsafe extern "C" fn dispatch(
+    signal: i32,
+    pc: usize,
+    fault_address: usize,
+    access: usize,
+    context: *mut c_void,
+) -> usize {
+    match unsafe { dispatch_session(signal, pc, fault_address, access, context) } {
+        0 => TRANSLATED
+            .get()
+            // SAFETY: the registered handler upholds the signal-context contract.
+            .map_or(0, |handler| unsafe { handler(pc, fault_address) }),
+        target => target,
+    }
+}
+
+unsafe fn dispatch_session(
     _signal: i32,
     pc: usize,
     fault_address: usize,

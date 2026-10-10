@@ -62,6 +62,10 @@ pub enum Exit {
     Interpret = 0,
     /// Look up or translate the unit at EIP.
     Dispatch = 1,
+    /// A host fault at a side-table site. EIP is not set; the owner takes it
+    /// from the site, where guest state is exactly that before the
+    /// instruction (§5.2).
+    Fault = 2,
 }
 
 impl Exit {
@@ -69,6 +73,7 @@ impl Exit {
         match raw {
             0 => Some(Self::Interpret),
             1 => Some(Self::Dispatch),
+            2 => Some(Self::Fault),
             _ => None,
         }
     }
@@ -79,6 +84,8 @@ pub struct Stubs {
     pub code: Vec<u32>,
     pub enter: usize,
     pub exit: usize,
+    /// Where the fault handler resumes a faulting site.
+    pub fault: usize,
 }
 
 const fn r(number: u8) -> Reg {
@@ -123,12 +130,18 @@ pub fn stubs() -> Stubs {
     let mut asm = Asm::new();
     let enter = asm.offset();
     emit_enter(&mut asm);
+    let exit_label = asm.label();
+    asm.bind(exit_label);
     let exit = asm.offset();
     emit_exit(&mut asm);
+    let fault = asm.offset();
+    asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
+    asm.b(exit_label);
     Stubs {
         code: asm.finish(),
         enter,
         exit,
+        fault,
     }
 }
 
@@ -257,7 +270,7 @@ fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
 }
 
-#[cfg(test)]
+#[cfg(all(test, emulator))]
 mod tests {
     use super::*;
     use crate::emulator::{CODE, Emulator};

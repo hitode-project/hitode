@@ -66,8 +66,8 @@ foreach ($test in $TestName) {
 }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 # Unit tests live in the core and engine crates; integration tests in the facade.
-$unitLibraries = @('adv_cpu_core', 'adv_cpu_x64')
-$cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'test', '--locked', '-p', 'adv-cpu', '-p', 'adv-cpu-core', '-p', 'adv-cpu-x64', '--release', '--no-run', '--target-dir', $TargetDir)
+$unitLibraries = @('adv_cpu_core', 'adv_cpu_x64', 'adv_cpu_a64')
+$cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'test', '--locked', '-p', 'adv-cpu', '-p', 'adv-cpu-core', '-p', 'adv-cpu-x64', '-p', 'adv-cpu-a64', '--release', '--no-run', '--target-dir', $TargetDir)
 if ($Features.Count) { $cargoArgs += @('--features', ($Features -join ',')) }
 foreach ($test in $TestName) { $cargoArgs += @('--test', $test) }
 if ($UnitFilter.Count) { $cargoArgs += '--lib' }

@@ -31,3 +31,10 @@ packed_scalar_fills_preserve_width_sources_tails_and_faults
 read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_state
 repeated_guards_preserve_each_faulting_prefix
 rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration
+
+# Safepoint placement: until M1 translates, an AArch64 host leaves translated
+# code after every instruction and can stop there; these assert interrupts at
+# loop back edges, which a64 matches once units carry their safepoints (§7.4).
+# Hosts without translated code interpret whole blocks and pass.
+batched_loop_interrupts_and_resumes_exactly
+versioned_invariant_loop_interrupts_and_resumes_exactly

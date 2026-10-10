@@ -1,8 +1,9 @@
 //! Execution owner of the a64 engine.
 //!
-//! M0 runs every instruction through the core interpreter; translated units
-//! join the same loop from M1. Exits, traps, fuel and deadlines follow the
-//! x64 executor's interpreter path exactly, so both engines pass the same
+//! On AArch64 hosts every boundary goes through translated code, which in M0
+//! exits to interpret one instruction; elsewhere the core interpreter runs
+//! blocks directly. Exits, traps, fuel and deadlines follow the x64
+//! executor's interpreter path exactly, so both engines pass the same
 //! semantic tests.
 
 use std::sync::Arc;
@@ -12,6 +13,8 @@ use std::time::Instant;
 use adv_cpu_core::interpreter::{Interpreter, Step};
 use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
+
+use crate::runtime::Exit;
 
 /// Interpreted instructions per decoded block, as in the x64 executor.
 const BLOCK_UNITS: u64 = 256;
@@ -60,19 +63,21 @@ pub struct Executor {
     interrupt: Arc<AtomicBool>,
     host_interrupts: bool,
     deadline: Option<Instant>,
+    #[cfg(native)]
+    native: crate::native::Native,
 }
 
 impl Executor {
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
-        Ok(Self::create(Memory::new(base, len)?))
+        Self::create(Memory::new(base, len)?)
     }
 
     pub fn address_space() -> Result<Self, String> {
-        Ok(Self::create(Memory::reserve(0, 1usize << 32)?))
+        Self::create(Memory::reserve(0, 1usize << 32)?)
     }
 
-    fn create(memory: Memory) -> Self {
-        Self {
+    fn create(memory: Memory) -> Result<Self, String> {
+        Ok(Self {
             state: CpuState::default(),
             stats: Stats::default(),
             memory,
@@ -81,7 +86,9 @@ impl Executor {
             interrupt: Arc::new(AtomicBool::new(false)),
             host_interrupts: true,
             deadline: None,
-        }
+            #[cfg(native)]
+            native: crate::native::Native::new()?,
+        })
     }
 
     pub fn memory(&self) -> &Memory {
@@ -203,6 +210,23 @@ impl Executor {
         address
     }
 
+    /// Runs translated code from EIP; `None` where the host has none.
+    #[cfg(native)]
+    fn run_native(&mut self) -> Result<Option<Exit>, String> {
+        let (exit, translated) = self.native.run(&mut self.state)?;
+        self.stats.native_entries += 1;
+        if translated != 0 {
+            self.stats.compilations += 1;
+            self.stats.native_code_bytes += translated as u64;
+        }
+        Ok(Some(exit))
+    }
+
+    #[cfg(not(native))]
+    fn run_native(&mut self) -> Result<Option<Exit>, String> {
+        Ok(None)
+    }
+
     fn run_inner(
         &mut self,
         stop: u32,
@@ -244,6 +268,16 @@ impl Executor {
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
                 (execution, execution.units)
+            } else if let Some(exit) = self.run_native()? {
+                match exit {
+                    Exit::Dispatch => continue,
+                    Exit::Interpret | Exit::Fault => {
+                        let execution =
+                            self.interpreter
+                                .run_chunk(&mut self.state, &mut self.memory, 1);
+                        (execution, execution.units)
+                    }
+                }
             } else {
                 self.interpreter
                     .run_block(&mut self.state, &mut self.memory, units, stop, None)

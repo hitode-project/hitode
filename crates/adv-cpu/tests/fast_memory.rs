@@ -70,7 +70,7 @@ fn operand(width: u32, write: bool) -> Vec<u8> {
     a.assemble(u64::from(CODE)).unwrap()
 }
 
-fn compare(mut jit: Executor, mut reference: Executor, width: u32) {
+fn compare(mut jit: Executor, mut reference: Executor) {
     // Both engines report the first inaccessible byte, as hardware does.
     let expected = reference.run(STOP, 100).unwrap();
     let actual = jit.run(STOP, 100).unwrap();
@@ -109,7 +109,7 @@ fn dynamic_widths_preserve_fault_prefixes_and_neighbor_fallbacks() {
                             m.state.regs[6] = DATA + offset;
                             m.protect(DATA + 4096, 4096, next).unwrap();
                         }
-                        compare(jit, reference, width);
+                        compare(jit, reference);
                     }
                 }
             }
@@ -135,7 +135,7 @@ fn full_window_end_never_wraps_and_short_window_checks_remain() {
                 }
                 m.state.regs[6] = address;
             }
-            compare(jit, reference, 4);
+            compare(jit, reference);
         }
     }
 }

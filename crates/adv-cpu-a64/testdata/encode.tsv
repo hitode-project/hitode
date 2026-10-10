@@ -68,3 +68,10 @@ d61f0220	br x17
 d63f0200	blr x16
 d53b4201	mrs x1, NZCV
 d51b4202	msr NZCV, x2
+b8744b73	ldr w19, [x27, w20, uxtw]
+f8705b60	ldr x0, [x27, w16, uxtw #3]
+b8304b61	str w1, [x27, w16, uxtw]
+b8305b61	str w1, [x27, w16, uxtw #2]
+b85fc2f3	ldur w19, [x23, #-4]
+f84ff300	ldur x0, [x24, #255]
+b81002f3	stur w19, [x23, #-256]

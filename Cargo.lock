@@ -80,6 +80,7 @@ name = "adv-cpu-a64"
 version = "0.1.0"
 dependencies = [
  "adv-cpu-core",
+ "libc",
  "unicorn-engine",
 ]
 
