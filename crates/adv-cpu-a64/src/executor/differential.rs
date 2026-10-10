@@ -700,9 +700,11 @@ fn translated(
     program: &Program,
     budget: u64,
     features: Features,
+    first_visits: bool,
 ) -> (RunOutcome, CpuState, Vec<u8>, u64) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     executor.native.features = features;
+    executor.native.first_visits = first_visits;
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();
     let outcome = executor.run(program.stop, budget).unwrap();
@@ -716,11 +718,12 @@ fn translated(
 }
 
 #[cfg(native)]
-fn compare(seed: u64, budget: u64, features: Features) -> u64 {
+fn compare(seed: u64, budget: u64, features: Features, first_visits: bool) -> u64 {
     let program = program(seed);
     let (outcome, state, memory) = reference(&program, budget);
-    let (a64_outcome, a64_state, a64_memory, native) = translated(&program, budget, features);
-    let context = format!("seed {seed} budget {budget} {features:?}");
+    let (a64_outcome, a64_state, a64_memory, native) =
+        translated(&program, budget, features, first_visits);
+    let context = format!("seed {seed} budget {budget} {features:?} first visits {first_visits}");
     assert_eq!(a64_outcome, outcome, "{context}: outcome");
     assert_eq!(a64_state.regs, state.regs, "{context}: registers");
     assert_eq!(a64_state.eip, state.eip, "{context}: eip");
@@ -737,12 +740,13 @@ fn compare(seed: u64, budget: u64, features: Features) -> u64 {
 #[test]
 fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
     let mut native = 0;
-    for flagm in [true, false] {
+    // Without first visits, everything the programs run is translated.
+    for (flagm, first_visits) in [(true, false), (false, false), (true, true)] {
         let features = Features { flagm };
         for seed in 1..=1000 {
-            native += compare(seed, u64::MAX >> 1, features);
+            native += compare(seed, u64::MAX >> 1, features, first_visits);
             for budget in [1, 5, 13, 40, 120, 400] {
-                compare(seed, budget + seed % 7, features);
+                compare(seed, budget + seed % 7, features, first_visits);
             }
         }
     }

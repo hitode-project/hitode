@@ -104,6 +104,25 @@ pub struct Trace {
     slots: Vec<u8>,
 }
 
+/// The stops, behind a one-word filter: most EIPs are not stops.
+struct Stops<'s> {
+    stops: &'s [u32],
+    filter: u64,
+}
+
+impl<'s> Stops<'s> {
+    fn new(stops: &'s [u32]) -> Self {
+        let filter = stops
+            .iter()
+            .fold(0, |filter, &stop| filter | 1 << (stop & 63));
+        Self { stops, filter }
+    }
+
+    fn contains(&self, pc: u32) -> bool {
+        self.filter >> (pc & 63) & 1 != 0 && self.stops.contains(&pc)
+    }
+}
+
 fn slot(pc: u32, frame: u16) -> usize {
     let key = pc ^ u32::from(frame) << 24;
     (key.wrapping_mul(0x9E37_79B1) >> 24) as usize & (SLOTS - 1)
@@ -124,11 +143,11 @@ impl Trace {
         self.slots.clear();
         self.slots.resize(SLOTS, 0);
         let mut fetcher = Fetcher::new(memory);
+        let stops = Stops::new(stops);
         let (mut pc, mut frame) = (entry, 0u16);
         loop {
             let len = self.insts.len();
-            let stop = stops.contains(&pc);
-            let end = if len > 0 && stop {
+            let end = if len > 0 && stops.contains(pc) {
                 Some(Edge::Exit(pc))
             } else if let Some(index) = self.find(pc, frame) {
                 Some(Edge::Internal(index))
@@ -164,9 +183,11 @@ impl Trace {
                 frame,
             };
             // A continuation must be new to the trace and leave room after it.
-            let continuation = !stops.contains(&next_pc)
-                && len + 4 < MAX_INSTRUCTIONS
-                && self.find(next_pc, frame).is_none();
+            let continuation = || {
+                len + 4 < MAX_INSTRUCTIONS
+                    && !stops.contains(next_pc)
+                    && self.find(next_pc, frame).is_none()
+            };
             let then = match op {
                 Op::Jmp(target) => Some((target, frame)),
                 // `call $+5` only pushes its own address.
@@ -175,10 +196,10 @@ impl Trace {
                     let depth = self.frames[usize::from(frame)].depth;
                     if depth < MAX_DEPTH
                         && len + 1 + INLINE_ROOM <= MAX_INSTRUCTIONS
-                        && !stops.contains(&target)
+                        && !stops.contains(target)
                     {
                         Some((target, self.callee(frame, next_pc, depth)))
-                    } else if continuation {
+                    } else if continuation() {
                         inst.mode = Mode::Real;
                         Some((next_pc, frame))
                     } else {
@@ -186,7 +207,7 @@ impl Trace {
                         None
                     }
                 }
-                Op::CallIndirect(_) if continuation => {
+                Op::CallIndirect(_) if continuation() => {
                     inst.mode = Mode::Real;
                     Some((next_pc, frame))
                 }
@@ -232,7 +253,7 @@ impl Trace {
             let inst = self.insts[index];
             if let Op::Jcc(_, target) = inst.op {
                 self.insts[index].taken = Some(match self.find(target, inst.frame) {
-                    Some(to) if !stops.contains(&target) => Edge::Internal(to),
+                    Some(to) if !stops.contains(target) => Edge::Internal(to),
                     _ => Edge::Exit(target),
                 });
             }
@@ -296,11 +317,13 @@ impl Trace {
         self.merge.resize(len, false);
         let mut backward = false;
         for (index, inst) in self.insts.iter().enumerate() {
-            for edge in [inst.taken, edge_of(inst.next)].into_iter().flatten() {
-                if let Edge::Internal(to) = edge {
-                    self.merge[to] = true;
-                    backward |= to <= index;
-                }
+            if let Some(Edge::Internal(to)) = inst.taken {
+                self.merge[to] = true;
+                backward |= to <= index;
+            }
+            if let Next::Edge(Edge::Internal(to)) = inst.next {
+                self.merge[to] = true;
+                backward |= to <= index;
             }
         }
         self.live_in.clear();
@@ -354,7 +377,7 @@ impl Trace {
     fn liveness(&mut self) -> bool {
         let mut changed = false;
         for index in (0..self.len()).rev() {
-            let inst = self.insts[index];
+            let inst = &self.insts[index];
             let mut out = match inst.next {
                 Next::Fall => self.live_in[index + 1],
                 Next::Edge(edge) => self.edge_live(index, edge),
@@ -380,12 +403,5 @@ impl Trace {
             }
         }
         changed
-    }
-}
-
-fn edge_of(next: Next) -> Option<Edge> {
-    match next {
-        Next::Edge(edge) => Some(edge),
-        Next::Fall | Next::Dynamic => None,
     }
 }

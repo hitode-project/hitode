@@ -726,26 +726,26 @@ impl Op {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    struct Rng(u64);
+    pub struct Rng(pub u64);
 
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
         }
 
-        fn byte(&mut self) -> u8 {
+        pub fn byte(&mut self) -> u8 {
             self.next() as u8
         }
     }
 
     /// Opcodes `quick` knows, and a few near them it must decline.
-    const OPCODES: &[&[u8]] = &[
+    pub const OPCODES: &[&[u8]] = &[
         &[0x01],
         &[0x03],
         &[0x05],

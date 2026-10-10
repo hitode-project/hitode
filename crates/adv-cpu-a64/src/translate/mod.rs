@@ -19,6 +19,7 @@
 //! FlagM, and x15 the lazy-carry scratch.
 
 mod decode;
+pub mod first;
 mod flags;
 mod ops;
 mod trace;
@@ -330,7 +331,7 @@ impl Translator<'_> {
         let inst = trace.insts[index];
         self.index = index;
         self.out = trace.live_out[index];
-        self.keep = self.out.minus(inst.op.effects().writes);
+        self.keep = self.out.minus(inst.effects.writes);
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);

@@ -24,7 +24,7 @@
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 
 use adv_cpu_core::CpuState;
@@ -242,6 +242,10 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     if native.stops.contains(&eip) || owner.error.is_some() {
         return 0;
     }
+    // A first visit runs in the owner; the point links on the next one.
+    if native.first_visit(eip) {
+        return 0;
+    }
     let before = native.cache.used();
     let unit = match native.link(memory, point, eip) {
         Ok(unit) => unit,
@@ -275,6 +279,10 @@ pub(crate) struct Native {
     linked: Vec<(usize, u32, u32)>,
     /// Link points of the units the current translation placed.
     points: Vec<(usize, u32, bool)>,
+    /// Entries that have run, so a return to one translates it.
+    seen: FxHashSet<u32>,
+    /// Whether entries run once before they are translated.
+    pub(crate) first_visits: bool,
     /// Buffers of the last translation.
     work: translate::Workspace,
     /// Counts cache clears, which invalidate link points.
@@ -332,6 +340,8 @@ impl Native {
             links: FxHashMap::default(),
             linked: Vec::new(),
             points: Vec::new(),
+            seen: FxHashSet::default(),
+            first_visits: true,
             work: translate::Workspace::default(),
             generation: 0,
             table,
@@ -355,8 +365,21 @@ impl Native {
     ) -> Result<Option<Run>, String> {
         self.invalidate(memory);
         self.observe_stop(stop);
-        let (entry, translated) = match self.units.get(&cpu.eip) {
-            Some(&entry) => (entry, 0),
+        let (entry, translated) = match self.units.get(&cpu.eip).copied() {
+            Some(entry) => (entry, 0),
+            None if self.first_visit(cpu.eip) => {
+                let visit = translate::first::run(cpu, memory, stop, fuel.min(SLICE));
+                let exit = if visit.declined {
+                    Exit::Interpret
+                } else {
+                    Exit::Dispatch
+                };
+                return Ok(Some(Run {
+                    exit,
+                    retired: visit.retired,
+                    translated: 0,
+                }));
+            }
             None => {
                 let before = self.cache.used();
                 let entry = self.translate(memory, cpu.eip)?;
@@ -505,9 +528,21 @@ impl Native {
         self.forget_dynamic();
     }
 
+    /// Whether code at `eip` is known to run, so translating it pays.
+    fn ran(&self, eip: u32) -> bool {
+        !self.first_visits || self.seen.contains(&eip)
+    }
+
+    /// Whether `eip`, which has no unit, runs for the first time; it will
+    /// not be again.
+    fn first_visit(&mut self, eip: u32) -> bool {
+        self.first_visits && !self.units.contains_key(&eip) && self.seen.insert(eip)
+    }
+
     /// Translates the unit at `eip`, and ahead of time the units its main
-    /// path leaves to, so they share one cache sync and link directly.
-    /// Every link point of these units to a unit that exists is patched.
+    /// path leaves to that have run before, so they share one cache sync
+    /// and link directly. Every link point of these units to a unit that
+    /// exists is patched.
     fn translate(&mut self, memory: &mut Memory, eip: u32) -> Result<Entry, String> {
         self.points.clear();
         let entry = match self.emit(memory, eip) {
@@ -532,10 +567,12 @@ impl Native {
             let unit = match self.units.get(&target) {
                 Some(entry) => entry.unit,
                 // A full cache waits for the next miss to clear it.
-                None if main && index <= first => match self.emit(memory, target) {
-                    Some(entry) => entry.unit,
-                    None => break,
-                },
+                None if main && index <= first && self.ran(target) => {
+                    match self.emit(memory, target) {
+                        Some(entry) => entry.unit,
+                        None => break,
+                    }
+                }
                 None => continue,
             };
             self.patch(point, target, unit);
