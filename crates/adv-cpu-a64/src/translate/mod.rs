@@ -13,10 +13,18 @@
 //! the flags canonical, an internal edge only those its target reads, and
 //! every fault site records sense, carry and recipe for the owner.
 //!
+//! Memory accesses go straight to the window, where a host fault at a
+//! site reaches the owner (§6.3). Instructions the owner has seen fault
+//! too often are checked instead: each access first reads its page's
+//! class, and one that stays in a page the window may take directly does;
+//! the rest call the `access` stub, so soft pages cost a helper call
+//! rather than a fault.
+//!
 //! Host registers beyond the guest map of §4: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
 //! exit stub saves for fault recovery, x13 and x14 flag scratch without
-//! FlagM, and x15 the lazy-carry scratch.
+//! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
+//! x5, which are free inside units.
 
 mod decode;
 pub mod first;
@@ -56,6 +64,9 @@ pub struct Site {
     pub sense: Sense,
     pub carry: Carry,
     pub recipe: Recipe,
+    /// Whether the access checks its page first, so a fault here is not
+    /// a reason to check it.
+    pub checked: bool,
 }
 
 /// The last unit translated, in buffers the next translation reuses.
@@ -121,8 +132,16 @@ pub struct Stubs {
     pub lookup_slow: usize,
     /// A return whose shadow entry did not match.
     pub ret_miss: usize,
+    /// A checked access the window cannot take.
+    pub access: usize,
 }
 
+const X0: Reg = Reg::new(0);
+const X1: Reg = Reg::new(1);
+const X2: Reg = Reg::new(2);
+const X3: Reg = Reg::new(3);
+const X4: Reg = Reg::new(4);
+const X5: Reg = Reg::new(5);
 const X6: Reg = Reg::new(6);
 const X9: Reg = Reg::new(9);
 const X10: Reg = Reg::new(10);
@@ -212,6 +231,16 @@ enum Cold {
         target: u32,
         point: Label,
     },
+    /// A checked access the window cannot take: the `access` stub does it
+    /// for the site at `site`, then the unit resumes.
+    Access {
+        label: Label,
+        resume: Label,
+        site: Label,
+        address: Reg,
+        value: Reg,
+        kind: u32,
+    },
 }
 
 struct Translator<'a> {
@@ -226,6 +255,10 @@ struct Translator<'a> {
     far: &'a mut Vec<(usize, usize)>,
     links: &'a mut Vec<Link>,
     stubs: Stubs,
+    /// Guest instructions whose accesses check their page first.
+    checked: &'a dyn Fn(u32) -> bool,
+    /// Whether the instruction being emitted is one.
+    checking: bool,
     state: State,
     /// The instruction being emitted.
     index: usize,
@@ -236,13 +269,16 @@ struct Translator<'a> {
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
-/// `at`. Units end before any of `stops`. Each translated byte is
+/// `at`. Units end before any of `stops`, and the accesses of instructions
+/// `checked` accepts check their page first. Each translated byte is
 /// registered with `watch_code`, so a store to it reaches the owner.
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     work: &mut Workspace,
     memory: &mut adv_cpu_core::memory::Memory,
     eip: u32,
     stops: &[u32],
+    checked: &dyn Fn(u32) -> bool,
     features: Features,
     at: usize,
     stubs: Stubs,
@@ -278,6 +314,8 @@ pub fn translate(
         far,
         links,
         stubs,
+        checked,
+        checking: false,
         state: State::CANONICAL,
         index: 0,
         out: FlagSet::ALL,
@@ -330,6 +368,7 @@ impl Translator<'_> {
         let trace = self.trace;
         let inst = trace.insts[index];
         self.index = index;
+        self.checking = (self.checked)(inst.pc);
         self.out = trace.live_out[index];
         self.keep = self.out.minus(inst.effects.writes);
         if trace.head(index) {
@@ -478,6 +517,7 @@ impl Translator<'_> {
                 sense: self.state.sense,
                 carry: self.state.carry,
                 recipe: self.state.recipe,
+                checked: self.checking,
             },
         ));
     }
@@ -815,6 +855,12 @@ impl Translator<'_> {
         self.emit(b(0));
     }
 
+    /// A call to the stub at host address `to`, placed by `finish`.
+    fn far_call(&mut self, to: usize) {
+        self.far.push((self.asm.offset() / 4, to));
+        self.emit(bl(0));
+    }
+
     /// A conditional branch (`cbnz`) to a far stub, through a cold `b`.
     fn far_cbnz(&mut self, size: Size, rt: Reg, to: usize) {
         let label = self.asm.label();
@@ -891,6 +937,28 @@ impl Translator<'_> {
                 self.asm.adr(Reg::new(2), point);
                 self.far(self.stubs.dispatch);
             }
+            Cold::Access {
+                label,
+                resume,
+                site,
+                address,
+                value,
+                kind,
+            } => {
+                self.asm.bind(label);
+                self.emit(mov(W, X1, address));
+                self.asm.adr(X2, site);
+                let store = kind & crate::runtime::ACCESS_STORE != 0;
+                if store {
+                    self.emit(mov(W, X3, value));
+                }
+                self.emit(movz(W, X4, kind as u16, 0));
+                self.far_call(self.stubs.access);
+                if !store {
+                    self.emit(mov(W, value, X0));
+                }
+                self.asm.b(resume);
+            }
         }
     }
 
@@ -901,8 +969,12 @@ impl Translator<'_> {
         self.asm.resolve();
         let words = self.asm.words_mut();
         for &(index, to) in self.far.iter() {
-            let from = at + 4 * index;
-            words[index] = b((to as i64 - from as i64) as i32);
+            let offset = (to as i64 - (at + 4 * index) as i64) as i32;
+            words[index] = if words[index] == bl(0) {
+                bl(offset)
+            } else {
+                b(offset)
+            };
         }
     }
 }

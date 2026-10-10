@@ -19,6 +19,15 @@
 //! state: the interpreter either completes it (a soft page) or reports the
 //! precise guest fault.
 //!
+//! Soft pages (§6.3): an instruction whose unchecked sites fault
+//! `CHECK_AFTER` times is checked from then on. The unit that faulted goes,
+//! and its next translation checks each access of the instruction against
+//! the page class table, a snapshot of `Memory::native_permissions` the
+//! runtime points at. Accesses the window cannot take call `access`, which
+//! performs them through `Memory` without leaving translated code. A stale
+//! table is harmless: the direct form is still a site, and `access`
+//! refuses anything the interpreter would not do.
+//!
 //! Code invalidation: translation registers its guest bytes with
 //! `watch_code`, which write-protects them in the window, so any store to
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
@@ -26,9 +35,11 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
+use std::sync::Arc;
 
 use adv_cpu_core::CpuState;
-use adv_cpu_core::memory::Memory;
+use adv_cpu_core::interpreter::accessible;
+use adv_cpu_core::memory::{Memory, READ, WRITE};
 
 use crate::cache::CodeCache;
 use crate::encode::{b, bl};
@@ -45,6 +56,24 @@ type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
+
+/// Faults at unchecked sites after which an instruction is checked (§6.3).
+pub(crate) const CHECK_AFTER: u32 = 8;
+
+/// Page class table entries: every guest page.
+const CLASSES: usize = 1 << 20;
+
+/// Which guest accesses check their page first (§6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Checks {
+    /// Those of instructions that faulted `CHECK_AFTER` times.
+    Adaptive,
+    /// All of them, for tests.
+    All,
+    /// All of them, every one through the owner, for tests.
+    Slow,
+}
 
 /// What the signal handler may read while translated code runs.
 struct Faults {
@@ -263,6 +292,49 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     unit
 }
 
+/// Called by the `access` stub for a checked access of `kind` the window
+/// cannot take: performs it as the interpreter would and returns a loaded
+/// value, or records `site` as faulting and refuses with bit 32. Stores to
+/// code are refused too, so the interpreter invalidates the code.
+unsafe extern "C" fn access(
+    runtime: *mut Runtime,
+    address: u32,
+    site: usize,
+    value: u32,
+    kind: u32,
+) -> u64 {
+    // SAFETY: as in `dispatch`.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    let (native, memory) = unsafe { (&*owner.native, &mut *owner.memory) };
+    let width = (kind & 7) as usize;
+    let done = if kind & runtime::ACCESS_STORE != 0 {
+        (accessible(memory, address, width as u8, WRITE)
+            && !memory.stores_code(address, width)
+            && memory.write(address, &value.to_le_bytes()[..width]).is_ok())
+        .then_some(0)
+    } else {
+        let mut bytes = [0; 4];
+        (accessible(memory, address, width as u8, READ)
+            && memory.read_into(address, &mut bytes[..width]).is_ok())
+        .then(|| {
+            let shift = 32 - 8 * width as u32;
+            let value = u32::from_le_bytes(bytes) << shift;
+            if kind & runtime::ACCESS_SIGNED != 0 {
+                ((value as i32) >> shift) as u32
+            } else {
+                value >> shift
+            }
+        })
+    };
+    match done {
+        Some(value) => u64::from(value),
+        None => {
+            native.faults.pc.set(site);
+            1 << 32
+        }
+    }
+}
+
 pub(crate) struct Native {
     cache: CodeCache,
     enter: Enter,
@@ -283,6 +355,19 @@ pub(crate) struct Native {
     seen: FxHashSet<u32>,
     /// Whether entries run once before they are translated.
     pub(crate) first_visits: bool,
+    pub(crate) checks: Checks,
+    /// Faults at unchecked sites by guest instruction.
+    strikes: FxHashMap<u32, u32>,
+    /// Guest instructions whose accesses check their page first.
+    checked: FxHashSet<u32>,
+    /// Faults at unchecked sites so far.
+    pub(crate) unchecked_faults: u64,
+    /// Each placed unit's host address and entry, ascending.
+    placed: Vec<(usize, u32)>,
+    /// The permissions the page class table was made from, and the table
+    /// when it is not that snapshot itself.
+    snapshot: Option<Arc<Vec<u8>>>,
+    classes: Option<Box<[u8]>>,
     /// Buffers of the last translation.
     work: translate::Workspace,
     /// Counts cache clears, which invalidate link points.
@@ -334,6 +419,7 @@ impl Native {
                 lookup: base + stubs.lookup,
                 lookup_slow: base + stubs.lookup_slow,
                 ret_miss: base + stubs.ret_miss,
+                access: base + stubs.access,
             },
             units: FxHashMap::default(),
             pages: FxHashMap::default(),
@@ -342,6 +428,13 @@ impl Native {
             points: Vec::new(),
             seen: FxHashSet::default(),
             first_visits: true,
+            checks: Checks::Adaptive,
+            strikes: FxHashMap::default(),
+            checked: FxHashSet::default(),
+            unchecked_faults: 0,
+            placed: Vec::new(),
+            snapshot: None,
+            classes: None,
             work: translate::Workspace::default(),
             generation: 0,
             table,
@@ -399,6 +492,9 @@ impl Native {
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         let budget = fuel.min(SLICE);
+        if self.checks != Checks::Adaptive || !self.checked.is_empty() {
+            self.classify(memory);
+        }
         self.cache.sync();
         self.faults.end.set(self.cache.next());
         let runtime: *mut Runtime = &mut *self.runtime;
@@ -417,6 +513,7 @@ impl Native {
             (*runtime).countdown = budget;
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
+            (*runtime).access = access as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -432,12 +529,14 @@ impl Native {
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {
-            let site = self
-                .faults
-                .site(self.faults.pc.get())
-                .expect("faulting site");
+            let pc = self.faults.pc.get();
+            let site = self.faults.site(pc).expect("faulting site");
             recover(cpu, site, self.runtime.temps);
             retired -= u64::from(site.refund);
+            if !site.checked {
+                self.unchecked_faults += 1;
+                self.strike(site.eip, pc);
+            }
         }
         let retired = retired as u32;
         Ok(Some(Run {
@@ -487,17 +586,75 @@ impl Native {
         let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
-                dropped |= self.units.remove(&eip).is_some();
-                let mut next = self.links.remove(&eip).unwrap_or(u32::MAX);
-                while let Some(&(point, word, after)) = self.linked.get(next as usize) {
-                    self.cache.patch(point, word);
-                    next = after;
-                }
+                dropped |= self.drop_unit(eip);
             }
         }
         if dropped {
             self.forget_dynamic();
         }
+    }
+
+    /// Drops the unit at `eip`, if any, and restores the link points that
+    /// branch to it; the caller forgets dynamic targets.
+    fn drop_unit(&mut self, eip: u32) -> bool {
+        let mut next = self.links.remove(&eip).unwrap_or(u32::MAX);
+        while let Some(&(point, word, after)) = self.linked.get(next as usize) {
+            self.cache.patch(point, word);
+            next = after;
+        }
+        self.units.remove(&eip).is_some()
+    }
+
+    /// Counts a fault at an unchecked site of `eip`, at host address `pc`.
+    /// From `CHECK_AFTER` on, `eip` is checked and the unit holding `pc`
+    /// goes, so the next dispatch translates it that way.
+    fn strike(&mut self, eip: u32, pc: usize) {
+        let strikes = self.strikes.entry(eip).or_default();
+        *strikes += 1;
+        if *strikes < CHECK_AFTER {
+            return;
+        }
+        self.checked.insert(eip);
+        let index = self.placed.partition_point(|&(start, _)| start <= pc);
+        let Some(&(start, entry)) = index.checked_sub(1).map(|index| &self.placed[index]) else {
+            return;
+        };
+        // A unit dropped before stays in `placed`.
+        if self
+            .units
+            .get(&entry)
+            .is_some_and(|unit| unit.unit == start)
+        {
+            self.drop_unit(entry);
+            self.forget_dynamic();
+        }
+    }
+
+    /// Points the runtime at the page classes of the current permissions.
+    fn classify(&mut self, memory: &mut Memory) {
+        let snapshot = memory.native_permissions();
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &snapshot))
+        {
+            return;
+        }
+        let first = (memory.base >> 12) as usize;
+        let direct = self.checks != Checks::Slow && first == 0 && snapshot.len() == CLASSES;
+        self.runtime.classes = if direct {
+            snapshot.as_ptr() as u64
+        } else {
+            let table = self
+                .classes
+                .get_or_insert_with(|| vec![0; CLASSES].into_boxed_slice());
+            // A slow table stays empty: no page may be taken directly.
+            if self.checks != Checks::Slow {
+                table[first..first + snapshot.len()].copy_from_slice(&snapshot);
+            }
+            table.as_ptr() as u64
+        };
+        self.snapshot = Some(snapshot);
     }
 
     /// Empties the indirect table and the shadow stack, which may lead to
@@ -523,6 +680,7 @@ impl Native {
         self.pages.clear();
         self.links.clear();
         self.linked.clear();
+        self.placed.clear();
         self.generation += 1;
         self.faults.sites.clear();
         self.forget_dynamic();
@@ -583,11 +741,13 @@ impl Native {
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
         let mut work = std::mem::take(&mut self.work);
+        let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
         translate::translate(
             &mut work,
             memory,
             eip,
             &self.stops,
+            &|pc| all || checked.contains(&pc),
             self.features,
             at,
             self.stubs,
@@ -633,6 +793,7 @@ impl Native {
         }
         let entry = Entry { unit, retired };
         self.units.insert(eip, entry);
+        self.placed.push((unit, eip));
         Some(entry)
     }
 }
@@ -695,6 +856,7 @@ mod tests {
             sense: Sense::Subtraction,
             carry: Carry::Host,
             recipe: Recipe::Canonical,
+            checked: false,
         };
         let words = [
             load,
@@ -793,6 +955,7 @@ mod tests {
                 sense: Sense::Addition,
                 carry: Carry::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
+                checked: false,
             },
             [0; 2],
         );

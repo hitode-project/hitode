@@ -14,6 +14,8 @@ use iced_x86::code_asm::*;
 #[cfg(native)]
 use super::Executor;
 #[cfg(native)]
+use crate::native::Checks;
+#[cfg(native)]
 use crate::translate::Features;
 
 const BASE: u32 = 0x1_0000;
@@ -699,12 +701,12 @@ fn snapshot(memory: &Memory) -> Vec<u8> {
 fn translated(
     program: &Program,
     budget: u64,
-    features: Features,
-    first_visits: bool,
+    (features, first_visits, checks): Config,
 ) -> (RunOutcome, CpuState, Vec<u8>, u64) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     executor.native.features = features;
     executor.native.first_visits = first_visits;
+    executor.native.checks = checks;
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();
     let outcome = executor.run(program.stop, budget).unwrap();
@@ -717,13 +719,16 @@ fn translated(
     )
 }
 
+/// Host features, first visits, and which accesses check their page.
 #[cfg(native)]
-fn compare(seed: u64, budget: u64, features: Features, first_visits: bool) -> u64 {
+type Config = (Features, bool, Checks);
+
+#[cfg(native)]
+fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     let program = program(seed);
     let (outcome, state, memory) = reference(&program, budget);
-    let (a64_outcome, a64_state, a64_memory, native) =
-        translated(&program, budget, features, first_visits);
-    let context = format!("seed {seed} budget {budget} {features:?} first visits {first_visits}");
+    let (a64_outcome, a64_state, a64_memory, native) = translated(&program, budget, config);
+    let context = format!("seed {seed} budget {budget} {config:?}");
     assert_eq!(a64_outcome, outcome, "{context}: outcome");
     assert_eq!(a64_state.regs, state.regs, "{context}: registers");
     assert_eq!(a64_state.eip, state.eip, "{context}: eip");
@@ -741,16 +746,68 @@ fn compare(seed: u64, budget: u64, features: Features, first_visits: bool) -> u6
 fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
     let mut native = 0;
     // Without first visits, everything the programs run is translated.
-    for (flagm, first_visits) in [(true, false), (false, false), (true, true)] {
-        let features = Features { flagm };
+    let configs = [
+        (true, false, Checks::Adaptive),
+        (false, false, Checks::Adaptive),
+        (true, true, Checks::Adaptive),
+        (true, false, Checks::All),
+        (false, false, Checks::Slow),
+    ];
+    for (flagm, first_visits, checks) in configs {
+        let config = (Features { flagm }, first_visits, checks);
         for seed in 1..=1000 {
-            native += compare(seed, u64::MAX >> 1, features, first_visits);
+            native += compare(seed, u64::MAX >> 1, config);
             for budget in [1, 5, 13, 40, 120, 400] {
-                compare(seed, budget + seed % 7, features, first_visits);
+                compare(seed, budget + seed % 7, config);
             }
         }
     }
     assert!(native > 1000, "translated code ran: {native} entries");
+}
+
+/// Data on a code page: each store faults until the instruction is checked,
+/// then takes `access` without leaving translated code.
+#[cfg(native)]
+#[test]
+fn stores_to_data_on_a_code_page_stop_faulting() {
+    const ITERATIONS: u32 = 2000;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(ecx, CODE + 0x800).unwrap();
+    a.mov(edx, ITERATIONS).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, dword_ptr(ecx)).unwrap();
+    a.add(eax, edx).unwrap();
+    a.mov(dword_ptr(ecx), eax).unwrap();
+    a.push(eax).unwrap();
+    a.pop(ebx).unwrap();
+    a.dec(edx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let stop = CODE + code.len() as u32 - 1;
+
+    let mut executor = Executor::new(BASE, LEN).unwrap();
+    let memory = executor.memory_mut();
+    memory.protect(CODE, 0x1_0000, 7).unwrap();
+    memory.write(CODE, &code).unwrap();
+    memory
+        .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
+        .unwrap();
+    executor.state.eip = CODE;
+    executor.state.regs[4] = STACK_TOP;
+    let outcome = executor.run(stop, u64::MAX >> 1).unwrap();
+    assert_eq!(outcome, RunOutcome::ReachedStop);
+    let sum = (1..=ITERATIONS).sum::<u32>();
+    assert_eq!(executor.state.regs[0], sum);
+    assert_eq!(executor.state.regs[3], sum);
+    let stored = executor.memory().read(CODE + 0x800, 4).unwrap();
+    assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
+    // The loop's unit, then the one it loops through, each fault until
+    // the store is checked.
+    let faults = executor.native.unchecked_faults;
+    let checked = u64::from(crate::native::CHECK_AFTER);
+    assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
 }
 
 #[test]

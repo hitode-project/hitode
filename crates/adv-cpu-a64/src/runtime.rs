@@ -20,6 +20,12 @@
 //! `ret_miss` resynchronizes with a few entries below the top before it
 //! looks up, and `shadow_reset` empties the stack after an overflow.
 //!
+//! Checked accesses (§6.3) call `access` when the page class table rules
+//! out the window: it saves every register translated code may keep live,
+//! has the owner's `access` helper perform the access, and returns the
+//! loaded value in w0; when the owner refuses, it leaves as the fault stub
+//! would for a host fault at the access, whose site the helper recorded.
+//!
 //! XMM state stays in `CpuState` until a unit uses SSE (M2), so the stubs
 //! do not move it. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
@@ -60,6 +66,12 @@ pub struct Runtime {
     pub shadow_top: u64,
     /// Where `shadow_reset` resumes.
     pub resume: u64,
+    /// `access(runtime, address, site, value, kind) -> value`, called by
+    /// `access`; bit 32 set refuses.
+    pub access: u64,
+    /// The page class table: a byte per guest page, its permissions as
+    /// `Memory::native_permissions` has them.
+    pub classes: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -80,6 +92,8 @@ impl Runtime {
             table: 0,
             shadow_top: 0,
             resume: 0,
+            access: 0,
+            classes: 0,
             exit: 0,
             temps: [0; 2],
         }
@@ -125,6 +139,8 @@ pub struct Stubs {
     pub ret_miss: usize,
     /// Where the fault handler resumes a shadow stack overflow.
     pub shadow_reset: usize,
+    /// Where a checked access the window cannot take calls the owner.
+    pub access: usize,
 }
 
 /// Indirect table entries; a guest EIP indexes them by bits 2 to 17.
@@ -137,6 +153,10 @@ pub const fn table_slot(eip: u32) -> usize {
 
 /// Shadow entries above the top that never match, for `ret_miss` to read.
 pub const SHADOW_SENTINELS: usize = 4;
+
+/// An `access` kind is the width in bytes, with these bits.
+pub const ACCESS_STORE: u32 = 8;
+pub const ACCESS_SIGNED: u32 = 16;
 
 const fn r(number: u8) -> Reg {
     Reg::new(number)
@@ -165,6 +185,8 @@ const HELPER: u32 = field(offset_of!(Runtime, helper));
 pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
+const ACCESS: u32 = field(offset_of!(Runtime, access));
+pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 const EIP: u32 = field(offset_of!(CpuState, eip));
@@ -188,6 +210,8 @@ pub fn stubs() -> Stubs {
     asm.bind(exit_label);
     let exit = asm.offset();
     emit_exit(&mut asm);
+    let fault_label = asm.label();
+    asm.bind(fault_label);
     let fault = asm.offset();
     asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
     asm.b(exit_label);
@@ -211,6 +235,8 @@ pub fn stubs() -> Stubs {
         ldr(X, Reg::LR, RUNTIME, RESUME),
         br(Reg::LR),
     ]);
+    let access = asm.offset();
+    emit_access(&mut asm, fault_label);
     Stubs {
         code: asm.finish(),
         enter,
@@ -221,7 +247,40 @@ pub fn stubs() -> Stubs {
         lookup_slow,
         ret_miss,
         shadow_reset,
+        access,
     }
+}
+
+/// `access`, called with w1 the guest address, x2 the site, w3 a value to
+/// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
+/// wherever translated code accesses memory.
+fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
+    asm.emit_all(&[
+        stp(X, Pre, r(5), r(6), SP, -128),
+        stp(X, Offset, r(7), r(8), SP, 16),
+        stp(X, Offset, r(9), r(10), SP, 32),
+        stp(X, Offset, r(11), r(12), SP, 48),
+        stp(X, Offset, r(13), r(14), SP, 64),
+        stp(X, Offset, r(15), r(16), SP, 80),
+        mrs_nzcv(r(0)),
+        stp(X, Offset, r(17), r(0), SP, 96),
+        str(X, Reg::LR, SP, 112),
+        mov(X, r(0), RUNTIME),
+        ldr(X, r(16), RUNTIME, ACCESS),
+        blr(r(16)),
+        ldr(X, Reg::LR, SP, 112),
+        ldp(X, Offset, r(17), r(1), SP, 96),
+        msr_nzcv(r(1)),
+        ldp(X, Offset, r(15), r(16), SP, 80),
+        ldp(X, Offset, r(13), r(14), SP, 64),
+        ldp(X, Offset, r(11), r(12), SP, 48),
+        ldp(X, Offset, r(9), r(10), SP, 32),
+        ldp(X, Offset, r(7), r(8), SP, 16),
+        ldp(X, Post, r(5), r(6), SP, 128),
+    ]);
+    // Refused: the site faults, with the state exactly that before it.
+    asm.tbz(true, r(0), 32, fault);
+    asm.emit(ret(Reg::LR));
 }
 
 /// The indirect table probe for the EIP in w16: branches to its unit, or to
