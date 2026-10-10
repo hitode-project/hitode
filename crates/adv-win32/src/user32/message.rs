@@ -1924,7 +1924,7 @@ fn timeout_to(
     wide: bool,
     then: sent::Done,
 ) -> Outcome {
-    let [hwnd, msg, wp, lp] = args;
+    let [hwnd, msg, mut wp, lp] = args;
     let Some(thread) = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
@@ -1936,13 +1936,30 @@ fn timeout_to(
         return encoded_to(env, None, hwnd, msg, wp, lp, wide, then);
     }
     let window = user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
+    let target_wide = window.unicode;
     let combo = user(env).classes[window.class]
         .name
         .eq_ignore_ascii_case("ComboBox");
     let text_message = matches!(msg, wm::SETTEXT | wm::GETTEXT | wm::GETTEXTLENGTH)
-        || character_message(msg)
         || (combo && matches!(msg, 0x143 | 0x148 | 0x149 | 0x14a | 0x14c | 0x14d | 0x158));
-    if window.unicode != wide && text_message {
+    if target_wide != wide && character_message(msg) {
+        wp = match character_param(env, wp, wide, target_wide) {
+            Ok(parameter) => parameter,
+            Err(reason) => {
+                adv_abi::warn_unavailable(
+                    env,
+                    if wide {
+                        "user32.dll!SendMessageTimeoutW"
+                    } else {
+                        "user32.dll!SendMessageTimeoutA"
+                    },
+                    reason,
+                );
+                return then(env, Err(50));
+            }
+        };
+    }
+    if target_wide != wide && text_message {
         // A timed sender may return while its receiver still runs. Do not hand
         // that receiver a converted temporary buffer with sender-only lifetime.
         adv_abi::warn_unavailable(

@@ -52,6 +52,13 @@ fn procedure(env: &mut Env<'_>) -> Outcome {
             env.ext.get_mut::<Observed>().0.push(2);
             Outcome::Return(1)
         }
+        window::wm::CHAR => {
+            assert_eq!(env.context, 1);
+            assert_eq!(env.arg(2), 0x80); // U+20AC in guest CP1252.
+            assert!(matches!(in_send(env), Outcome::Return(1)));
+            env.ext.get_mut::<Observed>().0.push(3);
+            Outcome::Return(9)
+        }
         APP => {
             assert_eq!(env.context, 1);
             assert_eq!(
@@ -321,4 +328,57 @@ fn timed_cross_encoding_text_is_rejected_before_queueing_receiver_unsafe_storage
     assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 0);
     assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 50);
     assert!(m.ext.get::<Observed>().0.is_empty());
+}
+
+#[test]
+fn timed_cross_thread_character_conversion_needs_no_temporary_storage() {
+    let mut m = fixture();
+    m.ext.get_mut::<crate::Win32>().codec = adv_os::Codec::new(1252);
+    let setup = m.resolve_import("sent-test", "setup").unwrap();
+    let done = m.resolve_import("sent-test", "finish").unwrap();
+    let send = m.resolve_import(USER32, "SendMessageTimeoutW").unwrap();
+    let peek = m.resolve_import(USER32, "PeekMessageA").unwrap();
+    let mut sender = Asm::new(CODE);
+    let wait = sender.here();
+    sender.cmp_mem_imm8(DATA + 4, 0).jz(wait);
+    sender
+        .push_imm(DATA + 8)
+        .push_imm(1000)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0x20ac)
+        .push_imm(window::wm::CHAR)
+        .mov_eax_mem(DATA + 4)
+        .push_eax()
+        .call(send)
+        .mov_mem_eax(DATA + 12)
+        .mov_mem_imm(DATA + 20, 1)
+        .call(done)
+        .hlt();
+    let mut receiver = Asm::new(CODE + 0x200);
+    receiver.call(setup).mov_mem_eax(DATA + 4);
+    let poll = receiver.here();
+    receiver
+        .push_imm(1)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(DATA + 64)
+        .call(peek)
+        .cmp_mem_imm8(DATA + 20, 0)
+        .jz(poll)
+        .call(done)
+        .hlt();
+    for (pc, code) in [(CODE, sender), (CODE + 0x200, receiver)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("timed character", pc, &[], 65536).unwrap();
+    }
+    run(&mut m);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 9);
+    assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 1);
+    assert_eq!(m.ext.get::<Observed>().0, [3]);
 }
