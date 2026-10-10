@@ -1,5 +1,5 @@
-//! The private virtual registry: keys, values and open-key handles, persisted as a bounded
-//! versioned file inside the runtime data folder. Never opens the host registry. Error
+//! The virtual registry: private keys persisted as a bounded versioned file and
+//! runtime-owned configuration sharing the same tree and handles. Never opens the host registry. Error
 //! values are Win32 error codes.
 use adv_machine::{Namespace, Objects};
 use std::collections::{BTreeMap, BTreeSet};
