@@ -501,11 +501,117 @@ fn the_new_pairs_are_public_registry_entries_before_process_installation() {
             "comctl32.dll",
             &["CreatePropertySheetPageW", "PropertySheetW"][..],
         ),
+        (
+            "shlwapi.dll",
+            &[
+                "PathCombineW",
+                "PathAppendW",
+                "PathRemoveFileSpecW",
+                "PathRemoveExtensionW",
+                "PathRenameExtensionW",
+                "PathAddExtensionW",
+                "PathAddBackslashW",
+                "PathStripPathW",
+                "PathUnquoteSpacesW",
+                "PathIsDirectoryW",
+                "PathMatchSpecA",
+            ][..],
+        ),
     ] {
         for name in names {
             assert!(r.dynamic_available(module, name), "{module}!{name}");
         }
     }
+}
+
+#[test]
+fn shell_path_pairs_preserve_relative_syntax_dbcs_characters_and_output_limits() {
+    let mut m = machine();
+    write_wide(&mut m, DATA, &r"a\b".encode_utf16().collect::<Vec<_>>());
+    write_wide(
+        &mut m,
+        DATA + 100,
+        &r"..\文字".encode_utf16().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "shlwapi.dll",
+            "PathCombineW",
+            &[DATA + 200, DATA, DATA + 100]
+        ),
+        DATA + 200
+    );
+    let text: Vec<_> = (0..4)
+        .map(|i| m.cpu.read_u16(DATA + 200 + i * 2).unwrap())
+        .collect();
+    assert_eq!(text, "a\\文字".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(
+        call(&mut m, "shlwapi.dll", "PathAddBackslashW", &[DATA + 200]),
+        DATA + 210
+    );
+    assert_eq!(
+        call(&mut m, "shlwapi.dll", "PathRemoveFileSpecW", &[DATA + 200]),
+        1
+    );
+    assert_eq!(m.cpu.read_u16(DATA + 208).unwrap(), 0);
+    assert_eq!(
+        call(&mut m, "shlwapi.dll", "PathStripPathW", &[DATA + 200]),
+        0
+    );
+    assert_eq!(m.cpu.read_u16(DATA + 200).unwrap(), 0x6587);
+    write_wide(&mut m, DATA, &"file".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(
+        call(&mut m, "shlwapi.dll", "PathAddExtensionW", &[DATA, 0]),
+        1
+    );
+    assert_eq!(
+        call(&mut m, "shlwapi.dll", "PathRemoveExtensionW", &[DATA]),
+        0
+    );
+    assert_eq!(m.cpu.read_u16(DATA + 8).unwrap(), 0);
+    write_wide(
+        &mut m,
+        DATA,
+        &"x".repeat(259).encode_utf16().collect::<Vec<_>>(),
+    );
+    assert_eq!(call(&mut m, "shlwapi.dll", "PathAddBackslashW", &[DATA]), 0);
+    assert_eq!(m.cpu.read_u16(DATA + 516).unwrap(), 0x78);
+    assert_eq!(m.cpu.read_u16(DATA + 518).unwrap(), 0);
+    m.cpu.write(DATA, &[b'a', b'\\', 0x95, 0x5c, 0]).unwrap();
+    m.cpu.write(DATA + 100, b"b\0").unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "shlwapi.dll",
+            "PathCombineA",
+            &[DATA + 200, DATA, DATA + 100]
+        ),
+        DATA + 200
+    );
+    assert_eq!(
+        m.cpu.read_cstr(DATA + 200, 100).unwrap(),
+        [b'a', b'\\', 0x95, 0x5c, b'\\', b'b']
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "shlwapi.dll",
+            "PathMatchSpecA",
+            &[DATA + 200, DATA + 100]
+        ),
+        0
+    );
+    m.cpu.write(DATA + 100, b"*\\?\\b\0").unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "shlwapi.dll",
+            "PathMatchSpecA",
+            &[DATA + 200, DATA + 100]
+        ),
+        1
+    );
 }
 
 #[test]

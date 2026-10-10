@@ -16,6 +16,7 @@ mod property_sheet;
 mod shell_drop;
 mod shell_execute;
 mod shell_icon;
+mod shell_path;
 mod theme;
 mod variant;
 mod wts;
@@ -222,39 +223,11 @@ fn path_add_backslash_a(env: &mut Env<'_>) -> Outcome {
     }
 }
 
-fn join(codec: &Codec, a: &[u8], b: &[u8]) -> Vec<u8> {
-    if b.first() == Some(&b'\\') || b.get(1) == Some(&b':') || a.is_empty() {
-        return b.to_vec();
-    }
-    let mut out = a.to_vec();
-    if last_sep(codec, a).is_none_or(|i| i + 1 != a.len()) {
-        out.push(b'\\');
-    }
-    out.extend_from_slice(b);
-    out
-}
-
 fn path_append_a(env: &mut Env<'_>) -> Outcome {
-    let (p, m) = (env.arg(0), env.arg(1));
-    let (a, b) = (cstr(env.cpu, p), cstr(env.cpu, m));
-    let out = join(&codec(env), &a, &b);
-    Outcome::Return(u32::from(put_cstr(env.cpu, p, MAX_PATH, &out).is_some()))
+    shell_path::join(env, false, true)
 }
-
 fn path_combine_a(env: &mut Env<'_>) -> Outcome {
-    let (d, a, b) = (env.arg(0), env.arg(1), env.arg(2));
-    let (sa, sb) = (cstr(env.cpu, a), cstr(env.cpu, b));
-    let out = join(&codec(env), &sa, &sb);
-    let full = env
-        .ext
-        .get::<Win32>()
-        .vfs
-        .normalize(&codec(env).decode(&out));
-    let out = codec(env).encode(&full);
-    match put_cstr(env.cpu, d, MAX_PATH, &out) {
-        Some(_) => Outcome::Return(d),
-        None => Outcome::Return(0),
-    }
+    shell_path::join(env, false, false)
 }
 
 fn path_unquote_spaces_a(env: &mut Env<'_>) -> Outcome {
@@ -399,6 +372,7 @@ pub fn register(reg: &mut Registry) {
     internet::register(reg);
     shell_execute::register(reg);
     shell_icon::register(reg);
+    shell_path::register(reg);
     shell_drop::register(reg);
     property_sheet::register(reg);
     stdcall(
