@@ -337,15 +337,14 @@ fn local_callee_code_write_exits_before_cached_successor() {
     let mut m = memory(&code);
     m.protect(CODE, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
     let mut s = state();
-    s.regs[6] = CODE + 128;
-    s.regs[0] = 17;
+    // Rewrite the CALL's own bytes unchanged: still a store to fetched code.
+    let word = u32::from_le_bytes(code[..4].try_into().unwrap());
+    s.regs[6] = CODE;
+    s.regs[0] = word;
     let mut interpreter = Interpreter::new();
     let result = interpreter.run_block(&mut s, &mut m, 256, STOP, None).0;
     assert_eq!(result.units, 2);
     assert_eq!(s.regs[3], 0);
     assert_eq!(s.regs[4], STACK - 4);
-    assert_eq!(
-        m.read_data(CODE + 128, 4).unwrap().as_ref(),
-        &17u32.to_le_bytes()
-    );
+    assert_eq!(m.read_data(CODE, 4).unwrap().as_ref(), &word.to_le_bytes());
 }
