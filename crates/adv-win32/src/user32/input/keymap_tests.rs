@@ -145,6 +145,12 @@ fn map_virtual_key_matches_explicit_native_enhanced_layouts_without_activation()
         }
         let initial = GetKeyboardLayout(0);
         let count = GetKeyboardLayoutList(0, std::ptr::null_mut());
+        // A non-interactive window station (for example a session 0 service
+        // host) has no input locales, and LoadKeyboardLayoutW fails there.
+        if count <= 0 {
+            eprintln!("native process has no keyboard layouts (non-interactive window station)");
+            return;
+        }
         let mut existing = vec![std::ptr::null_mut(); count as usize];
         assert_eq!(GetKeyboardLayoutList(count, existing.as_mut_ptr()), count);
         for (name, profile) in [
