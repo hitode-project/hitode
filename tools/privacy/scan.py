@@ -24,7 +24,7 @@ from pathlib import Path
 
 NOREPLY = "@users.noreply.github.com"
 # Third-party code keeps its authors' addresses.
-EMAIL_EXEMPT = ("vendor/", "crates/adv-cpu/softfloat/", "tools/fixtures/vendor/")
+EMAIL_EXEMPT = ("vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
 EMAIL_ALLOWED_DOMAINS = {"example.com", "example.org", "example.net"}
 # Guest-side profile names the emulator presents; any other C:\Users\<name> is a host path.
 GUEST_USERS = {"player", "public", "default", "all users", "{}"}

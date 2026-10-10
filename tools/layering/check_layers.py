@@ -16,7 +16,10 @@ import sys
 RULES: dict[str, set[str]] = {
     "adv-sync": set(),
     "adv-pe": set(),
-    "adv-cpu": {"adv-sync"},
+    # Engine-neutral core; each engine builds on it; the facade picks one.
+    "adv-cpu-core": {"adv-sync"},
+    "adv-cpu-x64": {"adv-cpu-core"},
+    "adv-cpu": {"adv-cpu-x64"},
     "adv-machine": {"adv-cpu", "adv-sync"},
     "adv-abi": {"adv-machine", "adv-abi-macros"},
     "adv-abi-macros": set(),

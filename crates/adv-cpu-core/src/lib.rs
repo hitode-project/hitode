@@ -1,0 +1,148 @@
+//! Engine-neutral x86-32 execution core: architectural state, guest memory,
+//! the interpreter, exact floating point and the guest CPU interface
+//! ([`backend`]) the machine layer drives. Engines build on these modules;
+//! the hidden ones are engine-facing, not part of the host contract.
+#[doc(hidden)]
+pub mod architecture;
+#[doc(hidden)]
+pub mod atomic_memory;
+pub mod backend;
+#[doc(hidden)]
+pub mod cliffs;
+mod code_image;
+#[doc(hidden)]
+pub mod cpu_profile;
+pub mod engine;
+pub mod execution_abi;
+#[doc(hidden)]
+#[allow(dead_code)]
+pub mod fault_recipe;
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod fault_recovery;
+#[doc(hidden)]
+pub mod file_memory;
+#[doc(hidden)]
+pub mod floating;
+pub mod frame_counters;
+pub mod host_features;
+pub mod interpreter;
+#[doc(hidden)]
+pub mod machine_memory;
+#[doc(hidden)]
+pub mod memory;
+#[doc(hidden)]
+pub mod perf_map;
+#[doc(hidden)]
+pub mod shared_memory;
+#[doc(hidden)]
+pub mod state;
+#[doc(hidden)]
+pub mod strings;
+#[doc(hidden)]
+pub mod timestamp;
+#[doc(hidden)]
+pub mod trap;
+#[doc(hidden)]
+pub mod virtual_memory;
+
+pub use architecture::{ArchitecturalState, StateError};
+pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
+pub use code_image::AotImage;
+pub use cpu_profile::{PROCESSOR_IDENTITY, ProcessorIdentity, SegmentState};
+pub use engine::{Engine, EngineCounters, EngineOptions, ProfileSample};
+pub use host_features::HostFeatures;
+pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
+pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
+pub use timestamp::TSC_FREQ;
+pub use trap::ExecutionTrap;
+#[cfg(unix)]
+pub use virtual_memory::{
+    DirectFaultView, FaultClassification, GuestAccess, GuestPageProtection,
+    Reservation as DirectMemoryReservation,
+};
+
+/// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
+#[repr(C)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuState {
+    pub regs: [u32; 8],
+    pub eip: u32,
+    pub eflags: u32,
+    pub fs_base: u32,
+    pub fault_addr: u32,
+    /// Work budget: native basic block, interpreted instruction, or REP element.
+    pub fuel: u64,
+    /// Raw XMM bits shared by native and interpreted execution.
+    pub xmm: [[u8; 16]; 8],
+    /// Native MMX cache of physical x87 significands. Pending writes are described
+    /// by mmx_mode and materialized into x87 at executor/context boundaries.
+    pub mmx: [u64; 8],
+    /// Deferred MMX entry (bit 0), EMMS (bit 1), tracked writes (bit 2),
+    /// and written physical slots (bits 8–15).
+    pub mmx_mode: u32,
+    /// Canonical x87 state. Registers are physical R0–R7, independent of TOP.
+    pub x87: X87State,
+    /// Guest SSE control/status, including rounding, DAZ and FTZ.
+    pub mxcsr: u32,
+    pub segments: SegmentState,
+    /// Shared REP continuation; not a guest-visible architectural register.
+    #[doc(hidden)]
+    pub rep: Option<interpreter::RepContinuation>,
+    /// Last committed indirect call, jump or return, preserved across CPU contexts.
+    pub last_indirect_branch: IndirectBranch,
+    /// Arithmetic flags native code left lazy: operands a and b, result and
+    /// recipe kind. Kind 0 means `eflags` is exact. Rust settles before use.
+    pub lazy_flags: [u32; 4],
+}
+
+impl Default for CpuState {
+    fn default() -> Self {
+        Self {
+            regs: [0; 8],
+            eip: 0,
+            eflags: 2,
+            fs_base: 0,
+            fault_addr: 0,
+            fuel: 0,
+            xmm: [[0; 16]; 8],
+            mmx: [0; 8],
+            mmx_mode: 0,
+            x87: X87State::default(),
+            mxcsr: 0x1f80,
+            segments: SegmentState::default(),
+            rep: None,
+            last_indirect_branch: IndirectBranch::default(),
+            lazy_flags: [0; 4],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+#[doc(hidden)]
+pub enum Exit {
+    Dispatch = 0,
+    Fallback = 1,
+    Budget = 2,
+    ReadFault = 3,
+    WriteFault = 4,
+    Trap = 5,
+    Interrupted = 6,
+}
+
+/// Optimization policy for a native guest region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompileStrategy {
+    /// Optimize generated code for sustained execution speed.
+    #[default]
+    Speed,
+    /// Skip expensive optimization passes to reduce cold compilation time.
+    Fast,
+}

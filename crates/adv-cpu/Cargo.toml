@@ -5,37 +5,27 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Execution layer: x86-32 interpreter, hot-region JIT and the guest CPU backend interface"
+description = "Execution layer facade: the platform's x86-32 engine over the engine-neutral core"
 
 [dependencies]
+adv-cpu-x64 = { path = "../adv-cpu-x64" }
+
+[features]
+jit-verifier = ["adv-cpu-x64/jit-verifier"]
+gir-capture = ["adv-cpu-x64/gir-capture"]
+gir-lift = ["adv-cpu-x64/gir-lift"]
+cross-dump = ["adv-cpu-x64/cross-dump"]
+
+[dev-dependencies]
+adv-cpu = { path = ".", features = ["jit-verifier"] }
 adv-sync = { path = "../adv-sync" }
-libc = "0.2"
-log.workspace = true
-thiserror.workspace = true
-sha2 = "0.10"
+adv-unicorn = { path = "../adv-unicorn" }
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"
 cranelift-jit = "0.125"
 cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
-
-[features]
-# Keep Cranelift verification in release test dependencies as well as unit tests.
-jit-verifier = []
-# Local research capture only; does not select a GIR execution path.
-gir-capture = []
-# Independent lift/verify census only; never selects an execution backend.
-gir-lift = []
-# ADV_JIT_DUMP_DIR also writes AArch64 vcode for each dumped region.
-cross-dump = ["cranelift-codegen/arm64"]
-
-[build-dependencies]
-cc = "1"
-sha2 = "0.10"
-
-[dev-dependencies]
-adv-cpu = { path = ".", features = ["jit-verifier"] }
-adv-unicorn = { path = "../adv-unicorn" }
+libc = "0.2"
 serde_json = "1"
 unicorn-engine.workspace = true
 

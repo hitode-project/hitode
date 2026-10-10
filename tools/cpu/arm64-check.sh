@@ -32,7 +32,7 @@ TOOL=$ARM64_CHECK_TOOLS/acceptance.py
 status=0
 run() {
   name=$1 strict=$2; shift 2
-  env "$@" cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests > "$OUT/$name.log" 2>&1
+  env "$@" cargo test --release --locked -p adv-cpu -p adv-cpu-core -p adv-cpu-x64 --no-fail-fast --lib --tests > "$OUT/$name.log" 2>&1
   if python3 "$TOOL" $strict "$OUT/$name.log" > "$OUT/$name.summary"; then :; else status=1; fi
   echo "$name: $(paste -sd' ' "$OUT/$name.summary")"
 }

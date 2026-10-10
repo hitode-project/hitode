@@ -61,8 +61,38 @@ name = "adv-cpu"
 version = "0.1.0"
 dependencies = [
  "adv-cpu",
+ "adv-cpu-x64",
  "adv-sync",
  "adv-unicorn",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "iced-x86",
+ "libc",
+ "serde_json",
+ "unicorn-engine",
+]
+
+[[package]]
+name = "adv-cpu-core"
+version = "0.1.0"
+dependencies = [
+ "adv-sync",
+ "cc",
+ "iced-x86",
+ "libc",
+ "log",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "adv-cpu-x64"
+version = "0.1.0"
+dependencies = [
+ "adv-cpu-core",
+ "adv-sync",
  "cc",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -70,11 +100,8 @@ dependencies = [
  "cranelift-module",
  "iced-x86",
  "libc",
- "log",
  "serde_json",
  "sha2",
- "thiserror 2.0.21",
- "unicorn-engine",
 ]
 
 [[package]]

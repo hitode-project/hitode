@@ -1,0 +1,40 @@
+[package]
+name = "adv-cpu-x64"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Cranelift hot-region engine over the adv-cpu core"
+
+[dependencies]
+adv-cpu-core = { path = "../adv-cpu-core" }
+adv-sync = { path = "../adv-sync" }
+libc = "0.2"
+sha2 = "0.10"
+cranelift-codegen = "0.125"
+cranelift-frontend = "0.125"
+cranelift-jit = "0.125"
+cranelift-module = "0.125"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
+
+[features]
+# Keep Cranelift verification in release test dependencies as well as unit tests.
+jit-verifier = []
+# Local research capture only; does not select a GIR execution path.
+gir-capture = []
+# Independent lift/verify census only; never selects an execution backend.
+gir-lift = []
+# ADV_JIT_DUMP_DIR also writes AArch64 vcode for each dumped region.
+cross-dump = ["cranelift-codegen/arm64"]
+
+[build-dependencies]
+cc = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+adv-cpu-core = { path = "../adv-cpu-core", features = ["testing"] }
+serde_json = "1"
+
+[lints]
+workspace = true

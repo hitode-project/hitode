@@ -1,0 +1,539 @@
+//! Device storage has two independent OS views. Guest accesses use byte atomics
+//! through the writable view; callbacks can only load the read-only alias.
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+pub struct SharedAllocation {
+    mapping: os::Mapping,
+    len: usize,
+}
+
+// SAFETY: mapping ownership and addresses are immutable. Every exposed data
+// access is a byte-width atomic. No ordinary shared Rust slice is produced.
+unsafe impl Send for SharedAllocation {}
+unsafe impl Sync for SharedAllocation {}
+
+impl SharedAllocation {
+    pub fn new(len: usize) -> Result<Arc<Self>, String> {
+        if len == 0 {
+            return Err("shared PCM length must be nonzero".into());
+        }
+        Ok(Arc::new(Self {
+            mapping: os::Mapping::new(len)?,
+            len,
+        }))
+    }
+
+    pub fn load_u8(&self, index: usize) -> u8 {
+        if index >= self.len {
+            return 0;
+        }
+        // SAFETY: byte alignment is one, the mapping stays alive through self,
+        // and AtomicU8 relaxed loads work on OS read-only memory (Rust atomic
+        // module's documented small-atomic read-only exception). Only matching
+        // byte-width atomic stores through the other physical alias can race.
+        unsafe {
+            (&*self.mapping.read.as_ptr().add(index).cast::<AtomicU8>()).load(Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn store_u8(&self, index: usize, value: u8) {
+        assert!(index < self.len);
+        // SAFETY: same stable storage and byte-width access as load_u8; this
+        // alias is writable. No mixed-width or non-atomic stores are permitted.
+        unsafe {
+            (&*self.mapping.write.as_ptr().add(index).cast::<AtomicU8>())
+                .store(value, Ordering::Relaxed)
+        };
+    }
+
+    #[cfg(windows)]
+    pub fn map_linear(
+        &self,
+        reservation: &crate::virtual_memory::Reservation,
+        offset: usize,
+    ) -> Result<(), String> {
+        reservation.map_section(offset, self.len, self.mapping.handle.as_ptr())
+    }
+
+    pub fn store_bytes(&self, offset: usize, input: &[u8]) {
+        assert!(
+            offset
+                .checked_add(input.len())
+                .is_some_and(|end| end <= self.len)
+        );
+        // SAFETY: the range is checked once and every write remains a matching
+        // AtomicU8 store through the independently retained writable OS view.
+        for (index, &byte) in input.iter().enumerate() {
+            unsafe {
+                (&*self
+                    .mapping
+                    .write
+                    .as_ptr()
+                    .add(offset + index)
+                    .cast::<AtomicU8>())
+                    .store(byte, Ordering::Relaxed)
+            };
+        }
+    }
+}
+
+impl crate::backend::SharedReadView for SharedAllocation {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn load_u8(&self, index: usize) -> u8 {
+        self.load_u8(index)
+    }
+    fn copy_into(&self, offset: usize, destination: &mut [u8]) {
+        let count = self.len.saturating_sub(offset).min(destination.len());
+        for (index, byte) in destination[..count].iter_mut().enumerate() {
+            // SAFETY: checked in-range byte-atomic access through the read-only
+            // OS alias. No ordinary Rust reference to shared data is produced.
+            *byte = unsafe {
+                (&*self
+                    .mapping
+                    .read
+                    .as_ptr()
+                    .add(offset + index)
+                    .cast::<AtomicU8>())
+                    .load(Ordering::Relaxed)
+            };
+        }
+        destination[count..].fill(0);
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use super::*;
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileMappingW(
+            file: *mut c_void,
+            attributes: *const c_void,
+            protection: u32,
+            size_high: u32,
+            size_low: u32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn MapViewOfFile(
+            mapping: *mut c_void,
+            access: u32,
+            offset_high: u32,
+            offset_low: u32,
+            bytes: usize,
+        ) -> *mut c_void;
+        fn UnmapViewOfFile(address: *const c_void) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub(super) struct Mapping {
+        pub read: NonNull<u8>,
+        pub write: NonNull<u8>,
+        pub(super) handle: NonNull<c_void>,
+    }
+    impl Mapping {
+        pub fn new(len: usize) -> Result<Self, String> {
+            // SAFETY: page-file-backed mapping with no inherited handle/name.
+            let handle = NonNull::new(unsafe {
+                CreateFileMappingW(
+                    (-1isize) as *mut c_void,
+                    std::ptr::null(),
+                    4,
+                    ((len as u64) >> 32) as u32,
+                    len as u32,
+                    std::ptr::null(),
+                )
+            })
+            .ok_or_else(|| format!("create shared PCM: {}", std::io::Error::last_os_error()))?;
+            let write =
+                NonNull::new(unsafe { MapViewOfFile(handle.as_ptr(), 2, 0, 0, len).cast::<u8>() });
+            let read =
+                NonNull::new(unsafe { MapViewOfFile(handle.as_ptr(), 4, 0, 0, len).cast::<u8>() });
+            if let (Some(write), Some(read)) = (write, read) {
+                Ok(Self {
+                    read,
+                    write,
+                    handle,
+                })
+            } else {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    if let Some(p) = write {
+                        UnmapViewOfFile(p.as_ptr().cast());
+                    }
+                    if let Some(p) = read {
+                        UnmapViewOfFile(p.as_ptr().cast());
+                    }
+                    CloseHandle(handle.as_ptr());
+                }
+                Err(format!("map shared PCM aliases: {error}"))
+            }
+        }
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            // SAFETY: Arc retains both views; destruction occurs only after the
+            // guest page owners and independently held read aliases are gone.
+            unsafe {
+                UnmapViewOfFile(self.read.as_ptr().cast());
+                UnmapViewOfFile(self.write.as_ptr().cast());
+                CloseHandle(self.handle.as_ptr());
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryInfo {
+        base: usize,
+        allocation: usize,
+        allocation_protection: u32,
+        partition: u16,
+        region: usize,
+        state: u32,
+        protection: u32,
+        kind: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualQuery(
+            address: *const std::ffi::c_void,
+            info: *mut std::ffi::c_void,
+            len: usize,
+        ) -> usize;
+    }
+    #[test]
+    fn callback_alias_is_os_read_only_and_reads_the_same_physical_bytes() {
+        let storage = SharedAllocation::new(8192).unwrap();
+        let mut read = MemoryInfo::default();
+        let mut write = MemoryInfo::default();
+        // SAFETY: query-only OS operation on the two live views.
+        unsafe {
+            assert_ne!(
+                VirtualQuery(
+                    storage.mapping.read.as_ptr().cast(),
+                    (&mut read as *mut MemoryInfo).cast(),
+                    std::mem::size_of::<MemoryInfo>()
+                ),
+                0
+            );
+            assert_ne!(
+                VirtualQuery(
+                    storage.mapping.write.as_ptr().cast(),
+                    (&mut write as *mut MemoryInfo).cast(),
+                    std::mem::size_of::<MemoryInfo>()
+                ),
+                0
+            );
+        }
+        assert_eq!(read.protection, 2); // PAGE_READONLY
+        assert_eq!(write.protection, 4); // PAGE_READWRITE
+        assert_ne!(read.base, write.base);
+        storage.store_u8(0, 0x91);
+        storage.store_u8(8191, 0x37);
+        assert_eq!(storage.load_u8(0), 0x91);
+        assert_eq!(storage.load_u8(8191), 0x37);
+        assert_eq!(storage.load_u8(8192), 0);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+mod os {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    pub(super) struct Mapping {
+        pub read: View,
+        pub write: View,
+    }
+
+    pub(super) struct View {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    /// Each view owns an independent mapping of the same backing object. The
+    /// descriptor is closed after construction; the mappings retain the object.
+    impl Mapping {
+        pub fn new(len: usize) -> Result<Self, String> {
+            // SAFETY: sysconf only queries the running host, including 16 KiB
+            // Android/macOS hosts. Guest pages remain independently 4 KiB.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page = usize::try_from(page)
+                .ok()
+                .filter(|&page| page != 0)
+                .ok_or_else(|| format!("query shared PCM host page size: {page}"))?;
+            let len = mapping_len(len, page)?;
+            let size = libc::off_t::try_from(len).map_err(|_| "shared PCM backing is too large")?;
+            let fd = create_backing()?;
+            // SAFETY: this newly created private object has no other owner and
+            // is sized before either alias is mapped. New backing bytes are zero.
+            if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
+                return Err(format!(
+                    "size shared PCM backing: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let write = View::new(fd.as_raw_fd(), len, libc::PROT_READ | libc::PROT_WRITE)?;
+            let read = View::new(fd.as_raw_fd(), len, libc::PROT_READ)?;
+            // OwnedFd closes here. On errors it also closes, and View drops any
+            // completed mapping if creating the second view failed.
+            Ok(Self { read, write })
+        }
+    }
+
+    fn mapping_len(len: usize, page: usize) -> Result<usize, String> {
+        if len == 0 || page == 0 {
+            return Err("shared PCM length and host page size must be nonzero".into());
+        }
+        let len = len
+            .checked_add(page - 1)
+            .ok_or("shared PCM host page rounding overflow")?
+            / page
+            * page;
+        if len > isize::MAX as usize {
+            return Err("shared PCM mapping exceeds pointer offset limits".into());
+        }
+        Ok(len)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn create_backing() -> Result<OwnedFd, String> {
+        // Android's libc memfd_create symbol requires API 30, while this project
+        // also supports API 29. The kernel syscall avoids that loader dependency.
+        // SAFETY: the name is NUL terminated and CLOEXEC is a supported flag.
+        #[cfg(target_os = "android")]
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"adv-pcm".as_ptr(),
+                libc::MFD_CLOEXEC,
+            ) as libc::c_int
+        };
+        #[cfg(target_os = "linux")]
+        let fd = unsafe { libc::memfd_create(c"adv-pcm".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!(
+                "create shared PCM memfd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: success returns a fresh descriptor owned solely by this call.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_backing() -> Result<OwnedFd, String> {
+        use std::ffi::CString;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
+
+        // Names fit Darwin's short SHM_NAME_MAX. O_EXCL prevents attaching to
+        // another object's storage, including a stale name after process death.
+        for _ in 0..128 {
+            let id = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
+            let name = CString::new(format!("/ap-{:x}-{id:x}", std::process::id())).unwrap();
+            // SAFETY: valid C name, exclusive creation and owner-only access.
+            // Darwin marks shm_open descriptors close-on-exec.
+            let fd = unsafe {
+                libc::shm_open(
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(format!("create shared PCM shm object: {error}"));
+            }
+            // SAFETY: this descriptor is fresh and has not escaped.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            loop {
+                // SAFETY: remove the newly created name immediately. The fd,
+                // and later the mappings, retain the otherwise anonymous object.
+                if unsafe { libc::shm_unlink(name.as_ptr()) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(format!("unlink shared PCM shm object: {error}"));
+                }
+            }
+            return Ok(fd);
+        }
+        Err("create shared PCM shm object: exhausted exclusive names".into())
+    }
+
+    impl View {
+        fn new(fd: RawFd, len: usize, protection: libc::c_int) -> Result<Self, String> {
+            // SAFETY: the object is sized to len, the offset is zero, and the OS
+            // chooses a disjoint address. MAP_SHARED supplies true physical aliases.
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    protection,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if address == libc::MAP_FAILED {
+                return Err(format!(
+                    "map shared PCM alias: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let Some(ptr) = NonNull::new(address.cast()) else {
+                // SAFETY: mmap succeeded at zero; Rust cannot expose that address
+                // as non-null storage, but the mapping must still be released.
+                unsafe { libc::munmap(address, len) };
+                return Err("shared PCM alias mapped at a null address".into());
+            };
+            Ok(Self { ptr, len })
+        }
+
+        pub(super) fn as_ptr(&self) -> *mut u8 {
+            self.ptr.as_ptr()
+        }
+    }
+
+    impl Drop for View {
+        fn drop(&mut self) {
+            // SAFETY: this view uniquely owns its whole host-page-rounded range.
+            // Arc retains both aliases until every guest/callback owner is gone.
+            unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn host_page_rounding_handles_small_allocations_and_rejects_overflow() {
+            for page in [4096, 16384] {
+                assert_eq!(mapping_len(1, page).unwrap(), page);
+                assert_eq!(mapping_len(4096, page).unwrap(), page);
+                assert_eq!(mapping_len(page, page).unwrap(), page);
+                assert_eq!(mapping_len(page + 1, page).unwrap(), page * 2);
+            }
+            assert!(mapping_len(0, 4096).is_err());
+            assert!(mapping_len(4096, 0).is_err());
+            assert!(mapping_len(usize::MAX, 4096).is_err());
+            assert!(mapping_len(isize::MAX as usize, 4096).is_err());
+            assert!(SharedAllocation::new(0).is_err());
+        }
+
+        #[test]
+        fn callback_alias_is_os_read_only_and_reads_the_same_physical_bytes() {
+            let storage = SharedAllocation::new(8192).unwrap();
+            assert_ne!(
+                storage.mapping.read.as_ptr(),
+                storage.mapping.write.as_ptr()
+            );
+            storage.store_u8(0, 0x91);
+            storage.store_u8(8191, 0x37);
+            assert_eq!(storage.load_u8(0), 0x91);
+            assert_eq!(storage.load_u8(8191), 0x37);
+            assert_eq!(storage.load_u8(8192), 0);
+
+            let mut pipe = [-1; 2];
+            // SAFETY: output storage contains room for both returned descriptors.
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            // SAFETY: successful pipe returned fresh, independently owned fds.
+            let input = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+            let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+            let byte = [0xa5u8];
+            // SAFETY: the source is a live byte. This does not touch shared data.
+            assert_eq!(
+                unsafe { libc::write(output.as_raw_fd(), byte.as_ptr().cast(), byte.len()) },
+                1
+            );
+            // A kernel copy validates the destination mapping and returns EFAULT
+            // for the RO alias. No illegal user-space store or signal handler is
+            // involved, and the test runner process cannot be faulted by the probe.
+            // SAFETY: both fd and mapping are live; the OS rejects the RO write.
+            assert_eq!(
+                unsafe { libc::read(input.as_raw_fd(), storage.mapping.read.as_ptr().cast(), 1) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EFAULT)
+            );
+            assert_eq!(storage.load_u8(0), 0x91);
+        }
+
+        #[test]
+        fn rounded_backing_is_zeroed_and_keeps_the_logical_read_bounds() {
+            // SAFETY: query only; Mapping::new validates the same runtime value.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            assert_ne!(page, 0);
+            for len in [1, 4096, page, page + 1] {
+                let storage = SharedAllocation::new(len).unwrap();
+                let rounded = mapping_len(len, page).unwrap();
+                assert_eq!(storage.mapping.read.len, rounded);
+                assert_eq!(storage.mapping.write.len, rounded);
+                assert_eq!(storage.mapping.read.as_ptr() as usize % page, 0);
+                assert_eq!(storage.mapping.write.as_ptr() as usize % page, 0);
+                let mut initial = vec![0xa5; len];
+                crate::backend::SharedReadView::copy_into(&*storage, 0, &mut initial);
+                assert_eq!(initial, vec![0; len]);
+                storage.store_u8(len - 1, 0x37);
+                assert_eq!(storage.load_u8(len - 1), 0x37);
+                if len < rounded {
+                    // SAFETY: padding is backed by both live OS mappings. Even
+                    // internal test access uses matching byte atomics; no public
+                    // read operation may expose these out-of-logical-range bytes.
+                    unsafe {
+                        (&*storage.mapping.write.as_ptr().add(len).cast::<AtomicU8>())
+                            .store(0xa5, Ordering::Relaxed);
+                        assert_eq!(
+                            (&*storage.mapping.read.as_ptr().add(len).cast::<AtomicU8>())
+                                .load(Ordering::Relaxed),
+                            0xa5
+                        );
+                    }
+                }
+                assert_eq!(storage.load_u8(len), 0);
+                let mut tail = [0xa5; 4];
+                crate::backend::SharedReadView::copy_into(&*storage, len - 1, &mut tail);
+                assert_eq!(tail, [0x37, 0, 0, 0]);
+                crate::backend::SharedReadView::copy_into(&*storage, usize::MAX, &mut tail);
+                assert_eq!(tail, [0; 4]);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
+mod os {
+    use super::*;
+    pub(super) struct Mapping {
+        pub read: NonNull<u8>,
+        pub write: NonNull<u8>,
+    }
+    impl Mapping {
+        pub fn new(_: usize) -> Result<Self, String> {
+            Err("shared PCM OS aliases are unsupported on this platform".into())
+        }
+    }
+}

@@ -35,13 +35,13 @@ Assert ($features.features.Count -eq 1 -and $features.features[0] -eq 'gir-lift'
 Assert ($features.runs[0].shell.Contains('ADV_JIT_VERIFY=strict')) 'Strict oracle was lost.'
 Reject { & $runner -WhatIf -Features 'bad;feature' } 'Unsafe feature name accepted.'
 $oldUnit = & $runner -WhatIf -TestName @() -UnitFilter virtual_memory::tests -Output $output | ConvertFrom-Json
-Assert (($oldUnit.targets -join ',') -eq 'adv_cpu') 'Unit-only command must build one ELF.'
-Assert ($oldUnit.runs[0].id -eq 'adv_cpu') 'Single-filter log name must stay compatible.'
+Assert (($oldUnit.targets -join ',') -eq 'adv_cpu_core,adv_cpu_x64') 'Unit-only command must build the core and engine harnesses.'
+Assert (($oldUnit.runs.id -join ',') -eq 'adv_cpu_core,adv_cpu_x64') 'Single-filter log names must name their library.'
 $all = & $runner -ExecutionExperiments -WhatIf -Serial 'test-device' -AdbPort 15037 -TimeoutSeconds 600 -JitVerify strict -Output $output | ConvertFrom-Json
-Assert (($all.targets -join ',') -eq 'adv_cpu') 'Experiments must build the unit harness.'
-Assert ($all.runs.Count -eq 3) 'A/B/D must all run.'
-Assert (($all.runs.filter -join ',') -eq 'virtual_memory,fault_recovery,compile::x87::tests') 'Experiment filters are incomplete.'
-Assert (@($all.runs.id | Select-Object -Unique).Count -eq 3) 'Unit filters must have separate evidence logs.'
+Assert (($all.targets -join ',') -eq 'adv_cpu_core,adv_cpu_x64') 'Experiments must build the unit harnesses.'
+Assert ($all.runs.Count -eq 6) 'A/B/D must all run in both unit harnesses.'
+Assert ((@($all.runs.filter | Select-Object -Unique) -join ',') -eq 'virtual_memory,fault_recovery,compile::x87::tests') 'Experiment filters are incomplete.'
+Assert (@($all.runs.id | Select-Object -Unique).Count -eq 6) 'Unit filters must have separate evidence logs.'
 Assert ($all.serial -eq 'test-device' -and $all.adb_port -eq 15037) 'Device selection was not retained.'
 foreach ($run in $all.runs) {
     Assert ($run.shell.Contains('ADV_JIT_VERIFY=strict timeout 600')) 'Strict mode or timeout did not reach the device command.'
@@ -52,11 +52,11 @@ foreach ($run in $all.runs) {
 $build = & $runner -ExecutionExperiments -BuildOnly -WhatIf -Output $output | ConvertFrom-Json
 Assert $build.build_only 'Build-only selection was lost.'
 $multiple = & $runner -TestName safepoints,safepoints -UnitFilter virtual_memory,fault_recovery,virtual_memory -WhatIf -Output $output | ConvertFrom-Json
-Assert ($multiple.targets.Count -eq 2 -and $multiple.runs.Count -eq 3) 'Duplicate selectors should run only once.'
+Assert ($multiple.targets.Count -eq 3 -and $multiple.runs.Count -eq 5) 'Duplicate selectors should run only once.'
 $full = & $runner -AllTests -JitVerify 1 -WhatIf -Output $output | ConvertFrom-Json
 $expected = @(Get-ChildItem (Join-Path $PSScriptRoot '../../crates/adv-cpu/tests') -File -Filter '*.rs')
-Assert ($full.targets.Count -eq $expected.Count + 1) 'Full suite must include every integration target and the library.'
-Assert ($full.runs[-1].target -eq 'adv_cpu' -and $full.runs[-1].filter -eq '') 'Full library suite must have no filter.'
+Assert ($full.targets.Count -eq $expected.Count + 2) 'Full suite must include every integration target and both libraries.'
+Assert ((($full.runs | Select-Object -Last 2).target -join ',') -eq 'adv_cpu_core,adv_cpu_x64' -and -not ($full.runs | Select-Object -Last 2 | Where-Object filter)) 'Full library suites must have no filter.'
 Assert ($full.runs[0].shell.Contains('ADV_JIT_VERIFY=1 timeout')) 'Execution settings must reach the device.'
 Reject { & $runner -AllTests -ExecutionExperiments -WhatIf } 'Conflicting presets were accepted.'
 Reject { & $runner -AllTests -UnitFilter virtual_memory -WhatIf } 'Full suite accepted a unit filter.'

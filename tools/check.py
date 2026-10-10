@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 # Generated (tools/abi) or third-party sources: never reformatted.
-UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu/softfloat/", "tools/fixtures/vendor/")
+UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
 HOOK = """#!/bin/sh
 # Installed by tools/check.py --install-hook; shared by every worktree.
 if [ -f tools/check.py ]; then

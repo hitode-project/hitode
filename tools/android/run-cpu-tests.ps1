@@ -65,17 +65,21 @@ foreach ($test in $TestName) {
     }
 }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
-$cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'test', '--locked', '-p', 'adv-cpu', '--release', '--no-run', '--target-dir', $TargetDir)
+# Unit tests live in the core and engine crates; integration tests in the facade.
+$unitLibraries = @('adv_cpu_core', 'adv_cpu_x64')
+$cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'test', '--locked', '-p', 'adv-cpu', '-p', 'adv-cpu-core', '-p', 'adv-cpu-x64', '--release', '--no-run', '--target-dir', $TargetDir)
 if ($Features.Count) { $cargoArgs += @('--features', ($Features -join ',')) }
 foreach ($test in $TestName) { $cargoArgs += @('--test', $test) }
 if ($UnitFilter.Count) { $cargoArgs += '--lib' }
 $targets = @($TestName)
-if ($UnitFilter.Count) { $targets += 'adv_cpu' }
+if ($UnitFilter.Count) { $targets += $unitLibraries }
 $runs = @(
     foreach ($test in $TestName) { [pscustomobject]@{ id = $test; target = $test; filter = '' } }
-    for ($i = 0; $i -lt $UnitFilter.Count; $i++) {
-        $id = if ($UnitFilter.Count -eq 1) { 'adv_cpu' } else { "adv_cpu-$($i + 1)" }
-        [pscustomobject]@{ id = $id; target = 'adv_cpu'; filter = $UnitFilter[$i] }
+    foreach ($library in $(if ($UnitFilter.Count) { $unitLibraries } else { @() })) {
+        for ($i = 0; $i -lt $UnitFilter.Count; $i++) {
+            $id = if ($UnitFilter.Count -eq 1) { $library } else { "$library-$($i + 1)" }
+            [pscustomobject]@{ id = $id; target = $library; filter = $UnitFilter[$i] }
+        }
     }
 )
 function Get-DeviceCommand($remote, $run) {
