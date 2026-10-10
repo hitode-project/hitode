@@ -157,7 +157,7 @@ fn select_and_measure() {
             std::env::set_var("ADV_JIT_DUMP_DIR", &directory);
         }
         let began = std::time::Instant::now();
-        let baseline = crate::compile::compile(&region, &mut memory, false).unwrap();
+        let baseline = crate::compile::compile(&region, &mut memory).unwrap();
         assert_eq!(
             baseline.instruction_count,
             graph.instructions.len(),
@@ -340,7 +340,7 @@ fn measure_native_compilation() {
                 times[n].push(code.compile_us);
             }
             let began = std::time::Instant::now();
-            let code = crate::compile::compile(&region, &mut memory, false).unwrap();
+            let code = crate::compile::compile(&region, &mut memory).unwrap();
             times[3].push(began.elapsed().as_micros());
             assert_eq!(code.instruction_count, graph.instructions.len());
         }

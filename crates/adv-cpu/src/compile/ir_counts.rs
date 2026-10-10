@@ -232,7 +232,7 @@ mod tests {
                 let mut region = Region::new(0x10000, bytes.len());
                 region.compile_strategy = strategy;
                 FORCE.set(true);
-                let compiled = super::super::compile(&region, &mut memory, false);
+                let compiled = super::super::compile(&region, &mut memory);
                 FORCE.set(false);
                 let compiled = compiled.unwrap();
                 let summary = compiled.ir_counts.as_ref().unwrap();

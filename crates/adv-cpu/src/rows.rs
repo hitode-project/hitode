@@ -645,16 +645,13 @@ fn execute(batch: &Batch) {
             perms: batch.permissions as *const u8,
             bridge: std::ptr::null_mut(),
             interrupt: &NO_INTERRUPT,
-            slots: std::ptr::null(),
+            slots: crate::linking::unlinked().0,
             mask: 0,
-            remaining: 0,
             stop: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             recovery_slot: std::ptr::null(),
-            linked_entries: 0,
-            shadow: std::ptr::null_mut(),
             rows: std::ptr::null(),
             written: 0,
         };
@@ -847,6 +844,7 @@ unsafe fn try_run(
         }
     }
     merged.mmx_mode = results.mmx_mode;
+    merged.settle_flags();
     merged.fuel = batch.initial.fuel
         - (u64::from(claimed) * row_cost + u64::from(claimed - 1) * descriptor.glue_cost);
     // The last kernel contains cur + (claimed-1)*delta and the outer counter
@@ -1107,16 +1105,13 @@ mod tests {
                 perms: permissions.as_ptr(),
                 bridge: std::ptr::null_mut(),
                 interrupt: &interrupt,
-                slots: std::ptr::null(),
+                slots: crate::linking::unlinked().0,
                 mask: 0,
-                remaining: 0,
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
-                linked_entries: 0,
-                shadow: std::ptr::null_mut(),
                 rows: &pool,
                 written: 0,
             };
@@ -1194,16 +1189,13 @@ mod tests {
                 perms: permissions.as_ptr(),
                 bridge: std::ptr::null_mut(),
                 interrupt: &interrupt,
-                slots: std::ptr::null(),
+                slots: crate::linking::unlinked().0,
                 mask: 0,
-                remaining: 0,
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 recovery_slot: std::ptr::null(),
-                linked_entries: 0,
-                shadow: std::ptr::null_mut(),
                 rows: &pool,
                 written: 0,
             };

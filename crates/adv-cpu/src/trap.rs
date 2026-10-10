@@ -38,8 +38,15 @@ pub(crate) struct Bridge<'a> {
     pub unclocked_bytes: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    pub cliffs: crate::Cliffs,
+    pub cliffs: Box<crate::Cliffs>,
+    /// Operand buffer of the file-memory helpers; generated code reads and
+    /// writes it around one synchronous call.
+    pub scratch: Scratch,
 }
+
+#[derive(Default)]
+#[repr(C, align(16))]
+pub(crate) struct Scratch(pub [u8; 16]);
 
 // Bulk work between wall-clock checks: tens of microseconds at memcpy rates.
 const CLOCK_BYTES: u64 = 256 << 10;
@@ -123,6 +130,7 @@ pub(crate) unsafe extern "C" fn trap_call(
 ) -> u32 {
     // SAFETY: Executor creates both objects for this run and pauses native code here.
     let (bridge, state) = unsafe { (&mut *bridge.cast::<Bridge<'_>>(), &mut *state) };
+    state.settle_flags();
     if bridge.handler.is_none() {
         bridge.trap = Some((pc, 0x2e));
         return 1;

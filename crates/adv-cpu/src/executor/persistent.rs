@@ -71,7 +71,6 @@ mod tests {
         assert_eq!(second.stats.compile_requests, 0);
         assert!(second.persistent_code_cache_json().contains("\"hits\":1"));
         assert_eq!(second.stats.native_entries, 1);
-        assert!(second.set_shadow_returns(true).is_err());
 
         let (mut full, cached_region) = fixture(7);
         full.set_persistent_code_cache(&path).unwrap();
@@ -223,7 +222,6 @@ impl Executor {
             let Ok(mut input) = compile::Snapshot::capture(&region, &mut self.memory) else {
                 continue;
             };
-            input.shadow_returns = self.shadow_returns.is_some();
             if self.tiered_compilation && region.compile_strategy == CompileStrategy::Fast {
                 input.profile = Some(Arc::default());
             }

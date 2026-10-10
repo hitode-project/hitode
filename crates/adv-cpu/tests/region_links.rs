@@ -67,9 +67,8 @@ fn long_tail_chains_preserve_integer_flags_vectors_and_guest_stack() {
         assert_eq!(linked.state.regs[0], 100_000);
         assert_eq!(linked.state.regs[4], STACK + 4);
         assert_eq!(linked.state.xmm[0], [(300_000u32 % 256) as u8; 16]);
-        assert!(linked.stats.linked_entries > 190_000);
-        assert_eq!(dispatched.stats.linked_entries, 0);
-        assert_eq!(linked.stats.native_entries, dispatched.stats.native_entries);
+        assert!(dispatched.stats.native_entries > 190_000);
+        assert!(linked.stats.native_entries * 1000 < dispatched.stats.native_entries);
         assert_eq!(linked.stats.native_blocks, dispatched.stats.native_blocks);
         assert_eq!(linked.stats.interpreter_entries, 0);
     }
@@ -132,10 +131,11 @@ fn profiling_keeps_per_region_attribution_and_can_be_disabled_again() {
     seed(&mut m, 7);
     m.set_profiling(true);
     assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(m.stats.linked_entries, 0);
+    let profiled = m.stats.native_entries;
     assert_eq!(m.profile[&CALLEE].native_entries, 7);
     m.set_profiling(false);
     seed(&mut m, 7);
     assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-    assert!(m.stats.linked_entries >= 13);
+    // Profiling enters every region from Rust; without it they link again.
+    assert!(m.stats.native_entries - profiled < profiled);
 }

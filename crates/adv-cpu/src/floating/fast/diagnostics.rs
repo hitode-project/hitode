@@ -24,10 +24,16 @@ pub(crate) struct Census {
     counts: BTreeMap<(Code, Reason), u64>,
 }
 
+/// Read once: every executor run defaults a fresh census.
+fn enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"))
+}
+
 impl Default for Census {
     fn default() -> Self {
         Self {
-            enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
+            enabled: enabled(),
             counts: BTreeMap::new(),
         }
     }

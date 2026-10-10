@@ -137,8 +137,17 @@ fn exited(result: RunResult, value: u32) {
 #[test]
 fn api_loop_keeps_the_shared_cpu_and_matches_unicorn() {
     let mut logs = Vec::new();
-    for backend in ["jit", "interpreter", "unicorn"] {
+    let mut entries = [0; 2];
+    for (backend, linked) in [
+        ("jit", false),
+        ("jit", true),
+        ("interpreter", false),
+        ("unicorn", false),
+    ] {
         let (mut m, [leaf, ..]) = fixture(backend);
+        if let Some(jit) = m.cpu.jit_mut() {
+            jit.set_region_linking(linked);
+        }
         program(&mut m, CODE, |a| {
             let mut again = a.create_label();
             a.mov(ecx, 1000).unwrap();
@@ -157,11 +166,12 @@ fn api_loop_keeps_the_shared_cpu_and_matches_unicorn() {
         assert_eq!(m.sys.host_calls, 1000);
         if backend == "jit" {
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
-            assert!(m.cpu.stats().linked_entries >= 1000);
+            entries[usize::from(linked)] = m.cpu.stats().native_entries;
         }
         logs.push(m.ext.get::<Calls>().log.clone());
     }
     assert!(logs.iter().all(|log| *log == logs[0]));
+    assert!(entries[1] < entries[0]);
 }
 
 #[test]
@@ -356,8 +366,17 @@ fn handler_code_write_exits_before_executing_stale_native_code() {
 
 #[test]
 fn callback_return_trap_is_dispatched_after_cross_region_tail_calls() {
-    for backend in ["jit", "interpreter", "unicorn"] {
+    let mut entries = [0; 2];
+    for (backend, linked) in [
+        ("jit", false),
+        ("jit", true),
+        ("interpreter", false),
+        ("unicorn", false),
+    ] {
         let (mut m, [_, callback, ..]) = fixture(backend);
+        if let Some(jit) = m.cpu.jit_mut() {
+            jit.set_region_linking(linked);
+        }
         program(&mut m, COLD, |a| {
             a.inc(eax).unwrap();
             a.ret().unwrap();
@@ -379,9 +398,10 @@ fn callback_return_trap_is_dispatched_after_cross_region_tail_calls() {
         assert_eq!(m.ext.get::<Calls>().log, ["call:callback", "returned:42"]);
         if backend == "jit" {
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
-            assert!(m.cpu.stats().linked_entries >= 3);
+            entries[usize::from(linked)] = m.cpu.stats().native_entries;
         }
     }
+    assert!(entries[1] < entries[0]);
 }
 
 #[test]

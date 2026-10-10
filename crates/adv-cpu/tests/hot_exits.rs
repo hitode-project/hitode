@@ -132,7 +132,8 @@ fn linked_stack_pointer_survives_a_cold_exit_in_a_region_that_does_not_write_it(
             }
         );
         assert_eq!(m.state.regs[4], STACK - 4);
-        assert_eq!(m.stats.linked_entries, 1);
+        // The fault is reported from the linked region of one Rust entry.
+        assert_eq!(m.stats.native_entries, 1);
         assert_eq!(m.memory().read(STACK - 4, 4).unwrap(), 123u32.to_le_bytes());
         assert_eq!(m.stats.interpreter_entries, 0);
     }

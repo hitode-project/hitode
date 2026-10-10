@@ -107,10 +107,11 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eip) as i32,
         );
+        let bridge = self.bridge();
         let call = self
             .b
             .ins()
-            .call(self.x87_ref, &[self.bridge, self.state, operation]);
+            .call(self.x87_ref, &[bridge, self.state, operation]);
         let result = self.b.inst_results(call)[0];
         let mut switch = Switch::new();
         let done = self.b.create_block();
@@ -136,14 +137,7 @@ impl Emitter<'_> {
         self.exit(Exit::Fallback, next);
         self.b.switch_to_block(done);
         self.b.seal_block(done);
-        if self.shadow_ref.is_some() {
-            let absent = self.b.ins().iconst(self.ptr_ty, 0);
-            self.b
-                .ins()
-                .jump(self.dispatch, &[next.into(), absent.into()]);
-        } else {
-            self.b.ins().jump(self.dispatch, &[next.into()]);
-        }
+        self.b.ins().jump(self.dispatch, &[next.into()]);
     }
 
     /// Emit an admitted operation plus a cold, in-region helper continuation.
@@ -946,22 +940,20 @@ pub(crate) mod testing {
             bulk_calls: 0,
             bulk_bytes: 0,
             cliffs: Default::default(),
+            scratch: Default::default(),
         };
         let interrupt = std::sync::atomic::AtomicBool::new(false);
-        compiled
-            .run(
-                state,
-                memory,
-                &mut bridge,
-                NativeRun {
-                    links: None,
-                    rows: None,
-                    stop: 0,
-                    interrupt: &interrupt,
-                    shadow: None,
-                },
-            )
-            .0
+        compiled.run(
+            state,
+            memory,
+            &mut bridge,
+            NativeRun {
+                links: None,
+                rows: None,
+                stop: 0,
+                interrupt: &interrupt,
+            },
+        )
     }
 }
 

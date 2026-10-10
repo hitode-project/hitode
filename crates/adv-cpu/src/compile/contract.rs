@@ -24,6 +24,19 @@ fn requested(b: &mut FunctionBuilder<'_>, interrupt: Value) -> Value {
 /// Rust entries start from canonical state. Linked entries have already polled
 /// their outgoing edge, so repeating this check in every Tail body is wasteful.
 pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: Value) {
+    let interrupt = b.ins().load(
+        ptr,
+        MemFlags::trusted(),
+        context,
+        offset_of!(NativeContext, interrupt) as i32,
+    );
+    let pending = requested(b, interrupt);
+    let polled = b.create_block();
+    b.set_cold_block(polled);
+    let continued = b.create_block();
+    b.ins().brif(pending, polled, &[], continued, &[]);
+    b.switch_to_block(polled);
+    // Exhausted fuel and the stop PC outrank an interrupt; the body reports them.
     let state = b.ins().load(
         ptr,
         MemFlags::trusted(),
@@ -42,27 +55,17 @@ pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: V
         state,
         offset_of!(CpuState, fuel) as i32,
     );
-    let interrupt = b.ins().load(
-        ptr,
-        MemFlags::trusted(),
-        context,
-        offset_of!(NativeContext, interrupt) as i32,
-    );
-    let pending = requested(b, interrupt);
     let stop = b.ins().load(
         types::I32,
         MemFlags::trusted(),
         context,
         offset_of!(NativeContext, stop) as i32,
     );
-    let work = b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-    let ordinary = b.ins().icmp(IntCC::NotEqual, pc, stop);
-    let pending = b.ins().band(pending, work);
-    let pending = b.ins().band(pending, ordinary);
+    let idle = b.ins().icmp_imm(IntCC::Equal, fuel, 0);
+    let stopped = b.ins().icmp(IntCC::Equal, pc, stop);
+    let deferred = b.ins().bor(idle, stopped);
     let interrupted = b.create_block();
-    b.set_cold_block(interrupted);
-    let continued = b.create_block();
-    b.ins().brif(pending, interrupted, &[], continued, &[]);
+    b.ins().brif(deferred, continued, &[], interrupted, &[]);
     b.switch_to_block(interrupted);
     let reason = b.ins().iconst(types::I32, Exit::Interrupted as i64);
     b.ins().return_(&[reason]);
@@ -177,7 +180,6 @@ pub(crate) struct NativeContext {
     pub interrupt: *const std::sync::atomic::AtomicBool,
     pub slots: *const Slot,
     pub mask: u32,
-    pub remaining: u32,
     pub stop: u32,
     /// Only the initial borrowed owner has a hardware-fault session. Tail
     /// transfers clear this flag before entering another checked region.
@@ -186,10 +188,6 @@ pub(crate) struct NativeContext {
     /// Private session cell receiving the IR-owned recovery stack address.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub recovery_slot: *const std::cell::Cell<usize>,
-    pub linked_entries: u64,
-    /// Exclusive metadata borrowed for this chain. Cleared before/after native
-    /// execution, so it cannot retain a target across publication or retirement.
-    pub shadow: *mut crate::linking::shadow::Stack,
 }
 
 impl Emitter<'_> {
@@ -198,7 +196,6 @@ impl Emitter<'_> {
         pc: Value,
         target_hash: Option<Value>,
         reason: Option<Value>,
-        prediction: Option<Value>,
     ) {
         self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Link));
         let returned = self.b.create_block();
@@ -211,59 +208,17 @@ impl Emitter<'_> {
             self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
             self.b.switch_to_block(candidate);
         }
+        // The table always has a vacant slot and never names the caller's
+        // stop PC, so a miss returns before reading interrupt or fuel state.
         let slots = self.b.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
             self.context,
             offset_of!(NativeContext, slots) as i32,
         );
-        let remaining = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let stop = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, stop) as i32,
-        );
-        let fuel = self.b.use_var(self.fuel);
-        let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
-        let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
-        let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
-        let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
-        let bad = self.b.ins().bor(none, limit);
-        let bad = self.b.ins().bor(bad, is_stop);
-        let bad = self.b.ins().bor(bad, empty);
-        let prepare = self.b.create_block();
-        self.b.ins().brif(bad, returned, &[], prepare, &[]);
-        self.b.switch_to_block(prepare);
-        // Both hot footers and cold exits have published canonical state.
-        let pending = requested(&mut self.b, self.interrupt);
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let search_ready = self.b.create_block();
-        self.b
-            .ins()
-            .brif(pending, interrupted, &[], search_ready, &[]);
-        self.b.switch_to_block(interrupted);
-        let interrupted_reason = self.constant(Exit::Interrupted as u32);
-        self.b.ins().return_(&[interrupted_reason]);
-        self.b.switch_to_block(search_ready);
         let hit = self.b.create_block();
         self.b.append_block_param(hit, self.ptr_ty);
-        if let Some(prediction) = prediction {
-            let valid = self.b.ins().icmp_imm(IntCC::NotEqual, prediction, 0);
-            let predicted = self.b.create_block();
-            let search_only = self.b.create_block();
-            self.b.ins().brif(valid, predicted, &[], search_only, &[]);
-            self.b.switch_to_block(predicted);
-            self.shadow_hit();
-            self.b.ins().jump(hit, &[prediction.into()]);
-            self.b.switch_to_block(search_only);
-        }
+        let wanted = self.b.ins().uextend(types::I64, pc);
         let mask = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),
@@ -282,81 +237,59 @@ impl Emitter<'_> {
         let index = self.b.ins().band(hashed, mask);
         let search = self.b.create_block();
         self.b.append_block_param(search, types::I32);
-        self.b.append_block_param(search, types::I32);
-        let zero = self.constant(0);
-        self.b.ins().jump(search, &[index.into(), zero.into()]);
+        self.b.ins().jump(search, &[index.into()]);
         self.b.switch_to_block(search);
         let index = self.b.block_params(search)[0];
-        let probes = self.b.block_params(search)[1];
         let offset = self.b.ins().uextend(self.ptr_ty, index);
         let offset = self
             .b
             .ins()
             .imul_imm(offset, std::mem::size_of::<Slot>() as i64);
         let address = self.b.ins().iadd(slots, offset);
-        let entry_address = self
+        // The whole table is immutable for this borrowed chain. Publication
+        // and retirement happen between calls, not concurrently with these loads.
+        let key = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted().with_readonly(),
+            address,
+            offset_of!(Slot, key) as i32,
+        );
+        let found = self.b.ins().icmp(IntCC::Equal, wanted, key);
+        let advance = self.b.create_block();
+        self.b
+            .ins()
+            .brif(found, hit, &[address.into()], advance, &[]);
+        self.b.switch_to_block(advance);
+        let vacant = self
             .b
             .ins()
-            .iadd_imm(address, offset_of!(Slot, entry) as i64);
-        // The whole table is immutable for this borrowed chain. Publication
-        // and retirement happen between calls, not concurrently with this load.
-        let entry = self.b.ins().load(
-            self.ptr_ty,
-            MemFlags::trusted().with_readonly(),
-            entry_address,
-            0,
-        );
-        let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
-        let occupied = self.b.create_block();
-        self.b.ins().brif(absent, returned, &[], occupied, &[]);
-        self.b.switch_to_block(occupied);
-        let key = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            address,
-            offset_of!(Slot, pc) as i32,
-        );
-        let found = self.b.ins().icmp(IntCC::Equal, pc, key);
-        let advance = self.b.create_block();
-        self.b.ins().brif(found, hit, &[entry.into()], advance, &[]);
-        self.b.switch_to_block(advance);
+            .icmp_imm(IntCC::Equal, key, crate::linking::VACANT as i64);
         let next = self.b.ins().iadd_imm(index, 1);
         let next = self.b.ins().band(next, mask);
-        let probes = self.b.ins().iadd_imm(probes, 1);
-        let exhausted = self.b.ins().icmp_imm(
-            IntCC::UnsignedGreaterThanOrEqual,
-            probes,
-            crate::linking::PROBES as i64,
-        );
-        self.b.ins().brif(
-            exhausted,
-            returned,
-            &[],
-            search,
-            &[next.into(), probes.into()],
-        );
+        self.b
+            .ins()
+            .brif(vacant, returned, &[], search, &[next.into()]);
         self.b.switch_to_block(hit);
-        let entry = self.b.block_params(hit)[0];
-        let remaining = self.b.ins().iadd_imm(remaining, -1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            remaining,
-            self.context,
-            offset_of!(NativeContext, remaining) as i32,
-        );
-        let linked = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
-        let linked = self.b.ins().iadd_imm(linked, 1);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            linked,
-            self.context,
-            offset_of!(NativeContext, linked_entries) as i32,
-        );
+        let address = self.b.block_params(hit)[0];
+        // Fuel and this poll bound a chain, as they bound an in-region loop.
+        // Both hot footers and cold exits have published canonical state.
+        let pending = requested(&mut self.b, self.interrupt);
+        let interrupted = self.b.create_block();
+        self.b.set_cold_block(interrupted);
+        let linked = self.b.create_block();
+        self.b.ins().brif(pending, interrupted, &[], linked, &[]);
+        self.b.switch_to_block(interrupted);
+        // Exhausted fuel takes precedence, as at a Rust entry. Without an
+        // interrupt, the linked target's own block budget check reports it.
+        let fuel = self.b.use_var(self.fuel);
+        let interrupted_reason = self.constant(Exit::Interrupted as u32);
+        let dispatch_reason = self.constant(Exit::Dispatch as u32);
+        let interrupted_reason = self
+            .b
+            .ins()
+            .select(fuel, interrupted_reason, dispatch_reason);
+        self.b.ins().return_(&[interrupted_reason]);
+        self.b.switch_to_block(linked);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if self.fault_mode.is_some() {
             let disabled = self.b.ins().iconst(types::I8, 0);
@@ -367,18 +300,32 @@ impl Emitter<'_> {
                 offset_of!(NativeContext, fault_reads) as i32,
             );
         }
+        let entry = self.b.ins().load(
+            self.ptr_ty,
+            MemFlags::trusted().with_readonly(),
+            address,
+            offset_of!(Slot, entry) as i32,
+        );
         self.tail_to(entry);
         self.b.switch_to_block(returned);
         let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
         self.b.ins().return_(&[reason]);
     }
+    /// The hot path tests the interrupt byte alone. Exhausted fuel and the
+    /// stop PC outrank an interrupt; the cold side lets them report themselves.
     pub(super) fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
-        let mut pending = requested(&mut self.b, self.interrupt);
+        let pending = requested(&mut self.b, self.interrupt);
+        let polled = self.b.create_block();
+        self.b.set_cold_block(polled);
+        let continued = self.b.create_block();
+        self.b.ins().brif(pending, polled, &[], continued, &[]);
+        self.b.switch_to_block(polled);
+        self.b.seal_block(polled);
+        let mut deferred = None;
         // A clone checks interrupts after funding its next iteration.
         if self.fast.is_none() {
             let fuel = self.b.use_var(self.fuel);
-            let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-            pending = self.b.ins().band(pending, work);
+            deferred = Some(self.b.ins().icmp_imm(IntCC::Equal, fuel, 0));
         }
         if respect_stops {
             let stop = self.b.ins().load(
@@ -387,15 +334,23 @@ impl Emitter<'_> {
                 self.context,
                 offset_of!(NativeContext, stop) as i32,
             );
-            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
-            pending = self.b.ins().band(pending, ordinary);
+            let stopped = self.b.ins().icmp(IntCC::Equal, pc, stop);
+            deferred = Some(match deferred {
+                Some(idle) => self.b.ins().bor(idle, stopped),
+                None => stopped,
+            });
         }
-        let interrupted = self.b.create_block();
-        self.b.set_cold_block(interrupted);
-        let continued = self.b.create_block();
-        self.b.ins().brif(pending, interrupted, &[], continued, &[]);
-        self.b.switch_to_block(interrupted);
+        if let Some(deferred) = deferred {
+            let interrupted = self.b.create_block();
+            self.b.set_cold_block(interrupted);
+            self.b
+                .ins()
+                .brif(deferred, continued, &[], interrupted, &[]);
+            self.b.switch_to_block(interrupted);
+            self.b.seal_block(interrupted);
+        }
         self.exit(Exit::Interrupted, pc);
         self.b.switch_to_block(continued);
+        self.b.seal_block(continued);
     }
 }

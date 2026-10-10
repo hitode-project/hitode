@@ -55,7 +55,7 @@ BUDGET_NS = 33_300_000
 SCENES = ("title", "normal", "ctrl", "transition")
 REASONS = ("uncovered", "rejected", "pending", "interior", "fallback", "forced")
 HLE_GROUPS = ("graphics", "file", "audio", "other")
-CPU_FIELDS = ("tier0_units", "tier2_blocks", "native_entries", "linked_entries", "interpreter_entries",
+CPU_FIELDS = ("tier0_units", "tier2_blocks", "native_entries", "interpreter_entries",
               "sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "invalidations",
               "recompilations", "compilations", "x87_helpers", "softfloat_calls", "retired_tier0_instructions")
 
@@ -289,8 +289,6 @@ def cost_totals(rows: list[dict]) -> dict:
     total["cpu"]["fallback_lane_ns"] = fallback_ns
     total["cpu"]["native_dispatch_residual_ns"] = max(0, total["guest_exec_ns"]
                                                        - total["cpu"]["sync_compile_ns"] - fallback_ns)
-    total["cpu"]["native_dispatch_entries"] = (max(0, total["cpu"]["native_entries"] - total["cpu"]["linked_entries"])
-        if all("linked_entries" in (row.get("cpu") or {}) for row in rows) else None)
     total["top_apis_subset"] = top_apis(rows)
     return total
 

@@ -6,7 +6,8 @@
 //! per mnemonic or reason so a run report shows which cliff to remove next,
 //! without the opt-in profilers. Counting happens only on paths that already
 //! left generated code, so the native fast path pays nothing.
-use std::collections::HashMap;
+//! Ordered maps make a fresh set free: every executor run starts one.
+use std::collections::BTreeMap;
 
 use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic};
 
@@ -28,7 +29,7 @@ pub enum X87Cliff {
 }
 
 /// Read-only opportunity classification for rejected PC=64 arithmetic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum X87Pc64 {
     Other,
     Operand,
@@ -60,7 +61,7 @@ pub enum InterpreterReason {
 }
 
 /// Observed entry state, not a guess about the instructions inside a batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum InterpreterDetail {
     AutoJitDisabled,
     NonExecutable,
@@ -94,16 +95,16 @@ pub struct Cliffs {
     /// Helper calls completed by the host-double fast path.
     pub x87_fast: u64,
     /// Helper calls that ran the exact model, by instruction and reason.
-    pub x87_exact: HashMap<(Mnemonic, X87Cliff), u64>,
+    pub x87_exact: BTreeMap<(Mnemonic, X87Cliff), u64>,
     /// Control-classified rejections, keyed by PC, RC and exception mask bits.
     /// Kept separately so the truncated mnemonic list cannot hide controls.
-    pub x87_control: HashMap<u16, u64>,
+    pub x87_control: BTreeMap<u16, u64>,
     /// PC=64, nearest, fully masked Control rejections; no operand data.
-    pub x87_pc64: HashMap<(Mnemonic, X87Pc64), u64>,
+    pub x87_pc64: BTreeMap<(Mnemonic, X87Pc64), u64>,
     /// Native exits that handed the instruction at their PC to the interpreter.
-    pub fallbacks: HashMap<Mnemonic, u64>,
-    pub interpreter: HashMap<InterpreterReason, Count>,
-    pub(crate) interpreter_details: HashMap<(InterpreterReason, InterpreterDetail), Count>,
+    pub fallbacks: BTreeMap<Mnemonic, u64>,
+    pub interpreter: BTreeMap<InterpreterReason, Count>,
+    pub(crate) interpreter_details: BTreeMap<(InterpreterReason, InterpreterDetail), Count>,
 }
 
 impl Cliffs {

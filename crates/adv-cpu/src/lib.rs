@@ -107,6 +107,9 @@ pub struct CpuState {
     pub rep: Option<interpreter::RepContinuation>,
     /// Last committed indirect call, jump or return, preserved across CPU contexts.
     pub last_indirect_branch: IndirectBranch,
+    /// Arithmetic flags native code left lazy: operands a and b, result and
+    /// recipe kind. Kind 0 means `eflags` is exact. Rust settles before use.
+    pub lazy_flags: [u32; 4],
 }
 
 impl Default for CpuState {
@@ -126,6 +129,7 @@ impl Default for CpuState {
             segments: SegmentState::default(),
             rep: None,
             last_indirect_branch: IndirectBranch::default(),
+            lazy_flags: [0; 4],
         }
     }
 }

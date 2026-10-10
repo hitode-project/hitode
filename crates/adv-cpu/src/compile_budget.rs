@@ -222,25 +222,7 @@ fn weight(i: &Instruction) -> usize {
     1
 }
 
-fn weight_for(i: &Instruction, shadow_returns: bool) -> usize {
-    weight(i)
-        + if shadow_returns
-            && matches!(
-                i.flow_control(),
-                FlowControl::Call | FlowControl::IndirectCall | FlowControl::Return
-            )
-        {
-            16
-        } else {
-            0
-        }
-}
-
-fn total(
-    instructions: &BTreeMap<u32, Instruction>,
-    strategy: CompileStrategy,
-    shadow_returns: bool,
-) -> usize {
+fn total(instructions: &BTreeMap<u32, Instruction>, strategy: CompileStrategy) -> usize {
     let multiplier = if strategy == CompileStrategy::Speed {
         4
     } else {
@@ -248,7 +230,7 @@ fn total(
     };
     instructions
         .values()
-        .map(|i| weight_for(i, shadow_returns))
+        .map(weight)
         .sum::<usize>()
         .saturating_mul(multiplier)
 }
@@ -271,11 +253,7 @@ fn allowance(instructions: &BTreeMap<u32, Instruction>, limit: usize, loops: usi
 
 #[cfg(test)]
 pub(crate) fn work(input: &Snapshot) -> usize {
-    total(
-        &decoded(input),
-        input.region.compile_strategy,
-        input.shadow_returns,
-    )
+    total(&decoded(input), input.region.compile_strategy)
 }
 
 /// The input's work and the most a single shared-worker job may take.
@@ -289,11 +267,7 @@ pub(crate) fn work_and_allowance(input: &Snapshot, limit: usize) -> (usize, usiz
 
 pub(crate) fn work_and_allowance_with_budget(input: &Snapshot, budget: Budget) -> (usize, usize) {
     let instructions = decoded(input);
-    let work = total(
-        &instructions,
-        input.region.compile_strategy,
-        input.shadow_returns,
-    );
+    let work = total(&instructions, input.region.compile_strategy);
     (work, allowance(&instructions, budget.limit, budget.loops))
 }
 
@@ -324,11 +298,7 @@ fn plan_within(
     {
         return Err(format!("entry {entry:#x} is not an instruction boundary"));
     }
-    let amount = total(
-        &instructions,
-        input.region.compile_strategy,
-        input.shadow_returns,
-    );
+    let amount = total(&instructions, input.region.compile_strategy);
     let whole = allowance(&instructions, limit, loops);
     if amount <= whole {
         return Ok(vec![input]);
@@ -337,7 +307,7 @@ fn plan_within(
         // Keeping a hot unit whole with its callees saves more than Speed.
         if speed_fallback
             && !input.region.callees.is_empty()
-            && total(&instructions, CompileStrategy::Fast, input.shadow_returns) <= whole
+            && total(&instructions, CompileStrategy::Fast) <= whole
         {
             let mut input = input;
             input.region.compile_strategy = CompileStrategy::Fast;
@@ -357,7 +327,7 @@ fn plan_within(
     let mut current = BTreeSet::new();
     let mut used = 0;
     for (&pc, instruction) in &instructions {
-        let cost = weight_for(instruction, input.shadow_returns);
+        let cost = weight(instruction);
         if cost > limit {
             return Err(format!(
                 "instruction work {cost} exceeds background budget {limit}"
@@ -476,23 +446,6 @@ mod tests {
         let fragments = plan(original, 8).unwrap();
         assert_eq!(fragments.len(), 2);
         assert!(fragments.iter().all(|f| f.region.callees.is_empty()));
-    }
-    #[test]
-    fn shadow_metadata_is_budgeted_and_preserved_in_every_fragment() {
-        // External CALL followed by RET: ordinary work 16, metadata adds 32.
-        let mut original = input(&[0xe8, 0, 1, 0, 0, 0xc3]);
-        assert_eq!(work(&original), 16);
-        original.shadow_returns = true;
-        assert_eq!(work(&original), 48);
-        let fragments = plan(original.clone(), 24).unwrap();
-        assert_eq!(fragments.len(), 2);
-        assert!(
-            fragments
-                .iter()
-                .all(|fragment| fragment.shadow_returns && work(fragment) <= 24)
-        );
-        original.region.compile_strategy = CompileStrategy::Speed;
-        assert!(plan(original, 128).is_err());
     }
     #[test]
     fn authored_large_regions_are_sliced_on_full_instruction_boundaries() {

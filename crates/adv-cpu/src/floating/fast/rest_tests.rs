@@ -121,7 +121,6 @@ fn matrix(mode: u8) {
             crate::compile::compile(
                 &crate::Region::new(CODE, bytes.len()),
                 &mut memory(0, &bytes),
-                false,
             )
             .unwrap()
         });

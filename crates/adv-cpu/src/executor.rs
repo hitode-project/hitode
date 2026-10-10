@@ -55,15 +55,8 @@ pub struct Stats {
     pub native_regions: usize,
     pub cache_evictions: u64,
     pub cache_rejections: u64,
+    /// Native chains entered from run_inner; generated tail links are not counted.
     pub native_entries: u64,
-    /// Entries reached by a generated tail call without returning to run_inner.
-    pub linked_entries: u64,
-    /// RET hints validated against the actual guest stack, including local hits.
-    pub shadow_matches: u64,
-    /// Validated hints that actually bypassed the hash search and tail-linked.
-    pub shadow_hits: u64,
-    pub shadow_misses: u64,
-    pub shadow_overflows: u64,
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
@@ -77,8 +70,9 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    /// Slow-path counters by instruction and reason.
-    pub cliffs: crate::Cliffs,
+    /// Slow-path counters by instruction and reason. Boxed: every run lends
+    /// them to its bridge, and a pointer moves for free.
+    pub cliffs: Box<crate::Cliffs>,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
 }
@@ -118,8 +112,9 @@ pub struct Executor {
     rows: Option<Box<crate::rows::RowPool>>,
     code: CodeStore,
     pub(crate) memory: Memory,
+    /// Stands in for `stats.cliffs` while a run's bridge holds them.
+    spare_cliffs: Option<Box<crate::Cliffs>>,
     region_linking: bool,
-    shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     pub(crate) interpreter: crate::interpreter::Interpreter,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
@@ -236,6 +231,7 @@ impl Executor {
         handler: Option<&mut dyn ExecutionTrap>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
+        let spare = self.spare_cliffs.take().unwrap_or_default();
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,
@@ -249,7 +245,8 @@ impl Executor {
             unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
-            cliffs: std::mem::take(&mut self.stats.cliffs),
+            cliffs: std::mem::replace(&mut self.stats.cliffs, spare),
+            scratch: Default::default(),
         };
         // Diagnostics use only the explicitly selected interpreter backend.
         // Disabled runs retain block execution and its instruction hot path.
@@ -275,7 +272,7 @@ impl Executor {
         self.stats.trap_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
-        self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
+        self.spare_cliffs = Some(std::mem::replace(&mut self.stats.cliffs, bridge.cliffs));
         self.timestamp = bridge.timestamp;
         result
     }
@@ -358,7 +355,6 @@ impl Executor {
             code: CodeStore::default(),
             memory,
             region_linking: true,
-            shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
@@ -385,6 +381,7 @@ impl Executor {
             demand: HashMap::new(),
             warm: None,
             aot: aot::State::default(),
+            spare_cliffs: Some(Box::default()),
             persistent_cache: None,
             cached_pending: None,
             cache_images: Vec::new(),
@@ -473,7 +470,6 @@ impl Executor {
         self.profiling = parent.profiling;
         self.cache_region_limit = parent.cache_region_limit;
         self.cache_byte_limit = parent.cache_byte_limit;
-        self.set_shadow_returns(parent.shadow_returns.is_some())?;
         self.set_compile_threads(parent.compile_threads)?;
         self.host_interrupts = parent.host_interrupts;
         self.rows = parent
@@ -547,7 +543,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile(&region, &mut self.memory, self.shadow_returns.is_some())?;
+        let compiled = compile::compile(&region, &mut self.memory)?;
         self.stats.compilations += 1;
         let elapsed = start.elapsed();
         self.stats.compile_time += elapsed;
@@ -744,7 +740,6 @@ impl Executor {
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
-        snapshot.shadow_returns = self.shadow_returns.is_some();
         self.locate_cache_input(&mut snapshot);
         let mut fragments = if let Some(limit) = limit {
             let budget = crate::compile_budget::background_budget(
@@ -1095,25 +1090,6 @@ impl Executor {
         self.region_linking = enabled;
     }
 
-    /// Experimental return prediction; choose codegen before compiling/submitting any region.
-    /// Hints are private to one bounded native chain and never enter a saved CPU
-    /// context. Default false preserves the existing checked CALL/RET path.
-    pub fn set_shadow_returns(&mut self, enabled: bool) -> Result<(), String> {
-        if self.shadow_returns.is_some() == enabled {
-            return Ok(());
-        }
-        if self.stats.compilations != 0
-            || self.stats.compile_requests != 0
-            || !self.code.compiled.is_empty()
-            || self.aot.has_ready()
-            || !self.pending_regions.is_empty()
-            || !self.deferred_compilations.is_empty()
-        {
-            return Err("shadow-return codegen must be configured before compilation".into());
-        }
-        self.shadow_returns = enabled.then(|| Box::new(crate::linking::shadow::Stack::new()));
-        Ok(())
-    }
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
     }
@@ -1605,7 +1581,7 @@ impl Executor {
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
-                let (result, linked) = native.run(
+                let result = native.run(
                     &mut self.state,
                     &mut self.memory,
                     bridge,
@@ -1620,10 +1596,6 @@ impl Executor {
                         } else {
                             &self.inactive_interrupt
                         },
-                        // Compiled shadow operations require their owner stack,
-                        // even for a verified block. Native entry/exit clears it;
-                        // the one-block allowance still bounds verification.
-                        shadow: self.shadow_returns.as_deref_mut(),
                     },
                 );
                 if let Some(trace) = &trace {
@@ -1635,14 +1607,7 @@ impl Executor {
                     p.native_entries += 1;
                     p.native_ns += timer.elapsed().as_nanos() as u64;
                 }
-                self.stats.native_entries += 1 + linked;
-                self.stats.linked_entries += linked;
-                if let Some(shadow) = &self.shadow_returns {
-                    self.stats.shadow_matches = shadow.matches;
-                    self.stats.shadow_hits = shadow.hits;
-                    self.stats.shadow_misses = shadow.misses;
-                    self.stats.shadow_overflows = shadow.overflows;
-                }
+                self.stats.native_entries += 1;
                 let completed = before - self.state.fuel;
                 if let Some((_, now)) = timed
                     && reserved != 0
@@ -2031,7 +1996,7 @@ mod responsive_compile_tests {
         );
         assert_eq!(m.state.regs[1], 0);
         assert_eq!(m.state.regs[4], STACK + 4);
-        assert!(m.stats.linked_entries > 0);
+        assert!(m.stats.native_blocks > m.stats.native_entries);
         // Patch an instruction in the last fragment; no old piece may execute.
         let mut patched = bytes.clone();
         let position = patched
@@ -2167,7 +2132,7 @@ mod responsive_compile_tests {
                     cold.push(begun.elapsed().as_secs_f64() * 1000.0);
                     compilation.push(m.stats.compile_time.as_secs_f64() * 1000.0);
                     sizes = (m.code.compiled.len(), m.stats.native_code_bytes);
-                    let before_linked = m.stats.linked_entries;
+                    let before_entries = m.stats.native_entries;
                     for _ in 0..7 {
                         seed(&mut m, 20_000);
                         let begun = Instant::now();
@@ -2184,7 +2149,7 @@ mod responsive_compile_tests {
                             );
                         }
                     }
-                    linked = (m.stats.linked_entries - before_linked) as f64 / 140_000.0;
+                    linked = (m.stats.native_entries - before_entries) as f64 / 140_000.0;
                     assert!(m.stats.interpreter_instructions == 0);
                     if limit != 0 {
                         assert!(m.stats.max_compile_work <= limit);
@@ -2528,7 +2493,8 @@ mod topology_tests {
         assert_eq!(m.code.compiled[&0x1300].tail_entry, old_entry);
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 4);
-        assert_eq!(m.stats.linked_entries, 1);
+        // One Rust entry: the new fragment tail-links to the old one.
+        assert_eq!(m.stats.native_entries, 1);
         assert_eq!(m.stats.interpreter_instructions, 0);
     }
 
@@ -3156,7 +3122,9 @@ mod tiering_tests {
         assert!(!merged.code.regions[&0x1100].frontier.contains(&0x1180));
         assert!(separate.code.regions[&0x1100].frontier.contains(&0x1180));
         assert_eq!(merged.code.entry_owner.get(&0x1180), Some(&0x1180));
+        // Rust entries count region transfers only while linking is off.
         for m in [&mut merged, &mut separate] {
+            m.set_region_linking(false);
             seed_direct_leaf(m, 1000);
         }
         let before_merged = merged.stats.native_entries;
@@ -3319,16 +3287,11 @@ mod publication_tests {
 
     fn targets(table: &crate::linking::Table) -> BTreeMap<u32, usize> {
         let (pointer, mask) = table.parts();
-        if pointer.is_null() {
-            return BTreeMap::new();
-        }
         // SAFETY: parts belongs to this borrowed immutable table generation.
         unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
             .iter()
-            .filter_map(|slot| {
-                let entry = slot.entry;
-                (entry != 0).then_some((slot.pc, entry))
-            })
+            .filter(|slot| slot.key != crate::linking::VACANT)
+            .map(|slot| (slot.key as u32, slot.entry))
             .collect()
     }
 

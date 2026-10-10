@@ -56,7 +56,7 @@ fn region_fact_emission_counts() {
             a.fstp(qword_ptr(esi + 16)).unwrap();
         });
         testing::reset_emission();
-        let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code), false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code)).unwrap();
         let counts = testing::emission();
         eprintln!(
             "region facts control_changes={control_changes}: bytes={} {counts:?}",
@@ -126,7 +126,7 @@ fn control_changes_and_faults_resume_with_the_precise_resident_prefix() {
             m.write(DATA + 64, &0x007fu16.to_le_bytes()).unwrap();
             m.protect(DATA + 4096, 4096, 0).unwrap();
         }
-        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory).unwrap();
         let mut actual = state();
         actual.x87.control = 0x027f;
         let mut expected = actual.clone();
@@ -301,7 +301,7 @@ fn code_observation_epoch_precedes_x87_instruction_effects() {
     let mut native = unobserved();
     let mut reference = unobserved();
     let before = native.epoch;
-    let compiled = compile(&Region::new(CODE, code.len()), &mut native, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut native).unwrap();
     assert_eq!(
         native.epoch,
         before + 1,
@@ -362,8 +362,7 @@ fn resident_stack_wrap_and_dead_raw_slots_match_every_budget_prefix() {
             actual_memory
                 .write(DATA + 4, &0.7f32.to_le_bytes())
                 .unwrap();
-            let compiled =
-                compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory).unwrap();
             for budget in 0..=instructions.len() {
                 let mut actual_memory = memory(&code);
                 let mut expected_memory = memory(&code);
@@ -534,7 +533,7 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
     let mut m = memory(&code);
     m.write(DATA, &1.3f32.to_le_bytes()).unwrap();
     m.write(DATA + 4, &0.7f32.to_le_bytes()).unwrap();
-    let compiled = compile(&region, &mut m, false).unwrap();
+    let compiled = compile(&region, &mut m).unwrap();
     let mut actual = state();
     actual.eip = split;
     let mut expected = actual.clone();
@@ -555,9 +554,9 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
     expected.fuel = actual.fuel;
     assert_eq!(actual, expected);
     let mut m = memory(&code);
-    let resident = compile(&Region::new(CODE, code.len()), &mut m, false).unwrap();
+    let resident = compile(&Region::new(CODE, code.len()), &mut m).unwrap();
     testing::SINGLE_ONLY.set(true);
-    let single = compile(&Region::new(CODE, code.len()), &mut m, false);
+    let single = compile(&Region::new(CODE, code.len()), &mut m);
     testing::SINGLE_ONLY.set(false);
     let single = single.unwrap();
     assert!(
@@ -661,9 +660,9 @@ fn integer_lanes_match_single_instruction_code_for_every_budget_and_entry() {
 fn lane_matches_single(code: &[u8]) {
     let instructions = decoded(code);
     let mut m = lane_memory(code);
-    let lanes = compile(&Region::new(CODE, code.len()), &mut m, false).unwrap();
+    let lanes = compile(&Region::new(CODE, code.len()), &mut m).unwrap();
     testing::SINGLE_ONLY.set(true);
-    let single = compile(&Region::new(CODE, code.len()), &mut m, false);
+    let single = compile(&Region::new(CODE, code.len()), &mut m);
     testing::SINGLE_ONLY.set(false);
     let single = single.unwrap();
     for i in &instructions {

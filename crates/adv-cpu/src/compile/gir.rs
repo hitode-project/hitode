@@ -200,9 +200,10 @@ mod tests {
             bulk_calls: 0,
             bulk_bytes: 0,
             cliffs: Default::default(),
+            scratch: Default::default(),
         };
         let interrupt = AtomicBool::new(false);
-        let (exit, _) = compiled.run(
+        let exit = compiled.run(
             state,
             memory,
             &mut bridge,
@@ -211,7 +212,6 @@ mod tests {
                 links: None,
                 stop: 0,
                 interrupt: &interrupt,
-                shadow: None,
             },
         );
         (compiled, exit)

@@ -534,8 +534,7 @@ fn measure_synthetic() {
     );
     let started = std::time::Instant::now();
     let baseline =
-        crate::compile::compile(&crate::Region::new(BASE, bytes.len()), &mut memory, false)
-            .unwrap();
+        crate::compile::compile(&crate::Region::new(BASE, bytes.len()), &mut memory).unwrap();
     println!(
         "gir-metric: {}",
         serde_json::json!({"route":"baseline","guest":baseline.instruction_count,"bytes":baseline.code_size,"compile_us":started.elapsed().as_micros()})

@@ -53,7 +53,7 @@ fn compare(bytes: &[u8], initial: CpuState, setup: impl Fn(&mut Memory), calls: 
     let mut reference_memory = memory(bytes);
     setup(&mut actual_memory);
     setup(&mut reference_memory);
-    let compiled = compile(&Region::new(CODE, bytes.len()), &mut actual_memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, bytes.len()), &mut actual_memory).unwrap();
     let mut expected = initial.clone();
     let mut actual = initial;
     let mut interpreter = Interpreter::new();
@@ -137,7 +137,7 @@ fn hot_operations_are_native_even_between_lazy_integer_flags() {
         Some(0),
     );
     #[cfg(target_arch = "x86_64")]
-    let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code), false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code)).unwrap();
     // Runtime helper counts prove the exercised path is native; the disassembly
     // additionally protects against accidentally deleting arithmetic lowering.
     #[cfg(target_arch = "x86_64")]
@@ -175,7 +175,7 @@ fn wait_preserves_state_and_delivers_pending_exceptions() {
         compare(&code, s, |_| {}, Some(1));
     }
     let mut mem = memory(&code);
-    let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut mem).unwrap();
     let mut s = state();
     s.x87.control &= !4;
     s.x87.status |= 0x8084;
@@ -401,7 +401,7 @@ fn file_backed_operands_and_copy_on_write_use_transactional_helpers() {
         let oracle = crate::backend::FilePage::new(data);
         let mut actual_memory = file_memory(&code, &page, cow);
         let mut reference_memory = file_memory(&code, &oracle, cow);
-        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory).unwrap();
         let mut actual = state();
         let mut expected = actual.clone();
         let mut interpreter = Interpreter::new();
@@ -453,7 +453,7 @@ fn a_lazy_file_fault_is_not_retried_inside_the_same_x87_instruction() {
             }
         });
         let mut memory = file_memory(&code, &page, store);
-        let compiled = compile(&Region::new(CODE, code.len()), &mut memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut memory).unwrap();
         let mut actual = state();
         let before = testing::calls();
         let reason = testing::run(&compiled, &mut actual, &mut memory);
@@ -507,7 +507,7 @@ fn pure_x87_shared_audio_accesses_never_use_ordinary_loads_or_stores() {
     memory.protect(CODE, 4096, READ | EXEC).unwrap();
     let shared = memory.map_shared_audio(DATA, 4096).unwrap();
     shared.store_bytes(0, &1.25f64.to_le_bytes());
-    let compiled = compile(&Region::new(CODE, code.len()), &mut memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut memory).unwrap();
     let mut actual = state();
     let before = testing::calls();
     assert_eq!(
@@ -654,7 +654,7 @@ fn native_x87_rounding_flags_are_independent_of_host_fpcr_and_preserve_fpsr() {
     };
     let mut reference_memory = memory(&code);
     setup(&mut reference_memory);
-    let compiled = compile(&Region::new(CODE, code.len()), &mut reference_memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut reference_memory).unwrap();
     let mut expected = state();
     let mut interpreter = Interpreter::new();
     for _ in 0..6 {
@@ -714,7 +714,7 @@ fn x87_fault_and_budget_exits_restore_the_callers_host_floating_environment() {
         });
         let mut actual_memory = memory(&code);
         actual_memory.protect(DATA + 4096, 4096, 0).unwrap();
-        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory).unwrap();
         let mut expected_memory = memory(&code);
         expected_memory.protect(DATA + 4096, 4096, 0).unwrap();
         let mut expected = state();
@@ -889,7 +889,7 @@ fn helper_effects_keep_fuel_and_exact_state_across_budget_resumptions() {
             region.entries.push(i.ip32());
         }
     }
-    let compiled = compile(&region, &mut actual_memory, false).unwrap();
+    let compiled = compile(&region, &mut actual_memory).unwrap();
     let mut actual = state();
     let mut expected = actual.clone();
     let mut interpreter = Interpreter::new();

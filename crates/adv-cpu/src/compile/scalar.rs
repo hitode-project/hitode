@@ -294,6 +294,7 @@ impl Emitter<'_> {
     /// computing any of them: kind bit 4 puts OF in b and folds the old b into
     /// a, so AF's a ^ b ^ result is unchanged and PF/ZF/SF stay as they were.
     fn set_carry_overflow(&mut self, carry: Value, overflow: Value) {
+        self.realize_flags();
         let a = self.b.use_var(self.lazy[0]);
         let b = self.b.use_var(self.lazy[1]);
         let a = self.b.ins().bxor(a, b);

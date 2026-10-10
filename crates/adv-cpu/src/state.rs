@@ -141,6 +141,43 @@ impl X87State {
 }
 
 impl CpuState {
+    /// Fold the flags native code left lazy into `eflags`. Generated exits only
+    /// store the recipe; this is the one place its full word is computed.
+    pub fn settle_flags(&mut self) {
+        let [a, b, result, kind] = std::mem::take(&mut self.lazy_flags);
+        if kind == 0 {
+            return;
+        }
+        let old = self.eflags;
+        let base = kind & 3;
+        let shift = (kind >> 8) & 31;
+        let logical = base == 3;
+        let ab = a ^ b;
+        let partial = if base == 0 {
+            old & 0xd4
+        } else {
+            let parity = (((result >> shift) & 0xff).count_ones() & 1 ^ 1) << 2;
+            let zero = u32::from(result == 0) << 6;
+            let sign = (result >> 24) & 0x80;
+            let adjust = if logical {
+                0
+            } else {
+                ((ab ^ result) >> shift) & 0x10
+            };
+            parity | zero | sign | adjust
+        };
+        // Kind bit 4: a later CF/OF writer put OF in b (see set_carry_overflow).
+        let overflow = if kind & 4 != 0 {
+            b << 11
+        } else if logical {
+            0
+        } else {
+            let first = if base == 1 { !ab } else { ab };
+            ((first & (a ^ result)) >> 20) & 0x800
+        };
+        // Exits keep CF exact in eflags itself.
+        self.eflags = old & !0x8d4 | partial | overflow;
+    }
     /// Materialize deferred native MMX changes at an executor/context boundary.
     /// Integer/SSE native region dispatch does not copy any floating registers.
     pub fn commit_mmx(&mut self) {
