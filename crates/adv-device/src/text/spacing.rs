@@ -2,6 +2,25 @@
 use super::*;
 
 impl Text {
+    /// One encoded character in the selected font's repertoire. This also
+    /// preserves the provider's default-glyph handling for incomplete sequences.
+    pub fn encoded_character_width(
+        &mut self,
+        request: &FontRequest,
+        code: u16,
+    ) -> Result<i32, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.encoded_character_width(code)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (request, code);
+            Err(TextError::Glyph(
+                "encoded character advances are unavailable on this text backend".into(),
+            ))
+        }
+    }
     /// Consecutive Unicode units, including NUL and missing/default characters.
     /// This measures individual advances, independently of string shaping.
     pub fn character_widths(

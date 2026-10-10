@@ -487,7 +487,15 @@ fn the_new_pairs_are_public_registry_entries_before_process_installation() {
                 "UnregisterClassW",
             ][..],
         ),
-        ("gdi32.dll", &["CreateFontW"][..]),
+        (
+            "gdi32.dll",
+            &[
+                "CreateFontW",
+                "GetCharWidth32A",
+                "GetKerningPairsA",
+                "GetOutlineTextMetricsW",
+            ][..],
+        ),
         (
             "winmm.dll",
             &[

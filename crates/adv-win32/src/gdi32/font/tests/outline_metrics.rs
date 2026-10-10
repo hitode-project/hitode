@@ -2,6 +2,45 @@ use super::*;
 
 #[cfg(windows)]
 impl NativeOracle {
+    fn wide_outline_metrics_x86(&self) -> Vec<u8> {
+        let size = unsafe { gdi::GetOutlineTextMetricsW(self.dc, 0, std::ptr::null_mut()) };
+        let mut storage = vec![0u64; (size as usize).div_ceil(8)];
+        let pointer = storage.as_mut_ptr().cast::<gdi::OUTLINETEXTMETRICW>();
+        assert_eq!(
+            unsafe { gdi::GetOutlineTextMetricsW(self.dc, size, pointer) },
+            size
+        );
+        let metrics = unsafe { &*pointer };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), size as usize) };
+        let mut expected = vec![0; 216];
+        expected[..200].copy_from_slice(&bytes[..200]);
+        for (index, offset) in [
+            metrics.otmpFamilyName,
+            metrics.otmpFaceName,
+            metrics.otmpStyleName,
+            metrics.otmpFullName,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = offset as usize;
+            let length = bytes[start..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .position(|&pair| pair == [0, 0])
+                .unwrap()
+                * 2
+                + 2;
+            let offset = expected.len() as u32;
+            expected[200 + index * 4..204 + index * 4].copy_from_slice(&offset.to_le_bytes());
+            expected.extend_from_slice(&bytes[start..start + length]);
+        }
+        let length = expected.len() as u32;
+        expected[..4].copy_from_slice(&length.to_le_bytes());
+        expected
+    }
     fn outline_metrics_x86(&self) -> Vec<u8> {
         // SAFETY: an owned font DC; a NULL output queries native buffer size.
         let size = unsafe { gdi::GetOutlineTextMetricsA(self.dc, 0, std::ptr::null_mut()) };
@@ -39,6 +78,64 @@ impl NativeOracle {
         let required = expected.len() as u32;
         expected[..4].copy_from_slice(&required.to_le_bytes());
         expected
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn wide_outline_metrics_match_native_layout_and_have_their_own_prefix_contract() {
+    let (mut machine, data, dc) = fixture();
+    let native = native_font(&machine, dc);
+    let expected = native.wide_outline_metrics_x86();
+    let required = expected.len() as u32;
+    let output = data + 512;
+    let error = machine.sys.contexts[machine.sys.current as usize].teb
+        + adv_machine::layout::teb::LAST_ERROR;
+    assert_eq!(
+        invoke(&mut machine, data, "GetOutlineTextMetricsW", &[dc, 0, 0]),
+        required
+    );
+    for size in [
+        0,
+        1,
+        3,
+        4,
+        60,
+        200,
+        212,
+        216,
+        217,
+        required - 1,
+        required,
+        required + 16,
+    ] {
+        let mut actual = vec![0xaa; expected.len() + 16];
+        machine.cpu.write(output, &actual).unwrap();
+        machine.cpu.write_u32(error, 12345).unwrap();
+        let failed = size > 216 && size < required;
+        let copied = if failed { 0 } else { size.min(required) };
+        assert_eq!(
+            invoke(
+                &mut machine,
+                data,
+                "GetOutlineTextMetricsW",
+                &[dc, size, output]
+            ),
+            copied,
+            "size={size}"
+        );
+        machine.cpu.read(output, &mut actual).unwrap();
+        let mut wanted = expected.clone();
+        if size < required {
+            wanted[200..216].fill(0);
+        }
+        assert_eq!(
+            &actual[..copied as usize],
+            &wanted[..copied as usize],
+            "size={size}"
+        );
+        assert!(actual[copied as usize..].iter().all(|&byte| byte == 0xaa));
+        assert_eq!(machine.cpu.read_u32(error).unwrap(), 12345);
     }
 }
 

@@ -2,6 +2,69 @@ use super::*;
 
 #[test]
 #[cfg(windows)]
+fn ansi_widths_match_native_and_dbcs_ranges_use_the_selected_charset() {
+    let (mut machine, data, dc) = fixture();
+    machine.ext.get_mut::<Win32>().codec =
+        adv_os::Codec::new(unsafe { windows_sys::Win32::Globalization::GetACP() });
+    let native = native_font(&machine, dc);
+    let mut expected = [0; 256];
+    assert_ne!(
+        unsafe { gdi::GetCharWidth32A(native.dc, 0, 255, expected.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "GetCharWidth32A",
+            &[dc, 0, 255, data + 512]
+        ),
+        1
+    );
+    for (index, width) in expected.into_iter().enumerate() {
+        assert_eq!(
+            machine.cpu.read_u32(data + 512 + index as u32 * 4).unwrap() as i32,
+            width
+        );
+    }
+    let mut raw = [0; 60];
+    raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
+    raw[16..20].copy_from_slice(&400i32.to_le_bytes());
+    raw[23] = 128;
+    raw[28..38].copy_from_slice(b"MS Gothic\0");
+    machine.cpu.write(data, &raw).unwrap();
+    let font = invoke(&mut machine, data, "CreateFontIndirectA", &[data]);
+    invoke(&mut machine, data, "SelectObject", &[dc, font]);
+    machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(936);
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "GetCharWidth32A",
+            &[dc, 0x82a0, 0x82a2, data + 512]
+        ),
+        1
+    );
+    let ansi: Vec<_> = (0..3)
+        .map(|index| machine.cpu.read_u32(data + 512 + index * 4).unwrap())
+        .collect();
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "GetCharWidth32W",
+            &[dc, 0x3042, 0x3044, data + 512]
+        ),
+        1
+    );
+    let wide: Vec<_> = (0..3)
+        .map(|index| machine.cpu.read_u32(data + 512 + index * 4).unwrap())
+        .collect();
+    assert_eq!(ansi, wide);
+}
+
+#[test]
+#[cfg(windows)]
 fn unicode_character_widths_match_native_selected_fonts_and_default_characters() {
     let (mut machine, data, dc) = fixture();
     let font_id = selected_font(&machine, dc);
