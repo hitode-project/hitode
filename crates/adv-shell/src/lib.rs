@@ -1230,12 +1230,15 @@ fn run_execution(
         let pending_input = wake.interrupt_flag();
         runtime
             .machine
-            .set_time_skip_source(Some(std::sync::Arc::new(move || {
+            .set_time_skip_source(Some(std::sync::Arc::new(move |startup| {
                 // Pending input/audio notifications must be drained before jumping.
+                // Until the first frame nothing is on screen to pace, so timed waits
+                // only delay first entry; afterwards skipping follows the Ctrl keys.
                 !pending_input.load(std::sync::atomic::Ordering::Acquire)
-                    && [0x11, 0xa2, 0xa3]
-                        .iter()
-                        .any(|key| skip_keys.get(*key) & 0x80 != 0)
+                    && (startup
+                        || [0x11, 0xa2, 0xa3]
+                            .iter()
+                            .any(|key| skip_keys.get(*key) & 0x80 != 0))
             })));
     }
     runtime

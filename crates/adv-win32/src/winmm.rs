@@ -91,7 +91,7 @@ fn caps(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 fn get_time(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return((env.sys.clock.guest_now_us() / 1000) as u32)
+    crate::kernel32::time::poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
 }
 fn begin_period(env: &mut Env<'_>) -> Outcome {
     let period = env.arg(0);

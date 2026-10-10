@@ -87,7 +87,7 @@ mod tests {
         .unwrap();
         let held = Arc::new(AtomicBool::new(held));
         let source = held.clone();
-        machine.set_time_skip_source(Some(Arc::new(move || source.load(Ordering::Acquire))));
+        machine.set_time_skip_source(Some(Arc::new(move |_| source.load(Ordering::Acquire))));
         machine.ext.insert(Mode {
             interval,
             occluded,
