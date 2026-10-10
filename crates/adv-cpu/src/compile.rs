@@ -182,6 +182,28 @@ impl Compiled {
         }
         true
     }
+    /// Code current before the changes in `prior` (page address to its version
+    /// before them) stays current when no changed range reaches a compared byte.
+    pub fn untouched(
+        &mut self,
+        memory: &Memory,
+        prior: &BTreeMap<u32, u64>,
+        ranges: &[(u32, usize)],
+    ) -> bool {
+        let current = memory.base == self.window_base
+            && memory.len == self.window_len
+            && self.pages.iter().all(|&(page, version)| {
+                let address = memory.base + (page * crate::memory::PAGE_SIZE) as u32;
+                prior.get(&address).or_else(|| memory.versions.get(page)) == Some(&version)
+            });
+        if !current || !self.input.untouched(memory, ranges) {
+            return false;
+        }
+        for (page, version) in &mut self.pages {
+            *version = memory.versions[*page];
+        }
+        true
+    }
 
     pub fn run(
         &self,
@@ -506,6 +528,26 @@ impl Snapshot {
                     })
                 },
             )
+    }
+
+    fn untouched(&self, memory: &Memory, ranges: &[(u32, usize)]) -> bool {
+        let origin = u64::from(self.origin);
+        let overlaps = |start: u64, end: u64, offset: usize, len: usize| {
+            start < origin + (offset + len) as u64 && origin + (offset as u64) < end
+        };
+        self.pages.iter().all(|stamp| {
+            memory.perms.get(stamp.page) == Some(&stamp.permissions)
+                && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
+        }) && ranges.iter().all(|&(address, len)| {
+            let (start, end) = (u64::from(address), u64::from(address) + len as u64);
+            // Most stores land beside the code; decoded ranges may overlap.
+            !overlaps(start, end, 0, self.bytes.len())
+                || self.covered.as_ref().is_some_and(|covered| {
+                    !covered
+                        .iter()
+                        .any(|&(offset, len)| overlaps(start, end, offset, len))
+                })
+        })
     }
 
     fn with_coverage(

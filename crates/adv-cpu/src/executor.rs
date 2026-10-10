@@ -66,6 +66,8 @@ pub struct Stats {
     /// Region candidates checked after changes to their code pages only.
     pub invalidation_candidates: u64,
     pub code_revalidations: u64,
+    /// Revalidations that compared code bytes; the rest missed every one.
+    pub code_comparisons: u64,
     /// Raw traps delivered to the caller-owned handler.
     pub trap_calls: u64,
     pub bulk_calls: u64,
@@ -1033,8 +1035,10 @@ impl Executor {
         }
         self.observed_epoch = self.memory.epoch;
         let mut affected = BTreeSet::new();
-        for page in std::mem::take(&mut self.memory.dirty_pages) {
-            if let Some(owners) = self.code.page_regions.get(&page) {
+        let prior = std::mem::take(&mut self.memory.dirty_pages);
+        let ranges = self.memory.dirty_ranges.replace(Vec::new());
+        for page in prior.keys() {
+            if let Some(owners) = self.code.page_regions.get(page) {
                 affected.extend(owners.iter().copied());
             }
         }
@@ -1045,6 +1049,14 @@ impl Executor {
                 if compiled.valid(&self.memory) {
                     continue;
                 }
+                if ranges
+                    .as_ref()
+                    .is_some_and(|ranges| compiled.untouched(&self.memory, &prior, ranges))
+                {
+                    self.stats.code_revalidations += 1;
+                    continue;
+                }
+                self.stats.code_comparisons += 1;
                 if compiled.revalidate(&self.memory) {
                     self.stats.code_revalidations += 1;
                     continue;
@@ -3476,6 +3488,44 @@ mod native_deadline_tests {
         assert_eq!(m.run(0x4000, 10000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 8);
         assert_eq!(m.state.fuel, 9999);
+    }
+
+    #[test]
+    fn code_stores_compare_only_the_regions_they_reach() {
+        let mut m = Executor::create(Memory::reserve(0, 0x40000).unwrap()).unwrap();
+        m.map(0x1000, 4096, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        for address in [0x1000, 0x1100] {
+            m.write(address, &[0x40, 0xc3]).unwrap();
+            m.add_region(Region::new(address, 2)).unwrap();
+        }
+        m.refresh().unwrap();
+        let compilations = m.stats.compilations;
+        let (checks, kept, compared) = (
+            m.stats.invalidation_candidates,
+            m.stats.code_revalidations,
+            m.stats.code_comparisons,
+        );
+        // Both regions share the page; only the one holding the byte compares.
+        m.write(0x1001, &[0xc3]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks + 2);
+        assert_eq!(m.stats.code_revalidations, kept + 2);
+        assert_eq!(m.stats.code_comparisons, compared + 1);
+        let invalidations = m.stats.invalidations;
+        m.write(0x1100, &[0x48]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.code_comparisons, compared + 2);
+        assert_eq!(m.stats.invalidations, invalidations + 1);
+        assert!(m.code.compiled.contains_key(&0x1000));
+        // Too many stores between refreshes compare every region again.
+        for _ in 0..=crate::memory::DIRTY_RANGES {
+            m.write(0x1001, &[0xc3]).unwrap();
+        }
+        m.refresh().unwrap();
+        assert!(m.stats.code_comparisons > compared + 2);
+        assert!(m.code.compiled.contains_key(&0x1000));
+        assert!(m.stats.compilations > compilations);
     }
 
     #[test]

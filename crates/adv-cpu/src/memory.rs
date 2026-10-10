@@ -20,6 +20,8 @@ fn epoch_origin() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed) << EPOCH_BITS
 }
 const EPOCH_BITS: u32 = 40;
+/// Changed byte ranges kept between refreshes; more compare whole code.
+pub(crate) const DIRTY_RANGES: usize = 64;
 
 /// Split a window range into (page, in-page byte range) pieces.
 fn page_spans(
@@ -134,7 +136,10 @@ pub struct Memory {
     /// Bytes of each watched page that were fetched or captured as code.
     code: BTreeMap<usize, Box<[u64; PAGE_SIZE / 64]>>,
     pub(crate) mapped: Arc<Vec<bool>>,
-    pub(crate) dirty_pages: BTreeSet<u32>,
+    /// Pages changed since the controller last looked, each with its version
+    /// before the first change, and the changed bytes while they stay few.
+    pub(crate) dirty_pages: BTreeMap<u32, u64>,
+    pub(crate) dirty_ranges: Option<Vec<(u32, usize)>>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: BTreeMap<usize, SharedPage>,
     /// Owned snapshots have no external alias. SHARED is only their first-store
@@ -439,7 +444,8 @@ impl Memory {
             watched: vec![false; len / PAGE_SIZE],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
-            dirty_pages: BTreeSet::new(),
+            dirty_pages: BTreeMap::new(),
+            dirty_ranges: Some(Vec::new()),
             reservation: None,
             shared_pages: BTreeMap::new(),
             private_copy_pages: BTreeMap::new(),
@@ -483,7 +489,8 @@ impl Memory {
             watched: vec![false; len / PAGE_SIZE],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
-            dirty_pages: BTreeSet::new(),
+            dirty_pages: BTreeMap::new(),
+            dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
             private_copy_pages: BTreeMap::new(),
@@ -613,13 +620,18 @@ impl Memory {
         }
         let start = (addr - self.base) as usize / PAGE_SIZE;
         let last = ((addr - self.base) as usize + len - 1) / PAGE_SIZE;
+        for page in start..=last {
+            self.dirty_pages
+                .entry(self.base + page as u32 * PAGE_SIZE as u32)
+                .or_insert(self.versions[page]);
+        }
+        match &mut self.dirty_ranges {
+            Some(ranges) if ranges.len() < DIRTY_RANGES => ranges.push((addr, len)),
+            ranges => *ranges = None,
+        }
         self.epoch += 1;
         for version in &mut self.versions[start..=last] {
             *version = self.epoch;
-        }
-        for page in start..=last {
-            self.dirty_pages
-                .insert(self.base + page as u32 * PAGE_SIZE as u32);
         }
     }
 
