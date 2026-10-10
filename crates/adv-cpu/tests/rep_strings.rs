@@ -78,8 +78,11 @@ fn forward_copies_and_fills_match_unicorn_for_aligned_unaligned_and_cross_page_r
                     jit.memory().read(DST, 0x10000).unwrap(),
                     uc.memory().read(DST, 0x10000).unwrap()
                 );
-                assert_eq!(jit.stats.interpreter_entries, 0);
-                assert_eq!(jit.stats.bulk_bytes, u64::from(count * width(operation)));
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
+                support::x64_shape!(assert_eq!(
+                    jit.stats.bulk_bytes,
+                    u64::from(count * width(operation))
+                ));
             }
         }
     }
@@ -98,8 +101,8 @@ fn zero_count_ignores_invalid_addresses_and_direction_flag() {
             assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
             assert_eq!(jit.state.regs, uc.state.regs);
             assert_eq!(jit.state.eflags, uc.state.eflags);
-            assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -122,11 +125,14 @@ fn backwards_ranges_retain_rep_semantics() {
         );
         assert_eq!(jit.state.eflags, uc.state.eflags);
         if cfg!(target_arch = "x86_64") {
-            assert_eq!(jit.stats.bulk_bytes, 27 * u64::from(width(operation)));
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(
+                jit.stats.bulk_bytes,
+                27 * u64::from(width(operation))
+            ));
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         } else {
-            assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -157,13 +163,18 @@ fn overlapping_copies_retain_element_order_and_flags() {
                 );
                 assert_eq!(jit.state.eflags, uc.state.eflags);
                 if cfg!(target_arch = "x86_64") {
-                    assert_eq!(jit.stats.bulk_bytes, 27 * u64::from(width(operation)));
-                    assert_eq!(jit.stats.interpreter_entries, 0);
+                    support::x64_shape!(assert_eq!(
+                        jit.stats.bulk_bytes,
+                        27 * u64::from(width(operation))
+                    ));
+                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
                 } else {
                     // Checked elements can leave a non-overlapping tail that
                     // the existing forward bulk helper completes on ARM64.
-                    assert!(jit.stats.bulk_bytes <= 27 * u64::from(width(operation)));
-                    assert_eq!(jit.stats.interpreter_entries, 0);
+                    support::x64_shape!(assert!(
+                        jit.stats.bulk_bytes <= 27 * u64::from(width(operation))
+                    ));
+                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
                 }
             }
         }
@@ -193,7 +204,7 @@ fn descending_overlap_yields_and_resumes_without_snapshotting_the_source() {
         jit.memory().read(SRC, 65536).unwrap(),
         uc.memory().read(SRC, 65536).unwrap()
     );
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -244,7 +255,7 @@ fn protected_later_pages_preserve_unicorn_partial_fault_progress() {
                     jit.memory().read(DST, 8192).unwrap(),
                     uc.memory().read(DST, 8192).unwrap()
                 );
-                assert_eq!(jit.stats.bulk_bytes, 0);
+                support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
                 assert_eq!(jit.state.regs[1], 32 - 16 / width(operation));
             }
         }
@@ -267,7 +278,7 @@ fn overflowing_bulk_ranges_use_checked_native_elements() {
             jit.memory().read(DST, 16).unwrap(),
             uc.memory().read(DST, 16).unwrap()
         );
-        assert_eq!(jit.stats.bulk_bytes, 0);
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
         assert_eq!(jit.state.regs[1], 0x4000_0000);
     }
     for operation in [0, 2, 3, 5] {
@@ -291,7 +302,7 @@ fn overflowing_bulk_ranges_use_checked_native_elements() {
                 uc.run_unicorn(STOP, 100).unwrap()
             );
             assert_eq!(jit.state.regs, uc.state.regs);
-            assert_eq!(jit.stats.bulk_bytes, 0);
+            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
         }
     }
 }
@@ -310,12 +321,12 @@ fn writes_to_executable_pages_fall_back_and_invalidate_warm_code() {
     start(&mut m, 1, SRC, TARGET + 1, 2);
     m.state.regs[0] = 73;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(m.stats.bulk_bytes, 0);
+    support::x64_shape!(assert_eq!(m.stats.bulk_bytes, 0));
     start(&mut m, 1, SRC, DST, 2);
     m.state.eip = TARGET;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 73);
-    assert_eq!(m.stats.invalidations, 1);
+    support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
 }
 
 #[test]
@@ -351,9 +362,9 @@ fn large_repeats_yield_at_chunk_boundaries_and_resume_independent_contexts() {
         m.memory().read(0x700000, 2 << 20).unwrap() == &pattern[4096..4096 + (2 << 20)],
         "context B output"
     );
-    assert_eq!(m.stats.bulk_calls, 5);
-    assert_eq!(m.stats.bulk_bytes, 5 << 20);
-    assert_eq!(m.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.bulk_calls, 5));
+    support::x64_shape!(assert_eq!(m.stats.bulk_bytes, 5 << 20));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -404,8 +415,8 @@ fn bulk_deadline_stops_at_a_restartable_rep_then_finishes_after_rearming() {
         cpu.read(at, &mut bytes).unwrap();
         assert_eq!(bytes, [0x44; 16]);
     }
-    assert_eq!(cpu.stats().bulk_bytes, u64::from(SIZE));
-    assert_eq!(cpu.stats().interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(cpu.stats().bulk_bytes, u64::from(SIZE)));
+    support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
 }
 
 #[test]
@@ -448,8 +459,8 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     let mut bytes = [0; 16];
     cpu.read(DST, &mut bytes).unwrap();
     assert_eq!(bytes, [0; 16]);
-    assert_eq!(cpu.stats().bulk_bytes, 0);
-    assert_eq!(cpu.stats().trap_calls, 1);
+    support::x64_shape!(assert_eq!(cpu.stats().bulk_bytes, 0));
+    support::x64_shape!(assert_eq!(cpu.stats().trap_calls, 1));
 }
 
 #[test]
@@ -466,7 +477,7 @@ fn native_address_size_and_fs_prefix_keep_zero_count_in_native_code() {
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs, uc.state.regs);
-        assert_eq!(jit.stats.bulk_bytes, 0);
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }

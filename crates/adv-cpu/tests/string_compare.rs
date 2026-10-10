@@ -138,9 +138,15 @@ fn all_repeat_conditions_widths_directions_and_alignment_match_unicorn() {
                             jit.memory().read(DST, 0x10000).unwrap(),
                             original_destination
                         );
-                        assert_eq!(jit.stats.interpreter_entries, 0, "{form:?}, DF={backwards}");
+                        support::x64_shape!(assert_eq!(
+                            jit.stats.interpreter_entries, 0,
+                            "{form:?}, DF={backwards}"
+                        ));
                         let compared = stop.map_or(count, |i| i + 1);
-                        assert_eq!(jit.stats.bulk_bytes, u64::from(compared * form.width));
+                        support::x64_shape!(assert_eq!(
+                            jit.stats.bulk_bytes,
+                            u64::from(compared * form.width)
+                        ));
                     }
                 }
             }
@@ -173,7 +179,7 @@ fn final_subtraction_flags_cover_carry_borrow_parity_sign_and_overflow() {
                 put(m, DST, form.width, right);
             }
             finish(&mut jit, &mut uc);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -189,8 +195,8 @@ fn zero_count_has_no_memory_access_and_preserves_all_flags() {
             }
             finish(&mut jit, &mut uc);
             assert_eq!(jit.state.eflags, 0x8d7 | if backwards { 0x400 } else { 0 });
-            assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -228,8 +234,8 @@ fn stopping_element_before_a_denied_page_does_not_access_it() {
                 }
                 finish(&mut jit, &mut uc);
                 assert_eq!(jit.state.regs[1], 99);
-                assert_eq!(jit.stats.interpreter_entries, 0);
-                assert_eq!(jit.stats.bulk_bytes, u64::from(form.width));
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
+                support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, u64::from(form.width)));
             }
         }
     }
@@ -277,8 +283,8 @@ fn page_fault_restores_input_flags_and_preserves_completed_progress() {
                 assert_eq!(jit.state.eflags, input_flags);
                 assert_eq!(jit.state.eip, CODE);
                 assert_eq!(jit.state.regs[1], 7);
-                assert_eq!(jit.stats.bulk_bytes, 0);
-                assert!(jit.stats.interpreter_entries > 0);
+                support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+                support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
                 for m in [&mut jit, &mut uc] {
                     m.protect(denied, 4096, READ).unwrap();
                 }
@@ -312,8 +318,8 @@ fn unaligned_denied_page_faults_before_the_first_comparison_and_restarts() {
         assert_eq!(jit.state.eip, CODE);
         // Unicorn can permit the straddling first read and fault at a later
         // element, so its fault ordering/address is not the specification here.
-        assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.interpreter_entries > 0);
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+        support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
         for m in [&mut jit, &mut uc] {
             m.protect(DST + 4096, 4096, READ).unwrap();
         }
@@ -332,8 +338,8 @@ fn huge_counts_can_stop_early_and_long_unknown_spans_preserve_element_budget() {
         }
         finish(&mut jit, &mut uc);
         assert_eq!(jit.state.regs[1], u32::MAX - 1);
-        assert_eq!(jit.stats.interpreter_entries, 0);
-        assert_eq!(jit.stats.bulk_bytes, u64::from(form.width));
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, u64::from(form.width)));
     }
     let form = Form {
         cmps: false,
@@ -353,8 +359,8 @@ fn huge_counts_can_stop_early_and_long_unknown_spans_preserve_element_budget() {
     assert_eq!(jit.state.regs, uc.state.regs);
     assert_eq!(jit.state.eflags, uc.state.eflags);
     assert_eq!(jit.state.eip, CODE);
-    assert_eq!(jit.stats.bulk_bytes, 0);
-    assert_eq!(jit.stats.bulk_calls, 0);
+    support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+    support::x64_shape!(assert_eq!(jit.stats.bulk_calls, 0));
 }
 
 #[test]
@@ -381,7 +387,7 @@ fn invalid_first_element_and_overflowing_addresses_keep_precise_faults() {
             assert!(matches!(actual, RunOutcome::ReadFault { .. }));
             assert_eq!(jit.state.regs, uc.state.regs);
             assert_eq!(jit.state.eflags, uc.state.eflags);
-            assert_eq!(jit.stats.bulk_bytes, 0);
+            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
             assert_eq!(jit.state.regs[1], 9);
         }
     }
@@ -407,8 +413,8 @@ fn crt_strlen_with_unbounded_count_stops_natively_at_the_terminator() {
         }
         finish(&mut jit, &mut uc);
         assert_eq!(jit.state.regs[0], length as u32);
-        assert_eq!(jit.stats.bulk_bytes, length as u64 + 1);
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, length as u64 + 1));
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -436,8 +442,11 @@ fn crt_memcmp_branches_use_last_comparison_flags_under_both_compile_strategies()
             }
             finish(&mut jit, &mut uc);
             assert_eq!(jit.state.regs[0], result);
-            assert_eq!(jit.stats.interpreter_entries, 0);
-            assert_eq!(jit.stats.bulk_bytes, if left == right { 32 } else { 13 });
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
+            support::x64_shape!(assert_eq!(
+                jit.stats.bulk_bytes,
+                if left == right { 32 } else { 13 }
+            ));
         }
     }
 }
@@ -468,8 +477,8 @@ fn finite_large_comparisons_commit_bounded_chunks_and_restore_independent_contex
         assert_eq!(m.state.regs[1], 0);
         assert_eq!(m.state.eflags, 0x46 | if backwards { 0x400 } else { 0 });
     }
-    assert_eq!(m.stats.bulk_bytes, 5 << 20);
-    assert_eq!(m.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.bulk_bytes, 5 << 20));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -516,15 +525,15 @@ fn comparison_can_resume_from_native_through_interpreter_back_to_native() {
     jit.write(0x100000, &vec![VALUE as u8; 2 << 20]).unwrap();
     start(&mut jit, 2 << 20, SRC, 0x100000, false);
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.stats.bulk_bytes, 1 << 20);
+    support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 1 << 20));
     // The guarded scan declines the inaccessible range without committing;
     // the interpreter then commits exactly the next 256 readable elements.
     jit.protect(0x201000, 4096, 0).unwrap();
     assert_eq!(jit.run(STOP, 257).unwrap(), RunOutcome::Budget);
     assert_eq!(jit.state.regs[1], (1 << 20) - 256);
     assert_eq!(jit.state.regs[7], 0x200100);
-    assert_eq!(jit.stats.interpreter_instructions, 256);
-    assert_eq!(jit.stats.bulk_bytes, 1 << 20);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_instructions, 256));
+    support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 1 << 20));
     assert!(jit.state.rep.is_some());
     // Changing an already compared byte would stop a replay from the old PC.
     jit.write(0x100000, &[VALUE as u8 ^ 1]).unwrap();
@@ -534,8 +543,8 @@ fn comparison_can_resume_from_native_through_interpreter_back_to_native() {
     assert_eq!(jit.state.regs[7], 0x300000);
     assert_eq!(jit.state.eflags, 0x46);
     assert!(jit.state.rep.is_none());
-    assert_eq!(jit.stats.interpreter_instructions, 256);
-    assert_eq!(jit.stats.bulk_bytes, (2 << 20) - 256);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_instructions, 256));
+    support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, (2 << 20) - 256));
 }
 
 #[test]
@@ -546,8 +555,8 @@ fn sixteen_bit_addresses_and_segment_overrides_use_the_interpreter() {
         let mut jit = program(std::mem::take(&mut bytes), true);
         start(&mut jit, 0, 0xffff_ffff, 0xffff_ffff, false);
         assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-        assert!(jit.stats.interpreter_entries > 0);
-        assert_eq!(jit.stats.bulk_bytes, 0);
+        support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
+        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
     }
 }
 
@@ -569,9 +578,9 @@ fn comparing_executable_memory_observes_host_smc_updates() {
     start(&mut m, 3, SRC, CODE, false);
     assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[1], 1);
-    assert_eq!(m.stats.invalidations, 1);
-    assert!(m.stats.compilations > compilations);
-    assert_eq!(m.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
+    support::x64_shape!(assert!(m.stats.compilations > compilations));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 mod sparse_memory {
@@ -640,11 +649,11 @@ mod sparse_memory {
                 assert_eq!(jit.reg(Reg::Eflags), uc.reg(Reg::Eflags));
                 if stop {
                     assert_eq!(actual, Exit::Parked);
-                    assert_eq!(jit.stats().interpreter_entries, 0);
+                    support::x64_shape!(assert_eq!(jit.stats().interpreter_entries, 0));
                 } else {
                     assert!(matches!(actual, Exit::Fault(_)));
                     assert_eq!(jit.reg(Reg::Eip), CODE);
-                    assert_eq!(jit.stats().bulk_bytes, 0);
+                    support::x64_shape!(assert_eq!(jit.stats().bulk_bytes, 0));
                     for c in [&mut jit, &mut uc] {
                         c.map(SRC + 4096, 4096, Prot::RW).unwrap();
                         c.map(DST + 4096, 4096, Prot::RW).unwrap();
@@ -709,6 +718,6 @@ mod sparse_memory {
         assert_eq!(cpu.reg(Reg::Ecx), 0);
         assert_eq!(cpu.reg(Reg::Edi), BUFFER + SIZE);
         assert_eq!(cpu.reg(Reg::Eflags), 0x46);
-        assert_eq!(cpu.stats().interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
     }
 }

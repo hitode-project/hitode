@@ -6,6 +6,10 @@
 //! under Unicorn arm64 in host tests, so most work needs no device.
 
 pub mod encode;
+mod executor;
+
+pub use adv_cpu_core::*;
+pub use executor::{ExecutionContext, Executor, Stats};
 
 #[cfg(test)]
 mod emulator;

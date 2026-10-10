@@ -15,9 +15,13 @@ jit-verifier = ["adv-cpu-x64/jit-verifier"]
 gir-capture = ["adv-cpu-x64/gir-capture"]
 gir-lift = ["adv-cpu-x64/gir-lift"]
 cross-dump = ["adv-cpu-x64/cross-dump"]
+# Migration comparison, deleted at a64 M3: integration tests built with it
+# drive the a64 executor instead of the x64 one. Production code ignores it.
+test-a64 = []
 
 [dev-dependencies]
 adv-cpu = { path = ".", features = ["jit-verifier"] }
+adv-cpu-a64 = { path = "../adv-cpu-a64" }
 adv-sync = { path = "../adv-sync" }
 adv-unicorn = { path = "../adv-unicorn" }
 cranelift-codegen = "0.125"

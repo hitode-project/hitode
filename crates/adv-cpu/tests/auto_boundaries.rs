@@ -1,3 +1,5 @@
+// Tests x64 engine mechanisms; the a64 engine has its own.
+#![cfg(not(feature = "test-a64"))]
 mod support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;

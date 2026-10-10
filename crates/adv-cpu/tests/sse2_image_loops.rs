@@ -80,8 +80,8 @@ fn equal_cpu(actual: &CpuState, expected: &CpuState) {
 }
 
 fn native_only(m: &Executor) {
-    assert_eq!(m.stats.interpreter_entries, 0);
-    assert_eq!(m.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
 }
 
 fn finish(jit: &mut Executor, interpreter: &mut Executor, uc: &mut Executor) {
@@ -418,7 +418,7 @@ fn masked_protection_fallback_is_transactional_and_zero_mask_never_accesses_memo
             let expected = interpreter.run(STOP, 100).unwrap();
             assert_eq!(actual, expected, "mask={mask:#x}");
             equal_cpu(&jit.state, &interpreter.state);
-            assert!(jit.stats.interpreter_entries > 0);
+            support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
             if mask == 0x00ff {
                 // The protected page is wholly unselected. Full-span native
                 // admission falls back; the checked masked write succeeds.
@@ -447,7 +447,7 @@ fn masked_protection_fallback_is_transactional_and_zero_mask_never_accesses_memo
                 assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
                 assert_eq!(interpreter.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
                 equal_cpu(&jit.state, &interpreter.state);
-                assert_eq!(jit.stats.interpreter_entries, fallbacks);
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, fallbacks));
                 assert_eq!(
                     jit.memory().read(at, 16).unwrap(),
                     masked_expected(&before, 0, &state)
@@ -482,7 +482,7 @@ fn masked_protection_fallback_is_transactional_and_zero_mask_never_accesses_memo
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(interpreter.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         equal_cpu(&jit.state, &interpreter.state);
-        assert!(jit.stats.interpreter_entries > 0);
+        support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
         assert_eq!(
             jit.memory().read(DATA, 32).unwrap(),
             masked_expected(&before, 3, &state)
@@ -518,7 +518,7 @@ fn maskmovdqu_shared_file_page_keeps_checked_masked_write_semantics() {
                 cpu.executor_mut().run(STOP, 100).unwrap(),
                 RunOutcome::ReachedStop
             );
-            assert!(cpu.stats().interpreter_entries > 0);
+            support::x64_shape!(assert!(cpu.stats().interpreter_entries > 0));
             let mut actual = [0; 32];
             cpu.read(DATA, &mut actual).unwrap();
             assert_eq!(actual.as_slice(), masked_expected(&before, 3, &state));

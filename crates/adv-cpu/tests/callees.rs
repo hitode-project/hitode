@@ -136,9 +136,9 @@ fn observed_callees_run_inside_the_caller_and_follow_their_own_code_pages() {
             assert_eq!(jit.state.mmx, reference.state.mmx);
             assert_eq!(jit.state.eflags & 0x8d5, reference.state.eflags & 0x8d5);
             if subtract {
-                assert!(jit.stats.invalidations > 0);
+                support::x64_shape!(assert!(jit.stats.invalidations > 0));
             } else {
-                assert_eq!(jit.stats.interpreter_entries, 0);
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
                 transfers.push(jit.stats.native_entries - before);
             }
         }

@@ -96,7 +96,7 @@ fn completed(jit: &mut Executor, interpreter: &mut Executor, unicorn: &mut Execu
         RunOutcome::ReachedStop
     );
     compare(jit, interpreter, unicorn);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 fn words(values: [i16; 8]) -> [u8; 16] {
@@ -192,7 +192,7 @@ fn mmx_xmm_moves_survive_native_dispatch_and_emms() {
         region.compile_strategy = strategy;
         jit.add_region(region).unwrap();
         completed(&mut jit, &mut interpreter, &mut unicorn);
-        assert!(jit.stats.native_entries >= 2);
+        support::x64_shape!(assert!(jit.stats.native_entries >= 2));
         assert_eq!(&jit.state.xmm[2][..8], &state.xmm[4][..8]);
         assert_eq!(&jit.state.xmm[2][8..], &[0; 8]);
         assert_eq!(jit.state.x87.tag, 0xffff);
@@ -391,7 +391,7 @@ fn packed_memory_faults_preserve_the_committed_prefix_and_resume() {
                     RunOutcome::ReachedStop
                 );
                 compare(&mut jit, &mut interpreter, &mut unicorn);
-                assert_eq!(jit.stats.interpreter_entries, fallbacks);
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, fallbacks));
             }
         }
     }

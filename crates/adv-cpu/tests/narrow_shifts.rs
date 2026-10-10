@@ -157,11 +157,11 @@ fn byte_and_word_shifts_match_both_references_for_all_registers_and_counts() {
                         }
                     }
                 }
-                assert_eq!(
+                support::x64_shape!(assert_eq!(
                     native.stats.interpreter_entries, 0,
                     "destination={destination}, operation={operation}, count={encoded:?}"
-                );
-                assert_eq!(interpreted.stats.native_entries, 0);
+                ));
+                support::x64_shape!(assert_eq!(interpreted.stats.native_entries, 0));
             }
         }
     }
@@ -223,7 +223,7 @@ fn narrow_shift_flags_are_consumed_inside_native_fast_and_speed_regions() {
                     assert_eq!(actual[n], reference[n], "count={count}, flag byte={n}");
                 }
             }
-            assert_eq!(native.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(native.stats.interpreter_entries, 0));
         }
     }
 }
@@ -267,7 +267,7 @@ fn pal_style_mmx_rotate_and_loop_keeps_narrow_shifts_native() {
             native.memory().read(DATA + 16, 8).unwrap(),
             unicorn.memory().read(DATA + 16, 8).unwrap()
         );
-        assert_eq!(native.stats.interpreter_entries, 0);
-        assert_eq!(native.stats.interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(native.stats.interpreter_entries, 0));
+        support::x64_shape!(assert_eq!(native.stats.interpreter_instructions, 0));
     }
 }

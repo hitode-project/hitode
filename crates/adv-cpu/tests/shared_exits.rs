@@ -142,7 +142,7 @@ fn repeated_guards_preserve_each_faulting_prefix() {
                     jit.memory().read(DATA, 8192).unwrap(),
                     uc.memory().read(DATA, 8192).unwrap()
                 );
-                assert_eq!(jit.stats.interpreter_entries, 0);
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
             }
         }
     }
@@ -191,7 +191,7 @@ fn read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_sta
                 assert_eq!(jit.memory().read(BAD, 16).unwrap(), [0x5a; 16]);
             }
         }
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -249,11 +249,11 @@ fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
                 assert_eq!(jit.run(STOP, 2).unwrap(), RunOutcome::ReachedStop);
                 assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
                 equal_state(&mut jit, &mut uc);
-                assert_eq!(
+                support::x64_shape!(assert_eq!(
                     jit.stats.native_entries,
                     entries + 2,
                     "dispatch must reach the second compiled region"
-                );
+                ));
                 assert_eq!(jit.state.fuel, 0);
                 assert_eq!(
                     jit.memory().read(DATA + 64, 16).unwrap(),
@@ -265,7 +265,7 @@ fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
                 );
             }
         }
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -308,16 +308,24 @@ fn cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs() {
                 assert_eq!(jit.state.fault_addr, INITIAL_FAULT_ADDRESS);
                 // Exhausting the native budget before PAUSE does not execute
                 // or count an interpreter instruction.
-                assert_eq!(jit.stats.interpreter_entries, interpreter_entries);
-                assert_eq!(jit.stats.interpreter_instructions, interpreter_instructions);
+                support::x64_shape!(assert_eq!(
+                    jit.stats.interpreter_entries,
+                    interpreter_entries
+                ));
+                support::x64_shape!(assert_eq!(
+                    jit.stats.interpreter_instructions,
+                    interpreter_instructions
+                ));
                 equal_state(&mut jit, &mut uc);
                 assert_eq!(
                     jit.state.regs[2], 0x89ab_cdef,
                     "no predecessor write was replayed"
                 );
                 assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-                assert!(jit.stats.interpreter_entries > interpreter_entries);
-                assert!(jit.stats.interpreter_instructions > interpreter_instructions);
+                support::x64_shape!(assert!(jit.stats.interpreter_entries > interpreter_entries));
+                support::x64_shape!(assert!(
+                    jit.stats.interpreter_instructions > interpreter_instructions
+                ));
                 assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
                 equal_state(&mut jit, &mut uc);
             }

@@ -78,7 +78,7 @@ fn equal_state(jit: &Executor, reference: &Executor) {
     assert_eq!(jit.state.regs, reference.state.regs);
     assert_eq!(jit.state.eflags, reference.state.eflags);
     assert_eq!(jit.state.eip, reference.state.eip);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 fn equal_fault_state(jit: &Executor, reference: &Executor, address: u32) {

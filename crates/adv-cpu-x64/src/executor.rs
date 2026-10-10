@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::cliffs::InterpreterDetail;
 use crate::compile::{self, Compiled};
 use crate::trap::{Bridge, ExecutionTrap};
-use crate::{CompileStrategy, CpuState, Exit, Memory, ProfileSample, Region};
+use crate::{CompileStrategy, CpuState, Exit, Memory, ProfileSample, Region, RunOutcome};
 
 mod code_store;
 mod coverage;
@@ -80,20 +80,6 @@ pub struct Stats {
     pub cliffs: Box<crate::Cliffs>,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RunOutcome {
-    ReachedStop,
-    Budget,
-    Interrupted,
-    ReadFault { pc: u32, address: u32 },
-    WriteFault { pc: u32, address: u32 },
-    FetchFault { pc: u32, address: u32 },
-    InvalidInstruction { pc: u32 },
-    UnsupportedInstruction { pc: u32, code: iced_x86::Code },
-    Trap { pc: u32, vector: u8 },
-    Parked,
 }
 
 /// Executed blocks after which an automatic Fast unit is recompiled for Speed.

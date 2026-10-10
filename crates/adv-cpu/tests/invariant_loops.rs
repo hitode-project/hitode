@@ -1,7 +1,7 @@
 mod support;
 
 use adv_cpu::backend::{FilePage, Guest, Prot};
-use adv_cpu::{CompileStrategy, EXEC, JitCpu, READ, Region, RunOutcome, WRITE};
+use adv_cpu::{CompileStrategy, CpuState, EXEC, JitCpu, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, OpKind};
 use support::Executor;
@@ -86,10 +86,10 @@ fn oracle_finish(m: &mut Executor) -> RunOutcome {
     panic!("authored invariant loop did not finish");
 }
 
-fn equal_cpu(jit: &adv_cpu::Executor, reference: &Executor) {
-    assert_eq!(jit.state.regs, reference.state.regs);
-    assert_eq!(jit.state.eflags, reference.state.eflags);
-    assert_eq!(jit.state.eip, reference.state.eip);
+fn equal_cpu(jit: &CpuState, reference: &Executor) {
+    assert_eq!(jit.regs, reference.state.regs);
+    assert_eq!(jit.eflags, reference.state.eflags);
+    assert_eq!(jit.eip, reference.state.eip);
 }
 
 fn checkpoint(jit: &Executor, reference: &mut Executor, outcome: &RunOutcome) {
@@ -106,7 +106,7 @@ fn checkpoint(jit: &Executor, reference: &mut Executor, outcome: &RunOutcome) {
     } else {
         assert_eq!(oracle_finish(reference), *outcome);
     }
-    equal_cpu(jit, reference);
+    equal_cpu(&jit.state, reference);
     assert_eq!(word(jit, COUNT), word(reference, COUNT));
     if let RunOutcome::ReadFault { address, .. } | RunOutcome::WriteFault { address, .. } = outcome
     {
@@ -141,7 +141,7 @@ fn unproven_alias_writes_remain_visible_to_every_invariant_read() {
             assert_eq!(word(&jit, SLOT + 4), word(&jit, SLOT));
             assert_eq!(jit.state.regs[2], 0x2244_6688);
             assert_eq!(jit.state.regs[7], 0x7788_99aa);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -171,7 +171,7 @@ fn rejected_cross_page_and_executable_writes_keep_exact_prefixes_and_reenter() {
                 "cross-page case: strategy={strategy:?}, permissions={permissions:#x}, jit regs={:x?}, interpreter regs={:x?}",
                 jit.state.regs, reference.state.regs
             );
-            equal_cpu(&jit, &reference);
+            equal_cpu(&jit.state, &reference);
             match &outcome {
                 RunOutcome::ReadFault { pc, address } | RunOutcome::WriteFault { pc, address } => {
                     // Independently verify every completed instruction with
@@ -183,7 +183,7 @@ fn rejected_cross_page_and_executable_writes_keep_exact_prefixes_and_reenter() {
                         assert!(step != 255, "Unicorn missed the checked fault prefix");
                         assert_eq!(uc.run_unicorn(STOP, 1).unwrap(), RunOutcome::Budget);
                     }
-                    equal_cpu(&jit, &uc);
+                    equal_cpu(&jit.state, &uc);
                     assert_eq!(jit.state.fault_addr, *address);
                     assert_eq!(
                         jit.memory().read(slot, 8).unwrap(),
@@ -192,7 +192,7 @@ fn rejected_cross_page_and_executable_writes_keep_exact_prefixes_and_reenter() {
                 }
                 RunOutcome::ReachedStop => {
                     assert_eq!(oracle_finish(&mut uc), RunOutcome::ReachedStop);
-                    equal_cpu(&jit, &uc);
+                    equal_cpu(&jit.state, &uc);
                 }
                 other => panic!("unexpected cross-page outcome: {other:?}"),
             }
@@ -212,13 +212,13 @@ fn rejected_cross_page_and_executable_writes_keep_exact_prefixes_and_reenter() {
                 assert_eq!(resumed, RunOutcome::ReachedStop);
                 assert_eq!(reference.run(STOP, 100).unwrap(), resumed);
                 assert_eq!(oracle_finish(&mut uc), resumed);
-                equal_cpu(&jit, &reference);
-                equal_cpu(&jit, &uc);
+                equal_cpu(&jit.state, &reference);
+                equal_cpu(&jit.state, &uc);
                 assert_eq!(
                     jit.memory().read(slot, 8).unwrap(),
                     uc.memory().read(slot, 8).unwrap()
                 );
-                assert_eq!(jit.stats.interpreter_entries, 0);
+                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
             } else {
                 // Executable guest writes use the existing SMC fallback.
                 assert_eq!(outcome, RunOutcome::ReachedStop);
@@ -269,7 +269,7 @@ fn side_entry_budget_restarts_and_wrapped_invariant_addresses_match_the_oracle()
                 assert!(round != 127);
             }
             assert_eq!(word(&jit, SLOT), 10 + ITERATIONS * 7);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -301,7 +301,7 @@ fn shared_file_operands_keep_checked_io_and_observe_each_alias_write() {
             RunOutcome::ReachedStop
         );
         assert_eq!(oracle_finish(&mut reference), RunOutcome::ReachedStop);
-        equal_cpu(cpu.executor_mut(), &reference);
+        equal_cpu(&cpu.executor().state, &reference);
         let mut actual = [0; 8];
         cpu.read(SLOT, &mut actual).unwrap();
         assert_eq!(actual.as_slice(), reference.memory().read(SLOT, 8).unwrap());
@@ -309,7 +309,7 @@ fn shared_file_operands_keep_checked_io_and_observe_each_alias_write() {
             u32::from_le_bytes(actual[..4].try_into().unwrap()),
             10 + ITERATIONS * 7
         );
-        assert_eq!(cpu.stats().interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(cpu.stats().interpreter_instructions, 0));
     }
 }
 
@@ -365,7 +365,7 @@ fn scoped_clone_exits_restore_state_and_reprove_a_changed_base_on_reentry() {
             }
             let untouched_regs = jit.state.regs;
             assert_eq!(jit.run(STOP, 0).unwrap(), RunOutcome::Budget);
-            equal_cpu(&jit, &reference);
+            equal_cpu(&jit.state, &reference);
             assert_eq!(jit.state.xmm, sentinels);
 
             let mut finished = false;
@@ -398,7 +398,7 @@ fn scoped_clone_exits_restore_state_and_reprove_a_changed_base_on_reentry() {
                     assert_eq!(oracle_finish(&mut reference), outcome);
                     finished = true;
                 }
-                equal_cpu(&jit, &reference);
+                equal_cpu(&jit.state, &reference);
                 assert_eq!(
                     jit.state.xmm, reference.state.xmm,
                     "XMM state at reentry prefix: strategy={strategy:?}, budget={budget}, round={round}"
@@ -431,7 +431,7 @@ fn scoped_clone_exits_restore_state_and_reprove_a_changed_base_on_reentry() {
             expected_xmm0[..4].copy_from_slice(&untouched_regs[2].to_le_bytes());
             assert_eq!(jit.state.xmm[0], expected_xmm0);
             assert_eq!(jit.state.xmm[1..], sentinels[1..]);
-            assert_eq!(jit.stats.interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }

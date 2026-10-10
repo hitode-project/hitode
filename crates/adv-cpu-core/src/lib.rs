@@ -146,3 +146,55 @@ pub enum CompileStrategy {
     /// Skip expensive optimization passes to reduce cold compilation time.
     Fast,
 }
+
+/// How a bounded execution run ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    ReachedStop,
+    Budget,
+    Interrupted,
+    ReadFault { pc: u32, address: u32 },
+    WriteFault { pc: u32, address: u32 },
+    FetchFault { pc: u32, address: u32 },
+    InvalidInstruction { pc: u32 },
+    UnsupportedInstruction { pc: u32, code: iced_x86::Code },
+    Trap { pc: u32, vector: u8 },
+    Parked,
+}
+
+/// A bounded region of x86 instructions. Extra entries can come from a profile or
+/// a discovered jump table; they must name instruction boundaries.
+#[derive(Clone, Debug)]
+pub struct Region {
+    pub start: u32,
+    pub len: usize,
+    pub entries: Vec<u32>,
+    /// Transfers to these guest PCs leave this compilation unit. Automatic
+    /// discovery uses existing entries and bounded CFG edges as link frontiers.
+    pub frontier: Vec<u32>,
+    /// Decode control flow from entries instead of scanning embedded data and padding.
+    pub reachable: bool,
+    /// Complete a final instruction whose start is inside this region. Automatic
+    /// regions enable this; explicit regions retain their strict byte boundary.
+    pub complete_tail: bool,
+    pub compile_strategy: CompileStrategy,
+    /// Observed indirect call targets at or below this region. Their
+    /// straight-line code is decoded into this unit so a call and its return
+    /// dispatch internally. They are not entries of this unit.
+    pub callees: Vec<u32>,
+}
+
+impl Region {
+    pub fn new(start: u32, len: usize) -> Self {
+        Self {
+            start,
+            len,
+            entries: Vec::new(),
+            frontier: Vec::new(),
+            reachable: false,
+            complete_tail: false,
+            compile_strategy: CompileStrategy::Speed,
+            callees: Vec::new(),
+        }
+    }
+}

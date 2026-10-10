@@ -124,8 +124,8 @@ fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
     assert_eq!(on.state.eflags, off.state.eflags);
     assert_eq!(on.state.eflags, uc.state.eflags);
     // x87 runs inside the native region with and without linking.
-    assert_eq!(on.stats.interpreter_instructions, 0);
-    assert_eq!(off.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(on.stats.interpreter_instructions, 0));
+    support::x64_shape!(assert_eq!(off.stats.interpreter_instructions, 0));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
     assert_eq!(on.state.mmx, uc.state.mmx);
     // Invalid, denormal and precision flags were checked independently above.
     // Special operands use the same shared transaction without leaving the region.
-    assert_eq!(on.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(on.stats.interpreter_instructions, 0));
 }
 
 #[test]
@@ -304,8 +304,11 @@ fn code_writes_invalidate_before_native_reentry() {
         m.memory().read(CODE + 0x300, 32).unwrap(),
         &expected(false)[..32]
     );
-    assert!(m.stats.invalidations > 0);
-    assert_eq!(m.stats.interpreter_instructions, interpreted_before);
+    support::x64_shape!(assert!(m.stats.invalidations > 0));
+    support::x64_shape!(assert_eq!(
+        m.stats.interpreter_instructions,
+        interpreted_before
+    ));
 }
 
 #[test]

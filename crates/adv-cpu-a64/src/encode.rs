@@ -57,7 +57,7 @@ pub enum Shift {
 }
 
 const fn wide(base: u32, size: Size, rd: Reg, imm: u16, shift: u32) -> u32 {
-    assert!(shift % 16 == 0 && shift < size.bits());
+    assert!(shift.is_multiple_of(16) && shift < size.bits());
     base | size.sf() | (shift / 16) << 21 | (imm as u32) << 5 | rd.number()
 }
 

@@ -211,7 +211,7 @@ fn loop_instruction_latches_match_unicorn_inside_and_across_page_permissions() {
     let mut m = machine(&copy, Some(CompileStrategy::Speed));
     m.state.regs = regs(1500, SRC, DST);
     assert_eq!(m.run(STOP, 1 << 30).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(m.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
     assert_eq!(
         m.memory().read(DST, 12000).unwrap(),
         m.memory().read(SRC, 12000).unwrap()
@@ -582,7 +582,7 @@ fn versioned_invariant_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.state.regs[1], 100_000_000 - completed);
     let sum = u32::from_le_bytes(m.memory().read(DST, 4).unwrap().try_into().unwrap());
     assert_eq!(sum, completed);
-    assert_eq!(m.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 10;
     assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
@@ -1855,7 +1855,7 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     assert_eq!(m.state.regs[7], SRC + done * width);
     assert_eq!(m.state.mmx[0], 0);
     assert_eq!(budget - m.state.fuel, u64::from(done) + u64::from(!looping));
-    assert_eq!(m.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 11;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);

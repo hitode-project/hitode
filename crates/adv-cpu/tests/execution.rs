@@ -96,7 +96,10 @@ fn integer_flags_match_unicorn_at_overflow_and_carry_boundaries() {
                 );
             }
         }
-        assert_eq!(jit.stats.interpreter_entries, 0, "operation {operation}");
+        support::x64_shape!(assert_eq!(
+            jit.stats.interpreter_entries, 0,
+            "operation {operation}"
+        ));
     }
 }
 
@@ -124,8 +127,8 @@ fn direct_loop_and_memory_keep_execution_in_one_native_region() {
         reset(m, [0, 64, 0, 0, 0, 0, DATA, DATA + 1024], 2);
     }
     equal(&mut jit, &mut uc, 0x8d5);
-    assert_eq!(jit.stats.native_entries, 1);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.native_entries, 1));
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -148,8 +151,8 @@ fn calls_returns_and_indirect_targets_stay_native() {
     reset(&mut uc, [0, 100, 0, 0, 0, 0, 0, 0], 2);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 300);
-    assert_eq!(jit.stats.native_entries, 1);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.native_entries, 1));
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -175,9 +178,9 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 5u32.to_le_bytes());
     // The cold interpreter may include successors in each window. Count real
     // work while the memory and architectural comparisons catch any replay.
-    assert!(jit.stats.interpreter_entries >= 5);
-    assert!(jit.stats.interpreter_instructions >= 5);
-    assert!(jit.stats.native_entries >= 5);
+    support::x64_shape!(assert!(jit.stats.interpreter_entries >= 5));
+    support::x64_shape!(assert!(jit.stats.interpreter_instructions >= 5));
+    support::x64_shape!(assert!(jit.stats.native_entries >= 5));
 }
 
 #[test]
@@ -244,7 +247,7 @@ fn host_patch_invalidates_native_and_unicorn_code() {
     reset(&mut jit, [0; 8], 2);
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(jit.state.regs[0], 42);
-    assert_eq!(jit.stats.invalidations, 1);
+    support::x64_shape!(assert_eq!(jit.stats.invalidations, 1));
 }
 
 #[test]
@@ -261,7 +264,7 @@ fn guest_patch_exits_before_write_and_invalidates_the_active_region() {
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(jit.state.regs[0], 42);
     assert_eq!(jit.memory().read(CODE + 7, 4).unwrap(), 42u32.to_le_bytes());
-    assert!(jit.stats.invalidations >= 1);
+    support::x64_shape!(assert!(jit.stats.invalidations >= 1));
 }
 
 #[test]
@@ -322,7 +325,7 @@ fn all_conditions_observe_lazy_flags_after_comparison() {
                 equal(&mut jit, &mut uc, 0x8d5);
             }
         }
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -355,9 +358,9 @@ fn an_indirect_target_is_reloaded_after_a_pointer_patch() {
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs[0], expected);
     }
-    assert_eq!(jit.stats.compilations, 1);
-    assert_eq!(jit.stats.native_entries, 2);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.compilations, 1));
+    support::x64_shape!(assert_eq!(jit.stats.native_entries, 2));
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -382,7 +385,7 @@ fn interpreted_floating_state_survives_native_islands() {
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 10f32.to_le_bytes());
     // The loop's x87 instructions stay inside the native region.
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -414,7 +417,7 @@ fn interpreted_sse_state_survives_native_islands() {
     }
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA + 32, 4).unwrap(), 9u32.to_le_bytes());
-    assert!(jit.stats.native_entries >= 9);
+    support::x64_shape!(assert!(jit.stats.native_entries >= 9));
 }
 
 #[test]
@@ -477,7 +480,7 @@ fn bytecode_loads_sign_extension_and_partial_registers_match() {
         }
         equal(&mut jit, &mut uc, 0x8d5);
     }
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -517,7 +520,7 @@ fn a_modified_return_address_misses_the_native_return_hint() {
     let mut uc = machine(&code, false);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 17);
-    assert_eq!(jit.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -575,7 +578,10 @@ fn integer_sse2_lanes_match_unicorn_including_saturation_and_packing() {
             }
             equal(&mut jit, &mut uc, 0x8d5);
         }
-        assert_eq!(jit.stats.interpreter_entries, 0, "SSE2 operation {op}");
+        support::x64_shape!(assert_eq!(
+            jit.stats.interpreter_entries, 0,
+            "SSE2 operation {op}"
+        ));
     }
 }
 
@@ -598,7 +604,7 @@ fn sse2_shift_counts_at_and_above_lane_width_zero_the_result() {
             m.write(DATA, &[0xfd; 16]).unwrap();
         }
         equal(&mut jit, &mut uc, 0x8d5);
-        assert_eq!(jit.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -708,6 +714,7 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
 }
 
 #[test]
+#[cfg(not(feature = "test-a64"))] // x64 tier verification
 fn tier_verification_checks_new_regions_without_changing_results() {
     let code = assemble(|a| {
         let mut top = a.create_label();

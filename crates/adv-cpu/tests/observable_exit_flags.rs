@@ -101,7 +101,7 @@ fn budget_and_memory_faults_publish_flags_before_a_future_full_writer() {
             assert_eq!(jit.run(STOP, 100).unwrap(), fault);
             assert_eq!(jit.state.regs, uc.state.regs);
             assert_eq!(jit.state.eflags, uc.state.eflags);
-            assert_eq!(jit.stats.interpreter_instructions, 0);
+            support::x64_shape!(assert_eq!(jit.stats.interpreter_instructions, 0));
         }
     }
 }
@@ -162,7 +162,7 @@ fn carry_controls_publish_exact_flags_at_budget_and_fault_boundaries() {
             assert_eq!(fresh.run(STOP, 100).unwrap(), fault);
             assert_eq!(fresh.state.regs, reference.state.regs);
             assert_eq!(fresh.state.eflags, reference.state.eflags);
-            assert_eq!(fresh.stats.interpreter_instructions, 0);
+            support::x64_shape!(assert_eq!(fresh.stats.interpreter_instructions, 0));
         }
     }
 }
@@ -212,6 +212,6 @@ fn a_native_backedge_interrupt_publishes_the_last_lazy_flags() {
             "no instruction from the next iteration ran"
         );
         assert_eq!(jit.state.eflags, uc.state.eflags);
-        assert_eq!(jit.stats.interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_instructions, 0));
     }
 }

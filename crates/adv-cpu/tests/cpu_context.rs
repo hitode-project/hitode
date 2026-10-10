@@ -214,7 +214,7 @@ fn native_mmx_writes_only_destination_exponents_and_supersedes_prior_emms() {
     m.restore_context(&snapshot).unwrap();
     assert_eq!(m.state.mmx[2], 0x89ab_cdef);
     assert_eq!(m.state.mmx_mode, 0);
-    assert_eq!(m.stats.interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn native_mmx_write_masks_survive_region_links_and_context_boundaries() {
                 written.map_or(previous, |bits| X87Register::from_parts(bits, 0xffff)),
             );
         }
-        assert_eq!(m.stats.interpreter_entries, 0);
+        support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
     }
 }
 

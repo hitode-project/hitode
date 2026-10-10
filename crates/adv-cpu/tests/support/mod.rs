@@ -275,15 +275,37 @@ impl Oracle {
     }
 }
 
+/// Asserts about the x64 engine's execution shape (native entries, compiled
+/// units, bulk counters). Skipped when the tests drive the a64 engine, so the
+/// semantic checks around them still run there.
+#[allow(unused_macros)]
+macro_rules! x64_shape {
+    ($($body:tt)*) => {
+        // Still type-checked under a64, so its operands stay in use.
+        if !cfg!(all(test, feature = "test-a64")) {
+            $($body)*
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use x64_shape;
+
+/// The engine under test; `--features test-a64` selects the a64 executor for
+/// integration tests. Examples share this module and keep the x64 executor.
+#[cfg(not(all(test, feature = "test-a64")))]
+pub type Engine = adv_cpu::Executor;
+#[cfg(all(test, feature = "test-a64"))]
+pub type Engine = adv_cpu_a64::Executor;
+
 /// Keeps existing differential fixtures' construction API while isolating UC entirely
 /// in their dev-only reference. Ordinary run dereferences to production.
 pub struct Executor {
-    inner: adv_cpu::Executor,
+    inner: Engine,
     oracle: Oracle,
     oracle_needs_sync: bool,
 }
 impl Deref for Executor {
-    type Target = adv_cpu::Executor;
+    type Target = Engine;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -296,14 +318,14 @@ impl DerefMut for Executor {
 impl Executor {
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Ok(Self {
-            inner: adv_cpu::Executor::new(base, len)?,
+            inner: Engine::new(base, len)?,
             oracle: Oracle::new(base, len)?,
             oracle_needs_sync: false,
         })
     }
     pub fn address_space() -> Result<Self, String> {
         Ok(Self {
-            inner: adv_cpu::Executor::address_space()?,
+            inner: Engine::address_space()?,
             oracle: Oracle::address_space()?,
             oracle_needs_sync: false,
         })
@@ -367,4 +389,14 @@ impl Executor {
         self.after_oracle()?;
         result
     }
+}
+
+/// x64 tuning has no a64 counterpart; fixtures that set it keep compiling.
+#[cfg(all(test, feature = "test-a64"))]
+impl Executor {
+    pub fn enable_auto_jit(&mut self, _enabled: bool) {}
+    pub fn set_region_linking(&mut self, _enabled: bool) {}
+    pub fn set_tier_verification(&mut self, _mode: Option<bool>) {}
+    pub fn set_profiling(&mut self, _enabled: bool) {}
+    pub fn set_auto_compile_strategy(&mut self, _strategy: adv_cpu::CompileStrategy) {}
 }

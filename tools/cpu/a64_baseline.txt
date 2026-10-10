@@ -1,0 +1,39 @@
+# Tests expected to fail when adv-cpu integration tests drive the a64 engine
+# (`cargo test -p adv-cpu --features test-a64 --tests`), judged with
+# `acceptance.py --strict --baseline tools/cpu/a64_baseline.txt`. One name per
+# line. Delete entries as a64 milestones make them pass; the file goes at M3.
+#
+# x64 execution shape: native entry, compilation, invalidation, bulk and
+# cliff counters of the Cranelift engine. a64 reports its own counters.
+cliffs_attribute_exact_x87_work_to_the_control_word
+cliffs_count_native_fallbacks_by_instruction
+comparison_can_resume_from_native_through_interpreter_back_to_native
+huge_counts_can_stop_early_and_long_unknown_spans_preserve_element_budget
+observed_callees_run_inside_the_caller_and_follow_their_own_code_pages
+
+# Fuel boundaries: until M1 translates, a64 interprets everything and charges
+# fuel per instruction, while these assert x64's per-block native charge.
+a_later_region_budget_exit_keeps_prior_writes_and_untouched_sentinels
+a_native_backedge_interrupt_publishes_the_last_lazy_flags
+budget_and_memory_faults_publish_flags_before_a_future_full_writer
+budget_merge_and_dispatch_save_state_before_another_region_consumes_it
+budget_yields_in_a_busy_loop_without_a_system_call
+carry_controls_publish_exact_flags_at_budget_and_fault_boundaries
+cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs
+compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state
+descending_overlap_yields_and_resumes_without_snapshotting_the_source
+finite_large_comparisons_commit_bounded_chunks_and_restore_independent_contexts
+large_repeats_yield_at_chunk_boundaries_and_resume_independent_contexts
+memory_bound_permissions_changed_between_slices_preserve_the_fault_prefix
+native_comparison_fault_after_a_slice_restores_instruction_input_flags
+packed_loop_transfers_preserve_aliases_faults_and_every_budget_prefix
+packed_scalar_fills_preserve_width_sources_tails_and_faults
+read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_state
+repeated_guards_preserve_each_faulting_prefix
+rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration
+
+# Page-split store faults: these assert x64's access-start address. Intel
+# hardware, like the core interpreter, reports the first inaccessible byte;
+# the tests move with the x64 fix.
+mmx_store_fault_checks_both_pages_before_writing
+vector_store_fault_checks_both_pages_before_writing

@@ -55,8 +55,8 @@ fn native_word_idiv_exit_uses_shared_state_then_resumes_native_without_unicorn()
     assert_eq!(hybrid.state.eflags, reference.state.eflags);
     assert_eq!(hybrid.state.regs[0] as i32, -14);
     assert_eq!(hybrid.state.regs[2] as i32, -3);
-    assert_eq!(hybrid.stats.interpreter_entries, 1);
-    assert_eq!(hybrid.stats.interpreter_instructions, 1);
+    support::x64_shape!(assert_eq!(hybrid.stats.interpreter_entries, 1));
+    support::x64_shape!(assert_eq!(hybrid.stats.interpreter_instructions, 1));
 }
 
 #[test]
@@ -72,11 +72,11 @@ fn interpreter_fault_preserves_native_prefix_and_resumes_only_faulting_instructi
     assert_eq!(m.state.regs[2], u32::MAX);
     assert_eq!(m.state.regs[3], 100);
     assert_eq!(m.state.fault_addr, address);
-    assert_eq!(m.stats.interpreter_entries, 1);
-    assert_eq!(m.stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 1));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
     m.protect(address, 4096, READ | WRITE).unwrap();
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[3], 86);
-    assert_eq!(m.stats.interpreter_instructions, 1);
-    assert_eq!(m.stats.interpreter_entries, 2);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 1));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 2));
 }

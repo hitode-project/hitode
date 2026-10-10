@@ -20,7 +20,7 @@ RULES: dict[str, set[str]] = {
     "adv-cpu-core": {"adv-sync"},
     "adv-cpu-x64": {"adv-cpu-core"},
     "adv-cpu-a64": {"adv-cpu-core"},
-    "adv-cpu": {"adv-cpu-x64"},
+    "adv-cpu": {"adv-cpu-x64", "adv-cpu-a64"},
     "adv-machine": {"adv-cpu", "adv-sync"},
     "adv-abi": {"adv-machine", "adv-abi-macros"},
     "adv-abi-macros": set(),

@@ -95,6 +95,6 @@ fn narrow_integer_operations_run_natively_and_match_unicorn() {
                 }
             }
         }
-        assert_eq!(jit.stats.interpreter_entries, 0, "op {index}");
+        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0, "op {index}"));
     }
 }
