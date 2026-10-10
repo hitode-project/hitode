@@ -1,11 +1,12 @@
 //! Translated execution on AArch64 hosts.
 //!
-//! Units come from `translate`. An exit to a static target returns here
-//! once: the owner then patches its link point into a branch to the target
-//! unit, so hot paths chain without leaving translated code. Each unit's
-//! safepoint checks the countdown, which `run` sets from the fuel and
-//! `SLICE`, so a chain returns within its budget. A link is undone when its
-//! target is dropped. The shadow stack comes with the next M1 slice.
+//! Units come from `translate`. A dispatch does not leave translated code: the
+//! `dispatch` stub calls `dispatch`, which finds or translates the target
+//! unit and, for a static target, patches the link point into a direct
+//! branch, so hot paths chain without even that call. Each unit's safepoint
+//! checks the countdown, which `run` sets from the fuel and `SLICE`, so a
+//! chain returns within its budget. A link is undone when its target is
+//! dropped. The shadow stack comes with a later M1 slice.
 //!
 //! Faults (§6.3, §6.4): every host instruction that may fault has a side-table
 //! site naming its guest instruction. The signal handler only checks that the
@@ -28,10 +29,9 @@ use adv_cpu_core::CpuState;
 use adv_cpu_core::memory::Memory;
 
 use crate::cache::CodeCache;
-use crate::encode::Size::W;
-use crate::encode::{Reg, b, movz};
+use crate::encode::b;
 use crate::runtime::{self, Exit, Runtime};
-use crate::translate::{self, Features, Operand, Sense, Site};
+use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 const CACHE_LEN: usize = 64 << 20;
 
@@ -124,17 +124,50 @@ pub(crate) struct Run {
     pub translated: usize,
 }
 
+/// What `dispatch` works on during one `run`.
+struct Owner {
+    native: *mut Native,
+    memory: *mut Memory,
+    translated: usize,
+    error: Option<String>,
+}
+
+/// Called by the `dispatch` stub with the guest EIP and the link point to
+/// patch, or 0. Returns the unit to continue at, or 0 to leave.
+unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> usize {
+    // SAFETY: `run` points `owner` at a live `Owner` whose pointees it does
+    // not touch while translated code runs.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    if native.stops.contains(&eip) || owner.error.is_some() {
+        return 0;
+    }
+    let before = native.cache.used();
+    let unit = match native.link(memory, point, eip) {
+        Ok(unit) => unit,
+        Err(error) => {
+            owner.error = Some(error);
+            return 0;
+        }
+    };
+    owner.translated += native.cache.used().saturating_sub(before);
+    native.cache.sync();
+    native.faults.end.set(native.cache.next());
+    unit
+}
+
 pub(crate) struct Native {
     cache: CodeCache,
     enter: Enter,
-    exit: usize,
+    stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     stub_len: usize,
     units: HashMap<u32, Entry>,
     /// Unit entries by the guest pages their code came from.
     pages: HashMap<u32, Vec<u32>>,
-    /// Patched link points by the unit they branch to.
-    links: HashMap<u32, Vec<usize>>,
+    /// Patched link points, with the words they held, by the unit they
+    /// branch to.
+    links: HashMap<u32, Vec<(usize, u32)>>,
     /// Counts cache clears, which invalidate link points.
     generation: u64,
     /// Stop addresses seen so far; units end before all of them.
@@ -166,7 +199,10 @@ impl Native {
             },
             cache,
             enter,
-            exit: base + stubs.exit,
+            stubs: Stubs {
+                exit: base + stubs.exit,
+                dispatch: base + stubs.dispatch,
+            },
             units: HashMap::new(),
             pages: HashMap::new(),
             links: HashMap::new(),
@@ -190,7 +226,7 @@ impl Native {
     ) -> Result<Option<Run>, String> {
         self.invalidate(memory);
         self.observe_stop(stop);
-        let (entry, mut translated) = match self.units.get(&cpu.eip) {
+        let (entry, translated) = match self.units.get(&cpu.eip) {
             Some(&entry) => (entry, 0),
             None => {
                 let before = self.cache.used();
@@ -211,16 +247,35 @@ impl Native {
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         let budget = fuel.min(SLICE);
-        self.runtime.countdown = budget;
-        self.runtime.link = 0;
+        self.cache.sync();
         self.faults.end.set(self.cache.next());
-        self.runtime.cpu = cpu;
-        let previous = ACTIVE.replace(&self.faults);
-        // SAFETY: `unit` is translated code ending at the exit stub, and the
-        // runtime points at a live CPU for the duration of the call.
-        unsafe { (self.enter)(&mut *self.runtime, entry.unit) };
-        ACTIVE.set(previous);
+        let runtime: *mut Runtime = &mut *self.runtime;
+        let faults: *const Faults = &self.faults;
+        let enter = self.enter;
+        let mut owner = Owner {
+            native: self,
+            memory,
+            translated,
+            error: None,
+        };
+        // SAFETY: until `enter` returns, `self` is reached only through
+        // `owner`, by `dispatch`. `unit` is translated code ending at the
+        // stubs, and the runtime points at a live CPU for the call.
+        unsafe {
+            (*runtime).countdown = budget;
+            (*runtime).cpu = cpu;
+            (*runtime).helper = dispatch as *const () as u64;
+            (*runtime).owner = &raw mut owner as u64;
+            let previous = ACTIVE.replace(faults);
+            enter(runtime, entry.unit);
+            ACTIVE.set(previous);
+        }
         self.runtime.cpu = std::ptr::null_mut();
+        self.runtime.owner = 0;
+        if let Some(error) = owner.error {
+            return Err(error);
+        }
+        let translated = owner.translated;
         let exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
         let mut retired = budget - self.runtime.countdown;
@@ -228,11 +283,6 @@ impl Native {
             let site = self.faults.sites[&self.faults.pc.get()];
             recover(cpu, site, self.runtime.temps);
             retired += u64::from(site.retired);
-        }
-        if exit == Exit::Dispatch && self.runtime.link != 0 {
-            let before = self.cache.used();
-            self.link(memory, self.runtime.link as usize, cpu.eip)?;
-            translated += self.cache.used().saturating_sub(before);
         }
         let retired = retired as u32;
         Ok(Some(Run {
@@ -242,26 +292,23 @@ impl Native {
         }))
     }
 
-    /// Patches the link point at `point` into a branch to the unit at
-    /// `eip`, translating it if needed. Stops are never linked: the owner
-    /// must see them.
-    fn link(&mut self, memory: &mut Memory, point: usize, eip: u32) -> Result<(), String> {
-        if self.stops.contains(&eip) {
-            return Ok(());
-        }
+    /// The unit at `eip`, translated if needed; a nonzero `point` is
+    /// patched into a branch to it. The caller keeps stops unlinked: the
+    /// owner must see them.
+    fn link(&mut self, memory: &mut Memory, point: usize, eip: u32) -> Result<usize, String> {
         let generation = self.generation;
         let entry = match self.units.get(&eip) {
             Some(&entry) => entry,
             None => self.translate(memory, eip)?,
         };
-        if self.generation != generation {
-            // Translating cleared the cache and the link point with it.
-            return Ok(());
+        // Translating may have cleared the cache and the link point with it.
+        if point != 0 && self.generation == generation {
+            let word = self.cache.word(point);
+            self.cache
+                .patch(point, b((entry.unit as i64 - point as i64) as i32));
+            self.links.entry(eip).or_default().push((point, word));
         }
-        self.cache
-            .patch(point, b((entry.unit as i64 - point as i64) as i32));
-        self.links.entry(eip).or_default().push(point);
-        Ok(())
+        Ok(entry.unit)
     }
 
     /// Drops units whose guest code changed, and restores the link points
@@ -273,9 +320,8 @@ impl Native {
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
                 self.units.remove(&eip);
-                for point in self.links.remove(&eip).unwrap_or_default() {
-                    self.cache
-                        .patch(point, movz(W, Reg::new(0), Exit::Dispatch as u16, 0));
+                for (point, word) in self.links.remove(&eip).unwrap_or_default() {
+                    self.cache.patch(point, word);
                 }
             }
         }
@@ -311,7 +357,7 @@ impl Native {
 
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
-        let unit = translate::translate(memory, eip, &self.stops, self.features, at, self.exit);
+        let unit = translate::translate(memory, eip, &self.stops, self.features, at, self.stubs);
         let entry = self.place(eip, &unit.words, &unit.sites, unit.retired)?;
         debug_assert_eq!(entry.unit, at);
         let mut pages: Vec<u32> = unit
@@ -369,8 +415,8 @@ mod tests {
     use adv_cpu_core::memory::Memory;
 
     use super::*;
-    use crate::encode::Size::X;
-    use crate::encode::{ldr, ldr_reg, ldur, movk, sub_imm};
+    use crate::encode::Size::{W, X};
+    use crate::encode::{Reg, ldr, ldr_reg, ldur, movk, movz, sub_imm};
     use crate::translate::Recipe;
 
     const X19: Reg = Reg::new(19);
@@ -403,8 +449,7 @@ mod tests {
             movz(W, Reg::new(0), Exit::Dispatch as u16, 0),
             movz(W, Reg::new(1), next as u16, 0),
             movk(W, Reg::new(1), (next >> 16) as u16, 16),
-            movz(X, Reg::new(2), 0, 0),
-            b((native.exit as i64 - (at + 24) as i64) as i32),
+            b((native.stubs.exit as i64 - (at + 20) as i64) as i32),
         ];
         native.place(eip, &words, &[(0, site)], 1).unwrap();
     }

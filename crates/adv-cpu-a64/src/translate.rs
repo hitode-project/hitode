@@ -499,8 +499,9 @@ struct Translator {
     eip: u32,
     /// Guest instructions completed before it.
     retired: u32,
-    /// Branches to the shared exit stub, as word indices.
-    exits: Vec<usize>,
+    /// Branches to stubs: word index and target address.
+    far: Vec<(usize, usize)>,
+    stubs: Stubs,
     /// The unit's first guest instruction.
     entry: u32,
 }
@@ -513,16 +514,23 @@ enum Flow {
     End,
 }
 
-/// Translates the unit at `eip`, to be placed at host address `at` with the
-/// exit stub at `exit`. Units end before any of `stops`. Each translated byte
-/// is registered with `watch_code`, so a store to it reaches the owner.
+/// Host addresses of the `runtime` stubs units branch to.
+#[derive(Clone, Copy, Debug)]
+pub struct Stubs {
+    pub exit: usize,
+    pub dispatch: usize,
+}
+
+/// Translates the unit at `eip`, to be placed at host address `at`. Units end
+/// before any of `stops`. Each translated byte is registered with
+/// `watch_code`, so a store to it reaches the owner.
 pub fn translate(
     memory: &mut Memory,
     eip: u32,
     stops: &[u32],
     features: Features,
     at: usize,
-    exit: usize,
+    stubs: Stubs,
 ) -> Unit {
     let mut t = Translator {
         asm: Asm::new(),
@@ -533,7 +541,8 @@ pub fn translate(
         recipe: Recipe::Canonical,
         eip,
         retired: 0,
-        exits: Vec::new(),
+        far: Vec::new(),
+        stubs,
         entry: eip,
     };
     // The safepoint; `finish` patches in the unit's instruction count.
@@ -569,7 +578,7 @@ pub fn translate(
         }
     }
     let retired = t.retired;
-    t.finish(at, exit, code, retired, refuse)
+    t.finish(at, code, retired, refuse)
 }
 
 impl Translator {
@@ -711,15 +720,35 @@ impl Translator {
         if self.retired != 0 {
             self.emit(sub_imm(X, X9, X9, self.retired, false));
         }
-        let link = exit == Exit::Dispatch && matches!(target, Target::Static(_));
-        self.exit(exit, target, link);
+        match exit {
+            Exit::Dispatch => self.dispatch(target),
+            _ => self.exit(exit, target),
+        }
     }
 
-    /// The exit protocol of `runtime`: w0 the exit, w1 the EIP and x2 the
-    /// link point the owner may patch into a branch to the target, else 0.
-    fn exit(&mut self, exit: Exit, target: Target, link: bool) {
-        let point = self.asm.offset();
+    /// Leaves translated code: w0 the exit, w1 the EIP.
+    fn exit(&mut self, exit: Exit, target: Target) {
         self.emit(movz(W, Reg::new(0), exit as u16, 0));
+        self.target(target);
+        self.far(self.stubs.exit);
+    }
+
+    /// Continues at `target` through the owner's helper: w1 the EIP and x2
+    /// the link point, the first word, which the helper may patch into a
+    /// branch to the target unit; 0 for a dynamic target.
+    fn dispatch(&mut self, target: Target) {
+        let point = self.asm.offset();
+        self.target(target);
+        if matches!(target, Target::Static(_)) {
+            let here = self.asm.offset();
+            self.emit(adr(Reg::new(2), point as i32 - here as i32));
+        } else {
+            self.emit(movz(X, Reg::new(2), 0, 0));
+        }
+        self.far(self.stubs.dispatch);
+    }
+
+    fn target(&mut self, target: Target) {
         match target {
             Target::Static(eip) => {
                 self.emit(movz(W, Reg::new(1), eip as u16, 0));
@@ -727,13 +756,11 @@ impl Translator {
             }
             Target::Dynamic => self.emit(mov(W, Reg::new(1), X16)),
         }
-        if link {
-            let here = self.asm.offset();
-            self.emit(adr(Reg::new(2), point as i32 - here as i32));
-        } else {
-            self.emit(movz(X, Reg::new(2), 0, 0));
-        }
-        self.exits.push(self.asm.offset() / 4);
+    }
+
+    /// A branch to the stub at host address `to`, placed by `finish`.
+    fn far(&mut self, to: usize) {
+        self.far.push((self.asm.offset() / 4, to));
         self.emit(b(0));
     }
 
@@ -1253,19 +1280,12 @@ impl Translator {
         self.recipe = recipe;
     }
 
-    fn finish(
-        mut self,
-        at: usize,
-        exit: usize,
-        code: Vec<(u32, u32)>,
-        retired: u32,
-        refuse: Label,
-    ) -> Unit {
+    fn finish(mut self, at: usize, code: Vec<(u32, u32)>, retired: u32, refuse: Label) -> Unit {
         // Not enough countdown for the whole unit: leave before it starts.
         self.asm.bind(refuse);
-        // Not linkable: a branch here would bypass the safepoint.
+        // The owner sees the budget run out.
         let entry = self.entry;
-        self.exit(Exit::Dispatch, Target::Static(entry), false);
+        self.exit(Exit::Dispatch, Target::Static(entry));
         for cold in std::mem::take(&mut self.cold) {
             self.asm.bind(cold.label);
             self.sense = cold.sense;
@@ -1273,12 +1293,12 @@ impl Translator {
             self.retired = cold.retired;
             self.leave(Exit::Dispatch, Target::Static(cold.target));
         }
-        let exits = std::mem::take(&mut self.exits);
+        let far = std::mem::take(&mut self.far);
         let mut words = self.asm.finish();
         words[0] = sub_imm(X, X16, X9, retired, false);
-        for index in exits {
+        for (index, to) in far {
             let from = at + 4 * index;
-            words[index] = b((exit as i64 - from as i64) as i32);
+            words[index] = b((to as i64 - from as i64) as i32);
         }
         Unit {
             words,

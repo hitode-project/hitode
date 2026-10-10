@@ -9,6 +9,11 @@
 //!   writing and executing with `pthread_jit_write_protect_np`.
 //!
 //! When the cache fills, the owner clears it and translates again.
+//!
+//! Writes only record what changed; `sync` makes it visible to instruction
+//! fetch, once per batch, before the owner runs translated code again. An
+//! `ic ivau` sequence costs about the same for one line as for a unit, so
+//! one sync per batch instead of one per unit or patch.
 
 use std::ptr::NonNull;
 
@@ -22,6 +27,8 @@ pub struct CodeCache {
     exec: NonNull<u8>,
     len: usize,
     used: usize,
+    /// Writes not yet synchronized, as offset and length.
+    dirty: Vec<(usize, usize)>,
 }
 
 impl CodeCache {
@@ -35,6 +42,7 @@ impl CodeCache {
             exec,
             len,
             used: 0,
+            dirty: Vec::new(),
         })
     }
 
@@ -56,6 +64,7 @@ impl CodeCache {
         }
         let address = self.next();
         self.store(self.used, words);
+        self.mark(self.used, bytes);
         self.used += bytes;
         Some(address)
     }
@@ -67,12 +76,42 @@ impl CodeCache {
             .filter(|&offset| offset + 4 <= self.used && offset.is_multiple_of(4))
             .expect("patch inside the cache");
         self.store(offset, &[word]);
+        self.mark(offset, 4);
+    }
+
+    fn mark(&mut self, offset: usize, len: usize) {
+        match self.dirty.last_mut() {
+            Some((start, dirty)) if *start + *dirty == offset => *dirty += len,
+            _ => self.dirty.push((offset, len)),
+        }
+    }
+
+    /// The word at `address`, which must be inside the cache.
+    pub fn word(&self, address: usize) -> u32 {
+        let offset = address
+            .checked_sub(self.exec.as_ptr() as usize)
+            .filter(|&offset| offset + 4 <= self.used && offset.is_multiple_of(4))
+            .expect("word inside the cache");
+        // SAFETY: inside the live, readable write view.
+        unsafe { self.write.as_ptr().add(offset).cast::<u32>().read() }
+    }
+
+    /// Makes every write since the last sync visible to instruction fetch.
+    pub fn sync(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        // SAFETY: every range is inside the live mapping.
+        unsafe { os::synchronize(self.write.as_ptr(), self.exec.as_ptr(), &self.dirty) };
+        self.dirty.clear();
     }
 
     /// Forgets everything after the first `keep` bytes.
     pub fn truncate(&mut self, keep: usize) {
         assert!(keep <= self.used);
         self.used = keep;
+        // Later appends reuse the space and are synchronized themselves.
+        self.dirty.retain(|&(start, _)| start < keep);
     }
 
     fn store(&mut self, offset: usize, words: &[u32]) {
@@ -88,14 +127,6 @@ impl CodeCache {
             );
         }
         os::writable(false);
-        // SAFETY: both ranges are inside the live mapping.
-        unsafe {
-            os::synchronize(
-                self.write.as_ptr().add(offset),
-                self.exec.as_ptr().add(offset),
-                len,
-            );
-        }
     }
 }
 
@@ -116,33 +147,45 @@ fn page_size() -> Result<usize, String> {
         .ok_or_else(|| "cannot determine host page size".into())
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn each_line(base: *const u8, line: usize, ranges: &[(usize, usize)], mut each: impl FnMut(usize)) {
+    for &(offset, len) in ranges {
+        let start = base as usize + offset;
+        let mut at = start & !(line - 1);
+        while at < start + len {
+            each(at);
+            at += line;
+        }
+    }
+}
+
 /// Cleans data lines through the write view to the point of unification,
-/// then invalidates instruction lines through the execute view.
+/// then invalidates instruction lines through the execute view, with one
+/// set of barriers for all `ranges` (offsets and lengths). Cores with
+/// CTR_EL0.IDC need no data clean.
 ///
 /// # Safety
-/// Both ranges must be mapped.
+/// Every range must be mapped in both views.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-unsafe fn clean_and_invalidate(write: *const u8, exec: *const u8, len: usize) {
+unsafe fn clean_and_invalidate(write: *const u8, exec: *const u8, ranges: &[(usize, usize)]) {
     use std::arch::asm;
     let ctr: u64;
     // SAFETY: CTR_EL0 is readable at EL0 on Linux.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-    let data_line = 4usize << (ctr >> 16 & 0xf);
-    let code_line = 4usize << (ctr & 0xf);
-    let mut line = write as usize & !(data_line - 1);
-    while line < write as usize + len {
+    if ctr >> 28 & 1 == 0 {
+        let data_line = 4usize << (ctr >> 16 & 0xf);
         // SAFETY: cache maintenance on mapped addresses has no other effect.
-        unsafe { asm!("dc cvau, {}", in(reg) line, options(nostack)) };
-        line += data_line;
+        each_line(write, data_line, ranges, |at| unsafe {
+            asm!("dc cvau, {}", in(reg) at, options(nostack))
+        });
     }
     // SAFETY: barriers only.
     unsafe { asm!("dsb ish", options(nostack)) };
-    let mut line = exec as usize & !(code_line - 1);
-    while line < exec as usize + len {
-        // SAFETY: as above.
-        unsafe { asm!("ic ivau, {}", in(reg) line, options(nostack)) };
-        line += code_line;
-    }
+    let code_line = 4usize << (ctr & 0xf);
+    // SAFETY: as above.
+    each_line(exec, code_line, ranges, |at| unsafe {
+        asm!("ic ivau, {}", in(reg) at, options(nostack))
+    });
     // SAFETY: barriers only.
     unsafe { asm!("dsb ish", "isb", options(nostack)) };
 }
@@ -200,10 +243,10 @@ mod os {
     pub fn writable(_: bool) {}
 
     /// # Safety
-    /// Both ranges must be mapped.
-    pub unsafe fn synchronize(write: *const u8, exec: *const u8, len: usize) {
+    /// Every range must be mapped in both views.
+    pub unsafe fn synchronize(write: *const u8, exec: *const u8, ranges: &[(usize, usize)]) {
         // SAFETY: forwarded.
-        unsafe { super::clean_and_invalidate(write, exec, len) };
+        unsafe { super::clean_and_invalidate(write, exec, ranges) };
     }
 
     /// # Safety
@@ -255,10 +298,12 @@ mod os {
     }
 
     /// # Safety
-    /// The range must be mapped.
-    pub unsafe fn synchronize(_: *const u8, exec: *const u8, len: usize) {
-        // SAFETY: forwarded.
-        unsafe { sys_icache_invalidate(exec.cast_mut().cast(), len) };
+    /// Every range must be mapped.
+    pub unsafe fn synchronize(_: *const u8, exec: *const u8, ranges: &[(usize, usize)]) {
+        for &(offset, len) in ranges {
+            // SAFETY: forwarded.
+            unsafe { sys_icache_invalidate(exec.add(offset).cast_mut().cast(), len) };
+        }
     }
 
     /// # Safety
@@ -287,8 +332,11 @@ mod tests {
         let first = cache
             .append(&[movz(W, Reg::new(0), 42, 0), ret(Reg::LR)])
             .unwrap();
+        cache.sync();
         assert_eq!(call(first), 42);
         cache.patch(first, movz(W, Reg::new(0), 7, 0));
+        assert_eq!(cache.word(first), movz(W, Reg::new(0), 7, 0));
+        cache.sync();
         assert_eq!(call(first), 7);
         let second = cache
             .append(&[movz(W, Reg::new(0), 9, 0), ret(Reg::LR)])

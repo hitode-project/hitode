@@ -3,10 +3,18 @@
 //!
 //! `enter` saves the host's callee-saved registers, loads the guest and
 //! branches to translated code. Translated code leaves through `exit` with
-//! the exit reason in w0, the guest EIP in w1 and in x2 the host address of
-//! a link point the owner may patch, or 0; `exit` stores the guest back and
-//! returns to `enter`'s caller. Translated code charges x9, the countdown,
-//! with the guest instructions it completes. Arithmetic flags cross the boundary
+//! the exit reason in w0 and the guest EIP in w1; `exit` stores the guest
+//! back and returns to `enter`'s caller. Translated code charges x9, the
+//! countdown, with the guest instructions it completes.
+//!
+//! Dispatches do not leave: they branch to `dispatch` with the EIP in w1
+//! and in x2 the host address of a link point to patch, or 0. That stub
+//! saves only the caller-saved registers translated code keeps live (x7-x12
+//! and NZCV; the guest GPRs are callee-saved) and calls the owner's helper,
+//! which returns the unit to continue at, or 0 to leave through `exit`.
+//!
+//! XMM state stays in `CpuState` until a unit uses SSE (M2), so the stubs
+//! do not move it. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` until M2 maps it.
@@ -20,7 +28,6 @@ use crate::encode::Extend::Uxtw;
 use crate::encode::Index::{Offset, Post, Pre};
 use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
-use crate::encode::VSize::Q;
 use crate::encode::*;
 
 /// What `x29` points at while translated code runs.
@@ -36,8 +43,10 @@ pub struct Runtime {
     pub countdown: u64,
     /// Host stack pointer inside `enter`'s frame, for helpers and `exit`.
     pub host_sp: u64,
-    /// The link point of the exit, or 0.
-    pub link: u64,
+    /// `helper(runtime, eip, link) -> unit or 0`, called by `dispatch`.
+    pub helper: u64,
+    /// Owner data for `helper`.
+    pub owner: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -53,7 +62,8 @@ impl Runtime {
             shadow: 0,
             countdown: u64::MAX >> 1,
             host_sp: 0,
-            link: 0,
+            helper: 0,
+            owner: 0,
             exit: 0,
             temps: [0; 2],
         }
@@ -92,6 +102,8 @@ pub struct Stubs {
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
     pub fault: usize,
+    /// Where translated code dispatches without leaving.
+    pub dispatch: usize,
 }
 
 const fn r(number: u8) -> Reg {
@@ -117,12 +129,11 @@ const SHADOW: u32 = field(offset_of!(Runtime, shadow));
 const COUNTDOWN: u32 = field(offset_of!(Runtime, countdown));
 const HOST_SP: u32 = field(offset_of!(Runtime, host_sp));
 const EXIT: u32 = field(offset_of!(Runtime, exit));
-const LINK: u32 = field(offset_of!(Runtime, link));
+const HELPER: u32 = field(offset_of!(Runtime, helper));
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 const EIP: u32 = field(offset_of!(CpuState, eip));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
-const XMM: u32 = field(offset_of!(CpuState, xmm));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.
 pub const MAPPED_FLAGS: u32 = 0xcd5;
@@ -143,18 +154,46 @@ pub fn stubs() -> Stubs {
     let exit = asm.offset();
     emit_exit(&mut asm);
     let fault = asm.offset();
-    asm.emit_all(&[
-        movz(W, r(0), Exit::Fault as u16, 0),
-        movz(W, r(1), 0, 0),
-        movz(X, r(2), 0, 0),
-    ]);
+    asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
     asm.b(exit_label);
+    let dispatch = asm.offset();
+    emit_dispatch(&mut asm, exit_label);
     Stubs {
         code: asm.finish(),
         enter,
         exit,
         fault,
+        dispatch,
     }
+}
+
+/// `dispatch`: w1 the guest EIP, x2 a link point or 0. Calls the helper with
+/// the runtime, and continues at the unit it returns or leaves with
+/// `Exit::Dispatch` when it returns 0.
+fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
+    asm.emit_all(&[
+        stp(X, Pre, r(1), r(2), SP, -80),
+        stp(X, Offset, r(7), r(8), SP, 16),
+        stp(X, Offset, r(9), r(10), SP, 32),
+        stp(X, Offset, r(11), r(12), SP, 48),
+        mrs_nzcv(r(17)),
+        stp(X, Offset, r(17), Reg::LR, SP, 64),
+        mov(X, r(0), RUNTIME),
+        ldr(X, r(16), RUNTIME, HELPER),
+        blr(r(16)),
+        ldp(X, Offset, r(17), Reg::LR, SP, 64),
+        msr_nzcv(r(17)),
+        ldp(X, Offset, r(11), r(12), SP, 48),
+        ldp(X, Offset, r(9), r(10), SP, 32),
+        ldp(X, Offset, r(7), r(8), SP, 16),
+        ldp(X, Post, r(1), r(2), SP, 80),
+    ]);
+    let leave = asm.label();
+    asm.cbz(X, false, r(0), leave);
+    asm.emit(br(r(0)));
+    asm.bind(leave);
+    asm.emit(movz(W, r(0), Exit::Dispatch as u16, 0));
+    asm.b(exit);
 }
 
 /// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
@@ -204,18 +243,7 @@ fn emit_enter(asm: &mut Asm) {
         eor_imm(W, r(10), r(10), 1),
         and_imm(W, r(11), r(1), 0x10),
         ubfx(W, r(12), r(1), 10, 1),
-        add_imm(X, r(16), r(0), XMM, false),
     ]);
-    for i in 0..4 {
-        asm.emit(ldp_v(
-            Q,
-            Offset,
-            v(16 + 2 * i),
-            v(17 + 2 * i),
-            r(16),
-            32 * i as i32,
-        ));
-    }
     asm.emit(br(r(17)));
 }
 
@@ -223,7 +251,6 @@ fn emit_enter(asm: &mut Asm) {
 fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[
         str(W, r(0), RUNTIME, EXIT),
-        str(X, r(2), RUNTIME, LINK),
         stp(X, Offset, r(7), r(8), RUNTIME, TEMPS),
         ldr(X, r(0), RUNTIME, CPU),
         str(W, r(1), r(0), EIP),
@@ -257,19 +284,6 @@ fn emit_exit(asm: &mut Asm) {
         bic(W, r(4), r(4), r(5), Lsl, 0),
         orr(W, r(4), r(4), r(3), Lsl, 0),
         str(W, r(4), r(0), EFLAGS),
-        add_imm(X, r(16), r(0), XMM, false),
-    ]);
-    for i in 0..4 {
-        asm.emit(stp_v(
-            Q,
-            Offset,
-            v(16 + 2 * i),
-            v(17 + 2 * i),
-            r(16),
-            32 * i as i32,
-        ));
-    }
-    asm.emit_all(&[
         str(X, r(9), RUNTIME, COUNTDOWN),
         str(X, r(28), RUNTIME, SHADOW),
         ldr(X, r(16), RUNTIME, HOST_SP),
@@ -293,6 +307,7 @@ mod tests {
     const STATE: u64 = DATA + 0x100;
     const STACK_TOP: u64 = 0x3001_0000;
     const BASE: u64 = 7 << 32;
+    const XMM: u32 = field(offset_of!(CpuState, xmm));
 
     /// Bytes of a `Runtime` for the emulator, whose `cpu` is at `STATE`.
     fn runtime_bytes() -> Vec<u8> {
