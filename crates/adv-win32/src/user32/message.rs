@@ -426,7 +426,12 @@ pub(super) fn send_encoded(
     wide: bool,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    encoded_to(env, None, hwnd, msg, wp, lp, wide, then)
+    encoded_to(env, None, hwnd, msg, wp, lp, wide, move |env, result| {
+        if let Err(error) = result {
+            crate::util::set_last_error(env, error);
+        }
+        then(env, result.unwrap_or(0))
+    })
 }
 
 /// Share bounded text conversion while calling an immutable saved procedure.
@@ -472,8 +477,11 @@ pub(super) fn call_proc_encoded(
             return Outcome::Return(0);
         }
     }
-    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |_, r| {
-        Outcome::Return(r)
+    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |env, result| {
+        if let Err(error) = result {
+            crate::util::set_last_error(env, error);
+        }
+        Outcome::Return(result.unwrap_or(0))
     })
 }
 
@@ -485,12 +493,16 @@ fn dispatch_encoded(
     msg: u32,
     wp: u32,
     lp: u32,
-    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+    then: impl FnOnce(&mut Env<'_>, Result<u32, u32>) -> Outcome + 'static,
 ) -> Outcome {
     if let Some(proc) = proc {
-        call_proc(proc, hwnd, msg, wp, lp, then)
+        call_proc(proc, hwnd, msg, wp, lp, move |env, value| {
+            then(env, Ok(value))
+        })
     } else {
-        send(env, hwnd, msg, wp, lp, then)
+        send(env, hwnd, msg, wp, lp, move |env, value| {
+            then(env, Ok(value))
+        })
     }
 }
 
@@ -503,17 +515,26 @@ fn encoded_to(
     wp: u32,
     lp: u32,
     wide: bool,
-    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+    then: impl FnOnce(&mut Env<'_>, Result<u32, u32>) -> Outcome + 'static,
 ) -> Outcome {
     let Some(target_wide) = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
         .map(|w| w.unicode)
     else {
-        return then(env, 0);
+        return then(env, Err(1400));
     };
     if wide == target_wide {
         return dispatch_encoded(env, proc, hwnd, msg, wp, lp, then);
+    }
+    if character_message(msg) {
+        return match character_param(env, wp, wide, target_wide) {
+            Ok(parameter) => dispatch_encoded(env, proc, hwnd, msg, parameter, lp, then),
+            Err(reason) => {
+                adv_abi::warn_unavailable(env, "user32.dll!A/W message conversion", reason);
+                then(env, Err(50))
+            }
+        };
     }
     let combo = user(env)
         .windows
@@ -528,13 +549,11 @@ fn encoded_to(
             return dispatch_encoded(env, proc, hwnd, msg, wp, 0, then);
         }
         let Some(text) = read_text(env, lp, wide) else {
-            crate::util::set_last_error(env, 87);
-            return then(env, 0);
+            return then(env, Err(87));
         };
         let pointer = guest_text(env, &text, target_wide);
         if pointer == 0 {
-            crate::util::set_last_error(env, 8);
-            return then(env, 0);
+            return then(env, Err(8));
         }
         return dispatch_encoded(env, proc, hwnd, msg, wp, pointer, move |env, result| {
             window::temp_free(env, pointer);
@@ -543,7 +562,7 @@ fn encoded_to(
     }
     if msg == wm::GETTEXT {
         if wp == 0 {
-            return then(env, 0);
+            return then(env, Ok(0));
         }
         // ACP936 native W->A sends wp*2 bytes. Follow the shared GetCPInfo
         // profile for other guest encoders, not the host's active code page.
@@ -556,8 +575,7 @@ fn encoded_to(
             2
         };
         let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { max_char_size }) else {
-            crate::util::set_last_error(env, 87);
-            return then(env, 0);
+            return then(env, Err(87));
         };
         return converted_text(
             env,
@@ -580,11 +598,15 @@ fn encoded_to(
             wm::GETTEXTLENGTH
         };
         return dispatch_encoded(env, proc, hwnd, query, wp, 0, move |env, length| {
+            let length = match length {
+                Ok(value) => value,
+                Err(error) => return then(env, Err(error)),
+            };
             if length == u32::MAX {
-                return then(env, length);
+                return then(env, Ok(length));
             }
             let Some(capacity) = length.checked_add(1) else {
-                return then(env, 0);
+                return then(env, Ok(0));
             };
             converted_text(
                 env,
@@ -616,7 +638,7 @@ fn converted_text(
     output_capacity: u32,
     wide: bool,
     target_wide: bool,
-    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+    then: impl FnOnce(&mut Env<'_>, Result<u32, u32>) -> Outcome + 'static,
 ) -> Outcome {
     // Bound temporary guest allocation even if an untrusted procedure reports a
     // bogus text length. Normal text uses the same limit as string marshalling.
@@ -629,13 +651,11 @@ fn converted_text(
             "user32.dll!A/W text conversion",
             "temporary text capacity exceeds the supported bounded buffer profile",
         );
-        crate::util::set_last_error(env, 87);
-        return then(env, 0);
+        return then(env, Err(87));
     };
     let pointer = window::temp_alloc(env, size);
     if pointer == 0 {
-        crate::util::set_last_error(env, 8);
-        return then(env, 0);
+        return then(env, Err(8));
     }
     dispatch_encoded(
         env,
@@ -647,24 +667,26 @@ fn converted_text(
         move |env, result| {
             let text = read_text_limit(env, pointer, target_wide, capacity as usize);
             window::temp_free(env, pointer);
+            let result = match result {
+                Ok(value) => value,
+                Err(error) => return then(env, Err(error)),
+            };
             if result == u32::MAX {
-                return then(env, result);
+                return then(env, Ok(result));
             }
             let Some(text) = text else {
-                crate::util::set_last_error(env, 87);
-                return then(env, 0);
+                return then(env, Err(87));
             };
             let length = text_length(env, &text, wide);
             if output_capacity == 0 {
-                return then(env, length);
+                return then(env, Ok(length));
             }
             let Some(length) =
                 write_text(env, output, output_capacity.min(length + 1), &text, wide)
             else {
-                crate::util::set_last_error(env, 87);
-                return then(env, 0);
+                return then(env, Err(87));
             };
-            then(env, length)
+            then(env, Ok(length))
         },
     )
 }
@@ -1809,6 +1831,23 @@ fn broadcast_encoded(
 }
 
 fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
+    send_message_timeout(env, false)
+}
+#[win32(user32, name = "SendMessageTimeoutW", level = implement)]
+#[allow(clippy::too_many_arguments)]
+fn send_message_timeout_w(
+    env: &mut Env<'_>,
+    _hwnd: AbiHandle,
+    _msg: u32,
+    _wp: u32,
+    _lp: i32,
+    _flags: u32,
+    _timeout: u32,
+    _out: GuestPtr<u32>,
+) -> Outcome {
+    send_message_timeout(env, true)
+}
+fn send_message_timeout(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (hwnd, msg, wp, lp, flags, timeout, out) = (
         env.arg(0),
         env.arg(1),
@@ -1841,9 +1880,16 @@ fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
             .iter()
             .map(|&window| [window, msg, wp, lp])
             .collect();
-        return timeout_broadcast(env, targets, flags, timeout, Ok(0), Box::new(then));
+        return timeout_broadcast(env, targets, flags, timeout, wide, Ok(0), Box::new(then));
     }
-    timeout_to(env, [hwnd, msg, wp, lp], flags, timeout, Box::new(then))
+    timeout_to(
+        env,
+        [hwnd, msg, wp, lp],
+        flags,
+        timeout,
+        wide,
+        Box::new(then),
+    )
 }
 
 fn timeout_broadcast(
@@ -1851,6 +1897,7 @@ fn timeout_broadcast(
     mut targets: VecDeque<[u32; 4]>,
     flags: u32,
     timeout: u32,
+    wide: bool,
     result: Result<u32, u32>,
     then: sent::Done,
 ) -> Outcome {
@@ -1862,8 +1909,9 @@ fn timeout_broadcast(
         target,
         flags,
         timeout,
+        wide,
         Box::new(move |env, next| {
-            timeout_broadcast(env, targets, flags, timeout, result.and(next), then)
+            timeout_broadcast(env, targets, flags, timeout, wide, result.and(next), then)
         }),
     )
 }
@@ -1873,6 +1921,7 @@ fn timeout_to(
     args: [u32; 4],
     flags: u32,
     timeout: u32,
+    wide: bool,
     then: sent::Done,
 ) -> Outcome {
     let [hwnd, msg, wp, lp] = args;
@@ -1884,9 +1933,28 @@ fn timeout_to(
         return then(env, Err(1400));
     };
     if thread == env.context {
-        return send(env, hwnd, msg, wp, lp, move |env, value| {
-            then(env, Ok(value))
-        });
+        return encoded_to(env, None, hwnd, msg, wp, lp, wide, then);
+    }
+    let window = user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
+    let combo = user(env).classes[window.class]
+        .name
+        .eq_ignore_ascii_case("ComboBox");
+    let text_message = matches!(msg, wm::SETTEXT | wm::GETTEXT | wm::GETTEXTLENGTH)
+        || character_message(msg)
+        || (combo && matches!(msg, 0x143 | 0x148 | 0x149 | 0x14a | 0x14c | 0x14d | 0x158));
+    if window.unicode != wide && text_message {
+        // A timed sender may return while its receiver still runs. Do not hand
+        // that receiver a converted temporary buffer with sender-only lifetime.
+        adv_abi::warn_unavailable(
+            env,
+            if wide {
+                "user32.dll!SendMessageTimeoutW"
+            } else {
+                "user32.dll!SendMessageTimeoutA"
+            },
+            "cross-thread A/W timed text requires receiver-owned conversion storage",
+        );
+        return then(env, Err(50));
     }
     let options = sent::Options {
         deadline: Some(
@@ -2319,6 +2387,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "SendMessageA", 4, send_message_a);
     reg.register(send_message_w_ABI);
     s(reg, "SendMessageTimeoutA", 7, send_message_timeout_a);
+    reg.register(send_message_timeout_w_ABI);
     s(reg, "InSendMessage", 0, sent::in_send);
     s(reg, "ReplyMessage", 1, sent::reply_message);
     s(reg, "DispatchMessageA", 1, dispatch_message_a);

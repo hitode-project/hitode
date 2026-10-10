@@ -132,6 +132,11 @@ fn console_reads_and_codepage_setters_preserve_the_no_console_boundary() {
         assert_eq!(call(&mut m, "kernel32.dll", "GetLastError", &[]), 6);
     }
     let acp = m.ext.get::<Win32>().codec.acp;
+    for name in ["GetConsoleCP", "GetConsoleOutputCP"] {
+        assert_eq!(call(&mut m, "kernel32.dll", name, &[]), 0);
+        assert_eq!(call(&mut m, "kernel32.dll", "GetLastError", &[]), 6);
+        assert_eq!(m.ext.get::<Win32>().codec.acp, acp);
+    }
     for name in ["SetConsoleCP", "SetConsoleOutputCP"] {
         assert_eq!(call(&mut m, "kernel32.dll", name, &[936]), 0);
         assert_eq!(call(&mut m, "kernel32.dll", "GetLastError", &[]), 6);
@@ -485,6 +490,9 @@ fn the_new_pairs_are_public_registry_entries_before_process_installation() {
                 "OemToCharW",
                 "LoadStringW",
                 "UnregisterClassW",
+                "GetClassLongW",
+                "SetClassLongW",
+                "SendMessageTimeoutW",
             ][..],
         ),
         (
@@ -508,6 +516,18 @@ fn the_new_pairs_are_public_registry_entries_before_process_installation() {
         (
             "comctl32.dll",
             &["CreatePropertySheetPageW", "PropertySheetW"][..],
+        ),
+        (
+            "comdlg32.dll",
+            &["GetOpenFileNameW", "GetSaveFileNameW"][..],
+        ),
+        (
+            "shell32.dll",
+            &[
+                "SHGetFileInfoW",
+                "SHGetPathFromIDListW",
+                "SHBrowseForFolderW",
+            ][..],
         ),
         (
             "shlwapi.dll",
@@ -620,6 +640,176 @@ fn shell_path_pairs_preserve_relative_syntax_dbcs_characters_and_output_limits()
         ),
         1
     );
+}
+
+#[test]
+fn class_scalar_pairs_share_one_class_and_refuse_unavailable_procedure_thunks() {
+    use adv_win32::user32::window::ClassKey;
+    let mut m = machine();
+    write_wide(
+        &mut m,
+        DATA + 100,
+        &"ClassPair".encode_utf16().collect::<Vec<_>>(),
+    );
+    write_wide(&mut m, DATA + 200, &"日".encode_utf16().collect::<Vec<_>>());
+    m.cpu.write(DATA, &[0; 40]).unwrap();
+    m.cpu.write_u32(DATA + 4, 0x123456).unwrap();
+    m.cpu.write_u32(DATA + 16, 0x400000).unwrap();
+    m.cpu.write_u32(DATA + 32, DATA + 200).unwrap();
+    m.cpu.write_u32(DATA + 36, DATA + 100).unwrap();
+    let atom = call(&mut m, "user32.dll", "RegisterClassW", &[DATA]);
+    assert_ne!(atom, 0);
+    let hwnd = m.ext.get::<Win32>().user.desktop;
+    let index = m
+        .ext
+        .get::<Win32>()
+        .user
+        .find_class(&ClassKey::Atom(atom as u16), 0x400000)
+        .unwrap();
+    let old = m
+        .ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get(&m.sys.objects, &hwnd)
+        .unwrap()
+        .class;
+    m.ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut m.sys.objects, &hwnd)
+        .unwrap()
+        .class = index;
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "SetClassLongW",
+            &[hwnd, (-26i32) as u32, 0x42]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "GetClassLongA",
+            &[hwnd, (-26i32) as u32]
+        ),
+        0x42
+    );
+    let menu = call(
+        &mut m,
+        "user32.dll",
+        "GetClassLongW",
+        &[hwnd, (-8i32) as u32],
+    );
+    assert_ne!(menu, DATA + 200);
+    assert_eq!(m.cpu.read_u16(menu).unwrap(), 0x65e5);
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "GetClassLongW",
+            &[hwnd, (-8i32) as u32]
+        ),
+        menu
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "GetClassLongA",
+            &[hwnd, (-24i32) as u32]
+        ),
+        0
+    );
+    assert_eq!(call(&mut m, "kernel32.dll", "GetLastError", &[]), 50);
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "SetClassLongW",
+            &[hwnd, (-24i32) as u32, 0x234567]
+        ),
+        0x123456
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "SetClassLongA",
+            &[hwnd, (-24i32) as u32, 0x345678]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "GetClassLongW",
+            &[hwnd, (-24i32) as u32]
+        ),
+        0x234567
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "user32.dll",
+            "CallWindowProcA",
+            &[0x123456, hwnd, 0x8000, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(call(&mut m, "kernel32.dll", "GetLastError", &[]), 50);
+    m.ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut m.sys.objects, &hwnd)
+        .unwrap()
+        .class = old;
+    assert_eq!(
+        call(&mut m, "user32.dll", "UnregisterClassW", &[atom, 0x400000]),
+        1
+    );
+}
+
+#[test]
+fn picker_pairs_report_initialization_failure_and_keep_errors_bound_to_the_thread() {
+    let mut m = machine();
+    let count = m.sys.objects.object_count();
+    m.cpu.write(DATA, &[0xcc; 100]).unwrap();
+    assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 0);
+    for name in [
+        "GetOpenFileNameA",
+        "GetOpenFileNameW",
+        "GetSaveFileNameA",
+        "GetSaveFileNameW",
+    ] {
+        assert_eq!(call(&mut m, "comdlg32.dll", name, &[DATA]), 0);
+        assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 2);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xcccccccc);
+    }
+    for (name, args) in [
+        ("SHBrowseForFolderW", vec![DATA]),
+        ("SHGetPathFromIDListW", vec![0, DATA]),
+        ("SHGetFileInfoW", vec![0, 0, DATA, 100, 0]),
+    ] {
+        assert_eq!(call(&mut m, "shell32.dll", name, &args), 0);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xcccccccc);
+    }
+    assert_eq!(m.sys.objects.object_count(), count);
+    m.spawn("dialog second thread", PARK_ADDR, &[], 65536)
+        .unwrap();
+    let caller = m.sys.current;
+    m.sys.current = 1;
+    assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 0);
+    assert_eq!(call(&mut m, "comdlg32.dll", "GetOpenFileNameW", &[0]), 0);
+    assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 2);
+    m.sys.current = caller;
+    assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 2);
 }
 
 #[test]

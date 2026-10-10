@@ -6,6 +6,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
+mod common_dialogs;
 mod dwm;
 mod image_list;
 pub(crate) mod imm;
@@ -29,7 +30,6 @@ use crate::{Win32, stdcall};
 const SHLWAPI: &str = "shlwapi.dll";
 const SHELL32: &str = "shell32.dll";
 const SHFOLDER: &str = "shfolder.dll";
-const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
 const COMCTL32: &str = "comctl32.dll";
 const MAX_PATH: u32 = 260;
@@ -425,19 +425,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHELL32, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
-    // File and folder pickers: the user cancels (CommDlgExtendedError stays 0).
-    stdcall(reg, COMDLG32, "GetOpenFileNameA", 1, |_| Outcome::Return(0));
-    stdcall(reg, COMDLG32, "GetSaveFileNameA", 1, |_| Outcome::Return(0));
-    stdcall(reg, COMDLG32, "CommDlgExtendedError", 0, |_| {
-        Outcome::Return(0)
-    });
-    stdcall(reg, SHELL32, "SHBrowseForFolderA", 1, |_| {
-        Outcome::Return(0)
-    });
-    stdcall(reg, SHELL32, "SHGetPathFromIDListA", 2, |_| {
-        Outcome::Return(0)
-    });
-    stdcall(reg, SHELL32, "SHGetFileInfoA", 5, |_| Outcome::Return(0));
+    common_dialogs::register(reg);
     ole_memory::register(reg);
     variant::register(reg);
     // Offline, with no error: the guest never reaches the network.
