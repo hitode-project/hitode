@@ -1,0 +1,17 @@
+[package]
+name = "adv-cpu-a64"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "AArch64 thin translator over the adv-cpu core"
+
+[dependencies]
+adv-cpu-core = { path = "../adv-cpu-core" }
+
+[dev-dependencies]
+unicorn-engine = { workspace = true, features = ["arch_aarch64"] }
+
+[lints]
+workspace = true

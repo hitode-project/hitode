@@ -1,0 +1,15 @@
+52bffff3	movz w19, #0xffff, lsl #16
+d2824680	movz x0, #0x1234
+d2e0003b	movz x27, #0x1, lsl #48
+728000e1	movk w1, #0x7
+f2d7dde0	movk x0, #0xbeef, lsl #32
+0b140273	add w19, w19, w20
+8b170377	add x23, x27, x23
+8b020c20	add x0, x1, x2, lsl #3
+4b827c20	sub w0, w1, w2, asr #31
+cb4730c5	sub x5, x6, x7, lsr #12
+d65f03c0	ret
+d65f0020	ret x1
+d4200000	brk #0x0
+d43e01a0	brk #0xf00d
+d503201f	nop

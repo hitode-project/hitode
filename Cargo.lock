@@ -75,6 +75,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-cpu-a64"
+version = "0.1.0"
+dependencies = [
+ "adv-cpu-core",
+ "unicorn-engine",
+]
+
+[[package]]
 name = "adv-cpu-core"
 version = "0.1.0"
 dependencies = [

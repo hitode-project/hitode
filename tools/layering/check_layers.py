@@ -19,6 +19,7 @@ RULES: dict[str, set[str]] = {
     # Engine-neutral core; each engine builds on it; the facade picks one.
     "adv-cpu-core": {"adv-sync"},
     "adv-cpu-x64": {"adv-cpu-core"},
+    "adv-cpu-a64": {"adv-cpu-core"},
     "adv-cpu": {"adv-cpu-x64"},
     "adv-machine": {"adv-cpu", "adv-sync"},
     "adv-abi": {"adv-machine", "adv-abi-macros"},
