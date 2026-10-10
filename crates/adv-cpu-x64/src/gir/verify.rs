@@ -541,8 +541,8 @@ fn type_valid(r: &Region, id: ValueId) -> bool {
         },
         ValueKind::Flags(f) => {
             let expected = match f.kind {
-                FlagKind::Add | FlagKind::Sub => ARITHMETIC,
-                FlagKind::Logic | FlagKind::Shl | FlagKind::Shr | FlagKind::Sar => ARITHMETIC & !AF,
+                FlagKind::Add | FlagKind::Sub | FlagKind::Logic => ARITHMETIC,
+                FlagKind::Shl | FlagKind::Shr | FlagKind::Sar => ARITHMETIC & !AF,
                 _ => CF | OF,
             };
             w == Width::B32

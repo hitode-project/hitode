@@ -60,7 +60,8 @@ pub(super) fn binary(flags: &mut u32, kind: M, a: u32, b: u32, width: u8) -> u32
                 M::Xor => a ^ b,
                 _ => unreachable!(),
             };
-            *flags &= !(CF | OF);
+            // AF is undefined; hardware clears it, as Unicorn and native code do.
+            *flags &= !(CF | OF | AF);
             szp(flags, value, width);
             value
         }
@@ -562,5 +563,23 @@ mod tests {
         );
         assert_eq!(state.regs[0], 9);
         assert!(interpreter.decode_count() > decodes);
+    }
+}
+
+#[cfg(test)]
+mod logic_flag_tests {
+    use super::*;
+
+    /// Measured on Intel hardware: logic operations clear the undefined AF
+    /// whatever its prior value, at every width.
+    #[test]
+    fn logic_operations_clear_the_auxiliary_carry() {
+        for kind in [M::And, M::Or, M::Xor, M::Test] {
+            for width in [1, 2, 4] {
+                let mut flags = 0x202 | CF | AF | OF;
+                binary(&mut flags, kind, 0x5a5a_5a5a, 0xa5a5_a5a5, width);
+                assert_eq!(flags & (CF | AF | OF), 0, "{kind:?} width {width}");
+            }
+        }
     }
 }

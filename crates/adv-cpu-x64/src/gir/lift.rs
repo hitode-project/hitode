@@ -680,9 +680,11 @@ impl Builder<'_> {
                     M::Sub | M::Sbb | M::Cmp | M::Dec | M::Neg => {
                         (Binary::Sub, FlagKind::Sub, ARITHMETIC)
                     }
-                    M::And | M::Test => (Binary::And, FlagKind::Logic, ARITHMETIC & !AF),
-                    M::Or => (Binary::Or, FlagKind::Logic, ARITHMETIC & !AF),
-                    _ => (Binary::Xor, FlagKind::Logic, ARITHMETIC & !AF),
+                    // Logic writes every arithmetic flag: hardware clears the
+                    // undefined AF together with CF and OF.
+                    M::And | M::Test => (Binary::And, FlagKind::Logic, ARITHMETIC),
+                    M::Or => (Binary::Or, FlagKind::Logic, ARITHMETIC),
+                    _ => (Binary::Xor, FlagKind::Logic, ARITHMETIC),
                 };
                 let mut result = self.binary(w, binary, lhs, rhs);
                 if matches!(i.mnemonic(), M::Adc | M::Sbb) {
