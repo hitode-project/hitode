@@ -2,7 +2,7 @@
 
 use adv_abi::{GuestPtr, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Outcome};
+use adv_machine::{CtxId, Env, Outcome, Wait};
 
 use super::K32;
 use crate::{Win32, stdcall, util::write_units};
@@ -354,19 +354,69 @@ fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     filetime_to_systemtime(ft as u64)
 }
 
+/// Back-to-back reads which prove a context is only polling the clock.
+const POLL_STREAK: u32 = 64;
+/// Longest gap between two reads of one poll: a loop doing real work between
+/// reads is not a busy-wait, however often it asks for the time.
+const POLL_GAP_US: u64 = 50;
+
+/// The last clock read and how many reads on that context came back to back,
+/// with no other host call and almost no guest time between them.
+#[derive(Default)]
+struct ClockPoll {
+    context: Option<CtxId>,
+    call: u64,
+    read_us: u64,
+    streak: u32,
+}
+
+/// Read the guest clock for a polling API. A context that does nothing but reread
+/// the clock is busy-waiting; once a streak proves it, each read waits for the
+/// next millisecond, as a preempted thread would observe, so the spin idles the
+/// context and time skipping can reach the time it waits for.
+pub(crate) fn poll_clock(
+    env: &mut Env<'_>,
+    finish: impl FnOnce(&mut Env<'_>, u64) -> Outcome + 'static,
+) -> Outcome {
+    let now = env.sys.clock.guest_now_us();
+    let (context, call) = (env.sys.current, env.sys.host_calls);
+    let poll = env.ext.get_or_default::<ClockPoll>();
+    let back_to_back = poll.context == Some(context)
+        && poll.call + 1 == call
+        && now.saturating_sub(poll.read_us) <= POLL_GAP_US;
+    poll.streak = if back_to_back {
+        poll.streak.saturating_add(1)
+    } else {
+        1
+    };
+    (poll.context, poll.call, poll.read_us) = (Some(context), call, now);
+    if poll.streak < POLL_STREAK {
+        return finish(env, now);
+    }
+    let next_ms = (now / 1000 + 1) * 1000;
+    Outcome::block_timed(Wait::Until(next_ms), move |env, _| {
+        let now = env.sys.clock.guest_now_us();
+        let call = env.sys.host_calls;
+        let poll = env.ext.get_or_default::<ClockPoll>();
+        (poll.call, poll.read_us) = (call, now);
+        finish(env, now)
+    })
+}
+
 #[win32(kernel32, name = "GetTickCount", level = implement)]
-fn get_tick_count(env: &mut Env<'_>) -> u32 {
-    (env.sys.clock.guest_now_us() / 1000) as u32
+fn get_tick_count(env: &mut Env<'_>) -> Outcome {
+    poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
 }
 
 #[win32(kernel32, name = "QueryPerformanceCounter", level = implement)]
-fn query_performance_counter(
-    env: &mut Env<'_>,
-    out: GuestPtr<i64>,
-) -> Result<i32, adv_cpu::backend::MemFault> {
-    let t = env.sys.clock.guest_now_us() * (adv_machine::clock::QPC_FREQ / 1_000_000);
-    out.write(env.cpu, t as i64)?;
-    Ok(1)
+fn query_performance_counter(env: &mut Env<'_>, out: GuestPtr<i64>) -> Outcome {
+    poll_clock(env, move |env, us| {
+        let t = us * (adv_machine::clock::QPC_FREQ / 1_000_000);
+        match out.write(env.cpu, t as i64) {
+            Ok(()) => Outcome::Return(1),
+            Err(fault) => adv_abi::guest::memory_failure(fault),
+        }
+    })
 }
 
 #[win32(kernel32, name = "QueryPerformanceFrequency", level = implement)]

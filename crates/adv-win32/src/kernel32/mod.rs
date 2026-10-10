@@ -56,7 +56,7 @@ mod string;
 mod sync;
 pub(crate) use sync::{CS_SIZE, enter_cs, initialize_cs, leave_cs, release_cs_wait};
 mod thread_handles;
-mod time;
+pub(crate) mod time;
 mod timer;
 mod toolhelp;
 pub(crate) use thread_handles::{find_thread, publish_thread, thread_access};

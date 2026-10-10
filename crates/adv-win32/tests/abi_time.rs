@@ -117,3 +117,118 @@ fn typed_time_output_fault_stops_without_bypassing_guest_protection() {
     assert!(failure.message.contains("ABI guest memory fault"));
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0);
 }
+
+/// Spin until `api` reports `span` units past its first reading, optionally making
+/// another host call on every iteration. Returns the machine and the iteration count.
+fn spin(
+    clock: Clock,
+    dll: &str,
+    api: &str,
+    span: u32,
+    interleave: bool,
+) -> (Machine<UnicornCpu>, u32) {
+    let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
+    registry.add("fixture.dll", "done", Conv::Cdecl { argc: 0 }, |_| {
+        adv_machine::Outcome::ExitProcess(0)
+    });
+    let mut machine = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, clock).unwrap();
+    machine.set_time_skip_source(Some(std::sync::Arc::new(|startup| startup)));
+    machine.cpu.map(CODE, PAGE, Prot::RWX).unwrap();
+    machine.cpu.map(DATA, PAGE, Prot::RW).unwrap();
+    let read = machine.resolve_import(dll, api).unwrap();
+    let other = machine
+        .resolve_import("kernel32.dll", "GetCurrentThreadId")
+        .unwrap();
+    let done = machine.resolve_import("fixture.dll", "done").unwrap();
+    let qpc = api == "QueryPerformanceCounter";
+    let read_eax = |code: &mut Asm| {
+        if qpc {
+            code.push_imm(DATA + 8).call(read).mov_eax_mem(DATA + 8);
+        } else {
+            code.call(read);
+        }
+    };
+    let mut code = Asm::new(CODE);
+    read_eax(&mut code);
+    code.mov_mem_eax(DATA);
+    code.bytes.extend_from_slice(&[0x31, 0xf6]); // xor esi, esi
+    let top = code.here();
+    code.bytes.push(0x46); // inc esi
+    if interleave {
+        code.call(other);
+    }
+    read_eax(&mut code);
+    code.bytes.extend_from_slice(&[0x2b, 0x05]); // sub eax, [DATA]
+    code.bytes.extend_from_slice(&DATA.to_le_bytes());
+    code.bytes.push(0x3d); // cmp eax, span
+    code.bytes.extend_from_slice(&span.to_le_bytes());
+    code.bytes.extend_from_slice(&[0x0f, 0x82]); // jb top
+    let next = code.here() + 4;
+    code.bytes
+        .extend_from_slice(&top.wrapping_sub(next).to_le_bytes());
+    code.bytes.extend_from_slice(&[0x89, 0x35]); // mov [DATA + 4], esi
+    code.bytes.extend_from_slice(&(DATA + 4).to_le_bytes());
+    code.call(done);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.spawn("spin", CODE, &[], 0x1_0000).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        match machine.run() {
+            RunResult::Exited(0) => break,
+            RunResult::Idle { .. } => std::thread::sleep(std::time::Duration::from_micros(100)),
+            other => panic!("spin did not finish: {other:?}"),
+        }
+        assert!(started.elapsed().as_secs() < 30, "spin never finished");
+    }
+    let iterations = machine.cpu.read_u32(DATA + 4).unwrap();
+    (machine, iterations)
+}
+
+#[test]
+fn clock_polling_spins_idle_and_skip_like_any_timed_wait() {
+    for (dll, api, second) in [
+        ("kernel32.dll", "GetTickCount", 1000),
+        ("winmm.dll", "timeGetTime", 1000),
+        (
+            "kernel32.dll",
+            "QueryPerformanceCounter",
+            adv_machine::clock::QPC_FREQ as u32,
+        ),
+    ] {
+        let started = std::time::Instant::now();
+        let (machine, iterations) = spin(Clock::real(), dll, api, second, false);
+        // A second of guest time passed by skipping, not by spinning through it.
+        assert!(
+            started.elapsed().as_millis() < 900,
+            "{api} spun in real time"
+        );
+        assert!(
+            machine.sys.scheduling.active_time_skip_us >= 500_000,
+            "{api}"
+        );
+        assert!(iterations < 10_000, "{api}: {iterations} polls");
+    }
+}
+
+#[test]
+fn reads_between_other_calls_are_not_a_spin() {
+    let (_, polled) = spin(
+        Clock::virtual_time(),
+        "kernel32.dll",
+        "GetTickCount",
+        2,
+        false,
+    );
+    let (machine, working) = spin(
+        Clock::virtual_time(),
+        "kernel32.dll",
+        "GetTickCount",
+        2,
+        true,
+    );
+    // Virtual time advances 1 us per read: only a detected spin waits for the tick.
+    assert!(polled < 200, "{polled}");
+    assert!(working > 1_000, "{working}");
+    assert_eq!(machine.sys.scheduling.active_time_skips, 0);
+}

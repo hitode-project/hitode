@@ -1560,7 +1560,7 @@ pub struct Machine<B: Backend> {
     frame_handoff: bool,
     /// Non-blocking live user intent, owned by the host input path. Never inferred
     /// from context names, frame rates or guest engine behavior.
-    time_skip_source: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    time_skip_source: Option<std::sync::Arc<dyn Fn(bool) -> bool + Send + Sync>>,
 }
 
 impl<B: Backend> Machine<B> {
@@ -1672,10 +1672,12 @@ impl<B: Backend> Machine<B> {
         self.sys.spawn(&mut self.cpu, name, entry, args, stack_size)
     }
 
-    /// Install a non-blocking, live input observation (normally atomic key state).
+    /// Install a non-blocking, live skip policy (normally atomic key state). It is
+    /// told whether the machine is still starting up: no frame completed yet, so
+    /// nothing a skipped wait would hurry has been shown.
     pub fn set_time_skip_source(
         &mut self,
-        source: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+        source: Option<std::sync::Arc<dyn Fn(bool) -> bool + Send + Sync>>,
     ) {
         self.time_skip_source = source;
     }
@@ -1684,7 +1686,8 @@ impl<B: Backend> Machine<B> {
         let Some(source) = &self.time_skip_source else {
             return false;
         };
-        if !source() || self.sys.active_contexts().any(|context| context.is_ready()) {
+        let startup = self.sys.completed_frames == 0;
+        if !source(startup) || self.sys.active_contexts().any(|context| context.is_ready()) {
             return false;
         }
         let Some(deadline) = self.sys.next_deadline() else {
@@ -1709,7 +1712,7 @@ impl<B: Backend> Machine<B> {
         });
         // Re-read live intent at the commit point; an up event never has to drain
         // a guest message queue before stopping time skipping.
-        if !eligible || !source() {
+        if !eligible || !source(startup) {
             return false;
         }
         let advanced = self.sys.clock.skip_to(deadline);

@@ -48,7 +48,7 @@ fn fixture(
     machine.ext.insert((object, timed));
     let held = Arc::new(AtomicBool::new(true));
     let observe = held.clone();
-    machine.set_time_skip_source(Some(Arc::new(move || observe.load(Ordering::Acquire))));
+    machine.set_time_skip_source(Some(Arc::new(move |_| observe.load(Ordering::Acquire))));
     machine.ext.insert(Control(held.clone()));
     machine.cpu.map(CODE, 4096, Prot::RWX).unwrap();
     let wait = machine.resolve_import("skip", "wait").unwrap();
@@ -187,4 +187,23 @@ fn an_earlier_external_timeout_cannot_be_overtaken_by_a_later_sleep() {
     ));
     assert_eq!(machine.sys.clock.now_us(), 1_000_000);
     assert_eq!(machine.sys.scheduling.active_time_skips, 0);
+}
+
+#[test]
+fn the_policy_sees_startup_until_the_first_completed_frame() {
+    for framed in [false, true] {
+        let (mut machine, _) = fixture(true, false, false, false, true);
+        machine.set_time_skip_source(Some(Arc::new(|startup| startup)));
+        if framed {
+            machine.sys.complete_frame();
+        }
+        let result = machine.run();
+        if framed {
+            assert!(matches!(result, RunResult::Idle { .. }));
+            assert_eq!(machine.sys.scheduling.active_time_skips, 0);
+        } else {
+            assert!(matches!(result, RunResult::Exited(0)));
+            assert_eq!(machine.sys.scheduling.active_time_skips, 1);
+        }
+    }
 }
