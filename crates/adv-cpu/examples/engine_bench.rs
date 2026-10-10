@@ -3,10 +3,11 @@
 //! Usage: `cargo run -p adv-cpu --release --example engine_bench [samples]`.
 //! Pin the process externally (for example `taskset 80` on Android) so engines
 //! are compared on the same core. Inputs: optional `ADV_ENGINE_BENCH_SCALE`
-//! (percent of the default iteration counts, 1-1000) and
-//! `ADV_ENGINE_BENCH_INTERPRETER=0` to skip the interpreter reference.
-//! `ADV_ENGINE_BENCH_A64=0` skips the a64 executor, which runs through the
-//! interpreter on hosts without its native backend.
+//! (percent of the default iteration counts, 1-1000),
+//! `ADV_ENGINE_BENCH_ENGINES` (comma list of `interpreter`, `cranelift` and
+//! `a64`, default all; a64 runs through the interpreter on hosts without its
+//! native backend) and `ADV_ENGINE_BENCH_WORKLOADS` (comma list of workload
+//! names, default all).
 //! Output: CSV rows of first-run milliseconds on a fresh CPU and steady-state
 //! nanoseconds per dynamic guest instruction. Workloads are self-authored; no
 //! game code or addresses are involved. Every engine's first run must match
@@ -427,7 +428,20 @@ fn main() {
     let scale: u64 =
         std::env::var("ADV_ENGINE_BENCH_SCALE").map_or(100, |s| s.parse().expect("scale percent"));
     assert!((1..=1000).contains(&scale));
-    let interpreter = std::env::var("ADV_ENGINE_BENCH_INTERPRETER").map_or(true, |v| v != "0");
+    let list = |name| std::env::var(name).ok();
+    let engines = list("ADV_ENGINE_BENCH_ENGINES");
+    let selected = list("ADV_ENGINE_BENCH_WORKLOADS");
+    let engine = |name: &str| {
+        engines
+            .as_ref()
+            .is_none_or(|v| v.split(',').any(|e| e == name))
+    };
+    let wanted = |name: &str| {
+        selected
+            .as_ref()
+            .is_none_or(|v| v.split(',').any(|w| w == name))
+    };
+    let interpreter = engine("interpreter");
     let n = |base: u64| (base * scale / 100).max(1) as u32;
     let workloads = [
         alu(n(1_000_000)),
@@ -437,23 +451,31 @@ fn main() {
         dispatch(n(8_000)),
     ];
     let cold = cold(n(4_000));
-    let a64 = std::env::var("ADV_ENGINE_BENCH_A64").map_or(true, |v| v != "0");
+    let (cranelift, a64) = (engine("cranelift"), engine("a64"));
     let reference = || Facade(JitCpu::new(PARK, false).unwrap());
     let jit = || Facade(JitCpu::new(PARK, true).unwrap());
     let translated = || adv_cpu_a64::Executor::address_space().unwrap();
     println!(
         "engine,workload,guest_instructions,first_run_ms,median_ns_per_instruction,min_ns,max_ns,warm_runs"
     );
-    for w in &workloads {
+    for w in workloads.iter().filter(|w| wanted(w.name)) {
         let expected = interpreter.then(|| measure("interpreter", &reference, w, 3, None));
-        let expected = Some(measure("cranelift", &jit, w, samples, expected));
+        let expected = match cranelift {
+            true => Some(measure("cranelift", &jit, w, samples, expected)),
+            false => expected,
+        };
         if a64 {
             measure("a64", &translated, w, samples, expected);
         }
     }
-    let expected = interpreter.then(|| measure_cold("interpreter", &reference, &cold, 3, None));
-    let expected = Some(measure_cold("cranelift", &jit, &cold, samples, expected));
-    if a64 {
-        measure_cold("a64", &translated, &cold, samples, expected);
+    if wanted(cold.name) {
+        let expected = interpreter.then(|| measure_cold("interpreter", &reference, &cold, 3, None));
+        let expected = match cranelift {
+            true => Some(measure_cold("cranelift", &jit, &cold, samples, expected)),
+            false => expected,
+        };
+        if a64 {
+            measure_cold("a64", &translated, &cold, samples, expected);
+        }
     }
 }
