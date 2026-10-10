@@ -14,6 +14,8 @@ reviewer and note; codepage may be absent/unknown, otherwise it must match.
 A sample's min_seconds (with a min_seconds_reason) raises its own limit for an
 engine whose first frame comes later; it never shortens a longer --seconds.
 --warm-from reuses only validated JIT archives in fresh overlays.
+Sample roots are process-only inputs: recorded commands use $ADV_SAMPLES and
+the runner receives a filename relative to its sample working directory.
 """
 from __future__ import annotations
 
@@ -442,7 +444,7 @@ def run(args: argparse.Namespace) -> None:
         folder.mkdir()
         game = sample_exe(sample)
         seconds = max(args.seconds, sample.get("min_seconds", 0))
-        command = [str(binary), str(game), "--" + args.mode, "--audio",
+        command = [str(binary), game.name, "--" + args.mode, "--audio",
                    "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(seconds),
                    "--codepage", str(sample.get("codepage", 932)),
                    "--auto-dialog-ms", "50", "--data-dir", str(folder / "overlay"),
@@ -451,15 +453,22 @@ def run(args: argparse.Namespace) -> None:
         if args.trace:
             command += ["--trace", str(folder / "api.log")]
         command += getattr(args, "runner_arg", [])
-        result = dict(sample, command=command, guest_exe_sha256=digest(game))
+        recorded_command = command.copy()
+        root = environment.get("ADV_SAMPLES")
+        if root and game.is_relative_to(Path(root).resolve()):
+            recorded_command[1] = "$ADV_SAMPLES/" + game.relative_to(Path(root).resolve()).as_posix()
+        else:
+            recorded_command[1] = sample["exe"]
+        result = dict(sample, command=recorded_command, guest_exe_sha256=digest(game))
         result["seconds"] = seconds
         if getattr(args, "warm_from", None):
             result["warm_inputs"] = import_warm_archives(args.warm_from, folder, sample,
                                                         metadata["binary_sha256"], result["guest_exe_sha256"])
-        (folder / "cmd.txt").write_text(subprocess.list2cmdline(command) + "\n" +
+        (folder / "cmd.txt").write_text(subprocess.list2cmdline(recorded_command) + "\n" +
             f"binary_sha256={metadata['binary_sha256']}\nguest_exe_sha256={result['guest_exe_sha256']}\n" +
             "environment=" + json.dumps({k: v for k, v in environment.items()
-                                          if k.startswith("ADV_") or k in ("TEMP", "TMP", "TMPDIR")}) + "\n",
+                                          if (k.startswith("ADV_") and k != "ADV_SAMPLES")
+                                          or k in ("TEMP", "TMP", "TMPDIR")}) + "\n",
             encoding="utf-8")
         validate_native_baseline(result)
         result["report_available"] = False
@@ -469,7 +478,7 @@ def run(args: argparse.Namespace) -> None:
         try:
             with (folder / "stdout.log").open("wb") as stdout, (folder / "stderr.log").open("wb") as stderr:
                 process = subprocess.Popen(command, stdout=stdout, stderr=stderr,
-                                           stdin=subprocess.DEVNULL, env=environment,
+                                           stdin=subprocess.DEVNULL, env=environment, cwd=game.parent,
                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 try:
                     result["exit_code"] = process.wait(timeout=seconds + args.timeout_grace)

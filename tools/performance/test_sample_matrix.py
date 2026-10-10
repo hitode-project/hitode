@@ -13,6 +13,39 @@ from sample_matrix import (analyze_report, diagnostic_completeness, milestones, 
 
 
 class CampaignTests(unittest.TestCase):
+    def test_sample_root_is_not_written_to_probe_metadata_or_runner_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            samples = root / "private-samples"
+            game = samples / "title" / "fixture.exe"
+            game.parent.mkdir(parents=True)
+            game.write_bytes(b"Mocked guest")
+            binary = root / "runner.exe"
+            binary.write_bytes(b"Mocked runner")
+            manifest = root / "samples.json"
+            manifest.write_text(json.dumps({"samples": [{"id": "one", "exe": "title/fixture.exe"}]}))
+
+            def launch(command, **kwargs):
+                self.assertEqual(command[1], "fixture.exe")
+                self.assertEqual(kwargs["cwd"], game.parent)
+                report = Path(command[command.index("--report") + 1])
+                report.write_text(json.dumps({"exe": command[1], "frames": 1}))
+                return SimpleNamespace(wait=lambda timeout: 0)
+
+            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=binary,
+                                      output=root / "output", seconds=1, timeout_grace=1,
+                                      mode="hidden", api_mode="strict", codec="native", trace=False)
+            with patch.dict(os.environ, {"ADV_SAMPLES": str(samples)}), \
+                    patch("sample_matrix.subprocess.Popen", side_effect=launch):
+                run(args)
+            for path in args.output.rglob("*"):
+                if path.is_file():
+                    content = path.read_text(encoding="utf-8")
+                    self.assertNotIn(str(samples), content)
+                    self.assertNotIn(str(samples).replace("\\", "\\\\"), content)
+            result = json.loads((args.output / "results.json").read_text())["samples"][0]
+            self.assertEqual(result["command"][1], "$ADV_SAMPLES/title/fixture.exe")
+
     def test_relative_samples_are_read_only_inputs_under_the_samples_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
