@@ -178,7 +178,7 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
         [fault, low, high, divisor, 0xaabbccdd]
     );
     assert_eq!(rd(36), rd(84));
-    assert_eq!(rd(40), rd(88));
+    assert_eq!(rd(40), rd(88) | (1 << 16)); // Native fault CONTEXT saves RF.
     assert_eq!(rd(48), 1);
     assert_eq!(
         [rd(64), rd(68), rd(72), rd(80)],

@@ -19,6 +19,23 @@ fn executor(bytes: &[u8], native: bool) -> Executor {
 }
 
 #[test]
+fn restored_resume_flag_survives_a_budget_stop_and_is_consumed_without_a_debug_trap() {
+    for native in [false, true] {
+        let mut cpu = executor(&[0x90, 0x40, 0xc3], native);
+        let mut state = cpu.state.capture_architecture();
+        state.eflags |= 1 << 16;
+        cpu.state.restore_architecture(&state).unwrap();
+        assert_eq!(cpu.run(STOP, 0).unwrap(), RunOutcome::Budget);
+        assert_ne!(cpu.state.eflags & (1 << 16), 0);
+        assert_eq!(cpu.run(STOP, 1).unwrap(), RunOutcome::Budget);
+        assert_eq!(cpu.state.eip, CODE + 1);
+        assert_eq!(cpu.state.eflags & (1 << 16), 0);
+        assert_eq!(cpu.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(cpu.state.regs[0], 1);
+    }
+}
+
+#[test]
 fn unhandled_native_and_interpreted_interrupt_return_committed_cpu_state() {
     for native in [false, true] {
         let mut cpu = executor(&[0x40, 0xcd, 0x2e, 0x43, 0xc3], native);

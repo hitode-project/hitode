@@ -78,6 +78,11 @@ fn get_file_information(env: &mut Env<'_>, handle: Handle, output: GuestPtr<u8>)
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
+    // The volume query comes first, and the null device has no volume.
+    if file.file.is_null_device() {
+        set_last_error(env, 1); // ERROR_INVALID_FUNCTION
+        return Outcome::Return(0);
+    }
     if output.addr() == 0 {
         set_last_error(env, err::INVALID_PARAMETER);
         return Outcome::Return(0);

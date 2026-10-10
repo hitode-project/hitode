@@ -298,7 +298,7 @@ fn unhandled_breakpoints_and_unknown_traps_fail_and_preserve_original_pc_diagnos
     .err()
     .unwrap();
     assert!(fabricated.contains("requires an executed CC or CD03"));
-    // The normalization hook cannot change even one field for other faults.
+    // Fault normalization adds only RF to the saved architectural image.
     machine.cpu.write(CODE, &[0xf7, 0xf1]).unwrap();
     state.eip = CODE;
     state.regs[1] = 0;
@@ -311,9 +311,10 @@ fn unhandled_breakpoints_and_unknown_traps_fail_and_preserve_original_pc_diagnos
         &state,
     )
     .unwrap();
-    let original = state.clone();
+    let mut expected = state.clone();
+    expected.eflags |= 1 << 16;
     normalize_context(&record, &mut state);
-    assert_eq!(state, original);
+    assert_eq!(state, expected);
 }
 
 fn debug_break_api<B: TestCpu>(cpu: B, direct: bool, handled: bool) {

@@ -665,3 +665,67 @@ fn short_paths_without_aliases_keep_guest_names_and_buffer_contracts() {
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn set_file_pointer_reports_last_error_only_for_ambiguous_and_failed_seeks() {
+    let (mut machine, root) = fixture("seek-errors");
+    std::fs::write(root.join("game/seek.dat"), b"seek").unwrap();
+    let handle = open(
+        &mut env(&mut machine),
+        "seek.dat",
+        0x8000_0000,
+        OPEN_EXISTING,
+    );
+    assert_ne!(handle, INVALID_HANDLE_VALUE);
+    // From the x86 native oracle: (low, high input, method, return, high output, error).
+    let high = 0x410100;
+    let cases = [
+        (10, None, 0, 10, None, 0x1234),
+        (20, Some(0), 0, 20, Some(0), 0x1234),
+        (u32::MAX, Some(0), 0, u32::MAX, Some(0), 0),
+        (u32::MAX, Some(1), 0, u32::MAX, Some(1), 0),
+        ((-5i32) as u32, None, 0, u32::MAX, None, 131),
+    ];
+    for (low, input, method, expected, output, error) in cases {
+        if let Some(input) = input {
+            machine.cpu.write_u32(high, input).unwrap();
+        }
+        args(
+            &mut machine,
+            &[handle, low, input.map_or(0, |_| high), method],
+        );
+        set_last_error(&mut env(&mut machine), 0x1234);
+        let label = format!("{low:#x} {input:?}");
+        assert_eq!(
+            returned(set_file_pointer(&mut env(&mut machine))),
+            expected,
+            "{label}"
+        );
+        if let Some(output) = output {
+            assert_eq!(machine.cpu.read_u32(high).unwrap(), output, "{label}");
+        }
+        assert_eq!(
+            crate::util::last_error(&env(&mut machine)),
+            error,
+            "{label}"
+        );
+    }
+    // SetFilePointerEx(handle, distance low, distance high, new position, method).
+    for (distance, result, error) in [(7i64, 1, 0x1234), (-1, 0, 131)] {
+        machine.cpu.write(high, &5u64.to_le_bytes()).unwrap();
+        let distance = distance as u64;
+        args(
+            &mut machine,
+            &[handle, distance as u32, (distance >> 32) as u32, high, 0],
+        );
+        set_last_error(&mut env(&mut machine), 0x1234);
+        assert_eq!(
+            returned(set_file_pointer_ex(&mut env(&mut machine))),
+            result
+        );
+        let position = if result == 1 { 7 } else { 5 };
+        assert_eq!(machine.cpu.read_u32(high).unwrap(), position);
+        assert_eq!(crate::util::last_error(&env(&mut machine)), error);
+    }
+    machine.sys.objects.close(handle);
+}

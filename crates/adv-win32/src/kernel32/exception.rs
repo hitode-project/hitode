@@ -4,7 +4,7 @@ pub(super) mod context;
 mod mapping;
 mod native;
 pub(super) mod phase;
-mod system_service;
+pub(super) mod system_service;
 pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
@@ -199,16 +199,7 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint
             adv_abi::warn_unavailable(env, "Win32 exception mapping", &reason);
             return Outcome::Fail(reason);
         }
-        // This native x86 OS profile publishes an empty numeric directory. Keep
-        // the retired PC and every other register; never dereference EDX or
-        // borrow a host thunk token to guess a service implementation.
-        adv_abi::warn_unavailable(
-            env,
-            "native x86 INT 2E",
-            "direct-service numeric directory has no registered services in the native x86 guest profile",
-        );
-        checkpoint.state.regs[0] = system_service::failure(checkpoint.state.regs[0]);
-        return Outcome::ResumeExecution(checkpoint);
+        return system_service::dispatch(env, checkpoint);
     }
     let record = match mapping::map(env.cpu, &event, &checkpoint.state) {
         Ok(record) => record,
@@ -218,6 +209,11 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint
         }
     };
     mapping::normalize_context(&record, &mut checkpoint.state);
+    // Windows enters the user exception dispatcher with DF clear, while the
+    // saved CONTEXT retains the interrupted DF for an explicit continuation.
+    // Do this before any guest dispatcher override or VEH/SEH callback runs.
+    env.cpu
+        .set_reg(Reg::Eflags, env.cpu.reg(Reg::Eflags) & !(1 << 10));
     dispatch_origin(env, checkpoint, record, native::Source::Hardware)
 }
 
@@ -434,7 +430,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
     }
     if frame == u32::MAX {
-        return native::unhandled(env, search);
+        return native::thread_unhandled(env, search);
     }
     // Bound malformed chains instead of repeatedly calling their handlers.
     if search.searched >= LIMIT {

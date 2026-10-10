@@ -186,7 +186,9 @@ fn integer_families_partial_registers_and_flags() {
         a.cwd().unwrap();
         a.cdq().unwrap();
     });
-    for flags in [2, 0x202, 0xad7, 0xffff_feff] {
+    // RF is excluded: the executor consumes RF in the interpreter before entering
+    // native code, so a lifted region never starts with RF set.
+    for flags in [2, 0x202, 0xad7, 0xfffe_feff] {
         let mut cpu = initial();
         cpu.eflags = flags;
         compare(&bytes, cpu, READ | WRITE, 1000);

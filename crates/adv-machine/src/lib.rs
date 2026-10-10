@@ -14,6 +14,7 @@ pub mod clock;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
+mod invocation;
 pub mod layout;
 pub mod objects;
 pub mod outcome;
@@ -73,6 +74,8 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
+    /// Explicit arguments exist only while a host invocation or its continuation runs.
+    invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
     rr_last: Option<CtxId>,
     pub trace: Trace,
@@ -177,6 +180,12 @@ pub struct Env<'a> {
 impl Env<'_> {
     /// `i`th stack argument of the current host call. Unreadable args read as 0 (and log).
     pub fn arg(&self, i: u32) -> u32 {
+        if let Some(arguments) = &self.sys.invocation_arguments
+            && arguments.context == self.context
+            && arguments.thunk == self.thunk
+        {
+            return arguments.values.get(i as usize).copied().unwrap_or(0);
+        }
         self.cpu.arg(i).unwrap_or_else(|e| {
             log::warn!("arg {i} unreadable: {e}");
             0
@@ -1596,6 +1605,7 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
+            invocation_arguments: None,
             trace: Trace::default(),
             thunks,
             objects: Objects::default(),

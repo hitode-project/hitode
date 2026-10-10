@@ -11,6 +11,7 @@ mod image_list;
 pub(crate) mod imm;
 mod internet;
 mod ole_memory;
+mod path_match;
 mod property_sheet;
 mod shell_drop;
 mod shell_execute;
@@ -393,6 +394,7 @@ pub fn register(reg: &mut Registry) {
     wts::register(reg);
     reg.register(path_find_extension_w_ABI);
     reg.register(path_find_file_name_w_ABI);
+    path_match::register(reg);
     theme::register(reg);
     internet::register(reg);
     shell_execute::register(reg);

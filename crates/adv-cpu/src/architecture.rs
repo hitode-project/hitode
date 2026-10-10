@@ -38,9 +38,9 @@ pub enum StateError {
 }
 
 impl ArchitecturalState {
-    // Arithmetic flags, TF, IF, DF and ID. Other bits remain opaque at this
+    // Arithmetic flags, TF, IF, DF, RF and ID. Other bits remain opaque at this
     // boundary; a roundtrip preserves them, but cannot switch CPU modes.
-    pub const WRITABLE_EFLAGS: u32 = 0x0020_0fd5;
+    pub const WRITABLE_EFLAGS: u32 = 0x0021_0fd5;
     // Exception masks, precision, rounding and legacy infinity control. Reserved
     // bits stay as captured; full restore is not FLDCW's status-mask operation.
     pub const WRITABLE_X87_CONTROL: u16 = 0x1f3f;

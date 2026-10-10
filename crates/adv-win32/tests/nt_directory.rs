@@ -425,6 +425,117 @@ fn move_file_directory_respects_open_children_and_keeps_the_enumeration_cursor()
     rename(JitCpu::new(PARK_ADDR, false).unwrap());
 }
 
+#[cfg(windows)]
+fn boolean_slots<B: Backend>(cpu: B) {
+    let (mut m, root) = fixture(cpu);
+    std::fs::write(root.join("game/nonempty/a.int"), b"a").unwrap();
+    std::fs::write(root.join("game/nonempty/b.int"), b"b").unwrap();
+    let mut code = Asm::new(CODE);
+    attrs(&mut m, DATA + 0x200, TEXT, r"\??\C:\Game\nonempty");
+    let mask: Vec<u8> = "*.int".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    m.cpu.write(TEXT + 256, &mask).unwrap();
+    m.cpu.write(DATA + 0x300, &10u16.to_le_bytes()).unwrap();
+    m.cpu.write(DATA + 0x302, &10u16.to_le_bytes()).unwrap();
+    m.cpu.write_u32(DATA + 0x304, TEXT + 256).unwrap();
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtCreateFile",
+        &[
+            DATA + 0x100,
+            0x100081,
+            DATA + 0x200,
+            DATA + 0x180,
+            0,
+            0x80,
+            7,
+            1,
+            0x21,
+            0,
+            0,
+        ],
+        DATA,
+    );
+    // Only the low byte of a BOOLEAN stack slot is significant: these single
+    // entries continue the cursor although the slots carry nonzero garbage.
+    for (index, buffer) in [0x400, 0x600, 0x800].into_iter().enumerate() {
+        handle_call(
+            &mut m,
+            &mut code,
+            "NtQueryDirectoryFile",
+            DATA + 0x100,
+            &[
+                0,
+                0,
+                0,
+                DATA + 0x180,
+                DATA + buffer,
+                512,
+                12,
+                0x145e_0b01,
+                DATA + 0x300,
+                0x1462_2700,
+            ],
+            DATA + 4 + index as u32 * 4,
+        );
+    }
+    // A restart whose low byte is set rescans; a cleared low byte returns
+    // every remaining entry in one buffer.
+    handle_call(
+        &mut m,
+        &mut code,
+        "NtQueryDirectoryFile",
+        DATA + 0x100,
+        &[
+            0,
+            0,
+            0,
+            DATA + 0x180,
+            DATA + 0xa00,
+            512,
+            12,
+            0x145e_0b00,
+            0,
+            0xffff_ff01,
+        ],
+        DATA + 16,
+    );
+    run(&mut m, code);
+    let name = |m: &Machine<B>, p: u32| {
+        let length = value(m, p + 8);
+        let mut bytes = vec![0; length as usize];
+        m.cpu.read(p + 12, &mut bytes).unwrap();
+        String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    assert_eq!(value(&m, DATA), 0);
+    assert_eq!(value(&m, DATA + 4), 0);
+    assert_eq!(value(&m, DATA + 8), 0);
+    assert_eq!(value(&m, DATA + 12), 0x80000006);
+    let mut found = [name(&m, DATA + 0x400), name(&m, DATA + 0x600)];
+    found.sort();
+    assert_eq!(found, ["a.int", "b.int"]);
+    assert_eq!(value(&m, DATA + 16), 0);
+    let next = value(&m, DATA + 0xa00);
+    assert_ne!(next, 0, "a non-single query returns every entry");
+    let mut all = [name(&m, DATA + 0xa00), name(&m, DATA + 0xa00 + next)];
+    all.sort();
+    assert_eq!(all, ["a.int", "b.int"]);
+    m.sys.objects.close(value(&m, DATA + 0x100));
+}
+#[cfg(windows)]
+#[test]
+fn directory_query_reads_only_the_low_byte_of_boolean_arguments() {
+    boolean_slots(UnicornCpu::new(PARK_ADDR).unwrap());
+    boolean_slots(JitCpu::new(PARK_ADDR, false).unwrap());
+}
+
 fn hook<B: Backend>(m: &mut Machine<B>, name: &str, slot: u32, argc: u8, deny_close: bool) {
     let binding = m.resolve_import("ntdll.dll", name).unwrap();
     let original = m

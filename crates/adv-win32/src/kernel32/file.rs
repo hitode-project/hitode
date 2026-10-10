@@ -144,6 +144,47 @@ fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Opens a Win32 name that selects a DOS device instead of a file. The null
+/// device accepts every create disposition and reports no prior existence.
+fn open_device(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> Option<u32> {
+    let nt = crate::ntdll::path::nt_path(env, path);
+    if !crate::ntdll::file::null_device(&nt) {
+        crate::ntdll::path::dos_device(&env.ext.get::<Win32>().vfs, path)?;
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateFile",
+            "console, serial and printer devices are not modeled",
+        );
+        set_last_error(env, 50);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    if !matches!(disposition, CREATE_NEW..=TRUNCATE_EXISTING) {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    // Windows 7 maps TRUNCATE_EXISTING to FILE_OVERWRITE, while later
+    // kernel32 releases reject truncating a device.
+    if disposition == TRUNCATE_EXISTING {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateFile",
+            "truncating the null device differs between Windows releases",
+        );
+        set_last_error(env, 50);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    if !env.sys.objects.can_insert() {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    let handle = env
+        .sys
+        .objects
+        .insert_host(crate::ntdll::file::null_file(access));
+    set_last_error(env, 0);
+    Some(handle)
+}
+
 fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
     let (access, share, disposition) = (env.arg(1), env.arg(2), env.arg(4));
     let inherit = match super::handle::security_inherit(env, env.arg(3)) {
@@ -155,6 +196,12 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
     };
     if let Some(outcome) = native::bridge::create(env, &path, access, share, inherit) {
         return outcome;
+    }
+    if let Some(handle) = open_device(env, &path, access, disposition) {
+        if handle != INVALID_HANDLE_VALUE {
+            super::handle::set_inherit(env, handle, inherit);
+        }
+        return Outcome::Return(handle);
     }
     let handle = open_with_share(env, &path, access, disposition, share);
     if handle != INVALID_HANDLE_VALUE {
@@ -473,6 +520,8 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
         return outcome;
     }
     let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    // The count is cleared before any work or error checking.
+    out_u32(env.cpu, read_out, 0);
     let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -507,6 +556,8 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
     {
         return outcome;
     }
+    // The count is cleared before any work or error checking.
+    out_u32(env.cpu, written, 0);
     let mut data = vec![0u8; n as usize];
     let _ = env.cpu.read(buf, &mut data);
     if matches!(h, STD_OUTPUT | STD_ERROR) {
@@ -561,6 +612,13 @@ fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
     if native::metadata::active(env, &["NtSetInformationFile", "NtQueryInformationFile"]) {
         return native::metadata::end(env, env.arg(0));
     }
+    // The I/O manager checks write access before the null driver rejects
+    // end-of-file information.
+    if let Some(access) = crate::ntdll::file::null_handle(env, env.arg(0)) {
+        let writable = access & (GENERIC_WRITE | 0x10000000 | 2) != 0;
+        set_last_error(env, if writable { 1 } else { err::ACCESS_DENIED });
+        return Outcome::Return(0);
+    }
     let Some(file) = env.sys.objects.host_mut::<FileObj>(env.arg(0)) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -607,19 +665,29 @@ fn seek(env: &mut Env<'_>, h: u32, dist: i64, method: u32) -> Option<u64> {
         return None;
     };
     let pos = match method {
-        0 => SeekFrom::Start(dist.max(0) as u64),
+        0 if dist < 0 => {
+            set_last_error(env, 131); // ERROR_NEGATIVE_SEEK
+            return None;
+        }
+        0 => SeekFrom::Start(dist as u64),
         1 => SeekFrom::Current(dist),
         _ => SeekFrom::End(dist),
     };
+    // A successful seek leaves the last error unchanged.
     match f.file.seek(pos) {
-        Ok(p) => {
-            set_last_error(env, 0);
-            Some(p)
-        }
+        Ok(p) => Some(p),
         Err(e) => {
             io_error(env, &e);
             None
         }
+    }
+}
+
+/// A successful SetFilePointer clears the last error only when the low position
+/// equals INVALID_SET_FILE_POINTER, so callers can tell it from a failure.
+fn clear_ambiguous_position(env: &mut Env<'_>, position: u64) {
+    if position as u32 == u32::MAX {
+        set_last_error(env, 0);
     }
 }
 
@@ -659,7 +727,7 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
                     set_last_error(env, 998);
                     return Outcome::Return(u32::MAX);
                 }
-                set_last_error(env, 0);
+                clear_ambiguous_position(env, position);
                 Outcome::Return(position as u32)
             }
             Err(error) => {
@@ -673,6 +741,7 @@ fn set_file_pointer(env: &mut Env<'_>) -> Outcome {
     match seek(env, h, dist, method) {
         Some(p) => {
             out_u32(env.cpu, hi_p, (p >> 32) as u32);
+            clear_ambiguous_position(env, p);
             Outcome::Return(p as u32)
         }
         None => Outcome::Return(u32::MAX),
@@ -704,7 +773,6 @@ fn set_file_pointer_ex(env: &mut Env<'_>) -> Outcome {
                     set_last_error(env, 998);
                     return Outcome::Return(0);
                 }
-                set_last_error(env, 0);
                 Outcome::Return(1)
             }
             Err(error) => {
@@ -828,6 +896,7 @@ fn get_file_type(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
     Outcome::Return(match h {
         STD_INPUT | STD_OUTPUT | STD_ERROR => 2, // FILE_TYPE_CHAR
+        _ if crate::ntdll::file::null_handle(env, h).is_some() => 2,
         _ if env.sys.objects.host::<FileObj>(h).is_some() => 1,
         _ => 0,
     })

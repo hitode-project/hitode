@@ -1,6 +1,6 @@
 //! lstr* and small arithmetic helpers.
 
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Registry, WideStr, win32};
 use adv_cpu::backend::Guest;
 use adv_machine::{Env, Outcome};
 use std::borrow::Cow;
@@ -23,6 +23,37 @@ fn lstrcat_a(env: &mut Env<'_>) -> Outcome {
     s.push(0);
     let _ = env.cpu.write(dst + d.len() as u32, &s);
     Outcome::Return(dst)
+}
+
+fn append_wide(
+    cpu: &mut dyn Guest,
+    mut dst: GuestPtr<u16>,
+    mut src: GuestPtr<u16>,
+) -> Result<(), adv_cpu::backend::MemFault> {
+    while dst.read(cpu)? != 0 {
+        dst = dst.offset(1)?;
+    }
+    loop {
+        let unit = src.read(cpu)?;
+        dst.write(cpu, unit)?;
+        if unit == 0 {
+            return Ok(());
+        }
+        dst = dst.offset(1)?;
+        src = src.offset(1)?;
+    }
+}
+
+#[win32(kernel32, name = "lstrcatW", level = implement)]
+fn lstrcat_w(env: &mut Env<'_>, dst: WideStr, src: WideStr) -> Outcome {
+    // Copy code units, including unpaired surrogates, without text conversion.
+    // Windows catches access errors and returns NULL; an already copied prefix
+    // is retained and LastError is not part of this API's result contract.
+    Outcome::Return(if append_wide(env.cpu, dst.0, src.0).is_ok() {
+        dst.0.addr()
+    } else {
+        0
+    })
 }
 
 fn cmp_ci(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -74,6 +105,7 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "lstrcpynA", 3, lstrcpyn_a);
     stdcall(reg, K32, "lstrcatA", 2, lstrcat_a);
+    reg.register(lstrcat_w_ABI);
     stdcall(reg, K32, "lstrcmpA", 2, |e| {
         Outcome::Return(sign(cstr(e.cpu, e.arg(0)).cmp(&cstr(e.cpu, e.arg(1)))))
     });
@@ -105,6 +137,24 @@ mod tests {
     use super::*;
     use adv_cpu::{JitCpu, backend::Prot};
     use adv_machine::layout::PARK_ADDR;
+
+    #[test]
+    fn wide_append_preserves_units_and_reports_partial_access_failure() {
+        let mut cpu = JitCpu::new(PARK_ADDR, false).unwrap();
+        cpu.map(0x400000, 4096, Prot::RW).unwrap();
+        cpu.write(0x400000, &[0x2d, 0x4e, 0, 0]).unwrap();
+        cpu.write(0x400100, &[0, 0xd8, 0x87, 0x65, 0, 0]).unwrap();
+        append_wide(&mut cpu, GuestPtr::new(0x400000), GuestPtr::new(0x400100)).unwrap();
+        let mut result = [0; 8];
+        cpu.read(0x400000, &mut result).unwrap();
+        assert_eq!(result, [0x2d, 0x4e, 0, 0xd8, 0x87, 0x65, 0, 0]);
+        cpu.write(0x400ffe, &[0, 0]).unwrap();
+        assert!(append_wide(&mut cpu, GuestPtr::new(0x400ffe), GuestPtr::new(0x400100)).is_err());
+        let mut prefix = [0; 2];
+        cpu.read(0x400ffe, &mut prefix).unwrap();
+        assert_eq!(prefix, [0, 0xd8]);
+        assert!(append_wide(&mut cpu, GuestPtr::new(0), GuestPtr::new(0x400100)).is_err());
+    }
 
     #[test]
     fn production_guest_view_borrows_only_terminated_names_on_one_page() {

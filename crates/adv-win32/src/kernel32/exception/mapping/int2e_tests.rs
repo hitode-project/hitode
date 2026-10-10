@@ -125,7 +125,14 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
     let result = machine.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     let rd = |slot| machine.cpu.read_u32(DATA + slot).unwrap();
-    assert_eq!(rd(8), 0xc000_001c);
+    assert_eq!(
+        rd(8),
+        if selector & 0x1fff == 0 {
+            0xc000_0002
+        } else {
+            0xc000_001c
+        }
+    );
     assert_eq!(
         [rd(12), rd(16), rd(20), rd(24), rd(28)],
         [
@@ -148,7 +155,7 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
     assert_eq!(diagnostics.warnings.len(), 1);
     let ((api, reason), count) = diagnostics.warnings.iter().next().unwrap();
     assert_eq!(api, "native x86 INT 2E");
-    assert!(reason.contains("no registered services"));
+    assert!(reason.contains("unavailable"));
     assert_eq!(*count, 1);
     let output = String::from_utf8(log.borrow().clone()).unwrap();
     let raw: Vec<_> = output

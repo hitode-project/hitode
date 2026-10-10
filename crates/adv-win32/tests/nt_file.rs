@@ -13,6 +13,8 @@ use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{FileObj, Win32, Win32Config};
 
+#[path = "nt_file/null_device.rs"]
+mod null_device;
 #[path = "nt_file/write_tests.rs"]
 mod write_tests;
 
@@ -166,6 +168,61 @@ fn lifecycle<B: Backend>(cpu: B) {
     );
 }
 
+fn attributes<B: Backend>(cpu: B) {
+    let (mut m, _root) = fixture(cpu);
+    // The native x86 oracle opens files case-insensitively for Attributes 0,
+    // OBJ_OPENIF and OBJ_CASE_INSENSITIVE | OBJ_OPENIF; a missing name keeps IOSB.
+    let cases = [
+        (0x00, r"\??\C:\Game\PRESENT.TXT", 0),
+        (0x80, r"\??\C:\Game\Present.Txt", 0),
+        (0xc0, r"\??\C:\GAME\present.txt", 0),
+        (0x00, r"\??\C:\Game\missing.txt", 0xc0000034),
+        (0x80, r"\??\C:\Game\missing.txt", 0xc0000034),
+    ];
+    let close = m.resolve_import("kernel32.dll", "CloseHandle").unwrap();
+    let mut code = Asm::new(CODE);
+    for (index, (attributes, path, status)) in cases.iter().enumerate() {
+        let base = DATA + index as u32 * 128;
+        input(&mut m, base, SOURCE + index as u32 * 512, path);
+        m.cpu.write_u32(base + 44, *attributes).unwrap();
+        create(&mut m, &mut code, arguments(base), base + 16);
+        if *status == 0 {
+            code.mov_eax_mem(base)
+                .push_eax()
+                .call(close)
+                .mov_mem_eax(base + 72);
+        }
+    }
+    run(&mut m, code);
+    for (index, (attributes, _, status)) in cases.into_iter().enumerate() {
+        let base = DATA + index as u32 * 128;
+        let label = format!("{attributes:#x} case {index}");
+        assert_eq!(m.cpu.read_u32(base + 16).unwrap(), status, "{label}");
+        assert_eq!(m.cpu.read_u32(base + 20).unwrap(), MARKER, "{label}");
+        if status == 0 {
+            assert_ne!(m.cpu.read_u32(base).unwrap(), 0, "{label}");
+            assert_eq!(m.cpu.read_u32(base + 8).unwrap(), 0, "{label}");
+            assert_eq!(m.cpu.read_u32(base + 12).unwrap(), 1, "{label}");
+            assert_eq!(m.cpu.read_u32(base + 72).unwrap(), 1, "{label}");
+        } else {
+            assert_eq!(m.cpu.read_u32(base).unwrap(), 0, "{label}");
+            assert_eq!(m.cpu.read_u32(base + 8).unwrap(), MARKER, "{label}");
+            assert_eq!(m.cpu.read_u32(base + 12).unwrap(), INFORMATION, "{label}");
+        }
+    }
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 0);
+}
+
+#[test]
+fn default_case_and_open_if_attributes_match_native_file_opens() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        attributes(cpu);
+    }
+    attributes(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
 #[test]
 fn native_handles_read_counted_unicode_names_and_share_the_win32_owner() {
     for jit in [false, true] {
@@ -246,7 +303,7 @@ fn failures<B: Backend>(cpu: B) {
             false,
         ),
         (
-            "no case-insensitive flag",
+            "inheritable handle",
             r"\??\C:\Game\present.txt",
             0xc00000bb,
             false,
@@ -291,7 +348,7 @@ fn failures<B: Backend>(cpu: B) {
             "read-only IOSB" => args[3] = READ_ONLY,
             "source overrun" => m.cpu.write_u32(base + 68, SOURCE + 0xffff).unwrap(),
             "object security" => m.cpu.write_u32(base + 48, SOURCE).unwrap(),
-            "no case-insensitive flag" => m.cpu.write_u32(base + 44, 0).unwrap(),
+            "inheritable handle" => m.cpu.write_u32(base + 44, 0x42).unwrap(),
             "supersede" => args[7] = 0,
             "unsupported access" => args[1] |= 0x20000000,
             "async open" => args[8] = 0x40,

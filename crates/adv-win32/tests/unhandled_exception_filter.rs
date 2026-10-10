@@ -88,6 +88,49 @@ fn registered_filter_receives_original_pointer_and_propagates_disposition() {
     dispositions(jit());
 }
 
+fn rtl_startup_filter<B: TestCpu>(cpu: B) {
+    let mut machine = machine(cpu);
+    let set_win = api(&mut machine, "SetUnhandledExceptionFilter");
+    let set_rtl = machine
+        .resolve_import("ntdll.dll", "RtlSetUnhandledExceptionFilter")
+        .unwrap();
+    let raise = api(&mut machine, "RaiseException");
+    let set_error = api(&mut machine, "SetLastError");
+    let get_error = api(&mut machine, "GetLastError");
+    let mut filter = Asm::new(FILTER);
+    filter.mov_eax_esp(4).mov_eax_ptr_eax().mov_eax_ptr_eax();
+    filter.mov_mem_eax(DATA);
+    filter.bytes.extend([0xb8, 0xff, 0xff, 0xff, 0xff]);
+    filter.ret_n(4);
+    machine.cpu.write(FILTER, &filter.bytes).unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(FRAME).call(set_win);
+    code.push_imm(0x4567).call(set_error);
+    code.push_imm(FILTER).call(set_rtl);
+    code.call(get_error).mov_mem_eax(DATA + 4);
+    code.push_imm(0).call(set_win).mov_mem_eax(DATA + 8);
+    code.push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0xe0425152)
+        .call(raise);
+    code.mov_mem_imm(DATA + 12, 1);
+    code.push_imm(0).call(set_rtl);
+    code.bytes.extend([0x31, 0xc0]);
+    code.ret();
+    run(&mut machine, code);
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0xe0425152);
+    assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0x4567);
+    assert_eq!(machine.cpu.read_u32(DATA + 8).unwrap(), FRAME);
+    assert_eq!(machine.cpu.read_u32(DATA + 12).unwrap(), 1);
+}
+
+#[test]
+fn rtl_startup_filter_is_independent_and_can_continue_an_exception() {
+    rtl_startup_filter(UnicornCpu::new(PARK_ADDR).unwrap());
+    rtl_startup_filter(jit());
+}
+
 fn resume_via_frame<B: TestCpu>(cpu: B) {
     let mut machine = machine(cpu);
     let set = api(&mut machine, "SetUnhandledExceptionFilter");

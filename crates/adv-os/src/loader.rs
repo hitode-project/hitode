@@ -1009,12 +1009,12 @@ impl<'a> Loader<'a> {
                 (thunk - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE
             }
         };
-        let size = self.sys.thunks.pristine_entry_bytes(index).len() as u32;
+        let size = self.sys.thunks.export_entry_bytes(index).len() as u32;
         adv_abi::guest::check_range(self.cpu, address, size, Prot::READ)?;
         Ok((!self
             .sys
             .thunks
-            .pristine_entry_matches(self.cpu, index, address)?)
+            .export_entry_matches(self.cpu, index, address)?)
         .then_some(address))
     }
 
@@ -1145,7 +1145,7 @@ impl<'a> Loader<'a> {
                             if self
                                 .sys
                                 .thunks
-                                .pristine_entry_matches(self.cpu, index, address)
+                                .export_entry_matches(self.cpu, index, address)
                                 .unwrap_or(true)
                             {
                                 return Err(LoadError::MissingExport { module: key, name });
@@ -1489,8 +1489,9 @@ pub(crate) fn system_image(
             crate::synthetic::Target::Absent
         } else {
             let thunk = sys.thunks.publish(cpu, key, &name)?;
-            let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
-            cpu.read(thunk, &mut bytes)?;
+            let index =
+                (thunk - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+            let bytes = sys.thunks.export_entry_bytes(index).to_vec();
             crate::synthetic::Target::Code(bytes)
         };
         let ordinal = name.strip_prefix('#').and_then(|n| n.parse().ok());
