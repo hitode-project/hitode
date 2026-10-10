@@ -192,6 +192,14 @@ pub(crate) fn volume(
     length: u32,
     class: i32,
 ) -> i32 {
+    if env
+        .sys
+        .objects
+        .host::<FileObj>(handle.0)
+        .is_some_and(|file| file.file.is_null_device())
+    {
+        return null_volume(env, iosb, output, length, class);
+    }
     if class != 1 {
         return unavailable_for(
             env,
@@ -229,6 +237,36 @@ pub(crate) fn volume(
     completion(env, iosb, 0, 20)
 }
 
+/// The null device answers only FileFsDeviceInformation: FILE_DEVICE_NULL
+/// with FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL. It has no volume, so every
+/// other class is an invalid device request.
+fn null_volume(
+    env: &mut Env<'_>,
+    iosb: GuestPtr<()>,
+    output: GuestPtr<()>,
+    length: u32,
+    class: i32,
+) -> i32 {
+    if class != 4 {
+        return INVALID_DEVICE_REQUEST;
+    }
+    if length < 8 {
+        return 0xc000_0004u32 as i32;
+    }
+    if check_range(env.cpu, output.addr(), 8, Prot::WRITE).is_err()
+        || check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    let mut data = [0; 8];
+    data[..4].copy_from_slice(&0x15u32.to_le_bytes());
+    data[4..].copy_from_slice(&0x100u32.to_le_bytes());
+    if env.cpu.write(output.addr(), &data).is_err() {
+        return ACCESS_VIOLATION;
+    }
+    completion(env, iosb, 0, 8)
+}
+
 pub(crate) fn flush(env: &mut Env<'_>, handle: Handle, iosb: GuestPtr<()>) -> i32 {
     if check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err() {
         return ACCESS_VIOLATION;
@@ -238,6 +276,10 @@ pub(crate) fn flush(env: &mut Env<'_>, handle: Handle, iosb: GuestPtr<()>) -> i3
     };
     if file.access & (GENERIC_WRITE | 0x10000000 | 2 | 4) == 0 {
         return ACCESS_DENIED;
+    }
+    // The null driver has no flush dispatch.
+    if file.file.is_null_device() {
+        return INVALID_DEVICE_REQUEST;
     }
     let Some(backing) = file.file.host() else {
         return ACCESS_DENIED;

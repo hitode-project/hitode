@@ -4,7 +4,7 @@ mod directory;
 mod loader;
 mod loader_lock;
 mod memory;
-mod path;
+pub(crate) mod path;
 mod peb_lock;
 pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;

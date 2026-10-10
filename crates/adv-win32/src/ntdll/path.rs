@@ -5,20 +5,59 @@ use adv_machine::Env;
 use adv_os::Heaps;
 
 use crate::Win32;
+use adv_os::Vfs;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(convert_ABI);
 }
 
-fn nt_name(env: &Env<'_>, input: &str) -> (String, Option<usize>) {
+/// The DOS device a Win32 name selects, spelled as the caller wrote it. One
+/// trailing colon and then trailing spaces/dots are ignored. Windows releases
+/// disagree on names with extensions, on directory-qualified devices other
+/// than NUL and on NUL below a missing directory; those stay ordinary files.
+pub(crate) fn dos_device<'a>(vfs: &Vfs, input: &'a str) -> Option<&'a str> {
+    let split = input
+        .rfind(['\\', '/'])
+        .map(|index| index + 1)
+        .or_else(|| (input.as_bytes().get(1) == Some(&b':')).then_some(2))
+        .unwrap_or(0);
+    let (parent, last) = input.split_at(split);
+    let last = last
+        .strip_suffix(':')
+        .unwrap_or(last)
+        .trim_end_matches([' ', '.']);
+    let upper = last.to_ascii_uppercase();
+    let numbered = upper.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && matches!(upper.as_bytes()[3], b'1'..=b'9');
+    if !numbered && !matches!(upper.as_str(), "NUL" | "CON" | "AUX" | "PRN") {
+        return None;
+    }
+    if parent.is_empty() {
+        return Some(last);
+    }
+    (upper == "NUL" && vfs.is_dir(&vfs.normalize(parent))).then_some(last)
+}
+
+/// The NT name RtlDosPathNameToNtPathName_U gives a Win32 name.
+pub(crate) fn nt_path(env: &Env<'_>, input: &str) -> String {
+    nt_name(env, input).0
+}
+
+/// The NT name, its relative-name start, and whether it names a DOS device.
+fn nt_name(env: &Env<'_>, input: &str) -> (String, Option<usize>, bool) {
     // Extended paths preserve dot components/trailing dots and spaces. The
     // already-NT prefix and local device prefix use the same DOS namespace.
     for prefix in [r"\\?\", r"\\.\", r"\??\"] {
         if let Some(path) = input.strip_prefix(prefix) {
-            return (format!(r"\??\{path}"), None);
+            return (format!(r"\??\{path}"), None, false);
         }
     }
     let vfs = &env.ext.get::<Win32>().vfs;
+    // A device has no file part and no current-directory relative view.
+    if let Some(device) = dos_device(vfs, input) {
+        return (format!(r"\??\{device}"), None, true);
+    }
     let full = vfs.normalize(input);
     let name = if let Some(unc) = full.strip_prefix(r"\\") {
         format!(r"\??\UNC\{unc}")
@@ -48,7 +87,7 @@ fn nt_name(env: &Env<'_>, input: &str) -> (String, Option<usize>) {
     } else {
         None
     };
-    (name, relative)
+    (name, relative, false)
 }
 
 fn unicode_string(length: u16, maximum: u16, buffer: u32) -> [u8; 8] {
@@ -90,7 +129,7 @@ fn convert(
         );
         return 0;
     };
-    let (path, relative) = nt_name(env, &input);
+    let (path, relative, device) = nt_name(env, &input);
     let units: Vec<u16> = path.encode_utf16().collect();
     let Some(length) = units
         .len()
@@ -116,7 +155,7 @@ fn convert(
     else {
         return 0;
     };
-    let part = if path.ends_with('\\') {
+    let part = if device || path.ends_with('\\') {
         0
     } else {
         let prefix = path.rfind('\\').map_or("", |index| &path[..index + 1]);

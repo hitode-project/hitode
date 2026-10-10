@@ -16,18 +16,22 @@ const SOURCE: u32 = 0x430000;
 const MARKER: u32 = 0x12345678;
 
 fn fixture<B: Backend>(cpu: B) -> Machine<B> {
+    fixture_in(
+        cpu,
+        "/nonexistent/nt-path".into(),
+        "/nonexistent/nt-path-data".into(),
+    )
+}
+
+fn fixture_in<B: Backend>(
+    cpu: B,
+    game: std::path::PathBuf,
+    data: std::path::PathBuf,
+) -> Machine<B> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
     let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
-    Win32::install(
-        &mut m,
-        Win32Config::new(
-            "/nonexistent/nt-path",
-            "fixture.exe",
-            "/nonexistent/nt-path-data",
-        ),
-    )
-    .unwrap();
+    Win32::install(&mut m, Win32Config::new(game, "fixture.exe", data)).unwrap();
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(READ_ONLY, 4096, Prot::READ).unwrap();
@@ -294,4 +298,100 @@ fn only_the_called_legacy_export_is_projected_and_implemented() {
     assert!(registry.dynamic_available("ntdll.dll", "RtlDosPathNameToNtPathName_U"));
     assert!(!registry.dynamic_available("ntdll.dll", "RtlDosPathNameToNtPathName_U_WithStatus"));
     assert!(registry.signature_conflicts().is_empty());
+}
+
+fn device_names<B: Backend>(cpu: B) {
+    // A directory-qualified NUL needs an existing parent directory.
+    let root =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/nt-path-tests");
+    std::fs::create_dir_all(root.join("game")).unwrap();
+    std::fs::create_dir_all(root.join("data/c")).unwrap();
+    let mut m = fixture_in(cpu, root.join("game"), root.join("data"));
+    let convert = m
+        .resolve_import("ntdll.dll", "RtlDosPathNameToNtPathName_U")
+        .unwrap();
+    // From the x86 native oracle. A device keeps the caller's spelling and has
+    // neither a file part nor a relative view; near misses stay relative files.
+    let devices = [
+        ("NUL", "NUL"),
+        ("nul", "nul"),
+        ("NUL:", "NUL"),
+        ("NUL ", "NUL"),
+        ("NUL.", "NUL"),
+        ("nul.", "nul"),
+        ("NUL :", "NUL"),
+        (r".\NUL", "NUL"),
+        (r"..\NUL", "NUL"),
+        ("C:NUL", "NUL"),
+        (r"\NUL", "NUL"),
+        ("/NUL", "NUL"),
+        (r"C:\NUL", "NUL"),
+        ("CON", "CON"),
+        ("CON:", "CON"),
+        ("AUX", "AUX"),
+        ("PRN", "PRN"),
+        ("COM1", "COM1"),
+        ("COM9", "COM9"),
+        ("LPT1", "LPT1"),
+    ];
+    let files = ["NUL.txt", "NULx", "COM0", "COM10", "LPT0", "CLOCK$"];
+    let inputs: Vec<&str> = devices
+        .iter()
+        .map(|(input, _)| *input)
+        .chain(files)
+        .collect();
+    let mut code = Asm::new(CODE);
+    for (index, input) in inputs.iter().enumerate() {
+        let source = SOURCE + index as u32 * 64;
+        let bytes: Vec<u8> = input
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        m.cpu.write(source, &bytes).unwrap();
+        let output = DATA + index as u32 * 32;
+        m.cpu.write(output, &[0xcd; 32]).unwrap();
+        code.push_imm(output + 12)
+            .push_imm(output + 8)
+            .push_imm(output)
+            .push_imm(source)
+            .call(convert)
+            .mov_mem_eax(output + 28);
+    }
+    run(&mut m, code);
+    for (index, input) in inputs.iter().enumerate() {
+        let output = DATA + index as u32 * 32;
+        assert_eq!(m.cpu.read_u32(output + 28).unwrap() & 0xff, 1, "{input}");
+        let (length, _, buffer) = descriptor(&m, output);
+        let mut bytes = vec![0; length as usize];
+        m.cpu.read(buffer, &mut bytes).unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let name = String::from_utf16(&units).unwrap();
+        let file_part = m.cpu.read_u32(output + 8).unwrap();
+        let relative = descriptor(&m, output + 12);
+        if let Some((_, device)) = devices.get(index) {
+            assert_eq!(name, format!(r"\??\{device}"), "{input}");
+            assert_eq!(file_part, 0, "{input}");
+            assert_eq!(relative, (0, 0, 0), "{input}");
+        } else {
+            assert_eq!(name, format!(r"\??\C:\Game\{input}"), "{input}");
+            let prefix = r"\??\C:\Game\".encode_utf16().count() as u32 * 2;
+            assert_eq!(file_part, buffer + prefix, "{input}");
+            let bytes = input.len() as u16 * 2;
+            assert_eq!(relative, (bytes, bytes, buffer + prefix), "{input}");
+        }
+    }
+}
+
+#[test]
+fn dos_device_names_convert_without_file_parts_on_all_backends() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        device_names(cpu);
+    }
+    device_names(UnicornCpu::new(PARK_ADDR).unwrap());
 }

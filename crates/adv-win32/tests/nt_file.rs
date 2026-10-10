@@ -13,6 +13,8 @@ use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{FileObj, Win32, Win32Config};
 
+#[path = "nt_file/null_device.rs"]
+mod null_device;
 #[path = "nt_file/write_tests.rs"]
 mod write_tests;
 

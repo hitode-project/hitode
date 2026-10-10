@@ -6,6 +6,7 @@ use adv_cpu::backend::Prot;
 use adv_machine::Env;
 
 use crate::{FileObj, Win32, util};
+use adv_os::vfs::FileStream;
 
 mod attributes;
 pub(crate) mod directory;
@@ -16,7 +17,9 @@ pub(crate) mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
 const INVALID_HANDLE: i32 = 0xc000_0008u32 as i32;
+const INVALID_INFO_CLASS: i32 = 0xc000_0003u32 as i32;
 const INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
+const INVALID_DEVICE_REQUEST: i32 = 0xc000_0010u32 as i32;
 const ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 const NAME_INVALID: i32 = 0xc000_0033u32 as i32;
 const NAME_NOT_FOUND: i32 = 0xc000_0034u32 as i32;
@@ -27,6 +30,8 @@ const FILE_IS_A_DIRECTORY: i32 = 0xc000_00bau32 as i32;
 const NOT_SUPPORTED: i32 = 0xc000_00bbu32 as i32;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
+/// Owner path of null device handles; no DOS file name normalizes to it.
+pub(crate) const NULL_DEVICE: &str = r"\Device\Null";
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -206,6 +211,25 @@ pub(crate) fn set(
     if directory::contains(env, handle.0) {
         return directory::set(env, handle, iosb, input, length, class);
     }
+    // The null driver rejects a new end of file after the I/O manager checks
+    // the handle's write right; only the position belongs to the file object.
+    if class != 14
+        && let Some(access) = null_handle(env, handle.0)
+    {
+        if class != 20 {
+            warn_unavailable(
+                env,
+                "ntdll.dll!ZwSetInformationFile",
+                "null device handles accept only position and end-of-file information",
+            );
+            return NOT_SUPPORTED;
+        }
+        return if access & (GENERIC_WRITE | 0x1000_0000 | 2) == 0 {
+            ACCESS_DENIED
+        } else {
+            INVALID_DEVICE_REQUEST
+        };
+    }
     if matches!(class, 10 | 13 | 64) {
         return mutation::set(env, handle, iosb, input, length, class);
     }
@@ -284,6 +308,11 @@ pub(crate) fn query(
 ) -> i32 {
     if directory::contains(env, handle.0) {
         return directory::query(env, handle, iosb, output, length, class);
+    }
+    // The null driver answers only standard information; the I/O manager
+    // itself answers position, access and mode queries for every file object.
+    if !matches!(class, 5 | 8 | 14 | 16) && null_handle(env, handle.0).is_some() {
+        return INVALID_INFO_CLASS;
     }
     if class == 4 || class == 6 {
         return metadata::query(env, handle, iosb, output, length, class);
@@ -426,6 +455,11 @@ impl ObjectAttributes {
     }
 
     fn path(&self, env: &mut Env<'_>, api: &str) -> Result<String, i32> {
+        let name = self.name(env, api)?;
+        dos_path(env, api, &name)
+    }
+
+    fn name(&self, env: &mut Env<'_>, api: &str) -> Result<String, i32> {
         let name = self.0[2];
         check_range(env.cpu, name, 8, Prot::READ).map_err(|_| ACCESS_VIOLATION)?;
         let mut descriptor = [0; 8];
@@ -448,49 +482,65 @@ impl ObjectAttributes {
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
-        let name = String::from_utf16(&units)
-            .map_err(|_| unavailable_for(env, api, "unpaired UTF-16 surrogate file names"))?;
-        let dos = name.strip_prefix(r"\??\").ok_or_else(|| {
-            unavailable_for(
-                env,
-                api,
-                "native device namespaces outside the guest DOS filesystem",
-            )
-        })?;
-        if dos.contains(['\0', '/', '*', '?']) {
-            return Err(NAME_INVALID);
-        }
-        let path = if dos
-            .get(..4)
-            .is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\"))
-        {
-            format!(r"\\{}", &dos[4..])
-        } else if dos.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-            && dos.as_bytes().get(1..3) == Some(b":\\")
-        {
-            dos.to_owned()
-        } else {
-            return Err(unavailable_for(
-                env,
-                api,
-                "DOS device names or relative NT names",
-            ));
-        };
-        // The VFS normalizes Win32 names. Reject unsupported literal native
-        // distinctions before normalization could silently select another file.
-        if path
-            .split('\\')
-            .any(|part| matches!(part, "." | "..") || part.ends_with([' ', '.']))
-            || path.get(2..).is_some_and(|p| p.contains(':'))
-        {
-            return Err(unavailable_for(
-                env,
-                api,
-                "literal native dot components, trailing dots/spaces, or streams",
-            ));
-        }
-        Ok(env.ext.get::<Win32>().vfs.normalize(&path))
+        String::from_utf16(&units)
+            .map_err(|_| unavailable_for(env, api, "unpaired UTF-16 surrogate file names"))
     }
+}
+
+/// `\??\NUL` links to `\Device\Null`, whose driver ignores any remaining name
+/// below it. Other spellings such as `\??\NUL.txt` are separate names.
+pub(crate) fn null_device(name: &str) -> bool {
+    let below = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .then(|| &name[prefix.len()..])
+    };
+    below(r"\??\NUL")
+        .or_else(|| below(r"\Device\Null"))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+}
+
+fn dos_path(env: &mut Env<'_>, api: &str, name: &str) -> Result<String, i32> {
+    let dos = name.strip_prefix(r"\??\").ok_or_else(|| {
+        unavailable_for(
+            env,
+            api,
+            "native device namespaces outside the guest DOS filesystem",
+        )
+    })?;
+    if dos.contains(['\0', '/', '*', '?']) {
+        return Err(NAME_INVALID);
+    }
+    let path = if dos
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\"))
+    {
+        format!(r"\\{}", &dos[4..])
+    } else if dos.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && dos.as_bytes().get(1..3) == Some(b":\\")
+    {
+        dos.to_owned()
+    } else {
+        return Err(unavailable_for(
+            env,
+            api,
+            "DOS device names or relative NT names",
+        ));
+    };
+    // The VFS normalizes Win32 names. Reject unsupported literal native
+    // distinctions before normalization could silently select another file.
+    if path
+        .split('\\')
+        .any(|part| matches!(part, "." | "..") || part.ends_with([' ', '.']))
+        || path.get(2..).is_some_and(|p| p.contains(':'))
+    {
+        return Err(unavailable_for(
+            env,
+            api,
+            "literal native dot components, trailing dots/spaces, or streams",
+        ));
+    }
+    Ok(env.ext.get::<Win32>().vfs.normalize(&path))
 }
 
 fn share_access(access: u32) -> u32 {
@@ -499,6 +549,62 @@ fn share_access(access: u32) -> u32 {
     let write = access & (0x4000_0000 | 0x1000_0000 | 0x6) != 0;
     let delete = access & (0x1000_0000 | 0x0001_0000) != 0;
     u32::from(read) | (u32::from(write) << 1) | (u32::from(delete) << 2)
+}
+
+/// The granted rights of a null device handle; None for every other handle.
+pub(crate) fn null_handle(env: &Env<'_>, handle: u32) -> Option<u32> {
+    env.sys
+        .objects
+        .host::<FileObj>(handle)
+        .filter(|file| file.file.is_null_device())
+        .map(|file| file.access)
+}
+
+/// A null device open instance. The null driver performs no share-access
+/// check, so the owner shares all access.
+pub(crate) fn null_file(access: u32) -> FileObj {
+    FileObj {
+        file: FileStream::Null,
+        guest_path: NULL_DEVICE.into(),
+        access,
+        share: 7,
+    }
+}
+
+/// The null device opens under every disposition, reports no create action
+/// in IOSB.Information and grants the requested rights unchanged.
+fn null_open(
+    env: &mut Env<'_>,
+    access: u32,
+    options: u32,
+    ea_buffer: GuestPtr<()>,
+    ea_length: u32,
+    output: GuestPtr<u32>,
+    iosb: GuestPtr<()>,
+) -> i32 {
+    if options & 0x30 == 0 {
+        return unavailable(
+            env,
+            "asynchronous null device handles require completion support",
+        );
+    }
+    if !ea_buffer.is_null() || ea_length != 0 {
+        return unavailable(env, "extended attributes are unavailable");
+    }
+    if !env.sys.objects.can_insert() {
+        return INSUFFICIENT_RESOURCES;
+    }
+    let handle = env.sys.objects.insert_host(null_file(access));
+    if env
+        .cpu
+        .write(iosb.addr(), &[0; 8])
+        .and_then(|()| output.write(env.cpu, handle))
+        .is_err()
+    {
+        env.sys.objects.close(handle);
+        return ACCESS_VIOLATION;
+    }
+    0
 }
 
 #[win32(ntdll, name = "ZwCreateFile", level = implement)]
@@ -541,6 +647,13 @@ pub(crate) fn create(
     if let Err(status) = oa.scope(env, "ntdll.dll!ZwCreateFile") {
         return status;
     }
+    let name = match oa.name(env, "ntdll.dll!ZwCreateFile") {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    if null_device(&name) {
+        return null_open(env, access, options, ea_buffer, ea_length, output, iosb);
+    }
     if options & 1 != 0 {
         if !allocation.is_null() || !ea_buffer.is_null() || ea_length != 0 {
             return unavailable(
@@ -551,7 +664,7 @@ pub(crate) fn create(
         if disposition != 1 && file_attributes & !0x90 != 0 {
             return unavailable(env, "only default attributes for created directories");
         }
-        let path = match oa.path(env, "ntdll.dll!ZwCreateFile") {
+        let path = match dos_path(env, "ntdll.dll!ZwCreateFile", &name) {
             Ok(path) => path,
             Err(status) => return status,
         };
@@ -619,7 +732,7 @@ pub(crate) fn create(
         }
     }
     // AllocationSize and FileAttributes do not change an existing FILE_OPEN.
-    let guest = match oa.path(env, "ntdll.dll!ZwCreateFile") {
+    let guest = match dos_path(env, "ntdll.dll!ZwCreateFile", &name) {
         Ok(path) => path,
         Err(status) => return status,
     };

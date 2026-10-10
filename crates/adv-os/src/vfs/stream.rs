@@ -15,6 +15,9 @@ pub enum FileStream {
     Host(HostFile),
     ReadOnly(Cursor<Arc<[u8]>>),
     Optical(super::OpticalFile),
+    /// The null device: reads end immediately and writes are discarded. Its
+    /// file position is never retained, so every position query reports zero.
+    Null,
 }
 
 /// Standard metadata for the opened file instance, independent of its path.
@@ -150,10 +153,13 @@ impl FileStream {
     pub fn read_only(bytes: Arc<[u8]>) -> Self {
         Self::ReadOnly(Cursor::new(bytes))
     }
+    pub fn is_null_device(&self) -> bool {
+        matches!(self, Self::Null)
+    }
     pub fn host(&self) -> Option<&std::fs::File> {
         match self {
             Self::Host(file) => Some(&file.file),
-            Self::ReadOnly(_) | Self::Optical(_) => None,
+            Self::ReadOnly(_) | Self::Optical(_) | Self::Null => None,
         }
     }
     /// No syscall. Unknown/non-file identities simply have no shared content.
@@ -162,11 +168,12 @@ impl FileStream {
             Self::Host(file) => file.identity,
             Self::ReadOnly(cursor) => Some((u64::MAX, cursor.get_ref().as_ptr() as usize as u64)),
             Self::Optical(file) => Some(file.identity()),
+            Self::Null => None,
         }
     }
     pub fn memory_bytes(&self) -> Option<&Arc<[u8]>> {
         match self {
-            Self::Host(_) | Self::Optical(_) => None,
+            Self::Host(_) | Self::Optical(_) | Self::Null => None,
             Self::ReadOnly(cursor) => Some(cursor.get_ref()),
         }
     }
@@ -184,6 +191,7 @@ impl FileStream {
             }
             Self::ReadOnly(cursor) => Ok(cursor.position()),
             Self::Optical(file) => Ok(file.position()),
+            Self::Null => Ok(0),
         }
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
@@ -191,13 +199,14 @@ impl FileStream {
             Self::Host(file) => file.file.metadata().map(Metadata::Host),
             Self::ReadOnly(cursor) => Ok(Metadata::ReadOnly(cursor.get_ref().len() as u64)),
             Self::Optical(file) => Ok(Metadata::Optical(file.len(), file.modified())),
+            Self::Null => Ok(Metadata::ReadOnly(0)),
         }
     }
     pub fn standard_information(&self) -> io::Result<StandardInformation> {
         if let Self::Host(file) = self {
             return host_standard_information(&file.file);
         }
-        // System32 byte images and ISO extents are immutable VFS file objects.
+        // System32 byte images, ISO extents and the null device are immutable VFS file objects.
         // Their model owns exactly their backing bytes and one logical link,
         // with no deletion queue or directory handles. This is not a host
         // allocation/identity claim and does not round EOF into cluster sizes.
@@ -214,6 +223,7 @@ impl FileStream {
         match self {
             Self::Host(file) => file.file.set_len(len),
             Self::ReadOnly(_) | Self::Optical(_) => Err(io::ErrorKind::PermissionDenied.into()),
+            Self::Null => Err(io::ErrorKind::Unsupported.into()),
         }
     }
 }
@@ -223,6 +233,7 @@ impl Read for FileStream {
             Self::Host(file) => file.file.read(output),
             Self::ReadOnly(cursor) => cursor.read(output),
             Self::Optical(file) => file.read(output),
+            Self::Null => Ok(0),
         }
     }
 }
@@ -231,12 +242,13 @@ impl Write for FileStream {
         match self {
             Self::Host(file) => file.file.write(input),
             Self::ReadOnly(_) | Self::Optical(_) => Err(io::ErrorKind::PermissionDenied.into()),
+            Self::Null => Ok(input.len()),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Host(file) => file.file.flush(),
-            Self::ReadOnly(_) | Self::Optical(_) => Ok(()),
+            Self::ReadOnly(_) | Self::Optical(_) | Self::Null => Ok(()),
         }
     }
 }
@@ -246,6 +258,13 @@ impl Seek for FileStream {
             Self::Host(file) => file.file.seek(position),
             Self::ReadOnly(cursor) => cursor.seek(position),
             Self::Optical(file) => file.seek(position),
+            // Current and end positions are both zero on the null device.
+            Self::Null => match position {
+                SeekFrom::Start(offset) => Ok(offset),
+                SeekFrom::Current(offset) | SeekFrom::End(offset) => {
+                    u64::try_from(offset).map_err(|_| io::ErrorKind::InvalidInput.into())
+                }
+            },
         }
     }
 }

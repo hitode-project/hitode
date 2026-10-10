@@ -144,6 +144,47 @@ fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Opens a Win32 name that selects a DOS device instead of a file. The null
+/// device accepts every create disposition and reports no prior existence.
+fn open_device(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> Option<u32> {
+    let nt = crate::ntdll::path::nt_path(env, path);
+    if !crate::ntdll::file::null_device(&nt) {
+        crate::ntdll::path::dos_device(&env.ext.get::<Win32>().vfs, path)?;
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateFile",
+            "console, serial and printer devices are not modeled",
+        );
+        set_last_error(env, 50);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    if !matches!(disposition, CREATE_NEW..=TRUNCATE_EXISTING) {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    // Windows 7 maps TRUNCATE_EXISTING to FILE_OVERWRITE, while later
+    // kernel32 releases reject truncating a device.
+    if disposition == TRUNCATE_EXISTING {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateFile",
+            "truncating the null device differs between Windows releases",
+        );
+        set_last_error(env, 50);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    if !env.sys.objects.can_insert() {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+        return Some(INVALID_HANDLE_VALUE);
+    }
+    let handle = env
+        .sys
+        .objects
+        .insert_host(crate::ntdll::file::null_file(access));
+    set_last_error(env, 0);
+    Some(handle)
+}
+
 fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
     let (access, share, disposition) = (env.arg(1), env.arg(2), env.arg(4));
     let inherit = match super::handle::security_inherit(env, env.arg(3)) {
@@ -155,6 +196,12 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
     };
     if let Some(outcome) = native::bridge::create(env, &path, access, share, inherit) {
         return outcome;
+    }
+    if let Some(handle) = open_device(env, &path, access, disposition) {
+        if handle != INVALID_HANDLE_VALUE {
+            super::handle::set_inherit(env, handle, inherit);
+        }
+        return Outcome::Return(handle);
     }
     let handle = open_with_share(env, &path, access, disposition, share);
     if handle != INVALID_HANDLE_VALUE {
@@ -561,6 +608,13 @@ fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
     if native::metadata::active(env, &["NtSetInformationFile", "NtQueryInformationFile"]) {
         return native::metadata::end(env, env.arg(0));
     }
+    // The I/O manager checks write access before the null driver rejects
+    // end-of-file information.
+    if let Some(access) = crate::ntdll::file::null_handle(env, env.arg(0)) {
+        let writable = access & (GENERIC_WRITE | 0x10000000 | 2) != 0;
+        set_last_error(env, if writable { 1 } else { err::ACCESS_DENIED });
+        return Outcome::Return(0);
+    }
     let Some(file) = env.sys.objects.host_mut::<FileObj>(env.arg(0)) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
@@ -828,6 +882,7 @@ fn get_file_type(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
     Outcome::Return(match h {
         STD_INPUT | STD_OUTPUT | STD_ERROR => 2, // FILE_TYPE_CHAR
+        _ if crate::ntdll::file::null_handle(env, h).is_some() => 2,
         _ if env.sys.objects.host::<FileObj>(h).is_some() => 1,
         _ => 0,
     })

@@ -86,7 +86,7 @@ pub(in crate::kernel32) fn create(
     if share & !7 != 0 {
         return Some(failed(env, 87, INVALID_HANDLE_VALUE));
     }
-    let path = env.ext.get::<Win32>().vfs.normalize(path);
+    let path = crate::ntdll::path::nt_path(env, path);
     let attrs = match attributes(env, &path, 16) {
         Ok(attrs) => attrs,
         Err(status) => return Some(failed(env, win32_error(status), INVALID_HANDLE_VALUE)),

@@ -40,6 +40,7 @@ pub(crate) fn win32_error(status: u32) -> u32 {
     match status {
         0 => 0,
         ACCESS_VIOLATION => 998,
+        0xc0000003 => 87,
         0xc0000004 => 24,
         0xc0000008 => 6,
         INVALID_PARAMETER => 87,
@@ -56,6 +57,7 @@ pub(crate) fn win32_error(status: u32) -> u32 {
         NOT_SUPPORTED => 50,
         0xc000007b => 193,
         0xc000000f | 0xc0000034 => 2,
+        0xc0000010 => 1,
         0xc000003a => 3,
         0xc0000035 => 80,
         0xc00000a2 => 19,
