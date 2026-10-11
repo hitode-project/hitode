@@ -249,14 +249,14 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             Some(source::add(env, graph, env.arg(1), env.arg(2), env.arg(3)))
         }
         (Face::FilterGraph, "Render") => Some(render::pin(env, graph, env.arg(1))),
-        (Face::FilterGraph, "RenderFile" | "RenderEx") => {
-            adv_abi::warn_unavailable(
-                env,
-                &format!("IGraphBuilder::{method}"),
-                "automatic graph building",
-            );
-            r(VFW_E_UNSUPPORTED_STREAM)
-        }
+        (Face::FilterGraph, "RenderFile") => Some(render::render_file(env, graph, env.arg(1))),
+        (Face::FilterGraph, "RenderEx") => Some(render::extended(
+            env,
+            graph,
+            env.arg(1),
+            env.arg(2),
+            env.arg(3),
+        )),
         (Face::FilterGraph, "SetLogFile") => r(S_OK),
         (Face::FilterGraph, "Abort") => r(S_OK),
         (Face::FilterGraph, "ShouldOperationContinue") => r(S_OK),
@@ -282,13 +282,14 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             let _ = env.cpu.write_u32(output, value);
             r(S_OK)
         }
-        (Face::MediaControl, "RenderFile" | "AddSourceFilter") => {
+        (Face::MediaControl, "RenderFile") => Some(render::render_file(env, graph, env.arg(1))),
+        (Face::MediaControl, "AddSourceFilter") => {
             adv_abi::warn_unavailable(
                 env,
-                &format!("IMediaControl::{method}"),
-                "automatic graph building",
+                "IMediaControl::AddSourceFilter",
+                "filter automation objects are unavailable",
             );
-            r(VFW_E_UNSUPPORTED_STREAM)
+            r(E_NOTIMPL)
         }
         (Face::MediaFilter, "GetClassID") => {
             let output = env.arg(1);

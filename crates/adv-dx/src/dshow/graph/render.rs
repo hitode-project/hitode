@@ -4,6 +4,7 @@ use super::*;
 use crate::dshow::filter::{INPUT, OUTPUT, Role};
 
 const VFW_E_CANNOT_RENDER: u32 = 0x8004_0218;
+const VFW_E_RENDERER_NOT_FOUND: u32 = 0x8004_0266;
 const VFW_S_PARTIAL_RENDER: u32 = 0x0004_0242;
 
 fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> Result<u32, u32> {
@@ -38,11 +39,59 @@ fn connect(env: &mut Env<'_>, out: u32, input: u32) -> Result<(), u32> {
 }
 
 pub(super) fn pin(env: &mut Env<'_>, graph: u32, pointer: u32) -> Outcome {
+    pin_with(env, graph, pointer, false)
+}
+
+pub(super) fn extended(
+    env: &mut Env<'_>,
+    graph: u32,
+    pointer: u32,
+    flags: u32,
+    context: u32,
+) -> Outcome {
+    if flags > 1 || context != 0 {
+        return Outcome::Return(E_INVALIDARG);
+    }
+    pin_with(env, graph, pointer, flags == 1)
+}
+
+/// Append a source and render its streams without replacing existing members.
+/// The reserved playlist is ignored, matching the native graph builder.
+pub(super) fn render_file(env: &mut Env<'_>, graph: u32, filename: u32) -> Outcome {
+    let Some(output) = alloc(env, 4) else {
+        return Outcome::Return(E_OUTOFMEMORY);
+    };
+    let outcome = source::add(env, graph, filename, 0, output);
+    after(
+        env,
+        outcome,
+        Box::new(move |env, result| {
+            let source = env.cpu.read_u32(output).unwrap_or(0);
+            free(env, output);
+            if result[0] & 0x8000_0000 != 0 {
+                return Outcome::Return(result[0]);
+            }
+            let output = state(env).filters[&source].pins[0];
+            let outcome = pin(env, graph, output);
+            after(
+                env,
+                outcome,
+                Box::new(move |env, result| {
+                    // Drop the AddSourceFilter caller reference; the graph keeps its own.
+                    release(env, source);
+                    Outcome::Return(result[0])
+                }),
+            )
+        }),
+    )
+}
+
+fn pin_with(env: &mut Env<'_>, graph: u32, pointer: u32, existing_only: bool) -> Outcome {
     if pointer == 0 {
         return Outcome::Return(E_POINTER);
     }
     let Some(pin) = filter::host_pin(env, pointer) else {
-        return guest_pin(env, graph, pointer);
+        return guest_pin(env, graph, pointer, existing_only);
     };
     let p = &state(env).pins[&pin];
     if p.dir != OUTPUT {
@@ -56,18 +105,19 @@ pub(super) fn pin(env: &mut Env<'_>, graph: u32, pointer: u32) -> Outcome {
         return Outcome::Return(E_INVALIDARG);
     }
     if state(env).filters[&filter].role == Role::FileSource {
-        return file(env, graph, filter, pin);
+        return file(env, graph, filter, pin, existing_only);
     }
     match state(env).pins[&pin].major {
         MEDIATYPE_VIDEO => video(
             env,
             graph,
             pin,
+            existing_only,
             Box::new(|_, results| Outcome::Return(results[0])),
         ),
-        MEDIATYPE_AUDIO => {
-            Outcome::Return(audio(env, graph, pin).map_or_else(|error| error, |_| S_OK))
-        }
+        MEDIATYPE_AUDIO => Outcome::Return(
+            audio(env, graph, pin, existing_only).map_or_else(|error| error, |_| S_OK),
+        ),
         _ => Outcome::Return(VFW_E_CANNOT_RENDER),
     }
 }
@@ -78,12 +128,13 @@ struct Build {
     graph: u32,
     splitter: u32,
     added: Vec<u32>,
-    file: Option<(u32, u32)>,
+    file: Option<(u32, u32, Option<MediaType>)>,
     guest: Option<u32>,
+    existing_only: bool,
 }
 
 impl Build {
-    fn new(env: &mut Env<'_>, graph: u32) -> Result<Self, u32> {
+    fn new(env: &mut Env<'_>, graph: u32, existing_only: bool) -> Result<Self, u32> {
         let splitter = member(
             env,
             graph,
@@ -97,6 +148,7 @@ impl Build {
             added: vec![splitter],
             file: None,
             guest: None,
+            existing_only,
         })
     }
 
@@ -104,7 +156,7 @@ impl Build {
         if hr & 0x8000_0000 == 0 {
             return Outcome::Return(hr);
         }
-        if let Some((source, output)) = self.file {
+        if let Some((source, output, media_type)) = self.file {
             let media = state(env)
                 .filters
                 .get_mut(&self.splitter)
@@ -115,6 +167,7 @@ impl Build {
                 state(env).filters.get_mut(&source).unwrap().source = media;
             }
             let _ = filter::disconnect_owned(env, output);
+            state(env).pins.get_mut(&output).unwrap().mt = media_type;
         }
         let mut calls = VecDeque::new();
         let mut disconnected_source = false;
@@ -155,7 +208,7 @@ impl Build {
     }
 }
 
-fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32) -> Outcome {
+fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) -> Outcome {
     // PIN_INFO is a filter pointer, direction and WCHAR[128]. The same cleared
     // block is reused for QueryDirection and ConnectedTo.
     let Some(scratch) = alloc(env, 264) else {
@@ -206,7 +259,7 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32) -> Outcome {
                     }
                     // Hold the caller's pin across nested source/renderer calls.
                     guest_call(env, output, 1, vec![], move |env, _| {
-                        let outcome = guest_source(env, graph, output);
+                        let outcome = guest_source(env, graph, output, existing_only);
                         after(
                             env,
                             outcome,
@@ -247,8 +300,8 @@ fn after(env: &mut Env<'_>, outcome: Outcome, finish: Then) -> Outcome {
     }
 }
 
-fn guest_source(env: &mut Env<'_>, graph: u32, output: u32) -> Outcome {
-    let mut build = match Build::new(env, graph) {
+fn guest_source(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) -> Outcome {
+    let mut build = match Build::new(env, graph, existing_only) {
         Ok(build) => build,
         Err(error) => return Outcome::Return(error),
     };
@@ -272,7 +325,7 @@ fn guest_source(env: &mut Env<'_>, graph: u32, output: u32) -> Outcome {
     )
 }
 
-fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32) -> Outcome {
+fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32, existing_only: bool) -> Outcome {
     let Some(info) = state(env).filters[&source]
         .source
         .as_ref()
@@ -280,11 +333,11 @@ fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32) -> Outcome {
     else {
         return Outcome::Return(VFW_E_UNSUPPORTED_STREAM);
     };
-    let mut build = match Build::new(env, graph) {
+    let mut build = match Build::new(env, graph, existing_only) {
         Ok(build) => build,
         Err(error) => return Outcome::Return(error),
     };
-    build.file = Some((source, output));
+    build.file = Some((source, output, state(env).pins[&output].mt.clone()));
     let input = endpoint(env, build.splitter, INPUT);
     if let Err(error) = connect(env, output, input) {
         return build.finish(env, error);
@@ -328,6 +381,7 @@ fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32) -> Outcome {
 /// probed splitter outputs and use identical decoder/renderer negotiation.
 fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
     let graph = build.graph;
+    let existing_only = build.existing_only;
     let mut video_output = None;
     let mut audio_output = None;
     let state = env.ext.get::<State>();
@@ -365,7 +419,7 @@ fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
     }
     let finish: Then = Box::new(move |env, results| {
         let video_result = results.first().copied();
-        let audio_result = audio_output.map(|pin| audio(env, graph, pin));
+        let audio_result = audio_output.map(|pin| audio(env, graph, pin, existing_only));
         let video_ok = video_result == Some(S_OK);
         let audio_ok = audio_result.as_ref().is_some_and(Result::is_ok);
         let failed = video_result.is_some_and(|hr| hr != S_OK)
@@ -390,12 +444,33 @@ fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
         build.finish(env, hr)
     });
     match video_output {
-        Some(out) => video(env, graph, out, finish),
+        Some(out) => video(env, graph, out, existing_only, finish),
         None => finish(env, Vec::new()),
     }
 }
 
-fn audio(env: &mut Env<'_>, graph: u32, out: u32) -> Result<(), u32> {
+fn available_renderer(env: &mut Env<'_>, graph: u32, role: Role) -> Option<u32> {
+    let candidates: Vec<_> = g(env, graph)
+        .members
+        .iter()
+        .filter_map(|m| m.host)
+        .collect();
+    candidates.into_iter().find(|id| {
+        if state(env).filters[id].role != role {
+            return false;
+        }
+        let input = endpoint(env, *id, INPUT);
+        state(env).pins[&input].peer == 0
+    })
+}
+
+fn audio(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) -> Result<(), u32> {
+    if let Some(renderer) = available_renderer(env, graph, Role::AudioRenderer) {
+        return connect(env, out, endpoint(env, renderer, INPUT));
+    }
+    if existing_only {
+        return Err(VFW_E_RENDERER_NOT_FOUND);
+    }
     let renderer = member(
         env,
         graph,
@@ -411,7 +486,7 @@ fn audio(env: &mut Env<'_>, graph: u32, out: u32) -> Result<(), u32> {
     Ok(())
 }
 
-fn video(env: &mut Env<'_>, graph: u32, out: u32, then: Then) -> Outcome {
+fn video(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool, then: Then) -> Outcome {
     let filters = g(env, graph)
         .members
         .iter()
@@ -421,7 +496,7 @@ fn video(env: &mut Env<'_>, graph: u32, out: u32, then: Then) -> Outcome {
     let Some(scratch) = alloc(env, 16) else {
         return then(env, vec![E_OUTOFMEMORY]);
     };
-    next_filter(env, out, filters, scratch, then)
+    next_filter(env, out, filters, scratch, existing_only, then)
 }
 
 fn next_filter(
@@ -429,22 +504,23 @@ fn next_filter(
     out: u32,
     mut filters: VecDeque<u32>,
     scratch: u32,
+    existing_only: bool,
     then: Then,
 ) -> Outcome {
     let Some(filter) = filters.pop_front() else {
         free(env, scratch);
         let owner = state(env).pins[&out].filter;
         let graph = state(env).filters[&owner].graph;
-        let hr = system_video(env, graph, out);
+        let hr = system_video(env, graph, out, existing_only);
         return then(env, vec![hr]);
     };
     let _ = env.cpu.write_u32(scratch, 0);
     guest_call(env, filter, 10, vec![scratch], move |env, hr| {
         let enumerator = env.cpu.read_u32(scratch).unwrap_or(0);
         if hr != S_OK || enumerator == 0 {
-            return next_filter(env, out, filters, scratch, then);
+            return next_filter(env, out, filters, scratch, existing_only, then);
         }
-        next_pin(env, out, filters, enumerator, scratch, then)
+        next_pin(env, out, filters, enumerator, scratch, existing_only, then)
     })
 }
 
@@ -454,6 +530,7 @@ fn next_pin(
     filters: VecDeque<u32>,
     enumerator: u32,
     scratch: u32,
+    existing_only: bool,
     then: Then,
 ) -> Outcome {
     let _ = env.cpu.write_u32(scratch + 4, 0);
@@ -466,13 +543,13 @@ fn next_pin(
             let pin = env.cpu.read_u32(scratch + 4).unwrap_or(0);
             if hr != S_OK || pin == 0 {
                 return guest_call(env, enumerator, 2, vec![], move |env, _| {
-                    next_filter(env, out, filters, scratch, then)
+                    next_filter(env, out, filters, scratch, existing_only, then)
                 });
             }
             guest_call(env, pin, 9, vec![scratch + 8], move |env, hr| {
                 if hr != S_OK || env.cpu.read_u32(scratch + 8).unwrap_or(OUTPUT) != INPUT {
                     return guest_call(env, pin, 2, vec![], move |env, _| {
-                        next_pin(env, out, filters, enumerator, scratch, then)
+                        next_pin(env, out, filters, enumerator, scratch, existing_only, then)
                     });
                 }
                 let _ = env.cpu.write_u32(scratch + 12, 0);
@@ -481,19 +558,35 @@ fn next_pin(
                     if hr == S_OK && peer != 0 {
                         return guest_call(env, peer, 2, vec![], move |env, _| {
                             guest_call(env, pin, 2, vec![], move |env, _| {
-                                next_pin(env, out, filters, enumerator, scratch, then)
+                                next_pin(
+                                    env,
+                                    out,
+                                    filters,
+                                    enumerator,
+                                    scratch,
+                                    existing_only,
+                                    then,
+                                )
                             })
                         });
                     }
                     if hr != VFW_E_NOT_CONNECTED {
                         return guest_call(env, pin, 2, vec![], move |env, _| {
-                            next_pin(env, out, filters, enumerator, scratch, then)
+                            next_pin(env, out, filters, enumerator, scratch, existing_only, then)
                         });
                     }
                     guest_call(env, out, 3, vec![pin, 0], move |env, hr| {
                         guest_call(env, pin, 2, vec![], move |env, _| {
                             if hr != S_OK {
-                                return next_pin(env, out, filters, enumerator, scratch, then);
+                                return next_pin(
+                                    env,
+                                    out,
+                                    filters,
+                                    enumerator,
+                                    scratch,
+                                    existing_only,
+                                    then,
+                                );
                             }
                             guest_call(env, enumerator, 2, vec![], move |env, _| {
                                 free(env, scratch);
@@ -509,7 +602,11 @@ fn next_pin(
 
 #[cfg(test)]
 mod guest_tests;
-fn system_video(env: &mut Env<'_>, graph: u32, out: u32) -> u32 {
+fn system_video(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) -> u32 {
+    let existing = available_renderer(env, graph, Role::VideoRenderer);
+    if existing_only && existing.is_none() {
+        return VFW_E_RENDERER_NOT_FOUND;
+    }
     if env.ext.try_get::<VideoProvider>().is_none() {
         adv_abi::warn_unavailable(
             env,
@@ -518,16 +615,8 @@ fn system_video(env: &mut Env<'_>, graph: u32, out: u32) -> u32 {
         );
         return VFW_E_CANNOT_RENDER;
     }
-    let existing = g(env, graph)
-        .members
-        .iter()
-        .filter_map(|m| m.host)
-        .collect::<Vec<_>>();
-    for id in existing {
-        if state(env).filters[&id].role == Role::VideoRenderer {
-            let input = endpoint(env, id, INPUT);
-            return connect(env, out, input).map_or_else(|hr| hr, |_| S_OK);
-        }
+    if let Some(renderer) = existing {
+        return connect(env, out, endpoint(env, renderer, INPUT)).map_or_else(|hr| hr, |_| S_OK);
     }
     let renderer = match member(
         env,

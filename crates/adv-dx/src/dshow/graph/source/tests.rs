@@ -239,3 +239,319 @@ fn automatic_audio_graph_owns_the_file_and_negotiates_pcm_without_a_video_render
     assert!(m.ext.get::<State>().filters.is_empty());
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
 }
+
+#[cfg(feature = "media")]
+fn invoke(
+    m: &mut Machine<adv_cpu::JitCpu>,
+    pointer: u32,
+    interface: &str,
+    name: &str,
+    args: &[u32],
+) -> u32 {
+    let slot = adv_abi::signature::com_signatures()
+        .iter()
+        .find(|s| s.module == interface && s.name == name)
+        .unwrap()
+        .com_slot
+        .unwrap();
+    let outcome = guest_call(
+        &mut env(m),
+        pointer,
+        u32::from(slot),
+        args.to_vec(),
+        |_, hr| Outcome::Return(hr),
+    );
+    finish(m, outcome)
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn render_file_appends_through_both_interfaces_and_owns_only_graph_references() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IFILTERGRAPH2);
+    let control = query(&mut m, graph, IID_IMEDIACONTROL);
+    let path = authored_wave();
+    wide(&mut m, DATA + 1024, &path);
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "RenderFile", &[0, 0]),
+        E_POINTER
+    );
+    assert!(m.ext.get::<State>().filters.is_empty());
+    // Native ignores the reserved playlist pointer rather than dereferencing it.
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "RenderFile",
+            &[DATA + 1024, u32::MAX]
+        ),
+        S_OK
+    );
+    let first: Vec<_> = m.ext.get::<State>().graphs[&graph]
+        .members
+        .iter()
+        .map(|member| member.filter)
+        .collect();
+    assert_eq!(first.len(), 4);
+    assert_eq!(
+        invoke(
+            &mut m,
+            control,
+            "IMediaControl",
+            "RenderFile",
+            &[DATA + 1024]
+        ),
+        S_OK
+    );
+    let state = m.ext.get::<State>();
+    assert_eq!(state.graphs[&graph].members.len(), 8);
+    assert!(first.iter().all(|f| state.filters.contains_key(f)));
+    assert_eq!(
+        state
+            .filters
+            .values()
+            .filter(|f| f.role == Role::AudioRenderer)
+            .count(),
+        2
+    );
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 2);
+    wide(&mut m, DATA + 1024, "target/nonexistent-dshow-source.wav");
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "RenderFile",
+            &[DATA + 1024, 0]
+        ),
+        VFW_E_NOT_FOUND
+    );
+    assert_eq!(m.ext.get::<State>().graphs[&graph].members.len(), 8);
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 2);
+    assert_eq!(method(&mut m, "IMediaControl::Release", &[control]), 1);
+    assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
+    assert!(m.ext.get::<State>().graphs.is_empty());
+    assert!(m.ext.get::<State>().filters.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn render_ex_existing_only_rolls_back_then_retries_with_existing_audio_renderer() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IFILTERGRAPH2);
+    wide(&mut m, DATA + 1024, &authored_wave());
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "AddSourceFilter",
+            &[DATA + 1024, 0, DATA]
+        ),
+        S_OK
+    );
+    let source = m.cpu.read_u32(DATA).unwrap();
+    let output = m.ext.get::<State>().filters[&source].pins[0];
+    for args in [[output, 2, 0], [output, 0, 1]] {
+        assert_eq!(
+            invoke(&mut m, graph, "IFilterGraph2", "RenderEx", &args),
+            E_INVALIDARG
+        );
+    }
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "RenderEx", &[output, 1, 0]),
+        0x8004_0266
+    );
+    let state = m.ext.get::<State>();
+    assert_eq!(state.graphs[&graph].members.len(), 1);
+    assert_eq!(state.pins[&output].peer, 0);
+    assert!(
+        state.filters[&source]
+            .source
+            .as_ref()
+            .unwrap()
+            .decoder
+            .is_some()
+    );
+    let renderer = activate(&mut m, CLSID_DSOUND_RENDER, IID_IBASEFILTER);
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "AddFilter", &[renderer, 0]),
+        S_OK
+    );
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "RenderEx", &[output, 1, 0]),
+        S_OK
+    );
+    let state = m.ext.get::<State>();
+    assert_eq!(state.graphs[&graph].members.len(), 4);
+    assert_eq!(
+        state
+            .filters
+            .values()
+            .filter(|f| f.role == Role::AudioRenderer)
+            .count(),
+        1
+    );
+    assert_ne!(state.pins[&state.filters[&renderer].pins[0]].peer, 0);
+    method(&mut m, "IBaseFilter::Release", &[renderer]);
+    method(&mut m, "IBaseFilter::Release", &[source]);
+    assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
+    assert!(m.ext.get::<State>().filters.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn render_file_movie_keeps_connected_renderers_and_appends_video_and_audio_streams() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IFILTERGRAPH2);
+    crate::dshow::video::set_video_provider(
+        &mut m.ext,
+        VideoProvider {
+            window: |_, _, _| None,
+            update: |_, _, _| Ok(1),
+            completed: |_, _| None,
+        },
+    );
+    let path = format!("target/dshow-source-tests/movie-{}.mpg", std::process::id());
+    std::fs::create_dir_all("target/dshow-source-tests").unwrap();
+    std::fs::write(&path, include_bytes!("../render/fixtures/guest_movie.mpg")).unwrap();
+    wide(&mut m, DATA + 1024, &path);
+    for count in [6, 12] {
+        assert_eq!(
+            invoke(
+                &mut m,
+                graph,
+                "IFilterGraph2",
+                "RenderFile",
+                &[DATA + 1024, 0]
+            ),
+            S_OK
+        );
+        let state = m.ext.get::<State>();
+        assert_eq!(state.graphs[&graph].members.len(), count);
+        for f in state
+            .filters
+            .values()
+            .filter(|f| matches!(f.role, Role::AudioRenderer | Role::VideoRenderer))
+        {
+            assert_ne!(state.pins[&f.pins[0]].peer, 0);
+        }
+    }
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 2);
+    assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
+    assert!(m.ext.get::<State>().filters.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_when_busy() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IFILTERGRAPH2);
+    crate::dshow::video::set_video_provider(
+        &mut m.ext,
+        VideoProvider {
+            window: |_, _, _| None,
+            update: |_, _, _| Ok(1),
+            completed: |_, _| None,
+        },
+    );
+    let path = format!(
+        "target/dshow-source-tests/movie-existing-{}.mpg",
+        std::process::id()
+    );
+    std::fs::create_dir_all("target/dshow-source-tests").unwrap();
+    std::fs::write(&path, include_bytes!("../render/fixtures/guest_movie.mpg")).unwrap();
+    wide(&mut m, DATA + 1024, &path);
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "AddSourceFilter",
+            &[DATA + 1024, 0, DATA]
+        ),
+        S_OK
+    );
+    let source = m.cpu.read_u32(DATA).unwrap();
+    let output = m.ext.get::<State>().filters[&source].pins[0];
+    for class in [CLSID_VIDEO_RENDER, CLSID_DSOUND_RENDER] {
+        let role = if class == CLSID_VIDEO_RENDER {
+            Role::VideoRenderer
+        } else {
+            Role::AudioRenderer
+        };
+        let renderer = filter::new_filter(&mut env(&mut m), role, class).unwrap();
+        assert_eq!(
+            invoke(&mut m, graph, "IFilterGraph2", "AddFilter", &[renderer, 0]),
+            S_OK
+        );
+        method(&mut m, "IBaseFilter::Release", &[renderer]);
+    }
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "RenderEx", &[output, 1, 0]),
+        S_OK
+    );
+    assert_eq!(m.ext.get::<State>().graphs[&graph].members.len(), 6);
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "AddSourceFilter",
+            &[DATA + 1024, 0, DATA]
+        ),
+        S_OK
+    );
+    let second_source = m.cpu.read_u32(DATA).unwrap();
+    let second_output = m.ext.get::<State>().filters[&second_source].pins[0];
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "RenderEx",
+            &[second_output, 1, 0]
+        ),
+        0x8004_0266
+    );
+    assert_eq!(m.ext.get::<State>().graphs[&graph].members.len(), 7);
+    assert_eq!(
+        invoke(
+            &mut m,
+            graph,
+            "IFilterGraph2",
+            "RenderEx",
+            &[second_output, 0, 0]
+        ),
+        S_OK
+    );
+    assert_eq!(m.ext.get::<State>().graphs[&graph].members.len(), 12);
+    for role in [Role::VideoRenderer, Role::AudioRenderer] {
+        assert_eq!(
+            m.ext
+                .get::<State>()
+                .filters
+                .values()
+                .filter(|f| f.role == role)
+                .count(),
+            2
+        );
+    }
+    method(&mut m, "IBaseFilter::Release", &[source]);
+    method(&mut m, "IBaseFilter::Release", &[second_source]);
+    assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
+    assert!(m.ext.get::<State>().filters.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+}
