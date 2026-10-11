@@ -35,19 +35,24 @@ fn task_alloc(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(pointer)
 }
 fn task_free(env: &mut Env<'_>) -> Outcome {
-    let pointer = env.arg(0);
+    free_value(env, env.arg(0))
+}
+pub(super) fn free_value(env: &mut Env<'_>, pointer: u32) -> Outcome {
     if pointer != 0 {
-        if !task(env).remove(&pointer) {
+        if env.ext.get_mut::<Heaps>().size(0, pointer).is_none() {
             return Outcome::Fail(format!(
                 "CoTaskMemFree: invalid task allocation {pointer:#x}"
             ));
         }
+        task(env).remove(&pointer);
         free(env, pointer);
     }
     Outcome::Return(0)
 }
 fn task_realloc(env: &mut Env<'_>) -> Outcome {
-    let (old, size) = (env.arg(0), env.arg(1));
+    realloc_value(env, env.arg(0), env.arg(1))
+}
+pub(super) fn realloc_value(env: &mut Env<'_>, old: u32, size: u32) -> Outcome {
     if old == 0 {
         let pointer = allocate(env, size);
         if pointer != 0 {
@@ -55,7 +60,7 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
         }
         return Outcome::Return(pointer);
     }
-    if !task(env).contains(&old) {
+    if env.ext.get_mut::<Heaps>().size(0, old).is_none() {
         return Outcome::Fail(format!(
             "CoTaskMemRealloc: invalid task allocation {old:#x}"
         ));

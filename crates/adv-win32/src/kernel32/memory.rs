@@ -8,7 +8,7 @@ use crate::stdcall;
 use crate::util::{err, set_last_error};
 use adv_os::Heaps;
 mod dep;
-mod global;
+pub(crate) mod global;
 pub(crate) use global::{allocate as allocate_local_memory, release as release_local_memory};
 mod locks;
 mod native;

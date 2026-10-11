@@ -8,6 +8,9 @@ use adv_machine::{Env, Outcome};
 
 mod common_dialogs;
 mod dwm;
+mod folder_browse;
+mod gdiplus;
+mod hglobal_stream;
 mod image_list;
 pub(crate) mod imm;
 mod internet;
@@ -18,6 +21,9 @@ mod shell_drop;
 mod shell_execute;
 mod shell_icon;
 mod shell_path;
+mod task_allocator;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod variant;
 mod wts;
@@ -426,7 +432,11 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     common_dialogs::register(reg);
+    folder_browse::register(reg);
+    gdiplus::register(reg);
+    hglobal_stream::register(reg);
     ole_memory::register(reg);
+    task_allocator::register(reg);
     variant::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
@@ -441,16 +451,6 @@ pub fn register(reg: &mut Registry) {
     });
     stdcall(reg, "mpr.dll", "WNetGetUniversalNameW", 4, |_| {
         Outcome::Return(2250) // ERROR_NOT_CONNECTED
-    });
-    stdcall(reg, "gdiplus.dll", "GdiplusStartup", 3, |e| {
-        let token = e.arg(0);
-        if token != 0 {
-            let _ = e.cpu.write_u32(token, 1);
-        }
-        Outcome::Return(0)
-    });
-    stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| {
-        Outcome::Return(0)
     });
     stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| {
         Outcome::Return(0)

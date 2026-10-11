@@ -127,9 +127,9 @@ fn display_dc_parallel_font_borrows_keep_the_live_canvas_and_independent_state()
         assert_eq!(call(&mut m, data, "user32.dll!ReleaseDC", &[hwnd, dc]), 0);
     }
     let screen = get(&mut m, data, 0);
-    assert_eq!(backing(&m, screen), primary);
+    assert_eq!(backing(&m, screen), 0);
     let surface = m.ext.get::<SurfaceStore>().get(primary).unwrap();
-    assert_eq!((surface.width, surface.height), (16, 12));
+    assert_eq!((surface.width, surface.height), (8, 8));
     assert_eq!(
         call(
             &mut m,
@@ -137,10 +137,46 @@ fn display_dc_parallel_font_borrows_keep_the_live_canvas_and_independent_state()
             "gdi32.dll!SetPixel",
             &[screen, 10, 10, 0x654321]
         ),
-        0x654321
+        u32::MAX
     );
     assert_eq!(call(&mut m, data, "user32.dll!ReleaseDC", &[0, screen]), 1);
     assert_eq!(m.sys.objects.object_count(), count);
+}
+
+#[test]
+fn hidden_parented_window_cannot_resize_the_client_after_its_last_dc_was_released() {
+    let (mut m, data, _, _) = fixture(8, 8, PixelFormat::Bgra32, false);
+    windows(&mut m, false);
+    m.ext
+        .get_mut::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut m.sys.objects, &CHILD)
+        .unwrap()
+        .style &= !WS_VISIBLE;
+    let dc = get(&mut m, data, ROOT);
+    let primary = backing(&m, dc);
+    let pixels = m.ext.get::<SurfaceStore>().get(primary).unwrap().pixels;
+    m.cpu.write(pixels, &[0x5a; 256]).unwrap();
+    assert_eq!(call(&mut m, data, "user32.dll!ReleaseDC", &[ROOT, dc]), 1);
+    let child = get(&mut m, data, CHILD);
+    assert_eq!(backing(&m, child), 0);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetDeviceCaps", &[child, 88]),
+        96
+    );
+    assert_eq!(
+        call(&mut m, data, "user32.dll!ReleaseDC", &[CHILD, child]),
+        1
+    );
+    let surface = m.ext.get::<SurfaceStore>().get(primary).unwrap();
+    assert_eq!(
+        (surface.width, surface.height, surface.pixels),
+        (8, 8, pixels)
+    );
+    let mut before = [0; 256];
+    m.cpu.read(pixels, &mut before).unwrap();
+    assert_eq!(before, [0x5a; 256]);
 }
 
 #[test]
@@ -186,6 +222,27 @@ fn display_dc_nested_paint_has_default_state_and_own_dc_retains_its_owner() {
         super::super::super::super::front::retire_window(&mut env(&mut m), ROOT);
         assert!(m.ext.get::<Win32>().gdi.get(&m.sys.objects, c).is_none());
     }
+}
+
+#[test]
+fn visible_child_can_be_the_presentation_canvas_after_the_parent_lease_ends() {
+    let (mut m, data, _, _) = fixture(8, 8, PixelFormat::Bgra32, false);
+    windows(&mut m, false);
+    let root = get(&mut m, data, ROOT);
+    let primary = backing(&m, root);
+    assert_eq!(call(&mut m, data, "user32.dll!ReleaseDC", &[ROOT, root]), 1);
+    let child = get(&mut m, data, CHILD);
+    assert_eq!(backing(&m, child), primary);
+    let surface = m.ext.get::<SurfaceStore>().get(primary).unwrap();
+    assert_eq!((surface.width, surface.height), (4, 4));
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetPixel", &[child, 1, 1, 0x123456]),
+        0x123456
+    );
+    assert_eq!(
+        call(&mut m, data, "user32.dll!ReleaseDC", &[CHILD, child]),
+        1
+    );
 }
 
 #[test]

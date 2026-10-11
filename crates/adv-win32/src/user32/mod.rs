@@ -17,6 +17,7 @@ pub(crate) mod hooks;
 pub mod host_input;
 pub(crate) mod image;
 mod input;
+mod layered;
 pub mod menu;
 pub mod message;
 mod monitor;
@@ -71,6 +72,15 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
     let win32 = m.ext.get_mut::<Win32>();
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);
     win32.user.add_system_classes(procs);
+    // The desktop object predates thunk installation; update its cached proc
+    // along with its class so activation/owner messages reach DefWindowProc.
+    if let Some(desktop) = win32
+        .user
+        .windows
+        .get_mut(&mut m.sys.objects, &win32.user.desktop)
+    {
+        desktop.proc = procs.def_window;
+    }
     Ok(())
 }
 
@@ -776,6 +786,7 @@ pub fn register(reg: &mut Registry) {
     dialog::register(reg);
     strings::register(reg);
     scroll::register(reg);
+    layered::register(reg);
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);

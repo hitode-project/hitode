@@ -55,22 +55,6 @@ fn error(env: &mut Env<'_>) -> u32 {
         .map_or(0, |&(_, error)| error)
 }
 
-#[win32(shell32, name = "SHBrowseForFolderA", level = safe_fail)]
-fn browse_a(env: &mut Env<'_>, _info: GuestPtr<()>) -> GuestPtr<()> {
-    GuestPtr::new(unavailable(env, "shell32.dll!SHBrowseForFolderA", false))
-}
-#[win32(shell32, name = "SHBrowseForFolderW", level = safe_fail)]
-fn browse_w(env: &mut Env<'_>, _info: GuestPtr<()>) -> GuestPtr<()> {
-    GuestPtr::new(unavailable(env, "shell32.dll!SHBrowseForFolderW", false))
-}
-#[win32(shell32, name = "SHGetPathFromIDListA", level = safe_fail)]
-fn path_a(env: &mut Env<'_>, _item: GuestPtr<()>, _output: AnsiStr) -> i32 {
-    unavailable(env, "shell32.dll!SHGetPathFromIDListA", false) as i32
-}
-#[win32(shell32, name = "SHGetPathFromIDListW", level = safe_fail)]
-fn path_w(env: &mut Env<'_>, _item: GuestPtr<()>, _output: WideStr) -> i32 {
-    unavailable(env, "shell32.dll!SHGetPathFromIDListW", false) as i32
-}
 #[win32(shell32, name = "SHGetFileInfoA", level = safe_fail)]
 fn info_a(
     env: &mut Env<'_>,
@@ -96,17 +80,7 @@ fn info_w(
 
 pub(super) fn register(registry: &mut Registry) {
     for api in [
-        open_a_ABI,
-        open_w_ABI,
-        save_a_ABI,
-        save_w_ABI,
-        error_ABI,
-        browse_a_ABI,
-        browse_w_ABI,
-        path_a_ABI,
-        path_w_ABI,
-        info_a_ABI,
-        info_w_ABI,
+        open_a_ABI, open_w_ABI, save_a_ABI, save_w_ABI, error_ABI, info_a_ABI, info_w_ABI,
     ] {
         registry.register(api);
     }

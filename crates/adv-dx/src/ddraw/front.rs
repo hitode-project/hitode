@@ -35,6 +35,7 @@ impl State {
 
 pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
+    registry.register(get_device_identifier_ABI);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
@@ -107,7 +108,34 @@ pub fn install<B: Backend>(
         dcs: DeviceContexts::new(gdi),
         provider,
     });
+    let factories = machine.ext.get_or_default::<adv_os::com::ClassFactories>();
+    factories.register(
+        [
+            0xe0, 0x0e, 0xb7, 0xd7, 0x40, 0x43, 0xcf, 0x11, 0xb0, 0x63, 0, 0x20, 0xaf, 0xc2, 0xcd,
+            0x35,
+        ],
+        activate,
+    );
+    factories.register(
+        [
+            0x96, 0x51, 0x30, 0x3c, 0xdb, 0x50, 0xd3, 0x11, 0x9c, 0xfe, 0, 0xc0, 0x4f, 0xd9, 0x30,
+            0xc5,
+        ],
+        activate,
+    );
     Ok(entries)
+}
+fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
+    let provider = env.ext.get::<State>().provider;
+    let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
+    let mut memory = (provider.memory)(env.cpu);
+    match state
+        .draw
+        .activate(&mut env.sys.objects, store, iid, outer, output, &mut memory)
+    {
+        Ok(hr) => Outcome::Return(hr),
+        Err(error) => Outcome::Fail(format!("DirectDraw activation: {error}")),
+    }
 }
 fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let provider = env.ext.get::<State>().provider;
@@ -163,6 +191,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::SET_CLIPPER, set_clipper_ABI),
     (api::CLIPPER_INITIALIZE, clipper_initialize_ABI),
     (api::DD_CREATE, dd_create_ABI),
+    (api::INITIALIZE, initialize_ABI),
     (api::QUERY, query_ABI),
     (api::ADDREF, addref_ABI),
     (api::RELEASE, release_ABI),
@@ -459,4 +488,48 @@ fn clipper_addref(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
 #[win32(ddraw, name = "IDirectDrawClipper::Release", level = implement)]
 fn clipper_release(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     call(env, api::RELEASE, &[this.addr()])
+}
+
+#[win32(ddraw, name = "IDirectDraw7::Initialize", level = state)]
+fn initialize(env: &mut Env<'_>, this: GuestPtr<()>, guid: GuestPtr<()>) -> Outcome {
+    call(env, api::INITIALIZE, &[this.addr(), guid.addr()])
+}
+
+#[win32(ddraw, name = "IDirectDraw7::GetDeviceIdentifier", level = state)]
+fn get_device_identifier(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    output: GuestPtr<adv_abi::types::DDDEVICEIDENTIFIER2>,
+    flags: u32,
+) -> Outcome {
+    let state = env.ext.get::<State>();
+    let Some(object) = state
+        .draw
+        .com
+        .and_then(|com| com.get::<ComState>(&env.sys.objects, this.addr()))
+    else {
+        return Outcome::Return(INVALID);
+    };
+    if !matches!(object.kind, Kind::Device) || flags & !1 != 0 {
+        return Outcome::Return(INVALID);
+    }
+    if !object.initialized {
+        return Outcome::Return(0x800401f0);
+    }
+    let mut value = adv_abi::types::DDDEVICEIDENTIFIER2::default();
+    let driver = b"adv-ddraw";
+    let description = b"ADV virtual DirectDraw adapter";
+    for (out, byte) in value.szDriver.iter_mut().zip(driver) {
+        *out = *byte as i8;
+    }
+    for (out, byte) in value.szDescription.iter_mut().zip(description) {
+        *out = *byte as i8;
+    }
+    value.liDriverVersion = 1;
+    // Identify our software adapter, without claiming host hardware or WHQL.
+    value.guidDeviceIdentifier = [0x66445641, 0x4e87461b, 0x219a38aa, 0x015eda1e];
+    match output.write(env.cpu, value) {
+        Ok(()) => Outcome::Return(0),
+        Err(_) => Outcome::Return(INVALID),
+    }
 }

@@ -22,6 +22,53 @@ const WS_GROUP: u32 = 0x0002_0000;
 const APP: u32 = 0x8000;
 
 #[test]
+fn set_parent_preserves_child_style_and_updates_queries_without_cycles() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let class = t.text("Static");
+    let first = t.window(&mut a, class, WS_POPUP, I(0), 0);
+    let second = t.window(&mut a, class, WS_POPUP, I(0), 0);
+    t.call(
+        &mut a,
+        "MoveWindow",
+        &[M(second), I(80), I(90), I(120), I(80), I(0)],
+    );
+    let child = t.window(&mut a, class, WS_CHILD, M(first), 7);
+    let before = t.alloc(16);
+    t.call(&mut a, "GetWindowRect", &[M(child), I(before)]);
+    let previous = t.call(&mut a, "SetParent", &[M(child), M(second)]);
+    let parent = t.call(&mut a, "GetParent", &[M(child)]);
+    let old_top = t.call(&mut a, "GetTopWindow", &[M(first)]);
+    let top = t.call(&mut a, "GetTopWindow", &[M(second)]);
+    let queried = t.call(&mut a, "GetWindow", &[M(second), I(5)]);
+    let after = t.alloc(16);
+    t.call(&mut a, "GetWindowRect", &[M(child), I(after)]);
+    let rejected = t.call(&mut a, "SetParent", &[M(second), M(child)]);
+    let error = t.call(&mut a, "kernel32.dll!GetLastError", &[]);
+    let detached = t.call(&mut a, "SetParent", &[M(child), I(0)]);
+    let desktop = t.call(&mut a, "GetDesktopWindow", &[]);
+    let final_parent = t.call(&mut a, "GetParent", &[M(child)]);
+    let style = t.call(&mut a, "GetWindowLongA", &[M(child), I((-16i32) as u32)]);
+    let desktop_top = t.call(&mut a, "GetTopWindow", &[M(desktop)]);
+    let desktop_child = t.call(&mut a, "GetWindow", &[M(desktop), I(5)]);
+    t.run(a);
+    assert_eq!(t.u32(previous), t.u32(first));
+    assert_eq!(t.u32(parent), t.u32(second));
+    assert_eq!(t.u32(old_top), 0);
+    assert_eq!(t.u32(top), t.u32(child));
+    assert_eq!(t.u32(queried), t.u32(child));
+    assert_eq!(t.words::<4>(before), [40, 60, 160, 140]);
+    assert_eq!(t.words::<4>(after), [100, 120, 220, 200]);
+    assert_eq!(t.u32(rejected), 0);
+    assert_eq!(t.u32(error), 87);
+    assert_eq!(t.u32(detached), t.u32(second));
+    assert_eq!(t.u32(final_parent), t.u32(desktop));
+    assert_eq!(t.u32(style), WS_CHILD | 0x04000000);
+    assert_eq!(t.u32(desktop_top), t.u32(child));
+    assert_eq!(t.u32(desktop_child), t.u32(child));
+}
+
+#[test]
 fn drag_accept_files_updates_the_existing_window_style() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);

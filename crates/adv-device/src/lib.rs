@@ -51,3 +51,5 @@ pub struct DeviceClock {
     pub consumed_frames: u64,
     pub queued_frames: u32,
 }
+
+pub mod gdiplus;

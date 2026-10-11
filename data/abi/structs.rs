@@ -495,3 +495,62 @@ const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, SubSysId) ==
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, Revision) == 1076);
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DeviceIdentifier) == 1080);
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, WHQLLevel) == 1096);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DDDEVICEIDENTIFIER2 {
+    pub szDriver: [i8; 512],
+    pub szDescription: [i8; 512],
+    pub liDriverVersion: i64,
+    pub dwVendorId: u32,
+    pub dwDeviceId: u32,
+    pub dwSubSysId: u32,
+    pub dwRevision: u32,
+    pub guidDeviceIdentifier: [u32; 4],
+    pub dwWHQLLevel: u32,
+    pub _padding0: [u8; 4],
+}
+const _: () = assert!(core::mem::size_of::<DDDEVICEIDENTIFIER2>() == 1072);
+const _: () = assert!(core::mem::align_of::<DDDEVICEIDENTIFIER2>() == 8);
+impl Default for DDDEVICEIDENTIFIER2 { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, szDriver) == 0);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, szDescription) == 512);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, liDriverVersion) == 1024);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwVendorId) == 1032);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwDeviceId) == 1036);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwSubSysId) == 1040);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwRevision) == 1044);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, guidDeviceIdentifier) == 1048);
+const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwWHQLLevel) == 1064);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct STATSTG {
+    pub pwcsName: u32,
+    pub r#type: u32,
+    pub cbSize: u64,
+    pub mtime: FILETIME,
+    pub ctime: FILETIME,
+    pub atime: FILETIME,
+    pub grfMode: u32,
+    pub grfLocksSupported: u32,
+    pub clsid: [u32; 4],
+    pub grfStateBits: u32,
+    pub reserved: u32,
+}
+const _: () = assert!(core::mem::size_of::<STATSTG>() == 72);
+const _: () = assert!(core::mem::align_of::<STATSTG>() == 8);
+const _: () = assert!(core::mem::offset_of!(STATSTG, pwcsName) == 0);
+const _: () = assert!(core::mem::offset_of!(STATSTG, r#type) == 4);
+const _: () = assert!(core::mem::offset_of!(STATSTG, cbSize) == 8);
+const _: () = assert!(core::mem::offset_of!(STATSTG, mtime) == 16);
+const _: () = assert!(core::mem::offset_of!(STATSTG, ctime) == 24);
+const _: () = assert!(core::mem::offset_of!(STATSTG, atime) == 32);
+const _: () = assert!(core::mem::offset_of!(STATSTG, grfMode) == 40);
+const _: () = assert!(core::mem::offset_of!(STATSTG, grfLocksSupported) == 44);
+const _: () = assert!(core::mem::offset_of!(STATSTG, clsid) == 48);
+const _: () = assert!(core::mem::offset_of!(STATSTG, grfStateBits) == 64);
+const _: () = assert!(core::mem::offset_of!(STATSTG, reserved) == 68);
+impl crate::GuestArg for STATSTG {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 18;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}

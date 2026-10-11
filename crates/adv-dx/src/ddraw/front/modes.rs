@@ -125,6 +125,9 @@ pub(super) fn enum_modes(
     else {
         return Outcome::Return(INVALID_OBJECT);
     };
+    if !object.initialized {
+        return Outcome::Return(0x800401f0);
+    }
     let legacy = object.legacy_descriptors.contains(&this.addr());
     let length = if legacy { 108 } else { 124 };
     // Standard VGA requests are accepted, but this device exposes no 8-bit

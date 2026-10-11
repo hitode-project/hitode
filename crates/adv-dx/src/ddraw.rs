@@ -46,6 +46,7 @@ pub mod api {
     pub const SET_CLIPPER: u32 = 228;
     pub const CLIPPER_INITIALIZE: u32 = 229;
     pub const ENUM_MODES: u32 = 230;
+    pub const INITIALIZE: u32 = 231;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -218,6 +219,7 @@ enum Kind {
 }
 struct ComState {
     kind: Kind,
+    initialized: bool,
     old: u32,
     modern: u32,
     legacy_descriptors: Vec<u32>,
@@ -284,6 +286,7 @@ impl DirectDraw {
                 (8, api::ENUM_MODES),
                 (11, api::GET_CAPS),
                 (12, api::GET_DISPLAY_MODE),
+                (18, api::INITIALIZE),
                 (19, api::RESTORE_MODE),
                 (20, api::COOPERATIVE),
                 (
@@ -397,6 +400,7 @@ impl DirectDraw {
         let initial_iid = layouts.iter().find(|(_, p)| *p == canonical).unwrap().0;
         let value = ComState {
             kind,
+            initialized: true,
             old,
             modern,
             legacy_descriptors: if matches!(kind, Kind::Clipper) {
@@ -434,6 +438,46 @@ impl DirectDraw {
             self.surface_objects.insert(sid, identity);
         }
         Ok(Some(canonical))
+    }
+    /// COM activation exposes the same device identity before Initialize.
+    fn activate<P: Presenter>(
+        &mut self,
+        objects: &mut Objects,
+        surfaces: &mut Surfaces<P>,
+        iid: [u8; 16],
+        outer: u32,
+        output: u32,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<u32, String> {
+        if outer != 0 {
+            return Ok(0x80040110);
+        }
+        if ![
+            adv_os::com::IUNKNOWN,
+            IID_DDRAW,
+            IID_DDRAW2,
+            IID_DDRAW4,
+            IID_DDRAW7,
+        ]
+        .contains(&iid)
+        {
+            return Ok(0x80004002);
+        }
+        let Some(pointer) = self.com_version(objects, surfaces, Kind::Device, false, m)? else {
+            return Ok(0x8007000e);
+        };
+        let com = self.com.unwrap();
+        com.get_mut::<ComState>(objects, pointer)
+            .unwrap()
+            .initialized = false;
+        let target = com
+            .resolve_interface::<ComState>(objects, pointer, iid)
+            .unwrap();
+        if let Err(error) = m.put_u32(output, target) {
+            self.release_com(objects, surfaces, pointer);
+            return Err(error);
+        }
+        Ok(0)
     }
     fn surface_id(&self, objects: &Objects, object: u32) -> Option<u32> {
         match self.com?.get::<ComState>(objects, object)?.kind {
@@ -576,7 +620,28 @@ impl DirectDraw {
         };
         let kind = object.kind;
         let legacy = object.legacy_descriptors.contains(&a[0]);
+        if matches!(kind, Kind::Device)
+            && !object.initialized
+            && !matches!(
+                id,
+                api::QUERY | api::ADDREF | api::RELEASE | api::INITIALIZE
+            )
+        {
+            return Ok(0x800401f0);
+        }
         Ok(match id {
+            api::INITIALIZE => {
+                if !matches!(kind, Kind::Device) {
+                    INVALID
+                } else if object.initialized {
+                    0x88760005
+                } else if a[1] != 0 {
+                    UNSUPPORTED
+                } else {
+                    com.get_mut::<ComState>(objects, a[0]).unwrap().initialized = true;
+                    0
+                }
+            }
             api::QUERY => {
                 m.put_u32(a[2], 0)?;
                 let iid: [u8; 16] = m.read(a[1], 16)?.as_ref().try_into().unwrap();

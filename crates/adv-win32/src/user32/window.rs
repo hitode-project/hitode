@@ -2528,13 +2528,67 @@ fn set_class_long(env: &mut Env<'_>, wide: bool) -> Outcome {
     Outcome::Return(std::mem::replace(slot, v))
 }
 
+#[win32(user32, name = "SetParent", level = state)]
+fn set_parent(env: &mut Env<'_>, hwnd: AbiHandle, parent: AbiHandle) -> Outcome {
+    let desktop = user(env).desktop;
+    let target = if parent.0 == 0 { desktop } else { parent.0 };
+    let state = user(env);
+    let Some(w) = state.windows.get(&env.sys.objects, &hwnd.0) else {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    };
+    if hwnd.0 == desktop || !state.is_window(&env.sys.objects, target) {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    if state.subtree(&env.sys.objects, hwnd.0).contains(&target) {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let old = w.parent;
+    let previous = if old == 0 { desktop } else { old };
+    if target == previous {
+        return Outcome::Return(previous);
+    }
+    let state = &mut env.ext.get_mut::<crate::Win32>().user;
+    if old == 0 {
+        state.top.retain(|&h| h != hwnd.0);
+    } else if let Some(w) = state.windows.get_mut(&mut env.sys.objects, &old) {
+        w.children.retain(|&h| h != hwnd.0);
+        w.needs_paint = true;
+    }
+    if target == desktop {
+        state.top.insert(0, hwnd.0);
+    } else if let Some(w) = state.windows.get_mut(&mut env.sys.objects, &target) {
+        w.children.insert(0, hwnd.0);
+        w.needs_paint = true;
+    }
+    let w = state
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd.0)
+        .unwrap();
+    // Native SetParent preserves local coordinates and CHILD/POPUP styles.
+    // Desktop parentage remains the existing zero-parent traversal convention.
+    w.parent = if target == desktop { 0 } else { target };
+    if target == desktop {
+        w.style |= 0x04000000;
+    } // WS_CLIPSIBLINGS
+    w.needs_paint = true;
+    set_last_error(env, 0);
+    Outcome::Return(previous)
+}
+
 fn get_parent(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     Outcome::Return(if w.style & WS_CHILD != 0 {
-        w.parent
+        if w.parent == 0 {
+            user(env).desktop
+        } else {
+            w.parent
+        }
     } else {
         w.owner
     })
@@ -2553,6 +2607,25 @@ fn is_child(env: &mut Env<'_>) -> Outcome {
         h = w.parent;
     }
     Outcome::Return(0)
+}
+
+#[win32(user32,name="GetTopWindow",level=state)]
+fn get_top_window(env: &mut Env<'_>, hwnd: AbiHandle) -> Outcome {
+    let u = user(env);
+    if hwnd.0 == 0 || hwnd.0 == u.desktop {
+        return Outcome::Return(
+            u.top
+                .iter()
+                .copied()
+                .find(|&h| h != u.desktop && u.is_window(&env.sys.objects, h))
+                .unwrap_or(0),
+        );
+    }
+    let Some(w) = u.windows.get(&env.sys.objects, &hwnd.0) else {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    };
+    Outcome::Return(w.children.first().copied().unwrap_or(0))
 }
 
 fn get_window(env: &mut Env<'_>) -> Outcome {
@@ -2575,6 +2648,7 @@ fn get_window(env: &mut Env<'_>) -> Outcome {
             .and_then(|i| i.checked_sub(1))
             .map_or(0, |i| siblings[i]), // GW_HWNDPREV
         4 => w.owner,                                // GW_OWNER
+        5 if hwnd == u.desktop => u.top.iter().copied().find(|&h| h != u.desktop).unwrap_or(0),
         5 => w.children.first().copied().unwrap_or(0), // GW_CHILD
         _ => 0,
     })
@@ -2993,6 +3067,8 @@ pub fn register(reg: &mut Registry) {
     s(reg, "SetClassLongA", 3, set_class_long_a);
     reg.register(set_class_long_w_ABI);
     s(reg, "GetParent", 1, get_parent);
+    reg.register(get_top_window_ABI);
+    reg.register(set_parent_ABI);
     s(reg, "IsChild", 2, is_child);
     s(reg, "GetWindow", 2, get_window);
     s(reg, "IsWindow", 1, is_window);

@@ -594,7 +594,7 @@ fn resize_front(
         Outcome::Return(resize(env, handle, requested, flags, local))
     })
 }
-pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, local: bool) -> u32 {
+pub(crate) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, local: bool) -> u32 {
     if flags & !0x7ff2 != 0 {
         return error(env, 87, 0);
     }

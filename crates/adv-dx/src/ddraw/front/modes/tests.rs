@@ -301,3 +301,69 @@ fn mode_filters_and_invalid_inputs_do_not_create_surfaces_or_call_guest() {
     ));
     assert_eq!(collect(&mut m, this, 0, 0), (INVALID_OBJECT, vec![]));
 }
+
+#[test]
+fn activated_device_initialization_identity_and_release_share_the_function_owner() {
+    let (mut m, created) = setup(false, false, Registry::default());
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::RELEASE, &[created]),
+        Outcome::Return(0)
+    ));
+    assert!(matches!(
+        front::activate(&mut env(&mut m), IID_DDRAW7, 1, DATA),
+        Outcome::Return(0x80040110)
+    ));
+    assert!(matches!(
+        front::activate(&mut env(&mut m), [0xff; 16], 0, DATA),
+        Outcome::Return(0x80004002)
+    ));
+    assert!(matches!(
+        front::activate(&mut env(&mut m), IID_DDRAW7, 0, DATA),
+        Outcome::Return(0)
+    ));
+    let this = m.cpu.read_u32(DATA).unwrap();
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::GET_CAPS, &[this, 0, 0]),
+        Outcome::Return(0x800401f0)
+    ));
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::INITIALIZE, &[this, 0]),
+        Outcome::Return(0)
+    ));
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::INITIALIZE, &[this, 0]),
+        Outcome::Return(0x88760005)
+    ));
+    m.cpu.write(DATA + 128, &adv_os::com::IUNKNOWN).unwrap();
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::QUERY, &[this, DATA + 128, DATA + 4]),
+        Outcome::Return(0)
+    ));
+    let identity = m.cpu.read_u32(DATA + 4).unwrap();
+    assert_eq!(identity, this);
+    m.cpu.write_u32(DATA + 1200, 0xabcdef01).unwrap();
+    assert!(matches!(
+        front::get_device_identifier(
+            &mut env(&mut m),
+            GuestPtr::new(this),
+            GuestPtr::new(DATA + 128),
+            0
+        ),
+        Outcome::Return(0)
+    ));
+    assert_eq!(m.cpu.read_u32(DATA + 1200).unwrap(), 0xabcdef01);
+    assert_eq!(m.cpu.read_u32(DATA + 128 + 1064).unwrap(), 0);
+    assert_ne!(m.cpu.read_u32(DATA + 128 + 1048).unwrap(), 0);
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::RELEASE, &[identity]),
+        Outcome::Return(1)
+    ));
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::RELEASE, &[this]),
+        Outcome::Return(0)
+    ));
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::INITIALIZE, &[this, 0]),
+        Outcome::Return(INVALID)
+    ));
+}

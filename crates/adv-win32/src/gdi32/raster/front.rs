@@ -218,16 +218,16 @@ fn raster_call_named(
 
 fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str) -> Outcome {
     let window = if hwnd == 0 {
-        Some((env.ext.get::<Win32>().user.screen, 0))
+        Some((env.ext.get::<Win32>().user.screen, 0, true))
     } else {
         env.ext
             .get::<Win32>()
             .user
             .windows
             .get(&env.sys.objects, &hwnd)
-            .map(|w| (w.client_size(), w.dc_style))
+            .map(|w| (w.client_size(), w.dc_style, w.parent == 0 || w.visible()))
     };
-    let Some(((width, height), style)) = window else {
+    let Some(((width, height), style, root)) = window else {
         return fail(env, 1400);
     };
     let private = usage != WindowDcUse::Window && style & 0x20 != 0;
@@ -244,7 +244,20 @@ fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str
     if state.window_leases.try_reserve(1).is_err() {
         return fail(env, 8);
     }
+    // A visible client may be the application's presentation canvas. A hidden
+    // parented window needs independent storage; borrowing metadata must not
+    // crop its parent's pixels. Screen metadata also preserves a live client.
+    let client_bound = env.ext.get::<State>().canvas_window.is_some_and(|owner| {
+        owner != 0
+            && env
+                .ext
+                .get::<Win32>()
+                .user
+                .is_window(&env.sys.objects, owner)
+    });
     let bind = raster
+        && root
+        && !(hwnd == 0 && client_bound)
         && !env.ext.get::<State>().window_leases.iter().any(|lease| {
             let gdi = &env.ext.get::<Win32>().gdi;
             let backed = matches!(gdi.get(&env.sys.objects, lease.dc),

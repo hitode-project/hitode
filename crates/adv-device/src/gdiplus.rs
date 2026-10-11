@@ -1,0 +1,144 @@
+//! Offscreen vector/text/image rendering. Device objects contain no guest handles.
+//! Windows uses its system GDI+ rasterizer; other hosts report unavailable until
+//! a portable implementation of the same service is supplied.
+use std::sync::Arc;
+#[cfg(windows)]
+mod windows;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Canvas,
+    Graphics,
+    Family,
+    Font,
+    Format,
+    Brush,
+    Path,
+    Gradient,
+}
+pub struct Runtime {
+    #[cfg(windows)]
+    token: usize,
+}
+pub struct Object {
+    pub kind: Kind,
+    _runtime: Arc<Runtime>,
+    #[cfg(windows)]
+    pointer: *mut std::ffi::c_void,
+    // Image graphics must keep their target alive after guest DisposeImage.
+    _backing: Option<Arc<Object>>,
+    #[cfg(windows)]
+    canvas: Option<windows::Canvas>,
+}
+pub enum Create<'a> {
+    Image(u32, u32, &'a [u8]),
+    Canvas(u32, u32, &'a [u8]),
+    Graphics(Arc<Object>),
+    Family(&'a [u16]),
+    SansSerif,
+    Font(&'a Object, f32, i32, i32),
+    Format(i32, u16),
+    Solid(u32),
+    Path(i32),
+    Gradient(&'a Object),
+    Clone(&'a Object),
+}
+pub enum Op<'a> {
+    Pixels,
+    Upload(&'a [u8]),
+    Size,
+    Align(i32),
+    LineAlign(i32),
+    PathLine([f32; 4]),
+    PathArc([f32; 4], f32, f32),
+    ClosePath,
+    PathString {
+        text: &'a [u16],
+        family: &'a Object,
+        style: i32,
+        size: f32,
+        rect: [f32; 4],
+        format: Option<&'a Object>,
+    },
+    Bounds,
+    PointCount,
+    CenterColor(u32),
+    Focus(f32, f32),
+    Gamma(bool),
+    Surround(&'a [u32]),
+    FillPath(&'a Object, &'a Object),
+    DrawImage(&'a Object, [f32; 4]),
+    DrawString {
+        text: &'a [u16],
+        font: &'a Object,
+        rect: [f32; 4],
+        format: Option<&'a Object>,
+        brush: &'a Object,
+    },
+    Measure {
+        text: &'a [u16],
+        font: &'a Object,
+        rect: [f32; 4],
+        format: Option<&'a Object>,
+    },
+    Clear(u32),
+    Clip(Vec<[f32; 4]>),
+    Smoothing(i32),
+    TextHint(i32),
+}
+pub enum Reply {
+    None,
+    Pixels(Vec<u8>),
+    Size(u32, u32),
+    Bounds([f32; 4]),
+    Count(i32),
+    Measure([f32; 4], i32, i32),
+}
+impl Runtime {
+    pub fn new() -> Result<Arc<Self>, i32> {
+        #[cfg(windows)]
+        {
+            windows::startup()
+        }
+        #[cfg(not(windows))]
+        {
+            Err(6)
+        }
+    }
+    pub fn create(self: &Arc<Self>, create: Create<'_>) -> Result<Arc<Object>, i32> {
+        #[cfg(windows)]
+        {
+            windows::create(self, create)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = create;
+            Err(6)
+        }
+    }
+}
+impl Object {
+    pub fn execute(&self, operation: Op<'_>) -> Result<Reply, i32> {
+        #[cfg(windows)]
+        {
+            windows::execute(self, operation)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = operation;
+            Err(6)
+        }
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        windows::shutdown(self.token);
+    }
+}
+impl Drop for Object {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        windows::destroy(self);
+    }
+}
