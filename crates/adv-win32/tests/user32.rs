@@ -299,6 +299,13 @@ fn custom_windows_built_from_standard_controls_project_as_dialogs() {
         M(prompt),
         10001,
     );
+    let owner_drawn = t.window(
+        &mut a,
+        button_class,
+        WS_CHILD | WS_VISIBLE | 11,
+        M(prompt),
+        10002,
+    );
     // Neither a canvas with a custom child nor a window without a button to
     // answer it is a dialog.
     let canvas = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
@@ -313,8 +320,19 @@ fn custom_windows_built_from_standard_controls_project_as_dialogs() {
     };
     assert_eq!(projected.target.hwnd, t.u32(prompt));
     let ids: Vec<_> = projected.controls.iter().map(|c| c.target.id).collect();
-    assert_eq!(ids, [9999, 10000, 10001]);
+    assert_eq!(ids, [9999, 10000, 10001, 10002]);
     assert!(projected.controls.iter().all(|c| c.supported));
+    let owner_drawn = projected
+        .controls
+        .iter()
+        .find(|c| c.target.hwnd == t.u32(owner_drawn))
+        .unwrap();
+    assert_eq!(
+        owner_drawn.style & 15,
+        11,
+        "the guest keeps its owner-drawn style"
+    );
+    let owner_drawn = owner_drawn.target;
     let ok = projected
         .controls
         .iter()
@@ -332,12 +350,16 @@ fn custom_windows_built_from_standard_controls_project_as_dialogs() {
         queue.posted.clear();
     }
     assert!(dialog::post_host_event(&mut env, DialogEvent::Click(ok)));
+    assert!(dialog::post_host_event(
+        &mut env,
+        DialogEvent::Click(owner_drawn)
+    ));
     let posted: Vec<_> = env.ext.get::<Win32>().user.queues[&0]
         .posted
         .iter()
         .map(|m| (m.hwnd, m.msg))
         .collect();
-    assert_eq!(posted, [(ok.hwnd, 0xf5)]);
+    assert_eq!(posted, [(ok.hwnd, 0xf5), (owner_drawn.hwnd, 0xf5)]);
 }
 
 #[derive(Clone, Copy)]

@@ -235,6 +235,9 @@ fn control_style(control: &DialogControl) -> u32 {
             3 => 2,
             6 => 5,
             9 => 4,
+            // Keep the guest caption and click identity accessible even when
+            // its custom WM_DRAWITEM appearance cannot be projected.
+            11 => 0,
             kind => kind,
         };
         style = (style & !15) | kind;
@@ -455,6 +458,10 @@ impl HostDialog {
                         "native dialog control unavailable: class={} guest={:#x}",
                         control.class,
                         control.target.hwnd
+                    );
+                } else if control.class.eq_ignore_ascii_case("Button") && control.style & 15 == 11 {
+                    log::warn!(
+                        "owner-drawn dialog button uses its guest caption; custom appearance is unavailable"
                     );
                 }
             }
@@ -814,12 +821,21 @@ mod tests {
         combo.items = vec!["Zeta".into(), "Alpha".into()];
         combo.selection = 1;
         let combo_target = combo.target;
-        set.dialogs[0].controls.extend([track, combo]);
+        let mut owner_drawn = set.dialogs[0].controls[0].clone();
+        owner_drawn.target.hwnd = 0x110;
+        owner_drawn.target.id = 1;
+        owner_drawn.style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | 11;
+        owner_drawn.text = "OK".into();
+        let owner_target = owner_drawn.target;
+        assert_eq!(control_style(&owner_drawn) & 15, 0);
+        set.dialogs[0].controls.extend([track, combo, owner_drawn]);
         window.set_dialogs(&set).unwrap();
         let native = window.dialogs.dialogs[&root.hwnd].hwnd;
         let checkbox = window.dialogs.dialogs[&root.hwnd].controls[&target.hwnd].hwnd;
         let track = window.dialogs.dialogs[&root.hwnd].controls[&track_target.hwnd].hwnd;
         let combo = window.dialogs.dialogs[&root.hwnd].controls[&combo_target.hwnd].hwnd;
+        let owner_button = window.dialogs.dialogs[&root.hwnd].controls[&owner_target.hwnd].hwnd;
+        assert_eq!(text(owner_button), "OK");
         assert_eq!(
             unsafe { IsWindowVisible(native) },
             0,
@@ -843,6 +859,16 @@ mod tests {
         assert!(
             window.dialogs.take_events().next().is_none(),
             "snapshot sync generates no guest input"
+        );
+        unsafe {
+            SendMessageW(owner_button, BM_CLICK, 0, 0);
+        }
+        assert_eq!(
+            window.dialogs.take_events().collect::<Vec<_>>(),
+            vec![
+                DialogEvent::Focus(owner_target),
+                DialogEvent::Click(owner_target)
+            ]
         );
         unsafe {
             SendMessageW(checkbox, BM_CLICK, 0, 0);

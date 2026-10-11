@@ -11,6 +11,7 @@ mod color_table;
 mod dib;
 pub(crate) mod fill;
 pub mod front;
+mod set_dib;
 pub use front::{DrawingProvider, install, register, set_provider};
 
 pub mod api {

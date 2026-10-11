@@ -20,6 +20,7 @@ const CONTROL_UNAVAILABLE: u32 = 0x8878001e;
 const OBJECT_NOT_FOUND: u32 = 0x88781161;
 const CLASS_NOT_REGISTERED: u32 = 0x80040154;
 const CTRL_FX: u32 = 0x200;
+const LOC_DEFER: u32 = 0x40000;
 const MAX_FX_DESCRIPTORS: u32 = 64;
 const DEVICE: &[(&str, u8)] = &[
     ("QueryInterface", 3),
@@ -905,7 +906,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         | 0x4000
                         | 0x8000
                         | 0x10000
+                        | LOC_DEFER
                         | 0x80000);
+                if flags & LOC_DEFER != 0 && flags & 0xc != 0 {
+                    return Ok(INVALID); // Deferred and fixed allocation are mutually exclusive.
+                }
                 if unsupported != 0 {
                     adv_abi::warn_unavailable(
                         e,
@@ -1264,6 +1269,56 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     if matches!(name, "SetFX" | "GetObjectInPath") {
         return empty_fx(e, a, name);
     }
+    if name == "AcquireResources" {
+        let flags = com
+            .get::<Object>(&e.sys.objects, a)
+            .unwrap()
+            .buffer
+            .as_ref()
+            .unwrap()
+            .flags;
+        if flags & LOC_DEFER == 0 {
+            return Ok(INVALID_CALL);
+        }
+        if b & !6 != 0 || b == 6 || c != 0 {
+            return Ok(INVALID);
+        }
+        if b == 2 {
+            adv_abi::warn_unavailable(
+                e,
+                "dsound.dll!IDirectSoundBuffer8::AcquireResources",
+                "deferred hardware voices are unavailable",
+            );
+            return Ok(INVALID_CALL);
+        }
+        // The software PCM backing is already reserved and the FX chain is
+        // empty. No hardware/DSP resource is claimed and nothing starts playing.
+        return Ok(0);
+    }
+    if name == "Play" {
+        let flags = com
+            .get::<Object>(&e.sys.objects, a)
+            .unwrap()
+            .buffer
+            .as_ref()
+            .unwrap()
+            .flags;
+        let allocation = e.arg(3) & !1;
+        if b != 0
+            || (flags & LOC_DEFER == 0 && (c != 0 || allocation != 0))
+            || !matches!(allocation, 0 | 2 | 4)
+        {
+            return Ok(INVALID);
+        }
+        if allocation == 2 {
+            adv_abi::warn_unavailable(
+                e,
+                "dsound.dll!IDirectSoundBuffer8::Play",
+                "deferred hardware voices are unavailable",
+            );
+            return Ok(INVALID_CALL);
+        }
+    }
     let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
     let s = e.ext.get_mut::<Sound>();
     let buf = com
@@ -1277,7 +1332,12 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if e.cpu.read_u32(b).map_err(|e| e.to_string())? < 20 {
                 return Ok(INVALID);
             }
-            for (i, v) in [20, buf.flags | 8, buf.len, 0, 0].into_iter().enumerate() {
+            let flags = if buf.flags & LOC_DEFER != 0 {
+                buf.flags
+            } else {
+                buf.flags | 8
+            };
+            for (i, v) in [20, flags, buf.len, 0, 0].into_iter().enumerate() {
                 e.cpu
                     .write_u32(b + i as u32 * 4, v)
                     .map_err(|e| e.to_string())?;
@@ -1395,9 +1455,6 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             0
         }
         "Play" => {
-            if b != 0 || c != 0 || args[3] & !1 != 0 {
-                return Ok(INVALID);
-            }
             let ended = !buf.looping && buf.len != 0 && buf.progress(now) >= u64::from(buf.len);
             let starting = !buf.playing || ended;
             let generation = if starting {
@@ -1795,6 +1852,7 @@ mod tests {
     use adv_cpu::JitCpu;
     use adv_cpu::backend::Reg;
     use adv_machine::{Clock, Object as WaitObject};
+    mod deferred;
     mod empty_fx;
     const DATA: u32 = 0x500000;
     const STACK: u32 = 0x600000;

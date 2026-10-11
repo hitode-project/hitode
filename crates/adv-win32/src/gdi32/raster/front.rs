@@ -10,6 +10,7 @@ use adv_os::gdi::WINDOW_DC;
 
 mod display;
 mod mapped;
+mod set_dib;
 pub mod surface_dc;
 
 #[derive(Clone, Copy)]
@@ -129,6 +130,7 @@ pub fn register(registry: &mut Registry) {
     super::fill::register(registry);
     super::clip::register(registry);
     super::color_table::register(registry);
+    set_dib::register(registry);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }

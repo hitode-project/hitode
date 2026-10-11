@@ -146,7 +146,9 @@ fn font(win32: &Win32, objects: &Objects, window: &Window) -> Option<DialogFont>
 }
 
 pub(super) fn supported(class: &str, style: u32) -> bool {
-    (class.eq_ignore_ascii_case("Button") && style & 0xf <= 9)
+    // Owner-drawn buttons retain guest input/state; the platform adapter can
+    // project their captions without inventing or running the guest painter.
+    (class.eq_ignore_ascii_case("Button") && matches!(style & 0xf, 0..=9 | 11))
         || (class.eq_ignore_ascii_case("Static") && matches!(style & 0x1f, 0..=2 | 7..=9 | 11..=12))
         || class.eq_ignore_ascii_case("Edit")
         || (class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3)
