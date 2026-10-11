@@ -28,12 +28,15 @@
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
 //! exit stub saves for fault recovery, x13 and x14 flag scratch without
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
-//! x5, which are free inside units.
+//! x5, which are free inside units; a run of SIMD instructions keeps the
+//! `CpuState` pointer in x5, MMX registers in d8-d15 and XMM registers in
+//! v16-v23, with v0-v2 as scratch.
 
 mod decode;
 pub mod first;
 mod flags;
 mod ops;
+mod simd;
 mod trace;
 
 use iced_x86::ConditionCode;
@@ -159,6 +162,7 @@ const X6: Reg = Reg::new(6);
 const X9: Reg = Reg::new(9);
 const X10: Reg = Reg::new(10);
 const X11: Reg = Reg::new(11);
+const X12: Reg = Reg::new(12);
 const X13: Reg = Reg::new(13);
 const X14: Reg = Reg::new(14);
 const X15: Reg = Reg::new(15);
@@ -284,6 +288,7 @@ struct Translator<'a> {
     out: FlagSet,
     /// Of those, the ones it does not write.
     keep: FlagSet,
+    vector: simd::Vector,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -341,6 +346,7 @@ pub fn translate(
         index: 0,
         out: FlagSet::ALL,
         keep: FlagSet::ALL,
+        vector: simd::Vector::default(),
     };
     if trace.len() == 0 {
         // Nothing to translate: other units may still link here.
@@ -392,6 +398,13 @@ impl Translator<'_> {
         self.checking = (self.checked)(inst.pc);
         self.out = trace.live_out[index];
         self.keep = self.out.minus(inst.effects.writes);
+        if trace.head(index) || trace.merge[index] {
+            // Control may arrive from elsewhere.
+            self.vector = simd::Vector::default();
+        } else if !matches!(inst.op, decode::Op::Simd(_)) {
+            // Other instructions may use x5.
+            self.vector.cpu = false;
+        }
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);

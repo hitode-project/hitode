@@ -282,7 +282,9 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         Op::Nop => {}
         // The interpreter runs these: `Fetcher::helpers` is off here, and
         // narrow forms are rare in code that runs once.
-        Op::Helper(_) | Op::Narrow(..) | Op::StepMemory(..) => return None,
+        Op::Helper(_) | Op::Narrow(..) | Op::StepMemory(..) | Op::Direction(_) | Op::Simd(_) => {
+            return None;
+        }
         Op::Mov(dst, src) => {
             let value = read(src, &regs, memory)?;
             Place::of(dst, &regs, memory)?.commit(value, cpu);

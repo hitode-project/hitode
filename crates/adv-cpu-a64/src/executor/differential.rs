@@ -131,7 +131,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(28) {
+    match rng.below(31) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -347,7 +347,256 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
                 _ => a.dec(dword_ptr(m)).unwrap(),
             }
         }
+        27..=29 => simd(a, rng, mem),
         _ => a.nop().unwrap(),
+    }
+}
+
+const MMX: [AsmRegisterMm; 8] = [mm0, mm1, mm2, mm3, mm4, mm5, mm6, mm7];
+const XMM: [AsmRegisterXmm; 8] = [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7];
+
+/// An MMX or SSE integer, logic, shuffle or move instruction on registers,
+/// memory and immediates; 16-byte operands that must be aligned are.
+fn simd(
+    a: &mut CodeAssembler,
+    rng: &mut Rng,
+    mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
+) {
+    let (m, m2, x, x2) = (
+        rng.pick(&MMX),
+        rng.pick(&MMX),
+        rng.pick(&XMM),
+        rng.pick(&XMM),
+    );
+    let aligned = |rng: &mut Rng| ebx + 16 * rng.below(0x7f) as i32;
+    let form = rng.below(4);
+    // Each form of a two-operand operation: MMX, then XMM, from a register
+    // or memory.
+    macro_rules! binary {
+        ($op:ident) => {
+            match form {
+                0 => a.$op(m, m2),
+                1 => {
+                    let p = mem(a, rng);
+                    a.$op(m, qword_ptr(p))
+                }
+                2 => a.$op(x, x2),
+                _ => {
+                    let p = aligned(rng);
+                    a.$op(x, xmmword_ptr(p))
+                }
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! sse {
+        ($op:ident) => {
+            match form {
+                0 | 2 => a.$op(x, x2),
+                _ => {
+                    let p = aligned(rng);
+                    a.$op(x, xmmword_ptr(p))
+                }
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! unpack {
+        ($op:ident) => {
+            match form {
+                0 => a.$op(m, m2),
+                1 => {
+                    let p = mem(a, rng);
+                    a.$op(m, dword_ptr(p))
+                }
+                2 => a.$op(x, x2),
+                _ => {
+                    let p = aligned(rng);
+                    a.$op(x, xmmword_ptr(p))
+                }
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! shift {
+        ($op:ident) => {{
+            let count = rng.pick(&[0, 1, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 200]);
+            match rng.below(5) {
+                0 => a.$op(m, count),
+                1 => a.$op(x, count),
+                2 => {
+                    a.mov(eax, count).unwrap();
+                    a.movd(m2, eax).unwrap();
+                    a.$op(m, m2)
+                }
+                3 => {
+                    a.mov(eax, count).unwrap();
+                    a.movd(x2, eax).unwrap();
+                    a.$op(x, x2)
+                }
+                _ => {
+                    let p = mem(a, rng);
+                    a.$op(m, qword_ptr(p))
+                }
+            }
+            .unwrap()
+        }};
+    }
+    match rng.below(46) {
+        0 => match form {
+            0 => a.movd(m, rng.pick(&READABLE)),
+            1 => a.movd(rng.pick(&WRITABLE), m),
+            2 => {
+                let p = mem(a, rng);
+                a.movd(m, dword_ptr(p))
+            }
+            _ => {
+                let p = mem(a, rng);
+                a.movd(dword_ptr(p), m)
+            }
+        }
+        .unwrap(),
+        1 => match form {
+            0 => a.movq(m, m2),
+            1 => {
+                let p = mem(a, rng);
+                a.movq(m, qword_ptr(p))
+            }
+            2 => {
+                let p = mem(a, rng);
+                a.movq(qword_ptr(p), m)
+            }
+            _ => {
+                let p = mem(a, rng);
+                a.movntq(qword_ptr(p), m)
+            }
+        }
+        .unwrap(),
+        2 => match form {
+            0 => a.movd(x, rng.pick(&READABLE)),
+            1 => a.movd(rng.pick(&WRITABLE), x),
+            2 => {
+                let p = mem(a, rng);
+                a.movd(x, dword_ptr(p))
+            }
+            _ => {
+                let p = mem(a, rng);
+                a.movd(dword_ptr(p), x)
+            }
+        }
+        .unwrap(),
+        3 => match form {
+            0 => a.movq(x, x2),
+            1 => {
+                let p = mem(a, rng);
+                a.movq(x, qword_ptr(p))
+            }
+            _ => {
+                let p = mem(a, rng);
+                a.movq(qword_ptr(p), x)
+            }
+        }
+        .unwrap(),
+        4 => match form {
+            0 => a.movss(x, x2),
+            1 => {
+                let p = mem(a, rng);
+                a.movss(x, dword_ptr(p))
+            }
+            _ => {
+                let p = mem(a, rng);
+                a.movss(dword_ptr(p), x)
+            }
+        }
+        .unwrap(),
+        5 => {
+            let p = mem(a, rng);
+            match form {
+                0 => a.movaps(x, x2),
+                1 => a.movups(x, xmmword_ptr(p)),
+                2 => a.movdqu(xmmword_ptr(p), x),
+                _ => {
+                    let p = aligned(rng);
+                    match rng.below(4) {
+                        0 => a.movaps(x, xmmword_ptr(p)),
+                        1 => a.movdqa(xmmword_ptr(p), x),
+                        2 => a.movntps(xmmword_ptr(p), x),
+                        _ => a.movapd(x, xmmword_ptr(p)),
+                    }
+                }
+            }
+            .unwrap()
+        }
+        6 => binary!(paddb),
+        7 => binary!(paddw),
+        8 => binary!(paddd),
+        9 => binary!(paddq),
+        10 => binary!(psubb),
+        11 => binary!(psubw),
+        12 => binary!(psubd),
+        13 => binary!(psubq),
+        14 => binary!(paddsb),
+        15 => binary!(paddusw),
+        16 => binary!(psubsw),
+        17 => binary!(psubusb),
+        18 => binary!(pcmpeqb),
+        19 => binary!(pcmpeqd),
+        20 => binary!(pcmpgtw),
+        21 => binary!(pcmpgtb),
+        22 => binary!(pmullw),
+        23 => binary!(pmulhw),
+        24 => binary!(pmulhuw),
+        25 => binary!(pmaddwd),
+        26 => binary!(pand),
+        27 => binary!(pandn),
+        28 => binary!(por),
+        29 => binary!(pxor),
+        30 => binary!(packsswb),
+        31 => binary!(packssdw),
+        32 => binary!(packuswb),
+        33 => binary!(pavgb),
+        34 => binary!(pminsw),
+        35 => binary!(pmaxub),
+        36 => unpack!(punpcklbw),
+        37 => unpack!(punpcklwd),
+        38 => binary!(punpckhbw),
+        39 => binary!(punpckhdq),
+        40 => match rng.below(3) {
+            0 => shift!(psllw),
+            1 => shift!(psrld),
+            _ => shift!(psraw),
+        },
+        41 => match rng.below(3) {
+            0 => shift!(psllq),
+            1 => shift!(psrlq),
+            _ => shift!(psrad),
+        },
+        42 => {
+            let imm = rng.below(256) as i32;
+            match form {
+                0 => a.pshufw(m, m2, imm),
+                1 => {
+                    let p = mem(a, rng);
+                    a.pshufw(m, qword_ptr(p), imm)
+                }
+                2 => a.pshufd(x, x2, imm),
+                _ => a.shufps(x, x2, imm),
+            }
+            .unwrap()
+        }
+        43 => match rng.below(6) {
+            0 => sse!(xorps),
+            1 => sse!(andps),
+            2 => sse!(andnps),
+            3 => sse!(orps),
+            4 => sse!(unpcklps),
+            _ => sse!(punpckhqdq),
+        },
+        44 => {
+            let p = aligned(rng);
+            a.shufps(x, xmmword_ptr(p), rng.below(256) as i32).unwrap()
+        }
+        _ => a.emms().unwrap(),
     }
 }
 
@@ -720,6 +969,15 @@ fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
         fs_base: 0x800,
         ..CpuState::default()
     };
+    for n in 0..8 {
+        state.xmm[n] = (rng.next() as u128 | (rng.next() as u128) << 64).to_le_bytes();
+        let sign_exponent = rng.next() as u16;
+        state.x87.regs[n] = adv_cpu_core::X87Register::from_parts(rng.next(), sign_exponent);
+    }
+    state.x87.tag = rng.next() as u16;
+    // Any TOP, and no exception pending.
+    state.x87.status = rng.next() as u16 & 0x3800;
+    state.refresh_mmx();
     for (index, value) in state.regs.iter_mut().enumerate() {
         *value = match index {
             3 => DATA,
@@ -844,6 +1102,9 @@ fn compare(seed: u64, budget: u64, config: Config) -> u64 {
         "{context}: eflags {:#x} != {:#x}",
         a64_state.eflags, state.eflags
     );
+    assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
+    assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
+    assert_eq!(a64_state.x87, state.x87, "{context}: x87");
     assert!(a64_memory == memory, "{context}: memory");
     native
 }
@@ -929,4 +1190,73 @@ fn random_programs_assemble_and_reach_the_stop_or_a_read_fault() {
         }
     }
     assert!((1..100).contains(&faults), "{faults} programs fault");
+}
+
+/// Lists the program of seed `SEED`, for a failure to reproduce by hand.
+#[test]
+#[ignore]
+fn dump_program() {
+    let seed: u64 = std::env::var("SEED").unwrap().parse().unwrap();
+    let program = program(seed);
+    let mut decoder = iced_x86::Decoder::with_ip(32, &program.code, u64::from(CODE), 0);
+    for i in &mut decoder {
+        let ops: Vec<String> = (0..i.op_count())
+            .map(|n| match i.op_kind(n) {
+                iced_x86::OpKind::Register => format!("{:?}", i.op_register(n)),
+                iced_x86::OpKind::Memory => format!(
+                    "[{:?}+{:?}*{}+{:#x}]",
+                    i.memory_base(),
+                    i.memory_index(),
+                    i.memory_index_scale(),
+                    i.memory_displacement32()
+                ),
+                iced_x86::OpKind::NearBranch32 => format!("{:#x}", i.near_branch32()),
+                k @ (iced_x86::OpKind::Immediate8
+                | iced_x86::OpKind::Immediate32
+                | iced_x86::OpKind::Immediate8to32
+                | iced_x86::OpKind::Immediate16) => format!("{k:?}={:#x}", i.immediate(n)),
+                k => format!("{k:?}"),
+            })
+            .collect();
+        println!("{:x} {:?} {}", i.ip(), i.mnemonic(), ops.join(", "));
+    }
+    println!("{:x?}", program.state.regs);
+}
+
+/// The first budget at which seed `SEED` diverges, which names the
+/// instruction a failure comes from.
+#[cfg(native)]
+#[test]
+#[ignore]
+fn first_divergence() {
+    let seed: u64 = std::env::var("SEED").unwrap().parse().unwrap();
+    let program = program(seed);
+    let config = (Features { flagm: true }, false, Checks::Adaptive);
+    for budget in 1..5000 {
+        let (outcome, state, memory) = reference(&program, budget);
+        let (a, b, m, _) = translated(&program, budget, config);
+        if a != outcome
+            || b.regs != state.regs
+            || b.eflags != state.eflags
+            || b.xmm != state.xmm
+            || b.mmx != state.mmx
+            || b.x87 != state.x87
+            || m != memory
+        {
+            println!("budget {budget}: eip {:#x} vs {:#x}", b.eip, state.eip);
+            println!("regs {:x?}\n  vs {:x?}", b.regs, state.regs);
+            println!("eflags {:#x} vs {:#x}", b.eflags, state.eflags);
+            println!("mmx {:x?}\n vs {:x?}", b.mmx, state.mmx);
+            println!(
+                "xmm eq {} x87 eq {} mem eq {}",
+                b.xmm == state.xmm,
+                b.x87 == state.x87,
+                m == memory
+            );
+            let (_, prev, _) = reference(&program, budget - 1);
+            println!("previous eip {:#x}", prev.eip);
+            return;
+        }
+    }
+    println!("no divergence");
 }

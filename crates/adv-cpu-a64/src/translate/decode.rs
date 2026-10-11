@@ -105,6 +105,10 @@ pub enum Op {
     Narrow(Option<Alu>, u8, Part, Part),
     /// `inc` (true) or `dec` of a 32-bit memory operand, which keep CF.
     StepMemory(bool, Mem),
+    /// `cld` (false) or `std`.
+    Direction(bool),
+    /// An MMX or SSE instruction.
+    Simd(super::simd::Simd),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -114,7 +118,7 @@ fn gpr32(register: Register) -> Option<u8> {
     register.is_gpr32().then(|| register.number() as u8)
 }
 
-fn memory(instruction: &Instruction) -> Option<Mem> {
+pub(super) fn memory(instruction: &Instruction) -> Option<Mem> {
     // CS, DS, SS and ES are flat; FS has the thread's base, and GS is left
     // to the interpreter.
     let fs = match instruction.segment_prefix() {
@@ -181,7 +185,15 @@ fn operand(instruction: &Instruction, n: u32) -> Option<Src> {
 
 pub fn plan(instruction: &Instruction) -> Option<Op> {
     use Mnemonic as M;
-    if instruction.has_lock_prefix() {
+    // Guest threads take turns on one host thread, so a locked
+    // read-modify-write is an ordinary one; other lock uses are #UD.
+    if instruction.has_lock_prefix()
+        && !(instruction.op_kind(0) == OpKind::Memory
+            && matches!(
+                instruction.mnemonic(),
+                M::Add | M::Sub | M::And | M::Or | M::Xor | M::Inc | M::Dec
+            ))
+    {
         return None;
     }
     let count = instruction.op_count();
@@ -224,6 +236,10 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     }
     Some(match mnemonic {
         M::Nop => Op::Nop,
+        // Hints that never fault.
+        M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 | M::Prefetchnta => Op::Nop,
+        M::Cld => Op::Direction(false),
+        M::Std => Op::Direction(true),
         M::Mov => match two()? {
             (Src::Imm(_), _) | (Src::Mem(_), Src::Mem(_)) => return None,
             (dst, src) => Op::Mov(dst, src),
@@ -792,7 +808,13 @@ impl<'m> Fetcher<'m> {
             next: instruction.next_ip32(),
             prepared: Prepared::new(&instruction, self.bytes.get(at..at + len)?)?,
         });
-        Some((Op::Helper((helpers.len() - 1) as u8), len as u32))
+        // SIMD instructions keep their helper for when they are checked.
+        let index = (helpers.len() - 1) as u8;
+        let op = match super::simd::plan(&instruction, index) {
+            Some(simd) => Op::Simd(simd),
+            None => Op::Helper(index),
+        };
+        Some((op, len as u32))
     }
 }
 
@@ -810,7 +832,11 @@ impl Op {
         use FlagSet as F;
         let mem = |src: Src| matches!(src, Src::Mem(_));
         let (reads, writes, site) = match self {
-            Op::Nop | Op::Lea(..) | Op::Not(_) | Op::Cdq | Op::Jmp(_) => (F::NONE, F::NONE, false),
+            Op::Nop | Op::Lea(..) | Op::Not(_) | Op::Cdq | Op::Jmp(_) | Op::Direction(_) => {
+                (F::NONE, F::NONE, false)
+            }
+            // An MMX instruction may leave for the interpreter.
+            Op::Simd(simd) => (F::NONE, F::NONE, simd.memory() || simd.mmx()),
             Op::Mov(dst, src) => (F::NONE, F::NONE, mem(dst) || mem(src)),
             Op::Alu(_, dst, src) => (F::NONE, F::ALL, mem(dst) || mem(src)),
             Op::Step(..) => (F::NONE, F::ALL.minus(F::CF), false),

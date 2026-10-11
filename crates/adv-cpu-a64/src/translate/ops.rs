@@ -26,7 +26,7 @@ enum Addr {
 }
 
 /// The register a 32-bit result for guest `index` is computed into.
-fn result(index: u8) -> Reg {
+pub(super) fn result(index: u8) -> Reg {
     if biased(index) { X16 } else { host(index) }
 }
 
@@ -45,6 +45,8 @@ impl Translator<'_> {
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
             Op::Helper(index) => self.helper(index),
+            Op::Simd(simd) => self.simd(simd),
+            Op::Direction(set) => self.emit(movz(W, super::X12, u16::from(set), 0)),
             Op::Mov(Src::Reg(dst), source) => self.mov_register(dst, source),
             Op::Mov(Src::Mem(mem), source) => {
                 let value = match source {
@@ -211,7 +213,7 @@ impl Translator<'_> {
     }
 
     /// Commits a result computed into `result(index)`.
-    fn commit(&mut self, index: u8) {
+    pub(super) fn commit(&mut self, index: u8) {
         if biased(index) {
             self.emit(add_ext(X, host(index), WINDOW, X16, Uxtw, 0));
         }
@@ -334,7 +336,7 @@ impl Translator<'_> {
     }
 
     /// The guest address of `mem` in a W register; uses w16 and w17.
-    fn effective(&mut self, mem: Mem) -> Reg {
+    pub(super) fn effective(&mut self, mem: Mem) -> Reg {
         let flat = self.flat(mem);
         if !mem.fs {
             return flat;
@@ -430,8 +432,10 @@ impl Translator<'_> {
 
     /// Has the interpreter run the instruction at helper `index` of the
     /// unit, with canonical flags; leaves when it asks to.
-    fn helper(&mut self, index: u8) {
+    pub(super) fn helper(&mut self, index: u8) {
         self.canonicalize();
+        // The interpreter may change any SIMD register.
+        self.vector = super::simd::Vector::default();
         self.mov_imm(X1, self.helpers + u32::from(index));
         self.far_call(self.stubs.interpret);
         self.state = State::CANONICAL;

@@ -31,8 +31,9 @@
 //! owner's `interpret` helper run the instruction, loads the guest back as
 //! `enter` does and returns the helper's status, 0 to continue.
 //!
-//! XMM state stays in `CpuState` until a unit uses SSE (M2), so the stubs
-//! do not move it. Arithmetic flags cross the boundary
+//! Units keep `CpuState` current for MMX and XMM registers and cache them
+//! in d8-d15 and v16-v23 (`translate::simd`), so only `access`, which
+//! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` until M2 maps it.
@@ -209,6 +210,11 @@ const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
+pub(crate) const XMM: u32 = field(offset_of!(CpuState, xmm));
+pub(crate) const MMX: u32 = field(offset_of!(CpuState, mmx));
+pub(crate) const X87_REGS: u32 = field(offset_of!(CpuState, x87.regs));
+pub(crate) const X87_STATUS: u32 = field(offset_of!(CpuState, x87.status));
+pub(crate) const X87_TAG: u32 = field(offset_of!(CpuState, x87.tag));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.
@@ -318,9 +324,18 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         mrs_nzcv(r(0)),
         stp(X, Offset, r(17), r(0), SP, 96),
         str(X, Reg::LR, SP, 112),
+        // The XMM registers units cache.
+        stp_v(VSize::Q, Pre, v(16), v(17), SP, -128),
+        stp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
+        stp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
+        stp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, ACCESS),
         blr(r(16)),
+        ldp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
+        ldp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
+        ldp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
+        ldp_v(VSize::Q, Post, v(16), v(17), SP, 128),
         ldr(X, Reg::LR, SP, 112),
         ldp(X, Offset, r(17), r(1), SP, 96),
         msr_nzcv(r(1)),

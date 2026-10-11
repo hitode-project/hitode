@@ -748,6 +748,386 @@ pub const fn brk(imm: u16) -> u32 {
 /// `nop`.
 pub const NOP: u32 = 0xD503_201F;
 
+/// A vector arrangement: lane size and count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arr {
+    B8,
+    B16,
+    H4,
+    H8,
+    S2,
+    S4,
+    D2,
+}
+
+impl Arr {
+    /// The arrangement with `log2` lanes of bytes, 64 or 128 bits wide.
+    pub const fn new(log2: u32, full: bool) -> Self {
+        match (log2, full) {
+            (0, false) => Self::B8,
+            (0, true) => Self::B16,
+            (1, false) => Self::H4,
+            (1, true) => Self::H8,
+            (2, false) => Self::S2,
+            (2, true) => Self::S4,
+            (3, _) => Self::D2,
+            _ => panic!("no such arrangement"),
+        }
+    }
+
+    const fn q(self) -> u32 {
+        match self {
+            Self::B16 | Self::H8 | Self::S4 | Self::D2 => 1 << 30,
+            _ => 0,
+        }
+    }
+
+    /// Log2 of the lane size in bytes.
+    pub const fn log2(self) -> u32 {
+        match self {
+            Self::B8 | Self::B16 => 0,
+            Self::H4 | Self::H8 => 1,
+            Self::S2 | Self::S4 => 2,
+            Self::D2 => 3,
+        }
+    }
+
+    /// Lane size in bits.
+    pub const fn bits(self) -> u32 {
+        8 << self.log2()
+    }
+}
+
+/// Three-register integer operations of the same arrangement, by U and
+/// opcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Same {
+    Add = 0x10,
+    Sub = 0x20 | 0x10,
+    Sqadd = 0x01,
+    Uqadd = 0x20 | 0x01,
+    Sqsub = 0x05,
+    Uqsub = 0x20 | 0x05,
+    Cmeq = 0x20 | 0x11,
+    Cmgt = 0x06,
+    Mul = 0x13,
+    Smax = 0x0c,
+    Smin = 0x0d,
+    Umax = 0x20 | 0x0c,
+    Umin = 0x20 | 0x0d,
+    Urhadd = 0x20 | 0x02,
+    Sshl = 0x08,
+    Ushl = 0x20 | 0x08,
+    Addp = 0x17,
+}
+
+/// `<op> vd.<arr>, vn.<arr>, vm.<arr>`.
+pub const fn vsame(op: Same, arr: Arr, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    let (u, opcode) = ((op as u32) >> 5, op as u32 & 0x1f);
+    assert!(arr.log2() < 3 || matches!(op, Same::Add | Same::Sub | Same::Sshl | Same::Ushl));
+    0x0E20_0400
+        | arr.q()
+        | u << 29
+        | arr.log2() << 22
+        | rm.number() << 16
+        | opcode << 11
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Bitwise operations, by U and the size field that selects them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Logic {
+    And = 0,
+    Bic = 1,
+    Orr = 2,
+    Eor = 4,
+    Bsl = 5,
+}
+
+/// `<op> vd, vn, vm` over 8 or 16 bytes.
+pub const fn vlogic(op: Logic, full: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    let (u, size) = ((op as u32) >> 2, op as u32 & 3);
+    0x0E20_1C00
+        | (full as u32) << 30
+        | u << 29
+        | size << 22
+        | rm.number() << 16
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `mov vd, vn` over 8 or 16 bytes.
+pub const fn vmov(full: bool, rd: VReg, rn: VReg) -> u32 {
+    vlogic(Logic::Orr, full, rd, rn, rn)
+}
+
+/// Single-precision operations, by U, the size field's high bit and
+/// opcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Float {
+    Fadd = 0x1a,
+    Fsub = 0x40 | 0x1a,
+    Fmul = 0x20 | 0x1b,
+    Fdiv = 0x20 | 0x1f,
+    Fcmeq = 0x1c,
+    Fcmge = 0x20 | 0x1c,
+    Fcmgt = 0x60 | 0x1c,
+}
+
+/// `<op> vd.<2s/4s>, vn, vm`.
+pub const fn vfloat(op: Float, full: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    let (u, a, opcode) = ((op as u32) >> 5 & 1, (op as u32) >> 6, op as u32 & 0x1f);
+    0x0E20_0400
+        | (full as u32) << 30
+        | u << 29
+        | a << 23
+        | rm.number() << 16
+        | opcode << 11
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `<op> sd, sn, sm`: the scalar single-precision form.
+pub const fn sfloat(op: Float, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    let opcode = match op {
+        Float::Fadd => 0x2800,
+        Float::Fsub => 0x3800,
+        Float::Fmul => 0x0800,
+        Float::Fdiv => 0x1800,
+        _ => panic!("no scalar form"),
+    };
+    0x1E20_0000 | opcode | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
+/// Permutes, by opcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permute {
+    Uzp1 = 1,
+    Trn1 = 2,
+    Zip1 = 3,
+    Uzp2 = 5,
+    Trn2 = 6,
+    Zip2 = 7,
+}
+
+/// `<op> vd.<arr>, vn.<arr>, vm.<arr>`.
+pub const fn vpermute(op: Permute, arr: Arr, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    0x0E00_0800
+        | arr.q()
+        | arr.log2() << 22
+        | rm.number() << 16
+        | (op as u32) << 12
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Narrowing moves, by U and opcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Narrowing {
+    Xtn = 0x12,
+    Sqxtn = 0x14,
+    Sqxtun = 0x20 | 0x12,
+}
+
+/// `<op> vd.<arr>, vn.<2×arr>`, into the high half of vd (the `2` form)
+/// when `arr` is 128 bits wide.
+pub const fn vnarrow(op: Narrowing, arr: Arr, rd: VReg, rn: VReg) -> u32 {
+    let (u, opcode) = ((op as u32) >> 5, op as u32 & 0x1f);
+    assert!(arr.log2() < 3);
+    0x0E20_0800
+        | arr.q()
+        | u << 29
+        | arr.log2() << 22
+        | opcode << 12
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `not vd, vn` over 8 or 16 bytes.
+pub const fn vnot(full: bool, rd: VReg, rn: VReg) -> u32 {
+    0x2E20_5800 | (full as u32) << 30 | rn.number() << 5 | rd.number()
+}
+
+/// Shifts by an immediate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftImm {
+    Shl,
+    Ushr,
+    Sshr,
+}
+
+/// `<op> vd.<arr>, vn.<arr>, #shift`: `shl` takes 0 to the lane size
+/// minus 1, the right shifts 1 to the lane size.
+pub const fn vshift(op: ShiftImm, arr: Arr, rd: VReg, rn: VReg, shift: u32) -> u32 {
+    let bits = arr.bits();
+    let (u, opcode, immhb) = match op {
+        ShiftImm::Shl => {
+            assert!(shift < bits);
+            (0, 0x0a, bits + shift)
+        }
+        ShiftImm::Ushr | ShiftImm::Sshr => {
+            assert!(shift >= 1 && shift <= bits);
+            (
+                (op as u32 == ShiftImm::Ushr as u32) as u32,
+                0,
+                2 * bits - shift,
+            )
+        }
+    };
+    0x0F00_0400 | arr.q() | u << 29 | immhb << 16 | opcode << 11 | rn.number() << 5 | rd.number()
+}
+
+/// `shrn vd.<arr>, vn.<2×arr>, #shift`, or `shrn2` when `arr` is 128 bits
+/// wide.
+pub const fn vshrn(arr: Arr, rd: VReg, rn: VReg, shift: u32) -> u32 {
+    let bits = arr.bits();
+    assert!(arr.log2() < 3 && shift >= 1 && shift <= bits);
+    0x0F00_8400 | arr.q() | (2 * bits - shift) << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `smull`/`umull vd.<2×arr>, vn.<arr>, vm.<arr>` on the low half, or
+/// `smull2`/`umull2` on the high half when `arr` is 128 bits wide.
+pub const fn vmull(signed: bool, arr: Arr, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    assert!(arr.log2() < 3);
+    0x0E20_C000
+        | arr.q()
+        | (!signed as u32) << 29
+        | arr.log2() << 22
+        | rm.number() << 16
+        | rn.number() << 5
+        | rd.number()
+}
+
+const fn imm5(log2: u32, index: u32) -> u32 {
+    assert!(index < 16 >> log2);
+    (index << 1 | 1) << log2
+}
+
+/// `dup vd.<arr>, wn` (or `xn` for 64-bit lanes).
+pub const fn vdup(arr: Arr, rd: VReg, rn: Reg) -> u32 {
+    0x0E00_0C00 | arr.q() | imm5(arr.log2(), 0) << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `mov vd.<lane>[to], vn.<lane>[from]` with lanes of `1 << log2` bytes.
+pub const fn vins(log2: u32, rd: VReg, to: u32, rn: VReg, from: u32) -> u32 {
+    0x6E00_0400 | imm5(log2, to) << 16 | (from << log2) << 11 | rn.number() << 5 | rd.number()
+}
+
+/// `mov vd.<lane>[to], wn` (or `xn`) with lanes of `1 << log2` bytes.
+pub const fn vins_general(log2: u32, rd: VReg, to: u32, rn: Reg) -> u32 {
+    0x4E00_1C00 | imm5(log2, to) << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `umov wd, vn.<lane>[index]` (`xd` for 64-bit lanes).
+pub const fn vumov(log2: u32, rd: Reg, rn: VReg, index: u32) -> u32 {
+    let q = if log2 == 3 { 1 << 30 } else { 0 };
+    0x0E00_3C00 | q | imm5(log2, index) << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `fmov sd, wn` (`W`) or `fmov dd, xn` (`X`): zeroes the rest of vd.
+pub const fn fmov_to_v(size: Size, rd: VReg, rn: Reg) -> u32 {
+    let base = match size {
+        Size::W => 0x1E27_0000,
+        Size::X => 0x9E67_0000,
+    };
+    base | rn.number() << 5 | rd.number()
+}
+
+/// `fmov wd, sn` (`W`) or `fmov xd, dn` (`X`).
+pub const fn fmov_from_v(size: Size, rd: Reg, rn: VReg) -> u32 {
+    let base = match size {
+        Size::W => 0x1E26_0000,
+        Size::X => 0x9E66_0000,
+    };
+    base | rn.number() << 5 | rd.number()
+}
+
+/// `movi vd.2d, #0`, or `movi dd, #0` unless `full`.
+pub const fn vzero(full: bool, rd: VReg) -> u32 {
+    0x2F00_E400 | (full as u32) << 30 | rd.number()
+}
+
+/// Width of a SIMD and floating-point register access: S, D or Q.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VMem {
+    S,
+    D,
+    Q,
+}
+
+impl VMem {
+    /// The `size` and load `opc` fields.
+    const fn fields(self) -> u32 {
+        match self {
+            Self::S => 2 << 30 | 1 << 22,
+            Self::D => 3 << 30 | 1 << 22,
+            Self::Q => 3 << 22,
+        }
+    }
+
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::S => 4,
+            Self::D => 8,
+            Self::Q => 16,
+        }
+    }
+}
+
+/// `ldr st/dt/qt, [rn, wm, uxtw]`: the window form of a guest access.
+pub const fn vldr_reg(size: VMem, rt: VReg, rn: Reg, rm: Reg) -> u32 {
+    0x3C20_4800 | size.fields() | rm.number() << 16 | rn.number() << 5 | rt.number()
+}
+
+/// `str st/dt/qt, [rn, wm, uxtw]`.
+pub const fn vstr_reg(size: VMem, rt: VReg, rn: Reg, rm: Reg) -> u32 {
+    vldr_reg(size, rt, rn, rm) & !(1 << 22)
+}
+
+/// `ldur st/dt/qt, [rn, #offset]` with an unscaled signed offset.
+pub const fn vldur(size: VMem, rt: VReg, rn: Reg, offset: i32) -> u32 {
+    assert!(offset >= -256 && offset < 256);
+    0x3C00_0000 | size.fields() | (offset as u32 & 0x1ff) << 12 | rn.number() << 5 | rt.number()
+}
+
+/// `stur st/dt/qt, [rn, #offset]`.
+pub const fn vstur(size: VMem, rt: VReg, rn: Reg, offset: i32) -> u32 {
+    vldur(size, rt, rn, offset) & !(1 << 22)
+}
+
+/// `ldr st/dt/qt, [rn, #offset]`, scaled by the width.
+pub const fn vldr(size: VMem, rt: VReg, rn: Reg, offset: u32) -> u32 {
+    unsigned_offset(
+        0x3D00_0000 | size.fields(),
+        size.bytes(),
+        rt.number(),
+        rn,
+        offset,
+    )
+}
+
+/// `str st/dt/qt, [rn, #offset]`, scaled by the width.
+pub const fn vstr(size: VMem, rt: VReg, rn: Reg, offset: u32) -> u32 {
+    vldr(size, rt, rn, offset) & !(1 << 22)
+}
+
+/// `ldrh wt, [rn, #offset]`, scaled by 2.
+pub const fn ldrh(rt: Reg, rn: Reg, offset: u32) -> u32 {
+    unsigned_offset(0x7940_0000, 2, rt.number(), rn, offset)
+}
+
+/// `strh wt, [rn, #offset]`, scaled by 2.
+pub const fn strh(rt: Reg, rn: Reg, offset: u32) -> u32 {
+    unsigned_offset(0x7900_0000, 2, rt.number(), rn, offset)
+}
+
+/// `sturh wt, [rn, #offset]` with an unscaled signed offset.
+pub const fn sturh(rt: Reg, rn: Reg, offset: i32) -> u32 {
+    assert!(offset >= -256 && offset < 256);
+    0x7800_0000 | (offset as u32 & 0x1ff) << 12 | rn.number() << 5 | rt.number()
+}
+
 #[cfg(test)]
 mod tests {
     use super::Extend::*;
@@ -976,6 +1356,242 @@ mod tests {
                 str_indexed(X, Index::Post, r(1), r(28), 255),
                 "str x1, [x28], #255",
             ),
+            (
+                vsame(Same::Add, Arr::H4, v(8), v(9), v(0)),
+                "add v8.4h, v9.4h, v0.4h",
+            ),
+            (
+                vsame(Same::Sub, Arr::D2, v(16), v(17), v(1)),
+                "sub v16.2d, v17.2d, v1.2d",
+            ),
+            (
+                vsame(Same::Sqadd, Arr::B16, v(0), v(1), v(2)),
+                "sqadd v0.16b, v1.16b, v2.16b",
+            ),
+            (
+                vsame(Same::Uqadd, Arr::B8, v(8), v(8), v(0)),
+                "uqadd v8.8b, v8.8b, v0.8b",
+            ),
+            (
+                vsame(Same::Sqsub, Arr::H8, v(3), v(4), v(5)),
+                "sqsub v3.8h, v4.8h, v5.8h",
+            ),
+            (
+                vsame(Same::Uqsub, Arr::H4, v(9), v(10), v(11)),
+                "uqsub v9.4h, v10.4h, v11.4h",
+            ),
+            (
+                vsame(Same::Cmeq, Arr::S2, v(12), v(13), v(14)),
+                "cmeq v12.2s, v13.2s, v14.2s",
+            ),
+            (
+                vsame(Same::Cmgt, Arr::B8, v(15), v(8), v(1)),
+                "cmgt v15.8b, v8.8b, v1.8b",
+            ),
+            (
+                vsame(Same::Mul, Arr::H8, v(20), v(21), v(22)),
+                "mul v20.8h, v21.8h, v22.8h",
+            ),
+            (
+                vsame(Same::Smax, Arr::H4, v(0), v(1), v(2)),
+                "smax v0.4h, v1.4h, v2.4h",
+            ),
+            (
+                vsame(Same::Smin, Arr::H4, v(0), v(1), v(2)),
+                "smin v0.4h, v1.4h, v2.4h",
+            ),
+            (
+                vsame(Same::Umax, Arr::B16, v(0), v(1), v(2)),
+                "umax v0.16b, v1.16b, v2.16b",
+            ),
+            (
+                vsame(Same::Umin, Arr::B8, v(0), v(1), v(2)),
+                "umin v0.8b, v1.8b, v2.8b",
+            ),
+            (
+                vsame(Same::Urhadd, Arr::B8, v(8), v(9), v(10)),
+                "urhadd v8.8b, v9.8b, v10.8b",
+            ),
+            (
+                vsame(Same::Sshl, Arr::S4, v(1), v(2), v(3)),
+                "sshl v1.4s, v2.4s, v3.4s",
+            ),
+            (
+                vsame(Same::Ushl, Arr::D2, v(1), v(2), v(3)),
+                "ushl v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vsame(Same::Addp, Arr::S4, v(0), v(0), v(0)),
+                "addp v0.4s, v0.4s, v0.4s",
+            ),
+            (
+                vlogic(Logic::And, false, v(8), v(9), v(10)),
+                "and v8.8b, v9.8b, v10.8b",
+            ),
+            (
+                vlogic(Logic::Bic, true, v(16), v(1), v(16)),
+                "bic v16.16b, v1.16b, v16.16b",
+            ),
+            (
+                vlogic(Logic::Orr, true, v(0), v(1), v(2)),
+                "orr v0.16b, v1.16b, v2.16b",
+            ),
+            (
+                vlogic(Logic::Eor, false, v(8), v(8), v(15)),
+                "eor v8.8b, v8.8b, v15.8b",
+            ),
+            (
+                vlogic(Logic::Bsl, true, v(0), v(1), v(2)),
+                "bsl v0.16b, v1.16b, v2.16b",
+            ),
+            (vmov(false, v(9), v(8)), "mov v9.8b, v8.8b"),
+            (
+                vfloat(Float::Fadd, true, v(16), v(17), v(18)),
+                "fadd v16.4s, v17.4s, v18.4s",
+            ),
+            (
+                vfloat(Float::Fsub, true, v(0), v(1), v(2)),
+                "fsub v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfloat(Float::Fmul, false, v(0), v(1), v(2)),
+                "fmul v0.2s, v1.2s, v2.2s",
+            ),
+            (
+                vfloat(Float::Fdiv, true, v(0), v(1), v(2)),
+                "fdiv v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfloat(Float::Fcmeq, true, v(0), v(1), v(2)),
+                "fcmeq v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfloat(Float::Fcmge, true, v(0), v(1), v(2)),
+                "fcmge v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfloat(Float::Fcmgt, true, v(0), v(1), v(2)),
+                "fcmgt v0.4s, v1.4s, v2.4s",
+            ),
+            (sfloat(Float::Fadd, v(0), v(16), v(1)), "fadd s0, s16, s1"),
+            (sfloat(Float::Fsub, v(0), v(16), v(1)), "fsub s0, s16, s1"),
+            (sfloat(Float::Fmul, v(0), v(16), v(1)), "fmul s0, s16, s1"),
+            (sfloat(Float::Fdiv, v(0), v(16), v(1)), "fdiv s0, s16, s1"),
+            (
+                vpermute(Permute::Zip1, Arr::B8, v(8), v(8), v(0)),
+                "zip1 v8.8b, v8.8b, v0.8b",
+            ),
+            (
+                vpermute(Permute::Zip2, Arr::H8, v(16), v(16), v(17)),
+                "zip2 v16.8h, v16.8h, v17.8h",
+            ),
+            (
+                vpermute(Permute::Uzp1, Arr::S4, v(0), v(1), v(2)),
+                "uzp1 v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vpermute(Permute::Uzp2, Arr::H8, v(0), v(1), v(2)),
+                "uzp2 v0.8h, v1.8h, v2.8h",
+            ),
+            (
+                vpermute(Permute::Trn1, Arr::S2, v(0), v(1), v(2)),
+                "trn1 v0.2s, v1.2s, v2.2s",
+            ),
+            (
+                vpermute(Permute::Trn2, Arr::D2, v(0), v(1), v(2)),
+                "trn2 v0.2d, v1.2d, v2.2d",
+            ),
+            (
+                vnarrow(Narrowing::Xtn, Arr::H4, v(0), v(1)),
+                "xtn v0.4h, v1.4s",
+            ),
+            (
+                vnarrow(Narrowing::Sqxtn, Arr::B8, v(8), v(0)),
+                "sqxtn v8.8b, v0.8h",
+            ),
+            (
+                vnarrow(Narrowing::Sqxtn, Arr::H8, v(16), v(1)),
+                "sqxtn2 v16.8h, v1.4s",
+            ),
+            (
+                vnarrow(Narrowing::Sqxtun, Arr::B16, v(0), v(2)),
+                "sqxtun2 v0.16b, v2.8h",
+            ),
+            (vnot(true, v(0), v(1)), "mvn v0.16b, v1.16b"),
+            (
+                vshift(ShiftImm::Shl, Arr::H4, v(8), v(9), 3),
+                "shl v8.4h, v9.4h, #3",
+            ),
+            (
+                vshift(ShiftImm::Shl, Arr::D2, v(16), v(16), 63),
+                "shl v16.2d, v16.2d, #63",
+            ),
+            (
+                vshift(ShiftImm::Ushr, Arr::S4, v(0), v(1), 32),
+                "ushr v0.4s, v1.4s, #32",
+            ),
+            (
+                vshift(ShiftImm::Sshr, Arr::H8, v(0), v(1), 1),
+                "sshr v0.8h, v1.8h, #1",
+            ),
+            (vshrn(Arr::H4, v(8), v(0), 16), "shrn v8.4h, v0.4s, #16"),
+            (vshrn(Arr::H8, v(16), v(1), 16), "shrn2 v16.8h, v1.4s, #16"),
+            (
+                vmull(true, Arr::H4, v(0), v(8), v(9)),
+                "smull v0.4s, v8.4h, v9.4h",
+            ),
+            (
+                vmull(false, Arr::H8, v(1), v(16), v(17)),
+                "umull2 v1.4s, v16.8h, v17.8h",
+            ),
+            (vdup(Arr::H4, v(0), r(16)), "dup v0.4h, w16"),
+            (vdup(Arr::D2, v(1), r(17)), "dup v1.2d, x17"),
+            (vins(2, v(0), 3, v(17), 1), "mov v0.s[3], v17.s[1]"),
+            (vins(3, v(16), 1, v(1), 0), "mov v16.d[1], v1.d[0]"),
+            (vins(1, v(8), 2, v(9), 7), "mov v8.h[2], v9.h[7]"),
+            (vins_general(1, v(8), 3, r(16)), "mov v8.h[3], w16"),
+            (vins_general(2, v(16), 0, r(19)), "mov v16.s[0], w19"),
+            (vumov(1, r(19), v(8), 3), "umov w19, v8.h[3]"),
+            (vumov(3, r(16), v(17), 1), "mov x16, v17.d[1]"),
+            (fmov_to_v(W, v(8), r(19)), "fmov s8, w19"),
+            (fmov_to_v(X, v(9), r(16)), "fmov d9, x16"),
+            (fmov_from_v(W, r(20), v(10)), "fmov w20, s10"),
+            (fmov_from_v(X, r(16), v(17)), "fmov x16, d17"),
+            (vzero(true, v(16)), "movi v16.2d, #0000000000000000"),
+            (vzero(false, v(8)), "movi d8, #0000000000000000"),
+            (
+                vldr_reg(VMem::S, v(8), r(27), r(16)),
+                "ldr s8, [x27, w16, uxtw]",
+            ),
+            (
+                vldr_reg(VMem::D, v(0), r(27), r(19)),
+                "ldr d0, [x27, w19, uxtw]",
+            ),
+            (
+                vldr_reg(VMem::Q, v(17), r(27), r(16)),
+                "ldr q17, [x27, w16, uxtw]",
+            ),
+            (
+                vstr_reg(VMem::S, v(8), r(27), r(16)),
+                "str s8, [x27, w16, uxtw]",
+            ),
+            (
+                vstr_reg(VMem::D, v(9), r(27), r(16)),
+                "str d9, [x27, w16, uxtw]",
+            ),
+            (
+                vstr_reg(VMem::Q, v(23), r(27), r(16)),
+                "str q23, [x27, w16, uxtw]",
+            ),
+            (vldur(VMem::D, v(8), r(5), -8), "ldur d8, [x5, #-8]"),
+            (vstur(VMem::D, v(15), r(5), 255), "stur d15, [x5, #255]"),
+            (vstur(VMem::Q, v(16), r(5), 3), "stur q16, [x5, #3]"),
+            (vldr(VMem::Q, v(16), r(5), 64), "ldr q16, [x5, #64]"),
+            (vstr(VMem::D, v(8), r(5), 184), "str d8, [x5, #184]"),
+            (vldr(VMem::S, v(0), r(5), 4), "ldr s0, [x5, #4]"),
+            (ldrh(r(16), r(5), 362), "ldrh w16, [x5, #362]"),
+            (strh(Reg::ZR, r(5), 364), "strh wzr, [x5, #364]"),
+            (sturh(r(17), r(5), -3), "sturh w17, [x5, #-3]"),
         ]
     }
 
