@@ -1,7 +1,10 @@
-//! Explicit no-device MCI boundary. No host activation or fabricated notification.
+//! Digital-video MCI delegates to the existing media graph. Other device types
+//! keep an explicit unavailable boundary; no host MCI activation is performed.
 use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
+use adv_machine::Outcome;
+mod video;
 
 const MCI_OPEN: u32 = 0x803;
 const INVALID_DEVICE_ID: u32 = 257;
@@ -10,13 +13,19 @@ const MISSING_PARAMETER: u32 = 273;
 const NULL_PARAMETER_BLOCK: u32 = 297;
 const DEVICE_NOT_INSTALLED: u32 = 306;
 
-#[win32(winmm, name = "mciSendCommandA", level = safe_fail)]
-fn send_a(env: &mut Env<'_>, _device: u32, message: u32, flags: u32, parameters: u32) -> u32 {
-    send(env, message, flags, parameters, false)
+#[win32(winmm, name = "mciSendCommandA", level = implement)]
+fn send_a(env: &mut Env<'_>, device: u32, message: u32, flags: u32, parameters: u32) -> Outcome {
+    if let Some(result) = video::send(env, device, message, flags, parameters, false) {
+        return result;
+    }
+    Outcome::Return(send(env, message, flags, parameters, false))
 }
-#[win32(winmm, name = "mciSendCommandW", level = safe_fail)]
-fn send_w(env: &mut Env<'_>, _device: u32, message: u32, flags: u32, parameters: u32) -> u32 {
-    send(env, message, flags, parameters, true)
+#[win32(winmm, name = "mciSendCommandW", level = implement)]
+fn send_w(env: &mut Env<'_>, device: u32, message: u32, flags: u32, parameters: u32) -> Outcome {
+    if let Some(result) = video::send(env, device, message, flags, parameters, true) {
+        return result;
+    }
+    Outcome::Return(send(env, message, flags, parameters, true))
 }
 fn send(env: &mut Env<'_>, message: u32, flags: u32, parameters: u32, wide: bool) -> u32 {
     let api = if wide {
@@ -114,6 +123,7 @@ fn error_string(env: &mut Env<'_>, error: u32, output: u32, capacity: u32, wide:
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    video::register(registry);
     registry.register(send_a_ABI);
     registry.register(send_w_ABI);
     registry.register(error_string_a_ABI);

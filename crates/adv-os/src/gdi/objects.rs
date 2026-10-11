@@ -119,7 +119,8 @@ pub enum GdiObj {
         /// The SaveDC stack, oldest first.
         saved: Vec<DcState>,
     },
-    Region,
+    /// Non-overlapping half-open rectangles in logical units.
+    Region(Vec<[i32; 4]>),
 }
 
 #[derive(Clone, Default)]

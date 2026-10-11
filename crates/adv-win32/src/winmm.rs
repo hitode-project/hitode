@@ -36,6 +36,7 @@ struct Timers {
 }
 
 pub fn register(registry: &mut Registry) {
+    registry.register(default_driver_ABI);
     wave_out::register(registry);
     mci::register(registry);
     joystick::register(registry);
@@ -54,6 +55,22 @@ pub fn register(registry: &mut Registry) {
         (WORKER, 0, worker),
     ] {
         crate::stdcall(registry, "winmm.dll", name, argc, handler);
+    }
+}
+
+#[adv_abi::win32(winmm, name = "DefDriverProc", level = implement)]
+fn default_driver(
+    _env: &mut Env<'_>,
+    _id: u32,
+    _driver: adv_abi::Handle,
+    message: u32,
+    _a: i32,
+    _b: i32,
+) -> i32 {
+    // Standard installable-driver lifecycle and configuration messages.
+    match message {
+        1 | 2 | 5 | 6 | 9 | 10 => 1,
+        _ => 0,
     }
 }
 

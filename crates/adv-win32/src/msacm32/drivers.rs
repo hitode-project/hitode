@@ -104,17 +104,27 @@ fn details(e: &mut Env<'_>, id: u32, output: u32, flags: u32, wide: bool) -> Res
 }
 
 #[win32(msacm32, name = "acmDriverDetailsA", level = state)]
-fn details_a(e: &mut Env<'_>, id: Handle, output: GuestPtr<()>, flags: u32) -> u32 {
-    details(e, id.0, output.addr(), flags, false)
-        .err()
-        .unwrap_or(0)
+fn details_a(e: &mut Env<'_>, id: Handle, output: GuestPtr<()>, flags: u32) -> Outcome {
+    if let Some(outcome) = guest::details(e, id.0, output.addr(), flags, false) {
+        return outcome;
+    }
+    Outcome::Return(
+        details(e, id.0, output.addr(), flags, false)
+            .err()
+            .unwrap_or(0),
+    )
 }
 
 #[win32(msacm32, name = "acmDriverDetailsW", level = state)]
-fn details_w(e: &mut Env<'_>, id: Handle, output: GuestPtr<()>, flags: u32) -> u32 {
-    details(e, id.0, output.addr(), flags, true)
-        .err()
-        .unwrap_or(0)
+fn details_w(e: &mut Env<'_>, id: Handle, output: GuestPtr<()>, flags: u32) -> Outcome {
+    if let Some(outcome) = guest::details(e, id.0, output.addr(), flags, true) {
+        return outcome;
+    }
+    Outcome::Return(
+        details(e, id.0, output.addr(), flags, true)
+            .err()
+            .unwrap_or(0),
+    )
 }
 
 fn metric(e: &mut Env<'_>, object: u32, index: u32, output: u32) -> Result<(), u32> {
@@ -239,7 +249,12 @@ fn enumerate(e: &mut Env<'_>, callback: GuestPtr<()>, instance: u32, flags: u32)
         Err(error) => return Outcome::Return(error),
     };
     let driver = e.ext.get::<Acm>().drivers.get(&e.sys.objects, id).unwrap();
-    if !driver.enabled && flags & 0x8000_0000 == 0 {
+    let global = (driver.enabled || flags & 0x8000_0000 != 0).then_some((id, driver.support()));
+    let locals = guest::enumeration(e, flags);
+    if !locals.is_empty() {
+        return guest::enumerate(e, callback.addr(), instance, locals, global);
+    }
+    if global.is_none() {
         return Outcome::Return(0);
     }
     let support = driver.support();

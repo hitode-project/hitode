@@ -17,6 +17,7 @@ mod palette;
 mod pen;
 pub mod raster;
 mod readback;
+pub(crate) mod region;
 
 #[cfg(test)]
 mod object_tests {
@@ -59,7 +60,7 @@ mod object_tests {
             ..ObjectLimits::default()
         });
         let mut gdi = Gdi::default();
-        assert_eq!(gdi.add(&mut objects, GdiObj::Region), 0);
+        assert_eq!(gdi.add(&mut objects, GdiObj::Region(Vec::new())), 0);
         assert!(!gdi.register_external_dc(&mut objects, 1, 7));
         assert_eq!(objects.object_count(), 0);
     }
@@ -1016,6 +1017,7 @@ fn create_di_bitmap(
 }
 
 pub fn register(reg: &mut Registry) {
+    region::register(reg);
     batch::register(reg);
     brush::register(reg);
     palette::register(reg);

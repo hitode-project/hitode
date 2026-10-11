@@ -1,5 +1,6 @@
-//! Synchronous 32-bit ACM streams. Symphonia is the only production decoder;
-//! Windows ACM is used solely by the repository's native differential fixture.
+//! Synchronous 32-bit ACM streams use Symphonia for built-in formats and guest
+//! DriverProc callbacks for application-local codecs. Host Windows ACM is used
+//! solely by the repository's native differential fixtures.
 use std::collections::BTreeMap;
 
 use adv_abi::{GuestPtr, Handle, Registry, win32};
@@ -8,6 +9,7 @@ use adv_device::codec::{Codec, Decoder, DecoderConfig, PcmEncoding};
 use adv_machine::{Conv, Env, Namespace, Objects, Outcome};
 
 mod drivers;
+mod guest;
 
 const INVALID_HANDLE: u32 = 5;
 const NO_MEMORY: u32 = 7;
@@ -530,31 +532,112 @@ fn close_impl(e: &mut Env<'_>, handle: u32, flags: u32) -> Result<(), u32> {
 
 pub fn register(registry: &mut Registry) {
     drivers::register(registry);
-    macro_rules! add {
-        ($name:literal, $argc:literal, $handler:ident) => {
-            registry.add("msacm32.dll", $name, Conv::Stdcall { argc: $argc }, |env| {
-                Outcome::Return($handler(env).err().unwrap_or(0))
-            });
-        };
-    }
-    add!("acmFormatSuggest", 5, suggest);
-    add!("acmStreamOpen", 8, open);
+    guest::register(registry);
+    registry.add(
+        "msacm32.dll",
+        "acmFormatSuggest",
+        Conv::Stdcall { argc: 5 },
+        |e| {
+            let args = std::array::from_fn(|i| e.arg(i as u32));
+            if args[0] != 0 {
+                return guest::suggest(e, args);
+            }
+            match suggest(e) {
+                Ok(()) => Outcome::Return(0),
+                Err(NOT_POSSIBLE) => guest::suggest(e, args),
+                Err(code) => Outcome::Return(code),
+            }
+        },
+    );
+    registry.add(
+        "msacm32.dll",
+        "acmStreamOpen",
+        Conv::Stdcall { argc: 8 },
+        |e| {
+            let args = std::array::from_fn(|i| e.arg(i as u32));
+            if args[1] != 0 {
+                return guest::open_stream(e, args);
+            }
+            match open(e) {
+                Ok(()) => Outcome::Return(0),
+                Err(NOT_POSSIBLE) => guest::open_stream(e, args),
+                Err(code) => Outcome::Return(code),
+            }
+        },
+    );
     registry.register(size_ABI);
-    add!("acmStreamPrepareHeader", 3, prepare);
-    add!("acmStreamConvert", 3, convert);
-    add!("acmStreamUnprepareHeader", 3, unprepare);
+    registry.add(
+        "msacm32.dll",
+        "acmStreamPrepareHeader",
+        Conv::Stdcall { argc: 3 },
+        stream_front::<0x6051>,
+    );
+    registry.add(
+        "msacm32.dll",
+        "acmStreamConvert",
+        Conv::Stdcall { argc: 3 },
+        stream_front::<0x604f>,
+    );
+    registry.add(
+        "msacm32.dll",
+        "acmStreamUnprepareHeader",
+        Conv::Stdcall { argc: 3 },
+        stream_front::<0x6052>,
+    );
+    registry.register(reset_ABI);
     registry.register(close_ABI);
+}
+fn stream_front<const MESSAGE: u32>(e: &mut Env<'_>) -> Outcome {
+    let (h, a, f) = (e.arg(0), e.arg(1), e.arg(2));
+    if let Some(outcome) = guest::stream_call(e, h, MESSAGE, a, f) {
+        return outcome;
+    }
+    let result = match MESSAGE {
+        0x6051 => prepare(e),
+        0x604f => convert(e),
+        _ => unprepare(e),
+    };
+    Outcome::Return(result.err().unwrap_or(0))
+}
+#[win32(msacm32, name="acmStreamReset", level=implement)]
+fn reset(e: &mut Env<'_>, handle: Handle, flags: u32) -> Outcome {
+    if let Some(outcome) = guest::stream_call(e, handle.0, 0x6050, 0, flags) {
+        return outcome;
+    }
+    if flags != 0 {
+        return Outcome::Return(INVALID_FLAG);
+    }
+    ensure(e);
+    let Some(stream) = e.ext.get::<Acm>().get_mut(&mut e.sys.objects, handle.0) else {
+        return Outcome::Return(INVALID_HANDLE);
+    };
+    stream.decoder.reset();
+    Outcome::Return(0)
 }
 
 #[win32(msacm32, name = "acmStreamSize", level = implement)]
-fn size(env: &mut Env<'_>, stream: Handle, input: u32, output: GuestPtr<u32>, flags: u32) -> u32 {
-    size_impl(env, stream.0, input, output.addr(), flags)
-        .err()
-        .unwrap_or(0)
+fn size(
+    env: &mut Env<'_>,
+    stream: Handle,
+    input: u32,
+    output: GuestPtr<u32>,
+    flags: u32,
+) -> Outcome {
+    if let Some(outcome) = guest::stream_call(env, stream.0, 0x604e, output.addr(), flags) {
+        return outcome;
+    }
+    Outcome::Return(
+        size_impl(env, stream.0, input, output.addr(), flags)
+            .err()
+            .unwrap_or(0),
+    )
 }
 #[win32(msacm32, name = "acmStreamClose", level = implement)]
-fn close(env: &mut Env<'_>, stream: Handle, flags: u32) -> u32 {
-    close_impl(env, stream.0, flags).err().unwrap_or(0)
+fn close(env: &mut Env<'_>, stream: Handle, flags: u32) -> Outcome {
+    if let Some(outcome) = guest::stream_call(env, stream.0, 0x604d, 0, flags) {
+        return outcome;
+    }
+    Outcome::Return(close_impl(env, stream.0, flags).err().unwrap_or(0))
 }
 
 #[cfg(test)]

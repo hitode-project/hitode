@@ -1,5 +1,6 @@
 //! The same authored x86 program exercises native Windows ACM and the three
-//! test CPUs. Production decoding always uses Symphonia, including PCM.
+//! test CPUs. Built-in decoding uses Symphonia; application-local function
+//! drivers execute their public DriverProc callbacks in the guest.
 #![cfg(windows)]
 use std::path::Path;
 use std::process::Command;
@@ -34,6 +35,39 @@ fn run_guest(exe: &Path, profile: &Path, backend: &str) {
             }
             other => panic!("ACM fixture {}/{backend}: {other:?}", exe.display()),
         }
+    }
+}
+
+#[test]
+fn application_function_drivers_convert_and_release_like_windows() {
+    use std::os::windows::process::CommandExt;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = root.join("target/acm-function-tests");
+    let build = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(root.join("tools/fixtures/build-mmio.ps1"))
+        .arg("-OutputDirectory")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let exe = output.join("fixture_acm_function.exe");
+    let native = Command::new(&exe)
+        .current_dir(&output)
+        .creation_flags(0x08000000)
+        .status()
+        .unwrap();
+    assert_eq!(native.code(), Some(0), "native function-driver fixture");
+    let reference = std::fs::read(output.join("acm-function.bin")).unwrap();
+    for backend in ["interpreter", "jit", "unicorn"] {
+        let data = output.join(backend);
+        run_guest(&exe, &data, backend);
+        let actual = std::fs::read(data.join("overlay/acm-function.bin")).unwrap();
+        assert_eq!(reference, actual, "ACM function driver {backend}");
     }
 }
 
