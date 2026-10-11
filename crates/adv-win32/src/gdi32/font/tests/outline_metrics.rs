@@ -298,30 +298,3 @@ fn outline_metrics_preflight_prevents_partial_guest_writes() {
         assert_eq!(unchanged, [0xa5; 96]);
     }
 }
-
-#[test]
-#[cfg(not(windows))]
-fn unavailable_outline_backend_does_not_publish_zero_success_metrics() {
-    let (mut machine, data, dc) = fixture();
-    machine.cpu.write(data + 512, &[0xa5; 212]).unwrap();
-    assert_eq!(
-        invoke(
-            &mut machine,
-            data,
-            "GetOutlineTextMetricsA",
-            &[dc, 212, data + 512]
-        ),
-        0
-    );
-    let mut bytes = [0; 212];
-    machine.cpu.read(data + 512, &mut bytes).unwrap();
-    assert_eq!(bytes, [0xa5; 212]);
-    assert!(
-        machine
-            .ext
-            .get::<adv_abi::ApiDiagnostics>()
-            .warnings
-            .keys()
-            .any(|key| key.0 == "gdi32.dll!GetOutlineTextMetricsA")
-    );
-}

@@ -895,6 +895,104 @@ impl Font {
     pub(super) fn metrics(&self) -> TextMetrics {
         self.metrics.clone()
     }
+    /// GDI's outline metrics of the primary face: typographic values from
+    /// OS/2, Mac values from hhea, the box and minimum size from head and
+    /// the underline and italic angle from post, scaled to this font's em
+    /// as GDI scales them. Names are family, full (ID 4), subfamily (ID 2)
+    /// and unique (ID 3).
+    pub(super) fn outline_metrics(&self) -> Result<OutlineMetrics, TextError> {
+        let font = self.primary.font()?;
+        let (os2, hhea, head) = (
+            font.os2().map_err(font_error)?,
+            font.hhea().map_err(font_error)?,
+            font.head().map_err(font_error)?,
+        );
+        let units = f32::from(head.units_per_em());
+        if units == 0.0 {
+            return Err(TextError::Font("font has no em square".into()));
+        }
+        let y = |value: i16| (f32::from(value) * self.em / units).round() as i32;
+        let x = |value: i16| (f32::from(value) * self.em * self.xscale / units).round() as i32;
+        let (italic_angle, underline_size, underline_position) = match font.post() {
+            Ok(post) => (
+                (post.italic_angle().to_f32() * 10.0).round() as i32,
+                y(post.underline_thickness().to_i16()),
+                y(post.underline_position().to_i16()),
+            ),
+            Err(_) => (0, y(os2.y_strikeout_size()), -y(os2.y_strikeout_size())),
+        };
+        let mut panose = [0; 10];
+        let bytes = os2.panose_10();
+        panose[..bytes.len().min(10)].copy_from_slice(&bytes[..bytes.len().min(10)]);
+        // Simulated italic and bold, and underline and strikeout, show in
+        // the selection flags; only the embedding bits of fsType remain.
+        let mut selection = u32::from(os2.fs_selection().bits());
+        if self.request.italic {
+            selection |= 1;
+        }
+        if self.request.underline {
+            selection |= 1 << 1;
+        }
+        if self.request.strikeout {
+            selection |= 1 << 4;
+        }
+        if self.request.weight >= 600 {
+            selection |= 1 << 5;
+        }
+        let name = |id| {
+            font.localized_strings(id)
+                .english_or_first()
+                .map(|name| name.to_string())
+                .unwrap_or_default()
+        };
+        let family = self
+            .primary
+            .info
+            .families
+            .first()
+            .map(|name| name.0.clone())
+            .unwrap_or_else(|| name(skrifa::string::StringId::FAMILY_NAME));
+        let point = |px: i16, py: i16| Point { x: x(px), y: y(py) };
+        Ok(OutlineMetrics {
+            text: self.metrics.clone(),
+            panose,
+            selection,
+            embedding: u32::from(os2.fs_type() & 0x30e),
+            caret_rise: i32::from(hhea.caret_slope_rise()),
+            caret_run: i32::from(hhea.caret_slope_run()),
+            italic_angle,
+            em_units: u32::from(head.units_per_em()),
+            ascent: y(os2.s_typo_ascender()),
+            descent: y(os2.s_typo_descender()),
+            line_gap: y(os2.s_typo_line_gap()).max(0) as u32,
+            cap_height: y(os2.s_cap_height().unwrap_or(0)).max(0) as u32,
+            x_height: y(os2.sx_height().unwrap_or(0)).max(0) as u32,
+            bounds: TextBox {
+                left: x(head.x_min()),
+                top: y(head.y_max()),
+                right: x(head.x_max()),
+                bottom: y(head.y_min()),
+            },
+            mac_ascent: y(hhea.ascender().to_i16()),
+            mac_descent: y(hhea.descender().to_i16()),
+            mac_line_gap: y(hhea.line_gap().to_i16()).max(0) as u32,
+            minimum_ppem: u32::from(head.lowest_rec_ppem()),
+            subscript_size: point(os2.y_subscript_x_size(), os2.y_subscript_y_size()),
+            subscript_offset: point(os2.y_subscript_x_offset(), os2.y_subscript_y_offset()),
+            superscript_size: point(os2.y_superscript_x_size(), os2.y_superscript_y_size()),
+            superscript_offset: point(os2.y_superscript_x_offset(), os2.y_superscript_y_offset()),
+            strikeout_size: y(os2.y_strikeout_size()).max(0) as u32,
+            strikeout_position: y(os2.y_strikeout_position()),
+            underline_size,
+            underline_position,
+            names: [
+                family,
+                name(skrifa::string::StringId::FULL_NAME),
+                name(skrifa::string::StringId::SUBFAMILY_NAME),
+                name(skrifa::string::StringId::UNIQUE_ID),
+            ],
+        })
+    }
     pub(super) fn logical_font(&self) -> FontRequest {
         let mut logical = self.request.clone();
         if logical.default.is_some() {

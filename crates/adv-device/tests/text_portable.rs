@@ -119,6 +119,38 @@ fn loaded() -> (Text, FontRequest) {
 }
 
 #[test]
+fn outline_metrics_scale_the_design_tables_to_the_selected_em() {
+    let (mut text, mut font) = loaded();
+    // The fixture: 1000 units per em, typographic and hhea 800/-200, box
+    // (50, 0)-(700, 700), smallest size 3 ppem, an upright caret.
+    let m = text.outline_metrics(&font).unwrap();
+    assert_eq!(m.em_units, 1000);
+    assert_eq!((m.ascent, m.descent, m.line_gap), (32, -8, 0));
+    assert_eq!((m.mac_ascent, m.mac_descent, m.mac_line_gap), (32, -8, 0));
+    assert_eq!(
+        (m.bounds.left, m.bounds.top, m.bounds.right, m.bounds.bottom),
+        (2, 28, 28, 0)
+    );
+    assert_eq!((m.caret_rise, m.caret_run, m.italic_angle), (1, 0, 0));
+    assert_eq!((m.minimum_ppem, m.selection, m.embedding), (3, 0, 0));
+    assert_eq!(m.text.height, text.metrics(&font).unwrap().height);
+    assert_eq!(
+        m.names,
+        [
+            "ADV Resource Fixture",
+            "ADV Resource Fixture Regular",
+            "Regular",
+            "ADV Resource Fixture-authored-20261004",
+        ]
+    );
+    // Simulated styles show in the selection flags.
+    font.italic = true;
+    font.underline = true;
+    font.weight = 700;
+    assert_eq!(text.outline_metrics(&font).unwrap().selection, 0x23);
+}
+
+#[test]
 fn authored_outline_gray_levels_mono_packing_and_transforms_are_real() {
     let (mut text, font) = loaded();
     let b = Character::Unicode(u32::from(b'B'));

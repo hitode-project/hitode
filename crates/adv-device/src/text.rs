@@ -729,8 +729,7 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = request;
-            Err(TextError::Unavailable)
+            self.font(request)?.outline_metrics()
         }
     }
     /// Unicode range, default and break characters from the same realized font
