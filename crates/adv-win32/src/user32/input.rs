@@ -4,6 +4,19 @@ use crate::util::set_last_error;
 use adv_abi::{AnsiStr, Env, GuestPtr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 
+pub(super) mod double_click;
+
+#[win32(user32, name = "GetDoubleClickTime", level = state)]
+fn get_double_click_time(env: &mut Env<'_>) -> u32 {
+    user(env).double_click.time_ms
+}
+
+#[win32(user32, name = "SetDoubleClickTime", level = state)]
+fn set_double_click_time(env: &mut Env<'_>, milliseconds: u32) -> i32 {
+    user_mut(env).double_click.set_time(milliseconds);
+    1
+}
+
 fn display_bounds(user: &User) -> Rect {
     Rect::new(0, 0, user.screen.0.max(1), user.screen.1.max(1))
 }
@@ -278,6 +291,8 @@ pub(super) fn register(registry: &mut Registry) {
         map_virtual_key_a_ABI,
         map_virtual_key_w_ABI,
         swap_mouse_button_ABI,
+        get_double_click_time_ABI,
+        set_double_click_time_ABI,
     ] {
         registry.register(api);
     }

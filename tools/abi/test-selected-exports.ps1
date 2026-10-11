@@ -19,7 +19,7 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $validOutput 'signatures.t
     $fields = $line.Split("`t")
     $rows[$fields[0] + '!' + $fields[1]] = $fields
 }
-$expectedScope = @{ 'mpr.dll' = 2; 'ntdll.dll' = 3; 'shfolder.dll' = 2 }
+$expectedScope = @{ 'mpr.dll' = 2; 'ntdll.dll' = 3; 'shfolder.dll' = 2; 'dbghelp.dll' = 1; 'imagehlp.dll' = 1 }
 foreach ($module in $expectedScope.Keys) {
     if (($rows.Keys | Where-Object { $_.StartsWith($module + '!') }).Count -ne $expectedScope[$module]) { throw "Selection widened $module" }
 }
@@ -29,6 +29,7 @@ foreach ($suffix in @('A', 'W')) {
     if (($alias[2..5] -join "`t") -cne ($original[2..5] -join "`t")) { throw 'Shell alias changed its source declaration' }
 }
 if (($rows['kernel32.dll!lstrcpy'][2..5] -join "`t") -cne ($rows['kernel32.dll!lstrcpyA'][2..5] -join "`t")) { throw 'Legacy ANSI alias changed its source declaration' }
+if (($rows['imagehlp.dll!MakeSureDirectoryPathExists'][2..5] -join "`t") -cne ($rows['dbghelp.dll!MakeSureDirectoryPathExists'][2..5] -join "`t")) { throw 'ImageHlp alias changed its source declaration' }
 function Assert-Rejected([string]$Name, [string[]]$InputLines, [string]$Reason) {
     $inputPath = Join-Path $cache ($Name + '.tsv')
     [IO.File]::WriteAllLines($inputPath, $InputLines)

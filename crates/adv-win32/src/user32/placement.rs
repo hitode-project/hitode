@@ -1,6 +1,7 @@
 //! WINDOWPLACEMENT uses the existing USER object and virtual desktop geometry.
 use adv_abi::{Env, GuestPtr, Handle, Registry, win32};
-use adv_cpu::backend::Prot;
+use adv_cpu::backend::{GuestExt, Prot};
+use adv_machine::Outcome;
 
 use super::{
     user,
@@ -175,6 +176,127 @@ fn get_window_placement(env: &mut Env<'_>, hwnd: Handle, output: GuestPtr<()>) -
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_window_placement_ABI);
+    registry.register(set_window_placement_ABI);
+}
+
+#[win32(user32, name = "SetWindowPlacement", level = state)]
+fn set_window_placement(env: &mut Env<'_>, hwnd: Handle, input: GuestPtr<()>) -> Outcome {
+    let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd.0) else {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    };
+    let thread = window.thread;
+    let normal_now = window.style & (WS_MINIMIZE | WS_MAXIMIZE) == 0;
+    let tool = window.ex_style & 0x80 != 0;
+    if adv_abi::guest::check_range(env.cpu, input.addr(), WINDOWPLACEMENT_SIZE, Prot::READ).is_err()
+    {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    let fields: [u32; 11] =
+        std::array::from_fn(|i| env.cpu.read_u32(input.addr() + i as u32 * 4).unwrap());
+    if fields[0] != WINDOWPLACEMENT_SIZE {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    if fields[1] & 4 != 0 && thread != env.context {
+        adv_abi::warn_unavailable(
+            env,
+            "SetWindowPlacement",
+            "asynchronous placement across input queues is unsupported",
+        );
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    let mut normal = Rect {
+        left: fields[7] as i32,
+        top: fields[8] as i32,
+        right: fields[9] as i32,
+        bottom: fields[10] as i32,
+    };
+    let width = i64::from(normal.right) - i64::from(normal.left);
+    let height = i64::from(normal.bottom) - i64::from(normal.top);
+    if !(0..=i64::from(i32::MAX)).contains(&width) || !(0..=i64::from(i32::MAX)).contains(&height) {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    // Tool windows retain screen coordinates, including intentional offscreen
+    // placement. Ordinary windows are recovered into the virtual work area.
+    if !tool {
+        let (sw, sh) = user(env).screen;
+        let work_height = (sh - 40).max(0);
+        if normal.left >= sw || normal.right <= 0 || normal.top >= work_height || normal.bottom <= 0
+        {
+            let x = normal.left.clamp(0, (sw - width as i32).max(0));
+            let y = normal.top.clamp(0, (work_height - height as i32).max(0));
+            normal = Rect::new(x, y, width as i32, height as i32);
+        }
+    }
+    let command = match fields[2] {
+        10 => SW_SHOWNORMAL,
+        11 => SW_MINIMIZE,
+        other => other,
+    };
+    let flags = fields[1];
+    let min_position = (fields[3] as i32, fields[4] as i32);
+    let apply = move |env: &mut Env<'_>| {
+        let Some(window) = env
+            .ext
+            .get_mut::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &hwnd.0)
+        else {
+            return Outcome::Return(0);
+        };
+        window.placement.normal_rect = if normal_now { window.rect } else { normal };
+        if normal_now || flags & 1 != 0 {
+            window.placement.min_position = min_position;
+        }
+        window.placement.restore_to_maximized = false;
+        let complete = move |env: &mut Env<'_>| {
+            let Some(window) = env
+                .ext
+                .get_mut::<crate::Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &hwnd.0)
+            else {
+                return Outcome::Return(0);
+            };
+            if flags & 1 != 0 {
+                window.placement.min_position = min_position;
+            }
+            window.placement.restore_to_maximized =
+                window.style & WS_MAXIMIZE != 0 || (command == SW_SHOWMINIMIZED && flags & 2 != 0);
+            if command > 11 {
+                set_last_error(env, 1449);
+            }
+            Outcome::Return(1)
+        };
+        if command > 11 {
+            return complete(env);
+        }
+        super::window::show_window(env, hwnd.0, command, move |env, _| complete(env))
+    };
+    if normal_now {
+        super::window::set_window_pos(
+            env,
+            hwnd.0,
+            0,
+            normal,
+            super::window::SWP_NOZORDER | super::window::SWP_NOACTIVATE,
+            move |env, success| {
+                if success {
+                    apply(env)
+                } else {
+                    Outcome::Return(0)
+                }
+            },
+        )
+    } else {
+        apply(env)
+    }
 }
 
 #[cfg(test)]

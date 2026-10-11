@@ -51,6 +51,7 @@ mod native {
 
     struct State {
         menu: Option<menu::HostMenu>,
+        popup: Option<menu::HostMenu>,
         menu_sink: Option<MenuSink>,
         events: VecDeque<Event>,
         width: u32,
@@ -583,10 +584,22 @@ mod native {
                     return 0;
                 }
                 let state = &mut *pointer;
+                if message == WM_TIMER && wparam == menu::POPUP_TIMER {
+                    if state.popup.as_ref().is_some_and(menu::HostMenu::ended) {
+                        EndMenu();
+                    }
+                    return 0;
+                }
                 if let Some(event) = state
-                    .menu
+                    .popup
                     .as_ref()
                     .and_then(|menu| menu.event(message, wparam, lparam))
+                    .or_else(|| {
+                        state
+                            .menu
+                            .as_ref()
+                            .and_then(|menu| menu.event(message, wparam, lparam))
+                    })
                 {
                     if let Some(sink) = state.menu_sink.as_mut() {
                         if let Err(error) = sink(event) {
@@ -616,6 +629,9 @@ mod native {
                         return 0;
                     }
                     WM_CLOSE => {
+                        if state.popup.is_some() {
+                            EndMenu();
+                        }
                         if !state.closed {
                             state.events.push_back(Event::Close);
                             state.closed = true;
@@ -755,6 +771,7 @@ mod native {
             let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
             let mut state = Box::new(State {
                 menu: None,
+                popup: None,
                 menu_sink: None,
                 events: VecDeque::new(),
                 width,

@@ -21,3 +21,6 @@ uxtheme.dll	IsAppThemed	uxtheme.dll	IsAppThemed	0
 uxtheme.dll	IsThemeActive	uxtheme.dll	IsThemeActive	0
 # Project the implemented safe failure without widening the DWM module scope.
 dwmapi.dll	DwmSetWindowAttribute	dwmapi.dll	DwmSetWindowAttribute	4
+# ImageHlp exposes the same directory utility declaration as DbgHelp.
+dbghelp.dll	MakeSureDirectoryPathExists	dbghelp.dll	MakeSureDirectoryPathExists	1
+imagehlp.dll	MakeSureDirectoryPathExists	dbghelp.dll	MakeSureDirectoryPathExists	1

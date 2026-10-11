@@ -890,6 +890,7 @@ d3dx9_43.dll	D3DXVec3Project	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV
 d3dx9_43.dll	D3DXVec3Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXVec3TransformCoord	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXVec4Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+dbghelp.dll	MakeSureDirectoryPathExists	stdcall	i32	Windows.Win32.Foundation.BOOL	DirPath:Windows.Win32.Foundation.PSTR:str8:1
 ddraw.dll	DirectDrawCreate	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGUID:System.Guid*:ptr:1|lplpDD:Windows.Win32.Graphics.DirectDraw.IDirectDraw*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateClipper	stdcall	i32	Windows.Win32.Foundation.HRESULT	dwFlags:u32:u32:1|lplpDDClipper:Windows.Win32.Graphics.DirectDraw.IDirectDrawClipper*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateEx	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGuid:System.Guid*:ptr:1|lplpDD:void**:ptr:1|iid:System.Guid*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
@@ -1973,6 +1974,7 @@ gdiplus.dll	GdiplusNotificationHook	stdcall	i32	Windows.Win32.Graphics.GdiPlus.S
 gdiplus.dll	GdiplusNotificationUnhook	stdcall	void	void	token:usize:u32:1
 gdiplus.dll	GdiplusShutdown	stdcall	void	void	token:usize:u32:1
 gdiplus.dll	GdiplusStartup	stdcall	i32	Windows.Win32.Graphics.GdiPlus.Status	token:usize*:ptr:1|input:Windows.Win32.Graphics.GdiPlus.GdiplusStartupInput*:ptr:1|output:Windows.Win32.Graphics.GdiPlus.GdiplusStartupOutput*:ptr:1
+imagehlp.dll	MakeSureDirectoryPathExists	stdcall	i32	Windows.Win32.Foundation.BOOL	DirPath:Windows.Win32.Foundation.PSTR:str8:1
 imm32.dll	ImmAssociateContext	stdcall	handle	Windows.Win32.UI.Input.Ime.HIMC	param0:Windows.Win32.Foundation.HWND:handle:1|param1:Windows.Win32.UI.Input.Ime.HIMC:handle:1
 imm32.dll	ImmAssociateContextEx	stdcall	i32	Windows.Win32.Foundation.BOOL	param0:Windows.Win32.Foundation.HWND:handle:1|param1:Windows.Win32.UI.Input.Ime.HIMC:handle:1|param2:u32:u32:1
 imm32.dll	ImmConfigureIMEA	stdcall	i32	Windows.Win32.Foundation.BOOL	param0:Windows.Win32.UI.Input.KeyboardAndMouse.HKL:handle:1|param1:Windows.Win32.Foundation.HWND:handle:1|param2:u32:u32:1|param3:void*:ptr:1

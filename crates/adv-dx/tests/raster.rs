@@ -37,6 +37,34 @@ struct Fixture {
     raster: Raster,
     device: u32,
 }
+
+#[test]
+fn write_only_surface_locks_pair_with_unlock_and_preserve_readonly_versioning() {
+    let mut f = Fixture::new();
+    let (surface, pixels, _) = f.surface(8, 8, PixelFormat::Bgra32, false);
+    let sid = (0..32)
+        .find(|&id| f.surfaces.get(id).is_some_and(|s| s.pixels == pixels))
+        .unwrap();
+    let before = f.surfaces[sid].version;
+    f.memory.put_u32(64, 124).unwrap();
+    assert_eq!(f.dd(dd::LOCK, &[surface, 0, 64, 0x821, 0]), 0);
+    f.memory.put_u32(pixels, 0xff123456).unwrap();
+    assert_eq!(f.dd(dd::LOCK, &[surface, 0, 64, 0x821, 0]), 0x887601ae);
+    assert_eq!(f.dd(dd::UNLOCK, &[surface, 0]), 0);
+    assert_eq!(f.surfaces[sid].version, before + 1);
+    assert_eq!(f.dd(dd::UNLOCK, &[surface, 0]), 0x88760248);
+    assert_eq!(f.dd(dd::LOCK, &[surface, 0, 64, 0x811, 0]), 0);
+    assert_eq!(f.memory.u32(pixels).unwrap(), 0xff123456);
+    assert_eq!(f.dd(dd::UNLOCK, &[surface, 0]), 0);
+    assert_eq!(f.surfaces[sid].version, before + 1);
+    assert_eq!(f.dd(dd::LOCK, &[surface, 0, 64, 0x30, 0]), 0);
+    assert_eq!(f.dd(dd::UNLOCK, &[surface, 0]), 0);
+    assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 0, 8]), 0);
+    assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 123, 0x80]), 0);
+    assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 0, 0x80]), 0x80070057);
+    assert_eq!(f.dd(dd::RELEASE, &[surface]), 0);
+    assert_eq!(f.dd(dd::RELEASE, &[f.device]), 0);
+}
 impl Fixture {
     fn new() -> Self {
         let mut f = Self::empty(adv_machine::Objects::default());

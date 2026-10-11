@@ -14,6 +14,8 @@ pub enum Command {
     Click(i16, i16),
     MouseDown(i16, i16),
     MouseUp(i16, i16),
+    RightMouseDown(i16, i16),
+    RightMouseUp(i16, i16),
     Move(i16, i16),
     Key(u32),
     KeyDown(u32),
@@ -41,6 +43,8 @@ impl Command {
             Self::Click(..)
                 | Self::MouseDown(..)
                 | Self::MouseUp(..)
+                | Self::RightMouseDown(..)
+                | Self::RightMouseUp(..)
                 | Self::Move(..)
                 | Self::Key(_)
                 | Self::KeyDown(_)
@@ -71,7 +75,7 @@ impl Command {
                 Ok(Self::DialogTrack(id, value))
             }
             "menu" => Ok(Self::Menu(rest.parse().map_err(|_| "menu requires a decimal command ID")?)),
-            "click" | "move" | "mouse-down" | "mouse-up" => {
+            "click" | "move" | "mouse-down" | "mouse-up" | "right-mouse-down" | "right-mouse-up" => {
                 let values: Vec<_> = rest.split_whitespace().collect();
                 if values.len() != 2 {
                     return Err(format!("{command} requires two signed client coordinates"));
@@ -82,6 +86,8 @@ impl Command {
                     "click" => Self::Click(x, y),
                     "mouse-down" => Self::MouseDown(x, y),
                     "mouse-up" => Self::MouseUp(x, y),
+                    "right-mouse-down" => Self::RightMouseDown(x, y),
+                    "right-mouse-up" => Self::RightMouseUp(x, y),
                     _ => Self::Move(x, y),
                 })
             }
@@ -545,6 +551,8 @@ impl Control {
                     match &command {
                         Command::MouseDown(..) => keys.set(1, true),
                         Command::MouseUp(..) => keys.set(1, false),
+                        Command::RightMouseDown(..) => keys.set(2, true),
+                        Command::RightMouseUp(..) => keys.set(2, false),
                         Command::KeyDown(key) => keys.set(*key, true),
                         Command::KeyUp(key) => keys.set(*key, false),
                         Command::Close => keys.release_all(),
@@ -743,6 +751,18 @@ mod tests {
         assert!(Command::parse("mouse-up 32768 0").is_err());
         assert!(Command::MouseDown(0, 0).interrupts_guest());
         assert!(Command::MouseUp(0, 0).interrupts_guest());
+        assert_eq!(
+            Command::parse("right-mouse-down -1 620"),
+            Ok(Command::RightMouseDown(-1, 620))
+        );
+        assert_eq!(
+            Command::parse("right-mouse-up 358 620"),
+            Ok(Command::RightMouseUp(358, 620))
+        );
+        assert!(Command::parse("right-mouse-down 1").is_err());
+        assert!(Command::parse("right-mouse-up 32768 0").is_err());
+        assert!(Command::RightMouseDown(0, 0).interrupts_guest());
+        assert!(Command::RightMouseUp(0, 0).interrupts_guest());
         assert_eq!(Command::parse("key-down 0x11"), Ok(Command::KeyDown(17)));
         assert_eq!(Command::parse("key-up 17"), Ok(Command::KeyUp(17)));
         assert_eq!(Command::parse("menus"), Ok(Command::Menus));

@@ -13,6 +13,80 @@ use std::borrow::Cow;
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 
+#[test]
+fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachment() {
+    #[derive(Clone, Copy)]
+    struct WindowPoint(i32, i32);
+    let (mut m, device) = setup(false, false, Registry::default());
+    m.ext.insert(WindowPoint(100, 50));
+    m.ext.get_mut::<front::State>().provider.window = |ext, _, hwnd| {
+        let point = ext.get::<WindowPoint>();
+        (hwnd == 7).then_some(front::WindowGeometry {
+            width: 4,
+            height: 2,
+            origin: (point.0, point.1),
+        })
+    };
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored draw"),
+    };
+    assert_eq!(call(&mut m, api::CREATE_CLIPPER, &[device, 0, DATA, 0]), 0);
+    let clipper = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::CLIPPER_SET_HWND, &[clipper, 0, 7]), 0);
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x200u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 64, DATA, 0]),
+        0
+    );
+    let primary = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::SET_CLIPPER, &[primary, clipper]), 0);
+    desc[4..8].copy_from_slice(&7u32.to_le_bytes());
+    desc[8..12].copy_from_slice(&2u32.to_le_bytes());
+    desc[12..16].copy_from_slice(&4u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x40u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 64, DATA, 0]),
+        0
+    );
+    let source = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(
+        call(&mut m, api::LOCK, &[source, 0, DATA + 64, 0x821, 0]),
+        0
+    );
+    let pixels = m.cpu.read_u32(DATA + 100).unwrap();
+    let expected: Vec<u8> = (0..32).collect();
+    m.cpu.write(pixels, &expected).unwrap();
+    assert_eq!(call(&mut m, api::UNLOCK, &[source, 0]), 0);
+    for point in [WindowPoint(100, 50), WindowPoint(130, 81)] {
+        m.ext.insert(point);
+        for (index, value) in [point.0, point.1, point.0 + 4, point.1 + 2]
+            .into_iter()
+            .enumerate()
+        {
+            m.cpu
+                .write_u32(DATA + index as u32 * 4, value as u32)
+                .unwrap();
+        }
+        assert_eq!(call(&mut m, api::BLT, &[primary, DATA, source, 0, 0, 0]), 0);
+        assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, expected);
+    }
+    assert_eq!(call(&mut m, api::CLIPPER_SET_HWND, &[clipper, 0, 0]), 0);
+    assert!(
+        !m.ext
+            .get::<front::State>()
+            .draw
+            .clipper_origins
+            .contains_key(&clipper)
+    );
+}
+
 fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
         context: m.sys.current,

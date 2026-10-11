@@ -8,7 +8,7 @@ use crate::{
         window::{WS_DISABLED, WS_VISIBLE, wm},
     },
 };
-use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, win32};
+use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::{
@@ -480,8 +480,83 @@ fn path_a(env: &mut Env<'_>, item: GuestPtr<()>, output: AnsiStr) -> i32 {
 fn path_w(env: &mut Env<'_>, item: GuestPtr<()>, output: WideStr) -> i32 {
     path(env, item.addr(), output.0.addr(), true)
 }
+fn folder_location(env: &mut Env<'_>, csidl: u32, token: u32, output: u32) -> i32 {
+    if output == 0 || env.cpu.write_u32(output, 0).is_err() {
+        return 0x8000_4003u32 as i32; // E_POINTER
+    }
+    if token != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "SHGetFolderLocation",
+            "folder lookup for another user token is unsupported",
+        );
+        return 0x8000_4001u32 as i32;
+    }
+    let Some(text) = super::special_folder(env.ext.get::<Win32>(), csidl) else {
+        if csidl & 0xff <= 0x3d {
+            adv_abi::warn_unavailable(
+                env,
+                "SHGetFolderLocation",
+                "this Shell folder has no guest filesystem mapping",
+            );
+            return 0x8000_4001u32 as i32;
+        }
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    };
+    // Provision the same virtual profile folders as the existing path APIs.
+    // These are filesystem PIDLs owned by the shared COM task allocator.
+    let Some(host) = env.ext.get::<Win32>().vfs.write_path(&text) else {
+        return 0x8007_0003u32 as i32;
+    };
+    if let Err(error) = std::fs::create_dir_all(host) {
+        let code = match error.kind() {
+            std::io::ErrorKind::NotFound => 3,
+            std::io::ErrorKind::PermissionDenied => 5,
+            std::io::ErrorKind::AlreadyExists => 183,
+            _ => 31,
+        };
+        return (0x8007_0000u32 | code) as i32;
+    }
+    let pointer = pidl(env, &text);
+    if pointer == 0 {
+        return 0x8007_000eu32 as i32;
+    }
+    if env.cpu.write_u32(output, pointer).is_err() {
+        task_free(env, pointer);
+        return 0x8000_4003u32 as i32;
+    }
+    0
+}
+#[win32(shell32,name="SHGetSpecialFolderLocation",level=state)]
+fn special_location(env: &mut Env<'_>, _owner: Handle, csidl: i32, output: GuestPtr<u32>) -> i32 {
+    folder_location(env, csidl as u32, 0, output.addr())
+}
+#[win32(shell32,name="SHGetFolderLocation",level=state)]
+fn location(
+    env: &mut Env<'_>,
+    _owner: Handle,
+    csidl: i32,
+    token: Handle,
+    _flags: u32,
+    output: GuestPtr<u32>,
+) -> i32 {
+    // Native Shell accepts reserved dwFlags values without changing the result.
+    folder_location(env, csidl as u32, token.0, output.addr())
+}
+#[win32(shell32,name="ILFree",level=state)]
+fn free_pidl(env: &mut Env<'_>, item: GuestPtr<()>) {
+    task_free(env, item.addr());
+}
 pub(super) fn register(reg: &mut Registry) {
-    for api in [browse_a_ABI, browse_w_ABI, path_a_ABI, path_w_ABI] {
+    for api in [
+        browse_a_ABI,
+        browse_w_ABI,
+        path_a_ABI,
+        path_w_ABI,
+        special_location_ABI,
+        location_ABI,
+        free_pidl_ABI,
+    ] {
         reg.register(api);
     }
     stdcall(reg, "shell32.dll", PROC, 4, procedure);
@@ -491,6 +566,74 @@ pub(super) fn register(reg: &mut Registry) {
 mod tests {
     use super::*;
     use crate::misc::test_support::{DATA, Fixture, env};
+    #[test]
+    fn special_folder_locations_share_paths_task_allocations_and_failure_outputs() {
+        let mut f = Fixture::new("shell-folder-location");
+        for csidl in [
+            0x00, 0x05, 0x1a, 0x1c, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2e, 0x401c, 0x801c, 0x105,
+        ] {
+            for extended in [false, true] {
+                let status = if extended {
+                    f.call(
+                        "shell32.dll",
+                        "SHGetFolderLocation",
+                        &[0, csidl, 0, 2, DATA],
+                    )
+                } else {
+                    f.call(
+                        "shell32.dll",
+                        "SHGetSpecialFolderLocation",
+                        &[0, csidl, DATA],
+                    )
+                };
+                assert_eq!(status, 0);
+                let pointer = f.m.cpu.read_u32(DATA).unwrap();
+                assert_ne!(pointer, 0);
+                let expected = super::super::special_folder(f.m.ext.get::<Win32>(), csidl).unwrap();
+                for (api, wide) in [
+                    ("SHGetPathFromIDListA", false),
+                    ("SHGetPathFromIDListW", true),
+                ] {
+                    assert_eq!(f.call("shell32.dll", api, &[pointer, DATA + 16]), 1);
+                    assert_eq!(
+                        read_text(&env(&mut f.m), DATA + 16, wide).as_deref(),
+                        Some(expected.as_str())
+                    );
+                }
+                if extended {
+                    f.call("shell32.dll", "ILFree", &[pointer]);
+                } else {
+                    f.call("ole32.dll", "CoTaskMemFree", &[pointer]);
+                }
+                assert!(f.m.ext.get_mut::<Heaps>().size(0, pointer).is_none());
+            }
+        }
+        f.m.cpu.write_u32(DATA, 1).unwrap();
+        assert_eq!(
+            f.call(
+                "shell32.dll",
+                "SHGetSpecialFolderLocation",
+                &[0, 0x7f, DATA]
+            ),
+            0x8007_0057
+        );
+        assert_eq!(f.m.cpu.read_u32(DATA).unwrap(), 0);
+        assert_eq!(
+            f.call("shell32.dll", "SHGetSpecialFolderLocation", &[0, 0x1c, 0]),
+            0x8000_4003
+        );
+        assert_eq!(
+            f.call(
+                "shell32.dll",
+                "SHGetFolderLocation",
+                &[0, 0x1c, 123, 0, DATA]
+            ),
+            0x8000_4001
+        );
+        assert_eq!(f.m.cpu.read_u32(DATA).unwrap(), 0);
+        f.call("shell32.dll", "ILFree", &[0]);
+        f.cleanup();
+    }
     #[test]
     fn folder_pidls_share_task_ownership_and_convert_ansi_and_unicode_paths() {
         let mut f = Fixture::new("shell-pidl");

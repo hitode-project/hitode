@@ -7,6 +7,7 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 mod common_dialogs;
+mod directories;
 mod dwm;
 mod folder_browse;
 mod gdiplus;
@@ -23,7 +24,7 @@ mod shell_icon;
 mod shell_path;
 mod task_allocator;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod theme;
 mod variant;
 mod wts;
@@ -432,6 +433,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     common_dialogs::register(reg);
+    directories::register(reg);
     folder_browse::register(reg);
     gdiplus::register(reg);
     hglobal_stream::register(reg);

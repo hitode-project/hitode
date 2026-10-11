@@ -1431,19 +1431,40 @@ fn run_execution(
                             Err("click has no guest target window".into())
                         }
                     }
-                    control::Command::MouseDown(x, y) | control::Command::MouseUp(x, y) => {
-                        let pressed = matches!(command, control::Command::MouseDown(..));
+                    control::Command::MouseDown(x, y)
+                    | control::Command::MouseUp(x, y)
+                    | control::Command::RightMouseDown(x, y)
+                    | control::Command::RightMouseUp(x, y) => {
+                        let right = matches!(
+                            command,
+                            control::Command::RightMouseDown(..)
+                                | control::Command::RightMouseUp(..)
+                        );
+                        let pressed = matches!(
+                            command,
+                            control::Command::MouseDown(..) | control::Command::RightMouseDown(..)
+                        );
+                        let buttons = if pressed {
+                            if right { 2 } else { 1 }
+                        } else {
+                            0
+                        };
                         let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
-                        let moved = runtime.post_input(0x200, u32::from(pressed), position);
+                        let moved = runtime.post_input(0x200, buttons, position);
                         let posted = runtime.post_input(
-                            if pressed { 0x201 } else { 0x202 },
-                            u32::from(pressed),
+                            if right {
+                                if pressed { 0x204 } else { 0x205 }
+                            } else {
+                                if pressed { 0x201 } else { 0x202 }
+                            },
+                            buttons,
                             position,
                         );
                         inputs += u64::from(moved) + u64::from(posted);
                         if moved && posted {
                             Ok(format!(
-                                "mouse-{} {x} {y}",
+                                "{}mouse-{} {x} {y}",
+                                if right { "right-" } else { "" },
                                 if pressed { "down" } else { "up" }
                             ))
                         } else {

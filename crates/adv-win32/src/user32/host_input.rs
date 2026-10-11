@@ -27,6 +27,16 @@ pub fn mouse_mapping(message: u32, buttons: u32, swapped: bool) -> (u32, u32) {
 /// Post input to the foremost visible window's thread. Keyboard messages use
 /// its valid focus window; mouse messages use its valid capture window.
 pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
+    post_at(env, message, wparam, lparam, std::time::Instant::now())
+}
+
+fn post_at(
+    env: &mut Env<'_>,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+    time: std::time::Instant,
+) -> bool {
     let user = &mut env.ext.get_mut::<Win32>().user;
     let Some((top, mut hwnd)) = target(user, &env.sys.objects, message) else {
         return false;
@@ -68,7 +78,7 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
             lparam = make_long(sx.wrapping_sub(tx), sy.wrapping_sub(ty));
         }
         for (down, up, vk) in [(0x201, 0x202, 1), (0x204, 0x205, 2), (0x207, 0x208, 4)] {
-            if message == down {
+            if message == down || message == down + 2 {
                 user.keys[vk] |= 0x80;
             }
             if message == up {
@@ -76,7 +86,16 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
             }
         }
     }
-    let (message, wparam) = mouse_mapping(message, wparam, user.swap_buttons);
+    let (mut message, wparam) = mouse_mapping(message, wparam, user.swap_buttons);
+    if (0x200..=0x20e).contains(&message) {
+        let style = user
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .map_or(0, |window| user.classes[window.class].style);
+        message = user
+            .double_click
+            .message(hwnd, style, message, wparam, user.cursor_pos, time);
+    }
     super::message::post_input(env, hwnd, message, wparam, lparam)
 }
 
@@ -86,6 +105,7 @@ pub fn release(env: &mut Env<'_>) -> usize {
     let (pressed, position) = {
         let user = &mut env.ext.get_mut::<Win32>().user;
         let pressed = user.keys;
+        user.double_click.reset();
         for key in &mut user.keys {
             *key &= 0x7f;
         }
@@ -168,3 +188,6 @@ fn valid_window(
     }
     false
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,6 +6,7 @@ use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Namespace, Objects, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
+mod popup;
 mod radio;
 mod text_query;
 
@@ -18,6 +19,7 @@ pub struct Menus {
     restored: BTreeSet<u32>,
     attached: BTreeMap<u32, u32>,
     class_resources: BTreeMap<usize, adv_pe::ResId>,
+    tracking: Option<popup::Tracking>,
 }
 #[derive(Default)]
 struct Menu {
@@ -48,7 +50,28 @@ pub struct MenuKey {
 pub struct MenuBar {
     pub key: MenuKey,
     pub items: Vec<MenuItem>,
+    pub popup: Option<PopupPresentation>,
 }
+/// Screen placement is projected to the guest client's coordinate space. UI
+/// reads the completion token only; no guest objects or native HWNDs are shared.
+#[derive(Clone, Debug)]
+pub struct PopupPresentation {
+    pub x: i32,
+    pub y: i32,
+    pub flags: u32,
+    pub exclude: Option<[i32; 4]>,
+    pub active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl PartialEq for PopupPresentation {
+    fn eq(&self, other: &Self) -> bool {
+        self.x == other.x
+            && self.y == other.y
+            && self.flags == other.flags
+            && self.exclude == other.exclude
+            && std::sync::Arc::ptr_eq(&self.active, &other.active)
+    }
+}
+impl Eq for PopupPresentation {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuItem {
     pub text: Vec<u16>,
@@ -68,6 +91,10 @@ pub struct MenuCommand {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEvent {
+    Cancel {
+        window: u32,
+        root: u32,
+    },
     Command(MenuCommand),
     Initialize {
         window: u32,
@@ -79,6 +106,17 @@ pub enum MenuEvent {
 
 /// Keep the visible menu owner's bar while a modal dialog disables its owner.
 pub fn presentation_key(user: &super::User, objects: &Objects) -> MenuKey {
+    if let Some(tracking) = user.menus.tracking.as_ref().filter(|t| t.ready && !t.ended) {
+        return MenuKey {
+            window: tracking.owner,
+            menu: tracking.root,
+            revision: user.menus.revision,
+            enabled: user
+                .windows
+                .get(objects, &tracking.owner)
+                .is_some_and(|w| w.enabled() && !w.destroying),
+        };
+    }
     let window = user
         .top
         .iter()
@@ -148,26 +186,67 @@ pub fn presentation(user: &super::User, objects: &Objects) -> Result<MenuBar, St
     Ok(MenuBar {
         key,
         items: items(&user.menus, objects, key, key.menu, 0, &mut remaining)?,
+        popup: user
+            .menus
+            .tracking
+            .as_ref()
+            .filter(|t| t.ready && !t.ended)
+            .map(|t| {
+                let (x, y) = user.client_origin(objects, t.owner);
+                PopupPresentation {
+                    x: t.x.saturating_sub(x),
+                    y: t.y.saturating_sub(y),
+                    flags: t.flags,
+                    exclude: t.exclude.map(|r| {
+                        [
+                            r[0].saturating_sub(x),
+                            r[1].saturating_sub(y),
+                            r[2].saturating_sub(x),
+                            r[3].saturating_sub(y),
+                        ]
+                    }),
+                    active: t.active.clone(),
+                }
+            }),
     })
 }
 
 /// Validate immutable UI routing data against the live, sole guest owner.
 pub fn post_host_event(env: &mut Env<'_>, event: MenuEvent) -> bool {
     let (hwnd, root) = match event {
+        MenuEvent::Cancel { window, root } => (window, root),
         MenuEvent::Command(command) => (command.window, command.root),
         MenuEvent::Initialize { window, root, .. } => (window, root),
     };
     let u = user(env);
+    let tracking = u
+        .menus
+        .tracking
+        .as_ref()
+        .is_some_and(|t| t.owner == hwnd && t.root == root && !t.ended);
     if root == 0
-        || u.menus.attached.get(&hwnd) != Some(&root)
+        || (!tracking && u.menus.attached.get(&hwnd) != Some(&root))
         || !u
             .windows
             .get(&env.sys.objects, &hwnd)
-            .is_some_and(|window| window.visible() && window.enabled() && !window.destroying)
+            .is_some_and(|window| {
+                (tracking || window.visible()) && window.enabled() && !window.destroying
+            })
     {
         return false;
     }
     let (message, wparam, lparam) = match event {
+        MenuEvent::Cancel { .. } => {
+            if !tracking {
+                return false;
+            }
+            if let Some(t) = user_mut(env).menus.tracking.as_mut() {
+                t.ended = true;
+                t.active.store(false, std::sync::atomic::Ordering::Release);
+            }
+            user_mut(env).menus.revision = user(env).menus.revision.wrapping_add(1);
+            return super::message::post(env, hwnd, 0, 0, 0);
+        }
         MenuEvent::Command(command) => {
             let mut pending = vec![root];
             let mut seen = BTreeSet::new();
@@ -196,6 +275,9 @@ pub fn post_host_event(env: &mut Env<'_>, event: MenuEvent) -> bool {
             }
             if !selectable {
                 return false;
+            }
+            if tracking {
+                return popup::select(env, command);
             }
             (0x111, command.id & 0xffff, 0)
         }
@@ -240,6 +322,10 @@ impl Menus {
         Some(&mut objects.owned_mut(id)?.items)
     }
     pub(super) fn remove_window(&mut self, hwnd: u32, objects: &mut Objects) {
+        if let Some(t) = self.tracking.as_mut().filter(|t| t.owner == hwnd) {
+            t.ended = true;
+            t.active.store(false, std::sync::atomic::Ordering::Release);
+        }
         self.remove_system(hwnd, objects);
         if let Some(menu) = self.attached.remove(&hwnd) {
             self.destroy(menu, objects);
@@ -256,6 +342,10 @@ impl Menus {
             return false;
         }
         self.revision = self.revision.wrapping_add(1);
+        if let Some(t) = self.tracking.as_mut().filter(|t| t.root == menu) {
+            t.ended = true;
+            t.active.store(false, std::sync::atomic::Ordering::Release);
+        }
         let mut pending = vec![menu];
         while let Some(menu) = pending.pop() {
             if let Some(Some(adv_machine::Object::Host(payload))) =
@@ -1099,6 +1189,7 @@ fn load_indirect(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    popup::register(reg);
     radio::register(reg);
     text_query::register(reg);
     reg.register(draw_menu_bar_ABI);

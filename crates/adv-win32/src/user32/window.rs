@@ -449,6 +449,7 @@ pub struct User {
     pub swap_buttons: bool,
     /// The guest's installed input profile, shared by all its current threads.
     pub keyboard_layout: u32,
+    pub(super) double_click: super::input::double_click::DoubleClick,
     pub icon_title_font: super::system_parameters::IconFont,
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
@@ -490,6 +491,7 @@ impl User {
             input_tracking: None,
             swap_buttons: false,
             keyboard_layout: 0x0411_0411,
+            double_click: super::input::double_click::DoubleClick::default(),
             icon_title_font: super::system_parameters::IconFont::default(),
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
@@ -674,6 +676,7 @@ impl User {
         let Some(w) = self.windows.remove(objects, &hwnd) else {
             return;
         };
+        self.double_click.forget_window(hwnd);
         if w.parent != 0 {
             if let Some(p) = self.windows.get_mut(objects, &w.parent) {
                 p.children.retain(|&c| c != hwnd);

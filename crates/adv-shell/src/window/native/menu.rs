@@ -2,6 +2,9 @@
 use super::*;
 use adv_runtime::{MenuBar, MenuCommand, MenuEvent, MenuItem};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub(super) const POPUP_TIMER: usize = usize::MAX - 2;
 
 struct OwnedMenu(HMENU);
 impl Drop for OwnedMenu {
@@ -18,6 +21,7 @@ pub(super) struct HostMenu {
     root: u32,
     commands: BTreeMap<u32, MenuCommand>,
     popups: BTreeMap<usize, (u32, u16)>,
+    active: Option<Arc<AtomicBool>>,
 }
 fn failure(operation: &str) -> String {
     format!("{operation} failed: {}", unsafe { GetLastError() })
@@ -106,7 +110,7 @@ impl HostMenu {
         let mut popups = BTreeMap::new();
         let handle = build(
             &bar.items,
-            false,
+            bar.popup.is_some(),
             bar.key.enabled,
             &mut commands,
             &mut popups,
@@ -117,6 +121,7 @@ impl HostMenu {
             root: bar.key.menu,
             commands,
             popups,
+            active: bar.popup.as_ref().map(|popup| popup.active.clone()),
         })
     }
     pub(super) fn event(&self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<MenuEvent> {
@@ -126,12 +131,14 @@ impl HostMenu {
                 .get(&(wparam as u32))
                 .copied()
                 .map(MenuEvent::Command),
-            WM_INITMENU if wparam == self.handle.0 as usize => Some(MenuEvent::Initialize {
-                window: self.window,
-                root: self.root,
-                menu: self.root,
-                position: None,
-            }),
+            WM_INITMENU if self.active.is_none() && wparam == self.handle.0 as usize => {
+                Some(MenuEvent::Initialize {
+                    window: self.window,
+                    root: self.root,
+                    menu: self.root,
+                    position: None,
+                })
+            }
             WM_INITMENUPOPUP if (lparam as usize >> 16) & 0xffff == 0 => self
                 .popups
                 .get(&wparam)
@@ -144,6 +151,11 @@ impl HostMenu {
             _ => None,
         }
     }
+    pub(super) fn ended(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| !active.load(Ordering::Acquire))
+    }
 }
 impl Window {
     pub fn set_menu_event_sink(&mut self, sink: MenuSink) {
@@ -155,11 +167,20 @@ impl Window {
         } else {
             Some(HostMenu::build(bar)?)
         };
-        let handle = next.as_ref().map_or(null_mut(), |menu| menu.handle.0);
         let mut client: RECT = unsafe { std::mem::zeroed() };
         if unsafe { GetClientRect(self.hwnd, &mut client) } == 0 {
             return Err(failure("GetClientRect"));
         }
+        if let Some(popup) = &bar.popup {
+            // A transient popup does not own or detach the window's menu bar.
+            self.state.popup = next;
+            if !self.hidden && popup.active.load(Ordering::Acquire) {
+                self.track_popup(bar, popup, &client)?;
+            }
+            return Ok(());
+        }
+        self.state.popup = None;
+        let handle = next.as_ref().map_or(null_mut(), |menu| menu.handle.0);
         if unsafe { SetMenu(self.hwnd, handle) } == 0 {
             return Err(failure("SetMenu"));
         }
@@ -178,11 +199,171 @@ impl Window {
         )?;
         Ok(())
     }
+
+    fn track_popup(
+        &mut self,
+        bar: &MenuBar,
+        popup: &adv_runtime::PopupPresentation,
+        client: &RECT,
+    ) -> Result<(), String> {
+        let Some(menu) = self.state.popup.as_ref() else {
+            return Ok(());
+        };
+        let handle = menu.handle.0;
+        let viewport = Viewport::fit(client, self.state.width, self.state.height);
+        let origin = {
+            let mut point = POINT { x: 0, y: 0 };
+            if unsafe { ClientToScreen(self.hwnd, &mut point) } == 0 {
+                return Err(failure("ClientToScreen"));
+            }
+            point
+        };
+        let project = |x: i32, y: i32| POINT {
+            x: (i64::from(origin.x)
+                + i64::from(viewport.x)
+                + i64::from(x) * i64::from(viewport.width) / i64::from(self.state.width.max(1)))
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            y: (i64::from(origin.y)
+                + i64::from(viewport.y)
+                + i64::from(y) * i64::from(viewport.height) / i64::from(self.state.height.max(1)))
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        };
+        let point = project(popup.x, popup.y);
+        let params = popup.exclude.map(|r| {
+            let a = project(r[0], r[1]);
+            let b = project(r[2], r[3]);
+            TPMPARAMS {
+                cbSize: std::mem::size_of::<TPMPARAMS>() as u32,
+                rcExclude: RECT {
+                    left: a.x,
+                    top: a.y,
+                    right: b.x,
+                    bottom: b.y,
+                },
+            }
+        });
+        // This native loop presents private UI state only. The worker owns guest
+        // semantics and can end it via a read-only completion token.
+        if unsafe { SetTimer(self.hwnd, POPUP_TIMER, 30, None) } == 0 {
+            return Err(failure("SetTimer"));
+        }
+        let id = unsafe {
+            TrackPopupMenuEx(
+                handle,
+                (popup.flags & !(TPM_RETURNCMD | TPM_NONOTIFY))
+                    | TPM_RETURNCMD
+                    | TPM_NONOTIFY
+                    | TPM_NOANIMATION,
+                point.x,
+                point.y,
+                self.hwnd,
+                params.as_ref().map_or(null(), |p| p),
+            )
+        };
+        unsafe {
+            KillTimer(self.hwnd, POPUP_TIMER);
+        }
+        if !popup.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let event = self
+            .state
+            .popup
+            .as_ref()
+            .and_then(|menu| menu.commands.get(&(id as u32)).copied())
+            .map_or(
+                MenuEvent::Cancel {
+                    window: bar.key.window,
+                    root: bar.key.menu,
+                },
+                MenuEvent::Command,
+            );
+        if let Some(sink) = self.state.menu_sink.as_mut() {
+            sink(event)?;
+            if matches!(event, MenuEvent::Command(_)) {
+                // A callback may have disabled or replaced the chosen item
+                // since this immutable tree was built. Rejected choices must
+                // still retire the native loop; accepted choices already did.
+                sink(MenuEvent::Cancel {
+                    window: bar.key.window,
+                    root: bar.key.menu,
+                })?;
+            }
+        } else {
+            self.state.events.push_back(Event::Menu(event));
+            if matches!(event, MenuEvent::Command(_)) {
+                self.state.events.push_back(Event::Menu(MenuEvent::Cancel {
+                    window: bar.key.window,
+                    root: bar.key.menu,
+                }));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_popup_preserves_attached_bar_and_retires_its_private_tree() {
+        let mut window = Window::new("authored popup", 320, 180, true).unwrap();
+        let token = Arc::new(AtomicBool::new(true));
+        let key = adv_runtime::MenuKey {
+            window: 123,
+            menu: 456,
+            revision: 1,
+            enabled: true,
+        };
+        let command = MenuCommand {
+            window: key.window,
+            root: key.menu,
+            menu: key.menu,
+            position: 0,
+            id: 7,
+        };
+        let popup = MenuBar {
+            key,
+            items: vec![MenuItem {
+                text: "Save".encode_utf16().collect(),
+                flags: 0,
+                supported: true,
+                command,
+                submenu: 0,
+                children: Vec::new(),
+            }],
+            popup: Some(adv_runtime::PopupPresentation {
+                x: 20,
+                y: 30,
+                flags: 0x100,
+                exclude: None,
+                active: token.clone(),
+            }),
+        };
+        let attached = MenuBar {
+            popup: None,
+            ..popup.clone()
+        };
+        window.set_menu_bar(&attached).unwrap();
+        let bar_handle = unsafe { GetMenu(window.hwnd) };
+        assert!(!bar_handle.is_null());
+        window.set_menu_bar(&popup).unwrap();
+        assert_eq!(unsafe { GetMenu(window.hwnd) }, bar_handle);
+        let menu = window.state.popup.as_ref().unwrap();
+        let handle = menu.handle.0;
+        assert_ne!(unsafe { IsMenu(handle) }, 0);
+        assert_eq!(menu.commands.get(&1), Some(&command));
+        assert!(!menu.ended());
+        token.store(false, Ordering::Release);
+        assert!(window.state.popup.as_ref().unwrap().ended());
+        window.set_menu_bar(&MenuBar::default()).unwrap();
+        assert_eq!(unsafe { IsMenu(bar_handle) }, 0);
+        assert_eq!(
+            unsafe { IsMenu(handle) },
+            0,
+            "popup ownership is retired with the UI projection"
+        );
+    }
     #[test]
     fn native_menu_preserves_client_size_states_and_specific_guest_target() {
         let mut window = Window::new("authored host menu", 320, 180, true).unwrap();
@@ -213,6 +394,7 @@ mod tests {
         disabled.command.id = 77;
         let bar = MenuBar {
             key,
+            popup: None,
             items: vec![MenuItem {
                 text: "&設定".encode_utf16().collect(),
                 flags: 0,

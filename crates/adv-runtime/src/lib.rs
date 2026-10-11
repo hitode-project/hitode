@@ -18,7 +18,9 @@ pub use adv_win32::user32::dialog::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,
 };
 pub use adv_win32::user32::host_input::mouse_mapping;
-pub use adv_win32::user32::menu::{MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey};
+pub use adv_win32::user32::menu::{
+    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation,
+};
 pub use adv_win32::vorbisfile as vorbis;
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, Graphics, GraphicsStats, IID_DDRAW7, IID_SURFACE7,

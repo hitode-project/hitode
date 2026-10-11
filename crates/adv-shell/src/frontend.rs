@@ -377,6 +377,7 @@ mod tests {
                     enabled: true,
                 },
                 items: Vec::new(),
+                popup: None,
             });
         }
         assert!(ui.menus.update());

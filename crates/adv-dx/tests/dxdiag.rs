@@ -316,8 +316,12 @@ fn installed_fronts_report_9_0_c_with_shared_variants_and_independent_container_
         assert_eq!(f.u32(invalid_child), 0x80070057);
         assert_eq!(f.u32(rejected), 0);
         assert_eq!(f.read(invalid_variant, 16), [0; 16]);
-        for variant in variants {
-            assert_eq!(f.read(variant, 16), [0; 16]);
+        for (index, variant) in variants.into_iter().enumerate() {
+            // VariantClear releases ownership and empties vt; native Windows
+            // retains the former payload, including a freed BSTR's address.
+            let mut expected = [0; 16];
+            expected[8..12].copy_from_slice(&f.u32(variant_values[index]).to_le_bytes());
+            assert_eq!(f.read(variant, 16), expected);
         }
         let bstr = f.u32(variant_values[2]);
         let env = Env {

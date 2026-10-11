@@ -297,6 +297,8 @@ fn get_system_metrics(env: &mut Env<'_>) -> Outcome {
         32 | 33 => 8,      // SM_CXFRAME, SM_CYFRAME
         34 => 136,         // SM_CXMINTRACK
         35 => 39,          // SM_CYMINTRACK
+        36 => user(env).double_click.width, // SM_CXDOUBLECLK
+        37 => user(env).double_click.height, // SM_CYDOUBLECLK
         49 | 50 => 16,     // SM_CXSMICON, SM_CYSMICON
         61 | 62 => w,      // SM_CXMAXIMIZED... close enough: SM_CXMAXTRACK
         80 => 1,           // SM_CMONITORS
@@ -442,21 +444,6 @@ fn union_rect(env: &mut Env<'_>) -> Outcome {
             let _ = env.cpu.write_u32(dst + 12, b1.max(b2) as u32);
         }
         Outcome::Return(1)
-    }
-}
-
-fn enum_display_settings(env: &mut Env<'_>) -> Outcome {
-    let (_dev, mode, out) = (env.arg(0), env.arg(1) as i32, env.arg(2));
-    if (mode == 0 || mode == -1 || mode == -2) && out != 0 {
-        let (w, h) = user(env).screen;
-        let _ = env.cpu.write_u32(out + 40, 0x001c_0000);
-        let _ = env.cpu.write_u32(out + 104, 32);
-        let _ = env.cpu.write_u32(out + 108, w as u32);
-        let _ = env.cpu.write_u32(out + 112, h as u32);
-        let _ = env.cpu.write_u32(out + 120, 60);
-        Outcome::Return(1)
-    } else {
-        Outcome::Return(0)
     }
 }
 
@@ -828,8 +815,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "ChangeDisplaySettingsExA", 5, |_| Outcome::Return(0));
     s(reg, "ChangeDisplaySettingsW", 2, |_| Outcome::Return(0));
     s(reg, "ChangeDisplaySettingsExW", 5, |_| Outcome::Return(0));
-    s(reg, "EnumDisplaySettingsA", 3, enum_display_settings);
-    s(reg, "EnumDisplaySettingsW", 3, enum_display_settings);
     s(reg, "WINNLSEnableIME", 2, |_| Outcome::Return(1));
     s(reg, "LoadCursorA", 2, load_cursor_a);
     reg.register(load_cursor_w_ABI);

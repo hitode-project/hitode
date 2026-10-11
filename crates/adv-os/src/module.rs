@@ -559,11 +559,20 @@ impl Modules {
         for (offset, head_offset) in [(0, 0x0c), (8, 0x14)] {
             let node = entry + offset;
             let head = self.ldr + head_offset;
-            let tail = cpu.read_u32(head + 4)?;
-            cpu.write_u32(node, head)?;
-            cpu.write_u32(node + 4, tail)?;
-            cpu.write_u32(tail, node)?;
-            cpu.write_u32(head + 4, node)?;
+            // Native infrastructure follows the executable before ordinary
+            // DLLs in both lists, even when mapped after their static imports.
+            let previous = if m.kind == ModuleKind::Host && m.name == "ntdll.dll" {
+                self.iter()
+                    .find(|(_, image)| !image.is_dll && image.ldr_entry != 0)
+                    .map_or(head, |(_, image)| image.ldr_entry + offset)
+            } else {
+                cpu.read_u32(head + 4)?
+            };
+            let next = cpu.read_u32(previous)?;
+            cpu.write_u32(node, next)?;
+            cpu.write_u32(node + 4, previous)?;
+            cpu.write_u32(previous, node)?;
+            cpu.write_u32(next + 4, node)?;
         }
         Ok(())
     }

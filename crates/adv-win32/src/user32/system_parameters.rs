@@ -26,6 +26,16 @@ fn fail(env: &mut Env<'_>, error: u32) -> i32 {
     0
 }
 fn parameters(env: &mut Env<'_>, action: u32, parameter: u32, output: u32, wide: bool) -> i32 {
+    match action {
+        0x1d => user_mut(env).double_click.width = parameter,
+        0x1e => user_mut(env).double_click.height = parameter,
+        0x20 => user_mut(env).double_click.set_time(parameter),
+        0x21 => user_mut(env).swap_buttons = parameter != 0,
+        _ => {}
+    }
+    if matches!(action, 0x1d | 0x1e | 0x20 | 0x21) {
+        return 1;
+    }
     if action != 0x1f {
         return fail(env, 120);
     }

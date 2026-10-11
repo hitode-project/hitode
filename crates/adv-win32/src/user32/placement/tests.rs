@@ -5,6 +5,134 @@ use adv_cpu::{
 };
 use adv_machine::{Clock, Machine};
 
+fn finish(machine: &mut Machine<JitCpu>, mut outcome: Outcome, messages: &mut Vec<u32>) -> u32 {
+    for _ in 0..64 {
+        match outcome {
+            Outcome::Return(value) => return value,
+            Outcome::Call { args, then, .. } => {
+                messages.push(args[1]);
+                outcome = then(&mut env(machine), adv_machine::Resume::Returned(0));
+            }
+            _ => panic!("same-thread placement must not suspend"),
+        }
+    }
+    panic!("unbounded placement callbacks");
+}
+fn input(machine: &mut Machine<JitCpu>, memory: u32, fields: [i32; 11]) {
+    for (i, field) in fields.iter().enumerate() {
+        machine
+            .cpu
+            .write_u32(memory + i as u32 * 4, *field as u32)
+            .unwrap();
+    }
+}
+
+#[test]
+fn setter_reads_only_a_complete_structure_and_routes_geometry_through_user_callbacks() {
+    let (mut m, memory, hwnd) = fixture();
+    let fields = [44, 8, 4, 10, 20, 30, 40, 250, 270, 710, 630];
+    input(&mut m, memory, fields);
+    m.cpu.write_u32(memory + 44, 0xcccccccc).unwrap();
+    m.cpu.protect(memory, 4096, Prot::READ).unwrap();
+    let mut messages = Vec::new();
+    let outcome = set_window_placement(&mut env(&mut m), Handle(hwnd), GuestPtr::new(memory));
+    assert_eq!(finish(&mut m, outcome, &mut messages), 1);
+    assert!(messages.contains(&0x46) && messages.contains(&0x47));
+    assert_eq!(
+        snapshot(&mut m, memory + 4096, hwnd),
+        [44, 0, 1, 10, 20, -1, -1, 250, 270, 710, 630]
+    );
+    assert_eq!(m.cpu.read_u32(memory + 44).unwrap(), 0xcccccccc);
+    for (i, value) in fields.iter().enumerate() {
+        assert_eq!(
+            m.cpu.read_u32(memory + i as u32 * 4).unwrap(),
+            *value as u32
+        );
+    }
+}
+
+#[test]
+fn setter_pairs_minimize_maximize_restore_and_explicit_minimum_positions() {
+    let (mut m, memory, hwnd) = fixture();
+    let mut messages = Vec::new();
+    for (flags, show, expected) in [(0, 3, [2, 3]), (2, 2, [2, 2]), (0, 9, [0, 1])] {
+        input(
+            &mut m,
+            memory,
+            [44, flags, show, 10, 20, -1, -1, 250, 270, 710, 630],
+        );
+        let outcome = set_window_placement(&mut env(&mut m), Handle(hwnd), GuestPtr::new(memory));
+        assert_eq!(finish(&mut m, outcome, &mut messages), 1);
+        let actual = snapshot(&mut m, memory + 4096, hwnd);
+        assert_eq!(actual[1..3], expected);
+        assert_eq!(actual[7..], [250, 270, 710, 630]);
+    }
+    m.ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut m.sys.objects, &hwnd)
+        .unwrap()
+        .ex_style = 0x80;
+    input(
+        &mut m,
+        memory,
+        [44, 1, 7, 10, 20, -1, -1, 250, 270, 710, 630],
+    );
+    let outcome = set_window_placement(&mut env(&mut m), Handle(hwnd), GuestPtr::new(memory));
+    assert_eq!(finish(&mut m, outcome, &mut messages), 1);
+    assert_eq!(snapshot(&mut m, memory + 4096, hwnd)[1..5], [0, 2, 10, 20]);
+}
+
+#[test]
+fn setter_recovers_offscreen_normal_windows_but_preserves_tool_coordinates() {
+    for (tool, expected) in [
+        (false, [1460, 680, 1920, 1040]),
+        (true, [30000, 30000, 30460, 30360]),
+    ] {
+        let (mut m, memory, hwnd) = fixture();
+        m.ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut m.sys.objects, &hwnd)
+            .unwrap()
+            .ex_style = if tool { 0x80 } else { 0 };
+        input(
+            &mut m,
+            memory,
+            [44, 0, 4, -1, -1, -1, -1, 30000, 30000, 30460, 30360],
+        );
+        let outcome = set_window_placement(&mut env(&mut m), Handle(hwnd), GuestPtr::new(memory));
+        assert_eq!(finish(&mut m, outcome, &mut Vec::new()), 1);
+        assert_eq!(snapshot(&mut m, memory + 4096, hwnd)[7..], expected);
+    }
+}
+
+#[test]
+fn setter_rejects_bad_lengths_and_unreadable_input_without_changing_window() {
+    let (mut m, memory, hwnd) = fixture();
+    let original = snapshot(&mut m, memory + 4096, hwnd);
+    for length in [0, 1, 43, 45, 60, -1] {
+        input(
+            &mut m,
+            memory,
+            [length, 0, 4, 10, 20, -1, -1, 250, 270, 710, 630],
+        );
+        let outcome = set_window_placement(&mut env(&mut m), Handle(hwnd), GuestPtr::new(memory));
+        assert_eq!(finish(&mut m, outcome, &mut Vec::new()), 0);
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+        assert_eq!(snapshot(&mut m, memory + 4096, hwnd), original);
+    }
+    for (target, pointer, error) in [(0, 0, 1400), (hwnd, 0, 998), (hwnd, u32::MAX - 20, 998)] {
+        let outcome =
+            set_window_placement(&mut env(&mut m), Handle(target), GuestPtr::new(pointer));
+        assert_eq!(finish(&mut m, outcome, &mut Vec::new()), 0);
+        assert_eq!(crate::util::last_error(&env(&mut m)), error);
+        assert_eq!(snapshot(&mut m, memory + 4096, hwnd), original);
+    }
+}
+
 fn fixture() -> (Machine<JitCpu>, u32, u32) {
     let mut registry = Registry::default();
     crate::register(&mut registry);

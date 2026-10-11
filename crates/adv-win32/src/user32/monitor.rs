@@ -4,6 +4,7 @@ use adv_abi::{Env, GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::Prot;
 
 mod enumeration;
+mod settings;
 
 const PRIMARY_DEVICE_NAME: &str = r"\\.\DISPLAY1";
 
@@ -11,6 +12,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(info_a_ABI);
     registry.register(info_w_ABI);
     enumeration::register(registry);
+    settings::register(registry);
 }
 fn fail(env: &mut Env<'_>, error: u32) -> i32 {
     crate::util::set_last_error(env, error);

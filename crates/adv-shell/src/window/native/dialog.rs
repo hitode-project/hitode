@@ -936,6 +936,7 @@ mod tests {
                 ..Default::default()
             },
             items: Vec::new(),
+            popup: None,
         };
         window.set_menu_bar(&bar).unwrap();
         window.set_dialogs(&set).unwrap();

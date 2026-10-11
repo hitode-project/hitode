@@ -12,13 +12,13 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
-pub(super) const CODE: u32 = 0x400000;
-pub(super) const DATA: u32 = 0x410000;
-pub(super) struct Fixture {
+pub(crate) const CODE: u32 = 0x400000;
+pub(crate) const DATA: u32 = 0x410000;
+pub(crate) struct Fixture {
     pub m: Machine<JitCpu>,
     pub root: PathBuf,
 }
-pub(super) fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
+pub(crate) fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
         context: m.sys.current,
         cpu: &mut m.cpu,

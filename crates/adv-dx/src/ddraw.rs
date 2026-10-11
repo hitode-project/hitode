@@ -220,6 +220,7 @@ enum Kind {
 struct ComState {
     kind: Kind,
     initialized: bool,
+    focus_window: u32,
     old: u32,
     modern: u32,
     legacy_descriptors: Vec<u32>,
@@ -401,6 +402,7 @@ impl DirectDraw {
         let value = ComState {
             kind,
             initialized: true,
+            focus_window: 0,
             old,
             modern,
             legacy_descriptors: if matches!(kind, Kind::Clipper) {
@@ -658,7 +660,19 @@ impl DirectDraw {
             api::ADDREF => com.add_ref::<ComState>(objects, a[0]).unwrap_or(0),
             api::RELEASE => self.release_com(objects, surfaces, a[0]),
             api::COOPERATIVE => {
-                if matches!(kind, Kind::Device) && (a[2] == 8 || a[2] & 0x11 == 0x11) {
+                if !matches!(kind, Kind::Device) {
+                    return Ok(INVALID);
+                }
+                if a[2] == 0x80 {
+                    // DDSCL_SETFOCUSWINDOW selects the shared device's HWND;
+                    // it does not switch display modes or activate a host UI.
+                    if a[1] == 0 {
+                        return Ok(INVALID);
+                    }
+                    com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
+                    0
+                } else if a[2] == 8 || a[2] & 0x11 == 0x11 {
+                    com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
                     0
                 } else {
                     UNSUPPORTED
@@ -689,6 +703,9 @@ impl DirectDraw {
                     return Ok(INVALID);
                 }
                 self.clipper_windows.insert(a[0], a[2]);
+                if a[2] == 0 {
+                    self.clipper_origins.remove(&a[0]);
+                }
                 0
             }
             api::CLIPPER_GET_HWND => {
@@ -872,7 +889,7 @@ impl DirectDraw {
                 if !matches!(len, 108 | 124) || a[4] != 0 {
                     return Ok(INVALID);
                 }
-                if a[3] & !(0x11 | 0x800 | 0x2000 | 0x4000) != 0 {
+                if a[3] & !(0x31 | 0x800 | 0x2000 | 0x4000) != 0 {
                     return Ok(UNSUPPORTED);
                 }
                 if surfaces[sid].locked.is_some() {

@@ -139,22 +139,47 @@ fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcom
 }
 fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let provider = env.ext.get::<State>().provider;
-    let hwnd = match id {
-        api::COOPERATIVE if words[2] == 8 => Some(words[1]),
-        api::CLIPPER_SET_HWND => Some(words[2]),
+    if id == api::COOPERATIVE
+        && words[2] == 0x80
+        && (provider.window)(env.ext, &env.sys.objects, words[1]).is_none()
+    {
+        return Outcome::Return(INVALID);
+    }
+    let binding = match id {
+        api::COOPERATIVE if words[2] == 8 => Some((words[1], None)),
+        api::CLIPPER_SET_HWND => Some((words[2], Some(words[0]))),
+        api::BLT => {
+            let state = env.ext.get::<State>();
+            let primary = env.ext.get::<SurfaceStore>().primary_id();
+            state
+                .draw
+                .surface_id(&env.sys.objects, words[0])
+                .filter(|&sid| Some(sid) == primary)
+                .and_then(|sid| state.draw.surface_clippers.get(&sid))
+                .and_then(|clipper| {
+                    state
+                        .draw
+                        .clipper_windows
+                        .get(clipper)
+                        .filter(|&&hwnd| hwnd != 0)
+                        .map(|&hwnd| (hwnd, Some(*clipper)))
+                })
+        }
         _ => None,
     };
-    let geometry = hwnd.and_then(|window| (provider.window)(env.ext, &env.sys.objects, window));
+    let geometry = binding.and_then(|(window, clipper)| {
+        (provider.window)(env.ext, &env.sys.objects, window).map(|geometry| (geometry, clipper))
+    });
     let (result, presented, changed) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
-        if let Some(geometry) = geometry {
+        if let Some((geometry, clipper)) = geometry {
             if let Err(error) = store.configure_window(geometry.width, geometry.height, &mut memory)
             {
                 return Outcome::Fail(format!("DirectDraw window: {error}"));
             }
-            if id == api::CLIPPER_SET_HWND {
-                state.draw.configure_clipper(words[0], geometry.origin);
+            if let Some(clipper) = clipper {
+                state.draw.configure_clipper(clipper, geometry.origin);
             }
         }
         let before = store.stats.presentations;

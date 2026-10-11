@@ -807,6 +807,73 @@ fn native_initialization_list_precedes_other_dlls_and_keeps_both_link_directions
     assert_eq!(m.cpu.read_u32(second + 4).unwrap(), first);
     assert_eq!(m.cpu.read_u32(second).unwrap(), head);
     assert_eq!(m.cpu.read_u32(head + 4).unwrap(), second);
+    for (offset, head_offset) in [(0, 0x0c), (8, 0x14)] {
+        let head = ldr + head_offset;
+        let first = adv_os::modules(&m.ext).get(native).ldr_entry + offset;
+        let second = adv_os::modules(&m.ext).get(prior).ldr_entry + offset;
+        assert_eq!(m.cpu.read_u32(head).unwrap(), first);
+        assert_eq!(m.cpu.read_u32(first + 4).unwrap(), head);
+        assert_eq!(m.cpu.read_u32(first).unwrap(), second);
+        assert_eq!(m.cpu.read_u32(second + 4).unwrap(), first);
+        assert_eq!(m.cpu.read_u32(second).unwrap(), head);
+        assert_eq!(m.cpu.read_u32(head + 4).unwrap(), second);
+    }
+}
+
+#[test]
+fn late_native_image_follows_executable_without_replacing_existing_loader_records() {
+    struct Files;
+    impl FileSource for Files {
+        fn read(&self, path: &str) -> Option<Vec<u8>> {
+            if path != "app.exe" {
+                return None;
+            }
+            let mut bytes = adv_os::synthetic::build(0x400000, path, &[]).unwrap().bytes;
+            bytes[0x97] &= !0x20;
+            Some(bytes)
+        }
+    }
+    for jit in [false, true] {
+        let mut m = machine(jit);
+        let exe = m.load(&Files, "app.exe").unwrap();
+        let kernel = m.load(&Files, "kernel32.dll").unwrap();
+        let prior = m.load(&Files, "comctl32.dll").unwrap();
+        let stable: Vec<_> = [exe, kernel, prior]
+            .map(|id| adv_os::modules(&m.ext).get(id).ldr_entry)
+            .into();
+        let native = m.load(&Files, "ntdll.dll").unwrap();
+        let later = m.load(&Files, "user32.dll").unwrap();
+        let ldr = m
+            .cpu
+            .read_u32(adv_machine::layout::PEB_ADDR + 0x0c)
+            .unwrap();
+        for (offset, head_offset) in [(0, 0x0c), (8, 0x14)] {
+            let head = ldr + head_offset;
+            let mut previous = head;
+            for id in [exe, native, kernel, prior, later] {
+                let node = adv_os::modules(&m.ext).get(id).ldr_entry + offset;
+                assert_eq!(m.cpu.read_u32(previous).unwrap(), node);
+                assert_eq!(m.cpu.read_u32(node + 4).unwrap(), previous);
+                previous = node;
+            }
+            assert_eq!(m.cpu.read_u32(previous).unwrap(), head);
+            assert_eq!(m.cpu.read_u32(head + 4).unwrap(), previous);
+        }
+        assert_eq!(m.load(&Files, "ntdll.dll").unwrap(), native);
+        assert_eq!(adv_os::modules(&m.ext).get(native).load_count, 2);
+        for (id, address) in [exe, kernel, prior].into_iter().zip(stable) {
+            assert_eq!(adv_os::modules(&m.ext).get(id).ldr_entry, address);
+        }
+        adv_os::modules_mut(&mut m.ext)
+            .retire(&mut m.cpu, prior)
+            .unwrap();
+        for offset in [0, 8] {
+            let before = adv_os::modules(&m.ext).get(kernel).ldr_entry + offset;
+            let after = adv_os::modules(&m.ext).get(later).ldr_entry + offset;
+            assert_eq!(m.cpu.read_u32(before).unwrap(), after);
+            assert_eq!(m.cpu.read_u32(after + 4).unwrap(), before);
+        }
+    }
 }
 
 #[test]
