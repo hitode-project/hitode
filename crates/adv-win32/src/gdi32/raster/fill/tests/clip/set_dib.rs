@@ -224,3 +224,311 @@ fn true_colour_palette_flag_creates_and_uploads_real_pixels_through_both_dib_api
         assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
     }
 }
+
+#[test]
+fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_storage() {
+    for bpp in [1u32, 4, 8] {
+        let (mut m, data, dc, _) = fixture(9, 2, PixelFormat::Bgra32, false);
+        let info = data + 1024;
+        let output = data + 2200;
+        let readback = data + 2300;
+        let header = [40u32, 9, (-2i32) as u32, (bpp << 16) | 1, 0, 0, 0, 0, 0, 0];
+        m.cpu
+            .write(
+                info,
+                &header
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let indices: Vec<_> = (0..1u16 << bpp).flat_map(u16::to_le_bytes).collect();
+        m.cpu.write(info + 40, &indices).unwrap();
+        let bitmap = call(
+            &mut m,
+            data,
+            "gdi32.dll!CreateDIBSection",
+            &[dc, info, 1, output, 0, 0],
+        );
+        assert_ne!(bitmap, 0);
+        let pixels = m.cpu.read_u32(output).unwrap();
+        let surface = m.ext.get::<SurfaceStore>().get(bitmap).unwrap().clone();
+        assert_eq!(surface.format.bits(), bpp);
+        assert_eq!(surface.pitch, ((9 * bpp + 31) / 32) * 4);
+        let old = call(&mut m, data, "gdi32.dll!SelectObject", &[dc, bitmap]);
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!GetDIBColorTable",
+                &[dc, 0, 1 << bpp, readback]
+            ),
+            1 << bpp
+        );
+        let mut second = [0; 4];
+        m.cpu.read(readback + 4, &mut second).unwrap();
+        assert_eq!(second, [0, 0, 128, 0]);
+        // Change the selected DIB's real table, independently of its creation palette.
+        m.cpu
+            .write(readback, &[0, 0, 0, 0, 255, 255, 255, 0])
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!SetDIBColorTable",
+                &[dc, 0, 2, readback]
+            ),
+            2
+        );
+        m.cpu
+            .write(pixels, &vec![0xa5; surface.pitch as usize * 2])
+            .unwrap();
+        assert_ne!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!IntersectClipRect",
+                &[dc, 2, 0, 7, 1]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!PatBlt",
+                &[dc, 0, 0, 9, 2, 0xff0062]
+            ),
+            1
+        );
+        let row = surface
+            .read_pixels(&memory(&mut m.cpu), 0, 0, 9)
+            .unwrap()
+            .into_owned();
+        assert!(row[2..7].iter().all(|&i| u32::from(i) == (1 << bpp) - 1));
+        let untouched = surface
+            .read_pixels(&memory(&mut m.cpu), 0, 1, 9)
+            .unwrap()
+            .into_owned();
+        assert_eq!(&row[..2], &untouched[..2]);
+        assert_eq!(&row[7..], &untouched[7..]);
+        call(&mut m, data, "gdi32.dll!SelectObject", &[dc, old]);
+        // Read back packed storage, with a bounded RGBQUAD description.
+        m.cpu.write(readback, &[0; 128]).unwrap();
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!GetDIBits",
+                &[dc, bitmap, 0, 2, readback, info, 0]
+            ),
+            2
+        );
+        let mut actual = vec![0; surface.pitch as usize * 2];
+        m.cpu.read(readback, &mut actual).unwrap();
+        let mut original = vec![0; surface.pitch as usize * 2];
+        m.cpu.read(pixels, &mut original).unwrap();
+        if !(9 * bpp).is_multiple_of(8) {
+            for y in 0..2 {
+                original[y * surface.pitch as usize + ((9 * bpp + 7) / 8) as usize - 1] &=
+                    255 << (8 - (9 * bpp) % 8);
+            }
+        }
+        // Padding is not part of the returned pixel range.
+        let bytes = ((9 * bpp + 7) / 8) as usize;
+        for y in 0..2 {
+            assert_eq!(
+                &actual[y * surface.pitch as usize..y * surface.pitch as usize + bytes],
+                &original[y * surface.pitch as usize..y * surface.pitch as usize + bytes]
+            );
+        }
+        // Both outputs remain untouched when the packed row output crosses
+        // a protected second page, even though its header is writable.
+        m.cpu
+            .write(
+                info,
+                &header
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let guard_output = m.sys.vm.alloc(&mut m.cpu, 8192, Prot::RW).unwrap();
+        m.cpu.write(guard_output + 4092, &[0xa5; 24]).unwrap();
+        m.cpu
+            .protect(guard_output + 4096, 4096, Prot::READ)
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!GetDIBits",
+                &[dc, bitmap, 0, 2, guard_output + 4092, info, 0]
+            ),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+        let mut actual_header = [0; 40];
+        m.cpu.read(info, &mut actual_header).unwrap();
+        assert_eq!(
+            actual_header.as_slice(),
+            header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        let mut guard = [0; 24];
+        m.cpu.read(guard_output + 4092, &mut guard).unwrap();
+        assert_eq!(guard, [0xa5; 24]);
+        assert_eq!(call(&mut m, data, "gdi32.dll!DeleteObject", &[bitmap]), 1);
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn indexed_readback_matches_native_palette_mapping_queries_and_partial_bytes() {
+    use windows_sys::Win32::Graphics::Gdi as gdi;
+    for bpp in [1u32, 4, 8] {
+        for custom in [false, true] {
+            let (mut m, data, dc, _) = fixture(9, 2, PixelFormat::Bgra32, false);
+            let info = data + 1024;
+            let output = data + 2200;
+            let readback = data + 2300;
+            let mut initial = [0u32; 266];
+            initial[..10].copy_from_slice(&[
+                40,
+                9,
+                (-2i32) as u32,
+                (bpp << 16) | 1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            let logical = super::super::super::super::super::palette::dc_entries(&env(&mut m), dc);
+            for i in 0..1usize << bpp {
+                let color = if custom {
+                    let value = 255 - i as u8;
+                    [value, value, value, 0]
+                } else {
+                    let color = logical[i % logical.len()];
+                    [color[2], color[1], color[0], 0]
+                };
+                initial[10 + i] = u32::from_le_bytes(color);
+            }
+            let encoded: Vec<_> = initial.into_iter().flat_map(u32::to_le_bytes).collect();
+            m.cpu.write(info, &encoded).unwrap();
+            let bitmap = call(
+                &mut m,
+                data,
+                "gdi32.dll!CreateDIBSection",
+                &[dc, info, 0, output, 0, 0],
+            );
+            assert_ne!(bitmap, 0);
+            let pitch = ((9 * bpp + 31) / 32) * 4;
+            m.cpu
+                .write(
+                    m.cpu.read_u32(output).unwrap(),
+                    &vec![0xa5; (pitch * 2) as usize],
+                )
+                .unwrap();
+            // SAFETY: both native handles and all counted storage are owned here;
+            // no desktop/window DC is obtained or modified.
+            let native_dc = unsafe { gdi::CreateCompatibleDC(core::ptr::null_mut()) };
+            let mut pointer = core::ptr::null_mut();
+            let native = unsafe {
+                gdi::CreateDIBSection(
+                    native_dc,
+                    initial.as_ptr().cast(),
+                    0,
+                    &mut pointer,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(!native.is_null() && !pointer.is_null());
+            unsafe { core::ptr::write_bytes(pointer, 0xa5, (pitch * 2) as usize) };
+            for usage in [0, 1] {
+                for (attributes, height, start, count) in
+                    [(true, -2, 0, 0), (false, -2, 0, 2), (false, 2, 1, 1)]
+                {
+                    let mut description = [0xccccccccu32; 266];
+                    description[..10].copy_from_slice(&initial[..10]);
+                    description[2] = height as u32;
+                    if attributes {
+                        description[3] = 1;
+                    }
+                    m.cpu
+                        .write(
+                            info,
+                            &description
+                                .into_iter()
+                                .flat_map(u32::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap();
+                    m.cpu.write(readback, &[0xa5; 128]).unwrap();
+                    let mut expected = [0xa5; 128];
+                    let result = unsafe {
+                        gdi::GetDIBits(
+                            native_dc,
+                            native,
+                            start,
+                            count,
+                            if attributes {
+                                core::ptr::null_mut()
+                            } else {
+                                expected.as_mut_ptr().cast()
+                            },
+                            description.as_mut_ptr().cast(),
+                            usage,
+                        )
+                    };
+                    assert_eq!(
+                        call(
+                            &mut m,
+                            data,
+                            "gdi32.dll!GetDIBits",
+                            &[
+                                dc,
+                                bitmap,
+                                start,
+                                count,
+                                if attributes { 0 } else { readback },
+                                info,
+                                usage
+                            ],
+                        ),
+                        result as u32,
+                    );
+                    let mut actual = [0; 128];
+                    m.cpu.read(readback, &mut actual).unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "pixels bpp={bpp} custom={custom} usage={usage} attributes={attributes}"
+                    );
+                    let mut actual = vec![0; 1064];
+                    m.cpu.read(info, &mut actual).unwrap();
+                    let expected: Vec<_> =
+                        description.into_iter().flat_map(u32::to_le_bytes).collect();
+                    let differences: Vec<_> = actual
+                        .iter()
+                        .zip(&expected)
+                        .enumerate()
+                        .filter(|(_, (a, b))| a != b)
+                        .collect();
+                    assert!(
+                        differences.is_empty(),
+                        "description bpp={bpp} custom={custom} usage={usage} attributes={attributes}: {differences:?}"
+                    );
+                }
+            }
+            assert_eq!(unsafe { gdi::DeleteObject(native) }, 1);
+            assert_eq!(unsafe { gdi::DeleteDC(native_dc) }, 1);
+            assert_eq!(call(&mut m, data, "gdi32.dll!DeleteObject", &[bitmap]), 1);
+        }
+    }
+}

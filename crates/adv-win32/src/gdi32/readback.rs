@@ -9,7 +9,7 @@ fn unsupported(env: &mut Env<'_>) -> Outcome {
     adv_abi::warn_unavailable(
         env,
         "GetDIBits",
-        "only same-size 24/32-bit RGB or standard 32-bit BITFIELDS are supported",
+        "only same-depth indexed or same-size 24/32-bit RGB and standard 32-bit BITFIELDS are supported",
     );
     fail(env, 50)
 }
@@ -53,6 +53,17 @@ fn get_bits(
     }
     if usage > 1 {
         return fail(env, 87);
+    }
+    if matches!(source_bpp, 1 | 4 | 8) {
+        return indexed::read(
+            env,
+            dc.0,
+            bitmap.0,
+            start,
+            count,
+            output.addr(),
+            info.addr(),
+        );
     }
     if !matches!(source_bpp, 24 | 32) {
         return unsupported(env);
@@ -198,5 +209,6 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(get_bits_ABI);
 }
 
+mod indexed;
 #[cfg(test)]
 mod tests;

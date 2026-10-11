@@ -396,3 +396,69 @@ fn indexed_text_preserves_gray_antialiasing_clip_and_unchanged_duplicate_indices
         );
     }
 }
+
+#[test]
+fn packed_text_quantizes_into_actual_bits_and_keeps_clipped_edges_and_padding() {
+    let request = font(3);
+    let paint = Paint {
+        input: TextInput::Encoded(b"AW"),
+        origin: Point { x: 3, y: 2 },
+        horizontal: Horizontal::Left,
+        vertical: Vertical::Top,
+        foreground: [255; 3],
+        background: [0; 3],
+        opaque_background: false,
+        clip: Some(TextBox {
+            left: 3,
+            top: 2,
+            right: 35,
+            bottom: 23,
+        }),
+        fill: None,
+    };
+    for format in [PixelFormat::Indexed1, PixelFormat::Indexed4] {
+        for bottom_up in [false, true] {
+            let mut memory = Memory(vec![0; 65536]);
+            let mut store = Surfaces::new(41, 25, 16, 60000, Snapshot::default()).unwrap();
+            let id = store
+                .create(41, 25, bottom_up, format, &mut memory)
+                .unwrap();
+            let palette: Vec<_> = (0..format.colors())
+                .map(|i| {
+                    let v = (i * 255 / (format.colors() - 1)) as u8;
+                    [v, v, v, 0]
+                })
+                .collect();
+            store.set_palette(id, 0, &palette).unwrap();
+            let surface = store.get(id).unwrap().clone();
+            for y in 0..25 {
+                let at = surface.row(0, y) as usize;
+                memory.0[at + format.row_bytes(41) as usize..at + surface.pitch as usize]
+                    .fill(0xa5);
+            }
+            let mut text = Text::default();
+            assert!(
+                store
+                    .draw_text(id, &mut memory, &mut text, &request, paint)
+                    .unwrap()
+            );
+            let mut ink = 0;
+            for y in 0..25 {
+                let indices = surface.read_pixels(&memory, 0, y, 41).unwrap();
+                for (x, &index) in indices.iter().enumerate() {
+                    if !(3..35).contains(&x) || !(2..23).contains(&y) {
+                        assert_eq!(index, 0);
+                    }
+                    ink += usize::from(index != 0);
+                }
+                let at = surface.row(0, y) as usize;
+                assert!(
+                    memory.0[at + format.row_bytes(41) as usize..at + surface.pitch as usize]
+                        .iter()
+                        .all(|&b| b == 0xa5)
+                );
+            }
+            assert!(ink > 0);
+        }
+    }
+}

@@ -25,7 +25,13 @@ fn set_dibits_to_device(
         return fail(env, 6);
     }
     let provider = provider(env.ext).unwrap();
-    let decoded = match super::super::dib::read(&(provider.memory)(env.cpu), info.addr(), usage) {
+    let logical = super::super::super::palette::dc_entries(env, dc.0);
+    let decoded = match super::super::dib::read(
+        &(provider.memory)(env.cpu),
+        info.addr(),
+        usage,
+        Some(&logical),
+    ) {
         Ok(Some(dib)) => dib,
         _ => return fail(env, 87),
     };

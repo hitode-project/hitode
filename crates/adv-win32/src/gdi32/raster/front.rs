@@ -564,12 +564,19 @@ fn create_dib(
     {
         return fail(env, 87);
     }
-    if header[14..16] == 8u16.to_le_bytes() {
+    let bpp = u16::from_le_bytes(header[14..16].try_into().unwrap());
+    if matches!(bpp, 1 | 4 | 8) {
         let used = u32::from_le_bytes(header[32..36].try_into().unwrap());
-        let count = if used == 0 { 256 } else { used };
-        if count > 256
-            || adv_abi::guest::check_range(env.cpu, info.addr(), 40 + count * 4, Prot::READ)
-                .is_err()
+        let count = if used == 0 { 1u32 << bpp } else { used };
+        let entry_bytes = if usage == 1 { 2 } else { 4 };
+        if count > (1u32 << bpp)
+            || adv_abi::guest::check_range(
+                env.cpu,
+                info.addr(),
+                40 + count * entry_bytes,
+                Prot::READ,
+            )
+            .is_err()
         {
             let _ = bits.write(env.cpu, 0);
             return fail(env, 87);
@@ -577,7 +584,13 @@ fn create_dib(
     }
     let _ = (dc, offset); // An unbacked DIB does not retain its creation DC.
     let provider = env.ext.get::<State>().provider.unwrap();
-    let decoded = match super::dib::read(&(provider.memory)(env.cpu), info.addr(), usage) {
+    let logical = super::super::palette::dc_entries(env, dc.0);
+    let decoded = match super::dib::read(
+        &(provider.memory)(env.cpu),
+        info.addr(),
+        usage,
+        Some(&logical),
+    ) {
         Ok(Some(dib)) => dib,
         _ => {
             let _ = bits.write(env.cpu, 0);
@@ -854,6 +867,7 @@ pub(crate) fn dib_transfer(
     if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err() {
         return fail(env, 87);
     }
+    let logical = super::super::palette::dc_entries(env, dst.0);
     raster_call_named(env, Some(api), |r, s, d, o, m| {
         r.stretch_dib(
             s,
@@ -873,6 +887,7 @@ pub(crate) fn dib_transfer(
             info.addr(),
             usage,
             rop,
+            Some(&logical),
         )
         .map(|value| {
             if boolean {

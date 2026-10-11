@@ -920,3 +920,180 @@ fn indexed_primary_resize_keeps_the_palette_and_overlapping_indices() {
     s.present(primary, &m).unwrap();
     assert_eq!(s.presenter.bgra, INDEXED_COLORS[0].repeat(6));
 }
+
+#[test]
+fn packed_fill_preserves_edge_bits_padding_and_rejects_late_row_faults_atomically() {
+    for (format, expected) in [
+        (PixelFormat::Indexed1, vec![0xbf, 0xa5, 0xa5, 0xa5]),
+        (
+            PixelFormat::Indexed4,
+            vec![0xa5, 0xff, 0xff, 0xf5, 0xa5, 0xa5, 0xa5, 0xa5],
+        ),
+    ] {
+        let mut memory = Memory::new(false);
+        let mut surfaces = store();
+        let id = surfaces.create(9, 2, true, format, &mut memory).unwrap();
+        let surface = surfaces[id].clone();
+        assert_eq!(surface.pitch, expected.len() as u32);
+        memory
+            .write(surface.pixels, &vec![0xa5; surface.pitch as usize * 2])
+            .unwrap();
+        surfaces
+            .fill_raw(
+                id,
+                Rect {
+                    x: 2,
+                    y: 0,
+                    w: 5,
+                    h: 1,
+                },
+                255,
+                &mut memory,
+            )
+            .unwrap();
+        assert_eq!(
+            memory
+                .read(surface.row(0, 0), surface.pitch as usize)
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert_eq!(
+            memory
+                .read(surface.row(0, 1), surface.pitch as usize)
+                .unwrap()
+                .as_ref(),
+            vec![0xa5; surface.pitch as usize]
+        );
+        let before = memory.bytes.clone();
+        memory.denied = Some((surface.row(2, 1), 1));
+        assert!(
+            surfaces
+                .fill_raw(
+                    id,
+                    Rect {
+                        x: 2,
+                        y: 0,
+                        w: 5,
+                        h: 2
+                    },
+                    0,
+                    &mut memory
+                )
+                .is_err()
+        );
+        assert_eq!(memory.bytes, before);
+    }
+}
+
+#[test]
+fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
+    for owned in [false, true] {
+        let mut memory = Memory::new(owned);
+        let mut surfaces = store();
+        let mono = surfaces
+            .create(9, 1, false, PixelFormat::Indexed1, &mut memory)
+            .unwrap();
+        memory
+            .write(surfaces[mono].pixels, &[0xaa, 0x80, 0xcc, 0xdd])
+            .unwrap();
+        surfaces
+            .copy(
+                mono,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                mono,
+                Rect {
+                    x: 1,
+                    y: 0,
+                    w: 8,
+                    h: 1,
+                },
+                &mut memory,
+            )
+            .unwrap();
+        assert_eq!(
+            memory.read(surfaces[mono].pixels, 4).unwrap().as_ref(),
+            [0xd5, 0, 0xcc, 0xdd]
+        );
+        let indexed = surfaces
+            .create(9, 1, false, PixelFormat::Indexed4, &mut memory)
+            .unwrap();
+        let colors: Vec<_> = (0..16).map(|i| [i, 0, 0, 0]).collect();
+        surfaces.set_palette(indexed, 0, &colors).unwrap();
+        memory
+            .write(
+                surfaces[indexed].pixels,
+                &[0x01, 0x23, 0x45, 0x67, 0x80, 0xcc, 0xdd, 0xee],
+            )
+            .unwrap();
+        let rgb = surfaces
+            .create(9, 1, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        surfaces
+            .blit(
+                indexed,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 9,
+                    h: 1,
+                },
+                rgb,
+                BlitRect {
+                    x: 0,
+                    y: 0,
+                    w: 9,
+                    h: 1,
+                },
+                BlitOptions {
+                    mirror_x: true,
+                    ..BlitOptions::default()
+                },
+                &mut memory,
+            )
+            .unwrap();
+        let row = memory.read(surfaces[rgb].pixels, 36).unwrap();
+        assert_eq!(
+            row.chunks_exact(4).map(|p| p[0]).collect::<Vec<_>>(),
+            [8, 7, 6, 5, 4, 3, 2, 1, 0]
+        );
+        surfaces
+            .copy(
+                rgb,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 9,
+                    h: 1,
+                },
+                indexed,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 9,
+                    h: 1,
+                },
+                &mut memory,
+            )
+            .unwrap();
+        assert_eq!(
+            memory.read(surfaces[indexed].pixels, 8).unwrap().as_ref(),
+            [0x87, 0x65, 0x43, 0x21, 0, 0xcc, 0xdd, 0xee]
+        );
+        surfaces.present(indexed, &memory).unwrap();
+        assert_eq!(
+            surfaces
+                .presenter
+                .bgra
+                .chunks_exact(4)
+                .map(|p| p[0])
+                .collect::<Vec<_>>(),
+            [8, 7, 6, 5, 4, 3, 2, 1, 0]
+        );
+    }
+}

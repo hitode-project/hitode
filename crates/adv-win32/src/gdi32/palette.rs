@@ -8,7 +8,7 @@ use super::{GDI32, GdiObj, add, get, get_mut, stock_object};
 use crate::stdcall;
 
 // Windows' immutable 20-entry DEFAULT_PALETTE, confirmed by native GDI.
-const DEFAULT: [[u8; 4]; 20] = [
+pub(super) const DEFAULT: [[u8; 4]; 20] = [
     [0, 0, 0, 0],
     [128, 0, 0, 0],
     [0, 128, 0, 0],
@@ -61,6 +61,13 @@ pub(super) fn entries<'a>(env: &'a Env<'_>, palette: u32) -> Option<&'a [[u8; 4]
         GdiObj::Palette { entries } => Some(entries),
         _ => None,
     }
+}
+pub(super) fn dc_entries(env: &Env<'_>, dc: u32) -> Vec<[u8; 4]> {
+    let palette = match get(env, dc) {
+        Some(GdiObj::Dc { palette, .. }) => *palette,
+        _ => stock_object(15),
+    };
+    entries(env, palette).unwrap_or(&DEFAULT).to_vec()
 }
 fn create(env: &mut Env<'_>) -> Outcome {
     let ptr = env.arg(0);

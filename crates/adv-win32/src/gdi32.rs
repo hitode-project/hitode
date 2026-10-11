@@ -859,7 +859,7 @@ fn set_di_bits(
                 } else {
                     -(surf.height as i32)
                 },
-                (surf.format.bytes() * 8) as u16,
+                surf.format.bits() as u16,
                 surf.pixels,
                 surf.pitch,
             )
@@ -886,7 +886,7 @@ fn set_di_bits(
         let dst_line_addr = dst_bits + dst_y * dst_pitch;
 
         if src_bpp == dst_bpp {
-            let row_len = (src_w * (src_bpp as u32) / 8).min(dst_pitch);
+            let row_len = (src_w * u32::from(src_bpp)).div_ceil(8).min(dst_pitch);
             let mut row = vec![0u8; row_len as usize];
             if env.cpu.read(src_line_addr, &mut row).is_ok() {
                 let _ = env.cpu.write(dst_line_addr, &row);

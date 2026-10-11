@@ -17,7 +17,9 @@ fn range(env: &Env<'_>, dc: u32, start: u32, count: u32) -> Option<(u32, usize)>
     };
     let bitmap = selected[3];
     let GdiObj::Bitmap {
-        bpp: 8, dib_colors, ..
+        bpp: 1 | 4 | 8,
+        dib_colors,
+        ..
     } = gdi.get(&env.sys.objects, bitmap)?
     else {
         return None;

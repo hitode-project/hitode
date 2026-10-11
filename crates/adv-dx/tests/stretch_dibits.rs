@@ -62,17 +62,17 @@ fn input(format: PixelFormat, bottom_up: bool) -> (Info, Vec<u8>) {
     info.header[0] = 40;
     info.header[1] = 4;
     info.header[2] = if bottom_up { 3 } else { (-3i32) as u32 };
-    info.header[3] = 1 | (format.bytes() * 8) << 16;
+    info.header[3] = 1 | format.bits() << 16;
     if format == PixelFormat::Rgb565 {
         info.header[4] = 3;
         info.colors[0] = 0xf800u32.to_le_bytes();
         info.colors[1] = 0x7e0u32.to_le_bytes();
         info.colors[2] = 0x1fu32.to_le_bytes();
     }
-    if format == PixelFormat::Indexed8 {
-        info.header[8] = 256;
+    if format.indexed() {
+        info.header[8] = format.colors() as u32;
     }
-    let pitch = (4 * format.bytes() + 3) & !3;
+    let pitch = (format.row_bytes(4) + 3) & !3;
     let mut bits = vec![0xa5; (pitch * 3) as usize];
     for y in 0..3 {
         for x in 0..4 {
@@ -91,21 +91,27 @@ fn input(format: PixelFormat, bottom_up: bool) -> (Info, Vec<u8>) {
                     0,
                 ]
             };
-            let index = (y * 4 + x) as usize;
-            info.colors[index] = if format == PixelFormat::Indexed8 {
+            let index = (y * 4 + x) as usize % format.colors().max(1);
+            info.colors[index] = if format.indexed() {
                 [color[0], color[1], color[2], 0x99]
             } else {
                 info.colors[index]
             };
-            let packed = if format == PixelFormat::Indexed8 {
+            let packed = if format.indexed() {
                 [index as u8, 0, 0, 0]
             } else {
                 format.encode(color)
             };
             let physical = if bottom_up { 2 - y } else { y };
-            let at = (physical * pitch + x * format.bytes()) as usize;
-            bits[at..at + format.bytes() as usize]
-                .copy_from_slice(&packed[..format.bytes() as usize]);
+            let at = (physical * pitch + format.byte_offset(x)) as usize;
+            if format.packed() {
+                let shift = 8 - format.bits() - (x * format.bits()) % 8;
+                let mask = ((1u16 << format.bits()) - 1) as u8;
+                bits[at] = (bits[at] & !(mask << shift)) | (packed[0] << shift);
+            } else {
+                bits[at..at + format.bytes() as usize]
+                    .copy_from_slice(&packed[..format.bytes() as usize]);
+            }
         }
     }
     (info, bits)
@@ -186,6 +192,7 @@ impl Fixture {
             INFO,
             0,
             COPY,
+            None,
         )
     }
 }
@@ -279,7 +286,7 @@ fn unsupported_rop_usage_and_outside_source_rectangles_fail_without_drawing() {
     assert_eq!(f.run([0, 0, 4, 3, -1, 0, 4, 3], &info, &bits).unwrap(), 0);
     assert_eq!(f.raster.last_error(), 87);
     assert_eq!(f.pixels(), before);
-    for (usage, rop) in [(0, 0x008800c6), (1, COPY)] {
+    for (usage, rop) in [(0, 0x008800c6), (2, COPY)] {
         assert_eq!(
             f.raster
                 .stretch_dib(
@@ -299,7 +306,8 @@ fn unsupported_rop_usage_and_outside_source_rectangles_fail_without_drawing() {
                     BITS,
                     INFO,
                     usage,
-                    rop
+                    rop,
+                    None,
                 )
                 .unwrap(),
             0
@@ -470,6 +478,8 @@ mod native {
                 .set_stretch_mode(&mut f.objects, WINDOW_DC, mode as u32)
                 .unwrap();
             for format in [
+                PixelFormat::Indexed1,
+                PixelFormat::Indexed4,
                 PixelFormat::Indexed8,
                 PixelFormat::Rgb555,
                 PixelFormat::Rgb565,

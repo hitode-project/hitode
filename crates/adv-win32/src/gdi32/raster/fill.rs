@@ -175,7 +175,6 @@ fn paint_rectangles(
     if rectangles.is_empty() {
         return Outcome::Return(1);
     }
-    let bytes = surface.format.bytes();
     {
         let mut raw = (provider.memory)(env.cpu);
         let memory = super::clip::ClippedMemory::new(&mut raw, surface.clone(), &clip);
@@ -190,14 +189,14 @@ fn paint_rectangles(
                 let Some(address) = row
                     .checked_mul(surface.pitch)
                     .and_then(|o| surface.pixels.checked_add(o))
-                    .and_then(|a| a.checked_add(r.x * bytes))
+                    .and_then(|a| a.checked_add(surface.format.byte_offset(r.x)))
                 else {
                     return fail(env, 87);
                 };
                 if adv_device::surface::SurfaceMemory::writable(
                     &memory,
                     address,
-                    (r.w * bytes) as usize,
+                    surface.span(r.x, r.w) as usize,
                 )
                 .is_err()
                 {
@@ -341,7 +340,7 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
     let Some(address) = row
         .checked_mul(surface.pitch)
         .and_then(|offset| surface.pixels.checked_add(offset))
-        .and_then(|address| address.checked_add(ux * bytes))
+        .and_then(|address| address.checked_add(surface.format.byte_offset(ux)))
     else {
         return Outcome::Return(CLR_INVALID);
     };
@@ -429,7 +428,7 @@ fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
         return Outcome::Return(CLR_INVALID);
     }
     let target = selected[3];
-    let Some(_provider) = super::front::provider(env.ext) else {
+    let Some(provider) = super::front::provider(env.ext) else {
         return Outcome::Return(CLR_INVALID);
     };
     let Some(store) = env.ext.try_get::<SurfaceStore>() else {
@@ -445,27 +444,21 @@ fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
         return Outcome::Return(CLR_INVALID);
     }
     let (ux, uy) = (x as u32, y as u32);
-    let row = if surface.bottom_up {
-        surface.height - uy - 1
-    } else {
-        uy
-    };
-    let bytes = surface.format.bytes();
-    let Some(address) = row
-        .checked_mul(surface.pitch)
-        .and_then(|offset| surface.pixels.checked_add(offset))
-        .and_then(|address| address.checked_add(ux * bytes))
-    else {
-        return Outcome::Return(CLR_INVALID);
-    };
-    if adv_abi::guest::check_range(env.cpu, address, bytes, Prot::READ).is_err() {
+    if adv_abi::guest::check_range(
+        env.cpu,
+        surface.row(ux, uy),
+        surface.span(ux, 1),
+        Prot::READ,
+    )
+    .is_err()
+    {
         return Outcome::Return(CLR_INVALID);
     }
-    let mut raw = [0u8; 4];
-    if env.cpu.read(address, &mut raw[..bytes as usize]).is_err() {
-        return Outcome::Return(CLR_INVALID);
-    }
-    let [b, g, r, _a] = surface.decode_pixel(&raw[..bytes as usize]);
+    let raw = match surface.read_pixels(&(provider.memory)(env.cpu), ux, uy, 1) {
+        Ok(raw) => raw.into_owned(),
+        Err(_) => return Outcome::Return(CLR_INVALID),
+    };
+    let [b, g, r, _a] = surface.decode_pixel(&raw);
     Outcome::Return((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
@@ -550,7 +543,6 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
     }
     let clip = super::clip::snapshot(env, dc.0);
     let surface = surface.clone();
-    let bytes = surface.format.bytes();
     for row_y in top..bottom {
         let row = if surface.bottom_up {
             surface.height - row_y - 1
@@ -560,17 +552,24 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
         let Some(address) = row
             .checked_mul(surface.pitch)
             .and_then(|offset| surface.pixels.checked_add(offset))
-            .and_then(|address| address.checked_add(left * bytes))
+            .and_then(|address| address.checked_add(surface.format.byte_offset(left)))
         else {
             return fail(env, 87);
         };
-        if adv_abi::guest::check_range(env.cpu, address, (right - left) * bytes, Prot::WRITE)
-            .is_err()
+        if adv_abi::guest::check_range(
+            env.cpu,
+            address,
+            surface.span(left, right - left),
+            Prot::WRITE,
+        )
+        .is_err()
         {
             return fail(env, 87);
         }
     }
     let value = match surface.format {
+        format if format.indexed() && rop == WHITENESS => (1 << format.bits()) - 1,
+        format if format.indexed() && rop == BLACKNESS => 0,
         PixelFormat::Rgb555 => {
             u32::from(rgb[0] >> 3) << 10 | u32::from(rgb[1] >> 3) << 5 | u32::from(rgb[2] >> 3)
         }

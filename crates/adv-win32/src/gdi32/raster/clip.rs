@@ -419,7 +419,6 @@ impl<'a> ClippedMemory<'a> {
         }
         let first = start.max(base);
         let last = end.min(limit);
-        let bytes = u64::from(surface.format.bytes());
         let pitch = u64::from(surface.pitch);
         let a = (first - base) / pitch;
         let z = (last - base).div_ceil(pitch);
@@ -431,8 +430,8 @@ impl<'a> ClippedMemory<'a> {
             };
             let rowbase = base + row * pitch;
             for (l, r) in clip.spans(y as i32, surface.width) {
-                let l = (rowbase + u64::from(l) * bytes).max(first);
-                let r = (rowbase + u64::from(r) * bytes).min(last);
+                let l = (rowbase + u64::from(surface.format.byte_offset(l))).max(first);
+                let r = (rowbase + u64::from(surface.format.row_bytes(r))).min(last);
                 if l < r {
                     f((l - start) as usize, (r - l) as usize)?;
                 }
@@ -454,6 +453,40 @@ impl SurfaceMemory for ClippedMemory<'_> {
         })
     }
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        if self.surface.format.packed() && !self.clip.is_default() {
+            let mut merged = self.memory.read(addr, data.len())?.into_owned();
+            let bits = self.surface.format.bits();
+            let slots = 8 / bits;
+            let base = u64::from(self.surface.pixels);
+            let limit = base + u64::from(self.surface.pitch) * u64::from(self.surface.height);
+            for (i, (&value, original)) in data.iter().zip(merged.iter_mut()).enumerate() {
+                let at = u64::from(addr) + i as u64;
+                let mask = if at < base || at >= limit {
+                    255
+                } else {
+                    let row = (at - base) / u64::from(self.surface.pitch);
+                    let y = if self.surface.bottom_up {
+                        u64::from(self.surface.height) - 1 - row
+                    } else {
+                        row
+                    };
+                    let first = ((at - base) % u64::from(self.surface.pitch)) as u32 * slots;
+                    let spans = self.clip.spans(y as i32, self.surface.width);
+                    let mut mask = 0;
+                    for slot in 0..slots {
+                        let x = first + slot;
+                        if spans.iter().any(|&(left, right)| left <= x && x < right) {
+                            mask |= (((1u16 << bits) - 1) as u8) << (8 - bits - slot * bits);
+                        }
+                    }
+                    mask
+                };
+                *original = (*original & !mask) | (value & mask);
+            }
+            return Self::visit(&self.surface, self.clip, addr, merged.len(), |o, n| {
+                self.memory.write(addr + o as u32, &merged[o..o + n])
+            });
+        }
         Self::visit(&self.surface, self.clip, addr, data.len(), |o, n| {
             self.memory.write(addr + o as u32, &data[o..o + n])
         })

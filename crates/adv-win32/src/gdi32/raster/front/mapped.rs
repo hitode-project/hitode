@@ -48,7 +48,7 @@ pub(super) fn create(
         } else {
             -(dib.height as i32)
         },
-        bpp: (dib.format.bytes() * 8) as u16,
+        bpp: dib.format.bits() as u16,
         bits: pixels,
         stride: dib.pitch,
         owned: false,

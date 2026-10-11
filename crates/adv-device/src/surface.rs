@@ -5,6 +5,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod packed;
+
 /// Memory needed by software surfaces. PAL guests with shared storage borrow pixels;
 /// other CPU backends can supply an owned buffer at this boundary.
 pub trait SurfaceMemory {
@@ -199,11 +201,13 @@ impl PendingFrame {
                 dst.copy_from_slice(&src[..dst.len()]);
             } else {
                 for (x, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    pixel.copy_from_slice(&decode_pixel(
-                        self.format,
-                        self.palette.as_deref(),
-                        &src[x * self.format.bytes() as usize..],
-                    ));
+                    let index = [self.format.index(src, x as u32)];
+                    let raw = if self.format.packed() {
+                        &index[..]
+                    } else {
+                        &src[x * self.format.bytes() as usize..]
+                    };
+                    pixel.copy_from_slice(&decode_pixel(self.format, self.palette.as_deref(), raw));
                 }
             }
         }
@@ -316,13 +320,16 @@ pub enum PixelFormat {
     Rgb565,
     Rgb555,
     Indexed8,
+    Indexed4,
+    Indexed1,
 }
 impl PixelFormat {
+    /// Storage unit; packed indexed formats use a byte containing several pixels.
     pub fn bytes(self) -> u32 {
         match self {
             Self::Bgra32 => 4,
             Self::Bgr24 => 3,
-            Self::Indexed8 => 1,
+            Self::Indexed8 | Self::Indexed4 | Self::Indexed1 => 1,
             _ => 2,
         }
     }
@@ -331,12 +338,12 @@ impl PixelFormat {
             Self::Bgra32 | Self::Bgr24 => (0xff0000, 0xff00, 0xff),
             Self::Rgb565 => (0xf800, 0x7e0, 0x1f),
             Self::Rgb555 => (0x7c00, 0x3e0, 0x1f),
-            Self::Indexed8 => (0, 0, 0),
+            Self::Indexed8 | Self::Indexed4 | Self::Indexed1 => (0, 0, 0),
         }
     }
     pub fn decode(self, p: &[u8]) -> [u8; 4] {
         assert!(
-            self != Self::Indexed8,
+            !self.indexed(),
             "indexed decoding requires a surface palette"
         );
         if self == Self::Bgra32 {
@@ -349,7 +356,9 @@ impl PixelFormat {
         let (r, g) = match self {
             Self::Rgb565 => ((v >> 11) & 31, ((v >> 5) & 63) * 255 / 63),
             Self::Rgb555 => ((v >> 10) & 31, ((v >> 5) & 31) * 255 / 31),
-            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 | Self::Indexed4 | Self::Indexed1 => {
+                unreachable!()
+            }
         };
         [
             ((v & 31) * 255 / 31) as u8,
@@ -361,7 +370,7 @@ impl PixelFormat {
     /// Packed pixel, padded to four bytes. Only the first `bytes()` bytes are stored.
     pub fn encode(self, p: [u8; 4]) -> [u8; 4] {
         assert!(
-            self != Self::Indexed8,
+            !self.indexed(),
             "indexed encoding requires a surface palette"
         );
         if matches!(self, Self::Bgra32 | Self::Bgr24) {
@@ -372,7 +381,9 @@ impl PixelFormat {
         let value = match self {
             Self::Rgb565 => r << 11 | (u16::from(p[1]) * 63 / 255) << 5 | b,
             Self::Rgb555 => r << 10 | (u16::from(p[1]) * 31 / 255) << 5 | b,
-            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 | Self::Indexed4 | Self::Indexed1 => {
+                unreachable!()
+            }
         };
         let [lo, hi] = value.to_le_bytes();
         [lo, hi, 0, 0]
@@ -382,7 +393,7 @@ impl PixelFormat {
 const BLACK_PALETTE: [[u8; 4]; 256] = [[0; 4]; 256];
 
 fn decode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, raw: &[u8]) -> [u8; 4] {
-    if format == PixelFormat::Indexed8 {
+    if format.indexed() {
         palette.unwrap_or(&BLACK_PALETTE)[raw[0] as usize]
     } else {
         format.decode(raw)
@@ -390,12 +401,15 @@ fn decode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, raw: &[u8
 }
 
 fn encode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, pixel: [u8; 4]) -> [u8; 4] {
-    if format != PixelFormat::Indexed8 {
+    if !format.indexed() {
         return format.encode(pixel);
     }
     let mut closest = 0;
     let mut distance = u32::MAX;
-    for (index, color) in palette.unwrap_or(&BLACK_PALETTE).iter().enumerate() {
+    for (index, color) in palette.unwrap_or(&BLACK_PALETTE)[..format.colors()]
+        .iter()
+        .enumerate()
+    {
         let current = (0..3)
             .map(|channel| {
                 let difference = i32::from(color[channel]) - i32::from(pixel[channel]);
@@ -796,7 +810,7 @@ impl Surface {
             } else {
                 y
             }) * self.pitch
-            + x * self.format.bytes()
+            + self.format.byte_offset(x)
     }
 }
 
@@ -1020,11 +1034,11 @@ impl<P: Presenter> Surfaces<P> {
             .surfaces
             .get_mut(&id)
             .ok_or("unknown palette surface")?;
-        if surface.format != PixelFormat::Indexed8 {
+        if !surface.format.indexed() {
             return Err("surface is not indexed".into());
         }
-        let start = start.min(256) as usize;
-        let count = entries.len().min(256 - start);
+        let start = start.min(surface.format.colors() as u32) as usize;
+        let count = entries.len().min(surface.format.colors() - start);
         if count != 0 {
             let table = surface
                 .palette
@@ -1037,11 +1051,11 @@ impl<P: Presenter> Surfaces<P> {
 
     pub fn palette_entries(&self, id: u32, start: u32, count: u32) -> Option<&[[u8; 4]]> {
         let surface = self.surfaces.get(&id)?;
-        if surface.format != PixelFormat::Indexed8 {
+        if !surface.format.indexed() {
             return None;
         }
-        let start = start.min(256) as usize;
-        let count = (count as usize).min(256 - start);
+        let start = start.min(surface.format.colors() as u32) as usize;
+        let count = (count as usize).min(surface.format.colors() - start);
         Some(&surface.palette.as_deref().unwrap_or(&BLACK_PALETTE)[start..start + count])
     }
 
@@ -1385,10 +1399,7 @@ impl<P: Presenter> Surfaces<P> {
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
         size(surface.width, surface.height)?;
-        let row = surface
-            .width
-            .checked_mul(surface.format.bytes())
-            .ok_or("surface overflow")?;
+        let row = surface.format.row_bytes(surface.width);
         let bytes = surface
             .pitch
             .checked_mul(surface.height)
@@ -1422,7 +1433,7 @@ impl<P: Presenter> Surfaces<P> {
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
         size(w, h)?;
-        let pitch = (w * format.bytes() + 3) & !3;
+        let pitch = (format.row_bytes(w) + 3) & !3;
         let bytes = pitch.checked_mul(h).ok_or("surface overflow")?;
         let p = self.arena.alloc(bytes, m)?;
         // Reused storage must not expose pixels from a previously deleted object.
@@ -1448,7 +1459,7 @@ impl<P: Presenter> Surfaces<P> {
                 locked: None,
                 version: 0,
                 format,
-                palette: (format == PixelFormat::Indexed8).then(|| Arc::new(BLACK_PALETTE)),
+                palette: format.indexed().then(|| Arc::new(BLACK_PALETTE)),
             },
         );
         Ok(id)
@@ -1805,7 +1816,7 @@ impl<P: Presenter> Surfaces<P> {
             h: (bottom - top) as u32,
         };
         let row = usize::try_from(bounds.w).unwrap() * surface.format.bytes() as usize;
-        let indexed = surface.format == PixelFormat::Indexed8;
+        let indexed = surface.format.indexed();
         let paint_format = if indexed {
             PixelFormat::Bgra32
         } else {
@@ -1831,8 +1842,8 @@ impl<P: Presenter> Surfaces<P> {
         let (bytes, original_indices) = self.text_patch[..len].split_at_mut(paint_len);
         for y in 0..bounds.h {
             let addr = surface.row(bounds.x, bounds.y + y);
-            memory.writable(addr, row)?;
-            let source = memory.read(addr, row)?;
+            memory.writable(addr, surface.span(bounds.x, bounds.w) as usize)?;
+            let source = surface.read_pixels(memory, bounds.x, bounds.y + y, bounds.w)?;
             let destination = &mut bytes[y as usize * pitch..y as usize * pitch + paint_row];
             if indexed {
                 original_indices[y as usize * row..y as usize * row + row].copy_from_slice(&source);
@@ -1876,7 +1887,7 @@ impl<P: Presenter> Surfaces<P> {
             }
         }
         let changed = (0..bounds.h).try_fold(false, |changed, y| {
-            let original = memory.read(surface.row(bounds.x, bounds.y + y), row)?;
+            let original = surface.read_pixels(memory, bounds.x, bounds.y + y, bounds.w)?;
             Ok::<bool, String>(
                 changed
                     || original.as_ref() != &bytes[y as usize * pitch..y as usize * pitch + row],
@@ -1884,8 +1895,10 @@ impl<P: Presenter> Surfaces<P> {
         })?;
         if changed {
             for y in 0..bounds.h {
-                memory.write(
-                    surface.row(bounds.x, bounds.y + y),
+                surface.write_pixels(
+                    memory,
+                    bounds.x,
+                    bounds.y + y,
                     &bytes[y as usize * pitch..y as usize * pitch + row],
                 )?;
             }
@@ -1916,6 +1929,18 @@ impl<P: Presenter> Surfaces<P> {
             return Err("destination rectangle outside surface".into());
         }
         if rect.w == 0 || rect.h == 0 {
+            return Ok(());
+        }
+        if d.format.packed() {
+            for y in rect.y..rect.y + rect.h {
+                m.writable(d.row(rect.x, y), d.span(rect.x, rect.w) as usize)?;
+                m.read(d.row(rect.x, y), d.span(rect.x, rect.w) as usize)?;
+            }
+            let indices = vec![value as u8; rect.w as usize];
+            for y in rect.y..rect.y + rect.h {
+                d.write_pixels(m, rect.x, y, &indices)?;
+            }
+            self.surfaces.get_mut(&dst).unwrap().version += 1;
             return Ok(());
         }
         let bytes = d.format.bytes() as usize;
@@ -1993,13 +2018,10 @@ impl<P: Presenter> Surfaces<P> {
             return Err("empty external surface".into());
         }
         size(source.width, source.height)?;
-        let row_bytes = source
-            .width
-            .checked_mul(source.format.bytes())
-            .ok_or("source overflow")?;
+        let row_bytes = source.format.row_bytes(source.width);
         if source.pitch < row_bytes
             || source.pixels == 0
-            || (source.format == PixelFormat::Indexed8 && source.palette.is_none())
+            || (source.format.indexed() && source.palette.is_none())
             || (source.height - 1)
                 .checked_mul(source.pitch)
                 .and_then(|offset| offset.checked_add(row_bytes))
@@ -2043,15 +2065,12 @@ impl<P: Presenter> Surfaces<P> {
         // Validate every source/destination row before the first write. DIB
         // padding is not part of a pixel and need not be readable or writable.
         for y in sr.y..sr.y + sr.h {
-            m.read(
-                source.row(sr.x, y),
-                sr.w as usize * source.format.bytes() as usize,
-            )?;
+            m.read(source.row(sr.x, y), source.span(sr.x, sr.w) as usize)?;
         }
         for y in top..bottom {
             m.writable(
                 d.row(left as u32, y as u32),
-                (right - left) as usize * d.format.bytes() as usize,
+                d.span(left as u32, (right - left) as u32) as usize,
             )?;
         }
         self.blit_surface(source, sr, dst, dr, options, m)
@@ -2100,6 +2119,9 @@ impl<P: Presenter> Surfaces<P> {
         };
         let ox = (left - dr.x) as u32;
         let oy = (top - dr.y) as u32;
+        if s.format.packed() || d.format.packed() {
+            return self.blit_packed(s, sr, dst, &d, dr, options, m);
+        }
         let sb = s.format.bytes() as usize;
         let db = d.format.bytes() as usize;
         let unscaled = sr.w == dr.w && sr.h == dr.h;

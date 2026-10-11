@@ -75,6 +75,7 @@ pub(super) fn read(
     memory: &dyn SurfaceMemory,
     info: u32,
     usage: u32,
+    logical_palette: Option<&[[u8; 4]]>,
 ) -> Result<Option<Dib>, String> {
     let h = memory.read(info, 40)?;
     let width = i32::from_le_bytes(h[4..8].try_into().unwrap());
@@ -87,34 +88,48 @@ pub(super) fn read(
         || height == 0
         || height == i32::MIN
         || h[12..14] != 1u16.to_le_bytes()
-        || !matches!(bpp, 8 | 16 | 24 | 32)
+        || !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32)
         || !(compression == 0 || (compression == 3 && bpp == 16))
         // DIB_PAL_COLORS changes indexed colour tables only; true-colour DIBs
         // carry their colours in pixels (and their optional bit masks).
         || usage > 1
-        || (usage == 1 && bpp == 8)
         || size(width as u32, height.unsigned_abs()).is_err()
     {
         return Ok(None);
     }
-    let palette = if bpp == 8 {
-        let count = if used == 0 { 256 } else { used };
-        if count > 256 {
+    let palette = if bpp <= 8 {
+        let count = if used == 0 { 1u32 << bpp } else { used };
+        if count > (1u32 << bpp) {
             return Ok(None);
         }
         let Some(address) = info.checked_add(40) else {
             return Ok(None);
         };
-        let colors = memory.read(address, count as usize * 4)?;
         let mut palette = [[0; 4]; 256];
-        for (entry, color) in palette.iter_mut().zip(colors.as_chunks::<4>().0) {
-            *entry = [color[0], color[1], color[2], 0]; // RGBQUAD reserved byte is not alpha.
+        if usage == 1 {
+            let logical = logical_palette.unwrap_or(&super::super::palette::DEFAULT);
+            if logical.is_empty() {
+                return Ok(None);
+            }
+            let indices = memory.read(address, count as usize * 2)?;
+            for (entry, index) in palette.iter_mut().zip(indices.chunks_exact(2)) {
+                let color = logical
+                    [usize::from(u16::from_le_bytes(index.try_into().unwrap())) % logical.len()];
+                *entry = [color[2], color[1], color[0], 0];
+            }
+        } else {
+            let colors = memory.read(address, count as usize * 4)?;
+            for (entry, color) in palette.iter_mut().zip(colors.as_chunks::<4>().0) {
+                *entry = [color[0], color[1], color[2], 0]; // RGBQUAD reserved byte is not alpha.
+            }
         }
         Some(Arc::new(palette))
     } else {
         None
     };
     let format = match bpp {
+        1 => PixelFormat::Indexed1,
+        4 => PixelFormat::Indexed4,
         8 => PixelFormat::Indexed8,
         16 if compression == 0 => PixelFormat::Rgb555,
         16 => {
@@ -132,7 +147,7 @@ pub(super) fn read(
         24 => PixelFormat::Bgr24,
         _ => PixelFormat::Bgra32,
     };
-    let pitch = (width as u32 * format.bytes() + 3) & !3;
+    let pitch = (format.row_bytes(width as u32) + 3) & !3;
     Ok(Some(Dib {
         width: width as u32,
         height: height.unsigned_abs(),
@@ -140,6 +155,10 @@ pub(super) fn read(
         format,
         pitch,
         palette,
-        palette_count: if bpp == 8 { 256 } else { 0 },
+        palette_count: if bpp <= 8 {
+            if used == 0 { 1u16 << bpp } else { used as u16 }
+        } else {
+            0
+        },
     }))
 }

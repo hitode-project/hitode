@@ -99,7 +99,7 @@ impl Raster {
             if section != 0 {
                 return Ok(self.fail(87));
             }
-            let Some(dib) = dib::read(m, info, usage)? else {
+            let Some(dib) = dib::read(m, info, usage, None)? else {
                 return Ok(self.fail(87));
             };
             self.create_decoded_dib(surfaces, dcs, objects, m, dib, bits_out)?
@@ -135,7 +135,7 @@ impl Raster {
             let metadata = GdiObj::Bitmap {
                 width: w,
                 height,
-                bpp: (format.bytes() * 8) as u16,
+                bpp: format.bits() as u16,
                 bits,
                 stride: surface.pitch,
                 owned: false,
@@ -337,11 +337,12 @@ impl Raster {
         info: u32,
         usage: u32,
         rop: u32,
+        logical_palette: Option<&[[u8; 4]]>,
     ) -> Result<u32, String> {
         if rop != 0x00cc0020 || bits == 0 {
             return Ok(self.fail(87));
         }
-        let Some(dib) = dib::read(m, info, usage)? else {
+        let Some(dib) = dib::read(m, info, usage, logical_palette)? else {
             return Ok(self.fail(87));
         };
         let dst = if dcs.is_window_dc(objects, destination_dc) {
