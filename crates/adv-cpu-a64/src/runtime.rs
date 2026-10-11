@@ -215,6 +215,7 @@ pub(crate) const MMX: u32 = field(offset_of!(CpuState, mmx));
 pub(crate) const X87_REGS: u32 = field(offset_of!(CpuState, x87.regs));
 pub(crate) const X87_STATUS: u32 = field(offset_of!(CpuState, x87.status));
 pub(crate) const X87_TAG: u32 = field(offset_of!(CpuState, x87.tag));
+pub(crate) const MXCSR: u32 = field(offset_of!(CpuState, mxcsr));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.

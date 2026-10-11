@@ -291,15 +291,25 @@ impl Executor {
 
     /// Runs translated code from EIP; `None` where the host has none.
     #[cfg(native)]
-    fn run_native(&mut self, stop: u32) -> Result<Option<Exit>, String> {
+    fn run_native(&mut self, stop: u32, bridge: &mut Bridge<'_>) -> Result<Option<Exit>, String> {
         if self.interpreter_only {
             return Ok(None);
         }
         let fuel = self.state.fuel;
-        let Some(run) = self
+        // Host calls run in place only with a handler to take them.
+        let traps = if bridge.handler.is_some() {
+            bridge.memory = &mut self.memory;
+            (bridge as *mut Bridge<'_>).cast()
+        } else {
+            std::ptr::null_mut()
+        };
+        let run = self
             .native
-            .run(&mut self.state, &mut self.memory, stop, fuel)?
-        else {
+            .run(&mut self.state, &mut self.memory, stop, fuel, traps);
+        if let Some(error) = bridge.error.take() {
+            return Err(error);
+        }
+        let Some(run) = run? else {
             return Ok(None);
         };
         self.stats.native_entries += 1;
@@ -312,7 +322,7 @@ impl Executor {
     }
 
     #[cfg(not(native))]
-    fn run_native(&mut self, _stop: u32) -> Result<Option<Exit>, String> {
+    fn run_native(&mut self, _stop: u32, _bridge: &mut Bridge<'_>) -> Result<Option<Exit>, String> {
         Ok(None)
     }
 
@@ -362,7 +372,7 @@ impl Executor {
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
                 (execution, execution.units)
-            } else if let Some(exit) = self.run_native(stop)? {
+            } else if let Some(exit) = self.run_native(stop, bridge)? {
                 match exit {
                     Exit::Dispatch => continue,
                     // The helper ran the instruction; the owner completes it.

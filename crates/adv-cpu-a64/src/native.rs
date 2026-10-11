@@ -40,6 +40,7 @@ use std::sync::Arc;
 use adv_cpu_core::CpuState;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
+use adv_cpu_core::trap::{Bridge, call_trap};
 
 use crate::cache::CodeCache;
 use crate::encode::{b, bl};
@@ -281,6 +282,8 @@ pub(crate) struct Run {
 struct Owner {
     native: *mut Native,
     memory: *mut Memory,
+    /// The run's trap `Bridge`, or null when traps go to the owner.
+    bridge: *mut std::ffi::c_void,
     translated: usize,
     error: Option<String>,
 }
@@ -394,6 +397,24 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             };
             (status, i64::from(units) - 1)
         }
+        // A host call returns here unless it moved the guest elsewhere,
+        // changed memory, parked or failed (`call_trap`).
+        Ok(Execution {
+            step: Step::Trap { vector, .. },
+            units,
+        }) if !owner.bridge.is_null() => {
+            // SAFETY: the executor's bridge outlives the run and nothing
+            // else uses it while translated code runs.
+            let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
+            let status = call_trap(bridge, cpu, u32::from(vector));
+            let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
+            let status = if status == 0 && same && cpu.eip == helper.next {
+                0
+            } else {
+                LEAVE
+            };
+            (status, i64::from(units) - 1)
+        }
         Ok(execution) => {
             native.pending = Some(execution);
             (Exit::Stepped as u32 + 1, -1)
@@ -443,6 +464,8 @@ pub(crate) struct Native {
     /// The permissions the page class table was made from, and the table
     /// when it is not that snapshot itself.
     snapshot: Option<Arc<Vec<u8>>>,
+    /// `FastPermissions::version` of `snapshot`.
+    version: u64,
     classes: Option<Box<[u8]>>,
     /// Buffers of the last translation.
     work: translate::Workspace,
@@ -520,6 +543,7 @@ impl Native {
             diagnostics: Diagnostics::default(),
             placed: Vec::new(),
             snapshot: None,
+            version: 0,
             classes: None,
             work: translate::Workspace::default(),
             helpers: Vec::new(),
@@ -545,6 +569,7 @@ impl Native {
         memory: &mut Memory,
         stop: u32,
         fuel: u64,
+        bridge: *mut std::ffi::c_void,
     ) -> Result<Option<Run>, String> {
         self.invalidate(memory);
         self.observe_stop(stop);
@@ -597,6 +622,7 @@ impl Native {
         let mut owner = Owner {
             native: self,
             memory,
+            bridge,
             translated,
             error: None,
         };
@@ -742,14 +768,16 @@ impl Native {
 
     /// Points the runtime at the page classes of the current permissions.
     fn classify(&mut self, memory: &mut Memory) {
+        // Holding no reference while the table refreshes lets it update in
+        // place instead of copying a byte for every page.
+        let held = self.snapshot.take().map(|old| Arc::as_ptr(&old));
         let snapshot = memory.native_permissions();
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, &snapshot))
-        {
+        let version = memory.fast.version();
+        if held == Some(Arc::as_ptr(&snapshot)) && version == self.version {
+            self.snapshot = Some(snapshot);
             return;
         }
+        self.version = version;
         let first = (memory.base >> 12) as usize;
         let direct = self.checks != Checks::Slow && first == 0 && snapshot.len() == CLASSES;
         self.runtime.classes = if direct {
@@ -1032,7 +1060,10 @@ mod tests {
             ldr_reg(W, X19, X27, Reg::new(20), false), // mov eax, [ecx]
         );
         let mut cpu = cpu(0x1000, 0x8000, 0x2_0004);
-        let run = native.run(&mut cpu, &mut memory, STOP, 1).unwrap().unwrap();
+        let run = native
+            .run(&mut cpu, &mut memory, STOP, 1, std::ptr::null_mut())
+            .unwrap()
+            .unwrap();
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 1));
         assert_eq!(cpu.regs[0], 0x1234_5678);
         assert_eq!(cpu.eip, 0x1003);
@@ -1059,7 +1090,10 @@ mod tests {
         ] {
             let mut cpu = cpu(eip, esp, ecx);
             let before = cpu.clone();
-            let run = native.run(&mut cpu, &mut memory, STOP, 1).unwrap().unwrap();
+            let run = native
+                .run(&mut cpu, &mut memory, STOP, 1, std::ptr::null_mut())
+                .unwrap()
+                .unwrap();
             assert_eq!((run.exit, run.retired), (Exit::Fault, 0), "{eip:#x}");
             assert_eq!(
                 cpu, before,

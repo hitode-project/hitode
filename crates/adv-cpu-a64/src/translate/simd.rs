@@ -1,4 +1,4 @@
-//! MMX and SSE integer and move instructions in NEON (workbook §4, §8).
+//! MMX and SSE instructions in NEON (workbook §4, §8).
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it and
@@ -16,6 +16,15 @@
 //! accesses that are not 16-byte aligned leave for the interpreter too,
 //! which raises the fault. The cpu pointer stays in x5 across a run of
 //! SIMD instructions.
+//!
+//! Single-precision arithmetic runs in NEON while MXCSR is the default:
+//! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
+//! result is the x86 one whenever FPSR reports nothing but inexact: a quiet
+//! NaN operand propagates as the first source, as on x86. Invalid, divide
+//! by zero, overflow and underflow leave for the interpreter before the
+//! destination changes, which also settles x86's negative default NaN and
+//! its tininess after rounding. Inexact sets PE, and a denormal operand,
+//! which A64 does not report without FZ, sets DE from a check of the bits.
 
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -25,7 +34,7 @@ use crate::runtime::{self, Exit};
 
 use super::decode::{Mem, memory};
 use super::flags::Operand;
-use super::{Cold, RUNTIME, Translator, WINDOW, X5, X14, X16, X17, host};
+use super::{Cold, RUNTIME, Translator, WINDOW, X5, X13, X14, X16, X17, host};
 
 const V0: VReg = VReg::new(0);
 const V1: VReg = VReg::new(1);
@@ -70,6 +79,14 @@ pub enum Kind {
     Shuffle(u8),
     Shufps,
     Emms,
+    /// `addps`-style arithmetic on every lane, or on the low one (`true`).
+    Float(Float, bool),
+    /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
+    MinMax(bool, bool),
+    /// `cvtps2pi`, or `cvttps2pi` (true).
+    ToInt(bool),
+    /// `movlps` or `movhps` (true): a 64-bit half to or from memory.
+    Half(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +114,14 @@ impl Simd {
         matches!(self.dst, Loc::Mmx(_))
             || matches!(self.src, Loc::Mmx(_))
             || self.kind == Kind::Emms
+    }
+
+    /// Whether it may leave for the interpreter on its values.
+    pub fn floating(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Float(..) | Kind::MinMax(..) | Kind::ToInt(_)
+        )
     }
 
     /// Whether the destination is 128 bits wide.
@@ -226,6 +251,22 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Pshufw => Kind::Shuffle(1),
         M::Pshufd => Kind::Shuffle(2),
         M::Shufps => Kind::Shufps,
+        M::Addps => Kind::Float(Float::Fadd, false),
+        M::Subps => Kind::Float(Float::Fsub, false),
+        M::Mulps => Kind::Float(Float::Fmul, false),
+        M::Divps => Kind::Float(Float::Fdiv, false),
+        M::Addss => Kind::Float(Float::Fadd, true),
+        M::Subss => Kind::Float(Float::Fsub, true),
+        M::Mulss => Kind::Float(Float::Fmul, true),
+        M::Divss => Kind::Float(Float::Fdiv, true),
+        M::Maxps => Kind::MinMax(true, false),
+        M::Minps => Kind::MinMax(false, false),
+        M::Maxss => Kind::MinMax(true, true),
+        M::Minss => Kind::MinMax(false, true),
+        M::Cvtps2pi => Kind::ToInt(false),
+        M::Cvttps2pi => Kind::ToInt(true),
+        M::Movlps => Kind::Half(false),
+        M::Movhps => Kind::Half(true),
         _ => return None,
     };
     // Registers of one class, except moves to and from the GPRs.
@@ -238,6 +279,9 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (d, s) = (class(dst), class(src));
     let valid = match kind {
         Kind::Emms => true,
+        Kind::ToInt(_) => d == 1 && (s == 2 || src == Loc::Mem),
+        Kind::Half(_) => d == 2 && src == Loc::Mem || dst == Loc::Mem && s == 2,
+        Kind::Float(..) | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
         Kind::Move => match (d, s) {
             (1 | 2, 0) | (0, 1 | 2) | (1 | 2, 3) | (3, 1 | 2) => true,
             _ => d == s && matches!(d, 1 | 2),
@@ -360,6 +404,10 @@ impl Translator<'_> {
                 return;
             }
             Kind::Move => return self.simd_move(simd, address),
+            Kind::Half(high) => return self.half(simd, high, address),
+            Kind::Float(..) | Kind::MinMax(..) | Kind::ToInt(_) => {
+                return self.floating(simd, address);
+            }
             Kind::ShiftImm(op, log2) => {
                 let arr = Arr::new(u32::from(log2), full);
                 let (bits, count) = (arr.bits(), u32::from(simd.imm));
@@ -479,7 +527,14 @@ impl Translator<'_> {
                 }
                 self.emit(vmov(true, d, V0));
             }
-            Kind::Move | Kind::ShiftImm(..) | Kind::ShiftBy(..) | Kind::Emms => unreachable!(),
+            Kind::Move
+            | Kind::ShiftImm(..)
+            | Kind::ShiftBy(..)
+            | Kind::Emms
+            | Kind::Float(..)
+            | Kind::MinMax(..)
+            | Kind::ToInt(_)
+            | Kind::Half(_) => unreachable!(),
         }
         self.written(simd.dst);
     }
@@ -516,6 +571,134 @@ impl Translator<'_> {
                 self.written(dst);
             }
         }
+    }
+
+    /// `movlps` or `movhps`: one 64-bit lane of an XMM register.
+    fn half(&mut self, simd: Simd, high: bool, address: Reg) {
+        let lane = u32::from(high);
+        if simd.dst == Loc::Mem {
+            let s = self.register(simd.src);
+            let value = if high {
+                self.emit(vins(3, V1, 0, s, 1));
+                V1
+            } else {
+                s
+            };
+            self.site();
+            self.emit(vstr_reg(VMem::D, value, WINDOW, address));
+        } else {
+            let d = self.register(simd.dst);
+            self.site();
+            self.emit_all(&[
+                vldr_reg(VMem::D, V1, WINDOW, address),
+                vins(3, d, lane, V1, 0),
+            ]);
+            self.written(simd.dst);
+        }
+    }
+
+    /// Single-precision arithmetic and conversions under the default
+    /// MXCSR, leaving for the interpreter on any exception but inexact.
+    /// Uses x13, x14 and v0-v6.
+    fn floating(&mut self, simd: Simd, address: Reg) {
+        let (v3, v4, v5, v6) = (VReg::new(3), VReg::new(4), VReg::new(5), VReg::new(6));
+        self.cpu();
+        let bail = self.bail();
+        // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
+        self.emit_all(&[
+            ldr(W, X13, X5, runtime::MXCSR),
+            and_imm(W, X17, X13, 0xffc0),
+            eor_imm(W, X17, X17, 0x1f80),
+        ]);
+        self.asm.cbz(W, true, X17, bail);
+        let s = match simd.src {
+            Loc::Mem => {
+                self.site();
+                self.emit(vldr_reg(vmem(simd.width), V1, WINDOW, address));
+                V1
+            }
+            loc => self.register(loc),
+        };
+        let (scalar, inputs) = match simd.kind {
+            Kind::Float(_, scalar) | Kind::MinMax(_, scalar) => {
+                (scalar, [Some(self.register(simd.dst)), Some(s)])
+            }
+            _ => (false, [None, Some(s)]),
+        };
+        // DE: a lane whose bits shifted left once lie in 1..0x00ffffff,
+        // so x - 1 saturates 0x00ffffff - (x - 1) above zero.
+        let (lanes, arr) = match simd.kind {
+            Kind::ToInt(_) => (2, Arr::S2),
+            _ if scalar => (1, Arr::S2),
+            _ => (4, Arr::S4),
+        };
+        self.emit_all(&[
+            movz(W, X16, 1, 0),
+            vdup(arr, v4, X16),
+            movz(W, X16, 0xffff, 0),
+            movk(W, X16, 0x00ff, 16),
+            vdup(arr, v5, X16),
+        ]);
+        for (n, input) in inputs.into_iter().flatten().enumerate() {
+            let x = if lanes == 1 {
+                self.emit_all(&[vzero(false, v3), vins(2, v3, 0, input, 0)]);
+                v3
+            } else {
+                input
+            };
+            let target = if n == 0 { v6 } else { V0 };
+            self.emit_all(&[
+                vshift(ShiftImm::Shl, arr, target, x, 1),
+                vsame(Same::Sub, arr, target, target, v4),
+                vsame(Same::Uqsub, arr, target, v5, target),
+            ]);
+            if n != 0 {
+                self.emit(vlogic(Logic::Orr, true, v6, v6, V0));
+            }
+        }
+        // The 64-bit forms clear the high half.
+        let clean = self.asm.label();
+        self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X17, v6)]);
+        self.asm.cbz(W, false, X17, clean);
+        self.emit(orr_imm(W, X13, X13, 2));
+        self.asm.bind(clean);
+        self.emit(msr_fpsr(Reg::ZR));
+        match simd.kind {
+            Kind::Float(op, false) => self.emit(vfloat(op, true, V0, inputs[0].unwrap(), s)),
+            Kind::Float(op, true) => self.emit(sfloat(op, V0, inputs[0].unwrap(), s)),
+            Kind::MinMax(max, scalar) => {
+                let d = inputs[0].unwrap();
+                // The first source where it compares above (max) or
+                // below (min) the second, else the second; any NaN is
+                // invalid for the compare.
+                let (a, b) = if max { (d, s) } else { (s, d) };
+                self.emit_all(&[
+                    if scalar {
+                        sfcmgt(V0, a, b)
+                    } else {
+                        vfloat(Float::Fcmgt, true, V0, a, b)
+                    },
+                    vlogic(Logic::Bsl, true, V0, d, s),
+                ]);
+            }
+            Kind::ToInt(truncate) => self.emit(vtoint(truncate, false, V0, s)),
+            _ => unreachable!(),
+        }
+        // Anything but inexact leaves; inexact sets PE.
+        self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
+        self.asm.cbz(X, true, X14, bail);
+        self.emit_all(&[
+            ubfx(W, X17, X17, 4, 1),
+            orr(W, X13, X13, X17, Shift::Lsl, 5),
+            str(W, X13, X5, runtime::MXCSR),
+        ]);
+        let d = self.destination(simd.dst, false);
+        self.emit(match simd.kind {
+            Kind::Float(_, true) | Kind::MinMax(_, true) => vins(2, d, 0, V0, 0),
+            Kind::ToInt(_) => vmov(false, d, V0),
+            _ => vmov(true, d, V0),
+        });
+        self.written(simd.dst);
     }
 
     /// The host register of an MMX or XMM operand, loaded if the unit has
@@ -666,7 +849,12 @@ mod tests {
         let low = plan(&decode(|a| a.movss(xmm1, xmm2).unwrap()), 0).unwrap();
         assert_eq!(low.kind, Kind::MoveLow);
         assert!(plan(&decode(|a| a.movq2dq(xmm1, mm2).unwrap()), 0).is_none());
-        assert!(plan(&decode(|a| a.addps(xmm1, xmm2).unwrap()), 0).is_none());
+        let add = plan(&decode(|a| a.addss(xmm1, dword_ptr(esi)).unwrap()), 0).unwrap();
+        assert_eq!((add.kind, add.width), (Kind::Float(Float::Fadd, true), 4));
+        assert!(add.floating());
+        let convert = plan(&decode(|a| a.cvttps2pi(mm1, xmm2).unwrap()), 0).unwrap();
+        assert!(convert.mmx() && convert.floating());
+        assert!(plan(&decode(|a| a.sqrtps(xmm1, xmm2).unwrap()), 0).is_none());
         assert!(plan(&decode(|a| a.emms().unwrap()), 0).unwrap().mmx());
     }
 }

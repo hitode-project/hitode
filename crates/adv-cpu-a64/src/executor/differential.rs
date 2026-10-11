@@ -121,6 +121,106 @@ fn alu_imm(a: &mut CodeAssembler, op: usize, dst: AsmRegister32, imm: i32) {
 
 /// One straight-line instruction, after the ECX mask an indexed memory
 /// operand needs.
+/// Shifts by CL, rotates through carry, exchanges, the widening multiply
+/// and divide, byte swaps and `sahf`; a divide may raise #DE.
+fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegister32) {
+    let mem = |a: &mut CodeAssembler, rng: &mut Rng| {
+        let (operand, indexed) = memory_operand(rng);
+        if indexed {
+            a.and(ecx, 0x7f).unwrap();
+        }
+        operand
+    };
+    let other = rng.pick(&WRITABLE);
+    match rng.below(9) {
+        0 => {
+            if rng.below(2) == 0 {
+                a.mov(ecx, rng.pick(&[0u32, 1, 2, 31, 32, 33])).unwrap();
+            }
+            match rng.below(5) {
+                0 => a.shl(w, cl),
+                1 => a.shr(w, cl),
+                2 => a.sar(w, cl),
+                3 => a.rol(w, cl),
+                _ => a.ror(w, cl),
+            }
+            .unwrap()
+        }
+        1 => {
+            let count = rng.pick(&[1u32, 1, 2, 7, 31, 32, 33]);
+            if rng.below(2) == 0 {
+                a.rcl(w, count).unwrap()
+            } else {
+                a.rcr(w, count).unwrap()
+            }
+        }
+        2 => a.xadd(w, other).unwrap(),
+        3 => {
+            let m = mem(a, rng);
+            if rng.below(2) == 0 {
+                a.lock().xadd(dword_ptr(m), other).unwrap()
+            } else {
+                a.xadd(dword_ptr(m), other).unwrap()
+            }
+        }
+        4 => {
+            if rng.below(2) == 0 {
+                a.xchg(w, other).unwrap()
+            } else {
+                let m = mem(a, rng);
+                a.xchg(dword_ptr(m), other).unwrap()
+            }
+        }
+        5 => a.bswap(w).unwrap(),
+        6 => {
+            let signed = rng.below(2) == 0;
+            if rng.below(2) == 0 {
+                if signed { a.imul(r) } else { a.mul(r) }.unwrap()
+            } else {
+                let m = mem(a, rng);
+                if signed {
+                    a.imul(dword_ptr(m))
+                } else {
+                    a.mul(dword_ptr(m))
+                }
+                .unwrap()
+            }
+        }
+        7 => {
+            // Mostly a quotient that fits; otherwise #DE.
+            let signed = rng.below(2) == 0;
+            match rng.below(4) {
+                0 => {}
+                _ if signed => a.cdq().unwrap(),
+                _ => a.xor(edx, edx).unwrap(),
+            }
+            if rng.below(2) == 0 {
+                let divisor = rng.pick(&[ebx, esi, edi]);
+                if signed {
+                    a.idiv(divisor)
+                } else {
+                    a.div(divisor)
+                }
+                .unwrap()
+            } else {
+                let m = mem(a, rng);
+                if signed {
+                    a.idiv(dword_ptr(m))
+                } else {
+                    a.div(dword_ptr(m))
+                }
+                .unwrap()
+            }
+        }
+        _ => {
+            if rng.below(2) == 0 {
+                a.mov(ah, rng.imm() as u32 & 0xff).unwrap();
+            }
+            a.sahf().unwrap()
+        }
+    }
+}
+
 fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
     let w = rng.pick(&WRITABLE);
     let r = rng.pick(&READABLE);
@@ -131,7 +231,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(31) {
+    match rng.below(35) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -260,10 +360,10 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         // Left to the interpreter, between translated neighbours.
         19 => match rng.below(5) {
-            0 => a.shl(w, cl),
-            1 => a.rcl(w, 1),
-            2 => a.imul(r),
-            3 => a.bswap(w),
+            0 => a.bt(w, r),
+            1 => a.rcl(w, cl),
+            2 => a.cmpxchg(w, r),
+            3 => a.shld(w, r, cl),
             _ => a.add(al, 7),
         }
         .unwrap(),
@@ -348,8 +448,66 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
             }
         }
         27..=29 => simd(a, rng, mem),
+        30 => strings(a, rng),
+        32 => integer(a, rng, w, r),
+        33 | 34 => floating(a, rng, mem),
         _ => a.nop().unwrap(),
     }
+}
+
+/// A string instruction of any width, alone or repeated, in either
+/// direction, over overlapping operands; one running down from the start
+/// of the data faults in the hole below it part way.
+fn strings(a: &mut CodeAssembler, rng: &mut Rng) {
+    let near = |rng: &mut Rng| DATA as i32 + rng.below(0x1000) as i32;
+    let esi_at = near(rng);
+    let edi_at = match rng.below(4) {
+        0 => esi_at,
+        1 => esi_at + rng.below(9) as i32 - 4,
+        2 => DATA as i32 + rng.below(12) as i32,
+        _ => near(rng),
+    };
+    a.mov(esi, esi_at).unwrap();
+    a.mov(edi, edi_at).unwrap();
+    let compare = rng.below(2) == 0;
+    // A compare may count from -1, as the idioms that scan for a value do.
+    let count = if compare && rng.below(4) == 0 {
+        -1
+    } else {
+        rng.pick(&[0, 1, 2, 3, 7, 16, 33])
+    };
+    a.mov(ecx, count).unwrap();
+    if rng.below(3) == 0 {
+        a.std().unwrap();
+    } else {
+        a.cld().unwrap();
+    }
+    let prefix = rng.below(4);
+    let a = match prefix {
+        0 => a,
+        1 => a.rep(),
+        2 => a.repe(),
+        _ => a.repne(),
+    };
+    let width = rng.below(3);
+    match (rng.below(3), compare, width) {
+        (_, true, 0) if prefix % 2 == 0 => a.cmpsb(),
+        (_, true, 1) if prefix % 2 == 0 => a.cmpsw(),
+        (_, true, _) if prefix % 2 == 0 => a.cmpsd(),
+        (_, true, 0) => a.scasb(),
+        (_, true, 1) => a.scasw(),
+        (_, true, _) => a.scasd(),
+        (0, false, 0) => a.movsb(),
+        (0, false, 1) => a.movsw(),
+        (0, false, _) => a.movsd(),
+        (1, false, 0) => a.stosb(),
+        (1, false, 1) => a.stosw(),
+        (1, false, _) => a.stosd(),
+        (_, false, 0) => a.lodsb(),
+        (_, false, 1) => a.lodsw(),
+        _ => a.lodsd(),
+    }
+    .unwrap();
 }
 
 const MMX: [AsmRegisterMm; 8] = [mm0, mm1, mm2, mm3, mm4, mm5, mm6, mm7];
@@ -600,6 +758,128 @@ fn simd(
     }
 }
 
+/// Single-precision values at the edges: zeros, denormals, the smallest
+/// and largest normals, infinities, quiet and signalling NaNs, and values
+/// whose products overflow or underflow.
+const SPECIAL: [u32; 18] = [
+    0,
+    0x8000_0000,
+    1,
+    0x807f_ffff,
+    0x0080_0000,
+    0x0080_0001,
+    0x7f7f_ffff,
+    0x7f80_0000,
+    0xff80_0000,
+    0x7fc0_0001,
+    0xffc1_2345,
+    0x7f80_0001,
+    0xffa0_0000,
+    0x3f80_0000,
+    0xbfc0_0000,
+    0x5f00_0000,
+    0x1f00_0000,
+    0x4b00_0001,
+];
+
+/// SSE single-precision arithmetic, compares and conversions over
+/// special values, with MXCSR now and then in another rounding mode, with
+/// DAZ or FTZ, or with an exception unmasked.
+fn floating(
+    a: &mut CodeAssembler,
+    rng: &mut Rng,
+    mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
+) {
+    let (x, x2, m) = (rng.pick(&XMM), rng.pick(&XMM), rng.pick(&MMX));
+    let aligned = |rng: &mut Rng| ebx + 16 * rng.below(0x7f) as i32;
+    macro_rules! packed {
+        ($op:ident) => {
+            if rng.below(2) == 0 {
+                a.$op(x, x2)
+            } else {
+                let p = aligned(rng);
+                a.$op(x, xmmword_ptr(p))
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! scalar {
+        ($op:ident) => {
+            if rng.below(2) == 0 {
+                a.$op(x, x2)
+            } else {
+                let p = mem(a, rng);
+                a.$op(x, dword_ptr(p))
+            }
+            .unwrap()
+        };
+    }
+    match rng.below(24) {
+        0..=3 => {
+            a.mov(eax, rng.pick(&SPECIAL)).unwrap();
+            a.movd(x, eax).unwrap();
+            if rng.below(2) == 0 {
+                a.pshufd(x, x, rng.below(256) as i32).unwrap();
+            } else {
+                a.shufps(x, x2, rng.below(256) as i32).unwrap();
+            }
+        }
+        4 => {
+            let mxcsr = rng.pick(&[
+                0x1f80u32, 0x1fbf, 0x3f80, 0x5f80, 0x7f80, 0x9f80, 0x1fc0, 0x1b80, 0x1d80, 0x0f80,
+            ]);
+            a.mov(dword_ptr(ebx + 0x7f0), mxcsr).unwrap();
+            a.ldmxcsr(dword_ptr(ebx + 0x7f0)).unwrap();
+        }
+        5 => a.stmxcsr(dword_ptr(ebx + 0x7f4)).unwrap(),
+        6 => packed!(addps),
+        7 => packed!(subps),
+        8 | 9 => packed!(mulps),
+        10 => packed!(divps),
+        11 => packed!(minps),
+        12 => packed!(maxps),
+        13 => scalar!(addss),
+        14 => scalar!(subss),
+        15 => scalar!(mulss),
+        16 => scalar!(divss),
+        17 => {
+            if rng.below(2) == 0 {
+                scalar!(minss)
+            } else {
+                scalar!(maxss)
+            }
+        }
+        18 | 19 => {
+            let truncate = rng.below(2) == 0;
+            if rng.below(2) == 0 {
+                if truncate {
+                    a.cvttps2pi(m, x)
+                } else {
+                    a.cvtps2pi(m, x)
+                }
+            } else {
+                let p = mem(a, rng);
+                if truncate {
+                    a.cvttps2pi(m, qword_ptr(p))
+                } else {
+                    a.cvtps2pi(m, qword_ptr(p))
+                }
+            }
+            .unwrap()
+        }
+        _ => {
+            let p = mem(a, rng);
+            match rng.below(4) {
+                0 => a.movlps(x, qword_ptr(p)),
+                1 => a.movhps(x, qword_ptr(p)),
+                2 => a.movlps(qword_ptr(p), x),
+                _ => a.movhps(qword_ptr(p), x),
+            }
+            .unwrap()
+        }
+    }
+}
+
 /// An 8- or 16-bit `mov` or ALU operation on registers, memory and
 /// immediates, high byte registers and SP and BP included.
 fn narrow(
@@ -690,7 +970,17 @@ fn condition(a: &mut CodeAssembler, cc: usize, label: CodeLabel) {
         12 => a.jle(label),
         13 => a.jg(label),
         14 => a.jp(label),
-        _ => a.jnp(label),
+        15 => a.jnp(label),
+        16 => a.jecxz(label),
+        17 => a.loop_(label),
+        18 => a.loope(label),
+        19 => a.loopne(label),
+        _ => {
+            // `jcxz` over a 2-byte `xor`, by hand: the assembler only has
+            // its 16-bit form.
+            a.db(&[0x67, 0xe3, 2]).unwrap();
+            a.xor(edx, eax)
+        }
     }
     .unwrap();
 }
@@ -773,7 +1063,7 @@ fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
         match rng.below(20) {
             0 => {
                 let mut skip = a.create_label();
-                condition(&mut a, rng.below(16), skip);
+                condition(&mut a, rng.below(21), skip);
                 for _ in 0..1 + rng.below(3) {
                     simple(&mut a, &mut rng);
                 }
@@ -814,7 +1104,7 @@ fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
                 if rng.below(2) == 0 {
                     // A forward branch inside the loop body.
                     let mut skip = a.create_label();
-                    condition(&mut a, rng.below(14), skip);
+                    condition(&mut a, rng.below(18), skip);
                     simple(&mut a, &mut rng);
                     a.set_label(&mut skip).unwrap();
                     a.nop().unwrap();
@@ -823,6 +1113,26 @@ fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
                 a.sub(dword_ptr(esp), 1).unwrap();
                 a.jne(top).unwrap();
                 a.add(esp, 4).unwrap();
+            }
+            5 if rng.below(3) == 1 => {
+                // A loop counted in ECX, which its body leaves alone.
+                let mut top = a.create_label();
+                a.mov(ecx, 1 + rng.below(24) as i32).unwrap();
+                a.set_label(&mut top).unwrap();
+                a.add(eax, rng.imm()).unwrap();
+                if rng.below(2) == 0 {
+                    let mut skip = a.create_label();
+                    condition(&mut a, rng.below(16), skip);
+                    a.xor(edx, eax).unwrap();
+                    a.set_label(&mut skip).unwrap();
+                    a.nop().unwrap();
+                }
+                match rng.below(3) {
+                    0 => a.loop_(top),
+                    1 => a.loope(top),
+                    _ => a.loopne(top),
+                }
+                .unwrap();
             }
             4 if rng.below(40) == 0 => {
                 // A fault in the middle of a unit, with pending flags.
@@ -1046,6 +1356,14 @@ fn reference(program: &Program, budget: u64) -> (RunOutcome, CpuState, Vec<u8>) 
                     adv_cpu_core::interpreter::fault_address(&memory, address, adv_cpu_core::READ);
                 break RunOutcome::ReadFault { pc, address };
             }
+            adv_cpu_core::interpreter::Step::WriteFault { pc, address } => {
+                let address =
+                    adv_cpu_core::interpreter::fault_address(&memory, address, adv_cpu_core::WRITE);
+                break RunOutcome::WriteFault { pc, address };
+            }
+            adv_cpu_core::interpreter::Step::Trap { pc, vector } => {
+                break RunOutcome::Trap { pc, vector };
+            }
             other => panic!("unexpected step {other:?}"),
         }
     };
@@ -1103,6 +1421,11 @@ fn compare(seed: u64, budget: u64, config: Config) -> u64 {
         a64_state.eflags, state.eflags
     );
     assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
+    assert_eq!(
+        a64_state.mxcsr, state.mxcsr,
+        "{context}: mxcsr {:#x} != {:#x}",
+        a64_state.mxcsr, state.mxcsr
+    );
     assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
     assert_eq!(a64_state.x87, state.x87, "{context}: x87");
     assert!(a64_memory == memory, "{context}: memory");
@@ -1179,13 +1502,15 @@ fn stores_to_data_on_a_code_page_stop_faulting() {
 }
 
 #[test]
-fn random_programs_assemble_and_reach_the_stop_or_a_read_fault() {
+fn random_programs_assemble_and_reach_the_stop_or_a_fault() {
     let mut faults = 0;
     for seed in 1..=300 {
         let program = program(seed);
         match reference(&program, u64::MAX >> 1).0 {
             RunOutcome::ReachedStop => {}
-            RunOutcome::ReadFault { .. } => faults += 1,
+            RunOutcome::ReadFault { .. }
+            | RunOutcome::WriteFault { .. }
+            | RunOutcome::Trap { .. } => faults += 1,
             other => panic!("seed {seed}: {other:?}"),
         }
     }

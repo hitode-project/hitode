@@ -239,6 +239,54 @@ pub const fn smull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9B20_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
 }
 
+/// `umull xd, wn, wm`: the unsigned 64-bit product.
+pub const fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9BA0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `msub rd, rn, rm, ra`: `ra - rn * rm`.
+pub const fn msub(size: Size, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0x1B00_8000 | size.sf() | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
+const fn source2(opcode: u32, size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x1AC0_0000 | size.sf() | rm.number() << 16 | opcode << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `udiv rd, rn, rm`.
+pub const fn udiv(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    source2(0b10, size, rd, rn, rm)
+}
+
+/// `sdiv rd, rn, rm`.
+pub const fn sdiv(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    source2(0b11, size, rd, rn, rm)
+}
+
+/// `lslv`, `lsrv` or `asrv rd, rn, rm`: a shift by `rm` modulo the size.
+pub const fn shiftv(size: Size, shift: Shift, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    source2(0b1000 | shift as u32, size, rd, rn, rm)
+}
+
+/// `rorv rd, rn, rm`.
+pub const fn rorv(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    source2(0b1011, size, rd, rn, rm)
+}
+
+/// `rev rd, rn`: the bytes reversed.
+pub const fn rev(size: Size, rd: Reg, rn: Reg) -> u32 {
+    let opcode = match size {
+        Size::W => 0x5AC0_0800,
+        Size::X => 0xDAC0_0C00,
+    };
+    opcode | rn.number() << 5 | rd.number()
+}
+
+/// `clz rd, rn`.
+pub const fn clz(size: Size, rd: Reg, rn: Reg) -> u32 {
+    0x5AC0_1000 | size.sf() | rn.number() << 5 | rd.number()
+}
+
 /// `mov rd, rn` where either side may be SP.
 pub const fn mov_sp(rd: Reg, rn: Reg) -> u32 {
     add_imm(Size::X, rd, rn, 0, false)
@@ -730,6 +778,16 @@ pub const fn mrs_nzcv(rt: Reg) -> u32 {
     0xD53B_4200 | rt.number()
 }
 
+/// `mrs rt, fpsr`.
+pub const fn mrs_fpsr(rt: Reg) -> u32 {
+    0xD53B_4420 | rt.number()
+}
+
+/// `msr fpsr, rt`.
+pub const fn msr_fpsr(rt: Reg) -> u32 {
+    0xD51B_4420 | rt.number()
+}
+
 /// `msr nzcv, rt`.
 pub const fn msr_nzcv(rt: Reg) -> u32 {
     0xD51B_4200 | rt.number()
@@ -886,6 +944,22 @@ pub const fn vfloat(op: Float, full: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 
         | opcode << 11
         | rn.number() << 5
         | rd.number()
+}
+
+/// `fcmgt sd, sn, sm`: the scalar compare, all ones when greater.
+pub const fn sfcmgt(rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    vfloat(Float::Fcmgt, true, rd, rn, rm) | 1 << 28
+}
+
+/// `fcvtns` (nearest) or `fcvtzs` (`truncate`) `vd.2s/4s, vn.2s/4s`.
+pub const fn vtoint(truncate: bool, full: bool, rd: VReg, rn: VReg) -> u32 {
+    let base = if truncate { 0x0EA1_B800 } else { 0x0E21_A800 };
+    base | (full as u32) << 30 | rn.number() << 5 | rd.number()
+}
+
+/// `umaxv sd, vn.4s`.
+pub const fn umaxv(rd: VReg, rn: VReg) -> u32 {
+    0x6EB0_A800 | rn.number() << 5 | rd.number()
 }
 
 /// `<op> sd, sn, sm`: the scalar single-precision form.
@@ -1333,6 +1407,34 @@ mod tests {
                 "sub x17, x16, w16, sxtw",
             ),
             (smull(r(16), r(21), r(6)), "smull x16, w21, w6"),
+            (shiftv(W, Lsl, r(6), r(19), r(16)), "lslv w6, w19, w16"),
+            (shiftv(W, Lsr, r(17), r(20), r(17)), "lsrv w17, w20, w17"),
+            (shiftv(W, Asr, r(6), r(26), r(16)), "asrv w6, w26, w16"),
+            (rorv(W, r(6), r(25), r(17)), "rorv w6, w25, w17"),
+            (udiv(X, r(17), r(16), r(6)), "udiv x17, x16, x6"),
+            (sdiv(X, r(17), r(16), r(15)), "sdiv x17, x16, x15"),
+            (msub(X, r(15), r(17), r(6), r(16)), "msub x15, x17, x6, x16"),
+            (umull(r(16), r(19), r(6)), "umull x16, w19, w6"),
+            (mrs_fpsr(r(17)), "mrs x17, fpsr"),
+            (msr_fpsr(Reg::ZR), "msr fpsr, xzr"),
+            (umaxv(v(0), v(0)), "umaxv s0, v0.4s"),
+            (vtoint(false, false, v(0), v(1)), "fcvtns v0.2s, v1.2s"),
+            (vtoint(true, false, v(0), v(1)), "fcvtzs v0.2s, v1.2s"),
+            (sfcmgt(v(0), v(1), v(2)), "fcmgt s0, s1, s2"),
+            (
+                vfloat(Float::Fcmgt, false, v(0), v(1), v(2)),
+                "fcmgt v0.2s, v1.2s, v2.2s",
+            ),
+            (
+                vshift(ShiftImm::Shl, Arr::S2, v(0), v(1), 1),
+                "shl v0.2s, v1.2s, #1",
+            ),
+            (
+                vsame(Same::Uqsub, Arr::S2, v(0), v(5), v(0)),
+                "uqsub v0.2s, v5.2s, v0.2s",
+            ),
+            (rev(W, r(19), r(22)), "rev w19, w22"),
+            (clz(X, r(17), r(17)), "clz x17, x17"),
             (asr_imm(W, r(16), r(3), 7), "asr w16, w3, #7"),
             (ror_imm(W, r(19), r(19), 29), "ror w19, w19, #29"),
             (ror_imm(X, r(1), r(2), 63), "ror x1, x2, #63"),

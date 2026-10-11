@@ -8,7 +8,8 @@
 use adv_cpu_core::interpreter::Prepared;
 use adv_cpu_core::memory::Memory;
 use iced_x86::{
-    ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+    Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
+    Register,
 };
 
 use super::flags::FlagSet;
@@ -73,6 +74,18 @@ pub enum Narrow8or16 {
     Mem(Mem, bool),
 }
 
+/// What a conditional branch tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cc {
+    Flags(ConditionCode),
+    /// `jecxz`.
+    EcxZero,
+    /// `jcxz`.
+    CxZero,
+    /// `loop`, `loope` (`Some(true)`) or `loopne`: ECX counts down first.
+    Loop(Option<bool>),
+}
+
 /// One guest instruction the translator handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -89,7 +102,7 @@ pub enum Op {
     Pop(u8),
     Jmp(u32),
     Call(u32),
-    Jcc(ConditionCode, u32),
+    Jcc(Cc, u32),
     Ret(u16),
     JmpIndirect(Src),
     CallIndirect(Src),
@@ -109,6 +122,9 @@ pub enum Op {
     Direction(bool),
     /// An MMX or SSE instruction.
     Simd(super::simd::Simd),
+    /// A string instruction, perhaps repeated.
+    Strings(super::strings::Strings),
+    Integer(super::integer::Integer),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -215,7 +231,19 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     };
     let mnemonic = instruction.mnemonic();
     if instruction.is_jcc_short_or_near() {
-        return Some(Op::Jcc(instruction.condition_code(), near()?)).filter(|op| supported(*op));
+        let cc = Cc::Flags(instruction.condition_code());
+        return Some(Op::Jcc(cc, near()?)).filter(|op| supported(*op));
+    }
+    let counted = match instruction.code() {
+        Code::Jecxz_rel8_32 => Some(Cc::EcxZero),
+        Code::Jcxz_rel8_32 => Some(Cc::CxZero),
+        Code::Loop_rel8_32_ECX => Some(Cc::Loop(None)),
+        Code::Loope_rel8_32_ECX => Some(Cc::Loop(Some(true))),
+        Code::Loopne_rel8_32_ECX => Some(Cc::Loop(Some(false))),
+        _ => None,
+    };
+    if let Some(cc) = counted {
+        return Some(Op::Jcc(cc, near()?));
     }
     let narrow = match mnemonic {
         M::Mov => Some(None),
@@ -395,8 +423,8 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
 }
 
 fn supported(op: Op) -> bool {
-    // A condition on PF needs the parity materialized; leave it to the
-    // interpreter until a unit can test it.
+    // Only a branch tests PF in a unit; other conditions on it are left to
+    // the interpreter.
     let parity = |cc| {
         matches!(
             cc,
@@ -404,7 +432,8 @@ fn supported(op: Op) -> bool {
         )
     };
     match op {
-        Op::Jcc(cc, _) | Op::Setcc(cc, _) | Op::Cmov(cc, ..) => !parity(cc),
+        Op::Jcc(Cc::Flags(cc), _) => cc != ConditionCode::None,
+        Op::Setcc(cc, _) | Op::Cmov(cc, ..) => !parity(cc),
         _ => true,
     }
 }
@@ -574,7 +603,10 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
         }
         0x70..=0x7f => {
             let rel = b.i8()?;
-            Op::Jcc(CONDITIONS[usize::from(opcode & 15)], near(b, rel))
+            Op::Jcc(
+                Cc::Flags(CONDITIONS[usize::from(opcode & 15)]),
+                near(b, rel),
+            )
         }
         0x81 | 0x83 => {
             let (reg, rm) = b.modrm()?;
@@ -689,7 +721,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
                 },
                 0x80..=0x8f => {
                     let rel = b.u32()?;
-                    Op::Jcc(cc, near(b, rel))
+                    Op::Jcc(Cc::Flags(cc), near(b, rel))
                 }
                 // The reg field is ignored.
                 0x90..=0x9f => match b.modrm()? {
@@ -800,7 +832,11 @@ impl<'m> Fetcher<'m> {
             return Some((op, len as u32));
         }
         let helpers = self.helpers.as_mut()?;
-        if instruction.flow_control() != FlowControl::Next || helpers.len() > usize::from(u8::MAX) {
+        // A software interrupt is a host call, which mostly returns to the
+        // next instruction.
+        let next = instruction.flow_control() == FlowControl::Next
+            || instruction.code() == iced_x86::Code::Int_imm8;
+        if !next || helpers.len() > usize::from(u8::MAX) {
             return None;
         }
         helpers.push(Helper {
@@ -810,9 +846,14 @@ impl<'m> Fetcher<'m> {
         });
         // SIMD instructions keep their helper for when they are checked.
         let index = (helpers.len() - 1) as u8;
-        let op = match super::simd::plan(&instruction, index) {
-            Some(simd) => Op::Simd(simd),
-            None => Op::Helper(index),
+        let op = if let Some(simd) = super::simd::plan(&instruction, index) {
+            Op::Simd(simd)
+        } else if let Some(strings) = super::strings::plan(&instruction, index) {
+            Op::Strings(strings)
+        } else if let Some(integer) = super::integer::plan(&instruction, index) {
+            Op::Integer(integer)
+        } else {
+            Op::Helper(index)
         };
         Some((op, len as u32))
     }
@@ -835,8 +876,24 @@ impl Op {
             Op::Nop | Op::Lea(..) | Op::Not(_) | Op::Cdq | Op::Jmp(_) | Op::Direction(_) => {
                 (F::NONE, F::NONE, false)
             }
-            // An MMX instruction may leave for the interpreter.
-            Op::Simd(simd) => (F::NONE, F::NONE, simd.memory() || simd.mmx()),
+            // MMX and floating-point instructions may leave for the
+            // interpreter.
+            Op::Simd(simd) => (
+                F::NONE,
+                F::NONE,
+                simd.memory() || simd.mmx() || simd.floating(),
+            ),
+            // A REP compare of no elements keeps the flags.
+            Op::Strings(strings) if strings.compares() => {
+                let reads = if strings.rep == super::strings::Rep::None {
+                    F::NONE
+                } else {
+                    F::ALL
+                };
+                (reads, F::ALL, true)
+            }
+            Op::Strings(_) => (F::NONE, F::NONE, true),
+            Op::Integer(integer) => integer.effects(),
             Op::Mov(dst, src) => (F::NONE, F::NONE, mem(dst) || mem(src)),
             Op::Alu(_, dst, src) => (F::NONE, F::ALL, mem(dst) || mem(src)),
             Op::Step(..) => (F::NONE, F::ALL.minus(F::CF), false),
@@ -846,7 +903,9 @@ impl Op {
                 (F::NONE, F::NONE, true)
             }
             Op::JmpIndirect(target) => (F::NONE, F::NONE, mem(target)),
-            Op::Jcc(cc, _) | Op::Setcc(cc, _) => (F::of(cc), F::NONE, false),
+            Op::Jcc(Cc::Flags(cc), _) | Op::Setcc(cc, _) => (F::of(cc), F::NONE, false),
+            Op::Jcc(Cc::Loop(Some(_)), _) => (F::ZF, F::NONE, false),
+            Op::Jcc(..) => (F::NONE, F::NONE, false),
             Op::Cmov(cc, _, source) => (F::of(cc), F::NONE, mem(source)),
             Op::Shift(kind, _, count) => {
                 let overflow = if count == 1 { F::OF } else { F::NONE };

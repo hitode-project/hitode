@@ -1,0 +1,493 @@
+//! Integer instructions outside the lazy flag forms: shifts by CL,
+//! rotates through carry, exchanges, the widening multiply and divide,
+//! byte swaps and `sahf`.
+//!
+//! A shift by CL writes its flags only when the count is not zero, so when
+//! a later instruction reads them the code starts from canonical flags and
+//! skips a zero count; otherwise it is a bare variable shift, which masks
+//! the count as x86 does. A divide whose divisor is zero or whose quotient
+//! does not fit leaves the work, and the #DE, to the `interpret` helper.
+//! Registers change only after every access, so a fault leaves the
+//! instruction undone, as in the interpreter.
+
+use iced_x86::{Instruction, Mnemonic as M, OpKind, Register};
+
+use crate::encode::Shift::{Asr, Lsl, Lsr};
+use crate::encode::Size::{W, X};
+use crate::encode::*;
+
+use super::decode::{ShiftKind, Src, memory};
+use super::flags::FlagSet;
+use super::{
+    Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
+    biased, host, temp,
+};
+
+const EAX: u8 = 0;
+const ECX: u8 = 1;
+const EDX: u8 = 2;
+/// The old NZCV while a shift by CL builds the new one; free once flags
+/// are canonical.
+const X8: Reg = temp(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Integer {
+    /// A 32-bit register shifted or rotated by CL.
+    ShiftCl(ShiftKind, u8),
+    /// `rcl` (true) or `rcr` of a 32-bit register by 1 to 31.
+    Through(bool, u8, u32),
+    /// `xadd dst, src`.
+    Xadd(Src, u8),
+    /// `xchg dst, src`.
+    Xchg(Src, u8),
+    Bswap(u8),
+    /// `mul` or `imul` (true) of EAX into EDX:EAX.
+    Multiply(Src, bool),
+    /// `div` or `idiv` (true) of EDX:EAX, with the helper that raises #DE.
+    Divide(Src, bool, u8),
+    Sahf,
+}
+
+/// The flags a shift by a count that is not zero writes.
+fn written(kind: ShiftKind) -> FlagSet {
+    use FlagSet as F;
+    match kind {
+        ShiftKind::Rol | ShiftKind::Ror => F::CF.or(F::OF),
+        _ => F::CF.or(F::OF).or(F::PF).or(F::ZF).or(F::SF),
+    }
+}
+
+impl Integer {
+    /// Flags read, flags written, and whether it has a fault site.
+    pub fn effects(self) -> (FlagSet, FlagSet, bool) {
+        use FlagSet as F;
+        let mem = |src: Src| matches!(src, Src::Mem(_));
+        match self {
+            // A count of zero keeps the flags it would write.
+            Integer::ShiftCl(kind, _) => (written(kind), written(kind), false),
+            Integer::Through(_, _, count) => {
+                let overflow = if count == 1 { F::OF } else { F::NONE };
+                (F::CF, F::CF.or(overflow), false)
+            }
+            Integer::Xadd(dst, _) => (F::NONE, F::ALL, mem(dst)),
+            Integer::Xchg(dst, _) => (F::NONE, F::NONE, mem(dst)),
+            Integer::Bswap(_) => (F::NONE, F::NONE, false),
+            Integer::Multiply(src, _) => (F::NONE, F::CF.or(F::OF), mem(src)),
+            // The helper reads every flag.
+            Integer::Divide(..) => (F::NONE, F::NONE, true),
+            Integer::Sahf => (F::NONE, F::ALL.minus(F::OF), false),
+        }
+    }
+}
+
+/// The integer instruction `instruction` is, when the translator handles
+/// it; `helper` runs it when a divide faults.
+pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
+    // ESP and EBP are biased in their host registers.
+    let register = |n| {
+        let register = instruction.op_register(n);
+        (instruction.op_kind(n) == OpKind::Register && register.is_gpr32())
+            .then_some(register.number() as u8)
+            .filter(|&index| !biased(index))
+    };
+    let operand = |n| match instruction.op_kind(n) {
+        OpKind::Register => register(n).map(Src::Reg),
+        OpKind::Memory if instruction.memory_size().size() == 4 => {
+            memory(instruction).map(Src::Mem)
+        }
+        _ => None,
+    };
+    let mnemonic = instruction.mnemonic();
+    // Locked exchanges are ordinary ones: guest threads take turns.
+    if instruction.has_lock_prefix()
+        && !(matches!(mnemonic, M::Xadd | M::Xchg) && instruction.op_kind(0) == OpKind::Memory)
+    {
+        return None;
+    }
+    Some(match mnemonic {
+        M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror
+            if instruction.op_kind(1) == OpKind::Register
+                && instruction.op_register(1) == Register::CL =>
+        {
+            let kind = match mnemonic {
+                M::Shl | M::Sal => ShiftKind::Shl,
+                M::Shr => ShiftKind::Shr,
+                M::Sar => ShiftKind::Sar,
+                M::Rol => ShiftKind::Rol,
+                _ => ShiftKind::Ror,
+            };
+            Integer::ShiftCl(kind, register(0)?)
+        }
+        M::Rcl | M::Rcr if instruction.op_kind(1) == OpKind::Immediate8 => {
+            match u32::from(instruction.immediate8()) & 31 {
+                0 => return None,
+                count => Integer::Through(mnemonic == M::Rcl, register(0)?, count),
+            }
+        }
+        M::Xadd => Integer::Xadd(operand(0)?, register(1)?),
+        M::Xchg => Integer::Xchg(operand(0)?, register(1)?),
+        M::Bswap => Integer::Bswap(register(0)?),
+        M::Mul | M::Imul if instruction.op_count() == 1 => {
+            Integer::Multiply(operand(0)?, mnemonic == M::Imul)
+        }
+        M::Div | M::Idiv => Integer::Divide(operand(0)?, mnemonic == M::Idiv, helper),
+        M::Sahf => Integer::Sahf,
+        _ => return None,
+    })
+}
+
+impl Translator<'_> {
+    pub(super) fn integer(&mut self, op: Integer) {
+        match op {
+            Integer::ShiftCl(kind, dst) => self.shift_cl(kind, dst),
+            Integer::Through(left, dst, count) => self.through(left, dst, count),
+            Integer::Xadd(dst, src) => self.xadd(dst, src),
+            Integer::Xchg(dst, src) => self.xchg(dst, src),
+            Integer::Bswap(index) => {
+                self.clobber(Operand::Guest(index));
+                self.emit(rev(W, host(index), host(index)));
+            }
+            Integer::Multiply(src, signed) => self.multiply(src, signed),
+            Integer::Divide(src, signed, helper) => self.divide(src, signed, helper),
+            Integer::Sahf => self.sahf(),
+        }
+    }
+
+    /// A 32-bit source in a register: its own, or w6 loaded.
+    fn source(&mut self, src: Src) -> Reg {
+        match src {
+            Src::Reg(index) => host(index),
+            Src::Mem(mem) => {
+                let addr = self.address(mem);
+                self.load(addr, X6);
+                X6
+            }
+            Src::Imm(_) => unreachable!(),
+        }
+    }
+
+    fn shift_cl(&mut self, kind: ShiftKind, dst: u8) {
+        use ShiftKind::*;
+        let (source, ecx) = (host(dst), host(ECX));
+        if !self.out.any(written(kind)) {
+            // A variable shift takes the count modulo 32, as x86 masks it.
+            self.clobber(Operand::Guest(dst));
+            let word = match kind {
+                Shl => shiftv(W, Lsl, source, source, ecx),
+                Shr => shiftv(W, Lsr, source, source, ecx),
+                Sar => shiftv(W, Asr, source, source, ecx),
+                Rol => {
+                    self.emit(sub(W, X16, Reg::ZR, ecx, Lsl, 0));
+                    rorv(W, source, source, X16)
+                }
+                Ror => rorv(W, source, source, ecx),
+            };
+            self.emit(word);
+            return;
+        }
+        self.canonicalize();
+        let done = self.asm.label();
+        self.emit(and_imm(W, X16, ecx, 31));
+        self.asm.cbz(W, false, X16, done);
+        // The result in w6; CF and OF as bits of registers.
+        let (carry, overflow) = match kind {
+            Shl => {
+                self.emit_all(&[
+                    shiftv(W, Lsl, X6, source, X16),
+                    sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                    shiftv(W, Lsr, X17, source, X17),
+                    eor(W, X15, X17, X6, Lsr, 31),
+                ]);
+                ((X17, 0), (X15, 0))
+            }
+            Shr | Sar => {
+                let shift = if kind == Shr { Lsr } else { Asr };
+                self.emit_all(&[
+                    shiftv(W, shift, X6, source, X16),
+                    sub_imm(W, X17, X16, 1, false),
+                    shiftv(W, Lsr, X17, source, X17),
+                ]);
+                let overflow = if kind == Shr {
+                    (source, 31)
+                } else {
+                    (Reg::ZR, 0)
+                };
+                ((X17, 0), overflow)
+            }
+            Rol => {
+                self.emit_all(&[
+                    sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                    rorv(W, X6, source, X17),
+                    eor(W, X15, X6, X6, Lsr, 31),
+                ]);
+                ((X6, 0), (X15, 0))
+            }
+            Ror => {
+                self.emit_all(&[rorv(W, X6, source, X16), eor(W, X15, X6, X6, Lsl, 1)]);
+                ((X6, 31), (X15, 31))
+            }
+        };
+        // OF changes only for a count of 1; C holds CF in subtraction sense.
+        self.emit_all(&[
+            mrs_nzcv(X8),
+            ubfx(W, X14, overflow.0, overflow.1, 1),
+            ubfx(W, X13, X8, 28, 1),
+            cmp_imm(W, X16, 1, false),
+            csel(W, X14, X14, X13, Cond::Eq),
+            bfi(X, X8, X14, 28, 1),
+            ubfx(W, X14, carry.0, carry.1, 1),
+            eor_imm(W, X14, X14, 1),
+            bfi(X, X8, X14, 29, 1),
+        ]);
+        if !matches!(kind, Rol | Ror) {
+            self.emit_all(&[
+                lsr_imm(W, X14, X6, 31),
+                bfi(X, X8, X14, 31, 1),
+                cmp_imm(W, X6, 0, false),
+                cset(W, X14, Cond::Eq),
+                bfi(X, X8, X14, 30, 1),
+                mov(W, X10, X6),
+            ]);
+        }
+        self.emit_all(&[msr_nzcv(X8), mov(W, source, X6)]);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
+    }
+
+    /// `rcl` or `rcr` by 1 to 31: the 33-bit rotate of CF and the register.
+    fn through(&mut self, left: bool, dst: u8, count: u32) {
+        let source = host(dst);
+        self.convert(FlagSet::CF);
+        self.clobber(Operand::Guest(dst));
+        // CF is set when C is clear.
+        self.emit(cset(W, X17, Cond::Lo));
+        let (carry, overflow) = if left {
+            self.emit_all(&[
+                lsl_imm(W, X6, source, count),
+                orr(W, X6, X6, X17, Lsl, count - 1),
+            ]);
+            if count > 1 {
+                self.emit(orr(W, X6, X6, source, Lsr, 33 - count));
+            }
+            // OF is the new top bit XOR CF: the old top two bits.
+            self.emit(eor(W, X15, source, source, Lsl, 1));
+            ((source, 32 - count), (X15, 31))
+        } else {
+            self.emit_all(&[
+                lsr_imm(W, X6, source, count),
+                orr(W, X6, X6, X17, Lsl, 32 - count),
+            ]);
+            if count > 1 {
+                self.emit(orr(W, X6, X6, source, Lsl, 33 - count));
+            }
+            // OF is the XOR of the new top two bits.
+            self.emit(eor(W, X15, X6, X6, Lsl, 1));
+            ((source, count - 1), (X15, 31))
+        };
+        let overflow = (count == 1 && self.out.any(FlagSet::OF)).then_some(overflow);
+        self.insert_flags(Some(carry), overflow);
+        self.emit(mov(W, source, X6));
+        self.state = State {
+            sense: Sense::Addition,
+            carry: Carry::Host,
+            derivable: None,
+            recipe: self.state.recipe,
+        };
+    }
+
+    /// The flags of the sum in w6 of `left` and `right`, after every access.
+    fn sum_flags(&mut self, left: Reg, right: Reg) {
+        if self.out.any(FlagSet::NZV.or(FlagSet::CF)) {
+            self.emit(cmn(W, left, right, Lsl, 0));
+        }
+        if self.out.any(FlagSet::PF.or(FlagSet::AF)) {
+            self.emit_all(&[
+                mov(W, X10, X6),
+                eor(W, X11, left, right, Lsl, 0),
+                eor(W, X11, X11, X6, Lsl, 0),
+            ]);
+        }
+    }
+
+    fn xadd(&mut self, dst: Src, src: u8) {
+        let right = host(src);
+        match dst {
+            Src::Reg(index) => {
+                let left = host(index);
+                self.emit(add(W, X6, left, right, Lsl, 0));
+                self.sum_flags(left, right);
+                self.clobber(Operand::Guest(index));
+                self.clobber(Operand::Guest(src));
+                self.emit_all(&[mov(W, right, left), mov(W, left, X6)]);
+            }
+            Src::Mem(mem) => {
+                let t = self.take_temp();
+                let addr = self.address(mem);
+                let left = temp(t);
+                self.load(addr, left);
+                self.forget(Operand::Temp(t));
+                self.emit(add(W, X6, left, right, Lsl, 0));
+                self.store(addr, X6);
+                self.sum_flags(left, right);
+                self.clobber(Operand::Guest(src));
+                self.emit(mov(W, right, left));
+            }
+            Src::Imm(_) => unreachable!(),
+        }
+        self.state = State {
+            sense: Sense::Addition,
+            carry: Carry::Host,
+            derivable: None,
+            recipe: Recipe::Canonical,
+        };
+    }
+
+    fn xchg(&mut self, dst: Src, src: u8) {
+        let right = host(src);
+        match dst {
+            Src::Reg(index) if index == src => {}
+            Src::Reg(index) => {
+                let left = host(index);
+                self.clobber(Operand::Guest(index));
+                self.clobber(Operand::Guest(src));
+                self.emit_all(&[mov(W, X16, left), mov(W, left, right), mov(W, right, X16)]);
+            }
+            Src::Mem(mem) => {
+                let addr = self.address(mem);
+                self.load(addr, X6);
+                self.store(addr, right);
+                self.clobber(Operand::Guest(src));
+                self.emit(mov(W, right, X6));
+            }
+            Src::Imm(_) => unreachable!(),
+        }
+    }
+
+    /// CF and OF report a product that does not fit EAX; SF, ZF, AF and PF
+    /// stay, as in the interpreter.
+    fn multiply(&mut self, src: Src, signed: bool) {
+        let value = self.source(src);
+        self.clobber(Operand::Guest(EAX));
+        self.clobber(Operand::Guest(EDX));
+        let (eax, edx) = (host(EAX), host(EDX));
+        self.emit(if signed {
+            smull(X16, eax, value)
+        } else {
+            umull(X16, eax, value)
+        });
+        let flags = self.out.any(FlagSet::CF.or(FlagSet::OF));
+        if flags {
+            // What the low half cannot hold; bit 6 of its leading zeros,
+            // flipped, is whether there is any.
+            self.emit_all(&[
+                if signed {
+                    sub_ext(X, X17, X16, X16, Extend::Sxtw, 0)
+                } else {
+                    lsr_imm(X, X17, X16, 32)
+                },
+                clz(X, X17, X17),
+                eor_imm(W, X17, X17, 64),
+            ]);
+        }
+        self.emit_all(&[mov(W, eax, X16), lsr_imm(X, edx, X16, 32)]);
+        if flags {
+            self.insert_flags(Some((X17, 6)), Some((X17, 6)));
+            self.state.sense = Sense::Addition;
+            self.state.carry = Carry::Host;
+            self.state.derivable = None;
+        }
+    }
+
+    fn divide(&mut self, src: Src, signed: bool, helper: u8) {
+        self.canonicalize();
+        let value = self.source(src);
+        let (eax, edx) = (host(EAX), host(EDX));
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        self.asm.cbz(W, false, value, slow);
+        // x16 is EDX:EAX; x17 the quotient and x15 the remainder. Only the
+        // low halves of the guest registers are defined.
+        self.emit_all(&[
+            mov(W, X16, eax),
+            mov(W, X15, edx),
+            orr(X, X16, X16, X15, Lsl, 32),
+        ]);
+        if signed {
+            self.emit_all(&[
+                sbfx(X, X14, value, 0, 32),
+                sdiv(X, X17, X16, X14),
+                sub_ext(X, X15, X17, X17, Extend::Sxtw, 0),
+            ]);
+            self.asm.cbz(X, true, X15, slow);
+            self.emit(msub(X, X15, X17, X14, X16));
+        } else {
+            self.emit_all(&[
+                mov(W, X14, value),
+                udiv(X, X17, X16, X14),
+                lsr_imm(X, X15, X17, 32),
+            ]);
+            self.asm.cbz(X, true, X15, slow);
+            self.emit(msub(X, X15, X17, X14, X16));
+        }
+        self.clobber(Operand::Guest(EAX));
+        self.clobber(Operand::Guest(EDX));
+        self.emit_all(&[mov(W, eax, X17), mov(W, edx, X15)]);
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
+    }
+
+    /// SF, ZF, AF, PF and CF from AH, in canonical form; OF stays in V.
+    fn sahf(&mut self) {
+        let eax = host(EAX);
+        self.emit_all(&[
+            mrs_nzcv(X13),
+            ubfx(W, X14, eax, 14, 2),
+            bfi(X, X13, X14, 30, 2),
+            ubfx(W, X14, eax, 8, 1),
+            eor_imm(W, X14, X14, 1),
+            bfi(X, X13, X14, 29, 1),
+            msr_nzcv(X13),
+            // AF is bit 4 of AH, and an odd low byte of x10 clears PF.
+            ubfx(W, X11, eax, 8, 8),
+            ubfx(W, X10, eax, 10, 1),
+            eor_imm(W, X10, X10, 1),
+        ]);
+        self.state = State::CANONICAL;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> Instruction {
+        iced_x86::Decoder::with_ip(32, bytes, 0x1000, iced_x86::DecoderOptions::NONE).decode()
+    }
+
+    #[test]
+    fn plans_take_32_bit_forms_without_the_stack_registers() {
+        // shl eax, cl; rcl ebx, 1; lock xadd [ecx], edx; div dword [esi].
+        assert_eq!(
+            plan(&decode(&[0xd3, 0xe0]), 0),
+            Some(Integer::ShiftCl(ShiftKind::Shl, 0))
+        );
+        assert_eq!(
+            plan(&decode(&[0xd1, 0xd3]), 0),
+            Some(Integer::Through(true, 3, 1))
+        );
+        assert!(matches!(
+            plan(&decode(&[0xf0, 0x0f, 0xc1, 0x11]), 0),
+            Some(Integer::Xadd(Src::Mem(_), 2))
+        ));
+        assert!(matches!(
+            plan(&decode(&[0xf7, 0x36]), 5),
+            Some(Integer::Divide(Src::Mem(_), false, 5))
+        ));
+        // shl esp, cl; shl ax, cl; lock bswap; div byte [esi].
+        assert_eq!(plan(&decode(&[0xd3, 0xe4]), 0), None);
+        assert_eq!(plan(&decode(&[0x66, 0xd3, 0xe0]), 0), None);
+        assert_eq!(plan(&decode(&[0xf6, 0x36]), 0), None);
+    }
+}

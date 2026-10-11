@@ -282,7 +282,13 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         Op::Nop => {}
         // The interpreter runs these: `Fetcher::helpers` is off here, and
         // narrow forms are rare in code that runs once.
-        Op::Helper(_) | Op::Narrow(..) | Op::StepMemory(..) | Op::Direction(_) | Op::Simd(_) => {
+        Op::Helper(_)
+        | Op::Narrow(..)
+        | Op::StepMemory(..)
+        | Op::Direction(_)
+        | Op::Simd(_)
+        | Op::Strings(_)
+        | Op::Integer(_) => {
             return None;
         }
         Op::Mov(dst, src) => {
@@ -363,12 +369,20 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
             cpu.regs[usize::from(ESP)] = esp.wrapping_add(4).wrapping_add(u32::from(bytes));
         }
         Op::Jcc(cc, to) => {
-            if condition(cc, *flags) {
-                target = Some(to);
-            } else {
-                // A not-taken branch still ends the block.
-                target = Some(next);
-            }
+            use super::decode::Cc;
+            let ecx = regs[1];
+            let taken = match cc {
+                Cc::Flags(cc) => condition(cc, *flags),
+                Cc::EcxZero => ecx == 0,
+                Cc::CxZero => ecx & 0xffff == 0,
+                Cc::Loop(zero) => {
+                    let ecx = ecx.wrapping_sub(1);
+                    cpu.regs[1] = ecx;
+                    ecx != 0 && zero.is_none_or(|set| (*flags & ZF != 0) == set)
+                }
+            };
+            // A not-taken branch still ends the block.
+            target = Some(if taken { to } else { next });
         }
         Op::Setcc(cc, n) => {
             let value = u32::from(condition(cc, *flags));

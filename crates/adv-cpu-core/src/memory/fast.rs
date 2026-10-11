@@ -17,6 +17,8 @@ pub struct FastPermissions {
     bytes: Arc<Vec<u8>>,
     dirty: Option<Range<usize>>,
     selective: bool,
+    /// Counts the snapshots whose bytes differ from the one before.
+    version: u64,
 }
 
 impl FastPermissions {
@@ -29,7 +31,15 @@ impl FastPermissions {
             bytes,
             dirty: None,
             selective: false,
+            version: 0,
         }
+    }
+
+    /// Changes whenever a snapshot's bytes may differ from the last one's,
+    /// including when they were updated in place because no other holder
+    /// remained.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub(super) fn invalidate(&mut self, pages: Range<usize>) {
@@ -79,6 +89,7 @@ impl FastPermissions {
             permissions
         };
         if let Some(pages) = self.dirty.take() {
+            self.version += 1;
             let bytes = Arc::make_mut(&mut self.bytes);
             for page in pages {
                 let current = permission(page);

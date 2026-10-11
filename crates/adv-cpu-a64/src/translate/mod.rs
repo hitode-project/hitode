@@ -35,8 +35,10 @@
 mod decode;
 pub mod first;
 mod flags;
+mod integer;
 mod ops;
 mod simd;
+mod strings;
 mod trace;
 
 use iced_x86::ConditionCode;
@@ -206,6 +208,20 @@ impl State {
     };
 }
 
+/// What a conditional branch tests, once `Translator::test` has prepared
+/// it.
+#[derive(Clone, Copy)]
+enum Test {
+    Cond(Cond),
+    /// PF set (true) or clear, from w16's bit 0.
+    Parity(bool),
+    EcxZero,
+    /// CX, shifted into w16, is zero.
+    CxZero,
+    /// ECX, counted down, is not zero, and the condition holds if any.
+    Count(Option<Cond>),
+}
+
 /// Code emitted after the unit body.
 enum Cold {
     /// Leaves for a static EIP with canonical flags after refunding the
@@ -230,7 +246,7 @@ enum Cold {
     Refuse {
         label: Label,
         net: u32,
-        cond: Cond,
+        test: Test,
         leave: Label,
         resume: Label,
     },
@@ -464,13 +480,13 @@ impl Translator<'_> {
     }
 
     /// A jcc at the current instruction whose taken edge is `taken`.
-    fn branch(&mut self, cc: ConditionCode, taken: Edge) {
+    fn branch(&mut self, cc: decode::Cc, taken: Edge) {
         let from = self.index;
         match taken {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
                 self.convert(self.trace.live_in[to]);
-                let cond = self.condition(cc);
+                let test = self.test(cc);
                 let net = self.trace.net(from, to);
                 if net > 0 {
                     let net = net as u32;
@@ -478,13 +494,13 @@ impl Translator<'_> {
                         (self.asm.label(), self.asm.label(), self.asm.label());
                     self.emit(sub_imm(X, X9, X9, net, false));
                     self.asm.tbz(true, X9, 63, refuse);
-                    self.asm.b_cond(cond, self.labels[to]);
+                    self.jump_if(test, self.labels[to]);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
                     self.cold.push(Cold::Refuse {
                         label: refuse,
                         net,
-                        cond,
+                        test,
                         leave,
                         resume,
                     });
@@ -497,10 +513,10 @@ impl Translator<'_> {
                         link: false,
                     });
                 } else if net == 0 {
-                    self.asm.b_cond(cond, self.labels[to]);
+                    self.jump_if(test, self.labels[to]);
                 } else {
                     let label = self.asm.label();
-                    self.asm.b_cond(cond, label);
+                    self.jump_if(test, label);
                     self.cold.push(Cold::Edge {
                         label,
                         state: self.state,
@@ -510,12 +526,12 @@ impl Translator<'_> {
                 }
             }
             Edge::Internal(to) => {
-                let cond = self.condition(cc);
+                let test = self.test(cc);
                 if self.trace.net(from, to) == 0 && !self.needs(self.trace.live_in[to]) {
-                    self.asm.b_cond(cond, self.labels[to]);
+                    self.jump_if(test, self.labels[to]);
                 } else {
                     let label = self.asm.label();
-                    self.asm.b_cond(cond, label);
+                    self.jump_if(test, label);
                     self.cold.push(Cold::Edge {
                         label,
                         state: self.state,
@@ -525,9 +541,9 @@ impl Translator<'_> {
                 }
             }
             Edge::Exit(eip) => {
-                let cond = self.condition(cc);
+                let test = self.test(cc);
                 let label = self.asm.label();
-                self.asm.b_cond(cond, label);
+                self.jump_if(test, label);
                 self.cold.push(Cold::Leave {
                     label,
                     state: self.state,
@@ -538,6 +554,61 @@ impl Translator<'_> {
                 });
             }
             Edge::Interpret(_) => unreachable!("a jcc target dispatches"),
+        }
+    }
+
+    /// Emits what `cc` needs before its test: the decrement of a `loop`,
+    /// or PF's parity into w16.
+    fn test(&mut self, cc: decode::Cc) -> Test {
+        use decode::Cc;
+        const ECX: u8 = 1;
+        match cc {
+            Cc::Flags(ConditionCode::p | ConditionCode::np) => {
+                self.convert(FlagSet::PF);
+                // Bit 0 folds the parity of x10's low byte: 1 when odd,
+                // when PF is clear.
+                self.emit_all(&[
+                    eor(W, X16, X10, X10, Shift::Lsr, 4),
+                    eor(W, X16, X16, X16, Shift::Lsr, 2),
+                    eor(W, X16, X16, X16, Shift::Lsr, 1),
+                ]);
+                Test::Parity(cc == Cc::Flags(ConditionCode::p))
+            }
+            Cc::Flags(cc) => Test::Cond(self.condition(cc)),
+            Cc::EcxZero => Test::EcxZero,
+            Cc::CxZero => {
+                self.emit(lsl_imm(W, X16, host(ECX), 16));
+                Test::CxZero
+            }
+            Cc::Loop(zero) => {
+                self.clobber(Operand::Guest(ECX));
+                self.emit(sub_imm(W, host(ECX), host(ECX), 1, false));
+                let zero = zero.map(|set| {
+                    self.condition(if set {
+                        ConditionCode::e
+                    } else {
+                        ConditionCode::ne
+                    })
+                });
+                Test::Count(zero)
+            }
+        }
+    }
+
+    /// Branches to `label` when `test` holds; repeatable after it.
+    fn jump_if(&mut self, test: Test, label: Label) {
+        match test {
+            Test::Cond(cond) => self.asm.b_cond(cond, label),
+            Test::Parity(set) => self.asm.tbz(!set, X16, 0, label),
+            Test::EcxZero => self.asm.cbz(W, false, host(1), label),
+            Test::CxZero => self.asm.cbz(W, false, X16, label),
+            Test::Count(None) => self.asm.cbz(W, true, host(1), label),
+            Test::Count(Some(cond)) => {
+                let skip = self.asm.label();
+                self.asm.cbz(W, false, host(1), skip);
+                self.asm.b_cond(cond, label);
+                self.asm.bind(skip);
+            }
         }
     }
 
@@ -837,7 +908,7 @@ impl Translator<'_> {
                 self.set_sense(Sense::Subtraction);
                 if cc == C::be { Cond::Ls } else { Cond::Hi }
             }
-            C::p | C::np | C::None => unreachable!("filtered by `supported`"),
+            C::p | C::np | C::None => unreachable!("tested by `test`, or filtered by `supported`"),
         }
     }
 
@@ -930,13 +1001,13 @@ impl Translator<'_> {
             Cold::Refuse {
                 label,
                 net,
-                cond,
+                test,
                 leave,
                 resume,
             } => {
                 self.asm.bind(label);
                 self.emit(add_imm(X, X9, X9, net, false));
-                self.asm.b_cond(cond, leave);
+                self.jump_if(test, leave);
                 self.asm.b(resume);
             }
             Cold::Lookup {

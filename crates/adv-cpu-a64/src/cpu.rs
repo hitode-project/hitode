@@ -477,7 +477,10 @@ impl Backend for Cpu {
                     budget,
                 };
             }
-            let result = m.run_with_traps(self.park, 32_768, &mut Raw { handler }, !self.native);
+            // The deadline bounds the run, not the fuel: a short fuel would
+            // leave units that do not fit it to the interpreter.
+            let result =
+                m.run_with_traps(self.park, u64::MAX >> 2, &mut Raw { handler }, !self.native);
             let kind = match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;

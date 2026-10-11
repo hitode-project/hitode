@@ -18,7 +18,7 @@ use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 /// An address operand ready for a load or store.
 #[derive(Clone, Copy)]
-enum Addr {
+pub(super) enum Addr {
     /// A W register holding the guest address: `[x27, w, uxtw]`.
     Window(Reg),
     /// A biased stack register plus an offset the guards cover.
@@ -46,6 +46,8 @@ impl Translator<'_> {
             Op::Nop | Op::Jmp(_) => {}
             Op::Helper(index) => self.helper(index),
             Op::Simd(simd) => self.simd(simd),
+            Op::Strings(strings) => self.strings(strings),
+            Op::Integer(integer) => self.integer(integer),
             Op::Direction(set) => self.emit(movz(W, super::X12, u16::from(set), 0)),
             Op::Mov(Src::Reg(dst), source) => self.mov_register(dst, source),
             Op::Mov(Src::Mem(mem), source) => {
@@ -388,7 +390,7 @@ impl Translator<'_> {
 
     /// An address for a 32-bit access to `mem`; a checked one is always in
     /// a register.
-    fn address(&mut self, mem: Mem) -> Addr {
+    pub(super) fn address(&mut self, mem: Mem) -> Addr {
         if let (Some(base), None) = (mem.base, mem.index)
             && biased(base)
             && !self.checking
@@ -404,7 +406,7 @@ impl Translator<'_> {
         Addr::Window(self.effective(mem))
     }
 
-    fn load(&mut self, addr: Addr, rt: Reg) {
+    pub(super) fn load(&mut self, addr: Addr, rt: Reg) {
         if let (true, Addr::Window(a)) = (self.checking, addr) {
             self.checked(a, rt, 4, ldr_reg(W, rt, WINDOW, a, false));
             return;
@@ -417,7 +419,7 @@ impl Translator<'_> {
         });
     }
 
-    fn store(&mut self, addr: Addr, rt: Reg) {
+    pub(super) fn store(&mut self, addr: Addr, rt: Reg) {
         if let (true, Addr::Window(a)) = (self.checking, addr) {
             self.checked(a, rt, 4 | ACCESS_STORE, str_reg(W, rt, WINDOW, a, false));
             return;

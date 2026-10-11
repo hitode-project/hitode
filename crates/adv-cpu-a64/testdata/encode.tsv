@@ -193,3 +193,22 @@ bd4004a0	ldr s0, [x5, #4]
 7942d4b0	ldrh w16, [x5, #362]
 7902d8bf	strh wzr, [x5, #364]
 781fd0b1	sturh w17, [x5, #-3]
+1ad02266	lslv w6, w19, w16
+1ad12691	lsrv w17, w20, w17
+1ad02b46	asrv w6, w26, w16
+1ad12f26	rorv w6, w25, w17
+9ac60a11	udiv x17, x16, x6
+9acf0e11	sdiv x17, x16, x15
+9b06c22f	msub x15, x17, x6, x16
+9ba67e70	umull x16, w19, w6
+5ac00ad3	rev w19, w22
+dac01231	clz x17, x17
+d53b4431	mrs x17, fpsr
+d51b443f	msr fpsr, xzr
+6eb0a800	umaxv s0, v0.4s
+0e21a820	fcvtns v0.2s, v1.2s
+0ea1b820	fcvtzs v0.2s, v1.2s
+7ea2e420	fcmgt s0, s1, s2
+2ea2e420	fcmgt v0.2s, v1.2s, v2.2s
+0f215420	shl v0.2s, v1.2s, #1
+2ea02ca0	uqsub v0.2s, v5.2s, v0.2s
