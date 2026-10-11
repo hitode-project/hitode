@@ -5,6 +5,8 @@ use adv_cpu::backend::MemFault;
 use adv_machine::{Env, Object};
 use adv_os::processor::Processors;
 
+mod ideal;
+
 fn process(env: &Env<'_>, handle: Handle) -> bool {
     handle.0 == u32::MAX
         || matches!(env.sys.objects.get(handle.0), Some(Object::Process { identity, .. }) if identity.pid == env.sys.pid)
@@ -216,6 +218,7 @@ fn set_group_affinity(
     Ok(1)
 }
 pub(super) fn register(reg: &mut Registry) {
+    ideal::register(reg);
     for api in [
         get_affinity_ABI,
         set_process_ABI,
