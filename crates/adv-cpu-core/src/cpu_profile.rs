@@ -63,6 +63,61 @@ impl Default for SegmentState {
     }
 }
 
+impl SegmentState {
+    /// Writes the WoW64 flat GDT at `addr` and an empty IDT after it, and
+    /// selects them.
+    pub fn wow64(memory: &mut crate::Memory, addr: u32) -> Result<Self, String> {
+        use crate::backend::SegmentSetup;
+        memory.pages(addr, 4096)?;
+        memory.committed(addr, 4096)?;
+        let mut gdt = [0u8; 128];
+        for (selector, code, dpl) in [
+            (0x23u16, true, 3),
+            (0x2b, false, 3),
+            (0x30, false, 0),
+            (0x53, false, 3),
+        ] {
+            let offset = usize::from(selector >> 3) * 8;
+            gdt[offset..offset + 8].copy_from_slice(&descriptor(0, code, dpl).to_le_bytes());
+        }
+        memory.write(addr, &gdt)?;
+        let idt_base = addr + SegmentSetup::IDT_OFFSET;
+        memory.write(idt_base, &[0; SegmentSetup::IDT_LIMIT as usize + 1])?;
+        Ok(Self {
+            selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
+            gdt_base: addr,
+            gdt_limit: 127,
+            idt_base,
+            idt_limit: SegmentSetup::IDT_LIMIT,
+            ldt_selector: 0,
+        })
+    }
+
+    /// Points the FS descriptor, if there is a GDT, at `base`.
+    pub fn set_fs_base(&self, memory: &mut crate::Memory, base: u32) -> Result<(), String> {
+        if self.gdt_limit != 0 {
+            let offset = u32::from(self.selectors[4] >> 3) * 8;
+            let addr = self
+                .gdt_base
+                .checked_add(offset)
+                .ok_or("GDT address overflow")?;
+            memory.write(addr, &descriptor(base, false, 3).to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+/// A flat 4 GiB code or data descriptor at `base` with privilege `dpl`.
+fn descriptor(base: u32, code: bool, dpl: u64) -> u64 {
+    let base = u64::from(base);
+    0xffff
+        | ((base & 0xffff) << 16)
+        | (((base >> 16) & 0xff) << 32)
+        | (((if code { 0x9b } else { 0x93 }) | (dpl << 5)) << 40)
+        | (0xcf << 48)
+        | ((base >> 24) << 56)
+}
+
 /// CPUID result in architectural EAX, EBX, ECX, EDX order.
 pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
     let vendor = PROCESSOR_IDENTITY.vendor.as_bytes();

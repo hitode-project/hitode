@@ -57,7 +57,13 @@ pub struct Stats {
 pub struct Executor {
     pub state: CpuState,
     pub stats: Stats,
-    memory: Memory,
+    pub(crate) memory: Memory,
+    /// Whether every instruction runs in the interpreter.
+    pub(crate) interpreter_only: bool,
+    /// Instructions translated code left to the interpreter, by EIP.
+    pub(crate) histogram: rustc_hash::FxHashMap<u32, u64>,
+    /// Faults of translated code, by EIP.
+    pub(crate) faults: rustc_hash::FxHashMap<u32, u64>,
     interpreter: Interpreter,
     timestamp: adv_cpu_core::timestamp::Counter,
     interrupt: Arc<AtomicBool>,
@@ -99,6 +105,9 @@ impl Executor {
             state: CpuState::default(),
             stats: Stats::default(),
             memory,
+            interpreter_only: false,
+            histogram: Default::default(),
+            faults: Default::default(),
             interpreter: Interpreter::new(),
             timestamp: Default::default(),
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -176,16 +185,68 @@ impl Executor {
         self.run_execution(stop, budget, None)
     }
 
-    /// Execute with a caller-owned raw trap handler. `_interpreter_only` is
-    /// accepted for interface parity; M0 interprets everything.
+    /// Execute with a caller-owned raw trap handler; `interpreter_only`
+    /// keeps this run out of translated code.
     pub fn run_with_traps(
         &mut self,
         stop: u32,
         budget: u64,
         handler: &mut dyn ExecutionTrap,
-        _interpreter_only: bool,
+        interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        self.run_execution(stop, budget, Some(handler))
+        let saved = self.interpreter_only;
+        self.interpreter_only |= interpreter_only;
+        let result = self.run_execution(stop, budget, Some(handler));
+        self.interpreter_only = saved;
+        result
+    }
+
+    /// Diagnostic counts of the translated runs, as `name: value` pairs.
+    pub fn diagnostics(&self) -> String {
+        #[cfg(native)]
+        return format!(
+            "{:?} unchecked faults {} checked {}",
+            self.native.diagnostics,
+            self.native.unchecked_faults,
+            self.native.checked_count()
+        );
+        #[cfg(not(native))]
+        String::new()
+    }
+
+    /// Instructions by form, most frequent first, as the code at their
+    /// EIPs decodes now: those interpreted after an exit, after a fault, or
+    /// (`which` 2) run by helpers.
+    pub fn interpreted_forms(&self, which: u8) -> Vec<(iced_x86::Code, u64)> {
+        let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
+        #[cfg(native)]
+        let helpers = self.native.helper_histogram();
+        #[cfg(not(native))]
+        let helpers = rustc_hash::FxHashMap::default();
+        let histogram = match which {
+            0 => &self.histogram,
+            1 => &self.faults,
+            _ => &helpers,
+        };
+        for (&eip, &count) in histogram {
+            let mut bytes = [0; 15];
+            let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
+            if self.memory.read_into(eip, &mut bytes).is_err()
+                && self.memory.read_into(eip, &mut bytes[..page]).is_err()
+            {
+                continue;
+            }
+            let mut decoder = iced_x86::Decoder::with_ip(
+                32,
+                &bytes,
+                u64::from(eip),
+                iced_x86::DecoderOptions::NONE,
+            );
+            *forms.entry(decoder.decode().code()).or_default() += count;
+        }
+        let mut forms: Vec<_> = forms.into_iter().collect();
+        forms.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        forms
     }
 
     fn run_execution(
@@ -231,6 +292,9 @@ impl Executor {
     /// Runs translated code from EIP; `None` where the host has none.
     #[cfg(native)]
     fn run_native(&mut self, stop: u32) -> Result<Option<Exit>, String> {
+        if self.interpreter_only {
+            return Ok(None);
+        }
         let fuel = self.state.fuel;
         let Some(run) = self
             .native
@@ -296,9 +360,23 @@ impl Executor {
             } else if let Some(exit) = self.run_native(stop)? {
                 match exit {
                     Exit::Dispatch => continue,
+                    // The helper ran the instruction; the owner completes it.
+                    #[cfg(native)]
+                    Exit::Stepped => {
+                        let execution = self.native.pending.take().expect("a pending step");
+                        (execution, execution.units)
+                    }
+                    #[cfg(not(native))]
+                    Exit::Stepped => unreachable!("no translated code"),
                     // The unit spent the budget; the instruction waits.
                     Exit::Interpret | Exit::Fault if self.state.fuel == 0 => continue,
                     Exit::Interpret | Exit::Fault => {
+                        let histogram = if exit == Exit::Interpret {
+                            &mut self.histogram
+                        } else {
+                            &mut self.faults
+                        };
+                        *histogram.entry(self.state.eip).or_default() += 1;
                         let execution =
                             self.interpreter
                                 .run_chunk(&mut self.state, &mut self.memory, 1);

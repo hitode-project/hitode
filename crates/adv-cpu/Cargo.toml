@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Execution layer facade: the platform's x86-32 engine over the engine-neutral core"
 
 [dependencies]
+adv-cpu-a64 = { path = "../adv-cpu-a64", optional = true }
 adv-cpu-x64 = { path = "../adv-cpu-x64" }
 
 [features]
@@ -18,6 +19,9 @@ cross-dump = ["adv-cpu-x64/cross-dump"]
 # Migration comparison, deleted at a64 M3: integration tests built with it
 # drive the a64 executor instead of the x64 one. Production code ignores it.
 test-a64 = []
+# Migration comparison, deleted at a64 M3: on AArch64 hosts `JitCpu` is the
+# a64 engine's CPU, so whole-game runs can measure it against the x64 one.
+engine-a64 = ["dep:adv-cpu-a64"]
 
 [dev-dependencies]
 adv-cpu = { path = ".", features = ["jit-verifier"] }

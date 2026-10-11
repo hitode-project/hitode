@@ -80,6 +80,7 @@ name = "adv-cpu-a64"
 version = "0.1.0"
 dependencies = [
  "adv-cpu-core",
+ "adv-sync",
  "iced-x86",
  "libc",
  "rustc-hash 2.1.3",

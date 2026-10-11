@@ -20,6 +20,10 @@
 //! the rest call the `access` stub, so soft pages cost a helper call
 //! rather than a fault.
 //!
+//! An instruction the translator does not handle but the interpreter runs
+//! without transferring control calls the `interpret` stub with canonical
+//! flags, and the unit goes on unless the helper asks it to leave.
+//!
 //! Host registers beyond the guest map of §4: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
 //! exit stub saves for fault recovery, x13 and x14 flag scratch without
@@ -34,6 +38,7 @@ mod trace;
 
 use iced_x86::ConditionCode;
 
+pub use decode::Helper;
 pub use flags::{Carry, Operand, Recipe, Sense};
 pub use trace::MAX_INSTRUCTIONS;
 
@@ -72,7 +77,7 @@ pub struct Site {
 /// The last unit translated, in buffers the next translation reuses.
 #[derive(Default)]
 pub struct Workspace {
-    trace: Trace,
+    pub(crate) trace: Trace,
     asm: Asm,
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
@@ -119,6 +124,12 @@ impl Workspace {
     pub fn links(&self) -> &[Link] {
         &self.links
     }
+
+    /// What the unit's `interpret` calls run, from the base index
+    /// `translate` was given on.
+    pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
+        self.trace.helpers.drain(..)
+    }
 }
 
 /// Host addresses of the `runtime` stubs units branch to.
@@ -134,6 +145,8 @@ pub struct Stubs {
     pub ret_miss: usize,
     /// A checked access the window cannot take.
     pub access: usize,
+    /// An instruction the interpreter runs.
+    pub interpret: usize,
 }
 
 const X0: Reg = Reg::new(0);
@@ -241,6 +254,9 @@ enum Cold {
         value: Reg,
         kind: u32,
     },
+    /// The `interpret` helper asked to leave with the exit + 1 in w0, at
+    /// the EIP in `CpuState`, after refunding the countdown.
+    Helper { label: Label, refund: u32 },
 }
 
 struct Translator<'a> {
@@ -257,6 +273,8 @@ struct Translator<'a> {
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
     checked: &'a dyn Fn(u32) -> bool,
+    /// The index of the first helper of the unit.
+    helpers: u32,
     /// Whether the instruction being emitted is one.
     checking: bool,
     state: State,
@@ -269,8 +287,9 @@ struct Translator<'a> {
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
-/// `at`. Units end before any of `stops`, and the accesses of instructions
-/// `checked` accepts check their page first. Each translated byte is
+/// `at`. Units end before any of `stops`, the accesses of instructions
+/// `checked` accepts check their page first, and the unit's helpers are
+/// numbered from `helpers`. Each translated byte is
 /// registered with `watch_code`, so a store to it reaches the owner.
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
@@ -279,6 +298,7 @@ pub fn translate(
     eip: u32,
     stops: &[u32],
     checked: &dyn Fn(u32) -> bool,
+    helpers: u32,
     features: Features,
     at: usize,
     stubs: Stubs,
@@ -315,6 +335,7 @@ pub fn translate(
         links,
         stubs,
         checked,
+        helpers,
         checking: false,
         state: State::CANONICAL,
         index: 0,
@@ -958,6 +979,18 @@ impl Translator<'_> {
                     self.emit(mov(W, value, X0));
                 }
                 self.asm.b(resume);
+            }
+            Cold::Helper { label, refund } => {
+                self.asm.bind(label);
+                if refund != 0 {
+                    self.emit(add_imm(X, X9, X9, refund, false));
+                }
+                self.emit_all(&[
+                    sub_imm(W, X0, X0, 1, false),
+                    ldr(X, X17, RUNTIME, crate::runtime::CPU_STATE),
+                    ldr(W, X1, X17, crate::runtime::EIP),
+                ]);
+                self.far(self.stubs.exit);
             }
         }
     }

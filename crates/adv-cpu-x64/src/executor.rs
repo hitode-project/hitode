@@ -394,46 +394,12 @@ impl Executor {
     }
 
     pub(crate) fn setup_wow64_segments(&mut self, addr: u32) -> Result<(), String> {
-        self.memory.pages(addr, 4096)?;
-        self.memory.committed(addr, 4096)?;
-        let mut gdt = [0u8; 128];
-        for (selector, code, dpl) in [
-            (0x23u16, true, 3),
-            (0x2b, false, 3),
-            (0x30, false, 0),
-            (0x53, false, 3),
-        ] {
-            let offset = usize::from(selector >> 3) * 8;
-            gdt[offset..offset + 8].copy_from_slice(&descriptor_dpl(0, code, dpl).to_le_bytes());
-        }
-        self.memory.write(addr, &gdt)?;
-        let idt_base = addr + crate::backend::SegmentSetup::IDT_OFFSET;
-        self.memory.write(
-            idt_base,
-            &[0; crate::backend::SegmentSetup::IDT_LIMIT as usize + 1],
-        )?;
-        self.state.segments = crate::SegmentState {
-            selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
-            gdt_base: addr,
-            gdt_limit: 127,
-            idt_base,
-            idt_limit: crate::backend::SegmentSetup::IDT_LIMIT,
-            ldt_selector: 0,
-        };
+        self.state.segments = crate::SegmentState::wow64(&mut self.memory, addr)?;
         Ok(())
     }
 
     pub(crate) fn set_fs_base(&mut self, base: u32) -> Result<(), String> {
-        let segments = self.state.segments;
-        if segments.gdt_limit != 0 {
-            let offset = u32::from(segments.selectors[4] >> 3) * 8;
-            let addr = segments
-                .gdt_base
-                .checked_add(offset)
-                .ok_or("GDT address overflow")?;
-            self.memory
-                .write(addr, &descriptor_dpl(base, false, 3).to_le_bytes())?;
-        }
+        self.state.segments.set_fs_base(&mut self.memory, base)?;
         self.state.fs_base = base;
         Ok(())
     }
@@ -2184,16 +2150,6 @@ mod responsive_compile_tests {
             }
         }
     }
-}
-
-fn descriptor_dpl(base: u32, code: bool, dpl: u64) -> u64 {
-    let base = u64::from(base);
-    0xffff
-        | ((base & 0xffff) << 16)
-        | (((base >> 16) & 0xff) << 32)
-        | (((if code { 0x9b } else { 0x93 }) | (dpl << 5)) << 40)
-        | (0xcf << 48)
-        | ((base >> 24) << 56)
 }
 
 #[cfg(test)]

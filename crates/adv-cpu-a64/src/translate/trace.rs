@@ -21,7 +21,7 @@
 
 use adv_cpu_core::memory::Memory;
 
-use super::decode::{Effects, Fetcher, Op};
+use super::decode::{Effects, Fetcher, Helper, Op};
 use super::flags::FlagSet;
 
 /// Longest trace, in guest instructions.
@@ -102,6 +102,10 @@ pub struct Trace {
     frames: Vec<Frame>,
     /// Instruction index + 1 by (EIP, frame), open addressing.
     slots: Vec<u8>,
+    /// `Fetcher::failure` of the fetch that ended the trace.
+    pub failure: u8,
+    /// What each `Op::Helper` runs.
+    pub helpers: Vec<Helper>,
 }
 
 /// The stops, behind a one-word filter: most EIPs are not stops.
@@ -143,6 +147,8 @@ impl Trace {
         self.slots.clear();
         self.slots.resize(SLOTS, 0);
         let mut fetcher = Fetcher::new(memory);
+        self.helpers.clear();
+        fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
         let (mut pc, mut frame) = (entry, 0u16);
         loop {
@@ -161,6 +167,7 @@ impl Trace {
                 break;
             }
             let Some((op, size)) = fetcher.fetch(pc) else {
+                self.failure = fetcher.failure;
                 if let Some(last) = self.insts.last_mut() {
                     last.next = Next::Edge(Edge::Interpret(pc));
                 }
@@ -229,6 +236,7 @@ impl Trace {
                 None => break,
             }
         }
+        self.helpers = fetcher.helpers.take().unwrap_or_default();
         // Inlined callees and loops revisit bytes: watch each one once.
         self.code.sort_unstable();
         let mut merged = 0;

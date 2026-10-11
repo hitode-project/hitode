@@ -10,7 +10,8 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X3, X4, X5, X6, X16, X17, biased, host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X16, X17, biased,
+    host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
@@ -33,6 +34,7 @@ impl Translator<'_> {
     pub(super) fn op(&mut self, inst: Inst) {
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
+            Op::Helper(index) => self.helper(index),
             Op::Mov(Src::Reg(dst), source) => self.mov_register(dst, source),
             Op::Mov(Src::Mem(mem), source) => {
                 let value = match source {
@@ -396,6 +398,21 @@ impl Translator<'_> {
             Addr::Window(a) => str_reg(W, rt, WINDOW, a, false),
             Addr::Biased(b, d) if d >= 0 && d % 4 == 0 => str(W, rt, b, d as u32),
             Addr::Biased(b, d) => stur(W, rt, b, d),
+        });
+    }
+
+    /// Has the interpreter run the instruction at helper `index` of the
+    /// unit, with canonical flags; leaves when it asks to.
+    fn helper(&mut self, index: u8) {
+        self.canonicalize();
+        self.mov_imm(X1, self.helpers + u32::from(index));
+        self.far_call(self.stubs.interpret);
+        self.state = State::CANONICAL;
+        let leave = self.asm.label();
+        self.asm.cbz(W, true, X0, leave);
+        self.cold.push(Cold::Helper {
+            label: leave,
+            refund: self.trace.unused(self.index),
         });
     }
 

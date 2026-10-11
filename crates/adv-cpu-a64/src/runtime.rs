@@ -26,6 +26,11 @@
 //! loaded value in w0; when the owner refuses, it leaves as the fault stub
 //! would for a host fault at the access, whose site the helper recorded.
 //!
+//! Instructions the translator leaves to the interpreter call `interpret`
+//! with canonical flags: it stores the guest as `exit` does, has the
+//! owner's `interpret` helper run the instruction, loads the guest back as
+//! `enter` does and returns the helper's status, 0 to continue.
+//!
 //! XMM state stays in `CpuState` until a unit uses SSE (M2), so the stubs
 //! do not move it. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
@@ -72,6 +77,11 @@ pub struct Runtime {
     /// The page class table: a byte per guest page, its permissions as
     /// `Memory::native_permissions` has them.
     pub classes: u64,
+    /// `interpret(runtime, helper, countdown) -> status`, called by
+    /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
+    /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
+    /// beyond the one prepaid, signed.
+    pub interpret: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -94,6 +104,7 @@ impl Runtime {
             resume: 0,
             access: 0,
             classes: 0,
+            interpret: 0,
             exit: 0,
             temps: [0; 2],
         }
@@ -112,6 +123,8 @@ pub enum Exit {
     /// from the site, where guest state is exactly that before the
     /// instruction (§5.2).
     Fault = 2,
+    /// The `interpret` helper left a step for the owner to complete.
+    Stepped = 3,
 }
 
 impl Exit {
@@ -120,6 +133,7 @@ impl Exit {
             0 => Some(Self::Interpret),
             1 => Some(Self::Dispatch),
             2 => Some(Self::Fault),
+            3 => Some(Self::Stepped),
             _ => None,
         }
     }
@@ -141,6 +155,8 @@ pub struct Stubs {
     pub shadow_reset: usize,
     /// Where a checked access the window cannot take calls the owner.
     pub access: usize,
+    /// Where translated code has the owner interpret an instruction.
+    pub interpret: usize,
 }
 
 /// Indirect table entries; a guest EIP indexes them by bits 2 to 17.
@@ -186,10 +202,12 @@ pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
+const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
+pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
-const EIP: u32 = field(offset_of!(CpuState, eip));
+pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.
@@ -237,6 +255,8 @@ pub fn stubs() -> Stubs {
     ]);
     let access = asm.offset();
     emit_access(&mut asm, fault_label);
+    let interpret = asm.offset();
+    emit_interpret(&mut asm);
     Stubs {
         code: asm.finish(),
         enter,
@@ -248,7 +268,39 @@ pub fn stubs() -> Stubs {
         ret_miss,
         shadow_reset,
         access,
+        interpret,
     }
+}
+
+/// `interpret`, called with w1 the helper's index and canonical flags.
+/// Keeps x7-x9 and x27-x29; the guest registers and flags are what the
+/// helper left in `CpuState`, x0-x6 and x13-x17 are free.
+fn emit_interpret(asm: &mut Asm) {
+    asm.emit_all(&[
+        stp(X, Pre, r(7), r(8), SP, -32),
+        stp(X, Offset, r(9), Reg::LR, SP, 16),
+        mov(W, r(6), r(1)),
+        ldr(X, r(0), RUNTIME, CPU),
+    ]);
+    emit_store_guest(asm);
+    asm.emit_all(&[
+        mov(X, r(0), RUNTIME),
+        mov(W, r(1), r(6)),
+        mov(X, r(2), r(9)),
+        ldr(X, r(16), RUNTIME, INTERPRET),
+        blr(r(16)),
+        mov(X, r(6), r(0)),
+        ldr(X, r(0), RUNTIME, CPU),
+    ]);
+    emit_load_guest(asm);
+    asm.emit_all(&[
+        ldp(X, Offset, r(9), Reg::LR, SP, 16),
+        ldp(X, Post, r(7), r(8), SP, 32),
+        sbfx(X, r(1), r(6), 32, 32),
+        sub(X, r(9), r(9), r(1), Lsl, 0),
+        mov(W, r(0), r(6)),
+        ret(Reg::LR),
+    ]);
 }
 
 /// `access`, called with w1 the guest address, x2 the site, w3 a value to
@@ -371,6 +423,13 @@ fn emit_enter(asm: &mut Asm) {
         ldr(X, r(9), RUNTIME, COUNTDOWN),
         ldr(X, r(0), RUNTIME, CPU),
     ]);
+    emit_load_guest(asm);
+    asm.emit(br(r(17)));
+}
+
+/// Loads the guest registers and flags from the `CpuState` at x0; uses x1
+/// to x3 and x16.
+fn emit_load_guest(asm: &mut Asm) {
     for (i, (a, b)) in GUEST.into_iter().enumerate() {
         if a == 23 {
             // ESP and EBP live biased by the window base.
@@ -400,7 +459,6 @@ fn emit_enter(asm: &mut Asm) {
         and_imm(W, r(11), r(1), 0x10),
         ubfx(W, r(12), r(1), 10, 1),
     ]);
-    asm.emit(br(r(17)));
 }
 
 /// Translated code arrives with the `Exit` in w0 and the guest EIP in w1.
@@ -411,6 +469,25 @@ fn emit_exit(asm: &mut Asm) {
         ldr(X, r(0), RUNTIME, CPU),
         str(W, r(1), r(0), EIP),
     ]);
+    emit_store_guest(asm);
+    asm.emit_all(&[
+        str(X, r(9), RUNTIME, COUNTDOWN),
+        str(X, r(28), RUNTIME, SHADOW),
+        ldr(X, r(16), RUNTIME, HOST_SP),
+        mov_sp(SP, r(16)),
+    ]);
+    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
+        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
+    }
+    for (i, (a, b)) in SAVED.into_iter().enumerate() {
+        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
+    }
+    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
+}
+
+/// Stores the guest registers and flags to the `CpuState` at x0; uses x1
+/// to x5.
+fn emit_store_guest(asm: &mut Asm) {
     for (i, (a, b)) in GUEST.into_iter().enumerate() {
         // The low halves of x23 and x24 are ESP and EBP themselves.
         asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
@@ -440,18 +517,7 @@ fn emit_exit(asm: &mut Asm) {
         bic(W, r(4), r(4), r(5), Lsl, 0),
         orr(W, r(4), r(4), r(3), Lsl, 0),
         str(W, r(4), r(0), EFLAGS),
-        str(X, r(9), RUNTIME, COUNTDOWN),
-        str(X, r(28), RUNTIME, SHADOW),
-        ldr(X, r(16), RUNTIME, HOST_SP),
-        mov_sp(SP, r(16)),
     ]);
-    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
-        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
-    }
-    for (i, (a, b)) in SAVED.into_iter().enumerate() {
-        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
-    }
-    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
 }
 
 #[cfg(all(test, emulator))]

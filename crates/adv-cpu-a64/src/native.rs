@@ -38,7 +38,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use adv_cpu_core::CpuState;
-use adv_cpu_core::interpreter::accessible;
+use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 
 use crate::cache::CodeCache;
@@ -245,6 +245,30 @@ struct Entry {
 }
 
 /// One trip through translated code.
+/// How runs ended and what the cache went through, for reports.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Diagnostics {
+    pub first_visits: u64,
+    pub first_declined: u64,
+    pub empty: u64,
+    pub over_fuel: u64,
+    pub interprets: u64,
+    pub faults: u64,
+    pub dispatches: u64,
+    pub dropped_units: u64,
+    pub clears: u64,
+    /// Empty units translated, by `Fetcher::failure`.
+    pub empty_units: [u64; 4],
+    /// Checked accesses `access` performed and refused.
+    pub accesses: u64,
+    pub refused: u64,
+    /// Faults at checked sites, refusals included.
+    pub checked_faults: u64,
+    /// Instructions `interpret` ran, and the runs it left.
+    pub helpers: u64,
+    pub helper_exits: u64,
+}
+
 pub(crate) struct Run {
     pub exit: Exit,
     /// Guest instructions completed.
@@ -305,7 +329,8 @@ unsafe extern "C" fn access(
 ) -> u64 {
     // SAFETY: as in `dispatch`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
-    let (native, memory) = unsafe { (&*owner.native, &mut *owner.memory) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    native.diagnostics.accesses += 1;
     let width = (kind & 7) as usize;
     let done = if kind & runtime::ACCESS_STORE != 0 {
         (accessible(memory, address, width as u8, WRITE)
@@ -329,10 +354,59 @@ unsafe extern "C" fn access(
     match done {
         Some(value) => u64::from(value),
         None => {
+            native.diagnostics.refused += 1;
             native.faults.pc.set(site);
             1 << 32
         }
     }
+}
+
+/// Called by the `interpret` stub: runs helper `index` with the guest in
+/// `CpuState`, a REP for at most the countdown left and the instruction
+/// prepaid. Continues if it completed and changed no code or mapping;
+/// otherwise leaves to dispatch where it went, or with the step for the
+/// owner to complete, refunding the instruction (`Runtime::interpret`).
+unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64) -> u64 {
+    const LEAVE: u32 = Exit::Dispatch as u32 + 1;
+    // SAFETY: as in `dispatch`; the runtime's CPU is live while units run.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    let cpu = unsafe { &mut *(*runtime).cpu };
+    let helper = &native.helpers[index as usize];
+    cpu.eip = helper.pc;
+    native.diagnostics.helpers += 1;
+    native.helper_counts[index as usize] += 1;
+    let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
+    let units = countdown.saturating_add(1).min(u64::from(u32::MAX)) as u32;
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        helper.prepared.execute(cpu, memory, units)
+    }));
+    let (status, charge) = match run {
+        Ok(Execution {
+            step: Step::Executed,
+            units,
+        }) => {
+            let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
+            let status = if same && cpu.eip == helper.next {
+                0
+            } else {
+                LEAVE
+            };
+            (status, i64::from(units) - 1)
+        }
+        Ok(execution) => {
+            native.pending = Some(execution);
+            (Exit::Stepped as u32 + 1, -1)
+        }
+        Err(_) => {
+            owner.error = Some(format!("the interpreter panicked at {:#x}", helper.pc));
+            (LEAVE, -1)
+        }
+    };
+    if status != 0 {
+        native.diagnostics.helper_exits += 1;
+    }
+    (charge as u64) << 32 | u64::from(status)
 }
 
 pub(crate) struct Native {
@@ -362,6 +436,8 @@ pub(crate) struct Native {
     checked: FxHashSet<u32>,
     /// Faults at unchecked sites so far.
     pub(crate) unchecked_faults: u64,
+    /// Diagnostic counts of how runs end; see `Diagnostics`.
+    pub(crate) diagnostics: Diagnostics,
     /// Each placed unit's host address and entry, ascending.
     placed: Vec<(usize, u32)>,
     /// The permissions the page class table was made from, and the table
@@ -370,6 +446,14 @@ pub(crate) struct Native {
     classes: Option<Box<[u8]>>,
     /// Buffers of the last translation.
     work: translate::Workspace,
+    /// What the units' `interpret` calls run, until the cache clears,
+    /// and how often each ran.
+    helpers: Vec<translate::Helper>,
+    helper_counts: Vec<u64>,
+    /// Helper runs by EIP from before the last clear.
+    helper_eips: FxHashMap<u32, u64>,
+    /// The step an `Exit::Stepped` leaves the owner.
+    pub(crate) pending: Option<Execution>,
     /// Counts cache clears, which invalidate link points.
     generation: u64,
     /// The indirect table the runtime points at.
@@ -420,6 +504,7 @@ impl Native {
                 lookup_slow: base + stubs.lookup_slow,
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
+                interpret: base + stubs.interpret,
             },
             units: FxHashMap::default(),
             pages: FxHashMap::default(),
@@ -432,10 +517,15 @@ impl Native {
             strikes: FxHashMap::default(),
             checked: FxHashSet::default(),
             unchecked_faults: 0,
+            diagnostics: Diagnostics::default(),
             placed: Vec::new(),
             snapshot: None,
             classes: None,
             work: translate::Workspace::default(),
+            helpers: Vec::new(),
+            helper_counts: Vec::new(),
+            helper_eips: FxHashMap::default(),
+            pending: None,
             generation: 0,
             table,
             shadow,
@@ -462,6 +552,8 @@ impl Native {
             Some(entry) => (entry, 0),
             None if self.first_visit(cpu.eip) => {
                 let visit = translate::first::run(cpu, memory, stop, fuel.min(SLICE));
+                self.diagnostics.first_visits += 1;
+                self.diagnostics.first_declined += u64::from(visit.declined);
                 let exit = if visit.declined {
                     Exit::Interpret
                 } else {
@@ -480,9 +572,11 @@ impl Native {
             }
         };
         if u64::from(entry.retired) > fuel {
+            self.diagnostics.over_fuel += 1;
             return Ok(None);
         }
         if entry.retired == 0 {
+            self.diagnostics.empty += 1;
             // The first instruction is not translated: skip the round trip.
             return Ok(Some(Run {
                 exit: Exit::Interpret,
@@ -514,6 +608,7 @@ impl Native {
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
+            (*runtime).interpret = interpret as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -527,6 +622,12 @@ impl Native {
         let translated = owner.translated;
         let exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
+        match exit {
+            Exit::Interpret => self.diagnostics.interprets += 1,
+            Exit::Fault => self.diagnostics.faults += 1,
+            Exit::Dispatch => self.diagnostics.dispatches += 1,
+            Exit::Stepped => {}
+        }
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {
             let pc = self.faults.pc.get();
@@ -536,6 +637,8 @@ impl Native {
             if !site.checked {
                 self.unchecked_faults += 1;
                 self.strike(site.eip, pc);
+            } else {
+                self.diagnostics.checked_faults += 1;
             }
         }
         let retired = retired as u32;
@@ -586,7 +689,9 @@ impl Native {
         let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
-                dropped |= self.drop_unit(eip);
+                let unit = self.drop_unit(eip);
+                self.diagnostics.dropped_units += u64::from(unit);
+                dropped |= unit;
             }
         }
         if dropped {
@@ -603,6 +708,11 @@ impl Native {
             next = after;
         }
         self.units.remove(&eip).is_some()
+    }
+
+    /// Guest instructions whose accesses check their page.
+    pub(crate) fn checked_count(&self) -> usize {
+        self.checked.len()
     }
 
     /// Counts a fault at an unchecked site of `eip`, at host address `pc`.
@@ -675,15 +785,28 @@ impl Native {
 
     /// Clears the cache as a whole (§7.1).
     fn clear(&mut self) {
+        self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
         self.units.clear();
         self.pages.clear();
         self.links.clear();
         self.linked.clear();
         self.placed.clear();
+        self.helper_eips = self.helper_histogram();
+        self.helpers.clear();
+        self.helper_counts.clear();
         self.generation += 1;
         self.faults.sites.clear();
         self.forget_dynamic();
+    }
+
+    /// Helper runs by EIP.
+    pub(crate) fn helper_histogram(&self) -> FxHashMap<u32, u64> {
+        let mut eips = self.helper_eips.clone();
+        for (helper, &count) in self.helpers.iter().zip(&self.helper_counts) {
+            *eips.entry(helper.pc).or_default() += count;
+        }
+        eips
     }
 
     /// Whether code at `eip` is known to run, so translating it pays.
@@ -748,13 +871,19 @@ impl Native {
             eip,
             &self.stops,
             &|pc| all || checked.contains(&pc),
+            self.helpers.len() as u32,
             self.features,
             at,
             self.stubs,
         );
+        if work.retired() == 0 {
+            self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;
+        }
         let entry = self.place(eip, work.words(), work.sites(), work.retired());
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
+            self.helpers.extend(work.helpers());
+            self.helper_counts.resize(self.helpers.len(), 0);
             let points = work
                 .links()
                 .iter()

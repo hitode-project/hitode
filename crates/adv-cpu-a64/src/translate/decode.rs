@@ -5,8 +5,11 @@
 //! and `plan`. Whatever `quick` accepts, iced and `plan` decode to the same
 //! `Op` and length (`quick_agrees_with_iced`).
 
+use adv_cpu_core::interpreter::Prepared;
 use adv_cpu_core::memory::Memory;
-use iced_x86::{ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{
+    ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 
 use super::flags::FlagSet;
 
@@ -86,6 +89,9 @@ pub enum Op {
     Imul(u8, Src, Option<u32>),
     /// `adc` (false) or `sbb` (true) into a register.
     Carry(bool, u8, Src),
+    /// Anything else the interpreter runs without transferring control:
+    /// the `interpret` stub runs it, by its index in the trace's helpers.
+    Helper(u8),
 }
 
 fn gpr32(register: Register) -> Option<u8> {
@@ -621,6 +627,13 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
     })
 }
 
+/// An instruction the interpreter runs for translated code.
+pub struct Helper {
+    pub pc: u32,
+    pub next: u32,
+    pub prepared: Prepared,
+}
+
 /// Decodes guest instructions a page at a time, over the page and, when it
 /// is executable too, the start of the next one; iced only sees a page
 /// when `quick` declines an instruction on it.
@@ -629,6 +642,12 @@ pub struct Fetcher<'m> {
     page: Option<u32>,
     bytes: &'m [u8],
     decoder: Option<Decoder<'m>>,
+    /// Why the last fetch failed: 1 not executable, 2 unreadable, 3 not
+    /// handled.
+    pub failure: u8,
+    /// Whether instructions `plan` declines become `Op::Helper`, kept
+    /// here.
+    pub helpers: Option<Vec<Helper>>,
 }
 
 impl<'m> Fetcher<'m> {
@@ -638,6 +657,8 @@ impl<'m> Fetcher<'m> {
             page: None,
             bytes: &[],
             decoder: None,
+            failure: 0,
+            helpers: None,
         }
     }
 
@@ -650,6 +671,7 @@ impl<'m> Fetcher<'m> {
             self.page = None;
             self.decoder = None;
             if !self.memory.executable(page, PAGE as usize) {
+                self.failure = 1;
                 return None;
             }
             // An instruction may run up to 14 bytes into the next page.
@@ -657,9 +679,11 @@ impl<'m> Fetcher<'m> {
                 .checked_add(PAGE)
                 .is_some_and(|next| self.memory.executable(next, 15));
             let len = PAGE as usize + if more { 15 } else { 0 };
-            self.bytes = self.memory.read(page, len).ok()?;
+            self.failure = 2;
+            self.bytes = self.memory.read_linear(page, len).ok()?;
             self.page = Some(page);
         }
+        self.failure = 3;
         let at = (pc - page) as usize;
         if let Some(quick) = quick(&self.bytes[at..], pc) {
             return Some(quick);
@@ -676,7 +700,20 @@ impl<'m> Fetcher<'m> {
         if instruction.is_invalid() {
             return None;
         }
-        plan(&instruction).map(|op| (op, instruction.len() as u32))
+        let len = instruction.len();
+        if let Some(op) = plan(&instruction) {
+            return Some((op, len as u32));
+        }
+        let helpers = self.helpers.as_mut()?;
+        if instruction.flow_control() != FlowControl::Next || helpers.len() > usize::from(u8::MAX) {
+            return None;
+        }
+        helpers.push(Helper {
+            pc,
+            next: instruction.next_ip32(),
+            prepared: Prepared::new(&instruction, self.bytes.get(at..at + len)?)?,
+        });
+        Some((Op::Helper((helpers.len() - 1) as u8), len as u32))
     }
 }
 
@@ -716,6 +753,8 @@ impl Op {
             }
             Op::Imul(_, source, _) => (F::NONE, F::CF.or(F::OF), mem(source)),
             Op::Carry(_, _, source) => (F::CF, F::ALL, mem(source)),
+            // The interpreter reads and writes canonical flags.
+            Op::Helper(_) => (F::ALL, F::NONE, true),
         };
         Effects {
             reads,

@@ -5,7 +5,8 @@
 //! decoded `Op` at a time with the flags computed in full, until control
 //! transfers; the owner translates an entry when it comes back to it. Only
 //! the plain case runs here: an instruction `quick`/`plan` does not handle,
-//! or whose memory is not an ordinary page (`Memory::direct`), is declined
+//! or whose memory is not ordinary (`Memory::direct_read`, `Memory::direct`
+//! for stores), is declined
 //! before it changes anything, and the core interpreter runs it.
 
 use adv_cpu_core::CpuState;
@@ -78,8 +79,8 @@ fn address(mem: Mem, regs: &[u32; 8]) -> u32 {
 }
 
 fn load(address: u32, len: usize, memory: &Memory) -> Option<u32> {
-    let p = memory.direct(address, len, false)?;
-    // SAFETY: `direct` checked the whole ordinary readable range, and the
+    let p = memory.direct_read(address, len)?;
+    // SAFETY: `direct_read` checked the whole linear readable range, and the
     // borrow of `memory` keeps it mapped.
     Some(unsafe {
         match len {
@@ -275,6 +276,8 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
     let mut target = None;
     match op {
         Op::Nop => {}
+        // The interpreter runs these: `Fetcher::helpers` is off here.
+        Op::Helper(_) => return None,
         Op::Mov(dst, src) => {
             let value = read(src, &regs, memory)?;
             Place::of(dst, &regs, memory)?.commit(value, cpu);

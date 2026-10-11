@@ -131,7 +131,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(25) {
+    match rng.below(26) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -313,6 +313,27 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
                 }
             }
             .unwrap()
+        }
+        // More the interpreter runs inside units: narrow and
+        // read-modify-write memory forms, and REP elements.
+        24 => {
+            let m = mem(a, rng);
+            match rng.below(7) {
+                0 => a.mov(word_ptr(m), rng.pick(&WORDS)).unwrap(),
+                1 => a.add(byte_ptr(m), rng.imm() & 0x7f).unwrap(),
+                2 => a.cmp(word_ptr(m), rng.imm() & 0x7fff).unwrap(),
+                3 => a.xadd(dword_ptr(m), w).unwrap(),
+                4 => a.inc(dword_ptr(m)).unwrap(),
+                5 => {
+                    a.push(dword_ptr(m)).unwrap();
+                    a.pop(w).unwrap();
+                }
+                _ => {
+                    a.mov(edi, DATA as i32 + 0x200).unwrap();
+                    a.and(ecx, 15).unwrap();
+                    a.rep().stosb().unwrap();
+                }
+            }
         }
         _ => a.nop().unwrap(),
     }

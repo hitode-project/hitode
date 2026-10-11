@@ -645,7 +645,15 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
         } else {
             Decoded::Stop(Step::InvalidInstruction { pc })
         }
-    } else if let Some(action) = predecode(&instruction) {
+    } else {
+        decode(&instruction, &entry.bytes[..instruction.len()])
+    };
+    entry
+}
+
+/// How the interpreter runs a valid `instruction` encoded as `bytes`.
+fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
+    if let Some(action) = predecode(instruction) {
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
@@ -657,23 +665,76 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
                     && (instruction.op0_kind() == OpKind::Memory
                         || instruction.op1_kind() == OpKind::Memory),
         })
-    } else if let Some(plan) = simd::Plan::decode(&instruction) {
+    } else if let Some(plan) = simd::Plan::decode(instruction) {
         Decoded::Simd(plan)
-    } else if let Some(operation) = crate::floating::operation(&instruction) {
+    } else if let Some(operation) = crate::floating::operation(instruction) {
         // Preserve the original prefix/opcode scan in the decoded entry. Its
         // code bytes share the same validation as the instruction itself.
-        let opcode = entry.bytes[..instruction.len()]
-            .windows(2)
-            .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
-            .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16);
-        Decoded::Extended(instruction, operation, opcode)
+        Decoded::Extended(*instruction, operation, x87_opcode(bytes))
     } else {
         Decoded::Stop(Step::Unsupported {
-            pc,
+            pc: instruction.ip32(),
             code: instruction.code(),
         })
-    };
-    entry
+    }
+}
+
+/// The x87 opcode of an instruction's bytes: the first byte pair whose
+/// first byte is D8 to DF.
+fn x87_opcode(bytes: &[u8]) -> Option<u16> {
+    bytes
+        .windows(2)
+        .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
+        .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16)
+}
+
+/// One instruction translated code runs through the interpreter without
+/// leaving, decoded when it is translated.
+pub struct Prepared {
+    decoded: Decoded,
+    /// The host-double path of an x87 instruction.
+    x87: Option<crate::floating::NativeX87>,
+}
+
+impl Prepared {
+    /// `instruction`, encoded as `bytes`, unless the interpreter would stop
+    /// at it.
+    pub fn new(instruction: &Instruction, bytes: &[u8]) -> Option<Self> {
+        let decoded = decode(instruction, bytes);
+        let x87 = match decoded {
+            Decoded::Stop(_) => return None,
+            Decoded::Extended(i, crate::floating::Operation::X87, opcode) => {
+                Some(crate::floating::NativeX87 {
+                    instruction: i,
+                    opcode,
+                    fast: crate::floating::fast::classify(&i),
+                })
+            }
+            _ => None,
+        };
+        Some(Self { decoded, x87 })
+    }
+
+    /// Runs the instruction at `state.eip` as `Interpreter::run_chunk`
+    /// would, a REP for at most `max_units` elements.
+    pub fn execute(&self, state: &mut CpuState, memory: &mut Memory, max_units: u32) -> Execution {
+        if let Some(op) = &self.x87
+            && state.eflags & (1 << 8) == 0
+        {
+            let result = match op.fast {
+                Some(fast) => crate::floating::fast::execute(op, fast, state, memory),
+                None => crate::floating::fast::execute_other(op, state, memory),
+            };
+            if result.is_some() {
+                state.eflags &= !(1 << 16);
+                return Execution {
+                    step: Step::Executed,
+                    units: 1,
+                };
+            }
+        }
+        execute_decoded(&self.decoded, state, memory, max_units, None)
+    }
 }
 
 const BLOCK_INSTRUCTIONS: usize = 64;
