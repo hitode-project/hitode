@@ -131,7 +131,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(26) {
+    match rng.below(28) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -335,7 +335,92 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
                 }
             }
         }
+        25 => narrow(a, rng, mem),
+        // FS-relative accesses; FS points into the data.
+        26 => {
+            let m = mem(a, rng).fs();
+            match rng.below(5) {
+                0 => a.mov(w, dword_ptr(m)).unwrap(),
+                1 => a.mov(dword_ptr(m), r).unwrap(),
+                2 => a.add(dword_ptr(m), r).unwrap(),
+                3 => a.cmp(byte_ptr(m), rng.imm() & 0x7f).unwrap(),
+                _ => a.dec(dword_ptr(m)).unwrap(),
+            }
+        }
         _ => a.nop().unwrap(),
+    }
+}
+
+/// An 8- or 16-bit `mov` or ALU operation on registers, memory and
+/// immediates, high byte registers and SP and BP included.
+fn narrow(
+    a: &mut CodeAssembler,
+    rng: &mut Rng,
+    mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
+) {
+    let (op, form) = (rng.below(8), rng.below(5));
+    let imm = rng.imm();
+    macro_rules! apply {
+        ($dst:expr, $src:expr) => {
+            match op {
+                7 => a.test($dst, $src).unwrap(),
+                _ => load!($dst, $src),
+            }
+        };
+    }
+    // `test` has no register, memory form.
+    macro_rules! load {
+        ($dst:expr, $src:expr) => {
+            match op {
+                0 => a.mov($dst, $src),
+                1 => a.add($dst, $src),
+                2 => a.sub($dst, $src),
+                3 => a.and($dst, $src),
+                4 => a.or($dst, $src),
+                5 => a.xor($dst, $src),
+                _ => a.cmp($dst, $src),
+            }
+            .unwrap()
+        };
+    }
+    if rng.below(2) == 0 {
+        let (dst, src) = (rng.pick(&SET_BYTES), rng.pick(&BYTES));
+        match form {
+            0 => apply!(dst, src),
+            1 => apply!(dst, imm & 0xff),
+            2 => {
+                let m = mem(a, rng);
+                load!(dst, byte_ptr(m))
+            }
+            3 => {
+                let m = mem(a, rng);
+                apply!(byte_ptr(m), src)
+            }
+            _ => {
+                let m = mem(a, rng);
+                apply!(byte_ptr(m), imm & 0x7f)
+            }
+        }
+    } else {
+        // SP stays put: its low half is written with its own value.
+        let dst = rng.pick(&[ax, cx, dx, di, bp]);
+        let src = rng.pick(&WORDS);
+        match form {
+            0 => apply!(dst, src),
+            1 => apply!(dst, imm & 0x7fff),
+            2 => {
+                let m = mem(a, rng);
+                load!(dst, word_ptr(m))
+            }
+            3 => {
+                let m = mem(a, rng);
+                apply!(word_ptr(m), src)
+            }
+            _ => {
+                let m = mem(a, rng);
+                apply!(word_ptr(m), imm & 0x7fff)
+            }
+        }
     }
 }
 
@@ -632,6 +717,7 @@ fn build(seed: u64, addresses: &[u32]) -> (Program, Vec<u32>) {
     let mut state = CpuState {
         eip: CODE,
         eflags: 0x202 | (rng.next() as u32 & 0x8d5),
+        fs_base: 0x800,
         ..CpuState::default()
     };
     for (index, value) in state.regs.iter_mut().enumerate() {

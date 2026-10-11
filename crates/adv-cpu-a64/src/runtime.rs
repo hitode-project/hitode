@@ -208,6 +208,7 @@ pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
+pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
 const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.

@@ -70,12 +70,16 @@ pub fn run(cpu: &mut CpuState, memory: &Memory, stop: u32, fuel: u64) -> Visit {
     }
 }
 
-fn address(mem: Mem, regs: &[u32; 8]) -> u32 {
+/// The flat address of `mem`; FS-relative ones are declined.
+fn address(mem: Mem, regs: &[u32; 8]) -> Option<u32> {
+    if mem.fs {
+        return None;
+    }
     let base = mem.base.map_or(0, |base| regs[usize::from(base)]);
     let index = mem
         .index
         .map_or(0, |index| regs[usize::from(index)].wrapping_mul(mem.scale));
-    base.wrapping_add(index).wrapping_add(mem.disp)
+    Some(base.wrapping_add(index).wrapping_add(mem.disp))
 }
 
 fn load(address: u32, len: usize, memory: &Memory) -> Option<u32> {
@@ -111,7 +115,7 @@ fn read(src: Src, regs: &[u32; 8], memory: &Memory) -> Option<u32> {
     match src {
         Src::Reg(index) => Some(regs[usize::from(index)]),
         Src::Imm(value) => Some(value),
-        Src::Mem(mem) => load(address(mem, regs), 4, memory),
+        Src::Mem(mem) => load(address(mem, regs)?, 4, memory),
     }
 }
 
@@ -125,7 +129,7 @@ impl Place {
     fn of(dst: Src, regs: &[u32; 8], memory: &Memory) -> Option<Self> {
         match dst {
             Src::Reg(index) => Some(Self::Reg(index)),
-            Src::Mem(mem) => Store::at(address(mem, regs), memory).map(Self::Mem),
+            Src::Mem(mem) => Store::at(address(mem, regs)?, memory).map(Self::Mem),
             Src::Imm(_) => None,
         }
     }
@@ -276,13 +280,14 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
     let mut target = None;
     match op {
         Op::Nop => {}
-        // The interpreter runs these: `Fetcher::helpers` is off here.
-        Op::Helper(_) => return None,
+        // The interpreter runs these: `Fetcher::helpers` is off here, and
+        // narrow forms are rare in code that runs once.
+        Op::Helper(_) | Op::Narrow(..) | Op::StepMemory(..) => return None,
         Op::Mov(dst, src) => {
             let value = read(src, &regs, memory)?;
             Place::of(dst, &regs, memory)?.commit(value, cpu);
         }
-        Op::Lea(dst, mem) => cpu.regs[usize::from(dst)] = address(mem, &regs),
+        Op::Lea(dst, mem) => cpu.regs[usize::from(dst)] = address(mem, &regs)?,
         Op::Alu(alu, dst, src) => {
             let (a, b) = (read(dst, &regs, memory)?, read(src, &regs, memory)?);
             let place = match alu {
@@ -323,7 +328,7 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
                 Narrow8or16::Word(n) => (regs[usize::from(n)] & 0xffff, true),
                 Narrow8or16::Mem(mem, word) => {
                     let len = if word { 2 } else { 1 };
-                    (load(address(mem, &regs), len, memory)?, word)
+                    (load(address(mem, &regs)?, len, memory)?, word)
                 }
             };
             cpu.regs[usize::from(dst)] = match (signed, word) {

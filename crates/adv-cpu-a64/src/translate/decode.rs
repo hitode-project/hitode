@@ -22,6 +22,8 @@ pub struct Mem {
     pub index: Option<u8>,
     pub scale: u32,
     pub disp: u32,
+    /// Relative to the FS base rather than flat.
+    pub fs: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +51,16 @@ pub enum ShiftKind {
     Sar,
     Rol,
     Ror,
+}
+
+/// An operand of an 8- or 16-bit instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// A byte register as `Narrow8or16::Byte` numbers it, or a word
+    /// register by guest index.
+    Reg(u8),
+    Imm(u32),
+    Mem(Mem),
 }
 
 /// A narrow source of `movzx`/`movsx`.
@@ -89,6 +101,10 @@ pub enum Op {
     Imul(u8, Src, Option<u32>),
     /// `adc` (false) or `sbb` (true) into a register.
     Carry(bool, u8, Src),
+    /// `mov` (`None`) or an ALU operation of 1 or 2 bytes.
+    Narrow(Option<Alu>, u8, Part, Part),
+    /// `inc` (true) or `dec` of a 32-bit memory operand, which keep CF.
+    StepMemory(bool, Mem),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -99,11 +115,13 @@ fn gpr32(register: Register) -> Option<u8> {
 }
 
 fn memory(instruction: &Instruction) -> Option<Mem> {
-    // Flat DS/SS/ES only: FS and GS have bases, and an override is rare
-    // enough to leave to the interpreter.
-    if instruction.segment_prefix() != Register::None {
-        return None;
-    }
+    // CS, DS, SS and ES are flat; FS has the thread's base, and GS is left
+    // to the interpreter.
+    let fs = match instruction.segment_prefix() {
+        Register::FS => true,
+        Register::GS => return None,
+        _ => false,
+    };
     let register = |register| match register {
         Register::None => Some(None),
         register => gpr32(register).map(Some),
@@ -113,7 +131,39 @@ fn memory(instruction: &Instruction) -> Option<Mem> {
         index: register(instruction.memory_index())?,
         scale: instruction.memory_index_scale(),
         disp: instruction.memory_displacement32(),
+        fs,
     })
+}
+
+/// The width of an instruction's first operand, if it is 8 or 16 bits.
+fn narrow_width(instruction: &Instruction) -> Option<u8> {
+    let size = match instruction.op_kind(0) {
+        OpKind::Register => instruction.op_register(0).size(),
+        OpKind::Memory => instruction.memory_size().size(),
+        _ => return None,
+    };
+    matches!(size, 1 | 2).then_some(size as u8)
+}
+
+/// Operand `n` of an 8- or 16-bit instruction of `width` bytes.
+fn part(instruction: &Instruction, n: u32, width: u8) -> Option<Part> {
+    let mask = if width == 1 { 0xff } else { 0xffff };
+    match instruction.op_kind(n) {
+        OpKind::Register => {
+            let register = instruction.op_register(n);
+            let fits = if width == 1 {
+                register.is_gpr8()
+            } else {
+                register.is_gpr16()
+            };
+            fits.then(|| Part::Reg(register.number() as u8))
+        }
+        OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate8to16 => {
+            Some(Part::Imm(instruction.immediate(n) as u32 & mask))
+        }
+        OpKind::Memory => memory(instruction).map(Part::Mem),
+        _ => None,
+    }
 }
 
 fn operand(instruction: &Instruction, n: u32) -> Option<Src> {
@@ -155,13 +205,37 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     if instruction.is_jcc_short_or_near() {
         return Some(Op::Jcc(instruction.condition_code(), near()?)).filter(|op| supported(*op));
     }
+    let narrow = match mnemonic {
+        M::Mov => Some(None),
+        M::Add => Some(Some(Alu::Add)),
+        M::Sub => Some(Some(Alu::Sub)),
+        M::And => Some(Some(Alu::And)),
+        M::Or => Some(Some(Alu::Or)),
+        M::Xor => Some(Some(Alu::Xor)),
+        M::Cmp => Some(Some(Alu::Cmp)),
+        M::Test => Some(Some(Alu::Test)),
+        _ => None,
+    };
+    if let (Some(alu), Some(width), 2) = (narrow, narrow_width(instruction), count) {
+        return match (part(instruction, 0, width)?, part(instruction, 1, width)?) {
+            (Part::Imm(_), _) | (Part::Mem(_), Part::Mem(_)) => None,
+            (dst, src) => Some(Op::Narrow(alu, width, dst, src)),
+        };
+    }
     Some(match mnemonic {
         M::Nop => Op::Nop,
         M::Mov => match two()? {
             (Src::Imm(_), _) | (Src::Mem(_), Src::Mem(_)) => return None,
             (dst, src) => Op::Mov(dst, src),
         },
-        M::Lea => Op::Lea(register(0)?, memory(instruction)?),
+        // An address, with no segment base.
+        M::Lea => Op::Lea(
+            register(0)?,
+            Mem {
+                fs: false,
+                ..memory(instruction)?
+            },
+        ),
         M::Add => alu(Alu::Add)?,
         M::Sub => alu(Alu::Sub)?,
         M::And => alu(Alu::And)?,
@@ -169,8 +243,11 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         M::Xor => alu(Alu::Xor)?,
         M::Cmp => alu(Alu::Cmp)?,
         M::Test => alu(Alu::Test)?,
-        M::Inc => Op::Step(true, register(0)?),
-        M::Dec => Op::Step(false, register(0)?),
+        M::Inc | M::Dec => match operand(instruction, 0)? {
+            Src::Reg(index) => Op::Step(mnemonic == M::Inc, index),
+            Src::Mem(mem) => Op::StepMemory(mnemonic == M::Inc, mem),
+            Src::Imm(_) => return None,
+        },
         M::Neg => Op::Neg(register(0)?),
         M::Not => Op::Not(register(0)?),
         M::Movzx | M::Movsx => {
@@ -414,6 +491,7 @@ impl Bytes<'_> {
             index,
             scale,
             disp,
+            fs: false,
         };
         Some((reg, Src::Mem(mem)))
     }
@@ -514,6 +592,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
                 index: None,
                 scale: 1,
                 disp: b.u32()?,
+                fs: false,
             });
             match opcode {
                 0xa1 => Op::Mov(Src::Reg(0), mem),
@@ -753,6 +832,12 @@ impl Op {
             }
             Op::Imul(_, source, _) => (F::NONE, F::CF.or(F::OF), mem(source)),
             Op::Carry(_, _, source) => (F::CF, F::ALL, mem(source)),
+            Op::Narrow(alu, _, dst, src) => {
+                let site = matches!(dst, Part::Mem(_)) || matches!(src, Part::Mem(_));
+                let writes = if alu.is_some() { F::ALL } else { F::NONE };
+                (F::NONE, writes, site)
+            }
+            Op::StepMemory(..) => (F::NONE, F::ALL.minus(F::CF), true),
             // The interpreter reads and writes canonical flags.
             Op::Helper(_) => (F::ALL, F::NONE, true),
         };
@@ -919,7 +1004,9 @@ pub(super) mod tests {
             if let Some(actual) = actual {
                 assert_eq!(Some(actual), expected, "{bytes:02x?} at {pc:#x}");
             }
-            if expected.is_some() && round % 8 != 0 {
+            // Narrow and memory `inc`/`dec` forms are iced's alone.
+            let quick_form = !matches!(expected, Some((Op::Narrow(..) | Op::StepMemory(..), _)));
+            if expected.is_some() && quick_form && round % 8 != 0 {
                 planned += 1;
                 covered += u32::from(actual.is_some());
             }

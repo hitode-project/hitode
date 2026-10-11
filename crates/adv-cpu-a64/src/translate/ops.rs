@@ -6,7 +6,7 @@ use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, ShiftKind, Src};
+use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
@@ -28,6 +28,16 @@ enum Addr {
 /// The register a 32-bit result for guest `index` is computed into.
 fn result(index: u8) -> Reg {
     if biased(index) { X16 } else { host(index) }
+}
+
+/// The guest register and bit offset of a narrow register operand: AH to
+/// BH are bits 8 to 15 of EAX to EBX.
+fn part_register(number: u8, width: u8) -> (u8, u32) {
+    if width == 1 && number >= 4 {
+        (number - 4, 8)
+    } else {
+        (number, 0)
+    }
 }
 
 impl Translator<'_> {
@@ -60,6 +70,8 @@ impl Translator<'_> {
             Op::Alu(alu, Src::Mem(mem), source) => self.alu_memory(alu, mem, source),
             Op::Alu(_, Src::Imm(_), _) => unreachable!(),
             Op::Step(increment, index) => self.step(increment, index),
+            Op::StepMemory(increment, mem) => self.step_memory(increment, mem),
+            Op::Narrow(alu, width, dst, src) => self.narrow_op(alu, width, dst, src),
             Op::Neg(index) => {
                 let guest = Operand::Guest(index);
                 self.emit(subs(W, result(index), Reg::ZR, host(index), Lsl, 0));
@@ -323,6 +335,20 @@ impl Translator<'_> {
 
     /// The guest address of `mem` in a W register; uses w16 and w17.
     fn effective(&mut self, mem: Mem) -> Reg {
+        let flat = self.flat(mem);
+        if !mem.fs {
+            return flat;
+        }
+        self.emit_all(&[
+            ldr(X, X17, RUNTIME, runtime::CPU_STATE),
+            ldr(W, X17, X17, runtime::FS_BASE),
+            add(W, X16, flat, X17, Lsl, 0),
+        ]);
+        X16
+    }
+
+    /// `effective` without a segment base.
+    fn flat(&mut self, mem: Mem) -> Reg {
         let mut current = mem.base.map(host);
         if let Some(index) = mem.index {
             let shift = mem.scale.trailing_zeros();
@@ -364,6 +390,7 @@ impl Translator<'_> {
         if let (Some(base), None) = (mem.base, mem.index)
             && biased(base)
             && !self.checking
+            && !mem.fs
         {
             // Offsets well inside the guards: an access past 0 or 4 GiB
             // faults there and the interpreter wraps it exactly.
@@ -518,7 +545,41 @@ impl Translator<'_> {
     /// `inc` or `dec`, which keep CF.
     fn step(&mut self, increment: bool, index: u8) {
         let guest = Operand::Guest(index);
-        let (result, source) = (result(index), host(index));
+        self.step_flags(increment, host(index), result(index), guest);
+        self.commit(index);
+        self.state.recipe = if increment {
+            Recipe::AddResult(guest, Operand::Imm(1))
+        } else {
+            Recipe::SubResult(guest, Operand::Imm(1))
+        };
+    }
+
+    /// `inc` or `dec` of a 32-bit memory operand: load, store the result,
+    /// then the flags from the loaded value (§5.2).
+    fn step_memory(&mut self, increment: bool, mem: Mem) {
+        let t = self.take_temp();
+        let addr = self.address(mem);
+        let left = temp(t);
+        self.load(addr, left);
+        self.forget(Operand::Temp(t));
+        self.emit(if increment {
+            add_imm(W, X6, left, 1, false)
+        } else {
+            sub_imm(W, X6, left, 1, false)
+        });
+        self.store(addr, X6);
+        self.step_flags(increment, left, Reg::ZR, Operand::Temp(t));
+        self.state.recipe = if increment {
+            Recipe::Add(Operand::Temp(t), Operand::Imm(1))
+        } else {
+            Recipe::Sub(Operand::Temp(t), Operand::Imm(1))
+        };
+    }
+
+    /// The flags of `inc` or `dec` of `source`, which holds `guest`, with
+    /// the result in `result`: CF keeps its value, lazily if it can. Leaves
+    /// the recipe to the caller. Uses x6 and x17.
+    fn step_flags(&mut self, increment: bool, source: Reg, result: Reg, guest: Operand) {
         let step = |rd| {
             if increment {
                 adds_imm(W, rd, source, 1, false)
@@ -553,17 +614,176 @@ impl Translator<'_> {
                 msr_nzcv(X6),
             ]);
         }
-        self.commit(index);
         if !keep_c && self.state.carry == Carry::Host {
             // C is the step's, and CF dead.
             self.state.carry = Carry::Host;
         }
         self.state.derivable = None;
-        self.state.recipe = if increment {
-            Recipe::AddResult(guest, Operand::Imm(1))
-        } else {
-            Recipe::SubResult(guest, Operand::Imm(1))
+    }
+
+    /// A 1- or 2-byte `mov` or ALU operation. Values are zero-extended into
+    /// the recipe temporaries, so PF and AF recipes see their low bits; the
+    /// flags come from the operands shifted to the top of a W register.
+    /// Stores precede the flags (§5.2).
+    fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part) {
+        let shift = 32 - 8 * u32::from(width);
+        // Both temporaries are overwritten. A fault site observes every
+        // flag, so then nothing may still read them.
+        let site = matches!(dst, Part::Mem(_)) || matches!(src, Part::Mem(_));
+        for t in [Operand::Temp(0), Operand::Temp(1)] {
+            if !site {
+                self.prepare(t);
+            } else if self.state.recipe.uses(t) {
+                self.materialize();
+            }
+            if site && self.state.carry.uses(t) {
+                self.host_carry();
+            }
+        }
+        let address = match (dst, src) {
+            (Part::Mem(mem), _) | (_, Part::Mem(mem)) => self.effective(mem),
+            _ => Reg::ZR,
         };
+        let right = match src {
+            Part::Imm(value) => Operand::Imm(value),
+            part => {
+                self.narrow_read(part, width, address, temp(1));
+                Operand::Temp(1)
+            }
+        };
+        let right_reg = |t: &mut Self| match right {
+            Operand::Imm(value) => t.imm(value, X17),
+            _ => temp(1),
+        };
+        let Some(alu) = alu else {
+            let value = right_reg(self);
+            self.narrow_write(dst, width, address, value);
+            for t in [Operand::Temp(0), Operand::Temp(1)] {
+                self.forget(t);
+            }
+            return;
+        };
+        self.narrow_read(dst, width, address, temp(0));
+        let left = Operand::Temp(0);
+        let value = right_reg(self);
+        let stored = match alu {
+            Alu::Add => Some(add(W, X6, temp(0), value, Lsl, 0)),
+            Alu::Sub => Some(sub(W, X6, temp(0), value, Lsl, 0)),
+            Alu::And => Some(and(W, X6, temp(0), value, Lsl, 0)),
+            Alu::Or => Some(orr(W, X6, temp(0), value, Lsl, 0)),
+            Alu::Xor => Some(eor(W, X6, temp(0), value, Lsl, 0)),
+            Alu::Cmp | Alu::Test => None,
+        };
+        if let Some(word) = stored {
+            self.emit(word);
+            self.narrow_write(dst, width, address, X6);
+        }
+        for t in [Operand::Temp(0), Operand::Temp(1)] {
+            self.forget(t);
+        }
+        if !self.out.any(FlagSet::ALL) {
+            self.dead();
+            return;
+        }
+        // The right operand shifted to the top, as a register and a shift.
+        let shifted = |t: &mut Self| match right {
+            Operand::Imm(value) => (t.imm(value << shift, X16), 0),
+            _ => (temp(1), shift),
+        };
+        let (sense, recipe) = match alu {
+            Alu::Add | Alu::Sub | Alu::Cmp => {
+                let (reg, amount) = shifted(self);
+                self.emit(lsl_imm(W, X17, temp(0), shift));
+                if alu == Alu::Add {
+                    self.emit(adds(W, Reg::ZR, X17, reg, Lsl, amount));
+                    (Sense::Addition, Recipe::Add(left, right))
+                } else {
+                    self.emit(subs(W, Reg::ZR, X17, reg, Lsl, amount));
+                    (Sense::Subtraction, Recipe::Sub(left, right))
+                }
+            }
+            Alu::And | Alu::Test => {
+                let (reg, amount) = shifted(self);
+                self.emit_all(&[
+                    lsl_imm(W, X17, temp(0), shift),
+                    ands(W, Reg::ZR, X17, reg, Lsl, amount),
+                ]);
+                (Sense::Addition, Recipe::And(left, right))
+            }
+            Alu::Or | Alu::Xor => {
+                // N and Z of the result; C and V clear.
+                self.emit(adds(W, Reg::ZR, Reg::ZR, X6, Lsl, shift));
+                let recipe = if alu == Alu::Or {
+                    Recipe::Or(left, right)
+                } else {
+                    Recipe::Xor(left, right)
+                };
+                (Sense::Addition, recipe)
+            }
+        };
+        let logic = matches!(alu, Alu::And | Alu::Test | Alu::Or | Alu::Xor);
+        self.state = State {
+            sense,
+            carry: Carry::Host,
+            derivable: logic.then_some(Carry::Clear),
+            recipe,
+        };
+    }
+
+    /// Zero-extends the narrow `part` into `rt`; a memory part is at the
+    /// guest address in `address`.
+    fn narrow_read(&mut self, part: Part, width: u8, address: Reg, rt: Reg) {
+        match part {
+            Part::Reg(number) => {
+                let (index, lsb) = part_register(number, width);
+                self.emit(ubfx(W, rt, host(index), lsb, 8 * u32::from(width)));
+            }
+            Part::Imm(value) => self.mov_imm(rt, value),
+            Part::Mem(_) => {
+                let narrow = if width == 1 {
+                    Narrow::Byte
+                } else {
+                    Narrow::Half
+                };
+                let direct = ldr_narrow(narrow, rt, WINDOW, address);
+                if self.checking {
+                    self.checked(address, rt, u32::from(width), direct);
+                } else {
+                    self.site();
+                    self.emit(direct);
+                }
+            }
+        }
+    }
+
+    /// Writes the low bytes of `value` to the narrow `part`.
+    fn narrow_write(&mut self, part: Part, width: u8, address: Reg, value: Reg) {
+        match part {
+            Part::Reg(number) => {
+                let (index, lsb) = part_register(number, width);
+                let guest = Operand::Guest(index);
+                self.prepare(guest);
+                // SP and BP stay biased: keep the window in the high half.
+                let size = if biased(index) { X } else { W };
+                self.emit(bfi(size, host(index), value, lsb, 8 * u32::from(width)));
+                self.forget(guest);
+            }
+            Part::Mem(_) => {
+                let narrow = if width == 1 {
+                    Narrow::Byte
+                } else {
+                    Narrow::Half
+                };
+                let direct = str_narrow(narrow, value, WINDOW, address);
+                if self.checking {
+                    self.checked(address, value, u32::from(width) | ACCESS_STORE, direct);
+                } else {
+                    self.site();
+                    self.emit(direct);
+                }
+            }
+            Part::Imm(_) => unreachable!("not a destination"),
+        }
     }
 
     /// `alu reg, source`.
