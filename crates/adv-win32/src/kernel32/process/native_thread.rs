@@ -465,15 +465,13 @@ pub(super) fn create_front(env: &mut Env<'_>, remote: bool) -> Outcome {
             );
         }
     };
-    if flags & !(4 | 0x10000) != 0
-        || (tid != 0 && check_range(env.cpu, tid, 4, Prot::WRITE).is_err())
-    {
+    // Win32 consumes CREATE_SUSPENDED and STACK_SIZE_PARAM_IS_A_RESERVATION,
+    // and ignores the remaining bits. Do not pass them to NtCreateThreadEx,
+    // whose flag namespace and validation are different.
+    if tid != 0 && check_range(env.cpu, tid, 4, Prot::WRITE).is_err() {
         return api_error(
             env,
-            processes::Error::new(
-                if flags & !(4 | 0x10000) != 0 { 87 } else { 998 },
-                "invalid thread creation flags or output",
-            ),
+            processes::Error::new(998, "invalid thread creation output"),
             0,
         );
     }

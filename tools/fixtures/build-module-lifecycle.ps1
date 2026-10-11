@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Build authored x86 module and thread lifecycle fixtures.
+.DESCRIPTION
+Input: the adjacent synthetic sources and installed LLVM/Windows SDK.
+Output: executables, DLLs and objects in OutputDirectory; no sample inputs.
+#>
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/fixtures-module-lifecycle'),
     [string]$LlvmBin = 'C:\Program Files\LLVM\bin',
@@ -14,6 +21,8 @@ $compiler = Join-Path $LlvmBin 'clang-cl.exe'
 $linker = Join-Path $LlvmBin 'lld-link.exe'
 $compile = @('/nologo', '/c', '/O2', '/GS-', '/Gs9999999', '/Zl', '/clang:-fno-builtin', '/clang:--target=i686-pc-windows-msvc', "/I$PSScriptRoot")
 $link = @('/nologo', '/machine:x86', '/nodefaultlib', '/dynamicbase', '/safeseh:no', '/timestamp:0', '/manifest:embed', "/manifestuac:level='asInvoker' uiAccess='false'", "/libpath:$WindowsSdk", "/libpath:$OutputDirectory")
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'thread_create_flags.c'), "/Fo$OutputDirectory/thread_create_flags.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_thread_create_flags.exe", "$OutputDirectory/thread_create_flags.obj", 'kernel32.lib'))
 Invoke-LifecycleChecked (Join-Path $LlvmBin 'clang.exe') @('--target=i686-pc-windows-msvc', '-c', (Join-Path $PSScriptRoot 'tls_array.s'), '-o', "$OutputDirectory/tls_array.obj")
 $variants = @(
     @{Name='normal'; Id=1; Flags=@(); Libs=@()},
