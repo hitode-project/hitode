@@ -51,7 +51,10 @@ fn get_bits(
     {
         return fail(env, 87);
     }
-    if usage != 0 || !matches!(source_bpp, 24 | 32) {
+    if usage > 1 {
+        return fail(env, 87);
+    }
+    if !matches!(source_bpp, 24 | 32) {
         return unsupported(env);
     }
     let mut header = [0; 40];

@@ -89,7 +89,10 @@ pub(super) fn read(
         || h[12..14] != 1u16.to_le_bytes()
         || !matches!(bpp, 8 | 16 | 24 | 32)
         || !(compression == 0 || (compression == 3 && bpp == 16))
-        || usage != 0
+        // DIB_PAL_COLORS changes indexed colour tables only; true-colour DIBs
+        // carry their colours in pixels (and their optional bit masks).
+        || usage > 1
+        || (usage == 1 && bpp == 8)
         || size(width as u32, height.unsigned_abs()).is_err()
     {
         return Ok(None);

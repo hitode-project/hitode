@@ -144,7 +144,18 @@ fn invoke(
     count: u32,
     output: u32,
 ) -> u32 {
-    for (i, a) in [dc, bitmap, start, count, output, INFO, 0]
+    invoke_with_usage(m, dc, bitmap, start, count, output, 0)
+}
+fn invoke_with_usage(
+    m: &mut Machine<JitCpu>,
+    dc: u32,
+    bitmap: u32,
+    start: u32,
+    count: u32,
+    output: u32,
+    usage: u32,
+) -> u32 {
+    for (i, a) in [dc, bitmap, start, count, output, INFO, usage]
         .into_iter()
         .enumerate()
     {
@@ -287,4 +298,27 @@ fn dib_readback_matches_native_orientation_ranges_padding_and_queries() {
     );
     assert_eq!(unsafe { gdi::DeleteObject(native) }, 1);
     assert_eq!(unsafe { gdi::DeleteDC(native_dc) }, 1);
+}
+
+#[test]
+fn true_colour_readback_ignores_palette_flag_and_rejects_unknown_usage_without_output_writes() {
+    for dib in [false, true] {
+        let (mut m, dc, bitmap) = fixture(dib, false);
+        for bpp in [24, 32] {
+            prepare(&mut m, header(bpp, -3));
+            assert_eq!(invoke_with_usage(&mut m, dc, bitmap, 0, 3, OUTPUT, 0), 3);
+            let expected = bytes(&m, OUTPUT, 24);
+            let expected_header = bytes(&m, INFO, 40);
+            prepare(&mut m, header(bpp, -3));
+            assert_eq!(invoke_with_usage(&mut m, dc, bitmap, 0, 3, OUTPUT, 1), 3);
+            assert_eq!(bytes(&m, OUTPUT, 24), expected);
+            assert_eq!(bytes(&m, INFO, 40), expected_header);
+            prepare(&mut m, header(bpp, -3));
+            let before = bytes(&m, INFO, 40);
+            assert_eq!(invoke_with_usage(&mut m, dc, bitmap, 0, 3, OUTPUT, 2), 0);
+            assert_eq!(bytes(&m, INFO, 40), before);
+            assert_eq!(bytes(&m, OUTPUT, 24), [0xa5; 24]);
+            assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+        }
+    }
 }

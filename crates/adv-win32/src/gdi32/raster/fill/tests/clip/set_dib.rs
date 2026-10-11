@@ -156,3 +156,71 @@ fn device_dib_upload_matches_native_scan_bands_origins_and_clipping() {
         gdi::DeleteDC(native_dc);
     }
 }
+
+#[test]
+fn true_colour_palette_flag_creates_and_uploads_real_pixels_through_both_dib_apis() {
+    for bpp in [16u32, 24, 32] {
+        let (mut m, data, dc, pixels) = fixture(2, 2, PixelFormat::Bgra32, false);
+        let info = data + 1024;
+        let bits = data + 1100;
+        let output = data + 1200;
+        let header = [40u32, 2, (-2i32) as u32, (bpp << 16) | 1, 0, 0, 0, 0, 0, 0];
+        m.cpu
+            .write(
+                info,
+                &header
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let source: Vec<u8> = match bpp {
+            16 => [0x7c00u16, 0x03e0, 0x001f, 0x7fff]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            24 => vec![0, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0],
+            _ => vec![0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+        };
+        m.cpu.write(bits, &source).unwrap();
+        let bitmap = call(
+            &mut m,
+            data,
+            "gdi32.dll!CreateDIBSection",
+            &[dc, info, 1, output, 0, 0],
+        );
+        assert_ne!(bitmap, 0);
+        assert_ne!(m.cpu.read_u32(output).unwrap(), 0);
+        assert_eq!(call(&mut m, data, "gdi32.dll!DeleteObject", &[bitmap]), 1);
+        for stretch in [true, false] {
+            m.cpu.write(pixels, &[0; 16]).unwrap();
+            let (api, args) = if stretch {
+                (
+                    "gdi32.dll!StretchDIBits",
+                    vec![dc, 0, 0, 2, 2, 0, 0, 2, 2, bits, info, 1, 0xcc0020],
+                )
+            } else {
+                (
+                    "gdi32.dll!SetDIBitsToDevice",
+                    vec![dc, 0, 0, 2, 2, 0, 0, 0, 2, bits, info, 1],
+                )
+            };
+            assert_eq!(call(&mut m, data, api, &args), 2);
+            assert_eq!(call(&mut m, data, "gdi32.dll!GetPixel", &[dc, 0, 0]), 0xff);
+            assert_eq!(
+                call(&mut m, data, "gdi32.dll!GetPixel", &[dc, 1, 0]),
+                0xff00
+            );
+        }
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!CreateDIBSection",
+                &[dc, info, 2, output, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    }
+}
