@@ -32,6 +32,11 @@ bytemuck = { version = "1.23", optional = true, features = ["derive"] }
 [dev-dependencies]
 pollster = "0.4"
 
+# ARMv8 SHA-256 instructions, selected at run time, for the pinned font
+# profile's file hashes; the portable code is several times slower.
+[target.'cfg(all(target_arch = "aarch64", not(windows)))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Foundation", "Win32_Globalization"] }
 # The broad gpu-allocator windows range must select wgpu-hal's ABI version,
