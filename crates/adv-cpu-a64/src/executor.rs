@@ -324,6 +324,10 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         self.state.refresh_mmx();
         self.state.fuel = budget;
+        // Reading the clock costs as much as a short native run, so the
+        // deadline is polled every few iterations; one call is capped by
+        // its fuel anyway.
+        let mut polls = 0u32;
         loop {
             if bridge.parked {
                 return Ok(RunOutcome::Parked);
@@ -331,7 +335,8 @@ impl Executor {
             if self.state.eip == stop {
                 return Ok(RunOutcome::ReachedStop);
             }
-            if self.deadline.is_some_and(|at| Instant::now() >= at) {
+            polls = polls.wrapping_add(1);
+            if polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {
