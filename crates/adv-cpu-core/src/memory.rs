@@ -609,13 +609,18 @@ impl Memory {
             let reservation = self.reservation.as_ref().unwrap();
             let committed =
                 |page: usize| self.mapped[page] && !self.shared_pages.contains_key(&page);
+            // Owned private copies read linearly, as the native permission
+            // snapshot says; stores still trap so the first one retires COPY.
             let protection = |page: usize| {
-                if self.perms[page] & SHARED != 0 {
-                    GuestPageProtection::NONE
+                let perms = self.perms[page];
+                if perms & SHARED == 0 {
+                    GuestPageProtection::new(perms & 7, self.watched[page])
+                } else if self.private_copy_pages.get(&page) == Some(&true) {
+                    GuestPageProtection::new(perms & (READ | EXEC), self.watched[page])
                 } else {
-                    GuestPageProtection::new(self.perms[page] & 7, self.watched[page])
-                        .expect("guest permissions")
+                    Ok(GuestPageProtection::NONE)
                 }
+                .expect("guest permissions")
             };
             let mut page = pages.start;
             while page < pages.end {
@@ -874,6 +879,52 @@ impl Memory {
             at += len;
         }
         Ok(())
+    }
+
+    /// Whether `page` holds its bytes in the linear storage: it is not
+    /// shared, or it is an owned private copy, whose SHARED bit is only a
+    /// store barrier (as `native_permissions` treats it).
+    fn linear(&self, page: usize) -> bool {
+        self.perms[page] & SHARED == 0 || self.private_copy_pages.get(&page) == Some(&true)
+    }
+
+    /// Like `read`, but owned private copies are read too.
+    pub fn read_linear(&self, addr: u32, len: usize) -> Result<&[u8], String> {
+        let range = self.committed(addr, len)?;
+        if !range.is_empty()
+            && !(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                .all(|page| self.linear(page))
+        {
+            return Err("shared bytes require an atomic copy".into());
+        }
+        #[cfg(windows)]
+        if self.native_protection && self.host_no_access(&range) {
+            return Err("protected host bytes require read_into or read_data".into());
+        }
+        // SAFETY: committed linear storage remains immutable for this borrow.
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
+    }
+
+    /// Like `direct` for a read, but owned private copies are read too.
+    #[inline]
+    pub fn direct_read(&self, addr: u32, len: usize) -> Option<*const u8> {
+        if let Some(p) = self.direct(addr, len, false) {
+            return Some(p);
+        }
+        // Private copies may be host-protected under native protection.
+        if cfg!(windows) {
+            return None;
+        }
+        let offset = addr.wrapping_sub(self.base) as usize;
+        let page = offset / PAGE_SIZE;
+        let last = offset.checked_add(len.checked_sub(1)?)?;
+        let readable = last < self.len
+            && page == last / PAGE_SIZE
+            && self.mapped[page]
+            && self.perms[page] & READ != 0
+            && self.linear(page);
+        // SAFETY: offset + len lies inside the owned allocation.
+        readable.then(|| unsafe { self.ptr.as_ptr().add(offset).cast_const() })
     }
 
     /// Host address of `len` bytes within one ordinary page that guest code
@@ -1831,6 +1882,26 @@ mod file_page_tests {
     }
 
     #[test]
+    fn owned_private_copies_read_linearly_unlike_shared_pages() {
+        let mut memory = Memory::reserve(0x10000, 2 * PAGE_SIZE).unwrap();
+        memory
+            .map_private_copy_pages(0x10000, &[0x37; PAGE_SIZE], READ | EXEC)
+            .unwrap();
+        assert!(memory.read(0x10ff0, 4).is_err());
+        assert_eq!(memory.read_linear(0x10ff0, 4).unwrap(), [0x37; 4]);
+        assert_eq!(memory.direct_read(0x10ff0, 4).is_some(), !cfg!(windows));
+        assert!(memory.direct_read(0x10ffe, 4).is_none(), "crosses a page");
+        memory.map_shared_audio(0x11000, PAGE_SIZE).unwrap();
+        assert!(memory.read_linear(0x10ffe, 4).is_err());
+        assert!(memory.read_linear(0x11000, 4).is_err());
+        assert!(memory.direct_read(0x11000, 4).is_none());
+        // A privatized copy is an ordinary page.
+        memory.protect(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
+        memory.write(0x10000, &[1]).unwrap();
+        assert!(memory.read(0x10ff0, 4).is_ok());
+    }
+
+    #[test]
     fn code_bytes_match_across_ordinary_and_copy_pages() {
         let mut memory = Memory::reserve(0, 0x30000).unwrap();
         memory.map(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
@@ -2227,5 +2298,28 @@ mod window_tests {
                 "{host}: fresh pages are zero"
             );
         }
+    }
+
+    /// The native permission snapshot lets translated code read owned
+    /// private copies directly, so the window must too; stores still trap
+    /// until the copy is privatized.
+    #[test]
+    fn the_window_reads_owned_private_copies_and_traps_their_stores() {
+        let mut memory = Memory::window(0x10000, 0x4000).unwrap();
+        memory
+            .map_private_copy_pages(0x10000, &[0x37; 2 * PAGE_SIZE], READ | WRITE)
+            .unwrap();
+        let window = memory.window_base().unwrap();
+        let reservation = memory.reservation.as_ref().unwrap();
+        let start = reservation.ptr.as_ptr() as usize - window;
+        let allows = |memory: &Memory, addr: usize, access| {
+            let reservation = memory.reservation.as_ref().unwrap();
+            let view = reservation.direct_fault_view().unwrap();
+            view.window_allows(addr - start, PAGE_SIZE, access)
+        };
+        assert!(allows(&memory, 0x10000, Read) && !allows(&memory, 0x10000, Write));
+        memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
+        assert!(allows(&memory, 0x10000, Write));
+        assert!(allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write));
     }
 }
