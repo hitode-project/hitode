@@ -1,0 +1,824 @@
+//! x87 instructions on host doubles.
+//!
+//! Each instruction `fast::classify` accepts runs natively under the rules
+//! of `adv_cpu_core::floating::fast`, reading and writing the stack in
+//! `CpuState` directly, so fault sites, exits and helpers need no spill.
+//! Whenever a rule does not hold (an exception pending, MMX state live, an
+//! empty or full slot, an encoding that is not a zero or a normal, a value
+//! outside the range or precision the rule admits) the instruction's
+//! interpreter helper runs it in place and the unit goes on. Nothing is
+//! stored before every check has passed, and memory is accessed only with
+//! the guest flags in NZCV.
+//!
+//! Arithmetic needs exact doubles within `2^±fast::RANGE`, masked
+//! exceptions, round to nearest and precision 53 or 64; it rounds once in
+//! binary64 and takes the error from TwoSum, a fused multiply-subtract or
+//! the division residual. Precision 64 admits only exact results.
+//!
+//! Copies keep the extended encoding. Stores and compares see a value as
+//! the double holding its top 53 significand bits with the lowest one ORed
+//! with the rest: rounding that double to 24 bits or to an integer below
+//! 2^51 rounds the value, and it orders values as they do unless two equal
+//! ones lost bits. Stores to binary64 round the significand in integers.
+
+use adv_cpu_core::floating::fast::{self, Fast, Op as Arith, PE, RANGE, Source};
+use iced_x86::{Instruction, OpKind};
+
+use crate::asm::Label;
+use crate::encode::Shift::Lsl;
+use crate::encode::Size::{W, X};
+use crate::encode::*;
+use crate::runtime;
+
+use super::decode::{Mem, memory};
+use super::flags::Operand;
+use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+
+const X7: Reg = Reg::new(7);
+const X8: Reg = Reg::new(8);
+const V0: VReg = VReg::new(0);
+const V1: VReg = VReg::new(1);
+const V2: VReg = VReg::new(2);
+const V3: VReg = VReg::new(3);
+const V4: VReg = VReg::new(4);
+const V5: VReg = VReg::new(5);
+
+const C0: u32 = 0x100;
+const C1: u32 = 0x200;
+const C2: u32 = 0x400;
+const C3: u32 = 0x4000;
+/// The extended exponent bias minus the binary64 one.
+const REBIAS: u32 = 0x3fff - 1023;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X87 {
+    pub fast: Fast,
+    /// The memory operand, if any.
+    pub mem: Option<Mem>,
+    /// The helper that runs the instruction otherwise.
+    pub helper: u8,
+    /// The opcode the instruction records, if it records one.
+    pub opcode: Option<u16>,
+}
+
+/// The `X87` for `instruction`, whose interpreter helper is `helper`.
+pub fn plan(instruction: &Instruction, helper: u8, opcode: Option<u16>) -> Option<X87> {
+    let fast = fast::classify(instruction)?;
+    let mem = if instruction.op0_kind() == OpKind::Memory {
+        Some(memory(instruction)?)
+    } else {
+        None
+    };
+    if matches!(fast, Fast::StoreControl | Fast::StoreStatus) && mem.is_none() {
+        // Only `fnstsw ax` stores to a register.
+        if instruction.op0_register() != iced_x86::Register::AX {
+            return None;
+        }
+    }
+    Some(X87 {
+        fast,
+        mem,
+        helper,
+        opcode,
+    })
+}
+
+/// How `double` takes an extended value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// Exactly, within `2^±range`.
+    Exact(u32),
+    /// Its top 53 bits, the lowest ORed with the rest, which sets the
+    /// register to 1 when the rest is not zero; binary64 range.
+    Sticky(Reg),
+}
+
+/// Per-instruction register use: x0 and x1 hold one extended value
+/// (significand, sign and exponent), x2 and x3 another, x4 the guest NZCV,
+/// x6 the guest address, x8 the control word, w13 the status word, w14 the
+/// tag word, w15 TOP; x7, x16 and x17 are scratch.
+impl Translator<'_> {
+    pub(super) fn x87(&mut self, x: X87) {
+        if self.checking && x.mem.is_some() {
+            self.helper(x.helper);
+            return;
+        }
+        self.canonicalize();
+        if let Some(mem) = x.mem {
+            let address = self.effective(mem);
+            self.emit(mov(W, X6, address));
+        }
+        self.cpu();
+        let slow = self.asm.label();
+        let done = self.asm.label();
+        self.emit_all(&[
+            mrs_nzcv(X4),
+            ldrh(X13, X5, runtime::X87_STATUS),
+            ldr(W, X16, X5, runtime::MMX_MODE),
+        ]);
+        self.asm.tbz(true, X13, 7, slow);
+        self.asm.cbz(W, true, X16, slow);
+        if x.fast != Fast::Wait {
+            self.emit_all(&[
+                ubfx(W, X15, X13, 11, 3),
+                ldrh(X14, X5, runtime::X87_TAG),
+                ldrh(X8, X5, runtime::X87_CONTROL),
+            ]);
+        }
+        let mut dp = x.mem.is_some();
+        let mut metadata = true;
+        match x.fast {
+            Fast::Wait => metadata = false,
+            Fast::Load(source) => self.x87_load(source, slow),
+            Fast::Constant(one) => {
+                let target = self.push_target(slow);
+                if one {
+                    self.emit_all(&[movz(X, X0, 0x8000, 48), movz(W, X1, 0x3fff, 0)]);
+                } else {
+                    self.emit_all(&[movz(X, X0, 0, 0), movz(W, X1, 0, 0)]);
+                }
+                self.commit_value(target, X0, X1);
+                self.emit(mov(W, X15, target));
+                self.clear_c1();
+            }
+            Fast::Store {
+                width,
+                integer,
+                pop,
+            } => self.x87_store(width, integer, pop, slow),
+            Fast::StoreSt { index, pop } => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                let to = self.slot(index, X2);
+                self.commit_value(to, X0, X1);
+                self.clear_c1();
+                if pop {
+                    self.pop();
+                }
+            }
+            Fast::Arith {
+                op,
+                dest,
+                source,
+                reverse,
+                pop,
+            } => self.x87_arith(op, dest, source, reverse, pop, slow),
+            Fast::Compare { source, pops } => self.x87_compare(source, pops, slow),
+            Fast::Exchange(index) => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                self.read(index, X2, X3, slow);
+                self.ordinary(X2, X3, slow);
+                let other = self.slot(index, X7);
+                self.commit_value(X15, X2, X3);
+                self.commit_value(other, X0, X1);
+                self.clear_c1();
+            }
+            Fast::Negate | Fast::Absolute => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                self.emit(if x.fast == Fast::Negate {
+                    eor_imm(W, X1, X1, 0x8000)
+                } else {
+                    and_imm(W, X1, X1, 0x7fff)
+                });
+                // The tag follows the value, as on every write.
+                self.commit_value(X15, X0, X1);
+                self.clear_c1();
+            }
+            Fast::LoadControl => {
+                self.site();
+                self.emit(ldr_narrow(Narrow::Half, X0, WINDOW, X6));
+                // Unmasking a pending exception takes the interpreter.
+                self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
+                self.asm.cbz(W, true, X16, slow);
+                self.emit_all(&[
+                    strh(X0, X5, runtime::X87_CONTROL),
+                    movz(W, X16, 0x8080, 0),
+                    bic(W, X13, X13, X16, Lsl, 0),
+                ]);
+                (dp, metadata) = (false, false);
+            }
+            Fast::StoreControl | Fast::StoreStatus => {
+                let value = if x.fast == Fast::StoreControl {
+                    X8
+                } else {
+                    X13
+                };
+                match x.mem {
+                    Some(_) => {
+                        self.site();
+                        self.emit(str_narrow(Narrow::Half, value, WINDOW, X6));
+                    }
+                    None => {
+                        self.clobber(Operand::Guest(0));
+                        self.emit(bfi(W, super::host(0), value, 0, 16));
+                    }
+                }
+                (dp, metadata) = (false, false);
+            }
+        }
+        if x.fast != Fast::Wait {
+            self.emit_all(&[
+                bfi(W, X13, X15, 11, 3),
+                strh(X13, X5, runtime::X87_STATUS),
+                strh(X14, X5, runtime::X87_TAG),
+            ]);
+        }
+        if metadata {
+            let pc = self.trace.insts[self.index].pc;
+            self.mov_imm(X16, pc);
+            self.emit(str(W, X16, X5, runtime::X87_IP));
+            if let Some(opcode) = x.opcode {
+                self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
+            }
+        }
+        if dp {
+            self.emit(str(W, X6, X5, runtime::X87_DP));
+        }
+        self.emit(msr_nzcv(X4));
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.emit(msr_nzcv(X4));
+        self.helper(x.helper);
+        self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
+        self.asm.bind(done);
+        // The stack may have changed under the MMX registers.
+        self.vector = super::simd::Vector::default();
+        self.vector.cpu = true;
+    }
+
+    fn x87_load(&mut self, source: Source, slow: Label) {
+        match source {
+            Source::St(index) => {
+                self.read(index, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+            }
+            source => {
+                self.memory_operand(source, V0, None, slow);
+                self.extended(V0, X0, X1);
+            }
+        }
+        let target = self.push_target(slow);
+        self.commit_value(target, X0, X1);
+        self.emit(mov(W, X15, target));
+        self.clear_c1();
+    }
+
+    fn x87_store(&mut self, width: u8, integer: bool, pop: bool, slow: Label) {
+        self.read(0, X0, X1, slow);
+        self.ordinary(X0, X1, slow);
+        // Round to nearest, or toward zero for integers.
+        self.emit(ubfx(W, X17, X8, 10, 2));
+        if integer {
+            let nearest = self.asm.label();
+            self.asm.cbz(W, false, X17, nearest);
+            self.emit(cmp_imm(W, X17, 3, false));
+            self.asm.b_cond(Cond::Ne, slow);
+            self.asm.bind(nearest);
+        } else {
+            self.asm.cbz(W, true, X17, slow);
+        }
+        // x2 the bits, w3 whether they are inexact, w7 whether rounding
+        // grew the magnitude.
+        if integer {
+            // w7 the rounding control.
+            self.emit(mov(W, X7, X17));
+            self.double(X0, X1, V0, Take::Sticky(X3), slow);
+            // Below 2^63, and below 2^51 when bits were lost.
+            let whole = self.asm.label();
+            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+            self.asm.cbz(W, false, X3, whole);
+            self.emit(cmp_imm(W, X16, 1023 + 50, false));
+            self.asm.b_cond(Cond::Hi, slow);
+            self.asm.bind(whole);
+            self.emit(cmp_imm(W, X16, 1023 + 62, false));
+            self.asm.b_cond(Cond::Hi, slow);
+            let rounded = self.asm.label();
+            self.emit(unary(Unary::Frintn, V1, V0));
+            self.asm.cbz(W, false, X7, rounded);
+            self.emit(unary(Unary::Frintz, V1, V0));
+            self.asm.bind(rounded);
+            self.emit(fcvt_int(X, true, X2, V1));
+            if width == 4 {
+                self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
+                self.asm.b_cond(Cond::Ne, slow);
+            }
+            self.grew(V1, V0);
+        } else if width == 4 {
+            self.double(X0, X1, V0, Take::Sticky(X3), slow);
+            // A normal input and output: no underflow or overflow.
+            let zero = self.asm.label();
+            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+            self.asm.cbz(W, false, X16, zero);
+            self.emit_all(&[
+                sub_imm(W, X16, X16, 1023 - 126, false),
+                cmp_imm(W, X16, 253, false),
+            ]);
+            self.asm.b_cond(Cond::Hi, slow);
+            self.asm.bind(zero);
+            self.emit_all(&[
+                unary(Unary::Narrow, V1, V0),
+                fmov_from_v(W, X2, V1),
+                ubfx(W, X16, X2, 23, 8),
+                cmp_imm(W, X16, 0xff, false),
+            ]);
+            self.asm.b_cond(Cond::Eq, slow);
+            self.emit(unary(Unary::Widen, V1, V1));
+            self.grew(V1, V0);
+        } else {
+            // Round the significand to 53 bits, nearest even, in integers.
+            let zero = self.asm.label();
+            self.emit_all(&[
+                lsr_imm(W, X16, X1, 15),
+                lsl_imm(X, X2, X16, 63),
+                movz(W, X3, 0, 0),
+                movz(W, X7, 0, 0),
+            ]);
+            self.asm.cbz(X, false, X0, zero);
+            self.emit(and_imm(W, X16, X1, 0x7fff));
+            self.unbias(X16, 1022);
+            self.emit(cmp_imm(W, X16, 2045, false));
+            self.asm.b_cond(Cond::Hi, slow);
+            // w16 is the binary64 exponent - 1, which the explicit bit of
+            // the rounded significand completes; a carry out of the
+            // significand carries into the exponent.
+            self.emit_all(&[
+                and_imm(X, X3, X0, 0x7ff),
+                ubfx(X, X17, X0, 11, 1),
+                add(X, X17, X3, X17, Lsl, 0),
+                cmp_imm(X, X17, 0x400, false),
+                cset(W, X7, Cond::Hi),
+                lsr_imm(X, X17, X0, 11),
+                add(X, X17, X17, X7, Lsl, 0),
+                add(X, X17, X17, X16, Lsl, 52),
+                orr(X, X2, X2, X17, Lsl, 0),
+                ubfx(X, X17, X17, 52, 11),
+                cmp_imm(W, X17, 0x7ff, false),
+            ]);
+            self.asm.b_cond(Cond::Eq, slow);
+            self.asm.bind(zero);
+        }
+        // Inexact needs PE masked; it sets PE, and C1 when rounded up.
+        let exact = self.asm.label();
+        let flagged = self.asm.label();
+        self.asm.cbz(W, false, X3, exact);
+        self.asm.tbz(false, X8, 5, slow);
+        self.emit_all(&[orr_imm(W, X13, X13, u64::from(PE)), bfi(W, X13, X7, 9, 1)]);
+        self.asm.b(flagged);
+        self.asm.bind(exact);
+        self.clear_c1();
+        self.asm.bind(flagged);
+        self.emit(msr_nzcv(X4));
+        self.site();
+        let size = if width == 8 { X } else { W };
+        self.emit(str_reg(size, X2, WINDOW, X6, false));
+        if pop {
+            self.pop();
+        }
+    }
+
+    /// w3 whether `rounded` differs from `value`, w7 whether it is larger
+    /// in magnitude.
+    fn grew(&mut self, rounded: VReg, value: VReg) {
+        self.emit_all(&[
+            fcmp(rounded, value),
+            cset(W, X3, Cond::Ne),
+            unary(Unary::Fabs, V2, rounded),
+            unary(Unary::Fabs, V3, value),
+            fcmp(V2, V3),
+            cset(W, X7, Cond::Gt),
+        ]);
+    }
+
+    fn x87_arith(
+        &mut self,
+        op: Arith,
+        dest: u8,
+        source: Source,
+        reverse: bool,
+        pop: bool,
+        slow: Label,
+    ) {
+        let range = RANGE as u32;
+        if !matches!(source, Source::St(_)) {
+            self.memory_operand(source, V1, Some(range), slow);
+        }
+        // Masked exceptions, round to nearest, precision 53 or 64.
+        self.emit_all(&[and_imm(W, X16, X8, 0x3f), cmp_imm(W, X16, 0x3f, false)]);
+        self.asm.b_cond(Cond::Ne, slow);
+        self.emit_all(&[ubfx(W, X16, X8, 9, 3), cmp_imm(W, X16, 1, false)]);
+        self.asm.b_cond(Cond::Ne, slow);
+        let target = self.slot(dest, X2);
+        self.read_slot(target, X0, X1, slow);
+        self.double(X0, X1, V0, Take::Exact(range), slow);
+        if let Source::St(index) = source {
+            self.read(index, X0, X1, slow);
+            self.double(X0, X1, V1, Take::Exact(range), slow);
+        }
+        let (a, b) = if reverse { (V1, V0) } else { (V0, V1) };
+        // d2 the result; x16 the bits of the error, whose sign is that of
+        // exact - rounded.
+        match op {
+            Arith::Add | Arith::Sub => {
+                let b = if op == Arith::Sub {
+                    self.emit(unary(Unary::Fneg, V5, b));
+                    V5
+                } else {
+                    b
+                };
+                // TwoSum.
+                self.emit_all(&[
+                    dfloat(Float::Fadd, V2, a, b),
+                    dfloat(Float::Fsub, V3, V2, a),
+                    dfloat(Float::Fsub, V4, V2, V3),
+                    dfloat(Float::Fsub, V4, a, V4),
+                    dfloat(Float::Fsub, V3, b, V3),
+                    dfloat(Float::Fadd, V3, V4, V3),
+                    fmov_from_v(X, X16, V3),
+                ]);
+            }
+            Arith::Mul => self.emit_all(&[
+                dfloat(Float::Fmul, V2, a, b),
+                fnmsub(V3, a, b, V2),
+                fmov_from_v(X, X16, V3),
+            ]),
+            Arith::Div => {
+                self.emit(fcmp_zero(b));
+                self.asm.b_cond(Cond::Eq, slow);
+                // The residual a - q*b, whose sign over b's is the error's.
+                self.emit_all(&[
+                    dfloat(Float::Fdiv, V2, a, b),
+                    dfloat(Float::Fmul, V3, V2, b),
+                    dfloat(Float::Fsub, V4, a, V3),
+                    fnmsub(V5, V2, b, V3),
+                    dfloat(Float::Fsub, V3, V4, V5),
+                    fmov_from_v(X, X16, V3),
+                    fmov_from_v(X, X17, b),
+                    and_imm(X, X17, X17, 1 << 63),
+                    eor(X, X16, X16, X17, Lsl, 0),
+                ]);
+                // A quotient within the range keeps its residual exact.
+                let zero = self.asm.label();
+                self.emit_all(&[fmov_from_v(X, X17, V2), ubfx(X, X17, X17, 52, 11)]);
+                self.asm.cbz(W, false, X17, zero);
+                self.emit_all(&[
+                    sub_imm(W, X17, X17, 1023 - range, false),
+                    cmp_imm(W, X17, 2 * range, false),
+                ]);
+                self.asm.b_cond(Cond::Hi, slow);
+                self.asm.bind(zero);
+            }
+        }
+        let exact = self.asm.label();
+        let flagged = self.asm.label();
+        self.emit(lsl_imm(X, X17, X16, 1));
+        self.asm.cbz(X, false, X17, exact);
+        // Precision 64 takes only exact results.
+        self.asm.tbz(true, X8, 8, slow);
+        self.emit_all(&[
+            orr_imm(W, X13, X13, u64::from(PE)),
+            fmov_from_v(X, X17, V2),
+            eor(X, X17, X17, X16, Lsl, 0),
+            lsr_imm(X, X17, X17, 63),
+            bfi(W, X13, X17, 9, 1),
+        ]);
+        self.asm.b(flagged);
+        self.asm.bind(exact);
+        self.clear_c1();
+        self.asm.bind(flagged);
+        self.extended(V2, X0, X1);
+        self.commit_value(target, X0, X1);
+        if pop {
+            self.pop();
+        }
+    }
+
+    fn x87_compare(&mut self, source: Source, pops: u8, slow: Label) {
+        // w3 and w7 whether either operand lost bits.
+        if !matches!(source, Source::St(_)) {
+            self.memory_operand(source, V1, None, slow);
+            self.emit(movz(W, X7, 0, 0));
+        }
+        self.read(0, X0, X1, slow);
+        self.ordinary(X0, X1, slow);
+        self.double(X0, X1, V0, Take::Sticky(X3), slow);
+        if let Source::St(index) = source {
+            self.read(index, X0, X1, slow);
+            self.ordinary(X0, X1, slow);
+            self.double(X0, X1, V1, Take::Sticky(X7), slow);
+        }
+        let ordered = self.asm.label();
+        self.emit_all(&[orr(W, X16, X3, X7, Lsl, 0), fcmp(V0, V1)]);
+        self.asm.b_cond(Cond::Ne, ordered);
+        self.asm.cbz(W, true, X16, slow);
+        self.asm.bind(ordered);
+        self.emit_all(&[
+            movz(W, X16, (C0 | C1 | C2 | C3) as u16, 0),
+            bic(W, X13, X13, X16, Lsl, 0),
+            cset(W, X16, Cond::Eq),
+            orr(W, X13, X13, X16, Lsl, 14),
+            cset(W, X16, Cond::Mi),
+            orr(W, X13, X13, X16, Lsl, 8),
+        ]);
+        if pops == 2 {
+            let second = self.slot(1, X7);
+            self.free(second);
+        }
+        if pops > 0 {
+            self.free(X15);
+            self.emit_all(&[
+                add_imm(W, X15, X15, u32::from(pops), false),
+                and_imm(W, X15, X15, 7),
+            ]);
+        }
+    }
+
+    /// The memory operand as a double in `d`, rejecting encodings other
+    /// than zeros and normals and doubles outside `2^±range`. Uses x16
+    /// and x17.
+    fn memory_operand(&mut self, source: Source, d: VReg, range: Option<u32>, slow: Label) {
+        self.site();
+        match source {
+            Source::F32 => {
+                let ok = self.asm.label();
+                self.emit_all(&[
+                    vldr_reg(VMem::S, d, WINDOW, X6),
+                    fmov_from_v(W, X16, d),
+                    lsl_imm(W, X17, X16, 1),
+                ]);
+                self.asm.cbz(W, false, X17, ok);
+                self.emit_all(&[
+                    ubfx(W, X17, X16, 23, 8),
+                    sub_imm(W, X17, X17, 1, false),
+                    cmp_imm(W, X17, 253, false),
+                ]);
+                self.asm.b_cond(Cond::Hi, slow);
+                self.asm.bind(ok);
+                // Every single-precision normal is within any range used.
+                self.emit(unary(Unary::Widen, d, d));
+            }
+            Source::F64 => {
+                let ok = self.asm.label();
+                self.emit_all(&[
+                    vldr_reg(VMem::D, d, WINDOW, X6),
+                    fmov_from_v(X, X16, d),
+                    lsl_imm(X, X17, X16, 1),
+                ]);
+                self.asm.cbz(X, false, X17, ok);
+                let (low, span) = match range {
+                    Some(range) => (1023 - range, 2 * range),
+                    None => (1, 2045),
+                };
+                self.emit_all(&[
+                    ubfx(X, X17, X16, 52, 11),
+                    sub_imm(W, X17, X17, low, false),
+                    cmp_imm(W, X17, span, false),
+                ]);
+                self.asm.b_cond(Cond::Hi, slow);
+                self.asm.bind(ok);
+            }
+            Source::I16 => self.emit_all(&[
+                ldr_narrow(Narrow::SignedHalf, X16, WINDOW, X6),
+                scvtf(W, d, X16),
+            ]),
+            Source::I32 => self.emit_all(&[ldr_reg(W, X16, WINDOW, X6, false), scvtf(W, d, X16)]),
+            Source::St(_) => unreachable!("not a memory operand"),
+        }
+    }
+
+    /// The physical register of stack slot `index`: w15 itself for 0,
+    /// else `out`.
+    fn slot(&mut self, index: u8, out: Reg) -> Reg {
+        if index == 0 {
+            return X15;
+        }
+        self.emit_all(&[
+            add_imm(W, out, X15, u32::from(index), false),
+            and_imm(W, out, out, 7),
+        ]);
+        out
+    }
+
+    /// The host address of physical register `p`, in `out`.
+    fn slot_base(&mut self, p: Reg, out: Reg) {
+        self.emit_all(&[
+            add_imm(X, out, X5, runtime::X87_REGS, false),
+            add(X, out, out, p, Lsl, 3),
+            add(X, out, out, p, Lsl, 1),
+        ]);
+    }
+
+    /// Loads stack slot `index`, which must not be empty; uses x7, x16
+    /// and x17.
+    fn read(&mut self, index: u8, sig: Reg, sexp: Reg, slow: Label) {
+        let p = self.slot(index, X7);
+        self.read_slot(p, sig, sexp, slow);
+    }
+
+    /// Loads physical register `p`, which must not be empty; uses x16 and
+    /// x17.
+    fn read_slot(&mut self, p: Reg, sig: Reg, sexp: Reg, slow: Label) {
+        self.emit_all(&[
+            lsl_imm(W, X16, p, 1),
+            shiftv(W, Shift::Lsr, X16, X14, X16),
+            mvn(W, X16, X16),
+            and_imm(W, X16, X16, 3),
+        ]);
+        self.asm.cbz(W, false, X16, slow);
+        self.slot_base(p, X17);
+        self.emit_all(&[ldr(X, sig, X17, 0), ldrh(sexp, X17, 8)]);
+    }
+
+    /// The slot a push fills, in w2, which must be empty.
+    fn push_target(&mut self, slow: Label) -> Reg {
+        self.emit_all(&[
+            sub_imm(W, X2, X15, 1, false),
+            and_imm(W, X2, X2, 7),
+            lsl_imm(W, X16, X2, 1),
+            shiftv(W, Shift::Lsr, X16, X14, X16),
+            mvn(W, X16, X16),
+            and_imm(W, X16, X16, 3),
+        ]);
+        self.asm.cbz(W, true, X16, slow);
+        X2
+    }
+
+    /// Rejects extended encodings other than zeros and normals; uses x16
+    /// and x17.
+    fn ordinary(&mut self, sig: Reg, sexp: Reg, slow: Label) {
+        let zero = self.asm.label();
+        let ok = self.asm.label();
+        self.emit(and_imm(W, X16, sexp, 0x7fff));
+        self.asm.tbz(false, sig, 63, zero);
+        // A normal: the exponent is neither 0 nor 0x7fff.
+        self.asm.cbz(W, false, X16, slow);
+        self.emit(add_imm(W, X17, X16, 1, false));
+        self.asm.tbz(true, X17, 15, slow);
+        self.asm.b(ok);
+        self.asm.bind(zero);
+        self.emit(orr(X, X17, sig, X16, Lsl, 0));
+        self.asm.cbz(X, true, X17, slow);
+        self.asm.bind(ok);
+    }
+
+    /// Subtracts `0x3fff - low` from the extended exponent in `w`: the
+    /// exponent relative to `2^-low`.
+    fn unbias(&mut self, w: Reg, low: u32) {
+        let k = 0x3fff - low;
+        self.emit_all(&[
+            sub_imm(W, w, w, k >> 12, true),
+            sub_imm(W, w, w, k & 0xfff, false),
+        ]);
+    }
+
+    /// The extended value as a double in `d` as `take` says; slow unless
+    /// it is a zero or a normal in range. Uses x16 and x17.
+    fn double(&mut self, sig: Reg, sexp: Reg, d: VReg, take: Take, slow: Label) {
+        let zero = self.asm.label();
+        let join = self.asm.label();
+        self.emit_all(&[lsr_imm(W, X16, sexp, 15), lsl_imm(X, X16, X16, 63)]);
+        if let Take::Sticky(lost) = take {
+            self.emit(movz(W, lost, 0, 0));
+        }
+        self.asm.cbz(X, false, sig, zero);
+        self.asm.tbz(false, sig, 63, slow);
+        self.emit(tst_imm(X, sig, 0x7ff));
+        let (low, high) = match take {
+            Take::Exact(range) => {
+                self.asm.b_cond(Cond::Ne, slow);
+                (range, range)
+            }
+            Take::Sticky(lost) => {
+                self.emit(cset(W, lost, Cond::Ne));
+                (1022, 1023)
+            }
+        };
+        self.emit(and_imm(W, X17, sexp, 0x7fff));
+        self.unbias(X17, low);
+        self.emit(cmp_imm(W, X17, low + high, false));
+        self.asm.b_cond(Cond::Hi, slow);
+        self.emit_all(&[
+            add_imm(W, X17, X17, 1023 - low, false),
+            orr(X, X16, X16, X17, Lsl, 52),
+            ubfx(X, X17, sig, 11, 52),
+            orr(X, X16, X16, X17, Lsl, 0),
+        ]);
+        if let Take::Sticky(lost) = take {
+            self.emit(orr(X, X16, X16, lost, Lsl, 0));
+        }
+        self.asm.b(join);
+        self.asm.bind(zero);
+        self.emit(and_imm(W, X17, sexp, 0x7fff));
+        self.asm.cbz(W, true, X17, slow);
+        self.asm.bind(join);
+        self.emit(fmov_to_v(X, d, X16));
+    }
+
+    /// The extended encoding of the zero or normal double in `d`; uses
+    /// x16 and x17.
+    fn extended(&mut self, d: VReg, sig: Reg, sexp: Reg) {
+        let zero = self.asm.label();
+        self.emit_all(&[
+            fmov_from_v(X, X16, d),
+            lsr_imm(X, sexp, X16, 63),
+            lsl_imm(W, sexp, sexp, 15),
+            ubfx(X, X17, X16, 52, 11),
+            lsl_imm(X, sig, X16, 12),
+            lsr_imm(X, sig, sig, 1),
+        ]);
+        self.asm.cbz(W, false, X17, zero);
+        self.emit_all(&[
+            orr_imm(X, sig, sig, 1 << 63),
+            add_imm(W, X17, X17, REBIAS >> 12, true),
+            add_imm(W, X17, X17, REBIAS & 0xfff, false),
+            orr(W, sexp, sexp, X17, Lsl, 0),
+        ]);
+        self.asm.bind(zero);
+    }
+
+    /// Stores an ordinary value to physical register `p`, its MMX alias
+    /// and its tag; uses x16 and x17.
+    fn commit_value(&mut self, p: Reg, sig: Reg, sexp: Reg) {
+        self.slot_base(p, X17);
+        self.emit_all(&[
+            str(X, sig, X17, 0),
+            strh(sexp, X17, 8),
+            add(X, X17, X5, p, Lsl, 3),
+            str(X, sig, X17, runtime::MMX),
+            // Tag 1 for a zero, else 0.
+            lsl_imm(W, X16, p, 1),
+            movz(W, X17, 3, 0),
+            shiftv(W, Shift::Lsl, X17, X17, X16),
+            bic(W, X14, X14, X17, Lsl, 0),
+            clz(X, X17, sig),
+            lsr_imm(X, X17, X17, 6),
+            shiftv(W, Shift::Lsl, X17, X17, X16),
+            orr(W, X14, X14, X17, Lsl, 0),
+        ]);
+    }
+
+    /// Marks physical register `p` empty; uses x16 and x17.
+    fn free(&mut self, p: Reg) {
+        self.emit_all(&[
+            lsl_imm(W, X16, p, 1),
+            movz(W, X17, 3, 0),
+            shiftv(W, Shift::Lsl, X17, X17, X16),
+            orr(W, X14, X14, X17, Lsl, 0),
+        ]);
+    }
+
+    fn pop(&mut self) {
+        self.free(X15);
+        self.emit_all(&[add_imm(W, X15, X15, 1, false), and_imm(W, X15, X15, 7)]);
+    }
+
+    fn clear_c1(&mut self) {
+        self.emit(and_imm(W, X13, X13, u64::from(!C1)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    fn decode(build: impl FnOnce(&mut CodeAssembler)) -> Instruction {
+        let mut a = CodeAssembler::new(32).unwrap();
+        build(&mut a);
+        let bytes = a.assemble(0x1000).unwrap();
+        iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
+    }
+
+    #[test]
+    fn plans_take_the_fast_forms_with_their_operands() {
+        let load = plan(
+            &decode(|a| a.fld(dword_ptr(esi + 8)).unwrap()),
+            3,
+            Some(0x146),
+        )
+        .unwrap();
+        assert_eq!(load.fast, Fast::Load(Source::F32));
+        assert_eq!(
+            (load.mem.unwrap().disp, load.helper, load.opcode),
+            (8, 3, Some(0x146))
+        );
+        let add = plan(&decode(|a| a.faddp(st1, st0).unwrap()), 0, None).unwrap();
+        assert!(
+            matches!(
+                add.fast,
+                Fast::Arith {
+                    pop: true,
+                    dest: 1,
+                    ..
+                }
+            ) && add.mem.is_none()
+        );
+        assert!(plan(&decode(|a| a.fnstsw(ax).unwrap()), 0, None).is_some());
+        let control = plan(&decode(|a| a.fldcw(word_ptr(esp + 4)).unwrap()), 0, None).unwrap();
+        assert_eq!(control.fast, Fast::LoadControl);
+        assert!(plan(&decode(|a| a.fld(tword_ptr(esi)).unwrap()), 0, None).is_none());
+        assert!(plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).is_none());
+        assert!(plan(&decode(|a| a.fsqrt().unwrap()), 0, None).is_none());
+    }
+}

@@ -288,7 +288,8 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         | Op::Direction(_)
         | Op::Simd(_)
         | Op::Strings(_)
-        | Op::Integer(_) => {
+        | Op::Integer(_)
+        | Op::X87(_) => {
             return None;
         }
         Op::Mov(dst, src) => {

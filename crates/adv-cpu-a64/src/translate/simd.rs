@@ -764,7 +764,7 @@ impl Translator<'_> {
     }
 
     /// Loads the `CpuState` pointer into x5 unless it is there.
-    fn cpu(&mut self) {
+    pub(super) fn cpu(&mut self) {
         if !self.vector.cpu {
             self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
             self.vector.cpu = true;

@@ -40,6 +40,7 @@ mod ops;
 mod simd;
 mod strings;
 mod trace;
+mod x87;
 
 use iced_x86::ConditionCode;
 
@@ -417,7 +418,7 @@ impl Translator<'_> {
         if trace.head(index) || trace.merge[index] {
             // Control may arrive from elsewhere.
             self.vector = simd::Vector::default();
-        } else if !matches!(inst.op, decode::Op::Simd(_)) {
+        } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
             self.vector.cpu = false;
         }

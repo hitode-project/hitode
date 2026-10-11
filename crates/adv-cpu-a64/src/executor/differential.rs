@@ -231,7 +231,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         }
         operand
     };
-    match rng.below(35) {
+    match rng.below(39) {
         0 => a.mov(w, r).unwrap(),
         1 => a.mov(w, rng.imm()).unwrap(),
         2 => {
@@ -451,6 +451,7 @@ fn simple(a: &mut CodeAssembler, rng: &mut Rng) {
         30 => strings(a, rng),
         32 => integer(a, rng, w, r),
         33 | 34 => floating(a, rng, mem),
+        35..=38 => x87(a, rng, mem),
         _ => a.nop().unwrap(),
     }
 }
@@ -876,6 +877,209 @@ fn floating(
                 _ => a.movhps(qword_ptr(p), x),
             }
             .unwrap()
+        }
+    }
+}
+
+/// Doubles at the edges of what x87 units run natively: zeros, small
+/// integers and halves, inexact fractions, the binary64 extremes and
+/// denormals, infinities, NaNs, values beyond 2^±400 and the integer
+/// conversion limits.
+const DOUBLES: [u64; 22] = [
+    0,
+    1 << 63,
+    0x3ff0_0000_0000_0000,
+    0xbff8_0000_0000_0000,
+    0x3fe0_0000_0000_0000,
+    0x4004_0000_0000_0000,
+    0x4000_0000_0000_0001,
+    0x3fd5_5555_5555_5555,
+    0xc059_0ccc_cccc_cccd,
+    0x0010_0000_0000_0000,
+    0x000f_ffff_ffff_ffff,
+    0x7fef_ffff_ffff_ffff,
+    0x7ff0_0000_0000_0000,
+    0x7ff8_0000_0000_0000,
+    0xfff4_0000_0000_0001,
+    0x5fe0_0000_0000_0001,
+    0x2000_0000_0000_0000,
+    0x4330_0000_0000_0001,
+    0x41e0_0000_0000_0000,
+    0xc1e0_0000_0000_0000,
+    0x43e0_0000_0000_0000,
+    0x47ef_ffff_e000_0000,
+];
+
+/// Control words: precision 24, 53 and 64, every rounding mode, the
+/// MSVC defaults and `ftol`'s chop, and some with exceptions unmasked.
+const CONTROLS: [u16; 12] = [
+    0x037f, 0x027f, 0x133f, 0x1f3f, 0x007f, 0x0f7f, 0x077f, 0x0b7f, 0x027e, 0x035f, 0x0373, 0x037b,
+];
+
+const STS: [AsmRegisterSt; 8] = [st0, st1, st2, st3, st4, st5, st6, st7];
+
+/// A short run of x87 instructions over the stack the program left,
+/// sometimes after `fninit`: loads of special and random values, stores,
+/// arithmetic in every form, compares, exchanges and control words.
+fn x87(
+    a: &mut CodeAssembler,
+    rng: &mut Rng,
+    mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
+) {
+    // Scratch operands at the top of the data.
+    let slot = |rng: &mut Rng| ebx + 0x7c0 + 8 * rng.below(6) as i32;
+    if rng.below(4) == 0 {
+        a.fninit().unwrap();
+    }
+    for _ in 0..1 + rng.below(4) {
+        let i = STS[rng.below(8)];
+        let near = STS[rng.below(3)];
+        match rng.below(30) {
+            0 | 1 => {
+                let at = slot(rng);
+                a.mov(dword_ptr(at), rng.pick(&SPECIAL)).unwrap();
+                a.fld(dword_ptr(at)).unwrap();
+            }
+            2 | 3 => {
+                let at = slot(rng);
+                let value = rng.pick(&DOUBLES);
+                a.mov(dword_ptr(at), value as u32).unwrap();
+                a.mov(dword_ptr(at + 4), (value >> 32) as u32).unwrap();
+                a.fld(qword_ptr(at)).unwrap();
+            }
+            4 => {
+                let at = slot(rng);
+                a.mov(dword_ptr(at), rng.imm()).unwrap();
+                if rng.below(2) == 0 {
+                    a.fild(dword_ptr(at)).unwrap();
+                } else {
+                    a.fild(word_ptr(at)).unwrap();
+                }
+            }
+            5 => {
+                let m = mem(a, rng);
+                match rng.below(3) {
+                    0 => a.fld(dword_ptr(m)),
+                    1 => a.fld(qword_ptr(m)),
+                    _ => a.fild(dword_ptr(m)),
+                }
+                .unwrap();
+            }
+            6 => match rng.below(3) {
+                0 => a.fld1().unwrap(),
+                1 => a.fldz().unwrap(),
+                _ => a.fld(i).unwrap(),
+            },
+            7 | 8 => {
+                let m = mem(a, rng);
+                match rng.below(7) {
+                    0 => a.fst(dword_ptr(m)),
+                    1 => a.fstp(dword_ptr(m)),
+                    2 => a.fst(qword_ptr(m)),
+                    3 => a.fstp(qword_ptr(m)),
+                    4 => a.fist(dword_ptr(m)),
+                    5 => a.fistp(dword_ptr(m)),
+                    _ => a.fistp(qword_ptr(m)),
+                }
+                .unwrap();
+            }
+            9 => {
+                if rng.below(2) == 0 {
+                    a.fst(i).unwrap();
+                } else {
+                    a.fstp(i).unwrap();
+                }
+            }
+            10..=17 => {
+                macro_rules! arith {
+                    ($op:ident, $op2:ident, $popped:ident, $int:ident) => {
+                        match rng.below(6) {
+                            0 => a.$op2(st0, i),
+                            1 => a.$op2(i, st0),
+                            2 => a.$popped(near, st0),
+                            3 => {
+                                let at = slot(rng);
+                                a.mov(dword_ptr(at), rng.pick(&SPECIAL)).unwrap();
+                                a.$op(dword_ptr(at))
+                            }
+                            4 => {
+                                let at = slot(rng);
+                                let value = rng.pick(&DOUBLES);
+                                a.mov(dword_ptr(at), value as u32).unwrap();
+                                a.mov(dword_ptr(at + 4), (value >> 32) as u32).unwrap();
+                                a.$op(qword_ptr(at))
+                            }
+                            _ => {
+                                let at = slot(rng);
+                                a.mov(dword_ptr(at), rng.imm() >> rng.below(31)).unwrap();
+                                if rng.below(2) == 0 {
+                                    a.$int(dword_ptr(at))
+                                } else {
+                                    a.$int(word_ptr(at))
+                                }
+                            }
+                        }
+                        .unwrap()
+                    };
+                }
+                match rng.below(6) {
+                    0 => arith!(fadd, fadd_2, faddp, fiadd),
+                    1 => arith!(fsub, fsub_2, fsubp, fisub),
+                    2 => arith!(fsubr, fsubr_2, fsubrp, fisubr),
+                    3 => arith!(fmul, fmul_2, fmulp, fimul),
+                    4 => arith!(fdiv, fdiv_2, fdivp, fidiv),
+                    _ => arith!(fdivr, fdivr_2, fdivrp, fidivr),
+                }
+            }
+            18 | 19 => match rng.below(8) {
+                0 => a.fcom_2(st0, i).unwrap(),
+                1 => a.fcomp_2(st0, i).unwrap(),
+                2 => a.fcompp().unwrap(),
+                3 => a.fucom(st0, i).unwrap(),
+                4 => a.fucomp(st0, i).unwrap(),
+                5 => a.fucompp().unwrap(),
+                6 => {
+                    let at = slot(rng);
+                    a.mov(dword_ptr(at), rng.pick(&SPECIAL)).unwrap();
+                    a.fcomp(dword_ptr(at)).unwrap();
+                }
+                _ => {
+                    let at = slot(rng);
+                    let value = rng.pick(&DOUBLES);
+                    a.mov(dword_ptr(at), value as u32).unwrap();
+                    a.mov(dword_ptr(at + 4), (value >> 32) as u32).unwrap();
+                    a.fcom(qword_ptr(at)).unwrap();
+                }
+            },
+            20 => a.fxch(st0, i).unwrap(),
+            21 => {
+                if rng.below(2) == 0 {
+                    a.fchs().unwrap();
+                } else {
+                    a.fabs().unwrap();
+                }
+            }
+            22 | 23 => {
+                a.mov(word_ptr(ebx + 0x7f8), rng.pick(&CONTROLS) as u32)
+                    .unwrap();
+                a.fldcw(word_ptr(ebx + 0x7f8)).unwrap();
+            }
+            24 => {
+                let m = mem(a, rng);
+                if rng.below(2) == 0 {
+                    a.fnstcw(word_ptr(m)).unwrap();
+                } else {
+                    a.fnstsw(word_ptr(m)).unwrap();
+                }
+            }
+            25 => a.fnstsw(ax).unwrap(),
+            26 => a.wait().unwrap(),
+            27 => a.ffree(i).unwrap(),
+            _ => {
+                // Two pops through the stack, as compiled expressions end.
+                a.faddp(st1, st0).unwrap();
+                a.fstp(dword_ptr(slot(rng))).unwrap();
+            }
         }
     }
 }
@@ -1454,6 +1658,114 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
         }
     }
     assert!(native > 1000, "translated code ran: {native} entries");
+}
+
+/// A loop of the x87 code compilers emit for float expressions, under the
+/// MSVC control word with `ftol`'s switch to chop: it matches the
+/// interpreter, and none of its x87 instructions leaves translated code
+/// or calls a helper.
+#[cfg(native)]
+#[test]
+fn x87_loops_run_natively() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    let constant = |a: &mut CodeAssembler, at: i32, value: u32| {
+        a.mov(dword_ptr(ebx + at), value).unwrap();
+    };
+    constant(&mut a, 0x710, 0.25f32.to_bits());
+    constant(&mut a, 0x714, 3.0f32.to_bits());
+    constant(&mut a, 0x718, 2.0f32.to_bits());
+    constant(&mut a, 0x7f0, 0x133f);
+    constant(&mut a, 0x7f4, 0x1f3f);
+    constant(&mut a, 0x7f8, 0x027f);
+    a.fninit().unwrap();
+    a.fldcw(word_ptr(ebx + 0x7f0)).unwrap();
+    a.mov(ecx, 300).unwrap();
+    a.fldz().unwrap();
+    a.set_label(&mut top).unwrap();
+    // acc += i * 0.25
+    a.mov(dword_ptr(ebx + 0x700), ecx).unwrap();
+    a.fild(dword_ptr(ebx + 0x700)).unwrap();
+    a.fmul(dword_ptr(ebx + 0x710)).unwrap();
+    a.faddp(st1, st0).unwrap();
+    // Stores, a reload and a compare through the status word.
+    a.fld(st0).unwrap();
+    a.fmul(dword_ptr(ebx + 0x714)).unwrap();
+    a.fst(qword_ptr(ebx + 0x730)).unwrap();
+    a.fstp(dword_ptr(ebx + 0x720)).unwrap();
+    a.fld(dword_ptr(ebx + 0x720)).unwrap();
+    a.fcomp(dword_ptr(ebx + 0x714)).unwrap();
+    a.fnstsw(ax).unwrap();
+    a.mov(dword_ptr(ebx + 0x734), eax).unwrap();
+    a.fld1().unwrap();
+    a.fchs().unwrap();
+    a.fabs().unwrap();
+    a.fxch(st0, st1).unwrap();
+    a.fxch(st0, st1).unwrap();
+    a.fsubp(st1, st0).unwrap();
+    a.fld(st0).unwrap();
+    a.fdiv(dword_ptr(ebx + 0x718)).unwrap();
+    a.fstp(qword_ptr(ebx + 0x738)).unwrap();
+    // ftol.
+    a.fnstcw(word_ptr(ebx + 0x7fc)).unwrap();
+    a.fldcw(word_ptr(ebx + 0x7f4)).unwrap();
+    a.fld(st0).unwrap();
+    a.fistp(qword_ptr(ebx + 0x740)).unwrap();
+    a.fld(st0).unwrap();
+    a.fistp(dword_ptr(ebx + 0x748)).unwrap();
+    a.fldcw(word_ptr(ebx + 0x7fc)).unwrap();
+    // An inexact quotient at precision 53.
+    a.fldcw(word_ptr(ebx + 0x7f8)).unwrap();
+    a.fld(st0).unwrap();
+    a.fdivr(dword_ptr(ebx + 0x714)).unwrap();
+    a.fstp(dword_ptr(ebx + 0x74c)).unwrap();
+    a.fldcw(word_ptr(ebx + 0x7f0)).unwrap();
+    a.wait().unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.fstp(dword_ptr(ebx + 0x750)).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let mut state = CpuState {
+        eip: CODE,
+        ..CpuState::default()
+    };
+    state.regs[3] = DATA;
+    state.regs[4] = STACK_TOP;
+    let program = Program {
+        stop: CODE + code.len() as u32 - 1,
+        code,
+        data: vec![0; DATA_LEN],
+        state,
+    };
+    let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+    assert_eq!(outcome, RunOutcome::ReachedStop);
+    let mut executor = Executor::new(BASE, LEN).unwrap();
+    // Every instruction is translated.
+    executor.native.first_visits = false;
+    load(executor.memory_mut(), &program);
+    executor.state = program.state.clone();
+    assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
+    assert_eq!(executor.state.regs, state.regs);
+    assert_eq!(executor.state.x87, state.x87);
+    assert_eq!(executor.state.mmx, state.mmx);
+    assert!(snapshot(executor.memory()) == memory);
+    let sum = (1..=300).sum::<u32>() as f32 * 0.25 - 300.0;
+    assert_eq!(
+        executor.memory().read(DATA + 0x750, 4).unwrap(),
+        sum.to_le_bytes()
+    );
+    for which in [0, 2] {
+        for (code, count) in executor.interpreted_forms(which) {
+            let mnemonic = format!("{:?}", code.mnemonic());
+            assert!(
+                count == 0
+                    || !mnemonic.starts_with('F')
+                    || code.mnemonic() == iced_x86::Mnemonic::Fninit,
+                "{code:?} left translated code {count} times ({which})"
+            );
+        }
+    }
 }
 
 /// Data on a code page: each store faults until the instruction is checked,

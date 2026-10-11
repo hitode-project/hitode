@@ -48,6 +48,7 @@ impl Translator<'_> {
             Op::Simd(simd) => self.simd(simd),
             Op::Strings(strings) => self.strings(strings),
             Op::Integer(integer) => self.integer(integer),
+            Op::X87(x87) => self.x87(x87),
             Op::Direction(set) => self.emit(movz(W, super::X12, u16::from(set), 0)),
             Op::Mov(Src::Reg(dst), source) => self.mov_register(dst, source),
             Op::Mov(Src::Mem(mem), source) => {

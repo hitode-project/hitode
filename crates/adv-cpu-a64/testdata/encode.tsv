@@ -212,3 +212,22 @@ d51b443f	msr fpsr, xzr
 2ea2e420	fcmgt v0.2s, v1.2s, v2.2s
 0f215420	shl v0.2s, v1.2s, #1
 2ea02ca0	uqsub v0.2s, v5.2s, v0.2s
+1e622820	fadd d0, d1, d2
+1e623820	fsub d0, d1, d2
+1e620820	fmul d0, d1, d2
+1e621820	fdiv d0, d1, d2
+1f628c24	fnmsub d4, d1, d2, d3
+1e622020	fcmp d1, d2
+1e602028	fcmp d1, #0.0
+1e60c020	fabs d0, d1
+1e614020	fneg d0, d1
+1e644020	frintn d0, d1
+1e65c020	frintz d0, d1
+1e22c020	fcvt d0, s1
+1e624020	fcvt s0, d1
+1e620020	scvtf d0, w1
+9e620020	scvtf d0, x1
+9e780020	fcvtzs x0, d1
+9e600020	fcvtns x0, d1
+1e780020	fcvtzs w0, d1
+1e600020	fcvtns w0, d1

@@ -26,6 +26,10 @@ use super::flags::FlagSet;
 
 /// Longest trace, in guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;
+/// What an x87 instruction counts toward `MAX_INSTRUCTIONS`: each emits
+/// some hundred host instructions, and a unit must stay within the 32 KiB
+/// reach of `tbz` to its cold code.
+const X87_WEIGHT: usize = 4;
 /// Deepest inlined call.
 const MAX_DEPTH: u8 = 8;
 /// Room an inlined callee should still have.
@@ -151,13 +155,14 @@ impl Trace {
         fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
         let (mut pc, mut frame) = (entry, 0u16);
+        let mut weight = 0;
         loop {
             let len = self.insts.len();
             let end = if len > 0 && stops.contains(pc) {
                 Some(Edge::Exit(pc))
             } else if let Some(index) = self.find(pc, frame) {
                 Some(Edge::Internal(index))
-            } else if len == MAX_INSTRUCTIONS {
+            } else if len == MAX_INSTRUCTIONS || weight >= MAX_INSTRUCTIONS {
                 Some(Edge::Exit(pc))
             } else {
                 None
@@ -174,6 +179,11 @@ impl Trace {
                 break;
             };
             let next_pc = pc.wrapping_add(size);
+            weight += if matches!(op, Op::X87(_)) {
+                X87_WEIGHT
+            } else {
+                1
+            };
             match self.code.last_mut() {
                 // Spans grow along the fall-through path.
                 Some((start, bytes)) if start.wrapping_add(*bytes) == pc => *bytes += size,

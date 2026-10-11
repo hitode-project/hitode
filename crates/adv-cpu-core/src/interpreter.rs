@@ -715,6 +715,11 @@ impl Prepared {
         Some(Self { decoded, x87 })
     }
 
+    /// The x87 opcode (FOP) the instruction records, if it records one.
+    pub fn x87_opcode(&self) -> Option<u16> {
+        self.x87.as_ref().and_then(|op| op.opcode)
+    }
+
     /// Runs the instruction at `state.eip` as `Interpreter::run_chunk`
     /// would, a REP for at most `max_units` elements.
     pub fn execute(&self, state: &mut CpuState, memory: &mut Memory, max_units: u32) -> Execution {
