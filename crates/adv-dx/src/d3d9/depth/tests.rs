@@ -32,10 +32,7 @@ fn binding_public_zero_getter_parent_retain_failures_and_final_release_are_one_c
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
     assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(1));
     assert!(attach(&env, device, equal).unwrap().depth().is_some());
-    assert!(
-        matches!(attach(&env, device, smaller), Err(UNAVAILABLE)),
-        "larger D3D depth is explicitly outside the equal-view backend subset"
-    );
+    assert!(attach(&env, device, smaller).unwrap().depth().is_some());
     assert!(has_stencil(&env, device));
     let output = GuestPtr::<u32>::new(env.sys.vm.alloc(env.cpu, 4096, Prot::RW).unwrap());
     assert_eq!(get(&mut env, GuestPtr::new(device), output), 0);

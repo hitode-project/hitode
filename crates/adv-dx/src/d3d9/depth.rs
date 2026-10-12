@@ -91,8 +91,8 @@ pub(super) fn release_binding(env: &mut Env<'_>, binding: Option<Id>) {
         super::destroy(env, dead);
     }
 }
-/// Rendering requires equally sized attachment views on the shared backend.
-/// Keep the larger-D3D-depth case explicit until the device can represent it.
+/// Bind the original depth owner, including a larger D3D depth image. The
+/// shared renderer clips commands to the logical color view without resizing Z.
 pub(super) fn attach(env: &Env<'_>, this: u32, target: Target) -> Result<Target, u32> {
     let device = device(env, this).ok_or(INVALID)?;
     let Some(id) = device.depth_stencil else {

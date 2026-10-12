@@ -468,10 +468,12 @@ impl Gpu {
                 bytemuck::cast_slice(indices),
             );
         }
+        let attachment = self.attachment_color(target)?;
         let mut encoder = context.device.create_command_encoder(&Default::default());
+        attachment.load(&mut encoder, &target.image);
         {
             let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &target.image.render_view,
+                view: &attachment.image.render_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -508,9 +510,13 @@ impl Gpu {
                 v.minimum_depth,
                 v.maximum_depth,
             );
-            if let Some(r) = state.scissor {
-                pass.set_scissor_rect(r.x, r.y, r.w, r.h);
-            }
+            let r = state.scissor.unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                w: target.image.width,
+                h: target.image.height,
+            });
+            pass.set_scissor_rect(r.x, r.y, r.w, r.h);
             if state.stencil.is_some() {
                 pass.set_stencil_reference(state.stencil_reference & 255);
             }
@@ -531,6 +537,7 @@ impl Gpu {
                 pass.draw(0..draw.vertex_count, 0..1);
             }
         }
+        attachment.store(&mut encoder, &target.image);
         self.submit(encoder, &submission);
         self.stats.draws += 1;
         self.stats.vertices += count as u64;

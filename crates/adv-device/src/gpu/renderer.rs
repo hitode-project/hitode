@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 use super::*;
+mod attachments;
 mod pipeline_disk;
 mod program;
 pub use program::validate_program;
@@ -219,6 +220,11 @@ pub struct Target {
     depth: Option<Depth>,
 }
 impl Target {
+    pub(super) fn padded_attachments(&self) -> bool {
+        self.depth.as_ref().is_some_and(|depth| {
+            depth.width() != self.image.width || depth.height() != self.image.height
+        })
+    }
     pub fn mip_level(&self, level: u32) -> Result<Self, Error> {
         if level != 0 && self.depth.is_some() {
             return Err(invalid("depth attachment has no color mip-level alias"));
@@ -240,13 +246,13 @@ impl Target {
     pub fn depth(&self) -> Option<&Depth> {
         self.depth.as_ref()
     }
-    /// Attachment views must have equal dimensions on the common GPU backend.
-    /// Reject mismatches before encoding; never hide a resize or per-draw copy.
+    /// A depth image may cover a larger area than this logical color view.
+    /// Rendering preserves its original storage and clips to the color extent.
     pub fn with_depth(mut self, depth: Option<Depth>) -> Result<Self, Error> {
         if depth.as_ref().is_some_and(|d| {
             d.context() != self.image.context
-                || d.width() != self.image.width
-                || d.height() != self.image.height
+                || d.width() < self.image.width
+                || d.height() < self.image.height
         }) {
             return Err(invalid(
                 "depth attachment context or dimensions do not match",
@@ -379,6 +385,7 @@ pub struct Gpu {
     pipeline_order: VecDeque<PipelineKey>,
     pipeline_limit: usize,
     programmable: program::Cache,
+    attachment_scratch: Option<Image>,
     samplers: HashMap<Sampler, wgpu::Sampler>,
     white: Image,
     upload: wgpu::Buffer,
@@ -559,6 +566,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: MAX_PIPELINES,
             programmable: program::Cache::default(),
+            attachment_scratch: None,
             samplers: HashMap::new(),
             white,
             upload,
@@ -603,6 +611,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: self.pipeline_limit,
             programmable: program::Cache::default(),
+            attachment_scratch: None,
             samplers: HashMap::new(),
             white: self.white.clone(),
             upload,
@@ -676,8 +685,8 @@ impl Gpu {
         self.own(&target.image)?;
         if target.depth.as_ref().is_some_and(|depth| {
             depth.context() != target.image.context
-                || depth.width() != target.image.width
-                || depth.height() != target.image.height
+                || depth.width() < target.image.width
+                || depth.height() < target.image.height
         }) {
             return Err(invalid(
                 "depth attachment context or dimensions do not match",
@@ -838,6 +847,22 @@ impl Gpu {
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), Error> {
+        if target.padded_attachments() {
+            // A load-op clear would erase the larger depth image outside the
+            // logical color view. The bounded draw path clears only that view.
+            return self.clear_region(
+                target,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: target.image.width,
+                    h: target.image.height,
+                },
+                color,
+                depth,
+                stencil,
+            );
+        }
         let context = self.context.clone();
         let submission = context.submission()?;
         self.own_target(target)?;
@@ -1116,13 +1141,15 @@ impl Gpu {
                     },
                 ],
             });
+        let attachment = self.attachment_color(target)?;
         let mut encoder = self
             .context
             .device
             .create_command_encoder(&Default::default());
+        attachment.load(&mut encoder, &target.image);
         {
             let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &target.image.render_view,
+                view: &attachment.image.render_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -1163,9 +1190,13 @@ impl Gpu {
                 viewport.minimum_depth,
                 viewport.maximum_depth,
             );
-            if let Some(r) = state.scissor {
-                pass.set_scissor_rect(r.x, r.y, r.w, r.h);
-            }
+            let r = state.scissor.unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                w: target.image.width,
+                h: target.image.height,
+            });
+            pass.set_scissor_rect(r.x, r.y, r.w, r.h);
             pass.set_vertex_buffer(0, self.upload.slice(0..size));
             match inclusive {
                 None => pass.draw(0..vertices.len() as u32, 0..1),
@@ -1193,6 +1224,7 @@ impl Gpu {
                 }
             }
         }
+        attachment.store(&mut encoder, &target.image);
         self.submit(encoder, &submission);
         self.stats.draws += 1;
         self.stats.vertices += vertices.len() as u64;

@@ -309,8 +309,18 @@ fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
         assert_eq!(read(&mut gpu, &first.image), [0, 255, 0, 255].repeat(16));
     }
     let depth = gpu.depth(8, 8, DepthFormat::Float32).unwrap();
+    let smaller = gpu
+        .target(4, 4, false)
+        .unwrap()
+        .with_depth(Some(depth))
+        .unwrap();
+    gpu.clear(&smaller, Some([1., 0., 0., 1.]), Some(1.))
+        .unwrap();
+    assert_eq!(read(&mut gpu, &smaller.image), [0, 0, 255, 255].repeat(16));
     assert!(matches!(
-        gpu.target(4, 4, false).unwrap().with_depth(Some(depth)),
+        gpu.target(4, 4, false)
+            .unwrap()
+            .with_depth(Some(gpu.depth(3, 4, DepthFormat::Float32).unwrap())),
         Err(Error::Invalid(_))
     ));
     let foreign = pollster::block_on(Gpu::request(true))

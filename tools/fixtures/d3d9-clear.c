@@ -43,6 +43,21 @@ void mainCRTStartup(void){
  black(d);state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,TRUE);state(d,D3DRS_STENCILREF,5);quad(d,.5f,0xff00ff00u);capture(d,back,D3DFMT_A8R8G8B8);
  ok(IDirect3DDevice9_CreateTexture(d,16,12,1,D3DUSAGE_RENDERTARGET,D3DFMT_X8R8G8B8,D3DPOOL_DEFAULT,&texture,NULL));ok(IDirect3DTexture9_GetSurfaceLevel(texture,0,&x8));ok(IDirect3DDevice9_SetScissorRect(d,&scissor));ok(IDirect3DDevice9_SetRenderTarget(d,0,x8));scissor_value(d);ok(IDirect3DDevice9_Clear(d,0,NULL,D3DCLEAR_TARGET,0x00112233u,0,0));viewport(d,0,0,8,12,.8f,.9f);ok(IDirect3DDevice9_Clear(d,0,NULL,D3DCLEAR_TARGET,0x00445566u,0,0));
  ok(IDirect3DDevice9_SetRenderTarget(d,0,back));ok(IDirect3DDevice9_SetTexture(d,0,(IDirect3DBaseTexture9 *)texture));ok(IDirect3DDevice9_SetFVF(d,D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX1));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_COLOROP,D3DTOP_SELECTARG1));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_COLORARG1,D3DTA_TEXTURE));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE));state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,FALSE);texture_quad(d);capture(d,back,D3DFMT_A8R8G8B8);
- ok(IDirect3DDevice9_SetScissorRect(d,&scissor));ok(IDirect3DDevice9_SetRenderTarget(d,0,back));scissor_value(d);ok(IDirect3DDevice9_SetTexture(d,0,NULL));record(IDirect3DSurface9_Release(x8));record(IDirect3DTexture9_Release(texture));record(IDirect3DSurface9_Release(back));record(IDirect3DDevice9_Release(d));record(IDirect3D9_Release(factory));CloseHandle(pixel_file);DestroyWindow(w);
+ ok(IDirect3DDevice9_SetScissorRect(d,&scissor));ok(IDirect3DDevice9_SetRenderTarget(d,0,back));scissor_value(d);ok(IDirect3DDevice9_SetTexture(d,0,NULL));
+ // A smaller color target must not resize or clear outside the original Z/S.
+ {IDirect3DSurface9 *compact=NULL;
+  ok(IDirect3DDevice9_SetFVF(d,D3DFVF_XYZRHW|D3DFVF_DIFFUSE));
+  ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_COLOROP,D3DTOP_SELECTARG1));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_COLORARG1,D3DTA_DIFFUSE));
+  ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1));ok(IDirect3DDevice9_SetTextureStageState(d,0,D3DTSS_ALPHAARG1,D3DTA_DIFFUSE));
+  state(d,D3DRS_ZWRITEENABLE,FALSE);state(d,D3DRS_ZENABLE,TRUE);state(d,D3DRS_STENCILENABLE,FALSE);
+  state(d,D3DRS_STENCILMASK,0xff);state(d,D3DRS_STENCILWRITEMASK,0xff);state(d,D3DRS_STENCILFUNC,D3DCMP_EQUAL);state(d,D3DRS_STENCILPASS,D3DSTENCILOP_KEEP);state(d,D3DRS_STENCILREF,7);
+  ok(IDirect3DDevice9_Clear(d,0,NULL,7,0xff000000u,.75f,3));
+  ok(IDirect3DDevice9_CreateRenderTarget(d,8,6,D3DFMT_A8R8G8B8,0,0,FALSE,&compact,NULL));ok(IDirect3DDevice9_SetRenderTarget(d,0,compact));
+  ok(IDirect3DDevice9_Clear(d,0,NULL,6,0,.25f,7));ok(IDirect3DDevice9_SetRenderTarget(d,0,back));black(d);
+  quad(d,.5f,0xff00ff00u);capture(d,back,D3DFMT_A8R8G8B8);
+  black(d);state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,TRUE);quad(d,.5f,0xff0000ffu);capture(d,back,D3DFMT_A8R8G8B8);
+  record(IDirect3DSurface9_Release(compact));
+ }
+ record(IDirect3DSurface9_Release(x8));record(IDirect3DTexture9_Release(texture));record(IDirect3DSurface9_Release(back));record(IDirect3DDevice9_Release(d));record(IDirect3D9_Release(factory));CloseHandle(pixel_file);DestroyWindow(w);
  {volatile DWORD guard=0;for(i=0;i<50000;++i)guard=guard*33u+i;record(guard);}record(0xc1ea000du);save();ExitProcess(0);
 }

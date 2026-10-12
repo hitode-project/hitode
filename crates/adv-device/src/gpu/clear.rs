@@ -41,13 +41,14 @@ impl Gpu {
         if rectangle.w == 0 || rectangle.h == 0 {
             return Ok(());
         }
-        if rectangle
-            == (Rect {
-                x: 0,
-                y: 0,
-                w: width,
-                h: height,
-            })
+        if !target.padded_attachments()
+            && rectangle
+                == (Rect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: height,
+                })
         {
             return self.clear_with_stencil(target, color, depth, stencil);
         }
