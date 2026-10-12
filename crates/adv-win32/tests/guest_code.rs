@@ -6,7 +6,9 @@ use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_machine::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, PARK_ADDR};
+use adv_machine::layout::PARK_ADDR;
+#[cfg(not(target_arch = "aarch64"))]
+use adv_machine::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE};
 use adv_machine::{Clock, Machine, RunResult};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};

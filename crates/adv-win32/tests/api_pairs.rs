@@ -792,13 +792,15 @@ fn picker_pairs_report_initialization_failure_and_keep_errors_bound_to_the_threa
         assert_eq!(call(&mut m, "comdlg32.dll", "CommDlgExtendedError", &[]), 2);
         assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xcccccccc);
     }
-    for (name, args) in [
-        ("SHBrowseForFolderW", vec![DATA]),
-        ("SHGetPathFromIDListW", vec![0, DATA]),
-        ("SHGetFileInfoW", vec![0, 0, DATA, 100, 0]),
+    // SHGetPathFromIDList empties its output before rejecting the PIDL.
+    for (name, args, expected) in [
+        ("SHBrowseForFolderW", vec![DATA], 0xcccccccc),
+        ("SHGetPathFromIDListW", vec![0, DATA], 0xcccc0000),
+        ("SHGetFileInfoW", vec![0, 0, DATA, 100, 0], 0xcccccccc),
     ] {
+        m.cpu.write(DATA, &[0xcc; 4]).unwrap();
         assert_eq!(call(&mut m, "shell32.dll", name, &args), 0);
-        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xcccccccc);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), expected, "{name}");
     }
     assert_eq!(m.sys.objects.object_count(), count);
     m.spawn("dialog second thread", PARK_ADDR, &[], 65536)
