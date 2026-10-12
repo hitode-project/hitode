@@ -518,6 +518,110 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
 }
 #[test]
+fn neutral_sampler_defaults_pair_queries_changes_and_state_blocks_for_every_slot() {
+    let mut m = machine();
+    m.cpu.map(0x5a0000, 4096, Prot::RW).unwrap();
+    let mut env = env(&mut m);
+    let (device, _, _, _) = super::super::tests::setup(&mut env);
+    let mut registry = Registry::default();
+    super::super::register(&mut registry);
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 16).unwrap());
+    for sampler in (0..=15).chain(257..=260) {
+        for (kind, value) in [(8, 0), (10, 1), (11, 0), (12, 0), (13, 0)] {
+            assert_eq!(
+                typed_call(
+                    &mut env,
+                    &registry,
+                    "IDirect3DDevice9::GetSamplerState",
+                    &[device, sampler, kind, output.addr()]
+                ),
+                0
+            );
+            assert_eq!(output.read(env.cpu).unwrap(), value);
+            assert_eq!(
+                typed_call(
+                    &mut env,
+                    &registry,
+                    "IDirect3DDevice9::SetSamplerState",
+                    &[device, sampler, kind, value]
+                ),
+                0
+            );
+        }
+        assert_eq!(stateblocks::begin(&mut env, GuestPtr::new(device)), 0);
+        assert_eq!(
+            typed_call(
+                &mut env,
+                &registry,
+                "IDirect3DDevice9::SetSamplerState",
+                &[device, sampler, 8, 0x80000000]
+            ),
+            0
+        );
+        assert_eq!(stateblocks::end(&mut env, GuestPtr::new(device), output), 0);
+        let block = output.read(env.cpu).unwrap();
+        assert_eq!(
+            typed_call(
+                &mut env,
+                &registry,
+                "IDirect3DDevice9::GetSamplerState",
+                &[device, sampler, 8, output.addr()]
+            ),
+            0
+        );
+        assert_eq!(
+            output.read(env.cpu).unwrap(),
+            0,
+            "recording leaves current defaults intact"
+        );
+        assert_eq!(stateblocks::apply(&mut env, GuestPtr::new(block)), 0);
+        assert_eq!(
+            typed_call(
+                &mut env,
+                &registry,
+                "IDirect3DDevice9::GetSamplerState",
+                &[device, sampler, 8, output.addr()]
+            ),
+            0
+        );
+        assert_eq!(
+            output.read(env.cpu).unwrap(),
+            0x80000000,
+            "signed zero survives state blocks"
+        );
+        for (kind, value, previous) in [
+            (8, 0x3f800000, 0x80000000),
+            (8, 0x7f800000, 0x80000000),
+            (10, 2, 1),
+            (11, 1, 0),
+            (12, 1, 0),
+            (13, 1, 0),
+        ] {
+            assert_eq!(
+                typed_call(
+                    &mut env,
+                    &registry,
+                    "IDirect3DDevice9::SetSamplerState",
+                    &[device, sampler, kind, value]
+                ),
+                UNAVAILABLE
+            );
+            assert_eq!(
+                typed_call(
+                    &mut env,
+                    &registry,
+                    "IDirect3DDevice9::GetSamplerState",
+                    &[device, sampler, kind, output.addr()]
+                ),
+                0
+            );
+            assert_eq!(output.read(env.cpu).unwrap(), previous);
+        }
+        assert_eq!(release(&mut env, block), 0);
+    }
+}
+
+#[test]
 fn failed_block_retain_rolls_back_partial_ownership_and_unchanged_capture_reuses_refs() {
     let mut m = super::super::tests::machine();
     let mut env = env(&mut m);

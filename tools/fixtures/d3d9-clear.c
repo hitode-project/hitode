@@ -58,6 +58,22 @@ void mainCRTStartup(void){
   black(d);state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,TRUE);quad(d,.5f,0xff0000ffu);capture(d,back,D3DFMT_A8R8G8B8);
   record(IDirect3DSurface9_Release(compact));
  }
+ // POSITIONT bypasses a bound collapsing VS, while the constant PS still runs.
+ {IDirect3DVertexShader9 *vs=NULL,*queried=NULL;IDirect3DPixelShader9 *ps=NULL;IDirect3DVertexDeclaration9 *decl=NULL;
+  const DWORD vsCode[]={0xfffe0200,0x0200001f,0x80000000,0x900f0000,0x02000001,0xc00f0000,0xa0e40000,0xffff};
+  const DWORD psCode[]={0xffff0200,0x02000001,0x800f0800,0xa0e40000,0xffff};
+  const float position[]={0,0,.5f,1},green[]={0,1,0,1};
+  const D3DVERTEXELEMENT9 elements[]={{0,0,D3DDECLTYPE_FLOAT4,0,D3DDECLUSAGE_POSITIONT,0},{0,16,D3DDECLTYPE_D3DCOLOR,0,D3DDECLUSAGE_COLOR,0},{0,20,D3DDECLTYPE_FLOAT2,0,D3DDECLUSAGE_TEXCOORD,0},D3DDECL_END()};
+  ok(IDirect3DDevice9_CreateVertexShader(d,vsCode,&vs));ok(IDirect3DDevice9_CreatePixelShader(d,psCode,&ps));
+  ok(IDirect3DDevice9_SetVertexShaderConstantF(d,0,position,1));ok(IDirect3DDevice9_SetPixelShaderConstantF(d,0,green,1));
+  ok(IDirect3DDevice9_SetVertexShader(d,vs));ok(IDirect3DDevice9_SetPixelShader(d,ps));state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,FALSE);
+  ok(IDirect3DDevice9_SetFVF(d,D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX1));ok(IDirect3DDevice9_GetVertexShader(d,&queried));record(queried==vs);IDirect3DVertexShader9_Release(queried);
+  black(d);texture_quad(d);capture(d,back,D3DFMT_A8R8G8B8);
+  ok(IDirect3DDevice9_CreateVertexDeclaration(d,elements,&decl));ok(IDirect3DDevice9_SetVertexDeclaration(d,decl));ok(IDirect3DDevice9_GetVertexShader(d,&queried));record(queried==vs);IDirect3DVertexShader9_Release(queried);
+  black(d);texture_quad(d);capture(d,back,D3DFMT_A8R8G8B8);
+  ok(IDirect3DDevice9_SetVertexDeclaration(d,NULL));ok(IDirect3DDevice9_SetVertexShader(d,NULL));ok(IDirect3DDevice9_SetPixelShader(d,NULL));
+  record(IDirect3DVertexDeclaration9_Release(decl));record(IDirect3DVertexShader9_Release(vs));record(IDirect3DPixelShader9_Release(ps));
+ }
  record(IDirect3DSurface9_Release(x8));record(IDirect3DTexture9_Release(texture));record(IDirect3DSurface9_Release(back));record(IDirect3DDevice9_Release(d));record(IDirect3D9_Release(factory));CloseHandle(pixel_file);DestroyWindow(w);
  {volatile DWORD guard=0;for(i=0;i<50000;++i)guard=guard*33u+i;record(guard);}record(0xc1ea000du);save();ExitProcess(0);
 }

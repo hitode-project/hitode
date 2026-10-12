@@ -172,7 +172,12 @@ impl Fixed {
             (5, 1),
             (6, 1),
             (7, 0),
+            (8, 0),
             (9, 0),
+            (10, 1),
+            (11, 0),
+            (12, 0),
+            (13, 0),
         ]);
         let identity = [
             1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
@@ -629,6 +634,11 @@ fn set_sampler(env: &mut Env<'_>, this: GuestPtr<()>, sampler: u32, kind: i32, v
         5 | 6 => matches!(value, 1 | 2),
         7 => value <= 2,
         4 | 9 => true,
+        // These neutral values require no additional sampling operation. Keep
+        // exact DWORDs (including signed zero); nonneutral requests stay explicit.
+        8 if f32::from_bits(value) == 0. => true,
+        10 if value == 1 => true,
+        11..=13 if value == 0 => true,
         _ => return UNAVAILABLE,
     };
     if !valid {

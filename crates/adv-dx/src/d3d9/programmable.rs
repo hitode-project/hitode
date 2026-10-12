@@ -189,6 +189,22 @@ pub(super) fn sampler_slot(sampler: u32) -> Option<usize> {
         _ => None,
     }
 }
+fn pretransformed(env: &Env<'_>, pointer: u32) -> Result<bool, u32> {
+    let d = device(env, pointer).ok_or(INVALID)?;
+    if let Some(id) = d.buffers.declaration {
+        let Some(Payload::Declaration(declaration)) = com(env).get_identity(&env.sys.objects, id)
+        else {
+            return Err(INVALID);
+        };
+        Ok(declaration
+            .elements
+            .iter()
+            .take_while(|e| e[0] != 255)
+            .any(|e| e[6] == 9 && e[7] == 0))
+    } else {
+        Ok(d.fixed.fvf & 0x0e == 4)
+    }
+}
 pub(super) fn prepare(
     env: &mut Env<'_>,
     pointer: u32,
@@ -234,7 +250,16 @@ fn prepare_checked(
     if !d.scene || d.needs_reset {
         return Err(INVALID);
     }
-    let vs = stage(env, d.shaders.vertex)?;
+    // POSITIONT/FVF XYZRHW bypasses vertex processing even while a vertex
+    // shader remains bound. Getter/state-block identity remains unchanged.
+    let vs = stage(
+        env,
+        if pretransformed(env, pointer)? {
+            None
+        } else {
+            d.shaders.vertex
+        },
+    )?;
     let ps = stage(env, d.shaders.pixel)?;
     let vt = vs.as_ref().map(|s| s.translation.as_ref());
     let pt = ps.as_ref().map(|s| s.translation.as_ref());
