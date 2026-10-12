@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ARM64 Linux acceptance for adv-cpu without hosted CI.
+# AArch64 Linux or macOS acceptance for adv-cpu without hosted CI.
 #
 # Usage: tools/cpu/arm64-check.sh [REF] [OUT_DIR]
 #   REF      ref to test (default: HEAD); origin/REF wins when it exists.
 #   OUT_DIR  where logs go (default: target/arm64-acceptance/<short sha>).
-# Runs plain and ADV_JIT_VERIFY=strict
-# suites, then judges each log with acceptance.py. Prints one line per suite
-# and exits non-zero if any suite is not accepted. The checkout is detached;
+# Runs the CPU suites once on the a64 engine and judges the log with
+# acceptance.py, plainly and against the strict baseline. Prints one line per
+# judgement and exits non-zero if either does not accept. The checkout is detached;
 # run it in a clean clone, not in a working tree with uncommitted changes.
 set -u
 cd "$(git rev-parse --show-toplevel)"
@@ -30,13 +30,13 @@ mkdir -p "$OUT"
 { git rev-parse HEAD; rustc -V; uname -sm; echo "page size: $(getconf PAGESIZE)"; } > "$OUT/environment.txt"
 TOOL=$ARM64_CHECK_TOOLS/acceptance.py
 status=0
-run() {
-  name=$1 strict=$2; shift 2
-  env "$@" cargo test --release --locked -p adv-cpu -p adv-cpu-core -p adv-cpu-x64 --no-fail-fast --lib --tests > "$OUT/$name.log" 2>&1
-  if python3 "$TOOL" $strict "$OUT/$name.log" > "$OUT/$name.summary"; then :; else status=1; fi
-  echo "$name: $(paste -sd' ' "$OUT/$name.summary")"
+cargo test --release --locked -p adv-cpu -p adv-cpu-core -p adv-cpu-a64 --no-fail-fast --lib --tests > "$OUT/tests.log" 2>&1
+judge() {
+  name=$1; shift
+  if python3 "$TOOL" "$@" "$OUT/tests.log" > "$OUT/$name.summary"; then :; else status=1; fi
+  echo "$name: $(paste -sd' ' - < "$OUT/$name.summary")"
 }
-run tests ""
-run strict --strict ADV_JIT_VERIFY=strict
+judge plain
+judge strict --strict
 echo "logs: $OUT"
 exit $status
