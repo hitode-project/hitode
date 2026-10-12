@@ -11,7 +11,6 @@ description = "Host platform shell: window, input, audio device, execution drive
 default = []
 gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:wgpu", "dep:pollster"]
 media = ["adv-runtime/media"]
-# Migration comparison, deleted at a64 M3: see adv-cpu.
 
 [dependencies]
 adv-runtime = { path = "../adv-runtime" }
