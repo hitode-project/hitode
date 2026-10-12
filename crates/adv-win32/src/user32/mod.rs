@@ -22,6 +22,7 @@ pub mod menu;
 pub mod message;
 mod monitor;
 mod placement;
+mod property;
 mod rectangle;
 mod region;
 mod resources;
@@ -769,6 +770,7 @@ pub fn register(reg: &mut Registry) {
     window::register(reg);
     encoding::register(reg);
     placement::register(reg);
+    property::register(reg);
     rectangle::register(reg);
     region::register(reg);
     message::register(reg);
@@ -832,12 +834,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "ShowCursor", 1, show_cursor);
     s(reg, "GetCursorPos", 1, get_cursor_pos);
     s(reg, "SetCursorPos", 2, set_cursor_pos);
-    s(reg, "GetPropA", 2, |_| Outcome::Return(0));
-    s(reg, "SetPropA", 3, |_| Outcome::Return(1));
-    s(reg, "RemovePropA", 2, |_| Outcome::Return(0));
-    s(reg, "GetPropW", 2, |_| Outcome::Return(0));
-    s(reg, "SetPropW", 3, |_| Outcome::Return(1));
-    s(reg, "RemovePropW", 2, |_| Outcome::Return(0));
     s(reg, "EnableScrollBar", 3, |_| Outcome::Return(1));
     s(reg, "ShowScrollBar", 3, |_| Outcome::Return(1));
     s(reg, "GetAsyncKeyState", 1, get_async_key_state);

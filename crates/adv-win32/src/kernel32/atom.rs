@@ -31,13 +31,12 @@ impl Default for Atoms {
     }
 }
 
-enum Name {
+pub(crate) enum Name {
     Integer(u16),
     String(Vec<u16>),
 }
 
-fn name(env: &Env<'_>, wide: bool) -> Result<Name, u32> {
-    let pointer = env.arg(0);
+pub(crate) fn name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Name, u32> {
     if pointer < 0x10000 {
         return if (1..0xc000).contains(&pointer) {
             Ok(Name::Integer(pointer as u16))
@@ -91,11 +90,26 @@ fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
 }
 
 fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
-    let spelling = match name(env, wide) {
+    let spelling = match name(env, env.arg(0), wide) {
         Ok(Name::Integer(atom)) => return Outcome::Return(u32::from(atom)),
         Ok(Name::String(units)) => units,
         Err(error) => return fail(env, error),
     };
+    match resolve(env, spelling, add) {
+        Ok(atom) => Outcome::Return(u32::from(atom)),
+        Err(error) => fail(env, error),
+    }
+}
+
+pub(crate) fn spelling(env: &Env<'_>, atom: u16) -> Option<Vec<u16>> {
+    env.ext
+        .try_get::<Atoms>()?
+        .entries
+        .get(&atom)
+        .map(|e| e.spelling.clone())
+}
+
+pub(crate) fn resolve(env: &mut Env<'_>, spelling: Vec<u16>, add: bool) -> Result<u16, u32> {
     let key: Vec<_> = spelling
         .iter()
         .map(|&u| adv_os::nls::unit_case(u, true))
@@ -108,14 +122,14 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
         if add {
             let entry = table.entries.get_mut(&id).unwrap();
             let Some(references) = entry.references.checked_add(1) else {
-                return fail(env, 8);
+                return Err(8);
             };
             entry.references = references;
         }
-        return Outcome::Return(u32::from(id));
+        return Ok(id);
     }
     if !add {
-        return fail(env, 2);
+        return Err(2);
     }
     let id = if let Some(id) = table.free.pop_first() {
         id
@@ -124,7 +138,7 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
         table.next += 1;
         id
     } else {
-        return fail(env, 8);
+        return Err(8);
     };
     table.names.insert(key.clone(), id);
     table.entries.insert(
@@ -135,19 +149,26 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
             references: 1,
         },
     );
-    Outcome::Return(u32::from(id))
+    Ok(id)
 }
 
 fn delete(env: &mut Env<'_>) -> Outcome {
     let atom = env.arg(0) as u16;
+    match release(env, atom) {
+        Ok(()) => Outcome::Return(0),
+        Err(error) => fail(env, error),
+    }
+}
+
+pub(crate) fn release(env: &mut Env<'_>, atom: u16) -> Result<(), u32> {
     if atom < 0xc000 {
-        return Outcome::Return(0);
+        return Ok(());
     }
     let Some(table) = env.ext.try_get_mut::<Atoms>() else {
-        return fail(env, 6);
+        return Err(6);
     };
     let Some(entry) = table.entries.get_mut(&atom) else {
-        return fail(env, 6);
+        return Err(6);
     };
     entry.references -= 1;
     if entry.references == 0 {
@@ -155,7 +176,7 @@ fn delete(env: &mut Env<'_>) -> Outcome {
         table.names.remove(&entry.key);
         table.free.insert(atom);
     }
-    Outcome::Return(0)
+    Ok(())
 }
 
 fn get_name(env: &mut Env<'_>, wide: bool) -> Outcome {

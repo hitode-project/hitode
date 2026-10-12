@@ -189,6 +189,7 @@ pub struct Class {
 /// Per-window state of built-in controls and dialogs.
 #[derive(Default)]
 pub struct ControlState {
+    pub(crate) properties: Vec<(u16, u32, bool)>,
     pub(crate) update: super::update::UpdateRegion,
     pub(crate) scrolls: Option<[super::scroll::ScrollState; 2]>,
     /// Button check state (BST_*), and BST_PUSHED while the mouse is down.
@@ -1502,6 +1503,7 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
                 for h in all.iter().rev() {
                     super::message::sent::cancel_window(env, *h);
                     crate::gdi32::raster::front::retire_window(env, *h);
+                    super::property::retire_window(env, *h);
                     let u = &mut env.ext.get_mut::<crate::Win32>().user;
                     u.remove_window(*h, &mut env.sys.objects);
                 }

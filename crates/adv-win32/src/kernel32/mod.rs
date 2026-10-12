@@ -1,7 +1,7 @@
 //! kernel32.dll.
 
 mod activation;
-mod atom;
+pub(crate) mod atom;
 pub(crate) mod child_process;
 mod environment;
 mod exception;
