@@ -13,9 +13,13 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Dirty ranges kept apart before they collapse into one union.
+const MAX_DIRTY_RANGES: usize = 64;
+
 pub struct FastPermissions {
     bytes: Arc<Vec<u8>>,
-    dirty: Option<Range<usize>>,
+    /// Disjoint, sorted page ranges to recompute; distant changes stay apart.
+    dirty: Vec<Range<usize>>,
     selective: bool,
     /// Counts the snapshots whose bytes differ from the one before.
     version: u64,
@@ -29,7 +33,7 @@ impl FastPermissions {
     pub(super) fn from_snapshot(bytes: Arc<Vec<u8>>) -> Self {
         Self {
             bytes,
-            dirty: None,
+            dirty: Vec::new(),
             selective: false,
             version: 0,
         }
@@ -46,11 +50,23 @@ impl FastPermissions {
         if pages.is_empty() {
             return;
         }
-        let affected = pages.start.saturating_sub(1)..pages.end;
-        self.dirty = Some(match self.dirty.take() {
-            Some(old) => old.start.min(affected.start)..old.end.max(affected.end),
-            None => affected,
-        });
+        let mut affected = pages.start.saturating_sub(1)..pages.end;
+        // Absorb every range this one touches, keeping the rest in order.
+        let first = self
+            .dirty
+            .partition_point(|range| range.end < affected.start);
+        let last = self
+            .dirty
+            .partition_point(|range| range.start <= affected.end);
+        for range in self.dirty.drain(first..last) {
+            affected = range.start.min(affected.start)..range.end.max(affected.end);
+        }
+        self.dirty.insert(first, affected);
+        // Bound the bookkeeping: past this many, one union is cheaper to keep.
+        if self.dirty.len() > MAX_DIRTY_RANGES {
+            let union = self.dirty[0].start..self.dirty[self.dirty.len() - 1].end;
+            self.dirty = vec![union];
+        }
     }
 
     /// The returned allocation must remain pinned for the entire native chain,
@@ -75,7 +91,9 @@ impl FastPermissions {
             self.selective = watched.is_some();
             self.invalidate(0..permissions.len());
         }
-        let permission = |page: usize| {
+        // Guest pages of one host page share its protection: ask once each.
+        let mut host = None;
+        let mut permission = |page: usize| {
             let mut permissions = permissions[page];
             if watched.is_some_and(|pages| !pages[page]) {
                 permissions &= !EXEC;
@@ -94,8 +112,11 @@ impl FastPermissions {
             {
                 permissions = (permissions & !SHARED) | EXEC;
             }
-            if let Some((_, allows)) = window {
-                let host = allows(page);
+            if let Some((span, allows)) = window {
+                let host = match host {
+                    Some((index, allows)) if index == page / span => allows,
+                    _ => host.insert((page / span, allows(page))).1,
+                };
                 if permissions & READ != 0 && host & READ == 0 {
                     permissions |= SHARED;
                 }
@@ -105,29 +126,32 @@ impl FastPermissions {
             }
             permissions
         };
-        if let Some(mut pages) = self.dirty.take() {
-            // A change to one guest page may change its whole host page.
-            if let Some((span, _)) = window {
-                pages =
-                    (pages.start / span * span).saturating_sub(1)..pages.end.div_ceil(span) * span;
-                pages.end = pages.end.min(permissions.len());
-            }
+        if !self.dirty.is_empty() {
             self.version += 1;
             let bytes = Arc::make_mut(&mut self.bytes);
-            for page in pages {
-                let current = permission(page);
-                // Exact checks use the same base as the derived grants.
-                bytes[page] = current
-                    | (permissions.get(page + 1).map_or(0, |_| {
-                        let next = permission(page + 1);
-                        let both = current & next;
-                        let either = current | next;
-                        if either & SHARED != 0 {
-                            0
-                        } else {
-                            (both & READ) | if either & EXEC == 0 { both & WRITE } else { 0 }
-                        }
-                    }) << 5);
+            for mut pages in std::mem::take(&mut self.dirty) {
+                // A change to one guest page may change its whole host page.
+                if let Some((span, _)) = window {
+                    pages = (pages.start / span * span).saturating_sub(1)
+                        ..pages.end.div_ceil(span) * span;
+                    pages.end = pages.end.min(permissions.len());
+                }
+                let mut next = None;
+                for page in pages {
+                    let current = next.take().unwrap_or_else(|| permission(page));
+                    // Exact checks use the same base as the derived grants.
+                    bytes[page] = current
+                        | (permissions.get(page + 1).map_or(0, |_| {
+                            let next = *next.insert(permission(page + 1));
+                            let both = current & next;
+                            let either = current | next;
+                            if either & SHARED != 0 {
+                                0
+                            } else {
+                                (both & READ) | if either & EXEC == 0 { both & WRITE } else { 0 }
+                            }
+                        }) << 5);
+                }
             }
         }
         self.bytes.clone()
@@ -138,6 +162,27 @@ impl FastPermissions {
 mod tests {
     use super::*;
     use crate::memory::AUDIO;
+
+    #[test]
+    fn distant_changes_recompute_only_their_own_pages() {
+        let mut permissions = vec![READ; 4096];
+        let mut table = FastPermissions::new(permissions.len());
+        table.invalidate(0..permissions.len());
+        table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        // A stale middle page shows whether the two changes became one range.
+        for page in [8, 2048, 4000] {
+            permissions[page] = READ | WRITE;
+        }
+        table.invalidate(8..9);
+        table.invalidate(4000..4001);
+        let snapshot = table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        assert_eq!(snapshot[8] & 7, READ | WRITE);
+        assert_eq!(snapshot[4000] & 7, READ | WRITE);
+        assert_eq!(snapshot[2048] & 7, READ);
+        // The page before each change refreshes its two-page grant.
+        assert_eq!(snapshot[7] >> 5, READ);
+        assert_eq!(snapshot[3999] >> 5, READ);
+    }
 
     #[test]
     fn owned_copy_grants_preserve_access_bits_and_never_grant_stores() {
