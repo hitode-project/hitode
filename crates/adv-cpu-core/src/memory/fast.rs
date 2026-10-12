@@ -55,11 +55,19 @@ impl FastPermissions {
 
     /// The returned allocation must remain pinned for the entire native chain,
     /// including row workers. No mapping/helper update mutates these bytes.
+    ///
+    /// `window`, where host pages hold `span` guest pages, gives the READ and
+    /// WRITE bits the host page of a guest page takes in the guest window. A
+    /// page the guest may read but its host page may not is SHARED, and one
+    /// the guest may write but its host page may not has the EXEC store
+    /// barrier, so native code takes them through `Memory` instead of
+    /// faulting on every access.
     pub fn snapshot(
         &mut self,
         permissions: &[u8],
         watched: Option<&[bool]>,
         private_copies: &BTreeMap<usize, bool>,
+        window: Option<(usize, &dyn Fn(usize) -> u8)>,
     ) -> Arc<Vec<u8>> {
         debug_assert_eq!(permissions.len(), self.bytes.len());
         debug_assert!(watched.is_none_or(|pages| pages.len() == permissions.len()));
@@ -86,9 +94,24 @@ impl FastPermissions {
             {
                 permissions = (permissions & !SHARED) | EXEC;
             }
+            if let Some((_, allows)) = window {
+                let host = allows(page);
+                if permissions & READ != 0 && host & READ == 0 {
+                    permissions |= SHARED;
+                }
+                if permissions & WRITE != 0 && host & WRITE == 0 {
+                    permissions |= EXEC;
+                }
+            }
             permissions
         };
-        if let Some(pages) = self.dirty.take() {
+        if let Some(mut pages) = self.dirty.take() {
+            // A change to one guest page may change its whole host page.
+            if let Some((span, _)) = window {
+                pages =
+                    (pages.start / span * span).saturating_sub(1)..pages.end.div_ceil(span) * span;
+                pages.end = pages.end.min(permissions.len());
+            }
             self.version += 1;
             let bytes = Arc::make_mut(&mut self.bytes);
             for page in pages {
@@ -124,7 +147,7 @@ mod tests {
                 let copies = BTreeMap::from([(0, true)]);
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&permissions, watched, &copies);
+                let snapshot = table.snapshot(&permissions, watched, &copies, None);
                 assert_eq!(snapshot[0] & (READ | WRITE), protection & (READ | WRITE));
                 if watched.is_none() {
                     assert_eq!(snapshot[0], permissions[0]);
@@ -227,7 +250,7 @@ mod tests {
             for second in 0..32 {
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&[first, second], None, &BTreeMap::new());
+                let snapshot = table.snapshot(&[first, second], None, &BTreeMap::new(), None);
                 let readable = [first, second].iter().all(|p| p & (READ | SHARED) == READ);
                 let writable = [first, second]
                     .iter()
@@ -250,15 +273,15 @@ mod tests {
         let mut permissions = [READ | WRITE; 4];
         let mut table = FastPermissions::new(4);
         table.invalidate(0..4);
-        let old = table.snapshot(&permissions, None, &BTreeMap::new());
+        let old = table.snapshot(&permissions, None, &BTreeMap::new(), None);
         permissions[2] = READ | SHARED | AUDIO;
         table.invalidate(2..3);
         assert_eq!(&**old, &[99, 99, 99, 3]);
-        let new = table.snapshot(&permissions, None, &BTreeMap::new());
+        let new = table.snapshot(&permissions, None, &BTreeMap::new(), None);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
         permissions[2] = READ;
         table.invalidate(2..3);
-        let promoted = table.snapshot(&permissions, None, &BTreeMap::new());
+        let promoted = table.snapshot(&permissions, None, &BTreeMap::new(), None);
         assert_eq!(&**promoted, &[99, 35, 33, 3]);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
     }

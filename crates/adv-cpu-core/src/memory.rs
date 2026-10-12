@@ -174,8 +174,30 @@ impl Memory {
         let watched = self
             .selective_code_writes()
             .then_some(self.watched.as_slice());
+        // Where a host page holds several guest pages, the window protects
+        // each with the intersection of their permissions (§A4.2).
+        #[cfg(unix)]
+        if self.window.is_some() {
+            let slack = self.window_slack();
+            let view = self.reservation.as_ref().unwrap().direct_fault_view();
+            if let Some(view) = view.filter(|view| view.host_page_size() > PAGE_SIZE) {
+                use crate::virtual_memory::GuestAccess;
+                let allows = |page: usize| {
+                    let offset = slack + page * PAGE_SIZE;
+                    u8::from(view.host_allows(offset, GuestAccess::Read)) * READ
+                        | u8::from(view.host_allows(offset, GuestAccess::Write)) * WRITE
+                };
+                let span = view.host_page_size() / PAGE_SIZE;
+                return self.fast.snapshot(
+                    &self.perms,
+                    watched,
+                    &self.private_copy_pages,
+                    Some((span, &allows)),
+                );
+            }
+        }
         self.fast
-            .snapshot(&self.perms, watched, &self.private_copy_pages)
+            .snapshot(&self.perms, watched, &self.private_copy_pages, None)
     }
 
     /// Register sampled code bytes before reading or reusing them. This is
@@ -2296,6 +2318,50 @@ mod window_tests {
                 memory.read(0x8000, 6).unwrap(),
                 [0; 6],
                 "{host}: fresh pages are zero"
+            );
+        }
+    }
+
+    /// Native code takes a page directly only where its host page lets it:
+    /// on 16K hosts a mixed or code-watched host page sends the accesses its
+    /// window refuses through `Memory` instead of faulting on each one.
+    #[test]
+    fn native_permissions_follow_the_window_host_page() {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(0x10000, 0x8000, host).unwrap();
+            memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
+            // [0x10000, 0x14000): one guest page is read-only, one is inaccessible.
+            memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
+            memory.protect(0x13000, PAGE_SIZE, 0).unwrap();
+            // [0x14000, 0x18000): code is observed on one page.
+            memory.watch_code(0x14000, 1);
+            let classes = memory.native_permissions();
+            let mixed = host == 16384;
+            assert_eq!(
+                classes[1] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
+            );
+            assert_eq!(
+                classes[1] & SHARED != 0,
+                mixed,
+                "{host}: unreadable host page"
+            );
+            assert_eq!(
+                classes[5] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
+            );
+            assert_eq!(classes[5] & SHARED, 0, "{host}");
+            // Restoring the neighbour refreshes every guest page of its host page.
+            memory.protect(0x13000, PAGE_SIZE, READ | WRITE).unwrap();
+            let classes = memory.native_permissions();
+            assert_eq!(classes[1] & SHARED, 0, "{host}");
+            assert_eq!(
+                classes[2] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
             );
         }
     }
