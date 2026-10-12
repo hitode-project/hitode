@@ -542,12 +542,77 @@ fn copy_icon(env: &mut Env<'_>, icon: Handle) -> Handle {
     }
 }
 
+/// Color icons only: the AND mask as a 1-bit bitmap and the pixels as a
+/// 32-bit color bitmap the caller deletes, with the hotspot at the centre.
+/// Pixels are kept as decoded RGBA, so a monochrome resource also returns a
+/// color bitmap and its alpha bytes stay as decoded. Cursors and other
+/// identities without pixel data fail rather than invent bitmaps.
+#[win32(user32, name = "GetIconInfo", level = implement)]
+fn get_icon_info(env: &mut Env<'_>, icon: Handle, info: GuestPtr<()>) -> i32 {
+    const API: &str = "user32.dll!GetIconInfo";
+    if !user(env).objects.contains(&env.sys.objects, icon.0) {
+        set_last_error(env, 1402);
+        return 0;
+    }
+    if check_range(env.cpu, info.addr(), 20, Prot::WRITE).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    let Some(image) = user(env).objects.image(&env.sys.objects, icon.0) else {
+        unsupported(
+            env,
+            API,
+            "cursor or icon without decoded pixel data has no mask/color bitmaps",
+            50,
+        );
+        return 0;
+    };
+    let (width, height) = (image.width, image.height);
+    let mask_stride = width.div_ceil(32) as usize * 4;
+    let mut mask = vec![0; mask_stride * height as usize];
+    let mut color = Vec::with_capacity(image.pixels.len());
+    for (index, (&and, rgba)) in image
+        .mask
+        .iter()
+        .zip(image.pixels.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let (x, y) = (index % width as usize, index / width as usize);
+        mask[y * mask_stride + x / 8] |= (and & 1) << (7 - x % 8);
+        color.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+    }
+    let Some(mask) = crate::gdi32::bitmap_from_rows(env, width, height, 1, &mask) else {
+        set_last_error(env, 8);
+        return 0;
+    };
+    let Some(color) = crate::gdi32::bitmap_from_rows(env, width, height, 32, &color) else {
+        crate::gdi32::delete_object_value(env, mask);
+        set_last_error(env, 8);
+        return 0;
+    };
+    let mut bytes = [0; 20];
+    for (word, output) in [1, width / 2, height / 2, mask, color]
+        .into_iter()
+        .zip(bytes.as_chunks_mut::<4>().0)
+    {
+        output.copy_from_slice(&word.to_le_bytes());
+    }
+    if env.cpu.write(info.addr(), &bytes).is_err() {
+        crate::gdi32::delete_object_value(env, color);
+        crate::gdi32::delete_object_value(env, mask);
+        set_last_error(env, 998);
+        return 0;
+    }
+    1
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(load_a_ABI);
     registry.register(load_w_ABI);
     registry.register(load_icon_a_ABI);
     registry.register(load_icon_w_ABI);
     registry.register(copy_icon_ABI);
+    registry.register(get_icon_info_ABI);
 }
 
 #[cfg(test)]
