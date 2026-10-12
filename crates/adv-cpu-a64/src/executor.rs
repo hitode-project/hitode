@@ -1,8 +1,8 @@
 //! Execution owner of the a64 engine.
 //!
-//! On AArch64 hosts every boundary goes through translated code, which in M0
-//! exits to interpret one instruction; elsewhere the core interpreter runs
-//! blocks directly. Exits, traps, fuel and deadlines follow the x64
+//! On AArch64 hosts entries run translated code from their second visit
+//! (execution ABI §A7); elsewhere, and in interpreter-only executors, the
+//! core interpreter runs blocks directly. Exits, traps, fuel and deadlines follow the x64
 //! executor's interpreter path exactly, so both engines pass the same
 //! semantic tests.
 
@@ -36,7 +36,7 @@ impl ExecutionContext {
 }
 
 /// Execution counters. Names match the x64 executor where the meaning is
-/// shared; native and translation counters stay zero until M1 translates.
+/// shared; native and translation counters stay zero without translated code.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub interpreter_entries: u64,

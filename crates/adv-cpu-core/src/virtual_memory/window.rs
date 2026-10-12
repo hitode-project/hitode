@@ -1,5 +1,5 @@
 //! A 4 GiB guest window at a 4 GiB-aligned host base, with an inaccessible
-//! guard on each side (a64 workbook §6.1). Translated code addresses guest
+//! guard on each side (execution ABI §A4.1). Translated code addresses guest
 //! memory as base + zero-extended guest address, so the low 32 bits of a
 //! biased stack pointer are the guest value, and a push or pop that wraps
 //! past 0 or 4 GiB lands in a guard instead of host memory.

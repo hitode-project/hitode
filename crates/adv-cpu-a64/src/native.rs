@@ -10,16 +10,16 @@
 //! fills, and returns through the shadow stack; both are emptied whenever a
 //! unit is dropped, so they only ever lead to live units.
 //!
-//! Faults (§6.3, §6.4): every host instruction that may fault has a side-table
+//! Faults (§A4.3, §A4.4): every host instruction that may fault has a side-table
 //! site naming its guest instruction. The signal handler only checks that the
 //! PC is such a site, records it, and resumes at the fault stub. Because a
 //! translated instruction commits nothing before its last possible fault
-//! (§5.2), the owner then rebuilds the flags from the site's carry and
+//! (§A3.2), the owner then rebuilds the flags from the site's carry and
 //! PF/AF recipe and interprets that one instruction from the exact prior
 //! state: the interpreter either completes it (a soft page) or reports the
 //! precise guest fault.
 //!
-//! Soft pages (§6.3): an instruction whose unchecked sites fault
+//! Soft pages (§A4.3): an instruction whose unchecked sites fault
 //! `CHECK_AFTER` times is checked from then on. The unit that faulted goes,
 //! and its next translation checks each access of the instruction against
 //! the page class table, a snapshot of `Memory::native_permissions` the
@@ -58,13 +58,13 @@ type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
 
-/// Faults at unchecked sites after which an instruction is checked (§6.3).
+/// Faults at unchecked sites after which an instruction is checked (§A4.3).
 pub(crate) const CHECK_AFTER: u32 = 8;
 
 /// Page class table entries: every guest page.
 const CLASSES: usize = 1 << 20;
 
-/// Which guest accesses check their page first (§6.3).
+/// Which guest accesses check their page first (§A4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Checks {
@@ -811,7 +811,7 @@ impl Native {
         self.clear();
     }
 
-    /// Clears the cache as a whole (§7.1).
+    /// Clears the cache as a whole (§A5.1).
     fn clear(&mut self) {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);

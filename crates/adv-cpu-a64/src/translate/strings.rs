@@ -14,7 +14,7 @@
 //! When one unit is left, the `interpret` helper runs the next element, so
 //! a REP the countdown cannot finish stops part way exactly as in the
 //! interpreter, flags and continuation included. Checked
-//! instructions (§6.3) and segment or address-size overrides stay with the
+//! instructions (§A4.3) and segment or address-size overrides stay with the
 //! interpreter too.
 
 use iced_x86::{Code, Instruction, Register};

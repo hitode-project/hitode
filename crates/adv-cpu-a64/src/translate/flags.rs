@@ -1,4 +1,4 @@
-//! The x86 flags as the translator tracks them (§5).
+//! The x86 flags as the translator tracks them (§A3).
 //!
 //! SF ZF OF always live in NZCV. CF lives in NZCV's C in a tracked carry
 //! sense, or lazily as a `Carry` over values still in registers, which lets
@@ -53,7 +53,7 @@ impl FlagSet {
     }
 }
 
-/// How NZCV's C encodes CF (§5.1).
+/// How NZCV's C encodes CF (§A3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sense {
     /// C is NOT CF, as after `subs`: the canonical sense at exits.
@@ -72,7 +72,7 @@ pub enum Operand {
     Imm(u32),
 }
 
-/// Where PF and AF come from (§5.3): PF from the low byte of a result and
+/// Where PF and AF come from (§A3.3): PF from the low byte of a result and
 /// AF from bit 4 of left ^ right ^ result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recipe {
@@ -178,7 +178,7 @@ impl Recipe {
     }
 }
 
-/// Where CF is (§5.1).
+/// Where CF is (§A3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carry {
     /// NZCV's C in the tracked sense.
