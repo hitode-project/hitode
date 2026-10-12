@@ -36,6 +36,7 @@ pub const HOST_MODULES: &[&str] = &[
     "oleaut32.dll",
     "comdlg32.dll",
     "comctl32.dll",
+    "riched32.dll",
     "winmm.dll",
     "imm32.dll",
     "version.dll",

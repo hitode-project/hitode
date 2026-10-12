@@ -25,6 +25,7 @@ mod placement;
 mod rectangle;
 mod region;
 mod resources;
+pub(crate) mod rich_edit;
 mod scroll;
 mod station;
 pub(crate) mod strings;
@@ -68,6 +69,7 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         combo: proc(controls::COMBO_PROC)?,
         trackbar: proc(controls::TRACKBAR_PROC)?,
         tab: proc(tab::PROC)?,
+        rich_edit: proc(rich_edit::PROC)?,
     };
     let win32 = m.ext.get_mut::<Win32>();
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);
@@ -755,6 +757,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    rich_edit::register(reg);
     update::register(reg);
     formatting::register(reg);
     hooks::register(reg);

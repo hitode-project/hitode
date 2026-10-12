@@ -415,6 +415,7 @@ pub struct SysProcs {
     pub combo: u32,
     pub trackbar: u32,
     pub tab: u32,
+    pub rich_edit: u32,
 }
 
 pub struct User {
@@ -945,6 +946,7 @@ fn get_class_info(
     let c = &u.classes[i];
     if c.unicode
         .is_some_and(|registered_wide| registered_wide != wide)
+        && !stock_procedure(u, c.proc)
     {
         // Native returns an A/W procedure thunk for a custom class queried via
         // the opposite encoding. A raw guest procedure is not that thunk.
@@ -2155,6 +2157,7 @@ fn stock_procedure(u: &User, proc: u32) -> bool {
             u.procs.combo,
             u.procs.trackbar,
             u.procs.tab,
+            u.procs.rich_edit,
         ]
         .contains(&proc)
 }
@@ -2370,6 +2373,7 @@ pub(super) fn call_window_proc(
                         u.procs.combo,
                         u.procs.trackbar,
                         u.procs.tab,
+                        u.procs.rich_edit,
                     ]
                     .contains(&proc);
             let numeric = matches!(

@@ -225,7 +225,10 @@ fn free_library(env: &mut Env<'_>, handle: Handle) -> Outcome {
             return Outcome::Return(0);
         };
         match adv_os::modules_mut(env.ext).release(env.cpu, id) {
-            Ok(ids) => unload(env, ids, 1, None),
+            Ok(ids) => {
+                crate::user32::rich_edit::released(env, id);
+                unload(env, ids, 1, None)
+            }
             Err(error) => Outcome::Fail(error.to_string()),
         }
     })
@@ -237,7 +240,10 @@ pub(crate) fn native_unload_library(env: &mut Env<'_>, handle: u32) -> Outcome {
             return Outcome::Return(0xc0000135);
         };
         match adv_os::modules_mut(env.ext).release(env.cpu, id) {
-            Ok(ids) => unload(env, ids, 0, None),
+            Ok(ids) => {
+                crate::user32::rich_edit::released(env, id);
+                unload(env, ids, 0, None)
+            }
             Err(error) => Outcome::Fail(error.to_string()),
         }
     })
@@ -343,6 +349,7 @@ fn release_loaded(env: &mut Env<'_>, id: ModuleId, result: u32, error: Option<u3
         Ok(ids) => ids,
         Err(error) => return Outcome::Fail(error.to_string()),
     };
+    crate::user32::rich_edit::released(env, id);
     unload(env, ids, result, error)
 }
 
@@ -424,17 +431,22 @@ fn load_library_attempt(
             run_inits(
                 env,
                 inits,
-                Box::new(move |env| match front {
-                    LibraryFront::Win32 => Outcome::Return(base),
-                    LibraryFront::Native(output) => {
-                        if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err()
-                            || env.cpu.write_u32(output, base).is_err()
-                        {
-                            // Guest initializers can unmap the caller's output.
-                            // Release only the reference acquired by this call.
-                            release_loaded(env, id, 0xc0000005, None)
-                        } else {
-                            Outcome::Return(0)
+                Box::new(move |env| {
+                    if !matches!(crate::user32::rich_edit::loaded(env, id), Ok(true)) {
+                        return release_loaded(env, id, 0, Some(1114));
+                    }
+                    match front {
+                        LibraryFront::Win32 => Outcome::Return(base),
+                        LibraryFront::Native(output) => {
+                            if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err()
+                                || env.cpu.write_u32(output, base).is_err()
+                            {
+                                // Guest initializers can unmap the caller's output.
+                                // Release only the reference acquired by this call.
+                                release_loaded(env, id, 0xc0000005, None)
+                            } else {
+                                Outcome::Return(0)
+                            }
                         }
                     }
                 }),

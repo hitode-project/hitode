@@ -11,10 +11,12 @@ use super::K32;
 use crate::util::{err, set_last_error};
 use crate::{Win32, stdcall};
 
+mod condition;
 mod event;
 mod local;
 pub(crate) mod native;
 mod owned;
+mod srw;
 pub(crate) use local::detach_fls;
 #[cfg(test)]
 mod event_tests;
@@ -502,6 +504,8 @@ mod critical_tests {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    srw::register(reg);
+    condition::register(reg);
     native::register(reg);
     event::register(reg);
     owned::register(reg);
