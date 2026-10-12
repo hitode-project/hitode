@@ -164,6 +164,16 @@ impl Fixed {
         };
     }
     pub fn new(width: u32, height: u32) -> Self {
+        let sampler = BTreeMap::from([
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 0),
+            (5, 1),
+            (6, 1),
+            (7, 0),
+            (9, 0),
+        ]);
         let identity = [
             1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
         ];
@@ -245,10 +255,8 @@ impl Fixed {
                 (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
                 (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
             ]),
-            sampler: BTreeMap::from([(1, 1), (2, 1), (4, 0), (5, 1), (6, 1), (7, 0), (9, 0)]),
-            sampler_slots: std::array::from_fn(|_| {
-                BTreeMap::from([(1, 1), (2, 1), (4, 0), (5, 1), (6, 1), (7, 0), (9, 0)])
-            }),
+            sampler: sampler.clone(),
+            sampler_slots: std::array::from_fn(|_| sampler.clone()),
             viewport: D3DVIEWPORT9 {
                 X: 0,
                 Y: 0,
@@ -617,7 +625,7 @@ fn set_sampler(env: &mut Env<'_>, this: GuestPtr<()>, sampler: u32, kind: i32, v
         return INVALID;
     };
     let valid = match kind {
-        1 | 2 => address(value).is_some(),
+        1 | 2 | 3 => address(value).is_some(),
         5 | 6 => matches!(value, 1 | 2),
         7 => value <= 2,
         4 | 9 => true,

@@ -593,6 +593,17 @@ fn create_dib(
     ) {
         Ok(Some(dib)) => dib,
         _ => {
+            log::debug!(
+                "CreateDIBSection rejected layout: size={}, width={}, height={}, planes={}, bpp={}, compression={}, used={}, usage={}",
+                u32::from_le_bytes(header[0..4].try_into().unwrap()),
+                i32::from_le_bytes(header[4..8].try_into().unwrap()),
+                i32::from_le_bytes(header[8..12].try_into().unwrap()),
+                u16::from_le_bytes(header[12..14].try_into().unwrap()),
+                bpp,
+                u32::from_le_bytes(header[16..20].try_into().unwrap()),
+                u32::from_le_bytes(header[32..36].try_into().unwrap()),
+                usage
+            );
             let _ = bits.write(env.cpu, 0);
             return fail(env, 87);
         }

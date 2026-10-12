@@ -7,6 +7,121 @@ fn header(width: u32, height: i32) -> [u32; 10] {
 
 #[test]
 #[cfg(windows)]
+fn bitfield_dib32_create_draw_and_readback_match_native() {
+    use windows_sys::Win32::Graphics::Gdi as gdi;
+    let (mut m, data, dc, _) = fixture(2, 2, PixelFormat::Bgra32, false);
+    for height in [-2, 2] {
+        let words = [
+            40,
+            2,
+            height as u32,
+            0x00200001,
+            3,
+            16,
+            0,
+            0,
+            0,
+            0,
+            0xff0000,
+            0xff00,
+            0xff,
+        ];
+        let info = data + 1024;
+        let output = data + 1200;
+        m.cpu
+            .write(
+                info,
+                &words
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let bitmap = call(
+            &mut m,
+            data,
+            "gdi32.dll!CreateDIBSection",
+            &[dc, info, 0, output, 0, 0],
+        );
+        assert_ne!(bitmap, 0);
+        let pixels = m.cpu.read_u32(output).unwrap();
+        let native_dc = unsafe { gdi::CreateCompatibleDC(core::ptr::null_mut()) };
+        let mut native_pixels = core::ptr::null_mut();
+        let native_bitmap = unsafe {
+            gdi::CreateDIBSection(
+                native_dc,
+                words.as_ptr().cast(),
+                0,
+                &mut native_pixels,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!native_bitmap.is_null());
+        let initial: Vec<_> = [0x11223344u32, 0x55667788, 0x99aabbcc, 0xddeeff00]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        m.cpu.write(pixels, &initial).unwrap();
+        unsafe {
+            core::ptr::copy_nonoverlapping(initial.as_ptr(), native_pixels.cast(), 16);
+        }
+        let old = call(&mut m, data, "gdi32.dll!SelectObject", &[dc, bitmap]);
+        let native_old = unsafe { gdi::SelectObject(native_dc, native_bitmap) };
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!SetPixelV", &[dc, 1, 0, 0xff]),
+            1
+        );
+        assert_ne!(unsafe { gdi::SetPixelV(native_dc, 1, 0, 0xff) }, 0);
+        unsafe {
+            gdi::GdiFlush();
+        }
+        let mut actual = [0; 16];
+        m.cpu.read(pixels, &mut actual).unwrap();
+        assert_eq!(actual.as_slice(), unsafe {
+            core::slice::from_raw_parts(native_pixels.cast::<u8>(), 16)
+        });
+        call(&mut m, data, "gdi32.dll!SelectObject", &[dc, old]);
+        unsafe {
+            gdi::SelectObject(native_dc, native_old);
+        }
+        let mut native_info = words;
+        let mut expected = [0; 16];
+        assert_eq!(
+            unsafe {
+                gdi::GetDIBits(
+                    native_dc,
+                    native_bitmap,
+                    0,
+                    2,
+                    expected.as_mut_ptr().cast(),
+                    native_info.as_mut_ptr().cast(),
+                    0,
+                )
+            },
+            2
+        );
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!GetDIBits",
+                &[dc, bitmap, 0, 2, data + 1400, info, 0]
+            ),
+            2
+        );
+        m.cpu.read(data + 1400, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(call(&mut m, data, "gdi32.dll!DeleteObject", &[bitmap]), 1);
+        unsafe {
+            gdi::DeleteObject(native_bitmap);
+            gdi::DeleteDC(native_dc);
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn device_dib_upload_matches_native_scan_bands_origins_and_clipping() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     let (mut m, data, dc, pixels) = fixture(6, 6, PixelFormat::Bgra32, false);

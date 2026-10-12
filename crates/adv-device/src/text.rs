@@ -269,6 +269,38 @@ pub struct GlyphMetrics {
     pub advance_x: i16,
     pub advance_y: i16,
 }
+
+/// Integer logical spacing: left bearing, black width and right bearing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbcWidths {
+    pub left: i32,
+    pub ink: u32,
+    pub right: i32,
+}
+
+/// Coverage of the selected face, without linked-font fallback.
+pub struct FontCoverage {
+    pub flags: u32,
+    pub glyphs: u32,
+    pub ranges: Vec<(u16, u16)>,
+}
+
+/// Owned optional placement arrays; initialized values preserve native partial writes.
+pub struct PlacementBuffers {
+    pub text: Option<Vec<u16>>,
+    pub encoded_text: Option<Vec<u8>>,
+    pub order: Option<Vec<u32>>,
+    pub advances: Option<Vec<i32>>,
+    pub caret: Option<Vec<i32>>,
+    pub classes: Option<Vec<u8>>,
+    pub glyphs: Option<Vec<u16>>,
+    pub capacity: u32,
+    pub max_fit: i32,
+}
+pub struct Placement {
+    pub extent: u32,
+    pub buffers: Option<PlacementBuffers>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
@@ -874,6 +906,93 @@ impl Text {
             }
             Ok(glyph)
         }
+    }
+
+    /// Glyph selectors belong to the selected font, without character fallback.
+    pub fn glyph_widths(
+        &mut self,
+        font: &FontRequest,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<i32>, TextError> {
+        validate_indices(count, indices)?;
+        self.font(font)?.glyph_widths(first, count, indices)
+    }
+
+    pub fn glyph_abc_widths(
+        &mut self,
+        font: &FontRequest,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        validate_indices(count, indices)?;
+        if count == 0 {
+            return Err(TextError::Font("empty ABC query".into()));
+        }
+        self.font(font)?.glyph_abc_widths(first, count, indices)
+    }
+
+    pub fn character_abc_widths(
+        &mut self,
+        font: &FontRequest,
+        characters: &[Character],
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        if characters.is_empty() || characters.len() > 65536 {
+            return Err(TextError::Font("invalid ABC query length".into()));
+        }
+        self.font(font)?.character_abc_widths(characters)
+    }
+
+    pub fn unicode_ranges(&mut self, font: &FontRequest) -> Result<FontCoverage, TextError> {
+        self.font(font)?.unicode_ranges()
+    }
+
+    pub fn language_info(&mut self, font: &FontRequest) -> Result<u32, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(font)?.language_info()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = font;
+            Err(TextError::Font(
+                "complete font language metadata is unavailable on the portable backend".into(),
+            ))
+        }
+    }
+
+    pub fn placement(
+        &mut self,
+        font: &FontRequest,
+        input: TextInput<'_>,
+        maximum: i32,
+        flags: u32,
+        buffers: Option<PlacementBuffers>,
+        ansi_codepage: u32,
+    ) -> Result<Placement, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(font)?
+                .placement(input, maximum, flags, buffers, ansi_codepage)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (font, input, maximum, flags, buffers, ansi_codepage);
+            Err(TextError::Font(
+                "native character placement and shaping are unavailable on the portable backend"
+                    .into(),
+            ))
+        }
+    }
+}
+
+fn validate_indices(count: u32, indices: Option<&[u16]>) -> Result<(), TextError> {
+    if count > 65536 || indices.is_some_and(|indices| indices.len() != count as usize) {
+        Err(TextError::Font("invalid glyph query length".into()))
+    } else {
+        Ok(())
     }
 }
 

@@ -14,7 +14,7 @@ const READ_ONLY: u32 = 0x420000;
 const UNMAPPED: u32 = 0x600000;
 const BUFFER: u32 = DATA + 0x800;
 const MARKER: u32 = 0x12345678;
-const DLLS: [&str; 2] = ["xinput9_1_0.dll", "xinput1_3.dll"];
+const DLLS: [&str; 3] = ["xinput9_1_0.dll", "xinput1_3.dll", "xinput1_4.dll"];
 
 fn registry() -> Registry {
     let mut registry = Registry::default();
@@ -137,7 +137,17 @@ fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
             assert!(registry.dynamic_available(dll, name));
         }
     }
-    assert!(!registry.dynamic_available("xinput1_4.dll", "XInputGetState"));
+    for (ordinal, name) in [
+        ("#2", "XInputGetState"),
+        ("#3", "XInputSetState"),
+        ("#4", "XInputGetCapabilities"),
+    ] {
+        assert_eq!(
+            registry.canonical_name("xinput1_4.dll", ordinal),
+            Some(name)
+        );
+        assert!(registry.dynamic_available("xinput1_4.dll", ordinal));
+    }
     assert!(!registry.dynamic_available("xinput1_3.dll", "XInputGetKeystroke"));
     assert!(registry.signature_conflicts().is_empty());
 }

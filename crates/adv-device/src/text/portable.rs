@@ -1163,6 +1163,115 @@ impl Font {
             height: self.metrics.height,
         })
     }
+    pub(super) fn unicode_ranges(&self) -> Result<FontCoverage, TextError> {
+        let font = self.primary.font()?;
+        let codes: BTreeSet<_> = font
+            .charmap()
+            .mappings()
+            .filter(|&(code, glyph)| code <= 65535 && glyph.to_u32() != 0)
+            .map(|(code, _)| code as u16)
+            .collect();
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        for code in codes {
+            if let Some((first, count)) = ranges.last_mut()
+                && *count != u16::MAX
+                && u32::from(*first) + u32::from(*count) == u32::from(code)
+            {
+                *count += 1;
+            } else {
+                ranges.push((code, 1));
+            }
+        }
+        Ok(FontCoverage {
+            flags: 0,
+            glyphs: ranges.iter().map(|&(_, count)| u32::from(count)).sum(),
+            ranges,
+        })
+    }
+
+    fn spacing_index(&self, index: u32) -> Result<GlyphId, TextError> {
+        let font = self.primary.font()?;
+        let loc = location(&font, &self.request);
+        let glyph = GlyphId::new(index);
+        Ok(
+            if font
+                .glyph_metrics(Size::new(self.em), &loc)
+                .advance_width(glyph)
+                .is_some()
+            {
+                glyph
+            } else {
+                GlyphId::new(0)
+            },
+        )
+    }
+
+    pub(super) fn glyph_widths(
+        &self,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<i32>, TextError> {
+        (0..count)
+            .map(|at| {
+                let index = indices.map_or_else(
+                    || first.saturating_add(at),
+                    |indices| u32::from(indices[at as usize]),
+                );
+                Ok(self.advance(&self.primary, self.spacing_index(index)?, None)? as i32)
+            })
+            .collect()
+    }
+
+    pub(super) fn glyph_abc_widths(
+        &self,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        let characters: Vec<_> = (0..count)
+            .map(|at| {
+                Character::GlyphIndex(indices.map_or_else(
+                    || first.saturating_add(at),
+                    |indices| u32::from(indices[at as usize]),
+                ))
+            })
+            .collect();
+        self.character_abc_widths(&characters)
+    }
+
+    pub(super) fn character_abc_widths(
+        &self,
+        characters: &[Character],
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        if !self.metrics.outline {
+            return Err(TextError::Font("ABC query requires a scalable font".into()));
+        }
+        characters
+            .iter()
+            .map(|&character| {
+                let character = match character {
+                    Character::GlyphIndex(index) => {
+                        Character::GlyphIndex(self.spacing_index(index)?.to_u32())
+                    }
+                    character => character,
+                };
+                let glyph = self.glyph(GlyphRequest {
+                    character,
+                    format: GlyphFormat::Metrics,
+                    hinted: true,
+                    transform: Transform::IDENTITY,
+                })?;
+                let metrics = glyph.metrics;
+                Ok(AbcWidths {
+                    left: metrics.origin_x,
+                    ink: metrics.width,
+                    right: i32::from(metrics.advance_x) - metrics.origin_x - metrics.width as i32,
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn glyph(&self, request: GlyphRequest) -> Result<Glyph, TextError> {
         let (face, glyph, code) = match request.character {
             Character::GlyphIndex(index) => (Arc::clone(&self.primary), GlyphId::new(index), None),

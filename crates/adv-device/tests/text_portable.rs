@@ -13,6 +13,45 @@ const SINGLE: &[u8] = include_bytes!("fixtures/font-resource.ttf");
 const COLLECTION: &[u8] = include_bytes!("fixtures/font-resource.ttc");
 
 #[test]
+fn selected_face_spacing_defaults_and_unicode_coverage_share_the_font() {
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(SINGLE, true).unwrap();
+    let request = font("ADV Resource Fixture");
+    let coverage = text.unicode_ranges(&request).unwrap();
+    assert_eq!(
+        coverage.glyphs,
+        coverage
+            .ranges
+            .iter()
+            .map(|&(_, count)| u32::from(count))
+            .sum::<u32>()
+    );
+    assert!(
+        coverage
+            .ranges
+            .iter()
+            .any(|&(first, count)| u32::from(first) <= 65
+                && 65 < u32::from(first) + u32::from(count))
+    );
+    let index = text.resolved_character(&request, 65).unwrap().glyph_index;
+    let indices = [index as u16, 0, 65535];
+    let widths = text
+        .glyph_widths(&request, u32::MAX, 3, Some(&indices))
+        .unwrap();
+    let abc = text
+        .glyph_abc_widths(&request, u32::MAX, 3, Some(&indices))
+        .unwrap();
+    for (width, abc) in widths.iter().zip(&abc) {
+        assert_eq!(*width, abc.left + abc.ink as i32 + abc.right);
+    }
+    assert_eq!(widths[1], widths[2]);
+    assert_eq!(abc[1], abc[2]);
+    assert!(text.glyph_widths(&request, 0, 0, None).unwrap().is_empty());
+    assert!(text.glyph_abc_widths(&request, 0, 0, None).is_err());
+    assert!(text.glyph_widths(&request, 0, 2, Some(&indices)).is_err());
+}
+
+#[test]
 fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures() {
     let mut declared = SINGLE.to_vec();
     // The authored fixture's OS/2 v3 table starts at 400. Declare two code

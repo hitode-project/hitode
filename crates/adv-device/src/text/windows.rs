@@ -307,6 +307,308 @@ fn decode_family(value: u8) -> Family {
     }
 }
 impl Font {
+    pub(super) fn placement(
+        &self,
+        input: TextInput<'_>,
+        maximum: i32,
+        flags: u32,
+        mut buffers: Option<PlacementBuffers>,
+        ansi_codepage: u32,
+    ) -> Result<Placement, TextError> {
+        // Native ANSI/default conversion uses the process ACP. Refuse a foreign
+        // guest ACP instead of silently laying out different characters.
+        if matches!(input, TextInput::Encoded(_))
+            && matches!(
+                self.metrics()?.encoding,
+                Encoding::Latin | Encoding::Automatic
+            )
+            && ansi_codepage != unsafe { windows_sys::Win32::Globalization::GetACP() }
+        {
+            return Err(TextError::Font("ANSI/default placement needs matching guest/native ACP or an explicit font charset".into()));
+        }
+        let count = match input {
+            TextInput::Unicode(input) => input.len(),
+            TextInput::Encoded(input) => input.len(),
+        };
+        if count > 65536
+            || buffers
+                .as_ref()
+                .is_some_and(|buffers| buffers.capacity > 65536)
+        {
+            return Err(TextError::Font(
+                "placement length exceeds bounded profile".into(),
+            ));
+        }
+        fn pointer<T>(values: &mut Option<Vec<T>>) -> *mut T {
+            values
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |values| values.as_mut_ptr())
+        }
+        fn grow<T: Default + Clone>(values: &mut Option<Vec<T>>, size: usize) -> usize {
+            values.as_mut().map_or(0, |values| {
+                let original = values.len();
+                values.resize(size.max(original), T::default());
+                original
+            })
+        }
+        let mut original = [0usize; 7];
+        let mut result: gdi::GCP_RESULTSW = unsafe { std::mem::zeroed() };
+        if let Some(buffers) = &mut buffers {
+            let cap = buffers.capacity as usize;
+            if [
+                buffers.text.as_ref().map(Vec::len),
+                buffers.encoded_text.as_ref().map(Vec::len),
+                buffers.order.as_ref().map(Vec::len),
+                buffers.advances.as_ref().map(Vec::len),
+                buffers.caret.as_ref().map(Vec::len),
+                buffers.classes.as_ref().map(Vec::len),
+                buffers.glyphs.as_ref().map(Vec::len),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|length| length < cap || length > cap.max(count))
+            {
+                return Err(TextError::Font("placement buffer length mismatch".into()));
+            }
+            // Native placement can touch counted-input positions with a short
+            // glyph capacity. Keep host scratch large enough for both extents.
+            let scratch = cap.max(count) + 1;
+            original = [
+                grow(&mut buffers.text, scratch),
+                grow(&mut buffers.encoded_text, scratch),
+                grow(&mut buffers.order, scratch),
+                grow(&mut buffers.advances, scratch),
+                grow(&mut buffers.caret, scratch),
+                grow(&mut buffers.classes, scratch),
+                grow(&mut buffers.glyphs, scratch),
+            ];
+            result.lStructSize = std::mem::size_of::<gdi::GCP_RESULTSW>() as u32;
+            result.lpOutString = match input {
+                TextInput::Unicode(_) => pointer(&mut buffers.text),
+                TextInput::Encoded(_) => pointer(&mut buffers.encoded_text).cast(),
+            };
+            result.lpOrder = pointer(&mut buffers.order);
+            result.lpDx = pointer(&mut buffers.advances);
+            result.lpCaretPos = pointer(&mut buffers.caret);
+            result.lpClass = pointer(&mut buffers.classes);
+            result.lpGlyphs = pointer(&mut buffers.glyphs);
+            result.nGlyphs = buffers.capacity;
+            result.nMaxFit = buffers.max_fit;
+        }
+        let output = if buffers.is_some() {
+            &mut result as *mut _
+        } else {
+            std::ptr::null_mut()
+        };
+        // SAFETY: counted input and all requested initialized output allocations
+        // cover the bounded capacity. The provider owns its private selected DC.
+        let wide_input;
+        let ansi_input;
+        let input = match input {
+            TextInput::Unicode(input) => {
+                wide_input = input.iter().copied().chain([0]).collect::<Vec<_>>();
+                TextInput::Unicode(&wide_input)
+            }
+            TextInput::Encoded(input) => {
+                ansi_input = input.iter().copied().chain([0]).collect::<Vec<_>>();
+                TextInput::Encoded(&ansi_input)
+            }
+        };
+        let extent = unsafe {
+            match input {
+                TextInput::Unicode(input) => gdi::GetCharacterPlacementW(
+                    self.dc,
+                    input.as_ptr(),
+                    count as i32,
+                    maximum,
+                    output,
+                    flags,
+                ),
+                TextInput::Encoded(input) => gdi::GetCharacterPlacementA(
+                    self.dc,
+                    input.as_ptr(),
+                    count as i32,
+                    maximum,
+                    output.cast(),
+                    flags,
+                ),
+            }
+        };
+        if let Some(buffers) = &mut buffers {
+            if let Some(values) = &mut buffers.text {
+                values.truncate(original[0]);
+            }
+            if let Some(values) = &mut buffers.encoded_text {
+                values.truncate(original[1]);
+            }
+            if let Some(values) = &mut buffers.order {
+                values.truncate(original[2]);
+            }
+            if let Some(values) = &mut buffers.advances {
+                values.truncate(original[3]);
+            }
+            if let Some(values) = &mut buffers.caret {
+                values.truncate(original[4]);
+            }
+            if let Some(values) = &mut buffers.classes {
+                values.truncate(original[5]);
+            }
+            if let Some(values) = &mut buffers.glyphs {
+                values.truncate(original[6]);
+            }
+            buffers.capacity = result.nGlyphs;
+            buffers.max_fit = result.nMaxFit;
+        }
+        Ok(Placement { extent, buffers })
+    }
+
+    pub(super) fn language_info(&self) -> Result<u32, TextError> {
+        // SAFETY: this provider owns the selected font and private display DC.
+        let info = unsafe { gdi::GetFontLanguageInfo(self.dc) };
+        if info == u32::MAX || info == 0x8000 {
+            Err(TextError::Font("font language query failed".into()))
+        } else {
+            Ok(info)
+        }
+    }
+
+    pub(super) fn unicode_ranges(&self) -> Result<FontCoverage, TextError> {
+        // SAFETY: private selected DC; the null pointer only queries required size.
+        let size = unsafe { gdi::GetFontUnicodeRanges(self.dc, std::ptr::null_mut()) };
+        if !(16..=1024 * 1024).contains(&size) || size % 4 != 0 {
+            return Err(TextError::Font("font Unicode range query failed".into()));
+        }
+        let mut words = vec![0u32; size as usize / 4];
+        // SAFETY: aligned, initialized allocation covering the queried GLYPHSET.
+        if unsafe { gdi::GetFontUnicodeRanges(self.dc, words.as_mut_ptr().cast()) } != size
+            || words[0] != size
+            || words[3] as usize > words.len() - 4
+        {
+            return Err(TextError::Font("font Unicode range layout invalid".into()));
+        }
+        Ok(FontCoverage {
+            flags: words[1],
+            glyphs: words[2],
+            ranges: words[4..4 + words[3] as usize]
+                .iter()
+                .map(|&word| (word as u16, (word >> 16) as u16))
+                .collect(),
+        })
+    }
+
+    pub(super) fn glyph_widths(
+        &self,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<i32>, TextError> {
+        let mut widths = vec![0; count as usize];
+        let mut indices = indices.map(<[u16]>::to_vec);
+        // SAFETY: owned font/DC and complete initialized host buffers; no guest pointers.
+        if unsafe {
+            gdi::GetCharWidthI(
+                self.dc,
+                first,
+                count,
+                indices
+                    .as_mut()
+                    .map_or(std::ptr::null_mut(), |v| v.as_mut_ptr()),
+                widths.as_mut_ptr(),
+            )
+        } == 0
+        {
+            return Err(TextError::Font("glyph width query failed".into()));
+        }
+        Ok(widths)
+    }
+
+    pub(super) fn glyph_abc_widths(
+        &self,
+        first: u32,
+        count: u32,
+        indices: Option<&[u16]>,
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        let mut values = vec![
+            gdi::ABC {
+                abcA: 0,
+                abcB: 0,
+                abcC: 0
+            };
+            count as usize
+        ];
+        let mut indices = indices.map(<[u16]>::to_vec);
+        // SAFETY: owned font/DC and allocations covering count complete selectors/ABCs.
+        if unsafe {
+            gdi::GetCharABCWidthsI(
+                self.dc,
+                first,
+                count,
+                indices
+                    .as_mut()
+                    .map_or(std::ptr::null_mut(), |v| v.as_mut_ptr()),
+                values.as_mut_ptr(),
+            )
+        } == 0
+        {
+            return Err(TextError::Font(
+                "glyph ABC query failed (requires TrueType)".into(),
+            ));
+        }
+        Ok(values
+            .into_iter()
+            .map(|value| AbcWidths {
+                left: value.abcA,
+                ink: value.abcB,
+                right: value.abcC,
+            })
+            .collect())
+    }
+
+    pub(super) fn character_abc_widths(
+        &self,
+        characters: &[Character],
+    ) -> Result<Vec<AbcWidths>, TextError> {
+        characters
+            .iter()
+            .map(|&character| {
+                let mut value = gdi::ABC {
+                    abcA: 0,
+                    abcB: 0,
+                    abcC: 0,
+                };
+                // SAFETY: initialized one-element output and an owned selected DC.
+                let success = unsafe {
+                    match character {
+                        Character::Unicode(code) => {
+                            gdi::GetCharABCWidthsW(self.dc, code, code, &mut value)
+                        }
+                        Character::Encoded(code) => {
+                            gdi::GetCharABCWidthsA(self.dc, code, code, &mut value)
+                        }
+                        Character::GlyphIndex(index) => gdi::GetCharABCWidthsI(
+                            self.dc,
+                            index,
+                            1,
+                            std::ptr::null_mut(),
+                            &mut value,
+                        ),
+                    }
+                };
+                if success == 0 {
+                    Err(TextError::Font(
+                        "character ABC query failed (requires TrueType)".into(),
+                    ))
+                } else {
+                    Ok(AbcWidths {
+                        left: value.abcA,
+                        ink: value.abcB,
+                        right: value.abcC,
+                    })
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn encoded_character_width(&self, code: u16) -> Result<i32, TextError> {
         let mut width = 0;
         // SAFETY: the selected private font/DC belongs to this provider, and

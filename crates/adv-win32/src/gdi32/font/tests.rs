@@ -3,6 +3,10 @@ use super::*;
 mod outline_metrics;
 #[path = "tests/pairs.rs"]
 mod pairs;
+#[path = "tests/placement.rs"]
+mod placement;
+#[path = "tests/spacing.rs"]
+mod spacing;
 #[path = "tests/widths.rs"]
 mod widths;
 use crate as adv_win32;

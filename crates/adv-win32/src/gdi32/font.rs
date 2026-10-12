@@ -16,8 +16,10 @@ mod eudc;
 mod kerning;
 mod logical;
 mod paint;
+mod placement;
 mod rectangle;
 mod resource;
+mod spacing;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -39,6 +41,8 @@ pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
     rectangle::register(registry);
     widths::register(registry);
+    spacing::register(registry);
+    placement::register(registry);
     charset::register(registry);
     logical::register(registry);
     kerning::register(registry);

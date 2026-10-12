@@ -89,7 +89,7 @@ pub(super) fn read(
         || height == i32::MIN
         || h[12..14] != 1u16.to_le_bytes()
         || !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32)
-        || !(compression == 0 || (compression == 3 && bpp == 16))
+        || !(compression == 0 || (compression == 3 && matches!(bpp, 16 | 32)))
         // DIB_PAL_COLORS changes indexed colour tables only; true-colour DIBs
         // carry their colours in pixels (and their optional bit masks).
         || usage > 1
@@ -132,15 +132,16 @@ pub(super) fn read(
         4 => PixelFormat::Indexed4,
         8 => PixelFormat::Indexed8,
         16 if compression == 0 => PixelFormat::Rgb555,
-        16 => {
+        16 | 32 if compression == 3 => {
             let Some(address) = info.checked_add(40) else {
                 return Ok(None);
             };
             let masks = memory.read(address, 12)?;
             let mask = |at| u32::from_le_bytes(masks[at..at + 4].try_into().unwrap());
-            match (mask(0), mask(4), mask(8)) {
-                (0x7c00, 0x3e0, 0x1f) => PixelFormat::Rgb555,
-                (0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
+            match (bpp, mask(0), mask(4), mask(8)) {
+                (16, 0x7c00, 0x3e0, 0x1f) => PixelFormat::Rgb555,
+                (16, 0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
+                (32, 0xff0000, 0xff00, 0xff) => PixelFormat::Bgra32,
                 _ => return Ok(None),
             }
         }

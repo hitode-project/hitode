@@ -1,6 +1,8 @@
 import struct
 import unittest
-from import_ordinals import imports
+import tempfile
+from pathlib import Path
+from import_ordinals import generate, imports
 
 
 def archive(flags=0, ordinal=17, symbol=b"_Example@12"):
@@ -23,6 +25,16 @@ class ImportTests(unittest.TestCase):
     def test_truncated_member_is_rejected(self):
         with self.assertRaises(ValueError):
             list(imports(archive()[:-4]))
+
+    def test_xinput_uses_official_library_name_and_records_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modules = root / "modules.txt"
+            modules.write_text("# no stem-named libraries\n", encoding="utf-8")
+            (root / "xinput.lib").write_bytes(archive(ordinal=2, symbol=b"_XInputGetState@8"))
+            output = generate(root, modules)
+            self.assertIn("# xinput.lib SHA256 ", output)
+            self.assertIn("example.dll\t2\tXInputGetState\n", output)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,9 @@ pub fn register(registry: &mut Registry) {
         get_state_13_ABI,
         set_state_13_ABI,
         get_capabilities_13_ABI,
+        get_state_14_ABI,
+        set_state_14_ABI,
+        get_capabilities_14_ABI,
     ] {
         registry.register(api);
     }
@@ -58,5 +61,20 @@ fn set_state_13(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 
 
 #[win32(xinput1_3, name = "XInputGetCapabilities", level = safe_fail)]
 fn get_capabilities_13(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
+    disconnected(index, flags, output)
+}
+
+#[win32(xinput1_4, name = "XInputGetState", level = safe_fail)]
+fn get_state_14(_env: &mut Env<'_>, index: u32, output: GuestPtr<()>) -> u32 {
+    disconnected(index, 0, output)
+}
+
+#[win32(xinput1_4, name = "XInputSetState", level = safe_fail)]
+fn set_state_14(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
+    disconnected(index, 0, vibration)
+}
+
+#[win32(xinput1_4, name = "XInputGetCapabilities", level = safe_fail)]
+fn get_capabilities_14(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
     disconnected(index, flags, output)
 }

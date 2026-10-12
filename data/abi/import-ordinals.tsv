@@ -11,6 +11,7 @@
 # d2d1.lib SHA256 8d49cf3a1f32e8584f6a92ce7c54f3aa1f27163fa82ea02f67491b44bbac9d8d
 # wininet.lib SHA256 6429d7da97688884faaf8dce2806874748dac76cade31113da76fce8488d178e
 # winspool.lib SHA256 4e18ec5682ab14642352eaa2252f422a6b05de1d5a0a279d72e0ae009cc305ac
+# xinput.lib SHA256 6146847265c6eccd096dec00610e0792ca97a9b36837574dcea79d504c4399fa
 comctl32.dll	2	MenuHelp
 comctl32.dll	3	ShowHideMenuCtl
 comctl32.dll	4	GetEffectiveClientRect
@@ -868,3 +869,11 @@ wsock32.dll	1130	NPLoadNameSpaces
 wsock32.dll	1140	TransmitFile
 wsock32.dll	1141	AcceptEx
 wsock32.dll	1142	GetAcceptExSockaddrs
+xinput1_4.dll	1	DllMain
+xinput1_4.dll	2	XInputGetState
+xinput1_4.dll	3	XInputSetState
+xinput1_4.dll	4	XInputGetCapabilities
+xinput1_4.dll	5	XInputEnable
+xinput1_4.dll	7	XInputGetBatteryInformation
+xinput1_4.dll	8	XInputGetKeystroke
+xinput1_4.dll	10	XInputGetAudioDeviceIds

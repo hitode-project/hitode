@@ -413,6 +413,18 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     super::super::register(&mut registry);
     assert!(registry.signature_conflicts().is_empty());
     let output = GuestPtr::new(alloc(&mut env, 16).unwrap());
+    for sampler in (0..=15).chain(257..=260) {
+        assert_eq!(
+            typed_call(
+                &mut env,
+                &registry,
+                "IDirect3DDevice9::GetSamplerState",
+                &[device, sampler, 3, output.addr()]
+            ),
+            0
+        );
+        assert_eq!(output.read(env.cpu).unwrap(), 1);
+    }
     assert_eq!(
         typed_call(
             &mut env,
@@ -431,6 +443,8 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
         ("IDirect3DDevice9::SetRenderState", vec![device, 137, 0]),
         ("IDirect3DDevice9::SetSamplerState", vec![device, 2, 9, 5]),
         ("IDirect3DDevice9::SetSamplerState", vec![device, 0, 1, 4]),
+        ("IDirect3DDevice9::SetSamplerState", vec![device, 0, 3, 3]),
+        ("IDirect3DDevice9::SetSamplerState", vec![device, 2, 3, 2]),
         (
             "IDirect3DDevice9::SetSamplerState",
             vec![device, 0, 4, 0x8010_2040],
@@ -456,6 +470,7 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     }
     assert_eq!(current_device(&env, device).unwrap().fixed.render[&137], 1);
     assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&1], 1);
+    assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&3], 1);
     assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&4], 0);
     assert_eq!(
         current_device(&env, device).unwrap().fixed.sampler_slots[2][&9],
@@ -479,6 +494,8 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     assert_eq!(d.fixed.sampler_slots[2][&9], 5);
     assert_eq!(d.fixed.sampler[&1], 4);
     assert_eq!(d.fixed.sampler[&4], 0x8010_2040);
+    assert_eq!(d.fixed.sampler[&3], 3);
+    assert_eq!(d.fixed.sampler_slots[2][&3], 2);
     assert_eq!(d.fixed.sampler_slots[2][&4], 0xffab_cdef);
     assert_eq!(d.fixed.sampler_slots[16][&4], 0xff12_3456);
     assert_eq!(

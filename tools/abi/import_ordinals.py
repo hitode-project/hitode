@@ -3,6 +3,7 @@
 
 Only IMPORT_OBJECT_HEADER records with IMPORT_ORDINAL are projected. The SDK
 library SHA-256 is recorded; no implementation bytes or DLLs enter the output.
+XInput 1.4 uses the SDK's xinput.lib rather than a DLL-stem library name.
 """
 from __future__ import annotations
 import argparse
@@ -45,10 +46,12 @@ def generate(sdk: Path, modules: Path) -> str:
         raise ValueError("SDK import library directory does not exist")
     sources = []
     aliases = {}
-    for module in modules.read_text(encoding="utf-8").splitlines():
+    libraries = {"xinput1_4.dll": "xinput.lib"}
+    selected = modules.read_text(encoding="utf-8").splitlines()
+    for module in dict.fromkeys([*selected, *libraries]):
         if not module or module.startswith("#"):
             continue
-        library = sdk / (Path(module).stem + ".lib")
+        library = sdk / libraries.get(module, Path(module).stem + ".lib")
         if not library.exists():
             continue
         data = library.read_bytes()
