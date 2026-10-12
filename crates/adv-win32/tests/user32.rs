@@ -954,6 +954,32 @@ fn queue_status_distinguishes_pending_changed_and_range_filtered_observation() {
 }
 
 #[test]
+fn thread_timers_rearm_by_id_and_never_reuse_a_live_id() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let first = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    let rearmed = t.call(&mut a, "SetTimer", &[I(0), M(first), I(20), I(0)]);
+    let second = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    let third = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    // An unknown ID is ignored for a fresh one.
+    let unknown = t.call(&mut a, "SetTimer", &[I(0), I(0x1234), I(10), I(0)]);
+    t.call(&mut a, "KillTimer", &[I(0), M(second)]);
+    let refill = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    // Re-arming replaced the first timer: one kill removes it.
+    let killed = t.call(&mut a, "KillTimer", &[I(0), M(first)]);
+    let gone = t.call(&mut a, "KillTimer", &[I(0), M(first)]);
+    t.run(a);
+    assert_eq!(t.u32(rearmed), t.u32(first));
+    let live = [t.u32(first), t.u32(third), t.u32(unknown), t.u32(refill)];
+    assert_ne!(t.u32(unknown), 0x1234);
+    for (index, id) in live.iter().enumerate() {
+        assert_ne!(*id, 0);
+        assert!(!live[index + 1..].contains(id), "{live:x?}");
+    }
+    assert_eq!((t.u32(killed), t.u32(gone)), (1, 0));
+}
+
+#[test]
 fn generated_timer_expiry_becomes_new_again_after_removal() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);

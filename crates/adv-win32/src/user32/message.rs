@@ -2137,10 +2137,13 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let interval_us = u64::from(ms.max(10)) * 1000;
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let q = u.queue(ctx);
-    let id = if hwnd == 0 {
-        0x7fff_0000 + q.timers.len() as u32 + 1
-    } else {
+    // A thread timer keeps an ID that names one of its own timers; any other
+    // ID is ignored for a fresh one, so re-arming never adds a timer.
+    let thread_timer = |id: u32| q.timers.iter().any(|t| t.hwnd == 0 && t.id == id);
+    let id = if hwnd != 0 || thread_timer(id) {
         id
+    } else {
+        (0x7fff_0001..).find(|&id| !thread_timer(id)).unwrap()
     };
     q.timers.retain(|t| !(t.hwnd == hwnd && t.id == id));
     q.timers.push(Timer {
