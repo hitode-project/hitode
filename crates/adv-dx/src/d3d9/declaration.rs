@@ -75,11 +75,22 @@ pub(super) fn layout(env: &Env<'_>, id: Id) -> Result<fixed::Layout, &'static st
     fixed_layout(&d.elements)
 }
 fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
+    if elements.iter().any(|e| !end(e) && e[6] == 9 && e[7] == 0) {
+        let mut previous = None;
+        for element in elements.iter().take_while(|e| !end(e)) {
+            let offset = u16::from_le_bytes([element[2], element[3]]);
+            if element[0] != 0 || element[1] != 0 || previous.is_some_and(|before| offset < before)
+            {
+                return Err("POSITIONT declaration requires ordered stream-zero inputs");
+            }
+            previous = Some(offset);
+        }
+    }
     let mut position = None;
     let mut color = None;
-    let mut uv = None;
+    let mut texcoords = [None; 8];
     let mut size = 0;
-    let mut streams = [0; 3];
+    let mut streams = [0; 2];
     for element in elements.iter().take_while(|e| !end(e)) {
         let stream = u16::from_le_bytes([element[0], element[1]]);
         if stream >= 16 {
@@ -90,7 +101,7 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
         }
         let offset = u32::from(u16::from_le_bytes([element[2], element[3]]));
         // (usage, usage index, type): POSITION FLOAT3, POSITIONT FLOAT4,
-        // COLOR0 D3DCOLOR and TEXCOORD0 FLOAT2 are the FVF-equivalent inputs.
+        // COLOR0 D3DCOLOR and TEXCOORD0..7 FLOAT1..4 are FVF-equivalent inputs.
         let bytes = match (element[6], element[7], element[4]) {
             (0, 0, 2) if position.is_none() => {
                 position = Some((offset, false));
@@ -107,10 +118,10 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
                 streams[1] = stream;
                 4
             }
-            (5, 0, 1) if uv.is_none() => {
-                uv = Some(offset);
-                streams[2] = stream;
-                8
+            (5, n @ 0..=7, kind @ 0..=3) if texcoords[n as usize].is_none() => {
+                let dimensions = kind + 1;
+                texcoords[n as usize] = Some((stream, offset, dimensions));
+                u32::from(dimensions) * 4
             }
             _ => return Err("vertex declaration element has no fixed-function equivalent"),
         };
@@ -122,7 +133,7 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
         transformed,
         position,
         color,
-        uv,
+        texcoords,
         streams,
         size,
     })

@@ -149,7 +149,7 @@ fn binding_replaces_the_fvf_and_set_fvf_releases_the_declaration() {
     assert_eq!(fixed::set_fvf(&mut env, this, 0x144), 0);
     assert_eq!(set(&mut env, this, GuestPtr::new(declaration)), 0);
     assert_eq!(fvf(&mut env, this), 0);
-    assert_eq!(fixed::vertex_size(&env, device), Ok(28));
+    assert_eq!(layout(&env, decl).unwrap().size, 28);
     // The device binding alone keeps the declaration alive.
     assert_eq!(release(&mut env, declaration), 0);
     assert!(com(&env).get_identity(&env.sys.objects, decl).is_some());
@@ -191,8 +191,8 @@ fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
             transformed: false,
             position: 12,
             color: Some(8),
-            uv: Some(0),
-            streams: [0; 3],
+            texcoords: [Some((0, 0, 2)), None, None, None, None, None, None, None],
+            streams: [0; 2],
             size: 24,
         })
     );
@@ -203,7 +203,7 @@ fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
             "no fixed-function equivalent",
         ),
         (
-            &[(0, 0, 2, 0, 0), (0, 12, 1, 5, 1)][..],
+            &[(0, 0, 2, 0, 0), (0, 12, 1, 5, 0), (0, 20, 1, 5, 0)][..],
             "no fixed-function equivalent",
         ),
         (&[(0, 0, 4, 10, 0)][..], "no POSITION"),

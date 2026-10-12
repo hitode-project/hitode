@@ -119,8 +119,10 @@ fn inputs(env: &Env<'_>, pointer: u32, vs: &Shader) -> Result<Vec<Input>, u32> {
         if let Some(o) = layout.color {
             v.push([0, 0, o as u8, (o >> 8) as u8, 4, 0, 10, 0]);
         }
-        if let Some(o) = layout.uv {
-            v.push([0, 0, o as u8, (o >> 8) as u8, 1, 0, 5, 0]);
+        for (n, coordinate) in layout.texcoords.iter().enumerate() {
+            if let Some((_, o, dimensions)) = *coordinate {
+                v.push([0, 0, o as u8, (o >> 8) as u8, dimensions - 1, 0, 5, n as u8]);
+            }
         }
         v.push([255, 0, 0, 0, 17, 0, 0, 0]);
         v
@@ -361,57 +363,23 @@ fn prepare_checked(
                 image,
                 state,
                 vertices: Vec::new(),
+                texcoords: None,
                 programmable: None,
             },
             streams,
             inputs,
         )
     } else {
-        let (data, stride) = if let Some(up) = up {
-            up
+        // The shared fixed decoder validates all declaration streams and expands
+        // indices/fans before assembling the neutral programmable stream.
+        let draw = if let Some((data, stride)) = up {
+            fixed::prepare(env, pointer, kind, count, data, stride, indices)?
         } else {
-            let stream = d.buffers.streams[0];
-            let Some(Payload::Buffer(b)) = stream
-                .buffer
-                .and_then(|id| com(env).get_identity(&env.sys.objects, id))
-            else {
-                return Err(INVALID);
-            };
-            if b.locks != 0 {
-                return Err(INVALID);
-            }
-            let bytes = fixed::vertex_size(env, pointer)?;
-            let last = indices
-                .and_then(|v| v.iter().max().copied())
-                .unwrap_or(length - 1);
-            if start
-                .checked_add(last)
-                .and_then(|v| v.checked_mul(stream.stride))
-                .and_then(|v| v.checked_add(stream.offset))
-                .and_then(|v| v.checked_add(bytes))
-                .is_none_or(|v| v > b.len)
-            {
-                return Err(INVALID);
-            }
-            (
-                GuestPtr::new(
-                    b.storage
-                        .checked_add(stream.offset)
-                        .and_then(|v| {
-                            start
-                                .checked_mul(stream.stride)
-                                .and_then(|n| v.checked_add(n))
-                        })
-                        .ok_or(INVALID)?,
-                ),
-                stream.stride,
-            )
+            fixed::prepare_bound(env, pointer, kind, count, start, indices)?
         };
-        // This decoder already expands indices/fans and performs fixed transforms.
-        let draw = fixed::prepare(env, pointer, kind, count, data, stride, indices)?;
         vertex_count = draw.vertices.len() as u32;
         output_indices = None;
-        let stream = VertexStream {
+        let mut stream = VertexStream {
             bytes: bytemuck::cast_slice(&draw.vertices).to_vec(),
             stride: 40,
             attributes: vec![
@@ -432,7 +400,42 @@ fn prepare_checked(
                 },
             ],
         };
-        (draw, vec![stream], Vec::new())
+        let mut inputs = Vec::new();
+        if let Some((count, values)) = &draw.texcoords {
+            stream.stride = 32 + *count as u32 * 16;
+            stream.bytes.clear();
+            stream
+                .bytes
+                .reserve(draw.vertices.len() * stream.stride as usize);
+            stream.attributes.truncate(2);
+            for (vertex, coordinates) in draw.vertices.iter().zip(values.chunks_exact(*count)) {
+                stream
+                    .bytes
+                    .extend_from_slice(bytemuck::cast_slice(&vertex.position));
+                stream
+                    .bytes
+                    .extend_from_slice(bytemuck::cast_slice(&vertex.color));
+                stream
+                    .bytes
+                    .extend_from_slice(bytemuck::cast_slice(coordinates));
+            }
+            for n in 0..*count {
+                let location = 2 + n as u32;
+                let offset = 32 + n as u32 * 16;
+                stream.attributes.push(Attribute {
+                    location,
+                    offset,
+                    format: AttributeFormat::Float4,
+                });
+                inputs.push(Input {
+                    stream: 0,
+                    offset,
+                    format: AttributeFormat::Float4,
+                    register: location,
+                });
+            }
+        }
+        (draw, vec![stream], inputs)
     };
     if vs.is_some() && kind == 6 {
         let original = output_indices

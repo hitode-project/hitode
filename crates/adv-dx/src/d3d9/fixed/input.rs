@@ -32,8 +32,13 @@ impl Reader {
             if layout.transformed { 16 } else { 12 },
         ))
         .chain(layout.color.map(|at| (layout.streams[1], at, 4)))
-        .chain(layout.uv.map(|at| (layout.streams[2], at, 8)))
-        {
+        .chain(
+            layout
+                .texcoords
+                .into_iter()
+                .flatten()
+                .map(|(stream, offset, dimensions)| (stream, offset, u32::from(dimensions) * 4)),
+        ) {
             let size = sizes.get_mut(stream as usize).ok_or(INVALID)?;
             *size = (*size).max(offset.checked_add(bytes).ok_or(INVALID)?);
         }

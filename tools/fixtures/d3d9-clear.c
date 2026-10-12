@@ -74,6 +74,34 @@ void mainCRTStartup(void){
   ok(IDirect3DDevice9_SetVertexDeclaration(d,NULL));ok(IDirect3DDevice9_SetVertexShader(d,NULL));ok(IDirect3DDevice9_SetPixelShader(d,NULL));
   record(IDirect3DVertexDeclaration9_Release(decl));record(IDirect3DVertexShader9_Release(vs));record(IDirect3DPixelShader9_Release(ps));
  }
+ // Eight independent coordinate sets, mixed FLOAT1..4 component defaults.
+ {DWORD fvf=D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX8,queried;float data[4][25];UINT n,v,at;
+  D3DVERTEXELEMENT9 elements[11];IDirect3DVertexDeclaration9 *decl=NULL;IDirect3DVertexBuffer9 *pos=NULL;IDirect3DStateBlock9 *saved=NULL;void *mapped=NULL;
+  for(n=0;n<8;n++){UINT dimensions=n%4+1;fvf|=(dimensions==1?3u:dimensions==2?0u:dimensions==3?1u:2u)<<(16+n*2);}
+  for(v=0;v<4;v++){data[v][0]=(v&1)?15.5f:-.5f;data[v][1]=(v&2)?11.5f:-.5f;data[v][2]=0;data[v][3]=1;*((DWORD *)&data[v][4])=0xffffffffu;at=5;for(n=0;n<8;n++)for(UINT c=0;c<n%4+1;c++)data[v][at++]=c==3?1:(n&(1u<<c))?1:0;}
+  for(n=0;n<8;n++){
+   const DWORD code[]={0xffff0200,0x0200001f,0x80000000,0xb00f0000u|n,0x02000001,0x800f0800,0xb0e40000u|n,0xffff};IDirect3DPixelShader9 *ps=NULL;
+   ok(IDirect3DDevice9_CreatePixelShader(d,code,&ps));ok(IDirect3DDevice9_SetPixelShader(d,ps));ok(IDirect3DDevice9_SetFVF(d,fvf));ok(IDirect3DDevice9_GetFVF(d,&queried));record(queried==fvf);
+   black(d);ok(IDirect3DDevice9_BeginScene(d));ok(IDirect3DDevice9_DrawPrimitiveUP(d,D3DPT_TRIANGLESTRIP,2,data,sizeof(data[0])));ok(IDirect3DDevice9_EndScene(d));capture(d,back,D3DFMT_A8R8G8B8);
+   if(n==7){
+    elements[0]=(D3DVERTEXELEMENT9){0,0,D3DDECLTYPE_FLOAT4,0,D3DDECLUSAGE_POSITIONT,0};elements[1]=(D3DVERTEXELEMENT9){0,16,D3DDECLTYPE_D3DCOLOR,0,D3DDECLUSAGE_COLOR,0};at=0;
+    for(UINT t=0;t<8;t++){UINT dimensions=t%4+1;elements[2+t]=(D3DVERTEXELEMENT9){0,(WORD)(20+at),(BYTE)(dimensions-1),0,D3DDECLUSAGE_TEXCOORD,(BYTE)t};at+=dimensions*4;}
+    elements[10]=(D3DVERTEXELEMENT9)D3DDECL_END();ok(IDirect3DDevice9_CreateVertexDeclaration(d,elements,&decl));
+    ok(IDirect3DDevice9_CreateStateBlock(d,D3DSBT_VERTEXSTATE,&saved));ok(IDirect3DDevice9_SetFVF(d,0x244));ok(IDirect3DDevice9_GetFVF(d,&queried));record(queried==0x244);ok(IDirect3DStateBlock9_Apply(saved));ok(IDirect3DDevice9_GetFVF(d,&queried));record(queried==fvf);record(IDirect3DStateBlock9_Release(saved));
+    ok(IDirect3DDevice9_CreateVertexBuffer(d,sizeof(data),0,0,D3DPOOL_MANAGED,&pos,NULL));ok(IDirect3DVertexBuffer9_Lock(pos,0,0,&mapped,0));for(UINT b=0;b<sizeof(data);b++)((BYTE *)mapped)[b]=((BYTE *)data)[b];ok(IDirect3DVertexBuffer9_Unlock(pos));
+    ok(IDirect3DDevice9_SetVertexDeclaration(d,decl));ok(IDirect3DDevice9_SetStreamSource(d,0,pos,0,sizeof(data[0])));black(d);ok(IDirect3DDevice9_BeginScene(d));ok(IDirect3DDevice9_DrawPrimitive(d,D3DPT_TRIANGLESTRIP,0,2));ok(IDirect3DDevice9_EndScene(d));capture(d,back,D3DFMT_A8R8G8B8);
+   }
+   ok(IDirect3DDevice9_SetPixelShader(d,NULL));record(IDirect3DPixelShader9_Release(ps));
+  }
+  ok(IDirect3DDevice9_SetStreamSource(d,0,NULL,0,0));ok(IDirect3DDevice9_SetVertexDeclaration(d,NULL));record(IDirect3DVertexBuffer9_Release(pos));record(IDirect3DVertexDeclaration9_Release(decl));
+ }
+ // TEX2 with default FLOAT2 sizes survives indexed fan expansion.
+ {float data[4][9];const WORD indices[]={0,1,3,2};IDirect3DPixelShader9 *ps=NULL;DWORD queried;
+  const DWORD code[]={0xffff0200,0x0200001f,0x80000000,0xb00f0001,0x02000001,0x800f0800,0xb0e40001,0xffff};
+  for(UINT v=0;v<4;v++){data[v][0]=(v&1)?15.5f:-.5f;data[v][1]=(v&2)?11.5f:-.5f;data[v][2]=0;data[v][3]=1;*((DWORD *)&data[v][4])=0xffffffffu;data[v][5]=0;data[v][6]=1;data[v][7]=1;data[v][8]=0;}
+  ok(IDirect3DDevice9_CreatePixelShader(d,code,&ps));ok(IDirect3DDevice9_SetPixelShader(d,ps));ok(IDirect3DDevice9_SetFVF(d,0x244));ok(IDirect3DDevice9_GetFVF(d,&queried));record(queried==0x244);
+  black(d);ok(IDirect3DDevice9_BeginScene(d));ok(IDirect3DDevice9_DrawIndexedPrimitiveUP(d,D3DPT_TRIANGLEFAN,0,4,2,indices,D3DFMT_INDEX16,data,sizeof(data[0])));ok(IDirect3DDevice9_EndScene(d));capture(d,back,D3DFMT_A8R8G8B8);ok(IDirect3DDevice9_SetPixelShader(d,NULL));record(IDirect3DPixelShader9_Release(ps));
+ }
  record(IDirect3DSurface9_Release(x8));record(IDirect3DTexture9_Release(texture));record(IDirect3DSurface9_Release(back));record(IDirect3DDevice9_Release(d));record(IDirect3D9_Release(factory));CloseHandle(pixel_file);DestroyWindow(w);
  {volatile DWORD guard=0;for(i=0;i<50000;++i)guard=guard*33u+i;record(guard);}record(0xc1ea000du);save();ExitProcess(0);
 }

@@ -27,9 +27,9 @@ pub(super) struct Layout {
     pub transformed: bool,
     pub position: u32,
     pub color: Option<u32>,
-    pub uv: Option<u32>,
-    /// POSITION/POSITIONT, COLOR0 and TEXCOORD0 source stream numbers.
-    pub streams: [u16; 3],
+    pub texcoords: [Option<(u16, u32, u8)>; 8],
+    /// POSITION/POSITIONT and COLOR0 source stream numbers.
+    pub streams: [u16; 2],
     /// Largest per-stream extent, also the vertex size for interleaved inputs.
     pub size: u32,
 }
@@ -47,21 +47,44 @@ impl Layout {
             })
         };
         let color = field(fvf & 0x40 != 0, 4);
-        let uv = field(fvf & 0x100 != 0, 8);
+        let mut texcoords = [None; 8];
+        for (n, coordinate) in texcoords
+            .iter_mut()
+            .enumerate()
+            .take(((fvf >> 8) & 15) as usize)
+        {
+            let dimensions = [2, 3, 4, 1][((fvf >> (16 + n * 2)) & 3) as usize];
+            let offset = size;
+            size += u32::from(dimensions) * 4;
+            *coordinate = Some((0, offset, dimensions));
+        }
         Some(Self {
             transformed,
             position: 0,
             color,
-            uv,
-            streams: [0; 3],
+            texcoords,
+            streams: [0; 2],
             size,
         })
+    }
+}
+impl Layout {
+    pub(super) fn coordinate_count(self) -> usize {
+        self.texcoords
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |n| n + 1)
+    }
+    fn extended_coordinates(self) -> bool {
+        self.coordinate_count() > 1
+            || self.texcoords[0].is_some_and(|(_, _, dimensions)| dimensions != 2)
     }
 }
 pub(super) struct Draw {
     pub target: Target,
     pub image: Option<Image>,
     pub vertices: Vec<Vertex>,
+    pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
     pub state: DrawState,
     pub programmable: Option<adv_device::gpu::ProgrammableDraw>,
 }
@@ -319,7 +342,12 @@ fn valid_fvf(fvf: u32) -> bool {
     // SPECULARENABLE is observable state, but these prelit/lighting-off inputs
     // have no specular color. Keep SPECULAR (0x80) unavailable until that color
     // is propagated through the neutral vertex and post-texture RGB stage.
-    matches!(fvf & 0x0e, 2 | 4) && fvf & !(0x0e | 0x40 | 0x100) == 0
+    let count = (fvf >> 8) & 15;
+    let sizes = fvf >> 16;
+    matches!(fvf & 0x0e, 2 | 4)
+        && fvf & !(0x0e | 0x40 | 0xf00 | 0xffff0000) == 0
+        && count <= 8
+        && (count == 8 || sizes >> (count * 2) == 0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetFVF",level=state)]
 pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
@@ -840,21 +868,6 @@ fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
 fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
     std::array::from_fn(|column| (0..4).map(|i| vector[i] * matrix[i * 4 + column]).sum())
 }
-pub(super) fn vertex_size(env: &Env<'_>, pointer: u32) -> Result<u32, u32> {
-    layout(env, pointer)
-        .and_then(|layout| {
-            if layout.streams != [0; 3] {
-                Err(rejected(
-                    UNAVAILABLE,
-                    "interleaved/UP vertex size requires stream-zero inputs",
-                ))
-            } else {
-                Ok(layout.size)
-            }
-        })
-        .map_err(|error| error.code)
-}
-
 /// Draw-bound buffers supply every declared input stream. UP callers still
 /// supply only their explicit stream-zero pointer through prepare_checked.
 pub(super) fn prepare_bound(
@@ -1022,6 +1035,26 @@ fn prepare_input_checked(
         .unwrap_or(length - 1);
     let mut input = input::Reader::new(env, pointer, layout, source, first, last)?;
     let mut vertices = Vec::with_capacity(length as usize);
+    let coordinate_count = layout.coordinate_count();
+    let mut texcoords = if layout.extended_coordinates() {
+        let output_length = if kind == 6 {
+            count.checked_mul(3).ok_or(INVALID)?
+        } else {
+            length
+        };
+        if output_length
+            .checked_mul(32 + coordinate_count as u32 * 16)
+            .is_none_or(|bytes| bytes > 16 * 1024 * 1024)
+        {
+            return Err(rejected(
+                INVALID,
+                "expanded texture-coordinate stream exceeds the draw budget",
+            ));
+        }
+        Some(Vec::with_capacity(length as usize * coordinate_count))
+    } else {
+        None
+    };
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         input.read(env, index)?;
@@ -1066,17 +1099,23 @@ fn prepare_input_checked(
                 (argb >> 24) as f32 / 255.,
             ];
         }
-        let uv = layout.uv.map_or([0.; 2], |at| {
-            [
-                float(layout.streams[2], at),
-                float(layout.streams[2], at + 4),
-            ]
-        });
-        if uv.iter().any(|v| !v.is_finite()) {
-            return Err(rejected(
-                INVALID,
-                "vertex texture coordinates are not finite",
-            ));
+        let mut coordinates = [[0., 0., 0., 1.]; 8];
+        for (n, coordinate) in layout.texcoords.iter().enumerate() {
+            if let Some((stream, offset, dimensions)) = *coordinate {
+                for component in 0..dimensions as usize {
+                    coordinates[n][component] = float(stream, offset + component as u32 * 4);
+                }
+                if coordinates[n].iter().any(|v| !v.is_finite()) {
+                    return Err(rejected(
+                        INVALID,
+                        "vertex texture coordinates are not finite",
+                    ));
+                }
+            }
+        }
+        let uv = [coordinates[0][0], coordinates[0][1]];
+        if let Some(values) = &mut texcoords {
+            values.extend_from_slice(&coordinates[..coordinate_count]);
         }
         vertices.push(Vertex {
             position: p,
@@ -1090,12 +1129,24 @@ fn prepare_input_checked(
             fan.extend_from_slice(&[vertices[0], vertices[i], vertices[i + 1]]);
         }
         vertices = fan;
+        if let Some(values) = &mut texcoords {
+            let mut fan = Vec::with_capacity(count as usize * 3 * coordinate_count);
+            for n in 1..length as usize - 1 {
+                for index in [0, n, n + 1] {
+                    fan.extend_from_slice(
+                        &values[index * coordinate_count..(index + 1) * coordinate_count],
+                    );
+                }
+            }
+            *values = fan;
+        }
     }
     let (target, image, state) = prepare_state(env, pointer, kind)?;
     Ok(Draw {
         target,
         image,
         vertices,
+        texcoords: texcoords.map(|values| (coordinate_count, values)),
         state,
         programmable: None,
     })

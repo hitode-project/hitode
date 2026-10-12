@@ -78,7 +78,19 @@ pub(super) fn build(
             .unwrap();
         }
     } else {
-        s.push_str("@location(0) a0:vec4<f32>,@location(1) a1:vec4<f32>,@location(2) a2:vec2<f32>");
+        s.push_str("@location(0) a0:vec4<f32>,@location(1) a1:vec4<f32>");
+        if inputs.is_empty() {
+            s.push_str(",@location(2) a2:vec2<f32>");
+        } else {
+            for input in inputs {
+                write!(
+                    s,
+                    ",@location({}) a{}:vec4<f32>",
+                    input.register, input.register
+                )
+                .unwrap();
+            }
+        }
     }
     s.push_str(")->Interpolated {\nvar out:Interpolated;\n");
     if let Some(vs) = vs {
@@ -126,7 +138,14 @@ pub(super) fn build(
             }
         }
     } else {
-        s.push_str("out.position=a0;let clip_position=out.position;out.c0=a1;out.fog=1.0;out.t0=vec4<f32>(a2,0.0,1.0);\n");
+        s.push_str("out.position=a0;let clip_position=out.position;out.c0=a1;out.fog=1.0;\n");
+        if inputs.is_empty() {
+            s.push_str("out.t0=vec4<f32>(a2,0.0,1.0);\n");
+        } else {
+            for input in inputs {
+                writeln!(s, "out.t{}=a{};", input.register - 2, input.register).unwrap();
+            }
+        }
     }
     for n in 0..6 {
         let field = if n < 4 {
