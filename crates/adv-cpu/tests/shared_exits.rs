@@ -92,6 +92,7 @@ fn equal_state(jit: &mut Executor, uc: &mut Executor) {
     assert_eq!(uc.state.mmx_mode, 0);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn repeated_guards_preserve_each_faulting_prefix() {
     for write in [false, true] {
@@ -148,6 +149,7 @@ fn repeated_guards_preserve_each_faulting_prefix() {
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_state() {
     let bytes = assemble(CODE, |a| {
@@ -195,6 +197,7 @@ fn read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_sta
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
     let bytes = assemble(CODE, |a| {
@@ -269,6 +272,7 @@ fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs() {
     let bytes = assemble(CODE, |a| {

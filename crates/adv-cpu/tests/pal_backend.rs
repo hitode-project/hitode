@@ -189,7 +189,9 @@ fn trap_mapping_new_rwx_page_tracks_actual_guest_code_writes() {
     for jit in [false, true] {
         let mut cpu = cpu(jit);
         // This regression needs compiled code before the guest patch. Keep its
-        // warm-up deterministic instead of racing a background compilation.
+        // warm-up deterministic instead of racing a background compilation;
+        // a64 translates synchronously.
+        #[cfg(not(target_arch = "aarch64"))]
         cpu.set_async_compilation(false);
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.map(API, 4096, Prot::RX).unwrap();

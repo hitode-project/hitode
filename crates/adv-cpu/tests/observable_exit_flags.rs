@@ -42,6 +42,7 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
     m
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn budget_and_memory_faults_publish_flags_before_a_future_full_writer() {
     for write in [false, true] {
@@ -108,6 +109,7 @@ fn budget_and_memory_faults_publish_flags_before_a_future_full_writer() {
 
 struct NotifyAtTrap(Arc<AtomicBool>);
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn carry_controls_publish_exact_flags_at_budget_and_fault_boundaries() {
     for carry in 0..3 {
@@ -180,6 +182,7 @@ impl ExecutionTrap for NotifyAtTrap {
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn a_native_backedge_interrupt_publishes_the_last_lazy_flags() {
     let bytes = code(|a| {

@@ -103,6 +103,7 @@ fn unit(start: u32, entry: u32, len: usize, callees: &[u32]) -> Region {
     region
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn observed_callees_run_inside_the_caller_and_follow_their_own_code_pages() {
     let mut transfers = Vec::new();

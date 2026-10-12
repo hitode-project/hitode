@@ -329,6 +329,7 @@ fn writes_to_executable_pages_fall_back_and_invalidate_warm_code() {
     support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn large_repeats_yield_at_chunk_boundaries_and_resume_independent_contexts() {
     let mut m = machine(0, true, 0x900000);

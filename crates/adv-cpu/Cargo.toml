@@ -7,31 +7,23 @@ license.workspace = true
 publish.workspace = true
 description = "Execution layer facade: the platform's x86-32 engine over the engine-neutral core"
 
-[dependencies]
-adv-cpu-a64 = { path = "../adv-cpu-a64", optional = true }
+# The engine is a platform fork, not a switch: AArch64 hosts run the a64
+# translator, every other host the Cranelift engine.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+adv-cpu-a64 = { path = "../adv-cpu-a64" }
+
+[target.'cfg(not(target_arch = "aarch64"))'.dependencies]
 adv-cpu-x64 = { path = "../adv-cpu-x64" }
 
 [features]
 jit-verifier = ["adv-cpu-x64/jit-verifier"]
 gir-capture = ["adv-cpu-x64/gir-capture"]
 gir-lift = ["adv-cpu-x64/gir-lift"]
-cross-dump = ["adv-cpu-x64/cross-dump"]
-# Migration comparison, deleted at a64 M3: integration tests built with it
-# drive the a64 executor instead of the x64 one. Production code ignores it.
-test-a64 = []
-# Migration comparison, deleted at a64 M3: on AArch64 hosts `JitCpu` is the
-# a64 engine's CPU, so whole-game runs can measure it against the x64 one.
-engine-a64 = ["dep:adv-cpu-a64"]
 
 [dev-dependencies]
 adv-cpu = { path = ".", features = ["jit-verifier"] }
-adv-cpu-a64 = { path = "../adv-cpu-a64" }
 adv-sync = { path = "../adv-sync" }
 adv-unicorn = { path = "../adv-unicorn" }
-cranelift-codegen = "0.125"
-cranelift-frontend = "0.125"
-cranelift-jit = "0.125"
-cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 libc = "0.2"
 serde_json = "1"

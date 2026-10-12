@@ -1,5 +1,7 @@
 //! A register overwritten later can still be observed at a CPU boundary or
 //! in a fault context before that overwrite. No game code or assets are used.
+// Tests x64 engine mechanisms; the a64 engine has its own.
+#![cfg(not(target_arch = "aarch64"))]
 use adv_cpu::{CompileStrategy, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};

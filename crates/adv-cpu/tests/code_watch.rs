@@ -1,4 +1,6 @@
 //! Executable data stays writable until sampled code needs an SMC barrier.
+// Tests x64 engine mechanisms; the a64 engine has its own.
+#![cfg(not(target_arch = "aarch64"))]
 use adv_cpu::{CompileStrategy, CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 

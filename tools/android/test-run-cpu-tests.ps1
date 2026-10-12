@@ -30,21 +30,20 @@ Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lock
 Assert (-not $defaults.runs[0].shell.Contains('ADV_SAFEPOINT')) 'Retired poll selector must not reach the device.'
 Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
-$features = & $runner -WhatIf -TestName execution_contract -Features gir-lift -JitVerify strict -Output $output | ConvertFrom-Json
+$features = & $runner -WhatIf -TestName execution_contract -Features gir-lift -Output $output | ConvertFrom-Json
 Assert ($features.features.Count -eq 1 -and $features.features[0] -eq 'gir-lift') 'Explicit diagnostic feature was lost.'
-Assert ($features.runs[0].shell.Contains('ADV_JIT_VERIFY=strict')) 'Strict oracle was lost.'
 Reject { & $runner -WhatIf -Features 'bad;feature' } 'Unsafe feature name accepted.'
 $oldUnit = & $runner -WhatIf -TestName @() -UnitFilter virtual_memory::tests -Output $output | ConvertFrom-Json
-Assert (($oldUnit.targets -join ',') -eq 'adv_cpu_core,adv_cpu_x64,adv_cpu_a64') 'Unit-only command must build the core and engine harnesses.'
-Assert (($oldUnit.runs.id -join ',') -eq 'adv_cpu_core,adv_cpu_x64,adv_cpu_a64') 'Single-filter log names must name their library.'
-$all = & $runner -ExecutionExperiments -WhatIf -Serial 'test-device' -AdbPort 15037 -TimeoutSeconds 600 -JitVerify strict -Output $output | ConvertFrom-Json
-Assert (($all.targets -join ',') -eq 'adv_cpu_core,adv_cpu_x64,adv_cpu_a64') 'Experiments must build the unit harnesses.'
-Assert ($all.runs.Count -eq 9) 'A/B/D must all run in every unit harness.'
-Assert ((@($all.runs.filter | Select-Object -Unique) -join ',') -eq 'virtual_memory,fault_recovery,compile::x87::tests') 'Experiment filters are incomplete.'
-Assert (@($all.runs.id | Select-Object -Unique).Count -eq 9) 'Unit filters must have separate evidence logs.'
+Assert (($oldUnit.targets -join ',') -eq 'adv_cpu_core,adv_cpu_a64') 'Unit-only command must build the core and engine harnesses.'
+Assert (($oldUnit.runs.id -join ',') -eq 'adv_cpu_core,adv_cpu_a64') 'Single-filter log names must name their library.'
+$all = & $runner -ExecutionExperiments -WhatIf -Serial 'test-device' -AdbPort 15037 -TimeoutSeconds 600 -Output $output | ConvertFrom-Json
+Assert (($all.targets -join ',') -eq 'adv_cpu_core,adv_cpu_a64') 'Experiments must build the unit harnesses.'
+Assert ($all.runs.Count -eq 4) 'Every experiment filter must run in every unit harness.'
+Assert ((@($all.runs.filter | Select-Object -Unique) -join ',') -eq 'virtual_memory,fault_recovery') 'Experiment filters are incomplete.'
+Assert (@($all.runs.id | Select-Object -Unique).Count -eq 4) 'Unit filters must have separate evidence logs.'
 Assert ($all.serial -eq 'test-device' -and $all.adb_port -eq 15037) 'Device selection was not retained.'
 foreach ($run in $all.runs) {
-    Assert ($run.shell.Contains('ADV_JIT_VERIFY=strict timeout 600')) 'Strict mode or timeout did not reach the device command.'
+    Assert ($run.shell.Contains("CARGO_TARGET_DIR='/data/local/tmp/adv-host-cpu-DRYRUN/target' timeout 600")) 'Timeout did not reach the device command.'
     Assert ($run.shell.Contains('--test-threads=1 --nocapture')) 'Harness options changed.'
     Assert ($run.shell.Contains('unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER ADV_CPU_DIRECT_PROBE ADV_CONTROLLED_FAULT_CASE ADV_JIT_VERIFY')) 'Parent fixture environment is not isolated.'
     Assert (-not $run.shell.Contains('--ignored')) 'Expected-signal fixture must only run under its parent.'
@@ -52,12 +51,11 @@ foreach ($run in $all.runs) {
 $build = & $runner -ExecutionExperiments -BuildOnly -WhatIf -Output $output | ConvertFrom-Json
 Assert $build.build_only 'Build-only selection was lost.'
 $multiple = & $runner -TestName safepoints,safepoints -UnitFilter virtual_memory,fault_recovery,virtual_memory -WhatIf -Output $output | ConvertFrom-Json
-Assert ($multiple.targets.Count -eq 4 -and $multiple.runs.Count -eq 7) 'Duplicate selectors should run only once.'
-$full = & $runner -AllTests -JitVerify 1 -WhatIf -Output $output | ConvertFrom-Json
+Assert ($multiple.targets.Count -eq 3 -and $multiple.runs.Count -eq 5) 'Duplicate selectors should run only once.'
+$full = & $runner -AllTests -WhatIf -Output $output | ConvertFrom-Json
 $expected = @(Get-ChildItem (Join-Path $PSScriptRoot '../../crates/adv-cpu/tests') -File -Filter '*.rs')
-Assert ($full.targets.Count -eq $expected.Count + 3) 'Full suite must include every integration target and every library.'
-Assert ((($full.runs | Select-Object -Last 3).target -join ',') -eq 'adv_cpu_core,adv_cpu_x64,adv_cpu_a64' -and -not ($full.runs | Select-Object -Last 3 | Where-Object filter)) 'Full library suites must have no filter.'
-Assert ($full.runs[0].shell.Contains('ADV_JIT_VERIFY=1 timeout')) 'Execution settings must reach the device.'
+Assert ($full.targets.Count -eq $expected.Count + 2) 'Full suite must include every integration target and every library.'
+Assert ((($full.runs | Select-Object -Last 2).target -join ',') -eq 'adv_cpu_core,adv_cpu_a64' -and -not ($full.runs | Select-Object -Last 2 | Where-Object filter)) 'Full library suites must have no filter.'
 Reject { & $runner -AllTests -ExecutionExperiments -WhatIf } 'Conflicting presets were accepted.'
 Reject { & $runner -AllTests -UnitFilter virtual_memory -WhatIf } 'Full suite accepted a unit filter.'
 Reject { & $runner -BuildOnly -SkipBuild -WhatIf } 'Contradictory build modes were accepted.'

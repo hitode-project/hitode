@@ -219,6 +219,7 @@ fn faults_keep_arithmetic_flags_that_later_code_can_read() {
     assert_eq!(jit.state.eflags & 0x8d5, 0x10);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn budget_yields_in_a_busy_loop_without_a_system_call() {
     let code = assemble(|a| {
@@ -634,6 +635,7 @@ fn vector_store_fault_checks_both_pages_before_writing() {
     assert_eq!(jit.state.xmm[0], [0xa5; 16]);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn cliffs_count_native_fallbacks_by_instruction() {
     let code = assemble(|a| {
@@ -655,6 +657,7 @@ fn cliffs_count_native_fallbacks_by_instruction() {
     assert!(fallback.instructions >= fallback.entries);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn cliffs_attribute_exact_x87_work_to_the_control_word() {
     for (control, inexact, reason) in [
@@ -722,7 +725,7 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
 }
 
 #[test]
-#[cfg(not(feature = "test-a64"))] // x64 tier verification
+#[cfg(not(target_arch = "aarch64"))] // x64 tier verification
 fn tier_verification_checks_new_regions_without_changing_results() {
     let code = assemble(|a| {
         let mut top = a.create_label();

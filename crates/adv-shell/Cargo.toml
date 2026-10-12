@@ -12,7 +12,6 @@ default = []
 gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:wgpu", "dep:pollster"]
 media = ["adv-runtime/media"]
 # Migration comparison, deleted at a64 M3: see adv-cpu.
-engine-a64 = ["adv-runtime/engine-a64"]
 
 [dependencies]
 adv-runtime = { path = "../adv-runtime" }

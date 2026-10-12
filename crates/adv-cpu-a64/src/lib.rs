@@ -1,8 +1,7 @@
 //! AArch64 thin translator for the adv-cpu core.
 //!
-//! The facade selects this engine only under its `engine-a64` migration
-//! comparison feature until M3. The design and milestones live in
-//! `docs/a64-workbook.md`. Encoders are checked against
+//! The facade selects this engine on every AArch64 host; the contracts live
+//! in `docs/execution-abi.md`. Encoders are checked against
 //! NDK clang vectors (`tools/cpu/a64_vectors.py`), and translated code runs
 //! under Unicorn arm64 in host tests, so most work needs no device.
 
