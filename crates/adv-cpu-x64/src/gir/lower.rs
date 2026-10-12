@@ -3,8 +3,6 @@ use super::*;
 use cranelift_codegen::ir::{
     self, AbiParam, InstBuilder, MemFlags, Value, condcodes::IntCC, types,
 };
-#[cfg(feature = "cross-dump")]
-use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -23,7 +21,6 @@ pub(super) struct Code {
     pub recovery_uses: usize,
     pub spill_stores: usize,
     pub compile_us: u128,
-    pub cross: Option<(usize, String, Vec<u8>, Vec<u32>)>,
     recoverable: bool,
     pub graph: Graph,
     pub proven: BTreeSet<u32>,
@@ -63,13 +60,12 @@ pub(super) fn compile(
     base: u32,
     len: usize,
     proven: &BTreeSet<u32>,
-    cross: bool,
 ) -> Code {
-    compile_inner(graph, route, base, len, proven, cross, true)
+    compile_inner(graph, route, base, len, proven, true)
 }
 
 pub(super) fn counterfactual(graph: &Graph, base: u32, len: usize, proven: &BTreeSet<u32>) -> Code {
-    compile_inner(graph, Route::Proof, base, len, proven, true, false)
+    compile_inner(graph, Route::Proof, base, len, proven, false)
 }
 
 fn compile_inner(
@@ -78,7 +74,6 @@ fn compile_inner(
     base: u32,
     len: usize,
     proven: &BTreeSet<u32>,
-    cross: bool,
     recoverable: bool,
 ) -> Code {
     let start = std::time::Instant::now();
@@ -92,8 +87,6 @@ fn compile_inner(
         cranelift_module::default_libcall_names(),
     )
     .unwrap();
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-    builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
     let mut module = JITModule::new(builder);
     let mut context = module.make_context();
     let ptr = module.target_config().pointer_type();
@@ -132,7 +125,6 @@ fn compile_inner(
         .blocks()
         .map(|b| context.func.layout.block_insts(b).count())
         .sum();
-    let cross_function = cross.then(|| context.func.clone());
     context.set_disasm(true);
     module.define_function(id, &mut context).unwrap();
     let machine = context.compiled_code().unwrap();
@@ -169,7 +161,6 @@ fn compile_inner(
     module.finalize_definitions().unwrap();
     let entry = module.get_finalized_function(id);
     let compile_us = start.elapsed().as_micros();
-    let cross = cross_function.and_then(|f| cross_compile(f));
     Code {
         module: Some(module),
         entry,
@@ -184,37 +175,10 @@ fn compile_inner(
         recovery_uses,
         spill_stores,
         compile_us,
-        cross,
         recoverable,
         graph: graph.clone(),
         proven: proven.clone(),
     }
-}
-
-#[cfg(feature = "cross-dump")]
-fn cross_compile(mut function: ir::Function) -> Option<(usize, String, Vec<u8>, Vec<u32>)> {
-    function.signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
-    let mut flags = settings::builder();
-    flags.set("opt_level", "speed").unwrap();
-    flags.set("preserve_frame_pointers", "true").unwrap();
-    flags.set("machine_code_cfg_info", "true").unwrap();
-    let isa = cranelift_codegen::isa::lookup_by_name("aarch64")
-        .unwrap()
-        .finish(settings::Flags::new(flags))
-        .unwrap();
-    let mut context = cranelift_codegen::Context::for_function(function);
-    context.set_disasm(true);
-    let code = context.compile(&*isa, &mut Default::default()).unwrap();
-    Some((
-        code.code_buffer().len(),
-        code.vcode.clone().unwrap(),
-        code.code_buffer().to_vec(),
-        code.bb_starts.clone(),
-    ))
-}
-#[cfg(not(feature = "cross-dump"))]
-fn cross_compile(_: ir::Function) -> Option<(usize, String, Vec<u8>, Vec<u32>)> {
-    None
 }
 
 struct Emitter<'a> {

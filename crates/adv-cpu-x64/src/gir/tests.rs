@@ -130,7 +130,7 @@ fn compare_prefixes(route: Route) {
         "two invariant data loads and one data store"
     );
     for proof in [&BTreeSet::new(), &proven] {
-        let code = lower::compile(&graph, route, BASE, LENGTH, proof, false);
+        let code = lower::compile(&graph, route, BASE, LENGTH, proof);
         let mut state = initial.clone();
         let mut interpreter = Interpreter::new();
         for budget in 0..200 {
@@ -202,7 +202,7 @@ fn backend_state_ssa_and_real_faults() {
 fn faults(route: Route) {
     let bytes = fixture();
     let graph = Graph::decode(&bytes, BASE).unwrap();
-    let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new(), false);
+    let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new());
     // Exercise data loads, committed data stores, CALL/PUSH and POP/RET faults.
     for (data_offset, stack, protection) in [
         (0, STACK, 0),
@@ -280,7 +280,7 @@ fn arithmetic_flags_and_preserved_registers_match_edge_values() {
 fn arithmetic_states(route: Route) {
     let bytes = fixture();
     let graph = Graph::decode(&bytes, BASE).unwrap();
-    let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new(), false);
+    let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new());
     for (index, value) in [0u32, 1, 7, 0x7fff_ffff, 0x8000_0000, u32::MAX, 0xffff_ff00]
         .into_iter()
         .enumerate()
@@ -328,7 +328,7 @@ fn stack_faults(route: Route) {
         }
         let bytes = a.assemble(u64::from(BASE)).unwrap();
         let graph = Graph::decode(&bytes, BASE).unwrap();
-        let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new(), false);
+        let code = lower::compile(&graph, route, BASE, LENGTH, &BTreeSet::new());
         let mut reference = memory(&bytes);
         let mut candidate = memory(&bytes);
         for memory in [&mut reference, &mut candidate] {
@@ -376,7 +376,7 @@ fn interrupt_and_failed_entry_proof_do_not_commit() {
     let state = initial();
     memory.protect(DATA, 4096, 0).unwrap();
     assert!(memory::prove(&graph, &Frame::from_cpu(&state), &memory).is_empty());
-    let code = lower::compile(&graph, Route::Proof, BASE, LENGTH, &BTreeSet::new(), false);
+    let code = lower::compile(&graph, Route::Proof, BASE, LENGTH, &BTreeSet::new());
     let mut frame = Frame::from_cpu(&state);
     assert_eq!(
         run(&code, Route::Proof, &mut memory, &mut frame, 200, true),
@@ -394,7 +394,7 @@ fn asynchronous_interrupt_restores_the_observed_loop_prefix() {
     a.jmp(top).unwrap();
     let bytes = a.assemble(u64::from(BASE)).unwrap();
     let graph = Graph::decode(&bytes, BASE).unwrap();
-    let code = lower::compile(&graph, Route::Proof, BASE, LENGTH, &BTreeSet::new(), false);
+    let code = lower::compile(&graph, Route::Proof, BASE, LENGTH, &BTreeSet::new());
     let mut memory = memory(&bytes);
     let initial = initial();
     let mut frame = Frame::from_cpu(&initial);
@@ -442,7 +442,6 @@ fn proofs_reject_wrap_special_pages_and_revocation() {
         BASE,
         LENGTH,
         &memory::prove(&graph, &frame, &memory),
-        false,
     );
     memory.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
     assert!(memory::prove(&graph, &frame, &memory).is_empty());
@@ -472,7 +471,7 @@ fn measure_synthetic() {
         ("B_checked", Route::Proof, &BTreeSet::new()),
         ("B_proven", Route::Proof, &proof),
     ] {
-        let code = lower::compile(&graph, route, BASE, LENGTH, proven, true);
+        let code = lower::compile(&graph, route, BASE, LENGTH, proven);
         std::fs::write(path.join(format!("{name}.vcode")), &code.vcode).unwrap();
         std::fs::write(path.join(format!("{name}.bin")), &code.machine).unwrap();
         std::fs::write(
@@ -484,22 +483,9 @@ fn measure_synthetic() {
                 .join("\n"),
         )
         .unwrap();
-        if let Some((_, text, machine, blocks)) = &code.cross {
-            std::fs::write(path.join(format!("{name}.arm64.vcode")), text).unwrap();
-            std::fs::write(path.join(format!("{name}.arm64.bin")), machine).unwrap();
-            std::fs::write(
-                path.join(format!("{name}.arm64.blocks")),
-                blocks
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .unwrap();
-        }
         println!(
             "gir-metric: {}",
-            serde_json::json!({"route":name,"guest":graph.instructions.len(),"bytes":code.bytes,"ir":code.ir_count,"guard_edges":code.exits,"recovery_uses":code.recovery_uses,"explicit_spills":code.spill_stores,"compile_us":code.compile_us,"arm64_bytes":code.cross.as_ref().map(|p| p.0)})
+            serde_json::json!({"route":name,"guest":graph.instructions.len(),"bytes":code.bytes,"ir":code.ir_count,"guard_edges":code.exits,"recovery_uses":code.recovery_uses,"explicit_spills":code.spill_stores,"compile_us":code.compile_us})
         );
     }
     let without = lower::counterfactual(&graph, BASE, LENGTH, &proof);
@@ -515,22 +501,9 @@ fn measure_synthetic() {
             .join("\n"),
     )
     .unwrap();
-    if let Some((_, text, machine, blocks)) = &without.cross {
-        std::fs::write(path.join("B_without_recovery.arm64.vcode"), text).unwrap();
-        std::fs::write(path.join("B_without_recovery.arm64.bin"), machine).unwrap();
-        std::fs::write(
-            path.join("B_without_recovery.arm64.blocks"),
-            blocks
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-    }
     println!(
         "gir-counterfactual: {}",
-        serde_json::json!({"bytes":without.bytes,"arm64_bytes":without.cross.as_ref().map(|p|p.0)})
+        serde_json::json!({"bytes":without.bytes})
     );
     let started = std::time::Instant::now();
     let baseline =

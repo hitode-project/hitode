@@ -31,7 +31,7 @@ pub(super) fn enabled() -> bool {
     if testing::HELPER_ONLY.get() {
         return false;
     }
-    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+    cfg!(target_arch = "x86_64")
         && std::env::var_os("ADV_JIT_X87_HELPER_ONLY").is_none_or(|v| v != "1")
 }
 
@@ -42,9 +42,7 @@ fn use_fma() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     return std::arch::is_x86_feature_detected!("fma");
-    #[cfg(target_arch = "aarch64")]
-    return true;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     false
 }
 
@@ -959,5 +957,5 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod fast_tests;
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests;

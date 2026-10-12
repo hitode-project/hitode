@@ -101,7 +101,7 @@ fn select_and_measure() {
             ("B_checked", Route::Proof, BTreeSet::new()),
             ("B_proven", Route::Proof, potential),
         ] {
-            let code = lower::compile(&graph, route, memory.base, memory.len, &proof, true);
+            let code = lower::compile(&graph, route, memory.base, memory.len, &proof);
             let key = format!("case-{ordinal}-{name}");
             std::fs::write(out.join(format!("{key}.bin")), &code.machine).unwrap();
             std::fs::write(out.join(format!("{key}.vcode")), &code.vcode).unwrap();
@@ -114,20 +114,7 @@ fn select_and_measure() {
                     .join("\n"),
             )
             .unwrap();
-            if let Some((_, vcode, bytes, blocks)) = &code.cross {
-                std::fs::write(out.join(format!("{key}.arm64.vcode")), vcode).unwrap();
-                std::fs::write(out.join(format!("{key}.arm64.bin")), bytes).unwrap();
-                std::fs::write(
-                    out.join(format!("{key}.arm64.blocks")),
-                    blocks
-                        .iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-                .unwrap();
-            }
-            metrics.push(serde_json::json!({"route":name,"bytes":code.bytes,"arm64_bytes":code.cross.as_ref().map(|c|c.0),"us":code.compile_us,"ir":code.ir_count,"guards":code.exits,"recovery_uses":code.recovery_uses,"explicit_spills":code.spill_stores,"proven_sites":proof.len()}));
+            metrics.push(serde_json::json!({"route":name,"bytes":code.bytes,"us":code.compile_us,"ir":code.ir_count,"guards":code.exits,"recovery_uses":code.recovery_uses,"explicit_spills":code.spill_stores,"proven_sites":proof.len()}));
         }
         let end = graph
             .instructions
@@ -228,7 +215,7 @@ fn captured_regions_match_interpreter() {
                 initial.regs[4] = memory.base + 0xc000;
                 let mut frame = Frame::from_cpu(&initial);
                 let proof = memory::prove(&graph, &frame, &memory);
-                let code = lower::compile(&graph, route, memory.base, memory.len, &proof, false);
+                let code = lower::compile(&graph, route, memory.base, memory.len, &proof);
                 let stop = AtomicBool::new(false);
                 let status = if route == Route::Backend {
                     let window = memory::Window::new(&memory);
@@ -336,7 +323,7 @@ fn measure_native_compilation() {
                 (1, Route::Proof, &BTreeSet::new()),
                 (2, Route::Proof, &proof),
             ] {
-                let code = lower::compile(&graph, route, memory.base, memory.len, proven, false);
+                let code = lower::compile(&graph, route, memory.base, memory.len, proven);
                 times[n].push(code.compile_us);
             }
             let began = std::time::Instant::now();

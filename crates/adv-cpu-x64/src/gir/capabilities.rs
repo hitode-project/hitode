@@ -108,13 +108,5 @@ fn stack_maps_cover_calls_but_not_scalar_loads() {
 }
 
 fn architectures() -> Vec<&'static str> {
-    let mut result = vec![if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    }];
-    if cfg!(all(feature = "cross-dump", target_arch = "x86_64")) {
-        result.push("aarch64");
-    }
-    result
+    vec!["x86_64"]
 }

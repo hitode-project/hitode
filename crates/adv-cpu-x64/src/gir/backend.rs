@@ -56,9 +56,7 @@ unsafe extern "C" fn dispatch(
     _: usize,
     context: *mut c_void,
 ) -> usize {
-    let sp =
-        unsafe { adv_posix_fault_gpr(context, if cfg!(target_arch = "aarch64") { 31 } else { 4 }) }
-            as usize;
+    let sp = unsafe { adv_posix_fault_gpr(context, 4) } as usize;
     capture(pc, address, sp)
 }
 
@@ -117,23 +115,12 @@ pub(super) unsafe fn run(
         assert_ne!(unsafe { adv_posix_fault_install(dispatch) }, 0);
     });
     let base = code.entry as usize;
-    // Android may tag executable allocations; the kernel reports untagged PCs.
-    let base = if cfg!(all(target_os = "android", target_arch = "aarch64")) {
-        base & 0x00ff_ffff_ffff_ffff
-    } else {
-        base
-    };
     let mut session = Session {
         base,
         end: base + code.bytes,
         recovery: base + code.recovery as usize,
         sites: &code.sites,
-        window: window.pointer() as usize
-            & if cfg!(target_arch = "aarch64") {
-                0x00ff_ffff_ffff_ffff
-            } else {
-                usize::MAX
-            },
+        window: window.pointer() as usize,
         len: window.len + 16384,
         captured: None,
     };

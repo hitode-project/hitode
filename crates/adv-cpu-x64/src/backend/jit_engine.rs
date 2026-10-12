@@ -140,13 +140,8 @@ impl Engine for JitCpu {
 fn compile_thread_count(cores: usize) -> usize {
     // Keep the small-host policy. Larger desktop hosts can serve another
     // compile without consuming the cores reserved for execution, audio and
-    // presentation. Phone SoCs count efficiency cores toward eight, so Android
-    // keeps three until headed device runs show a fourth worker helps there.
-    let cap = if cores >= 8 && !cfg!(target_os = "android") {
-        4
-    } else {
-        3
-    };
+    // presentation.
+    let cap = if cores >= 8 { 4 } else { 3 };
     cores.saturating_sub(2).clamp(1, cap)
 }
 
@@ -271,8 +266,7 @@ mod tests {
             );
         }
         for cores in [8, 10, 16, 128] {
-            let cap = if cfg!(target_os = "android") { 3 } else { 4 };
-            assert_eq!(compile_thread_count(cores), cap);
+            assert_eq!(compile_thread_count(cores), 4);
             assert!(compile_thread_count(cores) + 2 <= cores);
         }
     }

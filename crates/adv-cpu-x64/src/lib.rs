@@ -1,5 +1,7 @@
 //! Cranelift hot-region engine: GIR, compilation, the executor, row kernels,
 //! region linking and native code caches over the `adv-cpu-core` modules.
+//! The x86_64 platform's engine; AArch64 hosts run `adv-cpu-a64` instead.
+#![cfg(not(target_arch = "aarch64"))]
 pub use adv_cpu_core::*;
 
 pub mod backend;
@@ -21,10 +23,6 @@ mod gir_capture;
 mod host_fault;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod jit_memory;
-#[cfg(all(target_os = "android", target_arch = "aarch64"))]
-mod jit_memory_android;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod jit_memory_macos;
 mod linking;
 mod rows;
 
