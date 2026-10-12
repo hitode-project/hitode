@@ -2139,12 +2139,33 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let q = u.queue(ctx);
     // A thread timer keeps an ID that names one of its own timers; any other
     // ID is ignored for a fresh one, so re-arming never adds a timer.
-    let thread_timer = |id: u32| q.timers.iter().any(|t| t.hwnd == 0 && t.id == id);
-    let id = if hwnd != 0 || thread_timer(id) {
-        id
+    // Generated IDs cycle through 0x7fff..=0xffff: callers that keep only a
+    // WORD (Delphi's hint timer) must be able to kill them.
+    let live =
+        |q: &super::window::Queue, id: u32| q.timers.iter().any(|t| t.hwnd == 0 && t.id == id);
+    let id = if hwnd != 0 || live(q, id) {
+        Some(id)
     } else {
-        (0x7fff_0001..).find(|&id| !thread_timer(id)).unwrap()
+        let next = |id: u32| if id >= 0xffff { 0x7fff } else { id + 1 };
+        let start = q.next_timer_id.max(0x7fff);
+        let mut candidate = start;
+        while live(q, candidate) {
+            candidate = next(candidate);
+            if candidate == start {
+                break;
+            }
+        }
+        (!live(q, candidate)).then(|| {
+            q.next_timer_id = next(candidate);
+            candidate
+        })
     };
+    let Some(id) = id else {
+        // Every generated thread timer ID is live.
+        crate::util::set_last_error(env, 8);
+        return Outcome::Return(0);
+    };
+    let q = env.ext.get_mut::<crate::Win32>().user.queue(ctx);
     q.timers.retain(|t| !(t.hwnd == hwnd && t.id == id));
     q.timers.push(Timer {
         hwnd,
