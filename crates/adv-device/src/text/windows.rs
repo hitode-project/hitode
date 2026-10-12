@@ -342,9 +342,10 @@ impl Font {
         canvas: &mut Canvas,
         paint: Paint<'_>,
         pixels: Pixels<'_>,
+        palette: Option<[[u8; 4]; 2]>,
     ) -> Result<(), TextError> {
-        canvas.ensure(pixels.bounds.w, pixels.bounds.h, pixels.format)?;
-        let row = pixels.bounds.w as usize * pixels.format.bytes() as usize;
+        canvas.ensure(pixels.bounds.w, pixels.bounds.h, pixels.format, palette)?;
+        let row = pixels.format.row_bytes(pixels.bounds.w) as usize;
         // SAFETY: ensure owns a DIB of at least these dimensions; its storage is
         // unselected between calls, and GdiFlush completes each render before read.
         unsafe {
@@ -843,6 +844,7 @@ pub(super) struct Canvas {
     height: u32,
     pitch: usize,
     format: crate::surface::PixelFormat,
+    palette: Option<[[u8; 4]; 2]>,
 }
 impl Default for Canvas {
     fn default() -> Self {
@@ -853,6 +855,7 @@ impl Default for Canvas {
             height: 0,
             pitch: 0,
             format: crate::surface::PixelFormat::Bgra32,
+            palette: None,
         }
     }
 }
@@ -862,11 +865,13 @@ impl Canvas {
         width: u32,
         height: u32,
         format: crate::surface::PixelFormat,
+        palette: Option<[[u8; 4]; 2]>,
     ) -> Result<(), TextError> {
         if !self.bitmap.is_null()
             && self.width >= width
             && self.height >= height
             && self.format == format
+            && self.palette == palette
         {
             return Ok(());
         }
@@ -876,7 +881,7 @@ impl Canvas {
         let height = height
             .checked_next_power_of_two()
             .ok_or_else(|| TextError::Font("text canvas height overflow".into()))?;
-        let pitch = (width as usize * format.bytes() as usize + 3) & !3;
+        let pitch = ((format.row_bytes(width) + 3) & !3) as usize;
         if pitch
             .checked_mul(height as usize)
             .is_none_or(|n| n > 32 * 1024 * 1024)
@@ -897,14 +902,23 @@ impl Canvas {
                 biWidth: width as i32,
                 biHeight: -(height as i32),
                 biPlanes: 1,
-                biBitCount: (format.bytes() * 8) as u16,
+                biBitCount: format.bits() as u16,
                 biCompression: if format.bytes() == 2 { 3 } else { 0 },
                 ..Default::default()
             },
-            masks: [masks.0, masks.1, masks.2],
+            masks: if let Some(palette) = palette {
+                [
+                    u32::from_le_bytes(palette[0]),
+                    u32::from_le_bytes(palette[1]),
+                    0,
+                ]
+            } else {
+                [masks.0, masks.1, masks.2]
+            },
         };
         let mut bits = std::ptr::null_mut();
-        // SAFETY: info has the header and three bitfield masks when needed;
+        // SAFETY: info includes the header and either two monochrome RGBQUADs
+        // or three bitfield masks when needed;
         // acquired bitmap is not selected, and replacement is transactional.
         let bitmap = unsafe {
             gdi::CreateDIBSection(
@@ -933,6 +947,7 @@ impl Canvas {
                 height,
                 pitch,
                 format,
+                palette,
             },
         );
         drop(old);

@@ -107,6 +107,69 @@ impl Surface {
 }
 
 impl<P: Presenter> Surfaces<P> {
+    pub(super) fn draw_monochrome_text(
+        &mut self,
+        id: u32,
+        surface: &Surface,
+        bounds: Rect,
+        memory: &mut dyn SurfaceMemory,
+        text: &mut crate::text::Text,
+        font: &crate::text::FontRequest,
+        paint: crate::text::Paint<'_>,
+    ) -> Result<bool, String> {
+        let pitch = (surface.format.row_bytes(bounds.w) + 3) & !3;
+        let length = pitch
+            .checked_mul(bounds.h)
+            .and_then(|n| n.checked_mul(2))
+            .filter(|&n| n <= 32 * 1024 * 1024)
+            .ok_or("monochrome text patch exceeds allocation limit")? as usize;
+        if length > self.text_patch.capacity() {
+            self.text_patch
+                .reserve_exact(length - self.text_patch.len());
+            self.stats.text_scratch_growths += 1;
+        }
+        self.text_patch.resize(length, 0);
+        let (painted, original) = self.text_patch.split_at_mut(length / 2);
+        painted.fill(0);
+        for y in 0..bounds.h {
+            memory.writable(
+                surface.row(bounds.x, bounds.y + y),
+                surface.span(bounds.x, bounds.w) as usize,
+            )?;
+            let indices = surface.read_pixels(memory, bounds.x, bounds.y + y, bounds.w)?;
+            let row = &mut painted[(y * pitch) as usize..((y + 1) * pitch) as usize];
+            for (x, &index) in indices.iter().enumerate() {
+                surface.format.put_index(row, x as u32, index);
+            }
+        }
+        original.copy_from_slice(painted);
+        let table = surface.palette.as_deref().unwrap_or(&BLACK_PALETTE);
+        text.paint_monochrome(
+            font,
+            paint,
+            crate::text::Pixels {
+                bounds,
+                pitch,
+                format: PixelFormat::Indexed1,
+                bytes: painted,
+            },
+            [table[0], table[1]],
+        )
+        .map_err(|e| e.to_string())?;
+        if painted == original {
+            return Ok(false);
+        }
+        for y in 0..bounds.h {
+            let row = &painted[(y * pitch) as usize..((y + 1) * pitch) as usize];
+            let indices: Vec<_> = (0..bounds.w)
+                .map(|x| surface.format.index(row, x))
+                .collect();
+            surface.write_pixels(memory, bounds.x, bounds.y + y, &indices)?;
+        }
+        self.surfaces.get_mut(&id).unwrap().version += 1;
+        Ok(true)
+    }
+
     pub(super) fn blit_packed(
         &mut self,
         source: &Surface,

@@ -1815,6 +1815,9 @@ impl<P: Presenter> Surfaces<P> {
             w: (right - left) as u32,
             h: (bottom - top) as u32,
         };
+        if surface.format == PixelFormat::Indexed1 {
+            return self.draw_monochrome_text(id, &surface, bounds, memory, text, font, paint);
+        }
         let row = usize::try_from(bounds.w).unwrap() * surface.format.bytes() as usize;
         let indexed = surface.format.indexed();
         let paint_format = if indexed {

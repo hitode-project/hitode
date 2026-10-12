@@ -462,3 +462,169 @@ fn packed_text_quantizes_into_actual_bits_and_keeps_clipped_edges_and_padding() 
         }
     }
 }
+
+#[test]
+fn monochrome_text_matches_native_duplicate_palettes_colours_quality_and_partial_clips() {
+    use windows_sys::Win32::Graphics::Gdi as gdi;
+    let input = [b'A' as u16, b'W' as u16, 0x3042];
+    let clip = TextBox {
+        left: 3,
+        top: 2,
+        right: 35,
+        bottom: 23,
+    };
+    let mut text = Text::default();
+    for style in [0, 1, 2] {
+        let mut request = font(style);
+        if style == 2 {
+            request.default = None;
+            request.face = "System".into();
+            request.height = 136;
+            request.encoding = Encoding::Automatic;
+            request.quality = Quality::Default;
+        }
+        let mut logical = gdi::LOGFONTW {
+            lfHeight: request.height,
+            lfWeight: 400,
+            lfItalic: u8::from(request.italic),
+            lfUnderline: u8::from(request.underline),
+            lfCharSet: match style {
+                1 => 128,
+                2 => 1,
+                _ => 0,
+            },
+            lfQuality: match style {
+                0 => 5,
+                1 => 3,
+                _ => 0,
+            },
+            ..Default::default()
+        };
+        for (target, unit) in logical
+            .lfFaceName
+            .iter_mut()
+            .zip(request.face.encode_utf16())
+        {
+            *target = unit;
+        }
+        // SAFETY: fonts, DIBs, DCs and all buffers are owned by this test.
+        // No desktop/window DC is obtained, drawn into or otherwise changed.
+        let dc = unsafe { gdi::CreateCompatibleDC(core::ptr::null_mut()) };
+        let native_font = unsafe { gdi::CreateFontIndirectW(&logical) };
+        assert!(!dc.is_null() && !native_font.is_null());
+        let old_font = unsafe { gdi::SelectObject(dc, native_font) };
+        for palette in [
+            [[0; 4], [0; 4]],
+            [[255, 255, 255, 0], [255, 255, 255, 0]],
+            [[0; 4], [255, 255, 255, 0]],
+            [[255, 255, 255, 0], [0; 4]],
+        ] {
+            for foreground in [[0; 3], [255; 3], [255, 0, 0]] {
+                for opaque in [false, true] {
+                    for bottom_up in [false, true] {
+                        let mut memory = Memory(vec![0; 65536]);
+                        let mut store =
+                            Surfaces::new(41, 25, 16, 60000, Snapshot::default()).unwrap();
+                        let id = store
+                            .create(41, 25, bottom_up, PixelFormat::Indexed1, &mut memory)
+                            .unwrap();
+                        store.set_palette(id, 0, &palette).unwrap();
+                        let surface = store.get(id).unwrap().clone();
+                        let length = (surface.pitch * surface.height) as usize;
+                        memory.0[surface.pixels as usize..surface.pixels as usize + length]
+                            .fill(0xa5);
+                        let mut info = [0u32; 12];
+                        info[..10].copy_from_slice(&[
+                            40,
+                            41,
+                            if bottom_up { 25 } else { (-25i32) as u32 },
+                            0x10001,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]);
+                        info[10] = u32::from_le_bytes(palette[0]);
+                        info[11] = u32::from_le_bytes(palette[1]);
+                        let mut pointer = core::ptr::null_mut();
+                        let bitmap = unsafe {
+                            gdi::CreateDIBSection(
+                                dc,
+                                info.as_ptr().cast(),
+                                0,
+                                &mut pointer,
+                                core::ptr::null_mut(),
+                                0,
+                            )
+                        };
+                        assert!(!bitmap.is_null() && !pointer.is_null());
+                        let previous = unsafe { gdi::SelectObject(dc, bitmap) };
+                        let saved = unsafe { gdi::SaveDC(dc) };
+                        unsafe {
+                            core::ptr::write_bytes(pointer, 0xa5, length);
+                            gdi::IntersectClipRect(
+                                dc,
+                                clip.left,
+                                clip.top,
+                                clip.right,
+                                clip.bottom,
+                            );
+                            gdi::SetTextColor(
+                                dc,
+                                u32::from(foreground[0])
+                                    | u32::from(foreground[1]) << 8
+                                    | u32::from(foreground[2]) << 16,
+                            );
+                            gdi::SetBkColor(dc, 0xffffff);
+                            gdi::SetBkMode(dc, if opaque { 2 } else { 1 });
+                            assert_ne!(
+                                gdi::TextOutW(dc, 3, 2, input.as_ptr(), input.len() as i32),
+                                0
+                            );
+                            gdi::GdiFlush();
+                        }
+                        store
+                            .draw_text(
+                                id,
+                                &mut memory,
+                                &mut text,
+                                &request,
+                                Paint {
+                                    input: TextInput::Unicode(&input),
+                                    origin: Point { x: 3, y: 2 },
+                                    horizontal: Horizontal::Left,
+                                    vertical: Vertical::Top,
+                                    foreground,
+                                    background: [255; 3],
+                                    opaque_background: opaque,
+                                    clip: Some(clip),
+                                    fill: None,
+                                },
+                            )
+                            .unwrap();
+                        let expected =
+                            unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), length) };
+                        let actual =
+                            &memory.0[surface.pixels as usize..surface.pixels as usize + length];
+                        assert_eq!(
+                            actual, expected,
+                            "style={style} palette={palette:?} foreground={foreground:?} opaque={opaque} bottom_up={bottom_up}"
+                        );
+                        unsafe {
+                            assert_ne!(gdi::RestoreDC(dc, saved), 0);
+                            gdi::SelectObject(dc, previous);
+                            assert_ne!(gdi::DeleteObject(bitmap), 0);
+                        }
+                    }
+                }
+            }
+        }
+        unsafe {
+            gdi::SelectObject(dc, old_font);
+            assert_ne!(gdi::DeleteObject(native_font), 0);
+            assert_ne!(gdi::DeleteDC(dc), 0);
+        }
+    }
+}

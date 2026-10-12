@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod monochrome;
 mod spacing;
 
 #[cfg(not(windows))]
@@ -591,9 +592,35 @@ impl Text {
         paint: Paint<'_>,
         pixels: Pixels<'_>,
     ) -> Result<(), TextError> {
-        // Pixels carries no color table. Passing an 8-bit BITMAPINFO with only
+        self.paint_inner(request, paint, pixels, None)
+    }
+
+    /// Paint real monochrome indices, including duplicate palette colours.
+    pub fn paint_monochrome(
+        &mut self,
+        request: &FontRequest,
+        paint: Paint<'_>,
+        pixels: Pixels<'_>,
+        palette: [[u8; 4]; 2],
+    ) -> Result<(), TextError> {
+        if pixels.format != crate::surface::PixelFormat::Indexed1 {
+            return Err(TextError::Font(
+                "monochrome text requires one-bit storage".into(),
+            ));
+        }
+        self.paint_inner(request, paint, pixels, Some(palette))
+    }
+
+    fn paint_inner(
+        &mut self,
+        request: &FontRequest,
+        paint: Paint<'_>,
+        pixels: Pixels<'_>,
+        palette: Option<[[u8; 4]; 2]>,
+    ) -> Result<(), TextError> {
+        // Pixels carries no color table. Passing an indexed BITMAPINFO with only
         // the direct-color masks would make GDI read beyond that native buffer.
-        if pixels.format == crate::surface::PixelFormat::Indexed8 {
+        if pixels.format.indexed() && palette.is_none() {
             return Err(TextError::Font("indexed text requires a palette".into()));
         }
         let units = match paint.input {
@@ -603,9 +630,11 @@ impl Text {
         if units > MAX_PAINT_UNITS {
             return Err(TextError::Font("text run exceeds paint limit".into()));
         }
-        let row = pixels.bounds.w.checked_mul(pixels.format.bytes());
+        let row = u64::from(pixels.bounds.w)
+            .checked_mul(u64::from(pixels.format.bits()))
+            .map(|bits| bits.div_ceil(8));
         let length = pixels.pitch.checked_mul(pixels.bounds.h);
-        if row.is_none_or(|row| row > pixels.pitch)
+        if row.is_none_or(|row| row > u64::from(pixels.pitch))
             || length.is_none_or(|length| {
                 length as usize > pixels.bytes.len() || length > 32 * 1024 * 1024
             })
@@ -628,11 +657,15 @@ impl Text {
         {
             self.font(request)?;
             let canvas = self.canvas.get_or_insert_with(windows::Canvas::default);
-            self.fonts[request].paint(canvas, paint, pixels)
+            self.fonts[request].paint(canvas, paint, pixels, palette)
         }
         #[cfg(not(windows))]
         {
-            portable::paint(self, request, paint, pixels)
+            if let Some(palette) = palette {
+                monochrome::paint(self, request, paint, pixels, palette)
+            } else {
+                portable::paint(self, request, paint, pixels)
+            }
         }
     }
     pub fn stats(&self) -> CacheStats {
