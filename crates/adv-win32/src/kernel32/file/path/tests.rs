@@ -212,15 +212,22 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
     let provider = machine.ext.get::<Provider>();
     if mode == 0 {
         assert_eq!(provider.calls, 0);
+        // A hooked NT entry takes the delete-pending path, which only a
+        // Windows host provides; elsewhere it fails explicitly.
+        let removed = cfg!(windows);
         // RemoveDirectory owns an NtOpenFile operation, even when only the
         // distinct NtCreateFile entry is hooked. It no longer bypasses a hook.
-        assert_eq!(provider.warnings, [0, 1, 1, 1]);
+        let warnings = if removed { [0, 1, 1, 1] } else { [0, 1, 2, 2] };
+        assert_eq!(provider.warnings, warnings);
         assert_eq!(machine.cpu.read_u32(DATA + 512).unwrap(), 0);
         assert_eq!(machine.cpu.read_u32(DATA + 516).unwrap(), 79);
         assert_ne!(machine.cpu.read_u32(DATA + 520).unwrap(), 0);
-        assert_eq!(machine.cpu.read_u32(DATA + 524).unwrap(), 1);
         assert_eq!(machine.cpu.read_u32(DATA + 528).unwrap(), 0);
-        assert!(!root.join("data/overlay/folder").exists());
+        assert_eq!(
+            machine.cpu.read_u32(DATA + 524).unwrap(),
+            u32::from(removed)
+        );
+        assert_eq!(root.join("data/overlay/folder").exists(), !removed);
         let path = String::from_utf8(machine.cpu.read_cstr(OUTPUT, 260).unwrap()).unwrap();
         assert!(machine.ext.get::<Win32>().vfs.lookup(&path).is_some());
         let warnings = &machine.ext.get::<adv_abi::ApiDiagnostics>().warnings;
@@ -233,6 +240,12 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
             !warnings
                 .keys()
                 .any(|(api, _)| api == "kernel32.dll!RemoveDirectory")
+        );
+        assert_eq!(
+            warnings.keys().any(|(api, reason)| {
+                api == "ntdll.dll!NtSetInformationFile" && reason.contains("delete-pending")
+            }),
+            !removed
         );
     } else {
         assert_eq!(provider.calls, 1);
