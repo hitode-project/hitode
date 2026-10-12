@@ -31,7 +31,7 @@ WINDOW_COUNTERS = ("runtime_steps", "runtime_soft_yields", "runtime_step_seconds
 GATE_COUNTERS = ("arms", "matches", "frame_checks", "full_hash_checks", "check_seconds",
                  "hash_seconds", "frozen_observation_seconds")
 REPORT_CONFIG = ("backend", "compile_strategy", "region_linking", "tiered_compilation", "async_compilation", "codepage")
-REQUIRED_FILES = ("final.json", "final.png", "stderr.log", "remote-stdout.log", "exit-code.txt", "actions.json", "jit-warm.bin")
+REQUIRED_FILES = ("final.json", "final.png", "stderr.log", "remote-stdout.log", "exit-code.txt", "actions.json")
 
 
 def require(condition: bool, message: str) -> None:
@@ -159,11 +159,13 @@ def load_run(directory: Path) -> dict:
     require(metadata.get("font_diagnostics") is False and metadata.get("capture_pcm") is False,
             "diagnostic font/PCM I/O is ineligible for performance")
     require(metadata.get("context") == "adb-shell", "expected adb-shell session")
-    for name in REQUIRED_FILES:
+    # a64 on arm64 devices writes no warm profile.
+    caches = metadata.get("native_cache_files", True)
+    for name in REQUIRED_FILES + (("jit-warm.bin",) if caches else ()):
         require((directory / name).is_file(), f"missing {name}")
     require((directory / "exit-code.txt").read_text(encoding="utf-8").strip() == "0", "actual remote exit was not zero")
-    for name, field in (("final.json", "final_report_sha256"), ("final.png", "final_png_sha256"),
-                        ("jit-warm.bin", "warm_output_sha256")):
+    hashed = [("final.json", "final_report_sha256"), ("final.png", "final_png_sha256")]
+    for name, field in hashed + ([("jit-warm.bin", "warm_output_sha256")] if caches else []):
         require(sha256(directory / name) == exact_hash(metadata.get(field), 64), f"{name}: recorded hash differs")
     binding = metadata.get("scene_binding")
     require(isinstance(binding, dict) and all(key in binding for key in
@@ -282,7 +284,7 @@ def load_run(directory: Path) -> dict:
                 "runtime_config": config, "device": metadata.get("device"), "serial": metadata.get("serial"),
                 "device_conditions": condition_identity(metadata)}
     return {"run_directory": str(directory), "run_name": directory.name, "warm_mode": warmth,
-            "warm_input_sha256": warm_input, "warm_output_sha256": metadata["warm_output_sha256"],
+            "warm_input_sha256": warm_input, "warm_output_sha256": metadata.get("warm_output_sha256"),
             "session_sha256": sha256(session_path), "actions_sha256": sha256(directory / "actions.json"),
             "final_report_sha256": metadata["final_report_sha256"], "final_png_sha256": metadata["final_png_sha256"],
             "identity": identity, "checkpoints": rows,
