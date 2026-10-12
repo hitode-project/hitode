@@ -231,3 +231,19 @@ d51b443f	msr fpsr, xzr
 9e600020	fcvtns x0, d1
 1e780020	fcvtzs w0, d1
 1e600020	fcvtns w0, d1
+5ac010c6	clz w6, w6
+5ac000e6	rbit w6, w7
+dac00230	rbit x16, x17
+6ee52c83	uqsub v3.2d, v4.2d, v5.2d
+4e25e483	fcmeq v3.4s, v4.4s, v5.4s
+6ea5e483	fcmgt v3.4s, v4.4s, v5.4s
+6e25e483	fcmge v3.4s, v4.4s, v5.4s
+4e65e483	fcmeq v3.2d, v4.2d, v5.2d
+6ee5e483	fcmgt v3.2d, v4.2d, v5.2d
+6e65e483	fcmge v3.2d, v4.2d, v5.2d
+5e25e483	fcmeq s3, s4, s5
+7ea5e483	fcmgt s3, s4, s5
+7e25e483	fcmge s3, s4, s5
+5e65e483	fcmeq d3, d4, d5
+7ee5e483	fcmgt d3, d4, d5
+7e65e483	fcmge d3, d4, d5

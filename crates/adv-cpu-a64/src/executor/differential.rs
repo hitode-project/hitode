@@ -123,7 +123,7 @@ fn alu_imm(a: &mut CodeAssembler, op: usize, dst: AsmRegister32, imm: i32) {
 /// One straight-line instruction, after the ECX mask an indexed memory
 /// operand needs.
 /// Shifts by CL, rotates through carry, exchanges, the widening multiply
-/// and divide, byte swaps and `sahf`; a divide may raise #DE.
+/// and divide, bit scans, byte swaps and `sahf`; a divide may raise #DE.
 fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegister32) {
     let mem = |a: &mut CodeAssembler, rng: &mut Rng| {
         let (operand, indexed) = memory_operand(rng);
@@ -133,7 +133,7 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
         operand
     };
     let other = rng.pick(&WRITABLE);
-    match rng.below(9) {
+    match rng.below(10) {
         0 => {
             if rng.below(2) == 0 {
                 a.mov(ecx, rng.pick(&[0u32, 1, 2, 31, 32, 33])).unwrap();
@@ -213,11 +213,25 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
                 .unwrap()
             }
         }
-        _ => {
+        8 => {
             if rng.below(2) == 0 {
                 a.mov(ah, rng.imm() as u32 & 0xff).unwrap();
             }
             a.sahf().unwrap()
+        }
+        _ => {
+            let reverse = rng.below(2) == 0;
+            if rng.below(2) == 0 {
+                if reverse { a.bsr(w, r) } else { a.bsf(w, r) }.unwrap()
+            } else {
+                let m = mem(a, rng);
+                if reverse {
+                    a.bsr(w, dword_ptr(m))
+                } else {
+                    a.bsf(w, dword_ptr(m))
+                }
+                .unwrap()
+            }
         }
     }
 }
@@ -1611,6 +1625,9 @@ fn translated(
 /// Host features, first visits, and which accesses check their page.
 #[cfg(native)]
 type Config = (Features, bool, Checks);
+
+#[cfg(native)]
+mod native_instructions;
 
 #[cfg(native)]
 fn compare(seed: u64, budget: u64, config: Config) -> u64 {

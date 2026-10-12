@@ -742,7 +742,7 @@ impl Translator<'_> {
 
     /// Zero-extends the narrow `part` into `rt`; a memory part is at the
     /// guest address in `address`.
-    fn narrow_read(&mut self, part: Part, width: u8, address: Reg, rt: Reg) {
+    pub(super) fn narrow_read(&mut self, part: Part, width: u8, address: Reg, rt: Reg) {
         match part {
             Part::Reg(number) => {
                 let (index, lsb) = part_register(number, width);

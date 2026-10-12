@@ -4,7 +4,7 @@
 //! exercised on AArch64 hosts, where faults reach the real side tables.
 
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot, uc_error};
-use unicorn_engine::{RegisterARM64, Unicorn};
+use unicorn_engine::{Arm64CpuModel, RegisterARM64, Unicorn};
 
 use crate::encode::Reg;
 
@@ -36,6 +36,10 @@ fn register(reg: Reg) -> RegisterARM64 {
 impl Emulator {
     pub(crate) fn new() -> Self {
         let mut uc = Unicorn::new(Arch::ARM64, Mode::ARM).expect("unicorn arm64");
+        // The translator's optional FlagM sequences need a model newer than
+        // Unicorn's default Cortex-A57. Tests still select both emitter modes.
+        uc.ctl_set_cpu_model(Arm64CpuModel::MAX as i32)
+            .expect("arm64 max model");
         uc.mem_map(CODE, CODE_SIZE, Prot::READ | Prot::EXEC)
             .expect("map code");
         Self { uc }
@@ -102,6 +106,14 @@ impl Emulator {
         let bytes: Vec<u8> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
         assert!((bytes.len() as u64) < DONE - CODE, "code does not fit");
         self.uc.mem_write(CODE, &bytes)?;
+        // Unicorn can retain translated blocks after mem_write. Each call
+        // installs a fresh host unit at CODE, including shorter replacements.
+        self.uc.ctl_remove_cache(CODE, CODE + CODE_SIZE - 1)?;
+        self.call_loaded_at(start)
+    }
+
+    /// Runs already installed code, without rewriting it or flushing its blocks.
+    pub(crate) fn call_loaded_at(&mut self, start: usize) -> Result<(), uc_error> {
         self.uc.reg_write(RegisterARM64::LR, DONE)?;
         self.uc.emu_start(CODE + start as u64, DONE, 0, BUDGET)?;
         let pc = self.uc.reg_read(RegisterARM64::PC)?;
@@ -119,6 +131,27 @@ mod tests {
 
     const fn r(number: u8) -> Reg {
         Reg::new(number)
+    }
+
+    #[test]
+    fn replacing_code_at_the_same_address_discards_old_translations() {
+        let mut emu = Emulator::new();
+        for value in [1, 7, 0] {
+            emu.call(&[movz(W, r(0), value, 0), ret(Reg::LR)]).unwrap();
+            assert_eq!(emu.x(r(0)), u64::from(value));
+        }
+    }
+
+    #[test]
+    fn unchanged_code_can_run_again_with_new_register_inputs() {
+        let mut emu = Emulator::new();
+        let code = [add_imm(W, r(0), r(0), 1, false), ret(Reg::LR)];
+        emu.set_x(r(0), 7);
+        emu.call(&code).unwrap();
+        assert_eq!(emu.x(r(0)), 8);
+        emu.set_x(r(0), 19);
+        emu.call_loaded_at(0).unwrap();
+        assert_eq!(emu.x(r(0)), 20);
     }
 
     #[test]

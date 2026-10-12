@@ -39,6 +39,8 @@ mod integer;
 mod ops;
 mod simd;
 mod strings;
+#[cfg(all(test, emulator))]
+mod tests;
 mod trace;
 mod x87;
 
