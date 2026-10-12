@@ -37,10 +37,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 
-use adv_cpu_core::CpuState;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_trap};
+use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
 use crate::encode::{b, bl};
@@ -295,6 +295,22 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     // not touch while translated code runs.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    // An indirect transfer missed the table: record it as the interpreter
+    // would, so a jump to nowhere names its source.
+    let branch = std::mem::take(unsafe { &mut (*runtime).branch });
+    if branch != 0 {
+        // SAFETY: the runtime's CPU is live while units run.
+        let cpu = unsafe { &mut *(*runtime).cpu };
+        cpu.last_indirect_branch = IndirectBranch {
+            source: branch as u32,
+            target: eip,
+            kind: match branch >> 32 {
+                1 => IndirectBranchKind::Call,
+                2 => IndirectBranchKind::Jump,
+                _ => IndirectBranchKind::Return,
+            },
+        };
+    }
     if native.stops.contains(&eip) || owner.error.is_some() {
         return 0;
     }
@@ -408,7 +424,9 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
             let status = call_trap(bridge, cpu, u32::from(vector));
             let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            let status = if status == 0 && same && cpu.eip == helper.next {
+            // A slow host call must not leave the unit running past the
+            // deadline; the owner reports it at the next instruction.
+            let status = if status == 0 && same && cpu.eip == helper.next && !native.past() {
                 0
             } else {
                 LEAVE
@@ -428,6 +446,25 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
         native.diagnostics.helper_exits += 1;
     }
     (charge as u64) << 32 | u64::from(status)
+}
+
+/// The virtual counter, which reads in a few nanoseconds where
+/// `Instant::now` takes tens.
+fn ticks() -> u64 {
+    let value: u64;
+    // SAFETY: EL0 may read the virtual counter on every supported OS.
+    unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) value, options(nomem, nostack)) };
+    value
+}
+
+/// `at` as a virtual counter value.
+pub(crate) fn deadline(at: std::time::Instant) -> u64 {
+    let frequency: u64;
+    // SAFETY: as in `ticks`.
+    unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack)) };
+    let left = at.saturating_duration_since(std::time::Instant::now());
+    let left = left.as_nanos() * u128::from(frequency) / 1_000_000_000;
+    ticks().saturating_add(u64::try_from(left).unwrap_or(u64::MAX))
 }
 
 pub(crate) struct Native {
@@ -457,6 +494,8 @@ pub(crate) struct Native {
     checked: FxHashSet<u32>,
     /// Faults at unchecked sites so far.
     pub(crate) unchecked_faults: u64,
+    /// The run's wall deadline as a virtual counter value.
+    pub(crate) deadline: Option<u64>,
     /// Diagnostic counts of how runs end; see `Diagnostics`.
     pub(crate) diagnostics: Diagnostics,
     /// Each placed unit's host address and entry, ascending.
@@ -540,6 +579,7 @@ impl Native {
             strikes: FxHashMap::default(),
             checked: FxHashSet::default(),
             unchecked_faults: 0,
+            deadline: None,
             diagnostics: Diagnostics::default(),
             placed: Vec::new(),
             snapshot: None,
@@ -734,6 +774,11 @@ impl Native {
             next = after;
         }
         self.units.remove(&eip).is_some()
+    }
+
+    /// Whether the run's deadline has passed.
+    pub(crate) fn past(&self) -> bool {
+        self.deadline.is_some_and(|at| ticks() >= at)
     }
 
     /// Guest instructions whose accesses check their page.

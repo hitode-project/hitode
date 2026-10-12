@@ -48,6 +48,8 @@ pub use decode::Helper;
 pub use flags::{Carry, Operand, Recipe, Sense};
 pub use trace::MAX_INSTRUCTIONS;
 
+use adv_cpu_core::IndirectBranchKind;
+
 use crate::asm::{Asm, Label};
 use crate::encode::Extend::Uxtw;
 use crate::encode::Shift::Lsl;
@@ -256,9 +258,15 @@ enum Cold {
         label: Label,
         state: State,
         refund: u32,
+        branch: u64,
     },
-    /// A branch to a stub out of conditional-branch range.
-    Far { label: Label, to: usize },
+    /// A miss of an indirect transfer: loads `branch` into x4, then
+    /// branches to the stub at `to`, which may be out of `cbnz` range.
+    Miss {
+        label: Label,
+        to: usize,
+        branch: u64,
+    },
     /// A real call's first dispatch: the owner patches the `bl` at `point`.
     Call {
         label: Label,
@@ -967,11 +975,24 @@ impl Translator<'_> {
         self.emit(bl(0));
     }
 
-    /// A conditional branch (`cbnz`) to a far stub, through a cold `b`.
-    fn far_cbnz(&mut self, size: Size, rt: Reg, to: usize) {
+    /// A `cbnz` to the miss stub at `to` for an indirect transfer of
+    /// `kind` from this instruction, through cold code that loads x4.
+    fn miss_cbnz(&mut self, rt: Reg, to: usize, kind: IndirectBranchKind) {
         let label = self.asm.label();
-        self.asm.cbz(size, true, rt, label);
-        self.cold.push(Cold::Far { label, to });
+        self.asm.cbz(Size::X, true, rt, label);
+        let branch = self.indirect(kind);
+        self.cold.push(Cold::Miss { label, to, branch });
+    }
+
+    /// `Runtime::branch` for an indirect transfer of `kind` from here.
+    fn indirect(&self, kind: IndirectBranchKind) -> u64 {
+        u64::from(self.trace.insts[self.index].pc) | (kind as u64) << 32
+    }
+
+    /// x4 = `branch`.
+    fn mov_branch(&mut self, branch: u64) {
+        self.mov_imm(X4, branch as u32);
+        self.emit(movk(X, X4, (branch >> 32) as u16, 32));
     }
 
     fn cold(&mut self, cold: Cold) {
@@ -1015,6 +1036,7 @@ impl Translator<'_> {
                 label,
                 state,
                 refund,
+                branch,
             } => {
                 self.asm.bind(label);
                 self.state = state;
@@ -1022,10 +1044,12 @@ impl Translator<'_> {
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
+                self.mov_branch(branch);
                 self.far(self.stubs.lookup);
             }
-            Cold::Far { label, to } => {
+            Cold::Miss { label, to, branch } => {
                 self.asm.bind(label);
+                self.mov_branch(branch);
                 self.far(to);
             }
             Cold::Call {

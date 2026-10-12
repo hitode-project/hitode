@@ -2,9 +2,9 @@
 //!
 //! On AArch64 hosts entries run translated code from their second visit
 //! (execution ABI §A7); elsewhere, and in interpreter-only executors, the
-//! core interpreter runs blocks directly. Exits, traps, fuel and deadlines follow the x64
-//! executor's interpreter path exactly, so both engines pass the same
-//! semantic tests.
+//! core interpreter runs blocks directly. Exits, traps, fuel and deadlines
+//! follow the x64 executor's interpreter path exactly, so both engines
+//! pass the same semantic tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,6 +289,10 @@ impl Executor {
             cliffs: std::mem::take(&mut self.stats.cliffs),
             scratch: Default::default(),
         };
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.deadline = self.deadline.map(crate::native::deadline);
+        }
         let result = self.run_inner(stop, budget, &mut bridge);
         // Export canonical floating state at every public CPU boundary.
         self.state.refresh_mmx();
@@ -333,8 +337,23 @@ impl Executor {
             self.stats.compilations += 1;
             self.stats.native_code_bytes += run.translated as u64;
         }
+        self.stats.invalidations = native.diagnostics.dropped_units;
         self.state.fuel -= u64::from(run.retired);
         Ok(Some(run.exit))
+    }
+
+    /// Whether the wall deadline has passed. Translated runs compare the
+    /// virtual counter every time; otherwise reading the clock costs as
+    /// much as a short run, so it is polled every few iterations, and one
+    /// call is capped by its fuel anyway.
+    fn past_deadline(&self, polls: u32) -> bool {
+        #[cfg(native)]
+        if let Some(native) = &self.native
+            && native.deadline.is_some()
+        {
+            return native.past();
+        }
+        polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at)
     }
 
     #[cfg(not(native))]
@@ -350,9 +369,6 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         self.state.refresh_mmx();
         self.state.fuel = budget;
-        // Reading the clock costs as much as a short native run, so the
-        // deadline is polled every few iterations; one call is capped by
-        // its fuel anyway.
         let mut polls = 0u32;
         loop {
             if bridge.parked {
@@ -362,7 +378,7 @@ impl Executor {
                 return Ok(RunOutcome::ReachedStop);
             }
             polls = polls.wrapping_add(1);
-            if polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at) {
+            if self.past_deadline(polls) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {

@@ -15,7 +15,10 @@
 //!
 //! Dynamic transfers carry the guest EIP in w16. `lookup` probes the
 //! indirect table (§A5.3), which the helper fills, and `lookup_slow` asks
-//! the helper. Returns pop the shadow stack (§A5.2) at x28, whose entries
+//! the helper. A site that misses the table first loads x4 with its
+//! source EIP and kind (`Runtime::branch`) on its cold path, so the owner
+//! records the indirect branch without a cost on hits.
+//! Returns pop the shadow stack (§A5.2) at x28, whose entries
 //! are {host continuation, guest return EIP} and grow down to a guard page;
 //! `ret_miss` resynchronizes with a few entries below the top before it
 //! looks up, and `shadow_reset` empties the stack after an overflow.
@@ -87,6 +90,9 @@ pub struct Runtime {
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
     pub temps: [u64; 2],
+    /// The indirect branch that last missed the table: source EIP in the
+    /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
+    pub branch: u64,
 }
 
 impl Runtime {
@@ -108,6 +114,7 @@ impl Runtime {
             interpret: 0,
             exit: 0,
             temps: [0; 2],
+            branch: 0,
         }
     }
 }
@@ -207,6 +214,7 @@ const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
+const BRANCH: u32 = field(offset_of!(Runtime, branch));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
@@ -256,7 +264,11 @@ pub fn stubs() -> Stubs {
     emit_probe(&mut asm, slow_label);
     asm.bind(slow_label);
     let lookup_slow = asm.offset();
-    asm.emit_all(&[mov(W, r(1), r(16)), movz(X, r(2), 0, 0)]);
+    asm.emit_all(&[
+        str(X, r(4), RUNTIME, BRANCH),
+        mov(W, r(1), r(16)),
+        movz(X, r(2), 0, 0),
+    ]);
     asm.b(dispatch_label);
     let ret_miss = asm.offset();
     emit_ret_miss(&mut asm, lookup_label);

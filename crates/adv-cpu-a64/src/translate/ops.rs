@@ -14,6 +14,7 @@ use super::{
     host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
+use adv_cpu_core::IndirectBranchKind;
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 /// An address operand ready for a load or store.
@@ -164,6 +165,7 @@ impl Translator<'_> {
                             label,
                             state: self.state,
                             refund: self.trace.unused(self.index),
+                            branch: self.indirect(IndirectBranchKind::Return),
                         });
                     }
                     _ => {
@@ -175,7 +177,7 @@ impl Translator<'_> {
             Op::JmpIndirect(source) => {
                 self.target_to_w16(source);
                 self.settle();
-                self.probe(false);
+                self.probe(false, IndirectBranchKind::Jump);
             }
             Op::CallIndirect(source) => {
                 self.target_to_w16(source);
@@ -185,7 +187,7 @@ impl Translator<'_> {
                     self.real_call(None);
                 } else {
                     self.settle();
-                    self.probe(false);
+                    self.probe(false, IndirectBranchKind::Call);
                 }
             }
             Op::Setcc(cc, byte) => {
@@ -233,8 +235,9 @@ impl Translator<'_> {
     }
 
     /// Branches to the unit for the EIP in w16 through the indirect table,
-    /// from this site's own branch (§A5.3); `link` calls it.
-    fn probe(&mut self, link: bool) {
+    /// from this site's own branch (§A5.3); `link` calls it. A miss records
+    /// a transfer of `kind`.
+    fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
         self.emit_all(&[
             ldr(X, X17, RUNTIME, runtime::TABLE),
             ubfx(X, X6, X16, 2, 16),
@@ -242,7 +245,7 @@ impl Translator<'_> {
             ldp(X, crate::encode::Index::Offset, X6, X17, X17, 0),
             sub(X, X6, X6, X16, Lsl, 0),
         ]);
-        self.far_cbnz(X, X6, self.stubs.lookup_slow);
+        self.miss_cbnz(X6, self.stubs.lookup_slow, kind);
         self.emit(if link { blr(X17) } else { br(X17) });
     }
 
@@ -252,7 +255,7 @@ impl Translator<'_> {
             ldp(X, crate::encode::Index::Offset, Reg::LR, X17, SHADOW, 0),
             sub(X, X17, X17, X16, Lsl, 0),
         ]);
-        self.far_cbnz(X, X17, self.stubs.ret_miss);
+        self.miss_cbnz(X17, self.stubs.ret_miss, IndirectBranchKind::Return);
         self.emit_all(&[add_imm(X, SHADOW, SHADOW, 16, false), ret(Reg::LR)]);
     }
 
@@ -275,7 +278,7 @@ impl Translator<'_> {
                     point,
                 });
             }
-            None => self.probe(true),
+            None => self.probe(true, IndirectBranchKind::Call),
         }
         self.asm.bind(continuation);
         self.state = State::CANONICAL;

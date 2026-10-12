@@ -9,8 +9,8 @@
 //! for stores), is declined
 //! before it changes anything, and the core interpreter runs it.
 
-use adv_cpu_core::CpuState;
 use adv_cpu_core::memory::Memory;
+use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 use iced_x86::ConditionCode;
 
 use super::decode::{Alu, ESP, Fetcher, Mem, Narrow8or16, Op, ShiftKind, Src};
@@ -274,6 +274,15 @@ fn push(value: u32, cpu: &mut CpuState, memory: &Memory) -> Option<()> {
 
 /// Executes `op`, which ends at `next`; whether it transferred control, or
 /// `None`, having changed nothing, to decline it.
+/// Records the indirect transfer at EIP, as the interpreter does.
+fn indirect(cpu: &mut CpuState, target: u32, kind: IndirectBranchKind) {
+    cpu.last_indirect_branch = IndirectBranch {
+        source: cpu.eip,
+        target,
+        kind,
+    };
+}
+
 fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> {
     let regs = cpu.regs;
     let flags = &mut cpu.eflags;
@@ -362,12 +371,19 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
             let to = read(src, &regs, memory)?;
             push(next, cpu, memory)?;
             target = Some(to);
+            indirect(cpu, to, IndirectBranchKind::Call);
         }
-        Op::JmpIndirect(src) => target = Some(read(src, &regs, memory)?),
+        Op::JmpIndirect(src) => {
+            let to = read(src, &regs, memory)?;
+            target = Some(to);
+            indirect(cpu, to, IndirectBranchKind::Jump);
+        }
         Op::Ret(bytes) => {
             let esp = regs[usize::from(ESP)];
-            target = Some(load(esp, 4, memory)?);
+            let to = load(esp, 4, memory)?;
+            target = Some(to);
             cpu.regs[usize::from(ESP)] = esp.wrapping_add(4).wrapping_add(u32::from(bytes));
+            indirect(cpu, to, IndirectBranchKind::Return);
         }
         Op::Jcc(cc, to) => {
             use super::decode::Cc;
