@@ -24,6 +24,15 @@ pollster = { version = "0.4", optional = true }
 [target.'cfg(not(windows))'.dependencies]
 adv-device = { path = "../adv-device", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+log = "0.4"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-quartz-core = "0.3.2"
+
 [dev-dependencies]
 pollster = "0.4"
 
@@ -31,6 +40,10 @@ pollster = "0.4"
 adv-device = { path = "../adv-device", features = ["device"] }
 log = "0.4"
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[[test]]
+name = "macos_window"
+harness = false
 
 [lints]
 workspace = true

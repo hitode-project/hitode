@@ -181,6 +181,9 @@ mod os {
             }
             Ok(handle)
         }
+        pub fn raw(&self) -> i32 {
+            self.read
+        }
         pub fn signal(&self) {
             unsafe {
                 libc::write(self.write, [1u8].as_ptr().cast(), 1);
@@ -292,6 +295,12 @@ impl WakeEvent {
     }
     #[cfg(windows)]
     pub fn as_raw_handle(&self) -> *mut std::ffi::c_void {
+        self.handle.raw()
+    }
+    /// The pipe's read end, readable while a wake is pending, for a host
+    /// event loop to watch. `wait` drains it.
+    #[cfg(unix)]
+    pub fn as_raw_fd(&self) -> i32 {
         self.handle.raw()
     }
 }
