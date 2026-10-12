@@ -22,7 +22,8 @@ const BASE: u32 = 0x1_0000;
 const LEN: usize = 0x4_0000;
 const CODE: u32 = 0x1_0000;
 const DATA: u32 = 0x3_0000;
-const DATA_LEN: usize = 0x2000;
+/// One 16 KiB host page, so data is not soft on such hosts.
+const DATA_LEN: usize = 0x4000;
 const STACK: u32 = 0x4_8000;
 const STACK_TOP: u32 = 0x4_f000;
 /// A second stack inside the mapped one, for calls that switch to it.

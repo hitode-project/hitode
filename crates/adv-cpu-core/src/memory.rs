@@ -2305,21 +2305,34 @@ mod window_tests {
     /// until the copy is privatized.
     #[test]
     fn the_window_reads_owned_private_copies_and_traps_their_stores() {
-        let mut memory = Memory::window(0x10000, 0x4000).unwrap();
-        memory
-            .map_private_copy_pages(0x10000, &[0x37; 2 * PAGE_SIZE], READ | WRITE)
-            .unwrap();
-        let window = memory.window_base().unwrap();
-        let reservation = memory.reservation.as_ref().unwrap();
-        let start = reservation.ptr.as_ptr() as usize - window;
-        let allows = |memory: &Memory, addr: usize, access| {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            // One host page of copies, so only their own state sets its protection.
+            let mut memory = Memory::window_at_host_size(0x10000, 0x4000, host).unwrap();
+            memory
+                .map_private_copy_pages(0x10000, &vec![0x37; host], READ | WRITE)
+                .unwrap();
+            let window = memory.window_base().unwrap();
             let reservation = memory.reservation.as_ref().unwrap();
-            let view = reservation.direct_fault_view().unwrap();
-            view.window_allows(addr - start, PAGE_SIZE, access)
-        };
-        assert!(allows(&memory, 0x10000, Read) && !allows(&memory, 0x10000, Write));
-        memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
-        assert!(allows(&memory, 0x10000, Write));
-        assert!(allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write));
+            let start = reservation.ptr.as_ptr() as usize - window;
+            let allows = |memory: &Memory, addr: usize, access| {
+                let reservation = memory.reservation.as_ref().unwrap();
+                let view = reservation.direct_fault_view().unwrap();
+                view.window_allows(addr - start, PAGE_SIZE, access)
+            };
+            assert!(
+                allows(&memory, 0x10000, Read) && !allows(&memory, 0x10000, Write),
+                "{host}"
+            );
+            memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
+            // A host page with a copy left still traps every store.
+            assert_eq!(allows(&memory, 0x10000, Write), host == 4096, "{host}");
+            assert!(
+                allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write),
+                "{host}"
+            );
+            memory.privatize_copy_pages(0x10000, host).unwrap();
+            assert!(allows(&memory, 0x10000, Write), "{host}");
+        }
     }
 }

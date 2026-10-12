@@ -7,9 +7,11 @@ mod support;
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x13000;
 const STACK: u32 = 0x14f00;
+/// Whole 16 KiB host pages, so no page is soft on such hosts.
+const LEN: usize = 0x8000;
 fn machine(code: &[u8]) -> Executor {
-    let mut m = Executor::new(CODE, 0x5000).unwrap();
-    m.protect(CODE, 0x5000, READ | WRITE).unwrap();
+    let mut m = Executor::new(CODE, LEN).unwrap();
+    m.protect(CODE, LEN, READ | WRITE).unwrap();
     m.write(CODE, code).unwrap();
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -24,8 +26,8 @@ fn arbitrary_fuel_slices_match_single_instruction_reference() {
     code.push(0xc3);
     for slice in [1, 2, 7, 31, 32, 33, 97, 98, 256] {
         let mut m = machine(&code);
-        let mut memory = Memory::new(CODE, 0x5000).unwrap();
-        memory.protect(CODE, 0x5000, READ | WRITE).unwrap();
+        let mut memory = Memory::new(CODE, LEN).unwrap();
+        memory.protect(CODE, LEN, READ | WRITE).unwrap();
         memory.write(CODE, &code).unwrap();
         memory.write(STACK, &STOP.to_le_bytes()).unwrap();
         memory.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -75,8 +77,8 @@ fn mixed_x87_mmx_and_sse_aliases_match_public_steps_at_every_fuel_boundary() {
     for slice in 1..=16 {
         let mut m = machine(&code);
         m.state.xmm = [[0xa5; 16]; 8];
-        let mut memory = Memory::new(CODE, 0x5000).unwrap();
-        memory.protect(CODE, 0x5000, READ | WRITE).unwrap();
+        let mut memory = Memory::new(CODE, LEN).unwrap();
+        memory.protect(CODE, LEN, READ | WRITE).unwrap();
         memory.write(CODE, &code).unwrap();
         memory.write(STACK, &STOP.to_le_bytes()).unwrap();
         memory.protect(CODE, 4096, READ | EXEC).unwrap();
