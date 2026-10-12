@@ -10,6 +10,8 @@ use adv_cpu::{CompileStrategy, Region, RunOutcome};
 use iced_x86::code_asm::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+mod support;
 const CODE: u32 = 0x10000;
 const STOP: u32 = CODE + 0x1000;
 const DATA: u32 = 0x20000;
@@ -99,7 +101,7 @@ fn cold_pcm_operands_match_interpreter_at_every_width_in_both_strategies() {
                 audio.read_alias.copy_into(0, &mut output);
                 assert_eq!(&output[2049..2049 + width], &input[4093..4093 + width]);
                 if native {
-                    assert_eq!(cpu.stats().interpreter_instructions, 0);
+                    support::x64_shape!(assert_eq!(cpu.stats().interpreter_instructions, 0));
                 }
                 let state = &cpu.executor().state;
                 outputs.push((
@@ -227,7 +229,7 @@ fn native_integer_mmx_and_sse_use_atomic_bytes_while_x87_keeps_its_helper() {
         assert_eq!(machine.state.mmx[1], 0x8123_4567_89ab_cdef);
         assert_eq!(machine.state.xmm[1], [0xa5; 16]);
         if native {
-            assert!(machine.stats.interpreter_instructions < 7);
+            support::x64_shape!(assert!(machine.stats.interpreter_instructions < 7));
         } else {
             assert!(machine.stats.interpreter_instructions >= 7);
         }
@@ -267,7 +269,7 @@ fn native_rep_copy_fill_and_comparison_use_byte_atomic_storage() {
         }
         run(&mut cpu);
         assert_eq!(cpu.executor().state.regs[1], 0);
-        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
         let mut actual = vec![0; 8192];
         shared.read_alias.copy_into(0, &mut actual);
         if kind == 1 {
@@ -338,7 +340,7 @@ fn native_element_widths_cross_audio_and_ordinary_page_boundaries() {
                     expected[(at - address) as usize]
                 );
             }
-            assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+            support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
         }
     }
 }
@@ -384,7 +386,7 @@ fn protected_read_modify_write_and_vector_store_preserve_instruction_state() {
         } else {
             assert_eq!(&actual[..4], &0x7f7f_7f80u32.to_le_bytes());
         }
-        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
     }
 }
 
@@ -406,7 +408,7 @@ fn executable_audio_store_uses_the_self_modification_guard() {
     let mut actual = [0; 4];
     shared.read_alias.copy_into(0, &mut actual);
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
-    assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
 
     // Observed code beside the store leaves it native; a store over observed
     // code bytes goes through the guard.
@@ -424,11 +426,11 @@ fn executable_audio_store_uses_the_self_modification_guard() {
         );
         shared.read_alias.copy_into(0, &mut actual);
         assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
-        assert_eq!(
+        support::x64_shape!(assert_eq!(
             cpu.executor().stats.interpreter_instructions > 0,
             guarded,
             "observed code at offset {offset}"
-        );
+        ));
     }
 }
 
@@ -506,7 +508,10 @@ fn audio_rep_comparisons_match_interpreter_for_width_direction_and_stop_conditio
                         run(&mut cpu);
                         assert_eq!(cpu.executor().state.regs[1], 15);
                         if native {
-                            assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+                            support::x64_shape!(assert_eq!(
+                                cpu.executor().stats.interpreter_instructions,
+                                0
+                            ));
                         }
                         outputs.push((cpu.executor().state.regs, cpu.executor().state.eflags));
                     }
@@ -553,11 +558,12 @@ fn protected_cross_page_native_load_preserves_integer_and_vector_destinations() 
         } else {
             assert_eq!(cpu.executor().state.regs[0], 0xa5a5_a5a5);
         }
-        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+        support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
     }
 }
 
 #[test]
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 fn shared_rep_chunks_preserve_budget_and_pending_interrupt_then_resume() {
     for compare in [false, true] {
         let code = if compare {
@@ -705,7 +711,7 @@ fn concurrent_callback_reads_accept_byte_mixtures_during_native_simd_stores() {
         }
     }
     assert!(reader.finish() > 0);
-    assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(cpu.executor().stats.interpreter_instructions, 0));
     let mut actual = [0; 8192];
     shared.read_alias.copy_into(0, &mut actual);
     assert_eq!(actual, [0x11; 8192]);

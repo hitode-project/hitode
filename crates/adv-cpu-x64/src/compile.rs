@@ -21,8 +21,6 @@ pub(crate) use cache::restore_snapshot;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod fp_environment;
 mod gir;
 mod guards;
 mod invariants;
@@ -212,10 +210,6 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         controls: NativeRun<'_>,
     ) -> u32 {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        crate::jit_memory_macos::synchronize_execution();
-        #[cfg(target_arch = "aarch64")]
-        let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
         // window. Establish that owner's code barriers before its first entry.
         if self.watched_in.get() != memory.identity() + 1 {
@@ -785,8 +779,6 @@ pub(crate) fn compile(region: &Region, memory: &mut Memory) -> Result<Compiled, 
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let _write = crate::jit_memory_macos::WriteScope::new();
     let ir_counts =
         ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
@@ -1727,8 +1719,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 &tail_signature,
             )
             .map_err(|e| e.to_string())?;
-        #[cfg(feature = "cross-dump")]
-        let cross = dump_dir.as_ref().map(|_| kernel_ctx.func.clone());
         module
             .define_function(kernel_id, &mut kernel_ctx)
             .map_err(|e| format!("{e:?}"))?;
@@ -1738,15 +1728,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             format!("region-{:08x}.kernel-{index}", region.start)
         };
         dump(&dump_dir, &name, &kernel_ctx)?;
-        #[cfg(feature = "cross-dump")]
-        if let (Some(directory), Some(function)) = (&dump_dir, cross) {
-            let code = aarch64_vcode(function, opt_level)?;
-            std::fs::write(
-                std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
-                code,
-            )
-            .map_err(|e| e.to_string())?;
-        }
         kernel_functions.push((kernel_id, kernel_ctx));
         kernel_locations.push((index, row));
     }
@@ -1811,22 +1792,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             &addresses,
             true,
         );
-        #[cfg(feature = "cross-dump")]
-        let cross = dump_dir.as_ref().map(|_| invariant_ctx.func.clone());
         module
             .define_function(id, &mut invariant_ctx)
             .map_err(|e| format!("{e:?}"))?;
         let name = format!("region-{:08x}.invariant", region.start);
         dump(&dump_dir, &name, &invariant_ctx)?;
-        #[cfg(feature = "cross-dump")]
-        if let (Some(directory), Some(function)) = (&dump_dir, cross) {
-            let code = aarch64_vcode(function, opt_level)?;
-            std::fs::write(
-                std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
-                code,
-            )
-            .map_err(|e| e.to_string())?;
-        }
         // Finalize after the checked body: this body's absolute func_addr
         // references must be defined first.
         kernel_functions.push((id, invariant_ctx));
@@ -1843,22 +1813,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     );
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
-    #[cfg(feature = "cross-dump")]
-    let cross = dump_dir.as_ref().map(|_| ctx.func.clone());
     module
         .define_function(id, &mut ctx)
         .map_err(|e| format!("{e:?}"))?;
     let name = format!("region-{:08x}", region.start);
     dump(&dump_dir, &name, &ctx)?;
-    #[cfg(feature = "cross-dump")]
-    if let (Some(directory), Some(function)) = (&dump_dir, cross) {
-        let code = aarch64_vcode(function, opt_level)?;
-        std::fs::write(
-            std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
-            code,
-        )
-        .map_err(|e| e.to_string())?;
-    }
     let source_ranges = diagnostics::instruction_map_enabled().then(|| {
         ctx.compiled_code().map_or_else(Vec::new, |code| {
             code.buffer
@@ -2480,48 +2439,6 @@ fn dump(
         std::fs::write(directory.join(format!("{name}.vcode")), code).map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-/// The AArch64 lowering of a region function, for comparing the code the
-/// final target would run. Host helper signatures use the AArch64 C ABI.
-#[cfg(feature = "cross-dump")]
-fn aarch64_vcode(mut function: ir::Function, opt_level: &str) -> Result<String, String> {
-    use cranelift_codegen::settings::{self, Configurable};
-    for signature in function.dfg.signatures.values_mut() {
-        if signature.call_conv == cranelift_codegen::isa::CallConv::WindowsFastcall {
-            signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
-        }
-    }
-    let mut flags = settings::builder();
-    // Cross dumps are an explicit diagnostic, so always verify their IR.
-    flags
-        .set("enable_verifier", "true")
-        .map_err(|e| e.to_string())?;
-    flags
-        .set("opt_level", opt_level)
-        .map_err(|e| e.to_string())?;
-    flags
-        .set("preserve_frame_pointers", "true")
-        .map_err(|e| e.to_string())?;
-    #[cfg(feature = "gir-capture")]
-    if std::env::var_os("ADV_GIR_NATIVE").is_some() {
-        flags
-            .set("machine_code_cfg_info", "true")
-            .map_err(|e| e.to_string())?;
-    }
-    let isa = cranelift_codegen::isa::lookup_by_name("aarch64")
-        .map_err(|e| e.to_string())?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| e.to_string())?;
-    let mut context = cranelift_codegen::Context::for_function(function);
-    context.set_disasm(true);
-    let code = context
-        .compile(&*isa, &mut Default::default())
-        .map_err(|e| format!("{e:?}"))?;
-    let vcode = code.vcode.clone().unwrap_or_default();
-    #[cfg(feature = "gir-capture")]
-    crate::gir_capture::native(&context, "aarch64");
-    Ok(vcode)
 }
 
 /// Checked iterations a versioned loop runs after a failed proof, or after

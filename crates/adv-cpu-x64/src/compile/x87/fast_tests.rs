@@ -204,13 +204,13 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
 }
 
 #[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 fn compiled_x87_matches_the_transactional_path_bit_for_bit() {
     differential(true);
 }
 
 #[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 fn compiled_x87_without_fma_matches_the_transactional_path() {
     crate::compile::x87::testing::FORCE_DEKKER.set(true);
     differential(true);

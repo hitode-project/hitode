@@ -276,13 +276,15 @@ impl Oracle {
 }
 
 /// Asserts about the x64 engine's execution shape (native entries, compiled
-/// units, bulk counters). Skipped when the tests drive the a64 engine, so the
-/// semantic checks around them still run there.
+/// units, bulk counters). Skipped on AArch64 hosts, which run the a64 engine,
+/// so the semantic checks around them still run there. Whole tests about that
+/// shape (fuel per native block, regions, linking) are ignored there instead;
+/// a64 checks its own budget boundaries against the interpreter.
 #[allow(unused_macros)]
 macro_rules! x64_shape {
     ($($body:tt)*) => {
         // Still type-checked under a64, so its operands stay in use.
-        if !cfg!(all(test, feature = "test-a64")) {
+        if !cfg!(target_arch = "aarch64") {
             $($body)*
         }
     };
@@ -290,12 +292,8 @@ macro_rules! x64_shape {
 #[allow(unused_imports)]
 pub(crate) use x64_shape;
 
-/// The engine under test; `--features test-a64` selects the a64 executor for
-/// integration tests. Examples share this module and keep the x64 executor.
-#[cfg(not(all(test, feature = "test-a64")))]
+/// The platform's engine.
 pub type Engine = adv_cpu::Executor;
-#[cfg(all(test, feature = "test-a64"))]
-pub type Engine = adv_cpu_a64::Executor;
 
 /// Keeps existing differential fixtures' construction API while isolating UC entirely
 /// in their dev-only reference. Ordinary run dereferences to production.
@@ -392,7 +390,7 @@ impl Executor {
 }
 
 /// x64 tuning has no a64 counterpart; fixtures that set it keep compiling.
-#[cfg(all(test, feature = "test-a64"))]
+#[cfg(target_arch = "aarch64")]
 impl Executor {
     pub fn enable_auto_jit(&mut self, _enabled: bool) {}
     pub fn set_region_linking(&mut self, _enabled: bool) {}

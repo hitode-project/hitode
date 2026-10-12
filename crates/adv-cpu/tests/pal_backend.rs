@@ -7,6 +7,8 @@ use adv_cpu::backend::{
 };
 use iced_x86::code_asm::*;
 
+mod support;
+
 const CODE: u32 = 0x0040_0000;
 const API: u32 = 0x6000_0000;
 const DATA: u32 = 0x6100_0000;
@@ -166,7 +168,7 @@ fn raw_traps_obey_stdcall_cdecl_and_callback_pc_stack_changes() {
         assert_eq!(cpu.reg(Reg::Esp), STACK + 0x804);
         assert_eq!(calls.pcs, [API + 2, API + 18, API + 34, API + 50]);
         if jit {
-            assert_eq!(cpu.stats().interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
         }
     }
 }
@@ -189,7 +191,9 @@ fn trap_mapping_new_rwx_page_tracks_actual_guest_code_writes() {
     for jit in [false, true] {
         let mut cpu = cpu(jit);
         // This regression needs compiled code before the guest patch. Keep its
-        // warm-up deterministic instead of racing a background compilation.
+        // warm-up deterministic instead of racing a background compilation;
+        // a64 translates synchronously.
+        #[cfg(not(target_arch = "aarch64"))]
         cpu.set_async_compilation(false);
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.map(API, 4096, Prot::RX).unwrap();
@@ -291,7 +295,7 @@ fn host_patch_invalidates_both_warm_native_and_fallback_code() {
             cpu.read_u16(DATA + 0x103).unwrap()
         );
         if jit {
-            assert!(cpu.stats().invalidations >= 1);
+            support::x64_shape!(assert!(cpu.stats().invalidations >= 1));
         }
     }
 }
@@ -587,10 +591,10 @@ fn invalidation_recompiles_changed_region_and_revalidates_unchanged_same_page_co
     assert_eq!(cpu.run(&mut UnexpectedTrap), Exit::Parked);
     assert_eq!(cpu.reg(Reg::Eax), 15);
     // DATA changed, DATA+0x100 shares its page but its captured bytes did not.
-    assert_eq!(cpu.stats().compilations, 5);
-    assert_eq!(cpu.stats().invalidations, 1);
-    assert_eq!(cpu.stats().code_revalidations, 1);
-    assert_eq!(cpu.stats().interpreter_entries, 0);
+    support::x64_shape!(assert_eq!(cpu.stats().compilations, 5));
+    support::x64_shape!(assert_eq!(cpu.stats().invalidations, 1));
+    support::x64_shape!(assert_eq!(cpu.stats().code_revalidations, 1));
+    support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
 }
 
 #[test]
@@ -956,7 +960,7 @@ fn host_double_return_refreshes_mmx_alias_cache_and_emms_empties_x87_stack() {
         cpu.push_f64(VALUE);
         assert_eq!(cpu.pop_f64().unwrap().to_bits(), VALUE.to_bits());
         if jit {
-            assert_eq!(cpu.stats().interpreter_entries, 0);
+            support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
         }
     }
 }

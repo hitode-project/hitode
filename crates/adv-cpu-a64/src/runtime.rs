@@ -1,5 +1,5 @@
 //! The execution thread's runtime context and the stubs that move guest
-//! state between `CpuState` and the mapped host registers (workbook §4).
+//! state between `CpuState` and the mapped host registers (execution ABI §A2).
 //!
 //! `enter` saves the host's callee-saved registers, loads the guest and
 //! branches to translated code. Translated code leaves through `exit` with
@@ -14,13 +14,16 @@
 //! which returns the unit to continue at, or 0 to leave through `exit`.
 //!
 //! Dynamic transfers carry the guest EIP in w16. `lookup` probes the
-//! indirect table (§7.3), which the helper fills, and `lookup_slow` asks
-//! the helper. Returns pop the shadow stack (§7.2) at x28, whose entries
+//! indirect table (§A5.3), which the helper fills, and `lookup_slow` asks
+//! the helper. A site that misses the table first loads x4 with its
+//! source EIP and kind (`Runtime::branch`) on its cold path, so the owner
+//! records the indirect branch without a cost on hits.
+//! Returns pop the shadow stack (§A5.2) at x28, whose entries
 //! are {host continuation, guest return EIP} and grow down to a guard page;
 //! `ret_miss` resynchronizes with a few entries below the top before it
 //! looks up, and `shadow_reset` empties the stack after an overflow.
 //!
-//! Checked accesses (§6.3) call `access` when the page class table rules
+//! Checked accesses (§A4.3) call `access` when the page class table rules
 //! out the window: it saves every register translated code may keep live,
 //! has the owner's `access` helper perform the access, and returns the
 //! loaded value in w0; when the owner refuses, it leaves as the fault stub
@@ -34,9 +37,9 @@
 //! Units keep `CpuState` current for MMX and XMM registers and cache them
 //! in d8-d15 and v16-v23 (`translate::simd`), so only `access`, which
 //! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
-//! in the canonical block-exit form of §5: NZCV in subtraction sense, x10 a
+//! in the canonical block-exit form of §A3: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
-//! x12 DF. x87 state stays in `CpuState` until M2 maps it.
+//! x12 DF. x87 state stays in `CpuState` (execution ABI §A6.1).
 
 use std::mem::offset_of;
 
@@ -87,6 +90,9 @@ pub struct Runtime {
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
     pub temps: [u64; 2],
+    /// The indirect branch that last missed the table: source EIP in the
+    /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
+    pub branch: u64,
 }
 
 impl Runtime {
@@ -108,6 +114,7 @@ impl Runtime {
             interpret: 0,
             exit: 0,
             temps: [0; 2],
+            branch: 0,
         }
     }
 }
@@ -122,7 +129,7 @@ pub enum Exit {
     Dispatch = 1,
     /// A host fault at a side-table site. EIP is not set; the owner takes it
     /// from the site, where guest state is exactly that before the
-    /// instruction (§5.2).
+    /// instruction (§A3.2).
     Fault = 2,
     /// The `interpret` helper left a step for the owner to complete.
     Stepped = 3,
@@ -207,6 +214,7 @@ const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
+const BRANCH: u32 = field(offset_of!(Runtime, branch));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
@@ -256,7 +264,11 @@ pub fn stubs() -> Stubs {
     emit_probe(&mut asm, slow_label);
     asm.bind(slow_label);
     let lookup_slow = asm.offset();
-    asm.emit_all(&[mov(W, r(1), r(16)), movz(X, r(2), 0, 0)]);
+    asm.emit_all(&[
+        str(X, r(4), RUNTIME, BRANCH),
+        mov(W, r(1), r(16)),
+        movz(X, r(2), 0, 0),
+    ]);
     asm.b(dispatch_label);
     let ret_miss = asm.offset();
     emit_ret_miss(&mut asm, lookup_label);

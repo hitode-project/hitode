@@ -4,10 +4,10 @@
 //! Pin the process externally (for example `taskset 80` on Android) so engines
 //! are compared on the same core. Inputs: optional `ADV_ENGINE_BENCH_SCALE`
 //! (percent of the default iteration counts, 1-1000),
-//! `ADV_ENGINE_BENCH_ENGINES` (comma list of `interpreter`, `cranelift` and
-//! `a64`, default all; a64 runs through the interpreter on hosts without its
-//! native backend) and `ADV_ENGINE_BENCH_WORKLOADS` (comma list of workload
-//! names, default all).
+//! `ADV_ENGINE_BENCH_ENGINES` (comma list of `interpreter` and the platform's
+//! engine, `a64` on AArch64 hosts and `cranelift` elsewhere; default both)
+//! and `ADV_ENGINE_BENCH_WORKLOADS` (comma list of workload names, default
+//! all).
 //! Output: CSV rows of first-run milliseconds on a fresh CPU and steady-state
 //! nanoseconds per dynamic guest instruction. Workloads are self-authored; no
 //! game code or addresses are involved. Every engine's first run must match
@@ -255,7 +255,7 @@ fn cold(functions: u32) -> Workload {
     }
 }
 
-/// What `measure` drives: the facade's `Backend`, or the a64 executor.
+/// What `measure` drives: the facade's `Backend`.
 trait Engine {
     fn load(&mut self, w: &Workload);
     fn run(&mut self) -> [u32; 8];
@@ -270,31 +270,6 @@ impl<B: Backend> Engine for Facade<B> {
 
     fn run(&mut self) -> [u32; 8] {
         run(&mut self.0)
-    }
-}
-
-impl Engine for adv_cpu_a64::Executor {
-    fn load(&mut self, w: &Workload) {
-        self.map(CODE, CODE_SIZE as usize, 3).unwrap();
-        self.write(CODE, &w.code).unwrap();
-        self.protect(CODE, CODE_SIZE as usize, 5).unwrap();
-        self.map(DATA, DATA_SIZE as usize, 3).unwrap();
-        for (addr, bytes) in &w.data {
-            self.write(*addr, bytes).unwrap();
-        }
-        self.map(STACK_BASE, (STACK - STACK_BASE) as usize, 3)
-            .unwrap();
-    }
-
-    fn run(&mut self) -> [u32; 8] {
-        self.state.regs = [0, 0, 0, 0, STACK, 0, 0, 0];
-        self.state.eip = CODE;
-        let outcome = adv_cpu_a64::Executor::run(self, PARK, u64::MAX >> 1).unwrap();
-        assert!(
-            matches!(outcome, adv_cpu::RunOutcome::Trap { vector: 0x2e, .. }),
-            "{outcome:?}"
-        );
-        self.state.regs
     }
 }
 
@@ -451,31 +426,27 @@ fn main() {
         dispatch(n(8_000)),
     ];
     let cold = cold(n(4_000));
-    let (cranelift, a64) = (engine("cranelift"), engine("a64"));
+    let name = if cfg!(target_arch = "aarch64") {
+        "a64"
+    } else {
+        "cranelift"
+    };
+    let native = engine(name);
     let reference = || Facade(JitCpu::new(PARK, false).unwrap());
     let jit = || Facade(JitCpu::new(PARK, true).unwrap());
-    let translated = || adv_cpu_a64::Executor::address_space().unwrap();
     println!(
         "engine,workload,guest_instructions,first_run_ms,median_ns_per_instruction,min_ns,max_ns,warm_runs"
     );
     for w in workloads.iter().filter(|w| wanted(w.name)) {
         let expected = interpreter.then(|| measure("interpreter", &reference, w, 3, None));
-        let expected = match cranelift {
-            true => Some(measure("cranelift", &jit, w, samples, expected)),
-            false => expected,
-        };
-        if a64 {
-            measure("a64", &translated, w, samples, expected);
+        if native {
+            measure(name, &jit, w, samples, expected);
         }
     }
     if wanted(cold.name) {
         let expected = interpreter.then(|| measure_cold("interpreter", &reference, &cold, 3, None));
-        let expected = match cranelift {
-            true => Some(measure_cold("cranelift", &jit, &cold, samples, expected)),
-            false => expected,
-        };
-        if a64 {
-            measure_cold("a64", &translated, &cold, samples, expected);
+        if native {
+            measure_cold(name, &jit, &cold, samples, expected);
         }
     }
 }

@@ -36,10 +36,13 @@ pub struct Cpu {
 }
 
 impl Cpu {
-    /// A fresh 4 GiB address space; `native` false interprets everything.
+    /// A fresh 4 GiB address space; `native` false interprets everything
+    /// and maps no code cache.
     pub fn new(park: u32, native: bool) -> Result<Self, String> {
-        let mut inner = Executor::address_space()?;
-        inner.interpreter_only = !native;
+        let inner = match native {
+            true => Executor::address_space()?,
+            false => Executor::interpreted_address_space()?,
+        };
         Ok(Self {
             inner,
             park,

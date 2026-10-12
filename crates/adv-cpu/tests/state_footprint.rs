@@ -88,6 +88,7 @@ fn equal_fault_state(jit: &Executor, reference: &Executor, address: u32) {
     assert_eq!(jit.state.fault_addr, address);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn a_later_region_budget_exit_keeps_prior_writes_and_untouched_sentinels() {
     let body = code(BODY, |a| {

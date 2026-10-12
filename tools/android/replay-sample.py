@@ -9,6 +9,7 @@ Native caching/static discovery are default; --no-code-cache is diagnostic.
 --warm-code-cache
 imports and hashes a prior native archive; --cold removes both cache files only
 from the fresh overlay, and enabled native cache output is pulled as evidence.
+On an arm64 device the engine is a64, which writes neither cache file.
 """
 from __future__ import annotations
 
@@ -442,11 +443,14 @@ def run(args: argparse.Namespace) -> None:
     actions = []
     responses: queue.Queue[str | None] = queue.Queue()
     error = None
+    caches = True
     write_json(output / "session.json", metadata)
     try:
         metadata["device"] = {name: adb.shell(["getprop", name]) for name in (
             "ro.product.model", "ro.build.version.release", "ro.build.version.sdk",
             "ro.product.cpu.abilist")}
+        caches = not metadata["device"]["ro.product.cpu.abilist"].startswith("arm64")
+        metadata["native_cache_files"] = caches
         metadata["device"]["host_page_size"] = adb.shell(["getconf", "PAGESIZE"])
         # mkdir without -p refuses a collision; no shared game directory is changed.
         adb.shell(["mkdir", remote])
@@ -663,7 +667,7 @@ def run(args: argparse.Namespace) -> None:
                 if error is None:
                     error = caught
                     metadata["error"] = f"{type(caught).__name__}: {caught}"
-        if cold or warm_profile or scene:
+        if caches and (cold or warm_profile or scene):
             try:
                 adb.pull(remote + "/data/jit-warm.bin", output / "jit-warm.bin")
                 metadata["warm_output_sha256"] = sha256(output / "jit-warm.bin")
@@ -674,7 +678,7 @@ def run(args: argparse.Namespace) -> None:
                 if error is None:
                     error = caught
                     metadata["error"] = f"{type(caught).__name__}: {caught}"
-        if not getattr(args, "no_code_cache", False):
+        if caches and not getattr(args, "no_code_cache", False):
             try:
                 adb.pull(remote + "/data/jit-code.bin", output / "jit-code.bin")
                 metadata["code_cache_output_sha256"] = sha256(output / "jit-code.bin")

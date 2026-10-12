@@ -327,6 +327,7 @@ fn unaligned_denied_page_faults_before_the_first_comparison_and_restarts() {
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn huge_counts_can_stop_early_and_long_unknown_spans_preserve_element_budget() {
     for form in forms() {
@@ -451,6 +452,7 @@ fn crt_memcmp_branches_use_last_comparison_flags_under_both_compile_strategies()
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn finite_large_comparisons_commit_bounded_chunks_and_restore_independent_contexts() {
     let form = Form {
@@ -481,6 +483,7 @@ fn finite_large_comparisons_commit_bounded_chunks_and_restore_independent_contex
     support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn native_comparison_fault_after_a_slice_restores_instruction_input_flags() {
     let form = Form {
@@ -514,6 +517,7 @@ fn native_comparison_fault_after_a_slice_restores_instruction_input_flags() {
     assert_eq!(jit.state.eip, CODE);
 }
 
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 #[test]
 fn comparison_can_resume_from_native_through_interpreter_back_to_native() {
     let form = Form {

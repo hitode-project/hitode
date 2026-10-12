@@ -515,7 +515,7 @@ impl Memory {
     }
 
     /// Guest memory placed in a 4 GiB-aligned `GuestWindow` at its guest
-    /// addresses (a64 workbook §6). `ptr` is the always accessible alias, so
+    /// addresses (execution ABI §A4). `ptr` is the always accessible alias, so
     /// every Rust and interpreter access is unchanged; the window view's host
     /// protection follows the guest's for translated code. Pages the host
     /// cannot protect exactly stay inaccessible there as soft pages.

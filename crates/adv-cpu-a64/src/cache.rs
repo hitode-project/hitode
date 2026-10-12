@@ -1,4 +1,4 @@
-//! Executable storage for translated code (workbook §7.1).
+//! Executable storage for translated code (execution ABI §A5.1).
 //!
 //! One contiguous range, so a direct `B`/`BL` reaches every unit. Code is
 //! never writable and executable through the same mapping at once:

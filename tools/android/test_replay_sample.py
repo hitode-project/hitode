@@ -295,7 +295,7 @@ class ReplayTests(unittest.TestCase):
 
     def run_scene_mocked(self, *, wrong_hash=False, bad_assert=False, gate_timeout=False,
                          approve=False, record=False, cold=False, warm=False, capture_pcm=False,
-                         code_cache=False):
+                         code_cache=False, abi="fixture"):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             binary = root / "adv-run"
@@ -368,6 +368,7 @@ class ReplayTests(unittest.TestCase):
                             else: raise AssertionError(name)
                             hashes.append(digest + "  " + name)
                         return "\n".join(hashes)
+                    if words[-1] == "ro.product.cpu.abilist": return abi
                     return "4096" if words[0] == "getconf" else "fixture"
                 def push(self, source, destination): operations.append(("push", str(source), destination))
                 def pull(self, source, destination):
@@ -459,6 +460,14 @@ class ReplayTests(unittest.TestCase):
                 self.assertTrue(any(row[0] == "pull" and row[1].endswith("/jit-code.bin") for row in operations))
                 imports = [row for row in operations if row[0] == "push" and row[2].endswith("/data/jit-code.bin")]
                 self.assertEqual(len(imports), int(mode == "warm"))
+
+    def test_arm64_device_expects_no_cache_files(self):
+        metadata, _, operations, _ = self.run_scene_mocked(cold=True, approve=True, code_cache=True,
+                                                           abi="arm64-v8a,armeabi-v7a")
+        self.assertFalse(metadata["native_cache_files"])
+        self.assertTrue(metadata["evidence_complete"])
+        self.assertNotIn("warm_output_sha256", metadata)
+        self.assertFalse(any(row[0] == "pull" and "/jit-" in row[1] for row in operations))
 
     def test_pcm_capture_is_bounded_snapshot_diagnostics_and_excludes_performance_comparison(self):
         metadata, _, operations, _ = self.run_scene_mocked(approve=True, capture_pcm=True)

@@ -17,10 +17,7 @@ mod semantic_tests;
     test,
     any(
         all(windows, target_arch = "x86_64", target_env = "msvc"),
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )
+        all(target_os = "linux", target_arch = "x86_64")
     )
 ))]
 include!("prototype.rs");

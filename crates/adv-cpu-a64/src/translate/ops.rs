@@ -14,6 +14,7 @@ use super::{
     host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
+use adv_cpu_core::IndirectBranchKind;
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 /// An address operand ready for a load or store.
@@ -164,6 +165,7 @@ impl Translator<'_> {
                             label,
                             state: self.state,
                             refund: self.trace.unused(self.index),
+                            branch: self.indirect(IndirectBranchKind::Return),
                         });
                     }
                     _ => {
@@ -175,7 +177,7 @@ impl Translator<'_> {
             Op::JmpIndirect(source) => {
                 self.target_to_w16(source);
                 self.settle();
-                self.probe(false);
+                self.probe(false, IndirectBranchKind::Jump);
             }
             Op::CallIndirect(source) => {
                 self.target_to_w16(source);
@@ -185,7 +187,7 @@ impl Translator<'_> {
                     self.real_call(None);
                 } else {
                     self.settle();
-                    self.probe(false);
+                    self.probe(false, IndirectBranchKind::Call);
                 }
             }
             Op::Setcc(cc, byte) => {
@@ -233,8 +235,9 @@ impl Translator<'_> {
     }
 
     /// Branches to the unit for the EIP in w16 through the indirect table,
-    /// from this site's own branch (§7.3); `link` calls it.
-    fn probe(&mut self, link: bool) {
+    /// from this site's own branch (§A5.3); `link` calls it. A miss records
+    /// a transfer of `kind`.
+    fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
         self.emit_all(&[
             ldr(X, X17, RUNTIME, runtime::TABLE),
             ubfx(X, X6, X16, 2, 16),
@@ -242,17 +245,17 @@ impl Translator<'_> {
             ldp(X, crate::encode::Index::Offset, X6, X17, X17, 0),
             sub(X, X6, X6, X16, Lsl, 0),
         ]);
-        self.far_cbnz(X, X6, self.stubs.lookup_slow);
+        self.miss_cbnz(X6, self.stubs.lookup_slow, kind);
         self.emit(if link { blr(X17) } else { br(X17) });
     }
 
-    /// A return to the EIP in w16 through the shadow stack (§7.2).
+    /// A return to the EIP in w16 through the shadow stack (§A5.2).
     fn shadow_return(&mut self) {
         self.emit_all(&[
             ldp(X, crate::encode::Index::Offset, Reg::LR, X17, SHADOW, 0),
             sub(X, X17, X17, X16, Lsl, 0),
         ]);
-        self.far_cbnz(X, X17, self.stubs.ret_miss);
+        self.miss_cbnz(X17, self.stubs.ret_miss, IndirectBranchKind::Return);
         self.emit_all(&[add_imm(X, SHADOW, SHADOW, 16, false), ret(Reg::LR)]);
     }
 
@@ -275,7 +278,7 @@ impl Translator<'_> {
                     point,
                 });
             }
-            None => self.probe(true),
+            None => self.probe(true, IndirectBranchKind::Call),
         }
         self.asm.bind(continuation);
         self.state = State::CANONICAL;
@@ -450,7 +453,7 @@ impl Translator<'_> {
         });
     }
 
-    /// A checked access (§6.3) of `kind` at the guest address in `address`,
+    /// A checked access (§A4.3) of `kind` at the guest address in `address`,
     /// whose window form is `direct`: the window takes it if it stays in
     /// one page whose class allows it, else the `access` stub does, and
     /// loads `rt` or stores it. Uses x3 and x4.
@@ -562,7 +565,7 @@ impl Translator<'_> {
     }
 
     /// `inc` or `dec` of a 32-bit memory operand: load, store the result,
-    /// then the flags from the loaded value (§5.2).
+    /// then the flags from the loaded value (§A3.2).
     fn step_memory(&mut self, increment: bool, mem: Mem) {
         let t = self.take_temp();
         let addr = self.address(mem);
@@ -631,7 +634,7 @@ impl Translator<'_> {
     /// A 1- or 2-byte `mov` or ALU operation. Values are zero-extended into
     /// the recipe temporaries, so PF and AF recipes see their low bits; the
     /// flags come from the operands shifted to the top of a W register.
-    /// Stores precede the flags (§5.2).
+    /// Stores precede the flags (§A3.2).
     fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part) {
         let shift = 32 - 8 * u32::from(width);
         // Both temporaries are overwritten. A fault site observes every
@@ -931,7 +934,7 @@ impl Translator<'_> {
         }
     }
 
-    /// `alu [mem], source`: load, compute, store, then the flags (§5.2).
+    /// `alu [mem], source`: load, compute, store, then the flags (§A3.2).
     fn alu_memory(&mut self, alu: Alu, mem: Mem, source: Src) {
         let t = self.take_temp();
         // The address first: it may use w17, and the result goes to w6.

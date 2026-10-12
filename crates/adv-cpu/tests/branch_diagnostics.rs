@@ -3,6 +3,8 @@ use adv_cpu::{
 };
 use iced_x86::code_asm::*;
 
+mod support;
+
 const CODE: u32 = 0x10000;
 const TARGET: u32 = 0x12000;
 const DATA: u32 = 0x18000;
@@ -182,7 +184,7 @@ fn successful_linked_jump_is_retained_through_direct_transfers_and_context_resto
         assert_eq!(cpu.state.last_indirect_branch, record);
         if native {
             // CODE tail-links to TARGET within one Rust entry.
-            assert_eq!(cpu.stats.native_entries, 1);
+            support::x64_shape!(assert_eq!(cpu.stats.native_entries, 1));
         }
     }
 }

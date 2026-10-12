@@ -1,4 +1,6 @@
 //! Dynamic operands exercise the fast page table and its exact cold fallback.
+// Tests x64 engine mechanisms; the a64 engine has its own.
+#![cfg(not(target_arch = "aarch64"))]
 use adv_cpu::{
     CompileStrategy, CpuState, EXEC, ExecutionTrap, Executor, Memory, READ, Region, RunOutcome,
     WRITE,

@@ -1,10 +1,10 @@
 //! Execution owner of the a64 engine.
 //!
-//! On AArch64 hosts every boundary goes through translated code, which in M0
-//! exits to interpret one instruction; elsewhere the core interpreter runs
-//! blocks directly. Exits, traps, fuel and deadlines follow the x64
-//! executor's interpreter path exactly, so both engines pass the same
-//! semantic tests.
+//! On AArch64 hosts entries run translated code from their second visit
+//! (execution ABI §A7); elsewhere, and in interpreter-only executors, the
+//! core interpreter runs blocks directly. Exits, traps, fuel and deadlines
+//! follow the x64 executor's interpreter path exactly, so both engines
+//! pass the same semantic tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +36,7 @@ impl ExecutionContext {
 }
 
 /// Execution counters. Names match the x64 executor where the meaning is
-/// shared; native and translation counters stay zero until M1 translates.
+/// shared; native and translation counters stay zero without translated code.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub interpreter_entries: u64,
@@ -69,8 +69,10 @@ pub struct Executor {
     interrupt: Arc<AtomicBool>,
     host_interrupts: bool,
     deadline: Option<Instant>,
+    /// Translated code; `None` when every instruction is interpreted, so
+    /// such an executor maps no code cache and installs no fault handler.
     #[cfg(native)]
-    native: crate::native::Native,
+    native: Option<crate::native::Native>,
 }
 
 impl Executor {
@@ -83,29 +85,40 @@ impl Executor {
         };
         #[cfg(not(native))]
         let memory = Memory::new(base, len)?;
-        Self::create(memory)
+        Self::create(memory, true)
     }
 
     pub fn address_space() -> Result<Self, String> {
-        #[cfg(native)]
-        let memory = Memory::window(0, 1usize << 32)?;
-        #[cfg(not(native))]
-        let memory = Memory::reserve(0, 1usize << 32)?;
-        Self::create(memory)
+        Self::create(Self::space()?, true)
     }
 
-    fn create(memory: Memory) -> Result<Self, String> {
+    /// A 4 GiB address space whose every instruction is interpreted.
+    pub(crate) fn interpreted_address_space() -> Result<Self, String> {
+        Self::create(Self::space()?, false)
+    }
+
+    fn space() -> Result<Memory, String> {
         #[cfg(native)]
-        let native = crate::native::Native::new(
-            memory
-                .window_base()
-                .ok_or("a64 guest memory must live in a guest window")?,
-        )?;
+        return Memory::window(0, 1usize << 32);
+        #[cfg(not(native))]
+        Memory::reserve(0, 1usize << 32)
+    }
+
+    fn create(memory: Memory, translate: bool) -> Result<Self, String> {
+        #[cfg(native)]
+        let native = match translate {
+            true => Some(crate::native::Native::new(
+                memory
+                    .window_base()
+                    .ok_or("a64 guest memory must live in a guest window")?,
+            )?),
+            false => None,
+        };
         Ok(Self {
             state: CpuState::default(),
             stats: Stats::default(),
             memory,
-            interpreter_only: false,
+            interpreter_only: !translate,
             histogram: Default::default(),
             faults: Default::default(),
             interpreter: Interpreter::new(),
@@ -204,13 +217,14 @@ impl Executor {
     /// Diagnostic counts of the translated runs, as `name: value` pairs.
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
-        return format!(
-            "{:?} unchecked faults {} checked {}",
-            self.native.diagnostics,
-            self.native.unchecked_faults,
-            self.native.checked_count()
-        );
-        #[cfg(not(native))]
+        if let Some(native) = &self.native {
+            return format!(
+                "{:?} unchecked faults {} checked {}",
+                native.diagnostics,
+                native.unchecked_faults,
+                native.checked_count()
+            );
+        }
         String::new()
     }
 
@@ -220,7 +234,11 @@ impl Executor {
     pub fn interpreted_forms(&self, which: u8) -> Vec<(iced_x86::Code, u64)> {
         let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
         #[cfg(native)]
-        let helpers = self.native.helper_histogram();
+        let helpers = self
+            .native
+            .as_ref()
+            .map(crate::native::Native::helper_histogram)
+            .unwrap_or_default();
         #[cfg(not(native))]
         let helpers = rustc_hash::FxHashMap::default();
         let histogram = match which {
@@ -271,6 +289,10 @@ impl Executor {
             cliffs: std::mem::take(&mut self.stats.cliffs),
             scratch: Default::default(),
         };
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.deadline = self.deadline.map(crate::native::deadline);
+        }
         let result = self.run_inner(stop, budget, &mut bridge);
         // Export canonical floating state at every public CPU boundary.
         self.state.refresh_mmx();
@@ -292,9 +314,9 @@ impl Executor {
     /// Runs translated code from EIP; `None` where the host has none.
     #[cfg(native)]
     fn run_native(&mut self, stop: u32, bridge: &mut Bridge<'_>) -> Result<Option<Exit>, String> {
-        if self.interpreter_only {
+        let Some(native) = self.native.as_mut().filter(|_| !self.interpreter_only) else {
             return Ok(None);
-        }
+        };
         let fuel = self.state.fuel;
         // Host calls run in place only with a handler to take them.
         let traps = if bridge.handler.is_some() {
@@ -303,9 +325,7 @@ impl Executor {
         } else {
             std::ptr::null_mut()
         };
-        let run = self
-            .native
-            .run(&mut self.state, &mut self.memory, stop, fuel, traps);
+        let run = native.run(&mut self.state, &mut self.memory, stop, fuel, traps);
         if let Some(error) = bridge.error.take() {
             return Err(error);
         }
@@ -317,8 +337,23 @@ impl Executor {
             self.stats.compilations += 1;
             self.stats.native_code_bytes += run.translated as u64;
         }
+        self.stats.invalidations = native.diagnostics.dropped_units;
         self.state.fuel -= u64::from(run.retired);
         Ok(Some(run.exit))
+    }
+
+    /// Whether the wall deadline has passed. Translated runs compare the
+    /// virtual counter every time; otherwise reading the clock costs as
+    /// much as a short run, so it is polled every few iterations, and one
+    /// call is capped by its fuel anyway.
+    fn past_deadline(&self, polls: u32) -> bool {
+        #[cfg(native)]
+        if let Some(native) = &self.native
+            && native.deadline.is_some()
+        {
+            return native.past();
+        }
+        polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at)
     }
 
     #[cfg(not(native))]
@@ -334,9 +369,6 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         self.state.refresh_mmx();
         self.state.fuel = budget;
-        // Reading the clock costs as much as a short native run, so the
-        // deadline is polled every few iterations; one call is capped by
-        // its fuel anyway.
         let mut polls = 0u32;
         loop {
             if bridge.parked {
@@ -346,7 +378,7 @@ impl Executor {
                 return Ok(RunOutcome::ReachedStop);
             }
             polls = polls.wrapping_add(1);
-            if polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at) {
+            if self.past_deadline(polls) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {
@@ -378,7 +410,8 @@ impl Executor {
                     // The helper ran the instruction; the owner completes it.
                     #[cfg(native)]
                     Exit::Stepped => {
-                        let execution = self.native.pending.take().expect("a pending step");
+                        let execution = self.native.as_mut().and_then(|n| n.pending.take());
+                        let execution = execution.expect("a pending step");
                         (execution, execution.units)
                     }
                     #[cfg(not(native))]

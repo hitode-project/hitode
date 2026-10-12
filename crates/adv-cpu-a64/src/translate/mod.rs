@@ -1,10 +1,10 @@
-//! Translation units (workbook §9).
+//! Translation units (execution ABI §A7).
 //!
 //! `trace` picks the guest instructions of a unit and analyses them; this
 //! module emits them in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
-//! Flags follow §5. SF ZF OF live in NZCV. CF lives in NZCV's C in a
+//! Flags follow §A3. SF ZF OF live in NZCV. CF lives in NZCV's C in a
 //! tracked carry sense, or lazily as a `Carry` over values still in
 //! registers; while C holds it, a `derivable` expression may still compute
 //! it, so an `inc` or `dec` that keeps CF can let C go. PF and AF stay a
@@ -14,7 +14,7 @@
 //! every fault site records sense, carry and recipe for the owner.
 //!
 //! Memory accesses go straight to the window, where a host fault at a
-//! site reaches the owner (§6.3). Instructions the owner has seen fault
+//! site reaches the owner (§A4.3). Instructions the owner has seen fault
 //! too often are checked instead: each access first reads its page's
 //! class, and one that stays in a page the window may take directly does;
 //! the rest call the `access` stub, so soft pages cost a helper call
@@ -24,7 +24,7 @@
 //! without transferring control calls the `interpret` stub with canonical
 //! flags, and the unit goes on unless the helper asks it to leave.
 //!
-//! Host registers beyond the guest map of §4: x16 and x17 address and exit
+//! Host registers beyond the guest map of §A2: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
 //! exit stub saves for fault recovery, x13 and x14 flag scratch without
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
@@ -48,6 +48,8 @@ pub use decode::Helper;
 pub use flags::{Carry, Operand, Recipe, Sense};
 pub use trace::MAX_INSTRUCTIONS;
 
+use adv_cpu_core::IndirectBranchKind;
+
 use crate::asm::{Asm, Label};
 use crate::encode::Extend::Uxtw;
 use crate::encode::Shift::Lsl;
@@ -58,7 +60,7 @@ use decode::{EBP, ESP};
 use flags::FlagSet;
 use trace::{Edge, Next, Trace};
 
-/// Host features that change what the translator emits (§2).
+/// Host features that change what the translator emits (§A1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     pub flagm: bool,
@@ -67,7 +69,7 @@ pub struct Features {
 /// What the owner needs at a host instruction that may fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Site {
-    /// The guest instruction, which has committed nothing (§5.2).
+    /// The guest instruction, which has committed nothing (§A3.2).
     pub eip: u32,
     /// Instructions the countdown prepaid that the unit has not completed,
     /// this one included.
@@ -256,9 +258,15 @@ enum Cold {
         label: Label,
         state: State,
         refund: u32,
+        branch: u64,
     },
-    /// A branch to a stub out of conditional-branch range.
-    Far { label: Label, to: usize },
+    /// A miss of an indirect transfer: loads `branch` into x4, then
+    /// branches to the stub at `to`, which may be out of `cbnz` range.
+    Miss {
+        label: Label,
+        to: usize,
+        branch: u64,
+    },
     /// A real call's first dispatch: the owner patches the `bl` at `point`.
     Call {
         label: Label,
@@ -967,11 +975,24 @@ impl Translator<'_> {
         self.emit(bl(0));
     }
 
-    /// A conditional branch (`cbnz`) to a far stub, through a cold `b`.
-    fn far_cbnz(&mut self, size: Size, rt: Reg, to: usize) {
+    /// A `cbnz` to the miss stub at `to` for an indirect transfer of
+    /// `kind` from this instruction, through cold code that loads x4.
+    fn miss_cbnz(&mut self, rt: Reg, to: usize, kind: IndirectBranchKind) {
         let label = self.asm.label();
-        self.asm.cbz(size, true, rt, label);
-        self.cold.push(Cold::Far { label, to });
+        self.asm.cbz(Size::X, true, rt, label);
+        let branch = self.indirect(kind);
+        self.cold.push(Cold::Miss { label, to, branch });
+    }
+
+    /// `Runtime::branch` for an indirect transfer of `kind` from here.
+    fn indirect(&self, kind: IndirectBranchKind) -> u64 {
+        u64::from(self.trace.insts[self.index].pc) | (kind as u64) << 32
+    }
+
+    /// x4 = `branch`.
+    fn mov_branch(&mut self, branch: u64) {
+        self.mov_imm(X4, branch as u32);
+        self.emit(movk(X, X4, (branch >> 32) as u16, 32));
     }
 
     fn cold(&mut self, cold: Cold) {
@@ -1015,6 +1036,7 @@ impl Translator<'_> {
                 label,
                 state,
                 refund,
+                branch,
             } => {
                 self.asm.bind(label);
                 self.state = state;
@@ -1022,10 +1044,12 @@ impl Translator<'_> {
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
+                self.mov_branch(branch);
                 self.far(self.stubs.lookup);
             }
-            Cold::Far { label, to } => {
+            Cold::Miss { label, to, branch } => {
                 self.asm.bind(label);
+                self.mov_branch(branch);
                 self.far(to);
             }
             Cold::Call {

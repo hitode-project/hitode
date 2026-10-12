@@ -1591,9 +1591,10 @@ fn translated(
     (features, first_visits, checks): Config,
 ) -> (RunOutcome, CpuState, Vec<u8>, u64) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
-    executor.native.features = features;
-    executor.native.first_visits = first_visits;
-    executor.native.checks = checks;
+    let native = executor.native.as_mut().unwrap();
+    native.features = features;
+    native.first_visits = first_visits;
+    native.checks = checks;
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();
     let outcome = executor.run(program.stop, budget).unwrap();
@@ -1742,7 +1743,7 @@ fn x87_loops_run_natively() {
     assert_eq!(outcome, RunOutcome::ReachedStop);
     let mut executor = Executor::new(BASE, LEN).unwrap();
     // Every instruction is translated.
-    executor.native.first_visits = false;
+    executor.native.as_mut().unwrap().first_visits = false;
     load(executor.memory_mut(), &program);
     executor.state = program.state.clone();
     assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
@@ -1808,7 +1809,7 @@ fn stores_to_data_on_a_code_page_stop_faulting() {
     assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
     // The loop's unit, then the one it loops through, each fault until
     // the store is checked.
-    let faults = executor.native.unchecked_faults;
+    let faults = executor.native.as_ref().unwrap().unchecked_faults;
     let checked = u64::from(crate::native::CHECK_AFTER);
     assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
 }

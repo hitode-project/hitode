@@ -69,10 +69,6 @@ pub(super) fn builder(
         .map_err(|error| error.to_string())?;
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-    builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
@@ -604,8 +600,6 @@ fn parse(snapshot: &Snapshot, bytes: &[u8]) -> Result<Image, String> {
 /// Current Memory generations and runtime helper addresses are never read from disk.
 pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Compiled, String> {
     let image = parse(snapshot, bytes)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let _write = crate::jit_memory_macos::WriteScope::new();
     let bindings = Arc::new(Bindings::default());
     let x87 = x87_operations(snapshot, &image.instructions);
     let builder = builder(&[], snapshot.profile.as_ref(), bindings.clone(), &x87)?;

@@ -1,7 +1,7 @@
 //! Unicorn arm64 harness for running translated code on any host.
 //!
-//! M0 adds the guest window, guard zones and soft pages as memory hooks; the
-//! fault paths then go through the same side-table logic as on hardware.
+//! It maps plain memory: the guest window, guard zones and soft pages are
+//! exercised on AArch64 hosts, where faults reach the real side tables.
 
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot, uc_error};
 use unicorn_engine::{RegisterARM64, Unicorn};
