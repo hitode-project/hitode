@@ -99,15 +99,10 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
         return error(env, 2);
     };
     if !from.is_file() {
-        if target.is_some() {
-            warn_unavailable(
-                env,
-                "kernel32.dll!MoveFile",
-                "directory rename owners are unavailable",
-            );
-            return error(env, 50);
-        }
-        return error(env, 5);
+        return match target {
+            Some(target) => super::directory::portable_rename(env, source, target),
+            None => error(env, 5),
+        };
     }
     let identity =
         match std::fs::File::open(&from).and_then(|file| adv_os::vfs::file_identity(&file)) {
