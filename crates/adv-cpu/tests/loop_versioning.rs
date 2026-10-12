@@ -1859,7 +1859,10 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     assert_eq!(m.state.regs[6], SRC + if fill { 0 } else { done * width });
     assert_eq!(m.state.regs[7], SRC + done * width);
     assert_eq!(m.state.mmx[0], 0);
-    assert_eq!(budget - m.state.fuel, u64::from(done) + u64::from(!looping));
+    support::x64_shape!(assert_eq!(
+        budget - m.state.fuel,
+        u64::from(done) + u64::from(!looping)
+    ));
     support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 11;

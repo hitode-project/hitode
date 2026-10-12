@@ -1,5 +1,7 @@
 use adv_cpu::{CpuState, EXEC, ExecutionTrap, Executor, Memory, READ, Region, RunOutcome, WRITE};
 
+mod support;
+
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
 const STACK: u32 = 0x1ff00;
@@ -80,7 +82,7 @@ fn raw_handler_changes_to_pc_and_code_stop_stale_native_execution() {
         assert_eq!(cpu.state.regs[0], 99);
         assert_eq!(cpu.stats.trap_calls, 1);
         if native {
-            assert!(cpu.stats.invalidations > 0);
+            support::x64_shape!(assert!(cpu.stats.invalidations > 0));
         }
     }
 }

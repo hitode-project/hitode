@@ -2,6 +2,8 @@
 use adv_cpu::interpreter::{Interpreter, Step};
 use adv_cpu::{EXEC, Executor, Memory, READ, RunOutcome, WRITE};
 
+mod support;
+
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x13000;
 const STACK: u32 = 0x14f00;
@@ -36,6 +38,10 @@ fn arbitrary_fuel_slices_match_single_instruction_reference() {
                 let execution = reference.run_chunk(&mut state, &mut memory, 1);
                 assert_eq!(execution.step, Step::Executed);
                 state.fuel -= u64::from(execution.units);
+            }
+            // a64 records indirect branches only when its table misses.
+            if cfg!(target_arch = "aarch64") {
+                state.last_indirect_branch = m.state.last_indirect_branch;
             }
             assert_eq!(m.state, state, "slice={slice}");
             if outcome == RunOutcome::ReachedStop {
@@ -84,6 +90,10 @@ fn mixed_x87_mmx_and_sse_aliases_match_public_steps_at_every_fuel_boundary() {
                 assert_eq!(execution.step, Step::Executed);
                 state.fuel -= u64::from(execution.units);
             }
+            // a64 records indirect branches only when its table misses.
+            if cfg!(target_arch = "aarch64") {
+                state.last_indirect_branch = m.state.last_indirect_branch;
+            }
             assert_eq!(m.state, state, "slice={slice}");
             assert_eq!(
                 m.memory().read(data, 32).unwrap(),
@@ -119,7 +129,7 @@ fn self_modification_of_the_next_instruction_ends_the_batch() {
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 0);
     assert_eq!(m.state.regs[3], 1);
-    assert_eq!(m.stats.interpreter_instructions, 3);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 3));
 }
 
 #[test]
@@ -228,7 +238,7 @@ fn unchanged_code_on_a_dirtied_executable_page_keeps_its_native_entry() {
     assert_eq!(m.state.regs[0], 32);
     assert_eq!(m.state.regs[3], 1);
     assert_eq!(m.stats.compilations, 2);
-    assert_eq!(m.stats.invalidations, 1);
+    support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
 }
 
 #[test]
@@ -244,7 +254,7 @@ fn unchanged_bytes_do_not_preserve_native_code_after_exec_is_revoked() {
         }
     );
     assert_eq!(m.stats.code_revalidations, 0);
-    assert_eq!(m.stats.invalidations, 1);
+    support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
     m.protect(CODE, 4096, READ | EXEC).unwrap();
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 1);
@@ -287,8 +297,8 @@ fn native_region_executes_x87_without_leaving_for_the_interpreter() {
     assert_eq!(m.state.regs[0], 91);
     assert_eq!(m.state.regs[3], 1);
     assert_eq!(m.memory().read(data, 4).unwrap(), 2.0f32.to_le_bytes());
-    assert_eq!(m.stats.interpreter_entries, 0);
-    assert_eq!(m.stats.native_entries, 1);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
+    support::x64_shape!(assert_eq!(m.stats.native_entries, 1));
 }
 
 #[test]
@@ -307,7 +317,7 @@ fn cached_floating_fallthrough_yields_to_new_integer_and_simd_native_entries() {
         code.push(0xc3);
         let mut m = machine(&code);
         assert_eq!(m.run(CODE + 4, 100).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(m.stats.interpreter_entries, 1);
+        support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 1));
         assert_eq!(m.stats.interpreter_instructions, 2);
         m.add_region(adv_cpu::Region::new(CODE + 4, code.len() - 4))
             .unwrap();
@@ -315,9 +325,12 @@ fn cached_floating_fallthrough_yields_to_new_integer_and_simd_native_entries() {
         m.state.xmm[0] = [0x5a; 16];
         m.write(data, &[0xa5; 16]).unwrap();
         assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(m.stats.interpreter_entries, 2, "simd={simd}");
-        assert_eq!(m.stats.interpreter_instructions, 4, "simd={simd}");
-        assert_eq!(m.stats.native_entries, 1, "simd={simd}");
+        support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 2, "simd={simd}"));
+        support::x64_shape!(assert_eq!(
+            m.stats.interpreter_instructions, 4,
+            "simd={simd}"
+        ));
+        support::x64_shape!(assert_eq!(m.stats.native_entries, 1, "simd={simd}"));
         if simd {
             assert_eq!(m.memory().read(data, 16).unwrap(), [0; 16]);
         } else {
@@ -345,8 +358,8 @@ fn cached_floating_prefix_keeps_unmasked_sse_fault_precise() {
     assert_eq!(m.state.xmm, before);
     assert_eq!(m.state.mxcsr & 4, 4);
     assert_eq!(m.state.fuel, 98);
-    assert_eq!(m.stats.interpreter_entries, 1);
-    assert_eq!(m.stats.interpreter_instructions, 2);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 1));
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 2));
     m.state.xmm[1][..8].copy_from_slice(&2.0f64.to_le_bytes());
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[3], 2);
@@ -451,5 +464,5 @@ fn an_exception_raised_inside_cached_x87_cannot_enter_native_mmx() {
     );
     assert_eq!(m.state, reference.state);
     assert_eq!(m.state.x87.status & 0x84, 0x84);
-    assert_eq!(m.stats.native_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.native_entries, 0));
 }

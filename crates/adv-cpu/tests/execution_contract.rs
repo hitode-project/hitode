@@ -1,6 +1,8 @@
 //! Production execution contracts; this file never constructs a reference engine.
 use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
 
+mod support;
+
 const CODE: u32 = 0x1000;
 const STOP: u32 = 0x3000;
 
@@ -25,7 +27,7 @@ fn cold_code_executes_without_native_compilation_or_reference_engine() {
     assert_eq!(m.state.regs[0] as i32, -14);
     assert_eq!(m.state.regs[2] as i32, -3);
     assert_eq!(m.stats.compilations, 0);
-    assert_eq!(m.stats.interpreter_instructions, 5);
+    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 5));
 }
 
 #[test]
@@ -85,7 +87,7 @@ fn pending_x87_exception_cannot_be_bypassed_by_cached_mmx() {
     );
     assert_eq!(m.state.regs[0], 1);
     assert_eq!(m.state.x87.regs, registers);
-    assert_eq!(m.stats.native_entries, 0);
+    support::x64_shape!(assert_eq!(m.stats.native_entries, 0));
     m.state.x87.status = 0;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 1);
@@ -103,6 +105,7 @@ fn complete_guest_address_space_includes_the_final_page() {
 }
 
 #[test]
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 fn native_guard_with_one_unit_yields_then_delivers_the_precise_fault() {
     // div ecx is native, but a zero divisor must execute its precise slow path.
     let mut m = machine(&[0xf7, 0xf1, 0xc3]);

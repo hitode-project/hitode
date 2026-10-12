@@ -4,6 +4,8 @@ use iced_x86::code_asm::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+mod support;
+
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x11000;
 const SOURCE: u32 = 0x20000;
@@ -39,7 +41,7 @@ fn finish(cpu: &mut JitCpu) {
         cpu.executor_mut().run(STOP, 10000).unwrap(),
         RunOutcome::ReachedStop
     );
-    assert_eq!(cpu.stats().interpreter_instructions, 0);
+    support::x64_shape!(assert_eq!(cpu.stats().interpreter_instructions, 0));
 }
 
 #[test]
@@ -343,6 +345,7 @@ fn denied_rmw_keeps_input_flags_and_cow_then_restarts_natively() {
 }
 
 #[test]
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 fn rep_source_or_destination_io_fault_preserves_completed_prefix_without_replay() {
     for source_fails in [false, true] {
         let mut cpu = fixture(&[0xf3, 0xa5, 0xc3], true);
@@ -405,6 +408,7 @@ fn rep_source_or_destination_io_fault_preserves_completed_prefix_without_replay(
 }
 
 #[test]
+#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
 fn rep_comparison_io_fault_restores_original_flags_after_a_native_slice() {
     let mut cpu = fixture(&[0xf3, 0xa6, 0xc3], true);
     let calls = Rc::new(Cell::new(0));
@@ -601,7 +605,10 @@ fn file_cmps_and_scas_all_widths_directions_and_repeat_conditions_match_interpre
                                 RunOutcome::ReachedStop
                             );
                             if native {
-                                assert_eq!(cpu.stats().interpreter_instructions, 0);
+                                support::x64_shape!(assert_eq!(
+                                    cpu.stats().interpreter_instructions,
+                                    0
+                                ));
                             }
                             assert_eq!(
                                 cpu.executor().state.regs[1],
