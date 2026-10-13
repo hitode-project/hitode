@@ -1,53 +1,12 @@
 <script lang="ts">
+  import SettingsAccent from "../components/SettingsAccent.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
-  import {
-    APP_VERSION,
-    CACHE_GB,
-    DATA_DIR,
-    SAVES_GB,
-    clearCache,
-    fakeReports,
-    fakeRoots,
-    reportContents,
-  } from "../lib/fake-settings";
-  import { library } from "../lib/library.svelte";
+  import { APP_VERSION, DATA_DIR, reportContents } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
-  import { prefs, savePrefs, type Accent, type Prefs } from "../lib/prefs.svelte";
+  import { prefs } from "../lib/prefs.svelte";
+  import { general, setPref as set } from "../lib/settings-form.svelte";
 
-  function set<K extends keyof Prefs>(key: K, value: Prefs[K]): void {
-    prefs[key] = value;
-    savePrefs();
-  }
-
-  const accents: { value: Accent; label: string; color: string }[] = [
-    { value: "blue", label: "蓝", color: "#3767D6" },
-    { value: "green", label: "绿", color: "#2D7556" },
-    { value: "graphite", label: "石墨", color: "#3F3F44" },
-  ];
-
-  let roots = $state(fakeRoots.map((r) => ({ ...r })));
-  function rootMeta(path: string, depth: number | null): string {
-    const count = library.games.filter((g) => g.path.startsWith(path + "/")).length;
-    return depth === null ? `磁盘未连接 · ${count} 个游戏` : `自动发现 · ${depth} 层 · ${count} 个游戏`;
-  }
-
-  let cache = $state<"full" | "clearing" | "cleared">("full");
-  const cacheGb = $derived(cache === "cleared" ? 0 : CACHE_GB);
-  const totalGb = $derived(SAVES_GB + cacheGb);
-  const gb = (v: number) => `${v.toFixed(1)} GB`;
-  const cacheLabel = $derived(cache === "cleared" ? "0 MB" : gb(CACHE_GB));
-  async function onClearCache(): Promise<void> {
-    cache = "clearing";
-    await clearCache();
-    cache = "cleared";
-  }
-
-  let withdrawn = $state<Record<string, boolean>>({});
-  const reports = $derived(
-    fakeReports.map((r) => ({ ...r, title: library.get(r.gameId)?.title ?? "已移除的游戏" })),
-  );
-  let keyReset = $state(false);
   let contentsOpen = $state(false);
 </script>
 
@@ -86,19 +45,7 @@
       </div>
       <div class="row">
         <span class="t">强调色</span>
-        <div role="group" aria-label="强调色" style="display: flex; gap: 10px">
-          {#each accents as a (a.value)}
-            <button
-              class="swatch"
-              class:on={prefs.accent === a.value}
-              aria-label={a.label}
-              aria-pressed={prefs.accent === a.value}
-              onclick={() => set("accent", a.value)}
-            >
-              <span style:background={a.color}></span>
-            </button>
-          {/each}
-        </div>
+        <SettingsAccent />
       </div>
     </section>
 
@@ -168,13 +115,13 @@
 
     <section class="sec" aria-labelledby="g-roots">
       <h2 id="g-roots">游戏库文件夹</h2>
-      {#each roots as f (f.id)}
+      {#each general.roots as f (f.id)}
         <div class="row">
           <span class="t two">
             <span class="path">{f.path}</span>
-            <span class="meta">{rootMeta(f.path, f.depth)}</span>
+            <span class="meta">{general.rootMeta(f)}</span>
           </span>
-          <button class="quiet" aria-label="移除 {f.path}" onclick={() => (roots = roots.filter((r) => r.id !== f.id))}>
+          <button class="quiet" aria-label="移除 {f.path}" onclick={() => general.removeRoot(f.id)}>
             移除
           </button>
         </div>
@@ -188,31 +135,31 @@
       <h2 id="g-store">存储</h2>
       <div class="store">
         <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
-          <span class="total">{gb(totalGb)}</span>
+          <span class="total">{general.totalLabel}</span>
           <span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>
         </div>
-        <div class="usage" role="img" aria-label="存档 128 MB，缓存 {cacheLabel}">
-          <span style:width="{Math.max(2, (SAVES_GB / totalGb) * 100)}%" style:background="var(--accent)"></span>
-          <span style:width="{(cacheGb / totalGb) * 100}%" class="cache"></span>
+        <div class="usage" role="img" aria-label="存档 128 MB，缓存 {general.cacheLabel}">
+          <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>
+          <span style:width="{general.cachePct}%" class="cache"></span>
         </div>
         <div style="display: flex; gap: 18px; flex-wrap: wrap">
           <span class="key"><i style:background="var(--accent)"></i>存档 128 MB</span>
-          <span class="key"><i class="cache"></i>缓存 {cacheLabel}</span>
+          <span class="key"><i class="cache"></i>缓存 {general.cacheLabel}</span>
         </div>
       </div>
       <div class="row">
         <span class="t">缓存</span>
-        <span class="val">{cacheLabel}</span>
-        <button class="quiet" onclick={onClearCache} disabled={cache !== "full"}>
-          {cache === "cleared" ? "已清除" : cache === "clearing" ? "正在清除…" : "清除"}
+        <span class="val">{general.cacheLabel}</span>
+        <button class="quiet" onclick={() => general.clearCache()} disabled={general.cache !== "full"}>
+          {general.clearLabel}
         </button>
       </div>
     </section>
 
     <section class="sec" aria-labelledby="g-fb">
       <h2 id="g-fb">反馈与隐私</h2>
-      {#each reports as r (r.id)}
-        {@const gone = !!withdrawn[r.id]}
+      {#each general.reports as r (r.id)}
+        {@const gone = !!general.withdrawn[r.id]}
         <div class="row">
           <span class="t two">
             <span lang="ja" class="ellipsis">{r.title}</span>
@@ -220,7 +167,7 @@
           </span>
           <button
             class="quiet"
-            onclick={() => (withdrawn[r.id] = true)}
+            onclick={() => (general.withdrawn[r.id] = true)}
             disabled={gone}
             aria-label="撤回 {r.title} 的报告"
           >
@@ -233,7 +180,7 @@
           <span>重置报告密钥</span>
           <span class="meta">之后的报告无法与之前的关联</span>
         </span>
-        <button class="quiet" onclick={() => (keyReset = true)} disabled={keyReset}>{keyReset ? "已重置" : "重置"}</button>
+        <button class="quiet" onclick={() => (general.keyReset = true)} disabled={general.keyReset}>{general.keyReset ? "已重置" : "重置"}</button>
       </div>
       <div class="row" class:open={contentsOpen}>
         <span class="t">报告包含哪些内容</span>
@@ -348,29 +295,6 @@
     cursor: default;
     color: var(--fg3);
     background: transparent;
-  }
-
-  .swatch {
-    all: unset;
-    box-sizing: border-box;
-    width: 28px;
-    height: 28px;
-    border-radius: 14px;
-    cursor: pointer;
-    display: grid;
-    place-items: center;
-  }
-  .swatch span {
-    width: 20px;
-    height: 20px;
-    border-radius: 10px;
-  }
-  .swatch.on {
-    box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--fg3);
-  }
-  .swatch:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
 
   .store {

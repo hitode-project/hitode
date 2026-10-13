@@ -3,60 +3,11 @@
   import ImportMini from "../components/ImportMini.svelte";
   import ImportSwitch from "../components/ImportSwitch.svelte";
   import Icon from "../components/Icon.svelte";
-  import { addScanned, chooseInstallSource, scanFolder, SCAN_ROOT, type Enc, type ScanFound } from "../lib/fake-import";
+  import { SCAN_ROOT } from "../lib/fake-import";
+  import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
-  const found = scanFolder();
-  const encOptions: { value: Enc; label: string }[] = [
-    { value: "ja", label: "日文" },
-    { value: "zh", label: "简中" },
-  ];
-
-  let depth = $state(2);
-  let watch = $state(true);
-  /** Results the user unticked. */
-  let off = $state<Record<string, boolean>>({});
-  /** Encodings the user changed from the detected one. */
-  let enc = $state<Record<string, Enc>>({});
-  let done = $state(false);
-
-  const list = $derived(found.filter((g) => g.depth <= depth));
-  const isLocked = (g: ScanFound) => !!g.inLib || !!g.noExe || !!g.setup;
-  const pickable = $derived(list.filter((g) => !isLocked(g)));
-  const chosen = $derived(pickable.filter((g) => !off[g.id]));
-  const allOn = $derived(chosen.length === pickable.length);
-  const encOf = (g: ScanFound): Enc => enc[g.id] ?? g.enc ?? "ja";
-
-  function toggle(g: ScanFound) {
-    off[g.id] = !off[g.id];
-    done = false;
-  }
-
-  function toggleAll() {
-    const next = { ...off };
-    for (const g of pickable) next[g.id] = allOn;
-    off = next;
-    done = false;
-  }
-
-  function install(g: ScanFound) {
-    chooseInstallSource(g.id);
-    nav.go({ name: "install" });
-  }
-
-  function add() {
-    if (!done) {
-      addScanned(chosen.map((g) => ({ found: g, enc: encOf(g) })));
-      done = true;
-    }
-  }
-
-  // After the "已添加" confirmation, return to the library.
-  $effect(() => {
-    if (!done) return;
-    const timer = setTimeout(() => nav.home(), 900);
-    return () => clearTimeout(timer);
-  });
+  const scan = new ScanPick();
 </script>
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
@@ -70,43 +21,37 @@
       <div class="line wrap">
         <span id="lbl-depth" style="flex: 1 1 200px; font-size: 14px">子文件夹层数</span>
         <div class="seg" role="group" aria-labelledby="lbl-depth">
-          {#each [0, 1, 2, 3, 4] as n (n)}
-            <button
-              class:on={depth === n}
-              aria-pressed={depth === n}
-              aria-label={n === 0 ? "只看所选文件夹" : `${n} 层子文件夹`}
-              onclick={() => {
-                depth = n;
-                done = false;
-              }}>{n}</button
+          {#each SCAN_DEPTHS as n (n)}
+            <button class:on={scan.depth === n} aria-pressed={scan.depth === n} aria-label={depthLabel(n)} onclick={() => scan.setDepth(n)}
+              >{n}</button
             >
           {/each}
         </div>
       </div>
       <div class="line">
         <span style="flex: 1 1 auto; font-size: 14px">以后自动发现新游戏</span>
-        <ImportSwitch checked={watch} label="以后自动发现新游戏" onchange={(v) => (watch = v)} />
+        <ImportSwitch checked={scan.watch} label="以后自动发现新游戏" onchange={(v) => (scan.watch = v)} />
       </div>
     </section>
 
     <section aria-labelledby="h-found" style="display: flex; flex-direction: column; gap: 10px">
       <div style="display: flex; align-items: baseline; gap: 12px; padding: 0 2px">
-        <h2 id="h-found" class="lbl">找到 {list.length} 个</h2>
+        <h2 id="h-found" class="lbl">找到 {scan.list.length} 个</h2>
         <div style="flex: 1"></div>
-        {#if pickable.length > 0}
-          <button class="link" style="font-size: 13px" onclick={toggleAll}>{allOn ? "全不选" : "全选"}</button>
+        {#if scan.pickable.length > 0}
+          <button class="link" style="font-size: 13px" onclick={() => scan.toggleAll()}>{scan.allOn ? "全不选" : "全选"}</button>
         {/if}
       </div>
-      {#if list.length === 0}
+      {#if scan.list.length === 0}
         <div style="padding: 36px 0; text-align: center; font-size: 14px; color: var(--fg2)">这一层没有游戏</div>
       {/if}
       <div style="display: flex; flex-direction: column; gap: 2px">
-        {#each list as g (g.id)}
-          {@const locked = isLocked(g)}
-          {@const on = !locked && !off[g.id]}
+        {#each scan.list as g (g.id)}
+          {@const locked = scanLocked(g)}
+          {@const on = scan.isOn(g)}
           <div class="row" class:on class:off={locked && !g.setup}>
             <label class="pick">
-              <input type="checkbox" checked={on} disabled={locked} onchange={() => toggle(g)} />
+              <input type="checkbox" checked={on} disabled={locked} onchange={() => scan.toggle(g)} />
               <span class="box" aria-hidden="true"><Icon name="check" size={12} stroke={2.2} /></span>
               <span style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
                 <span lang="ja" class="ell" style="font-size: 14px">{g.name}</span>
@@ -115,13 +60,13 @@
             </label>
             <span class="exe mono" style="color: var(--fg2); white-space: nowrap">{g.exe}</span>
             {#if !locked}
-              <ImportMini options={encOptions} value={encOf(g)} label="{g.name} 的编码" onpick={(v) => { enc[g.id] = v; done = false; }} />
+              <ImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label="{g.name} 的编码" onpick={(v) => scan.setEnc(g, v)} />
             {/if}
             {#if g.setup}
-              <button class="link" style="font-size: 13px" aria-label="安装 {g.name}" onclick={() => install(g)}>安装…</button>
+              <button class="link" style="font-size: 13px" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
             {/if}
             {#if locked && !g.setup}
-              <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{g.inLib ? "已在游戏库" : "未找到主程序"}</span>
+              <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{scanNote(g)}</span>
             {/if}
           </div>
         {/each}
@@ -132,9 +77,7 @@
 
 <ImportFooter width={720}>
   <button class="quiet" onclick={() => nav.back()}>取消</button>
-  <button class="primary" onclick={add} disabled={!done && chosen.length === 0}>
-    {done ? "已添加" : chosen.length ? `添加 ${chosen.length} 个游戏` : "添加"}
-  </button>
+  <button class="primary" onclick={() => scan.add()} disabled={!scan.done && scan.chosen.length === 0}>{scan.addLabel}</button>
 </ImportFooter>
 
 <style>

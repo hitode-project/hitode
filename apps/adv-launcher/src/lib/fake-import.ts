@@ -72,6 +72,28 @@ export function addScanned(picked: { found: ScanFound; enc: Enc }[]): number {
   return picked.length;
 }
 
+/* ---------- Phone storage access ---------- */
+
+let storageGranted = false;
+
+/** Android: whether the launcher may already read game folders on shared storage. */
+export function hasStoragePermission(): boolean {
+  return storageGranted;
+}
+
+/** Android: simulates the system screen granting folder access; the user comes back granted. */
+export function requestStoragePermission(): void {
+  storageGranted = true;
+}
+
+/** Space a game takes when copied into the app's own storage instead. */
+export const COPY_SIZE = "2.3 GB";
+
+/** iOS: what the Files picker returns; part of the picked game is still in iCloud. */
+export function pickFolderIos(): { name: string; inCloud: boolean } {
+  return { name: IMPORT_CANDIDATE.title, inCloud: true };
+}
+
 /* ---------- Single game ---------- */
 
 export const IMPORT_CANDIDATE = {

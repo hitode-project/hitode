@@ -3,25 +3,35 @@
     label: string;
     checked: boolean;
     onchange: (checked: boolean) => void;
+    /** The phone's larger switch. */
+    touch?: boolean;
   }
 
-  let { label, checked, onchange }: Props = $props();
+  let { label, checked, onchange, touch = false }: Props = $props();
 </script>
 
-<button class="sw" class:on={checked} role="switch" aria-checked={checked} aria-label={label} onclick={() => onchange(!checked)}></button>
+<button class="sw" class:touch class:on={checked} role="switch" aria-checked={checked} aria-label={label} onclick={() => onchange(!checked)}></button>
 
 <style>
   .sw {
+    --w: 44px;
+    --h: 26px;
+    --knob: 20px;
     all: unset;
     box-sizing: border-box;
     position: relative;
     flex: 0 0 auto;
-    width: 44px;
-    height: 26px;
-    border-radius: 13px;
+    width: var(--w);
+    height: var(--h);
+    border-radius: calc(var(--h) / 2);
     background: rgba(24, 24, 22, 0.2);
     cursor: pointer;
     transition: background 0.15s ease;
+  }
+  .sw.touch {
+    --w: 48px;
+    --h: 28px;
+    --knob: 22px;
   }
   :global(:root[data-theme="dark"]) .sw {
     background: rgba(255, 255, 255, 0.2);
@@ -31,9 +41,9 @@
     position: absolute;
     top: 3px;
     left: 3px;
-    width: 20px;
-    height: 20px;
-    border-radius: 10px;
+    width: var(--knob);
+    height: var(--knob);
+    border-radius: calc(var(--knob) / 2);
     background: #ffffff;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
     transition: transform 0.15s ease;
@@ -47,7 +57,7 @@
   }
   .sw.on::after,
   :global(:root[data-theme="dark"]) .sw.on::after {
-    transform: translateX(18px);
+    transform: translateX(calc(var(--w) - var(--knob) - 6px));
     background: var(--on-accent);
   }
   .sw:focus-visible {

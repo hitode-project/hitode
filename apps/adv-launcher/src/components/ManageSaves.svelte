@@ -2,13 +2,13 @@
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import {
-    backupNow,
     exportSaves,
     fakeSaveInfo,
     importSaves,
     KEEP_CHOICES,
     restoreBackup,
     revealFolder,
+    withNewBackup,
     type Backup,
   } from "../lib/fake-manage";
   import type { Game } from "../lib/types";
@@ -37,9 +37,8 @@
 
   function makeBackup() {
     made += 1;
-    const next = backupNow(made);
-    backups = [next, ...backups.map((b) => (b.when === "刚刚" ? { ...b, when: "1 分钟前" } : b))];
-    fresh = next.id;
+    backups = withNewBackup(backups, made);
+    fresh = backups[0]?.id ?? null;
     ask = null;
   }
 
@@ -122,6 +121,21 @@
 </div>
 
 <style>
+  /* Tokens of the manage board that app.css does not define. */
+  .dlg-scrim,
+  .dlg {
+    --seg-on: #ffffff;
+    --knob: #ffffff;
+    --off: rgba(24, 24, 22, 0.2);
+    --scrim: rgba(0, 0, 0, 0.28);
+  }
+  :global(:root[data-theme="dark"]) .dlg-scrim,
+  :global(:root[data-theme="dark"]) .dlg {
+    --seg-on: #3a3a3e;
+    --knob: #ececea;
+    --off: rgba(255, 255, 255, 0.2);
+    --scrim: rgba(0, 0, 0, 0.5);
+  }
   .dlg-scrim {
     all: unset;
     position: fixed;

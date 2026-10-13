@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /** Whether the page runs inside the Tauri shell (false in a plain browser during `pnpm dev`). */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -17,6 +18,20 @@ export interface HostInfo {
 }
 
 export function hostInfo(): Promise<HostInfo> {
-  const platform = /Mac/.test(navigator.userAgent) ? "macos" : /Windows/.test(navigator.userAgent) ? "windows" : "linux";
-  return call("host_info", {}, { platform, gameView: false });
+  return call<HostInfo | null>("host_info", {}, null).then((info) => info ?? Promise.reject(new Error("not in Tauri")));
+}
+
+/** Subscribes to an event the Rust side emits (e.g. "pause" from the menu); a no-op outside Tauri. */
+export function onHostEvent(name: string, handler: () => void): () => void {
+  if (!inTauri) return () => {};
+  let unlisten: (() => void) | null = null;
+  let dropped = false;
+  void listen(name, handler).then((stop) => {
+    if (dropped) stop();
+    else unlisten = stop;
+  });
+  return () => {
+    dropped = true;
+    unlisten?.();
+  };
 }

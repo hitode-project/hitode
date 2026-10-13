@@ -52,7 +52,14 @@ function daily(index: number, last: number | null): number[] {
 }
 
 export function fakeLibrary(): Game[] {
-  return seeds.map((s, i) => ({
+  return seeds.map((s, i) => fakeGame(s, i));
+}
+
+function fakeGame(s: Seed, i: number): Game {
+  const days = daily(i, s.last);
+  // The total covers at least the last 30 days.
+  const recent = days.reduce((sum, minutes) => sum + minutes, 0);
+  return {
     id: `g${i + 1}`,
     title: s.title,
     brand: s.brand,
@@ -62,13 +69,13 @@ export function fakeLibrary(): Game[] {
     codepage: 932,
     path: s.path ?? `~/Games/${s.title}`,
     lastPlayed: s.last === null ? null : now - s.last * DAY,
-    playMinutes: Math.round(s.hours * 60),
+    playMinutes: Math.max(Math.round(s.hours * 60), recent),
     favorite: s.favorite ?? false,
     nsfw: s.nsfw ?? false,
     offline: s.offline ?? null,
-    daily: daily(i, s.last),
+    daily: days,
     sessions30: s.sessions ?? 0,
-  }));
+  };
 }
 
 export const FAKE_NOW = now;

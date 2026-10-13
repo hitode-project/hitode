@@ -3,50 +3,11 @@
   import ImportFooter from "../components/ImportFooter.svelte";
   import ImportOption from "../components/ImportOption.svelte";
   import Icon from "../components/Icon.svelte";
-  import { addToLibrary, encChoices, IMPORT_CANDIDATE as game, type Enc, type Meta } from "../lib/fake-import";
+  import { ImportPick, metaLine } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
-  /** Index into matches, then the manual search / link row, then "no online data". */
-  const LINK = game.matches.length;
-  const NONE = LINK + 1;
-  const VNDB = /(vndb\.org\/|^)v\d+/;
-
-  let exe = $state(0);
-  let enc = $state<Enc>("ja");
-  let match = $state(0);
-  let link = $state("");
-  let res = $state(0);
-  /** Library id once added; the button then starts the game. */
-  let addedId = $state<string | null>(null);
-
-  const encs = encChoices(game.title, game.mojibake);
-  const linkOk = $derived(VNDB.test(link.trim()));
-  const linkId = $derived(/v(\d+)/.exec(link)?.[1] ?? "");
-  const searchOn = $derived(link.trim() !== "" && !linkOk);
-
-  /** Any change after adding asks to add again with the new choices. */
-  function edit(apply: () => void) {
-    apply();
-    addedId = null;
-  }
-
-  function chosenMeta(): Meta {
-    const none: Meta = { title: game.title, brand: "", year: 0, cover: "" };
-    if (match < LINK) return game.matches[match] ?? none;
-    if (match === LINK && linkOk) return game.linked;
-    if (match === LINK && searchOn) return game.results[res] ?? none;
-    return none;
-  }
-
-  function add() {
-    if (addedId) {
-      nav.replace({ name: "launch", gameId: addedId });
-      return;
-    }
-    addedId = addToLibrary(chosenMeta(), enc, game.folder);
-  }
-
-  const metaLine = (m: Meta) => `${m.brand} · ${m.year}`;
+  const pick = new ImportPick();
+  const { game, LINK, NONE } = pick;
 </script>
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
@@ -60,7 +21,7 @@
       <legend class="lbl">主程序</legend>
       <div class="stack">
         {#each game.exes as x, i (x.name)}
-          <ImportOption name="exe" checked={exe === i} onpick={() => edit(() => (exe = i))}>
+          <ImportOption name="exe" checked={pick.exe === i} onpick={() => pick.pickExe(i)}>
             <span class="mono" style="font-size: 14px; color: var(--fg)">{x.name}</span>
             <span class="side-n">{x.size}</span>
           </ImportOption>
@@ -68,13 +29,13 @@
       </div>
     </fieldset>
 
-    <ImportEncoding choices={encs} value={enc} onpick={(v) => edit(() => (enc = v))} />
+    <ImportEncoding choices={pick.encs} value={pick.enc} onpick={(v) => pick.pickEnc(v)} />
 
     <fieldset>
       <legend class="lbl">资料</legend>
       <div class="stack">
         {#each game.matches as m, i (m.title)}
-          <ImportOption name="match" checked={match === i} onpick={() => edit(() => (match = i))} style="min-height: 60px">
+          <ImportOption name="match" checked={pick.match === i} onpick={() => pick.pickMatch(i)} style="min-height: 60px">
             <span class="th"><span class="art {m.cover}"></span></span>
             <span class="two">
               <span lang="ja" class="ell" style="font-size: 14px">{m.title}</span>
@@ -82,34 +43,34 @@
             </span>
           </ImportOption>
         {/each}
-        <ImportOption name="match" checked={match === LINK} onpick={() => edit(() => (match = LINK))} style="min-height: 60px">
+        <ImportOption name="match" checked={pick.match === LINK} onpick={() => pick.pickMatch(LINK)} style="min-height: 60px">
           <span class="glyph"><Icon name="search" size={18} /></span>
           <span style="font-size: 14px">手动搜索或链接</span>
         </ImportOption>
-        {#if match === LINK}
+        {#if pick.match === LINK}
           <div class="linkbox">
             <label class="linkf">
               <input
                 type="search"
                 aria-label="搜索标题或粘贴 VNDB 链接"
                 placeholder="搜索标题，或粘贴 VNDB 链接"
-                value={link}
-                oninput={(e) => edit(() => (link = e.currentTarget.value))}
+                value={pick.link}
+                oninput={(e) => pick.setLink(e.currentTarget.value)}
               />
             </label>
-            {#if linkOk}
+            {#if pick.linkOk}
               <div style="display: flex; align-items: center; gap: 14px; min-height: 52px">
                 <span class="th"><span class="art {game.linked.cover}"></span></span>
                 <span class="two">
                   <span lang="ja" style="font-size: 14px">{game.linked.title}</span>
-                  <span class="sub"><span lang="ja">{game.linked.brand}</span> · {game.linked.year} · v{linkId}</span>
+                  <span class="sub"><span lang="ja">{game.linked.brand}</span> · {game.linked.year} · v{pick.linkId}</span>
                 </span>
               </div>
             {/if}
-            {#if searchOn}
+            {#if pick.searchOn}
               <div class="stack">
                 {#each game.results as r, i (r.title)}
-                  <button class="res" class:on={res === i} aria-pressed={res === i} onclick={() => edit(() => (res = i))}>
+                  <button class="res" class:on={pick.res === i} aria-pressed={pick.res === i} onclick={() => pick.pickRes(i)}>
                     <span class="th"><span class="art {r.cover}"></span></span>
                     <span class="two">
                       <span lang="ja" class="ell" style="font-size: 14px">{r.title}</span>
@@ -122,7 +83,7 @@
             {/if}
           </div>
         {/if}
-        <ImportOption name="match" checked={match === NONE} onpick={() => edit(() => (match = NONE))} style="min-height: 60px">
+        <ImportOption name="match" checked={pick.match === NONE} onpick={() => pick.pickMatch(NONE)} style="min-height: 60px">
           <span class="th"><span class="art cvx"></span></span>
           <span style="font-size: 14px">不使用在线资料</span>
         </ImportOption>
@@ -133,7 +94,7 @@
 
 <ImportFooter width={600}>
   <button class="quiet" onclick={() => nav.back()}>取消</button>
-  <button class="primary" onclick={add}>{addedId ? "开始游戏" : "添加到游戏库"}</button>
+  <button class="primary" onclick={() => pick.add()}>{pick.addedId ? "开始游戏" : "添加到游戏库"}</button>
 </ImportFooter>
 
 <style>

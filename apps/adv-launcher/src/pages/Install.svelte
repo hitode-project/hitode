@@ -4,79 +4,14 @@
   import ImportMini from "../components/ImportMini.svelte";
   import ImportSwitch from "../components/ImportSwitch.svelte";
   import Icon from "../components/Icon.svelte";
-  import {
-    addToLibrary,
-    defaultInstallTarget,
-    encChoices,
-    pickInstallFolder,
-    takeInstallSource,
-    type Enc,
-  } from "../lib/fake-import";
+  import { InstallFlow } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
-  type Step = "识别" | "安装中" | "完成";
-
-  const source = takeInstallSource();
-  const title = source.meta.title;
-  const disc = source.kind === "disc";
-  const encs = encChoices(title, source.mojibake);
-
-  let step = $state<Step>("识别");
-  let keep = $state(true);
-  let target = $state(defaultInstallTarget(title));
-  let pct = $state(0);
-  let exe = $state(source.exes[0] ?? "");
-  let enc = $state<Enc>("ja");
-  /** Library id once added; the button then starts the game. */
-  let addedId = $state<string | null>(null);
-
-  const finished = $derived(pct >= 100);
-  const file = $derived(source.files[Math.min(source.files.length - 1, Math.floor(pct / 26))] ?? "");
-
-  // Simulated installer run: the guest SETUP.EXE copying files.
-  let timer: ReturnType<typeof setInterval> | undefined;
-  function stopTimer() {
-    clearInterval(timer);
-    timer = undefined;
-  }
-  $effect(() => stopTimer);
-
-  function start() {
-    stopTimer();
-    pct = 0;
-    addedId = null;
-    step = "安装中";
-    timer = setInterval(() => {
-      pct = Math.min(100, pct + 3);
-      if (pct >= 100) stopTimer();
-    }, 110);
-  }
-
-  function cancelRun() {
-    stopTimer();
-    step = "识别";
-  }
-
-  /** Clicking the installer window presses its default button. */
-  function tapFrame() {
-    if (!finished) {
-      stopTimer();
-      pct = 100;
-    } else {
-      step = "完成";
-    }
-  }
-
-  function add() {
-    if (addedId) {
-      nav.replace({ name: "launch", gameId: addedId });
-      return;
-    }
-    addedId = addToLibrary(source.meta, enc, target);
-  }
+  const flow = new InstallFlow();
+  const { source, title, disc } = flow;
 </script>
 
-{#if step === "识别"}
+{#if flow.step === "识别"}
   <div class="pane fade">
     <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
       <div class="col">
@@ -108,14 +43,14 @@
         <section class="list" aria-label="安装选项">
           <div class="rw">
             <span class="k" style="flex: 0 0 auto">安装位置</span>
-            <span class="v mono" style="flex: 1 1 auto; min-width: 0; text-align: right" lang="ja">{target}</span>
-            <button class="quiet sm" style="margin-right: -12px" onclick={() => (target = pickInstallFolder(target, title))}>更改…</button>
+            <span class="v mono" style="flex: 1 1 auto; min-width: 0; text-align: right" lang="ja">{flow.target}</span>
+            <button class="quiet sm" style="margin-right: -12px" onclick={() => flow.changeTarget()}>更改…</button>
           </div>
           {#if disc}
             <div class="rw">
               <span class="k">游玩时保留光盘</span>
               <span class="v mono" style="color: var(--fg3)">{source.drive}</span>
-              <ImportSwitch checked={keep} label="游玩时保留光盘" onchange={(v) => (keep = v)} />
+              <ImportSwitch checked={flow.keep} label="游玩时保留光盘" onchange={(v) => (flow.keep = v)} />
             </div>
           {/if}
         </section>
@@ -123,18 +58,18 @@
     </main>
     <ImportFooter width={600}>
       <button class="quiet" onclick={() => nav.back()}>取消</button>
-      <button class="primary" onclick={start}>开始安装</button>
+      <button class="primary" onclick={() => flow.start()}>开始安装</button>
     </ImportFooter>
   </div>
-{:else if step === "安装中"}
+{:else if flow.step === "安装中"}
   <!-- The installer runs over the whole window, sidebar included. -->
   <div class="run fade">
     <header class="bar">
       <h1 style="margin: 0; flex: 1; font-size: 14px; font-weight: 500">正在安装</h1>
-      <button class="quiet sm" onclick={cancelRun}>取消安装</button>
+      <button class="quiet sm" onclick={() => flow.cancelRun()}>取消安装</button>
     </header>
     <main style="flex: 1 1 0; min-height: 0; display: grid; place-items: center; padding: 24px">
-      <button class="frame" onclick={tapFrame} aria-label="安装程序窗口">
+      <button class="frame" onclick={() => flow.tapFrame()} aria-label="安装程序窗口">
         <div class="w98" lang="ja" aria-hidden="true">
           <div class="tb">
             <span style="flex: 1">セットアップ</span>
@@ -144,16 +79,16 @@
           </div>
           <div class="hd">
             <div style="flex: 1; display: flex; flex-direction: column; gap: 4px">
-              <span style="font-weight: 600">{finished ? "セットアップの完了" : "インストール中"}</span>
-              <span style="padding-left: 14px">{finished ? "すべてのファイルがインストールされました。" : "ファイルをコピーしています。しばらくお待ちください。"}</span>
+              <span style="font-weight: 600">{flow.finished ? "セットアップの完了" : "インストール中"}</span>
+              <span style="padding-left: 14px">{flow.finished ? "すべてのファイルがインストールされました。" : "ファイルをコピーしています。しばらくお待ちください。"}</span>
             </div>
             <span style="width: 40px; height: 40px; flex: 0 0 auto; background: linear-gradient(135deg, #7fa7d9, #2b4f8f)"></span>
           </div>
-          {#if !finished}
+          {#if !flow.finished}
             <div class="bd">
-              <span>コピー中: {file}</span>
-              <div class="wbar"><span class="fill" style="width: {pct}%"></span></div>
-              <span style="align-self: flex-end">{pct}%</span>
+              <span>コピー中: {flow.file}</span>
+              <div class="wbar"><span class="fill" style="width: {flow.pct}%"></span></div>
+              <span style="align-self: flex-end">{flow.pct}%</span>
             </div>
           {:else}
             <div class="bd" style="padding-top: 26px">
@@ -163,8 +98,8 @@
           {/if}
           <div class="ft">
             <span class="btn dis">&lt; 戻る(B)</span>
-            <span class="btn" class:def={finished} class:dis={!finished}>{finished ? "完了" : "次へ(N) >"}</span>
-            <span class="btn" class:dis={finished}>キャンセル</span>
+            <span class="btn" class:def={flow.finished} class:dis={!flow.finished}>{flow.finished ? "完了" : "次へ(N) >"}</span>
+            <span class="btn" class:dis={flow.finished}>キャンセル</span>
           </div>
         </div>
       </button>
@@ -180,7 +115,7 @@
             <span style="font-size: 13px; color: var(--fg2)">安装完成</span>
           </div>
           <h1 lang="ja">{title}</h1>
-          <div class="mono" lang="ja" style="margin-top: 8px">{target} · {source.installedSize}</div>
+          <div class="mono" lang="ja" style="margin-top: 8px">{flow.target} · {source.installedSize}</div>
         </header>
 
         <section class="list" aria-label="游戏信息">
@@ -188,36 +123,30 @@
             <span class="k" id="i-exe">主程序</span>
             <ImportMini
               options={source.exes.map((name) => ({ value: name, label: name }))}
-              value={exe}
+              value={flow.exe}
               labelledby="i-exe"
               mono
-              onpick={(v) => {
-                exe = v;
-                addedId = null;
-              }}
+              onpick={(v) => flow.pickExe(v)}
             />
           </div>
           {#if disc}
             <div class="rw">
               <span class="k">光盘</span>
-              <span class="v mono">{keep ? `${source.drive} ${source.label}` : "不保留"}</span>
+              <span class="v mono">{flow.discLine}</span>
             </div>
           {/if}
         </section>
 
         <ImportEncoding
-          choices={encs}
-          value={enc}
+          choices={flow.encs}
+          value={flow.enc}
           compact
-          onpick={(v) => {
-            enc = v;
-            addedId = null;
-          }}
+          onpick={(v) => flow.pickEnc(v)}
         />
       </div>
     </main>
     <ImportFooter width={600}>
-      <button class="primary" onclick={add}>{addedId ? "开始游戏" : "添加到游戏库"}</button>
+      <button class="primary" onclick={() => flow.add()}>{flow.addedId ? "开始游戏" : "添加到游戏库"}</button>
     </ImportFooter>
   </div>
 {/if}

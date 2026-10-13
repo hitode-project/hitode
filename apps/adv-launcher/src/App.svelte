@@ -1,6 +1,6 @@
 <script lang="ts">
   import Sidebar from "./components/Sidebar.svelte";
-  import { hostInfo, type HostInfo } from "./lib/bridge";
+  import { device } from "./lib/device.svelte";
   import { nav } from "./lib/nav.svelte";
   import { setGameActive } from "./lib/overlay";
   import { prefs } from "./lib/prefs.svelte";
@@ -14,9 +14,15 @@
   import Scan from "./pages/Scan.svelte";
   import Settings from "./pages/Settings.svelte";
   import Stats from "./pages/Stats.svelte";
-
-  let host = $state<HostInfo | null>(null);
-  hostInfo().then((info) => (host = info));
+  import PhoneGameSettings from "./phone/GameSettings.svelte";
+  import PhoneImport from "./phone/Import.svelte";
+  import PhoneInstall from "./phone/Install.svelte";
+  import PhoneLaunch from "./phone/Launch.svelte";
+  import PhoneLibrary from "./phone/Library.svelte";
+  import PhoneReport from "./phone/Report.svelte";
+  import PhoneScan from "./phone/Scan.svelte";
+  import PhoneSettings from "./phone/Settings.svelte";
+  import PhoneStats from "./phone/Stats.svelte";
 
   let systemDark = $state(matchMedia("(prefers-color-scheme: dark)").matches);
   $effect(() => {
@@ -35,17 +41,42 @@
     root.dataset.theme = prefs.theme === "system" ? (systemDark ? "dark" : "light") : prefs.theme;
     root.dataset.accent = prefs.accent;
     root.dataset.screen = route.name;
-    if (host) root.dataset.platform = host.platform;
+    root.dataset.platform = device.platform;
+    root.dataset.device = device.phone ? "phone" : "desktop";
+    if (device.simulated) root.dataset.simulated = "";
   });
 
   $effect(() => setGameActive(route.name === "game"));
 </script>
 
-{#if fullscreen}
+{#if route.name === "game"}
+  <Game gameId={route.gameId} gameView={device.gameView} phone={device.phone} />
+{:else if device.phone}
+  <!-- Phone screens fill the window; there is no sidebar. -->
+  <div class="phone">
+    {#if route.name === "library"}
+      <PhoneLibrary filter={route.filter} />
+    {:else if route.name === "stats"}
+      <PhoneStats />
+    {:else if route.name === "import"}
+      <PhoneImport />
+    {:else if route.name === "scan"}
+      <PhoneScan />
+    {:else if route.name === "install"}
+      <PhoneInstall />
+    {:else if route.name === "settings"}
+      <PhoneSettings />
+    {:else if route.name === "game-settings"}
+      <PhoneGameSettings gameId={route.gameId} />
+    {:else if route.name === "launch"}
+      <PhoneLaunch gameId={route.gameId} />
+    {:else if route.name === "report"}
+      <PhoneReport gameId={route.gameId} />
+    {/if}
+  </div>
+{:else if fullscreen}
   {#if route.name === "launch"}
     <Launch gameId={route.gameId} />
-  {:else if route.name === "game"}
-    <Game gameId={route.gameId} gameView={host?.gameView ?? false} />
   {:else if route.name === "report"}
     <Report gameId={route.gameId} />
   {/if}
@@ -77,6 +108,15 @@
     position: relative;
     height: 100%;
     display: flex;
+    background: var(--bg);
+    color: var(--fg);
+    overflow: hidden;
+  }
+  .phone {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
     background: var(--bg);
     color: var(--fg);
     overflow: hidden;

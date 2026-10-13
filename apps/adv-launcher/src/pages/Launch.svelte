@@ -1,23 +1,8 @@
-<script lang="ts" module>
-  /** The states of the launch screen; the game screen routes a crash here as "failed". */
-  export type LaunchState = "prepare" | "failed" | "unsupported";
-
-  // Fake outcomes until the Rust side reports them: g4 stops after preparing,
-  // g5 is a 64-bit program; every other game starts.
-  const FAILS = "g4";
-  const UNSUPPORTED = "g5";
-  const UNSUPPORTED_REASON = "64 位程序";
-
-  /** What launching `gameId` leads to before any preparation runs. */
-  export function launchStart(gameId: string): LaunchState {
-    return gameId === UNSUPPORTED ? "unsupported" : "prepare";
-  }
-</script>
-
 <script lang="ts">
   import { untrack } from "svelte";
   import ReportBackdrop from "../components/ReportBackdrop.svelte";
   import { FAKE_FAILURE_LABEL } from "../lib/fake-report";
+  import { LaunchFlow, UNSUPPORTED_REASON, type LaunchState } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
@@ -30,45 +15,7 @@
   let { gameId, initial }: Props = $props();
 
   const game = $derived(library.get(gameId));
-  let view = $state<LaunchState>(untrack(() => initial ?? launchStart(gameId)));
-  let pct = $state(0);
-  /** Bumped by 再试一次 to restart the preparation. */
-  let run = $state(0);
-
-  // Fake first-run preparation: steady progress, then the game screen.
-  $effect(() => {
-    if (view !== "prepare") return;
-    void run;
-    let p = 0;
-    pct = 0;
-    const timer = setInterval(() => {
-      p = Math.min(100, p + 2 + ((p * 7) % 5));
-      pct = p;
-      if (p < 100) return;
-      clearInterval(timer);
-      setTimeout(finish, 400);
-    }, 90);
-    let done = false;
-    function finish() {
-      if (done) return;
-      if (gameId === FAILS) view = "failed";
-      else nav.replace({ name: "game", gameId });
-    }
-    return () => {
-      done = true;
-      clearInterval(timer);
-    };
-  });
-
-  function retry() {
-    view = "prepare";
-    run += 1;
-  }
-
-  // Replaces this screen so leaving the report does not relaunch the game.
-  function report() {
-    nav.replace({ name: "report", gameId });
-  }
+  const flow = new LaunchFlow(() => gameId, untrack(() => initial));
 </script>
 
 <div class="launch">
@@ -79,7 +26,7 @@
       <div class="cv"><div class="art {game.cover}" class:blur={game.nsfw && prefs.blurAdult && !library.revealed[game.id]}></div></div>
       <h1 lang="ja">{game.title}</h1>
 
-      {#if view === "prepare"}
+      {#if flow.view === "prepare"}
         <div class="state fade">
           <div class="msg">首次准备中</div>
           <div
@@ -88,21 +35,21 @@
             aria-label="首次准备"
             aria-valuemin="0"
             aria-valuemax="100"
-            aria-valuenow={pct}
+            aria-valuenow={flow.pct}
             style="margin-top: 32px"
           >
-            <span class="fill" style="width: {pct}%"></span>
+            <span class="fill" style="width: {flow.pct}%"></span>
           </div>
-          <div class="pct">{pct}%</div>
+          <div class="pct">{flow.pct}%</div>
           <div style="margin-top: 36px"><button class="btn quiet" onclick={() => nav.back()}>取消</button></div>
         </div>
-      {:else if view === "failed"}
+      {:else if flow.view === "failed"}
         <div class="state fade">
           <div class="msg">游戏已停止</div>
           <div class="mono why">{FAKE_FAILURE_LABEL}</div>
           <div class="acts">
-            <button class="btn primary" onclick={retry}>再试一次</button>
-            <button class="btn quiet" onclick={report}>报告问题…</button>
+            <button class="btn primary" onclick={() => flow.retry()}>再试一次</button>
+            <button class="btn quiet" onclick={() => flow.report()}>报告问题…</button>
             <button class="btn quiet" onclick={() => nav.back()}>返回</button>
           </div>
         </div>
@@ -112,7 +59,7 @@
           <div class="mono why">{UNSUPPORTED_REASON}</div>
           <div class="acts">
             <button class="btn primary" onclick={() => nav.back()}>返回</button>
-            <button class="btn quiet" onclick={() => nav.replace({ name: "game-settings", gameId })}>更换主程序</button>
+            <button class="btn quiet" onclick={() => flow.changeExe()}>更换主程序</button>
           </div>
         </div>
       {/if}
