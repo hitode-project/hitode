@@ -1,3 +1,5 @@
+import type { RunSummary } from "./host";
+
 /** Why a library entry cannot be launched right now. */
 export type Offline = "disk" | "missing";
 
@@ -23,6 +25,10 @@ export interface Game {
   offline: Offline | null;
   /** Minutes played on each of the last 30 days, oldest first. */
   daily: number[];
+  /** Seconds played per local day ("YYYY-MM-DD"), all of it; empty in the browser preview. */
+  history: Record<string, number>;
+  /** Run summary of the last run, kept across restarts; null if none was recorded. */
+  lastSummary: RunSummary | null;
   sessions30: number;
 }
 

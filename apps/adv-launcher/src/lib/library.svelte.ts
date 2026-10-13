@@ -1,6 +1,7 @@
 import { inTauri, onHostEvent } from "./bridge";
 import { fakeLibrary } from "./fake";
 import { libraryInspect, libraryList, libraryPickFolder, libraryRemove, libraryRestore, libraryUpdate, type LibraryGame } from "./host";
+import { minutesByDay } from "./stats";
 import type { Game, LibraryFilter } from "./types";
 
 const COVERS = 12;
@@ -10,24 +11,6 @@ export function placeholderCover(id: string): string {
   let h = 2166136261;
   for (const ch of id) h = Math.imul(h ^ (ch.codePointAt(0) ?? 0), 16777619);
   return `cv${((h >>> 0) % COVERS) + 1}`;
-}
-
-/** Local midnight of the day containing `time`. */
-function dayStart(time: number): number {
-  const d = new Date(time);
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-}
-
-/** Minutes played on each of the 30 local days ending today, oldest first; a session counts on the day it ended. */
-export function dailyMinutes(sessions: LibraryGame["sessions"], now: number): number[] {
-  const seconds = Array.from({ length: 30 }, () => 0);
-  const today = dayStart(now);
-  for (const s of sessions) {
-    // Whole days between the two midnights; rounding absorbs daylight-saving shifts.
-    const ago = Math.round((today - dayStart(s.ended)) / 86_400_000);
-    if (ago >= 0 && ago < 30) seconds[29 - ago] = (seconds[29 - ago] ?? 0) + s.seconds;
-  }
-  return seconds.map((s) => Math.round(s / 60));
 }
 
 /** The page model of a library entry; brand, year and engine have no source yet. */
@@ -47,7 +30,9 @@ export function toGame(g: LibraryGame, now: number): Game {
     favorite: g.favorite,
     nsfw: g.nsfw,
     offline: g.offline,
-    daily: dailyMinutes(g.sessions, now),
+    daily: minutesByDay(g.daily, now, 0, 30),
+    history: g.daily,
+    lastSummary: g.lastRun?.summary ?? null,
     sessions30: g.sessions.length,
   };
 }

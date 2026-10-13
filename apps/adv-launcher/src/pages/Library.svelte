@@ -7,6 +7,7 @@
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { canReveal, reveal } from "../lib/reveal";
   import type { Game, LibraryFilter } from "../lib/types";
 
   let { filter }: { filter: LibraryFilter } = $props();
@@ -238,6 +239,12 @@
             {#if game.engine}<dt>引擎</dt><dd>{game.engine}</dd>{/if}
             <dt>编码</dt><dd>{codepageLabel(game.codepage)}</dd>
           </dl>
+          {#if canReveal()}
+            <button class="quiet locate" title={game.path} disabled={game.offline !== null} onclick={() => reveal(game.path)}>
+              <Icon name="folder" size={15} />
+              <span>在访达中显示</span>
+            </button>
+          {/if}
           {#if game.lastPlayed !== null}
             <div style="margin-top: 24px">
               <div class="trend-head"><span>近 30 天</span><span>{game.sessions30} 次</span></div>
@@ -502,6 +509,18 @@
   .remove {
     align-self: flex-start;
     margin: 12px 0 0 -8px;
+  }
+  .locate {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    margin: 10px 0 0 -8px;
+  }
+  .locate[disabled] {
+    opacity: 0.4;
+    cursor: default;
+    background: none;
   }
   .rule {
     height: 1px;

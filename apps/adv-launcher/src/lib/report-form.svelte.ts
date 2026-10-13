@@ -1,4 +1,4 @@
-import { call, inTauri } from "./bridge";
+import { call } from "./bridge";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
 import type { RunSummary } from "./host";
@@ -189,9 +189,8 @@ export class ReportForm {
     const report = this.report;
     if (!report || this.sending) return;
     this.view = "sending";
-    // There is no report service yet: inside the app sending always fails,
-    // which offers saving the report as a file instead.
-    this.view = inTauri ? "error" : await fakeSubmit(report);
+    // There is no report service yet: only the browser preview offers sending.
+    this.view = await fakeSubmit(report);
   }
 
   async save(): Promise<void> {

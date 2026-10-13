@@ -1,8 +1,8 @@
 import type { Game } from "./types";
 
-// Play statistics as pure functions of the library. The host keeps play
-// sessions for the last 30 days only (`Game.daily`); older days are empty in
-// the app and faked below for the browser preview.
+// Play statistics as pure functions of the library. The host keeps seconds
+// played per local day for good (`Game.history`); the browser preview fakes
+// the days before its 30-day window instead.
 
 export type StatsRange = "week" | "month" | "year";
 
@@ -172,7 +172,7 @@ export function defaultBucket(buckets: StatsBucket[]): number {
 }
 
 /** Play logs for the library: older days (from `older`) followed by `Game.daily`. */
-export function playLogs(games: Game[], now: number, older: (game: Game, now: number) => number[] = noOlderDays): PlayLog[] {
+export function playLogs(games: Game[], now: number, older: (game: Game, now: number) => number[] = historyOlderDays): PlayLog[] {
   return games.map((game) => ({ game, days: [...older(game, now), ...game.daily] }));
 }
 
@@ -181,9 +181,25 @@ export function playLogs(games: Game[], now: number, older: (game: Game, now: nu
 /** Days of fake history before `Game.daily`: back past January 1 of last year. */
 const HISTORY_DAYS = 700;
 
-/** No play recorded before the 30-day window: what the host knows. */
-export function noOlderDays(): number[] {
-  return Array.from({ length: HISTORY_DAYS }, () => 0);
+/** Local "YYYY-MM-DD" of the day `ago` days before the one containing `now`. */
+function localDay(now: number, ago: number): string {
+  const d = new Date(now);
+  const day = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ago);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`;
+}
+
+/**
+ * Minutes played on `count` local days, oldest first, ending `from` days
+ * before today, from the host's seconds per "YYYY-MM-DD".
+ */
+export function minutesByDay(daily: Record<string, number>, now: number, from: number, count: number): number[] {
+  return Array.from({ length: count }, (_, i) => Math.round((daily[localDay(now, from + count - 1 - i)] ?? 0) / 60));
+}
+
+/** The days before the 30-day window from the host's per-day record. */
+export function historyOlderDays(game: Game, now: number): number[] {
+  return minutesByDay(game.history, now, game.daily.length, HISTORY_DAYS);
 }
 
 /**

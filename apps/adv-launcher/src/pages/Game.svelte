@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent } from "../lib/bridge";
+  import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { modal, onOverlayInput, region, type Rect } from "../lib/overlay";
@@ -122,10 +123,24 @@
     }
   }
 
-  /** Without a native game view (a browser preview) there is no game to close. */
+  /** Asked once, the game quits on its own terms; asked again, it is forced. */
+  const stopping = $derived(runs.stopping[gameId] === true);
+
+  /**
+   * Asks the game to quit and stays here: game_finished leaves this screen.
+   * Without a native game view (a browser preview) there is no game to close.
+   */
   function quit() {
-    nav.home();
+    if (gameView) void runs.stop(gameId);
+    else nav.home();
   }
+
+  // The game is paused while the pause menu is open; once a quit is
+  // requested the host resumes it so it can answer.
+  $effect(() => {
+    if (!gameView || view === "closed" || stopping) return;
+    return pauser.hold();
+  });
 
   function onkeydown(event: KeyboardEvent) {
     if (event.key !== "Escape" || event.isComposing) return;
@@ -227,13 +242,7 @@
           </div>
           <div class="sep"></div>
           <div class="group" style="padding-bottom: 10px">
-            {#if gameView}
-              <!-- The host has no command to close a running game yet; the game quits from its own menu. -->
-              <button class="qrow" disabled aria-describedby="pz-quit-in-game">退出游戏</button>
-              <div id="pz-quit-in-game" class="qnote">请在游戏内退出</div>
-            {:else}
-              <button class="qrow danger" onclick={() => (view = "confirm")}>退出游戏</button>
-            {/if}
+            <button class="qrow danger" onclick={() => (view = "confirm")}>退出游戏</button>
           </div>
         </div>
       {:else}
@@ -243,13 +252,13 @@
           {#if phone}
             <div style="flex: 1"></div>
             <div style="display: flex; flex-direction: column; gap: 8px">
-              <button class="danger-btn" onclick={quit}>退出</button>
+              <button class="danger-btn" onclick={quit}>{stopping ? "强制结束" : "退出"}</button>
               <button class="secondary" onclick={() => (view = "menu")}>取消</button>
             </div>
           {:else}
             <div style="display: flex; gap: 8px; margin-top: 18px">
               <button class="secondary" style="flex: 1" onclick={() => (view = "menu")}>取消</button>
-              <button class="danger-btn" style="flex: 1" onclick={quit}>退出</button>
+              <button class="danger-btn" style="flex: 1" onclick={quit}>{stopping ? "强制结束" : "退出"}</button>
             </div>
           {/if}
         </div>
@@ -631,16 +640,6 @@
   }
   .qrow.danger {
     color: var(--danger);
-  }
-  .qrow:disabled {
-    color: var(--fg3);
-    cursor: default;
-    background: none;
-  }
-  .qnote {
-    padding: 0 10px 4px;
-    font-size: 12px;
-    color: var(--fg3);
   }
   .qrow.danger:hover {
     background: rgba(255, 139, 126, 0.1);

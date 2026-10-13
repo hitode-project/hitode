@@ -1,6 +1,7 @@
 <script lang="ts">
   import PhoneReportResult from "../components/PhoneReportResult.svelte";
-  import { runs } from "../lib/launch.svelte";
+  import { inTauri } from "../lib/bridge";
+  import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
@@ -10,8 +11,14 @@
   let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const form = new ReportForm(() => game, () => runs.summaries[gameId], true);
+  const form = new ReportForm(() => game, () => runs.summaryOf(gameId), true);
   const ctx = $derived(form.context);
+
+  // A report opened during play (from the pause menu) keeps the game paused.
+  $effect(() => {
+    if (runs.running === null) return;
+    return pauser.hold();
+  });
   const sending = $derived(form.sending);
 
   function close() {
@@ -154,14 +161,17 @@
       </main>
 
       <footer class="foot">
-        <button class="secondary big" onclick={() => form.save()} disabled={sending}>保存为文件</button>
-        <button class="primary big" onclick={() => form.submit()} disabled={sending}>
-          {#if sending}
-            <span class="spin" aria-hidden="true"></span><span>正在提交</span>
-          {:else}
-            <span>匿名提交</span>
-          {/if}
-        </button>
+        <button class={inTauri ? "primary big" : "secondary big"} onclick={() => form.save()} disabled={sending}>保存为文件</button>
+        <!-- There is no report service yet: inside the app a report is saved as a file. -->
+        {#if !inTauri}
+          <button class="primary big" onclick={() => form.submit()} disabled={sending}>
+            {#if sending}
+              <span class="spin" aria-hidden="true"></span><span>正在提交</span>
+            {:else}
+              <span>匿名提交</span>
+            {/if}
+          </button>
+        {/if}
       </footer>
     </div>
   {:else if form.view === "sent"}
