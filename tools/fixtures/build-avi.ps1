@@ -1,3 +1,13 @@
+<#
+Build authored x86 AVI lifetime and native-only open-error probes with LLVM and the Windows SDK.
+Inputs: avi_lifecycle.c and synthetic missing, empty, corrupt, and truncated files.
+Lifecycle checks compare balanced Init/Exit calls and stack deltas, excluding undefined EAX.
+Run from the repository root: ./tools/fixtures/build-avi.ps1
+Run fixture_avi_lifecycle.exe or fixture_avi_errors.exe from the output directory.
+Each executable writes avi-report.bin in its working directory.
+Default binaries: target/avi-tests. Neither probe uses game data, a window, or audio.
+Guest comparison: cargo test -p adv-runtime --test avi
+#>
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/avi-tests'),
     [string]$LlvmBin = 'C:\Program Files\LLVM\bin',

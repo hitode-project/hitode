@@ -142,7 +142,7 @@ fn adapter_and_child_share_ansi_unicode_profile_without_hardware_identity_or_own
             assert_eq!(text(&bytes, 4, 32, wide), PRIMARY_DEVICE_NAME);
             assert_eq!(
                 text(&bytes, label, 128, wide),
-                "adv-host virtual display adapter"
+                "hitode virtual display adapter"
             );
             assert_eq!(
                 u32::from_le_bytes(bytes[state..state + 4].try_into().unwrap()),
@@ -163,7 +163,7 @@ fn adapter_and_child_share_ansi_unicode_profile_without_hardware_identity_or_own
         );
         let bytes = raw(&machine, output);
         assert_eq!(text(&bytes, 4, 32, wide), r"\\.\DISPLAY1\Monitor0");
-        assert_eq!(text(&bytes, label, 128, wide), "adv-host virtual monitor");
+        assert_eq!(text(&bytes, label, 128, wide), "hitode virtual monitor");
         assert_eq!(
             u32::from_le_bytes(bytes[state..state + 4].try_into().unwrap()),
             3

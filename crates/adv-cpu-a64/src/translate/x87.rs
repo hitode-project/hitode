@@ -790,6 +790,7 @@ mod tests {
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
     }
 
+    // spec: A64-FP-2
     #[test]
     fn plans_take_the_fast_forms_with_their_operands() {
         let load = plan(

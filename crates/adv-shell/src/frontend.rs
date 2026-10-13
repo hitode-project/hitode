@@ -1,4 +1,4 @@
-//! UI owns the native window. The execution worker owns the entire guest machine.
+//! UI presents the native game view. The execution worker owns the guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
 #[cfg(not(target_os = "macos"))]
@@ -11,6 +11,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use std::{cell::RefCell, rc::Rc};
+/// Owner of the native menu and dialog projection the sinks are given to.
+#[cfg(target_os = "macos")]
+type SinkTarget = window::Projection;
+#[cfg(not(target_os = "macos"))]
+type SinkTarget = window::Window;
 
 enum Request {
     Hide,
@@ -41,6 +46,14 @@ pub struct Worker {
     metrics_dropped: Arc<AtomicU64>,
 }
 pub struct Ui {
+    #[cfg(target_os = "macos")]
+    next: Instant,
+    #[cfg(target_os = "macos")]
+    pub(crate) menu_changed: bool,
+    #[cfg(target_os = "macos")]
+    pub(crate) dialog_changed: bool,
+    #[cfg(target_os = "macos")]
+    repaint: bool,
     events: Rc<RefCell<spsc::Producer<Delivery>>>,
     requests: spsc::Consumer<Request>,
     frames: Option<FrameConsumer>,
@@ -81,6 +94,14 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             metrics_dropped: metrics_dropped.clone(),
         },
         Ui {
+            #[cfg(target_os = "macos")]
+            next: Instant::now(),
+            #[cfg(target_os = "macos")]
+            menu_changed: false,
+            #[cfg(target_os = "macos")]
+            dialog_changed: false,
+            #[cfg(target_os = "macos")]
+            repaint: false,
             events: Rc::new(RefCell::new(events)),
             requests: requests_rx,
             frames: Some(frames_rx),
@@ -196,7 +217,7 @@ impl Ui {
                     continue;
                 }
                 #[cfg(target_os = "macos")]
-                window::Event::AudioSuspended(_) => {}
+                window::Event::AudioSuspended(_) | window::Event::Text(..) => {}
                 #[cfg(target_os = "macos")]
                 window::Event::ForceClose => {
                     self.stopped.store(true, Ordering::Release);
@@ -217,11 +238,91 @@ impl Ui {
         }
         Ok(repaint)
     }
-    pub fn run<T>(
-        &mut self,
-        window: &mut window::Window,
-        done: &mut spsc::Consumer<T>,
-    ) -> Result<T, String> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn post_text(&mut self, text: &str) -> usize {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        if self.input(window::Event::Text(text.into(), reply)).is_err() {
+            return 0;
+        }
+        result.recv().unwrap_or(0)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn input(&mut self, event: window::Event) -> Result<(), String> {
+        self.repaint |= self.pump_events(vec![event], Instant::now())?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tick(&mut self, window: &window::GameView) -> Result<Option<Instant>, String> {
+        while let Some(request) = self.requests.pop() {
+            match request {
+                Request::Hide => window.hide(),
+                Request::Input(m, w, l) => window.post_input(m, w, l)?,
+            }
+        }
+        self.menu_changed |= self.menus.update();
+        let had_dialogs = !self.dialogs.current().dialogs.is_empty();
+        if self.dialogs.update() {
+            self.dialog_changed = true;
+            if !had_dialogs && !self.dialogs.current().dialogs.is_empty() {
+                // Physical focus moves to the native controls; their key
+                // releases no longer pass through the canvas procedure.
+                self.keys.release_all();
+            }
+        }
+        window.presentation(self.menus.current(), self.dialogs.current())?;
+        let started = Instant::now();
+        let events = window.take_events();
+        self.repaint |= self.pump_events(events, started)?;
+        if let Some(native) = &mut self.native {
+            let completed = native.poll()?;
+            if let Some(completed) = completed {
+                self.metric(Delivery::Native(completed.stats));
+                self.repaint |= window.native_canvas(completed.rendered.canvas)?;
+                window.set_video_cursor_regions(completed.rendered.cursor_regions);
+                if matches!(
+                    completed.rendered.result,
+                    crate::native_gpu::DrawResult::Presented
+                ) {
+                    self.metric(Delivery::Present(
+                        completed.rendered.serial,
+                        completed.elapsed,
+                        completed.at,
+                    ));
+                }
+            }
+            let native = self.native.as_mut().unwrap();
+            let dimensions = window.native_client_size()?;
+            if Instant::now() >= self.next
+                && (native.has_update() || self.repaint)
+                && native.schedule(dimensions, self.repaint)?
+            {
+                self.repaint = false;
+                self.next = window.next_refresh();
+            }
+        }
+        self.deadline(window)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {
+        let Some(native) = &self.native else {
+            return Ok(None);
+        };
+        Ok(refresh_deadline(
+            self.next,
+            native.in_flight(),
+            native.has_update() || self.repaint,
+            window.native_client_size()?,
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn menu_snapshot(&self) -> &MenuBar {
+        self.menus.current()
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn dialog_snapshot(&self) -> &DialogSet {
+        self.dialogs.current()
+    }
+    pub(crate) fn install_sinks(&self, window: &mut SinkTarget) {
         // Menu modal dispatch still runs on this UI thread. Its callbacks can
         // enqueue events immediately without waiting for the outer paint loop.
         let events = self.events.clone();
@@ -244,6 +345,14 @@ impl Ui {
             execution_wake.signal();
             Ok(())
         }));
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn run<T>(
+        &mut self,
+        window: &mut window::Window,
+        done: &mut spsc::Consumer<T>,
+    ) -> Result<T, String> {
+        self.install_sinks(window);
         let mut next = window.next_refresh();
         #[cfg(not(target_os = "macos"))]
         let mut snapshot = Snapshot::default();
@@ -354,6 +463,15 @@ impl Ui {
         self.wake.clone()
     }
 }
+#[cfg(target_os = "macos")]
+fn refresh_deadline(
+    next: Instant,
+    in_flight: bool,
+    dirty: bool,
+    dimensions: (u32, u32),
+) -> Option<Instant> {
+    (!in_flight && dirty && dimensions.0 != 0 && dimensions.1 != 0).then_some(next)
+}
 impl Drop for Ui {
     fn drop(&mut self) {
         self.keys.release_all();
@@ -378,6 +496,22 @@ pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-SES-2
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tick_deadline_is_only_armed_for_a_visible_pending_refresh() {
+        let next = Instant::now() + Duration::from_millis(16);
+        assert_eq!(refresh_deadline(next, false, true, (320, 240)), Some(next));
+        assert_eq!(refresh_deadline(next, false, false, (320, 240)), None);
+        assert_eq!(refresh_deadline(next, true, true, (320, 240)), None);
+        assert_eq!(refresh_deadline(next, false, true, (0, 0)), None);
+        let overdue = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            refresh_deadline(overdue, false, true, (320, 240)),
+            Some(overdue)
+        );
+    }
+    // spec: HOST-SES-3
     #[test]
     fn menu_mailbox_coalesces_and_commands_use_the_existing_waking_input_channel() {
         let wake = WakeEvent::new().unwrap();
@@ -423,6 +557,26 @@ mod tests {
         assert_eq!(keys.get(0x11), 0, "menu clicks do not change physical Ctrl");
     }
 
+    // spec: HOST-SES-4
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_text_uses_input_delivery_and_returns_the_guest_count() {
+        let wake = WakeEvent::new().unwrap();
+        let (mut worker, mut ui) = channel(wake.clone(), Arc::new(KeyState::default())).unwrap();
+        let execution = std::thread::spawn(move || {
+            assert!(wake.wait(Some(Duration::from_secs(1))).unwrap());
+            let events = worker.pump(&mut performance::Performance::default());
+            let window::Event::Text(text, reply) = &events[0] else {
+                panic!("expected text input")
+            };
+            assert_eq!(text, "あいう");
+            reply.send(2).unwrap();
+        });
+        assert_eq!(ui.post_text("あいう"), 2);
+        execution.join().unwrap();
+    }
+
+    // spec: HOST-SES-2
     #[test]
     fn repaint_and_telemetry_do_not_wake_execution_but_real_input_does() {
         let wake = WakeEvent::new().unwrap();
@@ -478,6 +632,7 @@ mod tests {
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
     }
 
+    // spec: HOST-SES-3
     #[test]
     fn saturated_telemetry_keeps_reserved_input_capacity_and_reports_drops() {
         let wake = WakeEvent::new().unwrap();

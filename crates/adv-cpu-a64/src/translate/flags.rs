@@ -1,4 +1,4 @@
-//! The x86 flags as the translator tracks them (§A3).
+//! The x86 flags as the translator tracks them (A64-FLAG-1 to A64-FLAG-5).
 //!
 //! SF ZF OF always live in NZCV. CF lives in NZCV's C in a tracked carry
 //! sense, or lazily as a `Carry` over values still in registers, which lets
@@ -53,7 +53,7 @@ impl FlagSet {
     }
 }
 
-/// How NZCV's C encodes CF (§A3.1).
+/// How NZCV's C encodes CF (A64-FLAG-1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sense {
     /// C is NOT CF, as after `subs`: the canonical sense at exits.
@@ -72,7 +72,7 @@ pub enum Operand {
     Imm(u32),
 }
 
-/// Where PF and AF come from (§A3.3): PF from the low byte of a result and
+/// Where PF and AF come from (A64-FLAG-5): PF from the low byte of a result and
 /// AF from bit 4 of left ^ right ^ result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recipe {
@@ -178,7 +178,7 @@ impl Recipe {
     }
 }
 
-/// Where CF is (§A3.1).
+/// Where CF is (A64-FLAG-1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carry {
     /// NZCV's C in the tracked sense.
@@ -222,6 +222,7 @@ impl Carry {
 mod tests {
     use super::*;
 
+    // spec: A64-FLAG-1
     #[test]
     fn lazy_carries_match_x86_cf() {
         let regs = [0xffff_fff0u32, 0x20, 0, 5];
@@ -251,6 +252,7 @@ mod tests {
         assert_eq!(Carry::Host.evaluate(value), None);
     }
 
+    // spec: A64-FLAG-1
     #[test]
     fn condition_codes_read_their_flags() {
         assert_eq!(FlagSet::of(ConditionCode::a), FlagSet::CF.or(FlagSet::ZF));

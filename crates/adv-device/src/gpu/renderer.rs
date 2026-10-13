@@ -1307,7 +1307,7 @@ impl Gpu {
         // uses (x+0.5)*(src-1)/(dst-1)-0.5 for a magnified axis; UVs therefore
         // start at zero, with the far edge below one. A one-texel source axis
         // always samples its center. REF rejects this filtered profile; see
-        // tools/fixtures/d3d9-stretch-native.md for the measured contract.
+        // tools/fixtures/d3d9-stretch-native.c for the measured contract.
         let coordinates = |src: u32, dst: u32| {
             if dst <= src {
                 (0., 1.)

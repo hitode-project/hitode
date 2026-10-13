@@ -131,6 +131,7 @@ fn message_extra_info_is_thread_local_and_only_successful_peeks_replace_it() {
 }
 
 #[test]
+// spec: PERS-SCOPE-10
 fn queued_down_remains_down_after_live_release_until_this_thread_removes_up() {
     let (mut machine, memory, live) = fixture();
     live.set(0x41, true);
@@ -275,6 +276,7 @@ fn keyboard_output_fault_checks_the_full_span_and_preserves_its_writable_prefix(
 }
 
 #[test]
+// spec: PERS-SCOPE-10
 fn set_keyboard_state_changes_only_this_queue_and_preserves_pending_input() {
     let (mut machine, memory, live) = fixture();
     let input = memory + 256;

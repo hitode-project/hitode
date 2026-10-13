@@ -270,6 +270,7 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
 }
 
 #[test]
+// spec: PERS-BRIDGE-1
 fn temp_path_mutations_diagnose_bypasses_directory_opens_ignore_create_hooks_and_profiles_route_close()
  {
     for mode in 0..3 {

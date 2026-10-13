@@ -100,6 +100,7 @@ fn video_layer() -> VideoLayer {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     let mut store = store();
     let mut memory = Memory::new(false);
@@ -213,6 +214,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     let mut store = store();
     let (producer, mut consumer) = frame_mailbox();
@@ -237,6 +239,7 @@ fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     assert!(store.presenter.bgra.iter().all(|byte| *byte == 0));
 }
 
+// spec: PROC-DEV-1
 #[test]
 fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
     let mut parent = store();
@@ -666,6 +669,7 @@ fn shrink_modes_combine_removed_pixels_before_format_conversion() {
 }
 
 #[test]
+// spec: DEV-FRAME-2
 fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels() {
     for format in [
         PixelFormat::Bgra32,

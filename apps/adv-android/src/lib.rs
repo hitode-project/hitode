@@ -230,7 +230,7 @@ fn string(env: &mut JNIEnv<'_>, value: &JString<'_>) -> Result<String, String> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeInit(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     application: JObject<'_>,
@@ -280,7 +280,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStart(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeStart(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     exe: JString<'_>,
@@ -372,7 +372,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStart(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCommand(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeCommand(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -389,7 +389,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCommand(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativePoll(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativePoll(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -412,7 +412,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativePoll(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStop(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeStop(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -454,7 +454,7 @@ unsafe extern "C" {
     fn AndroidBitmap_unlockPixels(env: *mut jni::sys::JNIEnv, bitmap: jni::sys::jobject) -> i32;
 }
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeFrameInfo(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -491,7 +491,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCopyFrame(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeCopyFrame(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -575,6 +575,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCopyFrame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-AND-6
     #[test]
     fn ui_notifications_ignore_telemetry_but_preserve_controls_and_errors() {
         let initial = json!({"status":"running", "menus":[], "dialogs":[],
@@ -626,6 +627,7 @@ mod tests {
     fn key(session: &Session, key: u32, pressed: bool) -> Result<(), String> {
         submit_command(session, protocol::Command::Key { key, pressed })
     }
+    // spec: HOST-AND-3
     #[test]
     fn input_requires_both_lifecycle_and_audio_focus_handshakes() {
         let (session, _receiver) = fixture(4);
@@ -635,6 +637,7 @@ mod tests {
         activate(&session);
         assert!(key(&session, 17, true).is_ok());
     }
+    // spec: HOST-AND-4
     #[test]
     fn ctrl_release_is_immediate_and_supersedes_a_queued_down() {
         let (session, receiver) = fixture(4);
@@ -647,6 +650,7 @@ mod tests {
         assert!(!packet_current(&session, &down));
         assert!(packet_current(&session, &receiver.recv().unwrap()));
     }
+    // spec: HOST-AND-3
     #[test]
     fn pause_resume_before_worker_observation_still_invalidates_old_inputs() {
         let (session, receiver) = fixture(4);
@@ -660,6 +664,7 @@ mod tests {
         key(&session, 17, true).unwrap();
         assert!(packet_current(&session, &receiver.recv().unwrap()));
     }
+    // spec: HOST-AND-4
     #[test]
     fn queue_saturation_cannot_leave_ctrl_physically_pressed() {
         let (session, receiver) = fixture(1);
@@ -670,6 +675,7 @@ mod tests {
         assert!(!packet_current(&session, &receiver.recv().unwrap()));
         assert!(session.release_input.load(Ordering::Acquire));
     }
+    // spec: HOST-AND-4
     #[test]
     fn discrete_tap_packets_keep_down_and_up_order_without_superseding_down() {
         let (session, receiver) = fixture(4);

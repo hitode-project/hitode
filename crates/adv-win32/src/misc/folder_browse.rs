@@ -567,6 +567,7 @@ mod tests {
     use super::*;
     use crate::misc::test_support::{DATA, Fixture, env};
     #[test]
+    // spec: WIN32-API-1
     fn special_folder_locations_share_paths_task_allocations_and_failure_outputs() {
         let mut f = Fixture::new("shell-folder-location");
         for csidl in [
@@ -635,6 +636,7 @@ mod tests {
         f.cleanup();
     }
     #[test]
+    // spec: WIN32-OBJECT-6
     fn folder_pidls_share_task_ownership_and_convert_ansi_and_unicode_paths() {
         let mut f = Fixture::new("shell-pidl");
         let text = "C:\\Game\\百合";

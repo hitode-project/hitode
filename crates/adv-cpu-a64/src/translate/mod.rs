@@ -1,10 +1,10 @@
-//! Translation units (execution ABI §A7).
+//! Translation units (A64-TR-3).
 //!
 //! `trace` picks the guest instructions of a unit and analyses them; this
 //! module emits them in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
-//! Flags follow §A3. SF ZF OF live in NZCV. CF lives in NZCV's C in a
+//! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV. CF lives in NZCV's C in a
 //! tracked carry sense, or lazily as a `Carry` over values still in
 //! registers; while C holds it, a `derivable` expression may still compute
 //! it, so an `inc` or `dec` that keeps CF can let C go. PF and AF stay a
@@ -14,7 +14,7 @@
 //! every fault site records sense, carry and recipe for the owner.
 //!
 //! Memory accesses go straight to the window, where a host fault at a
-//! site reaches the owner (§A4.3). Instructions the owner has seen fault
+//! site reaches the owner (A64-MEM-5, A64-MEM-6). Instructions the owner has seen fault
 //! too often are checked instead: each access first reads its page's
 //! class, and one that stays in a page the window may take directly does;
 //! the rest call the `access` stub, so soft pages cost a helper call
@@ -24,7 +24,7 @@
 //! without transferring control calls the `interpret` stub with canonical
 //! flags, and the unit goes on unless the helper asks it to leave.
 //!
-//! Host registers beyond the guest map of §A2: x16 and x17 address and exit
+//! Host registers beyond the guest map of A64-REG-1: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
 //! exit stub saves for fault recovery, x13 and x14 flag scratch without
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
@@ -62,7 +62,7 @@ use decode::{EBP, ESP};
 use flags::FlagSet;
 use trace::{Edge, Next, Trace};
 
-/// Host features that change what the translator emits (§A1).
+/// Host features that change what the translator emits (A64-ISA-4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     pub flagm: bool,
@@ -71,7 +71,7 @@ pub struct Features {
 /// What the owner needs at a host instruction that may fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Site {
-    /// The guest instruction, which has committed nothing (§A3.2).
+    /// The guest instruction, which has committed nothing (A64-FLAG-4).
     pub eip: u32,
     /// Instructions the countdown prepaid that the unit has not completed,
     /// this one included.

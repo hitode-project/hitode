@@ -17,7 +17,7 @@ mod mac {
         DialogControl, DialogEvent, DialogSet, DialogTarget, DialogWindow, MenuBar, MenuCommand,
         MenuEvent, MenuItem, MenuKey,
     };
-    use adv_shell::window::{Event, WaitOutcome, WakeEvent, Window};
+    use adv_shell::window::{Event, Window};
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{MainThreadMarker, msg_send};
@@ -25,10 +25,13 @@ mod mac {
         NSApplication, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSPopUpButton,
         NSTextField, NSView, NSWindow,
     };
+    use objc2_core_foundation::{
+        CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
+        kCFRunLoopCommonModes,
+    };
     use objc2_foundation::{NSNotification, NSPoint, NSString};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::time::{Duration, Instant};
 
     fn inputs(events: Vec<Event>) -> Vec<(u32, u32, u32)> {
         events
@@ -78,11 +81,57 @@ mod mac {
     }
 
     fn post(mtm: MainThreadMarker, event: &NSEvent) {
-        NSApplication::sharedApplication(mtm).postEvent_atStart(event, false);
+        if let Some(view) = event.window(mtm).and_then(|window| window.contentView()) {
+            if view.downcast_ref::<adv_shell::window::GameView>().is_some() {
+                match event.r#type() {
+                    NSEventType::KeyDown => view.keyDown(event),
+                    NSEventType::KeyUp => view.keyUp(event),
+                    NSEventType::LeftMouseDown => view.mouseDown(event),
+                    _ => unreachable!(),
+                }
+                return;
+            }
+        }
+        NSApplication::sharedApplication(mtm).sendEvent(event);
     }
 
     fn subviews(window: &NSWindow) -> Vec<Retained<NSView>> {
         window.contentView().unwrap().subviews().to_vec()
+    }
+
+    fn dispatch(window: &mut Window) -> Vec<Event> {
+        unsafe extern "C-unwind" fn stop(_: *mut CFRunLoopTimer, _: *mut std::ffi::c_void) {
+            NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).stop(None);
+            // AppKit needs an event to finish the current dispatch after stop.
+            let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined, NSPoint::new(0.0, 0.0), NSEventModifierFlags::empty(), 0.0, 0, None, 0, 0, 0).unwrap();
+            NSApplication::sharedApplication(MainThreadMarker::new().unwrap())
+                .postEvent_atStart(&event, false);
+        }
+        let mut context = CFRunLoopTimerContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let timer = unsafe {
+            CFRunLoopTimer::new(
+                None,
+                CFAbsoluteTimeGetCurrent() + 0.005,
+                0.0,
+                0,
+                0,
+                Some(stop),
+                &mut context,
+            )
+        }
+        .unwrap();
+        CFRunLoop::main()
+            .unwrap()
+            .add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+        NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).run();
+        window.pump()
     }
 
     pub fn run() {
@@ -110,7 +159,7 @@ mod mac {
         println!("ok Metal surface and backing pixel dimensions");
 
         // Keys: positions become VK, scan code and the Win32 lParam layout.
-        window.pump();
+        dispatch(&mut window);
         post(
             mtm,
             &key_event(
@@ -159,7 +208,7 @@ mod mac {
             ),
         );
         assert_eq!(
-            inputs(window.pump()),
+            inputs(dispatch(&mut window)),
             [
                 (0x100, 0x41, 0x001e_0001),
                 (0x101, 0x41, 0xc01e_0001),
@@ -183,7 +232,7 @@ mod mac {
         )
         .unwrap();
         post(mtm, &click);
-        let mouse = inputs(window.pump());
+        let mouse = inputs(dispatch(&mut window));
         assert!(
             mouse
                 .iter()
@@ -192,43 +241,100 @@ mod mac {
         );
         // Posted client points map through the same viewport.
         window.post_input(0x200, 0, position(10, 20)).unwrap();
-        assert_eq!(inputs(window.pump()), [(0x200, 0, position(10, 20))]);
+        assert_eq!(
+            inputs(dispatch(&mut window)),
+            [(0x200, 0, position(10, 20))]
+        );
         println!("ok mouse");
 
-        // Waits end at the deadline, or early on a wake from another thread.
-        let wake = WakeEvent::new().unwrap();
-        let started = Instant::now();
-        assert_eq!(
-            window
-                .wait_with_wake(Some(Duration::from_millis(30)), Some(&wake))
-                .unwrap(),
-            WaitOutcome::Deadline
-        );
-        assert!(started.elapsed() >= Duration::from_millis(25));
-        let signal = wake.clone();
-        let thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            signal.signal();
-        });
-        let started = Instant::now();
-        assert_eq!(
-            window
-                .wait_with_wake(Some(Duration::from_secs(5)), Some(&wake))
-                .unwrap(),
-            WaitOutcome::Input
-        );
-        assert!(started.elapsed() < Duration::from_secs(2));
-        thread.join().unwrap();
-        // Surface setup can enqueue AppKit events before the asynchronous wake.
-        // A following wait must still observe and drain that retained wake.
-        window
-            .wait_with_wake(Some(Duration::ZERO), Some(&wake))
-            .unwrap();
-        window.pump();
-        // The wake was consumed. AppKit may still post its own events, so
-        // the pipe is checked rather than another wait.
-        assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
-        println!("ok wake");
+        // The embedded container routes top-left logical points, while Router
+        // owns captures even when regions change between mouse down and up.
+        {
+            use adv_shell::overlay::{OverlayInput, Rect, Router, Target};
+            use adv_shell::window::{GameContainer, GameView};
+            use objc2::{MainThreadOnly, msg_send};
+            use std::sync::{Arc, Mutex};
+            let game = native
+                .contentView()
+                .unwrap()
+                .downcast::<GameView>()
+                .unwrap();
+            let root: Retained<NSView> =
+                unsafe { msg_send![NSView::alloc(mtm), initWithFrame: game.frame()] };
+            let overlay: Retained<NSView> =
+                unsafe { msg_send![NSView::alloc(mtm), initWithFrame: root.bounds()] };
+            native.setContentView(Some(&root));
+            root.addSubview(&overlay);
+            let router = Arc::new(Mutex::new(Router::new(OverlayInput {
+                regions: vec![Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 40.0,
+                    height: 20.0,
+                }],
+                ..Default::default()
+            })));
+            let container = GameContainer::new(&overlay, router.clone()).unwrap();
+            container.set_game(Some(&game));
+            assert_eq!(
+                container.hitTest(NSPoint::new(20.0, 220.0)).as_deref(),
+                Some(&*overlay)
+            );
+            assert_eq!(
+                container.hitTest(NSPoint::new(200.0, 40.0)).as_deref(),
+                Some(game.as_ref() as &NSView)
+            );
+            let mouse = |kind, x, y| {
+                NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                kind, NSPoint::new(x, y), NSEventModifierFlags::empty(), 0.0,
+                native.windowNumber(), None, 0, 1, 1.0).unwrap()
+            };
+            let app = NSApplication::sharedApplication(mtm);
+            dispatch(&mut window);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDown, 20.0, 220.0), false);
+            assert!(inputs(dispatch(&mut window)).is_empty());
+            assert_eq!(router.lock().unwrap().captured(0), Some(Target::Overlay));
+            router.lock().unwrap().set_input(OverlayInput::default());
+            assert_eq!(
+                container.hitTest(NSPoint::new(200.0, 40.0)).as_deref(),
+                Some(&*overlay)
+            );
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDragged, 200.0, 40.0), false);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseUp, 200.0, 40.0), false);
+            assert!(inputs(dispatch(&mut window)).is_empty());
+            assert_eq!(router.lock().unwrap().captured(0), None);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDown, 200.0, 40.0), false);
+            dispatch(&mut window);
+            assert_eq!(router.lock().unwrap().captured(0), Some(Target::Game));
+            // Hidden windows do not dispatch canvas events; deliver to the
+            // actual hit-test result as in the physical input checks above.
+            let receiver = container.hitTest(NSPoint::new(200.0, 40.0)).unwrap();
+            receiver.mouseDown(&mouse(NSEventType::LeftMouseDown, 200.0, 40.0));
+            assert!(
+                inputs(dispatch(&mut window))
+                    .iter()
+                    .any(|event| event.0 == 0x201)
+            );
+            router.lock().unwrap().set_input(OverlayInput::exclusive());
+            assert_eq!(
+                container.hitTest(NSPoint::new(20.0, 220.0)).as_deref(),
+                Some(game.as_ref() as &NSView)
+            );
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDragged, 20.0, 220.0), false);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseUp, 20.0, 220.0), false);
+            dispatch(&mut window);
+            receiver.mouseDragged(&mouse(NSEventType::LeftMouseDragged, 20.0, 220.0));
+            receiver.mouseUp(&mouse(NSEventType::LeftMouseUp, 20.0, 220.0));
+            let events = inputs(dispatch(&mut window));
+            assert!(events.iter().any(|event| event.0 == 0x200));
+            assert!(events.iter().any(|event| event.0 == 0x202));
+            assert_eq!(router.lock().unwrap().captured(0), None);
+            container.set_game(None);
+            native.setContentView(Some(&game));
+            native.makeFirstResponder(Some(&game));
+            dispatch(&mut window);
+        }
+        println!("ok container hitTest, logical coordinates and mouse capture");
 
         // Menus: the guest bar follows the application menu.
         let menus = Rc::new(RefCell::new(Vec::new()));
@@ -416,7 +522,7 @@ mod mac {
                 NSEventModifierFlags::empty(),
             ),
         );
-        window.pump();
+        dispatch(&mut window);
         panel.performClose(None);
         let events = dialogs.borrow().clone();
         let has = |wanted: &DialogEvent| events.iter().any(|event| event == wanted);
@@ -438,7 +544,7 @@ mod mac {
         );
         assert!(has(&DialogEvent::Close(set.dialogs[0].target)));
         // A modal dialog owned by the main window blocks canvas input.
-        window.pump();
+        dispatch(&mut window);
         post(
             mtm,
             &key_event(
@@ -448,7 +554,7 @@ mod mac {
                 NSEventModifierFlags::empty(),
             ),
         );
-        assert!(inputs(window.pump()).is_empty());
+        assert!(inputs(dispatch(&mut window)).is_empty());
         window.set_dialogs(&DialogSet::default()).unwrap();
         assert!(!panel.isVisible());
         post(
@@ -460,7 +566,7 @@ mod mac {
                 NSEventModifierFlags::empty(),
             ),
         );
-        assert_eq!(inputs(window.pump()).len(), 1);
+        assert_eq!(inputs(dispatch(&mut window)).len(), 1);
         println!("ok dialogs");
 
         // Exercise delegate notifications without showing a window, sleeping
@@ -472,13 +578,13 @@ mod mac {
                 Some(&native),
             )
         };
-        window.pump();
+        dispatch(&mut window);
         let _: () = unsafe { msg_send![&*delegate, windowDidMiniaturize: &*note] };
-        assert!(inputs(window.pump()).contains(&(5, 1, 0)));
+        assert!(inputs(dispatch(&mut window)).contains(&(5, 1, 0)));
         assert_eq!(window.native_client_size().unwrap(), (0, 0));
         let _: () = unsafe { msg_send![&*delegate, windowDidDeminiaturize: &*note] };
         assert!(
-            inputs(window.pump())
+            inputs(dispatch(&mut window))
                 .iter()
                 .any(|&(message, state, _)| message == 5 && state == 0)
         );
@@ -490,13 +596,13 @@ mod mac {
         let app = NSApplication::sharedApplication(mtm);
         let application = app.delegate().unwrap();
         let _: () = unsafe { msg_send![&*application, applicationDidHide: &*note] };
-        assert!(inputs(window.pump()).contains(&(0x1c, 0, 0)));
+        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 0, 0)));
         assert_eq!(window.native_client_size().unwrap(), (0, 0));
         let _: () = unsafe { msg_send![&*application, applicationDidUnhide: &*note] };
         let _: () = unsafe { msg_send![&*application, applicationDidBecomeActive: &*note] };
-        assert!(inputs(window.pump()).contains(&(0x1c, 1, 0)));
+        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 1, 0)));
         let _: () = unsafe { msg_send![&*application, applicationDidResignActive: &*note] };
-        assert!(inputs(window.pump()).contains(&(0x1c, 0, 0)));
+        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 0, 0)));
         println!("ok hide and activation");
 
         let center = objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter();
@@ -505,8 +611,7 @@ mod mac {
                 .postNotificationName_object(objc2_app_kit::NSWorkspaceWillSleepNotification, None);
         }
         assert!(
-            window
-                .pump()
+            dispatch(&mut window)
                 .iter()
                 .any(|e| matches!(e, Event::AudioSuspended(true)))
         );
@@ -515,8 +620,7 @@ mod mac {
             center.postNotificationName_object(objc2_app_kit::NSWorkspaceDidWakeNotification, None);
         }
         assert!(
-            window
-                .pump()
+            dispatch(&mut window)
                 .iter()
                 .any(|e| matches!(e, Event::AudioSuspended(false)))
         );
@@ -529,25 +633,58 @@ mod mac {
             reply,
             objc2_app_kit::NSApplicationTerminateReply::TerminateLater
         );
-        assert!(window.pump().iter().any(|e| matches!(e, Event::Close)));
+        assert!(
+            dispatch(&mut window)
+                .iter()
+                .any(|e| matches!(e, Event::Close))
+        );
         native.performClose(None);
-        assert!(window.pump().iter().any(|e| matches!(e, Event::Close)));
+        assert!(
+            dispatch(&mut window)
+                .iter()
+                .any(|e| matches!(e, Event::Close))
+        );
         // A second Cmd+Q is the explicit escape from an unresponsive guest.
         let quit = objc2_app_kit::NSMenuItem::new(mtm);
         let _: () = unsafe { msg_send![&*application, hostQuit: &*quit] };
-        assert!(window.pump().iter().any(|e| matches!(e, Event::ForceClose)));
+        assert!(
+            dispatch(&mut window)
+                .iter()
+                .any(|e| matches!(e, Event::ForceClose))
+        );
         unsafe {
             center.postNotificationName_object(
                 objc2_app_kit::NSWorkspaceWillPowerOffNotification,
                 None,
             );
         }
-        let ending = inputs(window.pump());
+        let ending = inputs(dispatch(&mut window));
         assert_eq!(ending, vec![(0x11, 0, 0), (0x16, 1, 0)]);
         println!("ok logout and shutdown notifications");
         println!("ok close and application quit");
         drop(window);
         assert!(app.delegate().is_none());
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch/game-view/run-loop-test");
+        std::fs::create_dir_all(&directory).unwrap();
+        let called = Rc::new(RefCell::new(0));
+        let completed = called.clone();
+        let view = adv_shell::window::GameView::new(320, 240).unwrap();
+        let session = adv_shell::Session::new(view, adv_shell::Options::new(directory.join("missing.exe"), directory.join("data")), Box::new(move |result| {
+            assert!(MainThreadMarker::new().is_some());
+            assert!(result.is_err());
+            *completed.borrow_mut() += 1;
+            let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+            app.stop(None);
+            let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined, NSPoint::new(0.0, 0.0), NSEventModifierFlags::empty(), 0.0, 0, None, 0, 0, 0).unwrap();
+            app.postEvent_atStart(&event, false);
+        })).unwrap();
+        app.run();
+        assert_eq!(*called.borrow(), 1);
+        drop(session);
+        assert_eq!(*called.borrow(), 1);
+        println!("ok Session driven by external NSApp.run and one-shot main-thread completion");
         println!("ok all");
     }
 }

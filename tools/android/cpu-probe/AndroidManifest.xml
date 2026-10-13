@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.advhost.cpuprobe"
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.hitode.cpuprobe"
     android:versionCode="1" android:versionName="0.1.0">
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
     <application android:label="ADV CPU Probe" android:hasCode="true" android:debuggable="true"

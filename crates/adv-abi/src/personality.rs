@@ -1,4 +1,4 @@
-//! Export classes of the Windows personality (docs/personality-contracts.md).
+//! Export classes of the Windows personality (PERS-EXPORT-2).
 //! Structure keeps every declared name; discovery and calls follow the class.
 use std::sync::OnceLock;
 

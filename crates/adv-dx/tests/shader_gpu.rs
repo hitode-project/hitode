@@ -102,6 +102,7 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
 }
 
 #[test]
+// spec: GFX-NUM-1
 fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
     let backend = std::env::var("ADV_TEST_GPU_BACKEND").unwrap_or_default();
     let (fallback, backend) = match backend.as_str() {

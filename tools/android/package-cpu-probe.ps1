@@ -91,8 +91,8 @@ try {
     if ($nativeEntry.Length -ne $nativeEntry.CompressedLength) { throw 'CPU probe native library unexpectedly compressed' }
 } finally { $archive.Dispose() }
 $metadata = [ordered]@{
-    package = 'org.advhost.cpuprobe'
-    activity = 'org.advhost.cpuprobe.ProbeActivity'
+    package = 'org.hitode.cpuprobe'
+    activity = 'org.hitode.cpuprobe.ProbeActivity'
     build_identifier = $BuildIdentifier
     apk = $signed
     apk_sha256 = (Get-FileHash -LiteralPath $signed -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -83,6 +83,7 @@ impl NativeOracle {
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-12
 fn wide_outline_metrics_match_native_layout_and_have_their_own_prefix_contract() {
     let (mut machine, data, dc) = fixture();
     let native = native_font(&machine, dc);

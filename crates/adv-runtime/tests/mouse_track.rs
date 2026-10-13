@@ -7,6 +7,7 @@ use std::{os::windows::process::CommandExt, path::Path, process::Command};
 mod cpu;
 
 #[test]
+// spec: WIN32-INPUT-1
 fn mouse_tracking_fronts_match_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/investigations/mouse-track/native-differential");

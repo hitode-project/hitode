@@ -2,7 +2,7 @@
 use adv_abi::{Env, GuestPtr, Outcome, Registry, win32};
 use adv_cpu::backend::{Prot, Reg};
 
-const DESCRIPTION: &str = "adv-host virtual display adapter";
+const DESCRIPTION: &str = "hitode virtual display adapter";
 const DRIVER: &str = "display";
 const INVALID: u32 = 0x80070057;
 

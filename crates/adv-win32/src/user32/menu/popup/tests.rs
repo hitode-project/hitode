@@ -81,6 +81,7 @@ fn returned(outcome: Outcome) -> u32 {
 }
 
 #[test]
+// spec: WIN32-USER-3
 fn popup_notifications_return_command_and_cancel_follow_native_order() {
     for flags in [0, 0x100, 0x80, 0x180] {
         for selected in [false, true] {
@@ -131,6 +132,7 @@ fn popup_notifications_return_command_and_cancel_follow_native_order() {
 }
 
 #[test]
+// spec: WIN32-USER-3
 fn popup_wait_accepts_only_live_choices_and_retires_frontend_token() {
     let (mut m, owner, root) = fixture();
     let outcome = track(
@@ -195,6 +197,7 @@ fn popup_wait_accepts_only_live_choices_and_retires_frontend_token() {
 }
 
 #[test]
+// spec: WIN32-USER-3
 fn popup_end_and_destroy_cancel_without_command_or_ownership_leak() {
     for destroy in [false, true] {
         let (mut m, owner, root) = fixture();
@@ -232,6 +235,7 @@ fn popup_end_and_destroy_cancel_without_command_or_ownership_leak() {
 }
 
 #[test]
+// spec: WIN32-USER-4
 fn popup_validation_and_unsupported_presentation_fail_without_false_success() {
     let (mut m, owner, root) = fixture();
     for (menu, flags, hwnd, error) in [
@@ -283,6 +287,7 @@ fn popup_validation_and_unsupported_presentation_fail_without_false_success() {
 }
 
 #[test]
+// spec: WIN32-USER-4
 fn popup_ex_checks_entire_params_and_preserves_exclusion_and_caller_storage() {
     const DATA: u32 = 0x410000;
     let (mut m, owner, root) = fixture();

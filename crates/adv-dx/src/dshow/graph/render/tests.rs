@@ -274,6 +274,7 @@ fn fixture(reject_all: bool) -> (Machine<JitCpu>, u32, u32) {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-3
 fn video_render_retries_after_allocator_refusal_and_leaves_only_the_accepted_connection() {
     let (mut m, graph, out) = fixture(false);
     let outcome = pin(&mut env(&mut m), graph, out);

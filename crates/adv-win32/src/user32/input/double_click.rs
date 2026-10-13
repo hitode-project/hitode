@@ -119,6 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
+    // spec: WIN32-USER-8
     fn each_button_forms_two_double_clicks_and_requires_an_up() {
         for (down, wparam) in [
             (0x201, 1),
@@ -145,6 +146,7 @@ mod tests {
     }
 
     #[test]
+    // spec: WIN32-USER-8
     fn classification_respects_class_window_button_time_and_rectangle() {
         let time = Instant::now();
         for (hwnd, style, down, wparam, position, elapsed, expected) in [
@@ -176,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    // spec: WIN32-USER-9
     fn changing_profile_and_destroying_a_window_keep_no_host_state() {
         let mut clicks = DoubleClick::default();
         clicks.set_time(u32::MAX);

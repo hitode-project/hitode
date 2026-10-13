@@ -64,6 +64,7 @@ fn file(relocations: bool) -> Vec<u8> {
 }
 
 #[test]
+// spec: WIN32-IMAGE-1
 fn rebase_updates_the_mapped_header_and_highlow_target() {
     let bytes = file(true);
     let mut pe = Pe::parse(&bytes).unwrap();
@@ -79,6 +80,7 @@ fn rebase_updates_the_mapped_header_and_highlow_target() {
 }
 
 #[test]
+// spec: WIN32-IMAGE-1
 fn rebase_without_a_directory_still_updates_the_header() {
     let mut pe = Pe::parse(&file(false)).unwrap();
     assert_eq!(pe.characteristics & file_flags::RELOCS_STRIPPED, 0);
@@ -89,6 +91,7 @@ fn rebase_without_a_directory_still_updates_the_header() {
 }
 
 #[test]
+// spec: WIN32-IMAGE-1
 fn invalid_rebase_preserves_the_header_and_all_fixups() {
     for case in 0..5 {
         let mut pe = Pe::parse(&file(true)).unwrap();

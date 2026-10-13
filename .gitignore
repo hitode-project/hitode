@@ -14,3 +14,7 @@ __pycache__/
 /tools/windows/launch-trial.ps1
 /tools/windows/trial-readme.txt
 .DS_Store
+# Launcher app icons are source assets (apps/adv-launcher/scripts/icons.py);
+# the iOS set stays ignored and is regenerated with the iOS project.
+!/apps/adv-launcher/src-tauri/icons/*.png
+!/apps/adv-launcher/src-tauri/icons/android/*/*.png

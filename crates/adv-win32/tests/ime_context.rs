@@ -216,6 +216,7 @@ fn lifecycle<B: TestCpu>(cpu: B) {
 }
 
 #[test]
+// spec: WIN32-USER-13
 fn no_provider_disable_queries_and_native_release_share_live_user_and_object_owners() {
     lifecycle(UnicornCpu::new(PARK_ADDR).unwrap());
     lifecycle(JitCpu::new(PARK_ADDR, false).unwrap());

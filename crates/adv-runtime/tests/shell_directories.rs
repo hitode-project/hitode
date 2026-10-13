@@ -7,6 +7,7 @@ use std::{os::windows::process::CommandExt, path::Path, process::Command};
 mod cpu;
 
 #[test]
+// spec: WIN32-API-11
 fn shell_directory_fronts_match_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/investigations/shell-directories/native-differential");

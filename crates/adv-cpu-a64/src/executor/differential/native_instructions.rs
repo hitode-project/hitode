@@ -132,6 +132,7 @@ fn bit_scans_biased_cl_shifts_and_comparisons_run_without_helpers_and_resume_at_
     }
 }
 
+// spec: A64-FLAG-4
 #[test]
 fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retry_after_mapping() {
     for kind in 0..6 {
@@ -190,6 +191,7 @@ fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retr
     }
 }
 
+// spec: A64-FP-5
 #[test]
 fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {
     for scalar in [false, true] {
@@ -304,6 +306,7 @@ fn tf_and_rf_keep_precise_boundaries_for_new_native_forms() {
     }
 }
 
+// spec: A64-CTL-10
 #[test]
 fn rewritten_bit_scan_and_comparison_forms_invalidate_the_old_native_unit() {
     let make = |reverse| {

@@ -133,6 +133,7 @@ mod tests {
         Reg::new(number)
     }
 
+    // spec: A64-CTL-9, A64-CTL-10
     #[test]
     fn replacing_code_at_the_same_address_discards_old_translations() {
         let mut emu = Emulator::new();
@@ -154,6 +155,7 @@ mod tests {
         assert_eq!(emu.x(r(0)), 20);
     }
 
+    // spec: A64-REG-2
     #[test]
     fn every_general_register_round_trips() {
         let mut emu = Emulator::new();
@@ -168,6 +170,7 @@ mod tests {
         }
     }
 
+    // spec: A64-REG-6
     #[test]
     fn biased_stack_pointer_and_constants_execute_as_encoded() {
         let mut emu = Emulator::new();

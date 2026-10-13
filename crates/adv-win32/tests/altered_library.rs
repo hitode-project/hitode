@@ -227,6 +227,7 @@ fn altered_failed_initializer_and_invalid_flag_combinations_leave_no_live_image(
 }
 
 #[test]
+// spec: PERS-BRIDGE-3
 fn altered_load_and_module_queries_observe_native_hooks_and_reference_lifetime() {
     for jit in [false, true] {
         let mut test = Test::new(jit, false);
@@ -294,6 +295,7 @@ fn altered_load_and_module_queries_observe_native_hooks_and_reference_lifetime()
 }
 
 #[test]
+// spec: PERS-BRIDGE-3
 fn inner_lookup_hook_and_pin_are_observable_without_an_outer_hook() {
     for jit in [false, true] {
         let mut test = Test::new(jit, false);

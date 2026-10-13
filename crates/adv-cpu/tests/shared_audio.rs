@@ -204,6 +204,7 @@ fn pcm_in_a_partial_host_page_preserves_ordinary_neighbours_and_permissions() {
     assert_eq!(new.read_alias.load_u8(0), 0xa5);
 }
 
+// spec: A64-MEM-11
 #[test]
 fn native_integer_mmx_and_sse_use_atomic_bytes_while_x87_keeps_its_helper() {
     let code = bytes(|a| {
@@ -345,6 +346,7 @@ fn native_element_widths_cross_audio_and_ordinary_page_boundaries() {
     }
 }
 
+// spec: A64-MEM-11
 #[test]
 fn protected_read_modify_write_and_vector_store_preserve_instruction_state() {
     for vector in [false, true] {

@@ -1840,6 +1840,7 @@ mod tests {
         ]
     }
 
+    // spec: A64-TR-1
     #[test]
     fn encoders_match_clang_vectors_and_cover_every_vector() {
         let text = include_str!("../testdata/encode.tsv");

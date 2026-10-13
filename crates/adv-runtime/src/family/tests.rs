@@ -88,6 +88,7 @@ fn pump(runtime: &mut Runtime<JitCpu>) {
     }
 }
 
+// spec: PROC-SCHED-1
 #[test]
 fn ordinary_process_receives_the_requested_slice_before_any_child_exists() {
     let (mut runtime, _, exe) = fixture();
@@ -108,6 +109,7 @@ fn ordinary_process_receives_the_requested_slice_before_any_child_exists() {
     cleanup(exe);
 }
 
+// spec: PROC-SCHED-2
 #[test]
 fn ordinary_process_keeps_its_terminal_result_on_repeated_steps() {
     let (mut runtime, _, exe) = fixture();
@@ -139,6 +141,7 @@ fn ordinary_process_keeps_its_terminal_result_on_repeated_steps() {
     cleanup(exe);
 }
 
+// spec: PROC-CREATE-1
 #[test]
 fn unpublished_and_abandoned_creation_never_executes_and_releases_address_space() {
     let (mut runtime, spec, exe) = fixture();
@@ -193,6 +196,7 @@ fn install_call(machine: &mut Machine<JitCpu>, name: &str, handler: adv_machine:
     call_and_loop(machine, entry);
 }
 
+// spec: PROC-SCHED-1
 #[test]
 fn publication_after_a_pending_visit_wakes_only_runnable_children() {
     for suspended in [false, true] {
@@ -241,6 +245,7 @@ fn publication_after_a_pending_visit_wakes_only_runnable_children() {
     }
 }
 
+// spec: PROC-HANDLE-1
 #[test]
 fn child_exit_revisits_a_parent_wait_before_host_sleep() {
     let (mut runtime, spec, exe) = fixture();
@@ -285,6 +290,7 @@ fn child_exit_revisits_a_parent_wait_before_host_sleep() {
     cleanup(exe);
 }
 
+// spec: PROC-CREATE-1, PROC-MEM-2
 #[test]
 fn failed_publication_reaps_even_when_the_parent_remains_live() {
     let (mut runtime, spec, exe) = fixture();
@@ -305,6 +311,7 @@ fn failed_publication_reaps_even_when_the_parent_remains_live() {
     cleanup(exe);
 }
 
+// spec: PROC-MEM-2
 #[test]
 fn malformed_remote_headers_end_only_the_child_and_retain_diagnostics() {
     let (mut runtime, spec, exe) = fixture();
@@ -339,7 +346,9 @@ fn malformed_remote_headers_end_only_the_child_and_retain_diagnostics() {
     cleanup(exe);
 }
 
+// spec: PROC-SCHED-5
 #[test]
+// spec: PERS-SCOPE-6
 fn structural_mismatch_in_a_child_disqualifies_the_family_after_retirement() {
     let (mut runtime, spec, exe) = fixture();
     let parent = runtime.machine.sys.pid;
@@ -383,6 +392,7 @@ fn structural_mismatch_in_a_child_disqualifies_the_family_after_retirement() {
     cleanup(exe);
 }
 
+// spec: PROC-LIMIT-1
 #[test]
 fn live_process_limit_fails_without_publishing_an_extra_machine() {
     let (mut runtime, spec, exe) = fixture();
@@ -404,6 +414,7 @@ fn live_process_limit_fails_without_publishing_an_extra_machine() {
     cleanup(exe);
 }
 
+// spec: PROC-SCHED-4
 #[test]
 fn unhandled_child_exception_preserves_native_status_while_parent_runs() {
     let (mut runtime, spec, exe) = fixture();

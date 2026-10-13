@@ -294,6 +294,7 @@ mod tests {
         );
     }
 
+    // spec: EXEC-GIR-3
     #[test]
     fn ssa_runs_bridge_opaque_simd_x87_and_partial_registers() {
         let mut a = CodeAssembler::new(32).unwrap();
@@ -316,6 +317,7 @@ mod tests {
         }
     }
 
+    // spec: EXEC-GIR-4
     #[test]
     fn gir_memory_fault_keeps_the_committed_integer_and_flag_prefix() {
         let mut a = CodeAssembler::new(32).unwrap();
@@ -330,6 +332,7 @@ mod tests {
         }
     }
 
+    // spec: EXEC-GIR-2
     #[test]
     fn side_entries_split_integer_ssa_without_losing_opaque_coverage() {
         let mut a = CodeAssembler::new(32).unwrap();
@@ -352,6 +355,7 @@ mod tests {
         assert_eq!(plan.operations.len(), 4);
     }
 
+    // spec: EXEC-GIR-2, EXEC-GIR-5
     #[test]
     fn overlapping_decode_entries_share_an_integer_suffix() {
         let mut a = CodeAssembler::new(32).unwrap();

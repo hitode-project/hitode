@@ -40,10 +40,10 @@ $Keystore = [IO.Path]::GetFullPath($Keystore)
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 [xml]$manifestDocument = Get-Content -LiteralPath $manifest -Raw
 $androidNamespace = 'http://schemas.android.com/apk/res/android'
-if ($manifestDocument.manifest.package -ne 'org.advhost.player') { throw 'Manifest package must be org.advhost.player' }
+if ($manifestDocument.manifest.package -ne 'org.hitode.player') { throw 'Manifest package must be org.hitode.player' }
 if ($manifestDocument.manifest.application.GetAttribute('extractNativeLibs', $androidNamespace) -ne 'false') { throw 'Manifest must set extractNativeLibs=false' }
 $activities = @($manifestDocument.manifest.application.activity)
-if (-not ($activities | Where-Object { $_.GetAttribute('name', $androidNamespace) -in @('.GameActivity', 'org.advhost.player.GameActivity') })) { throw 'Manifest must declare GameActivity' }
+if (-not ($activities | Where-Object { $_.GetAttribute('name', $androidNamespace) -in @('.GameActivity', 'org.hitode.player.GameActivity') })) { throw 'Manifest must declare GameActivity' }
 # Resolve the complete native dependency closure before compiling the launcher.
 # Public API-29 linker stubs identify system libraries; private libraries must
 # be packaged explicitly. libc++_shared is an app dependency when DT_NEEDED says so.
@@ -121,9 +121,9 @@ try {
     & $d8 --lib $androidJar --min-api 29 --output $dex $classJar
     if ($LASTEXITCODE -ne 0) { throw 'Game shell d8 failed' }
 } finally { $env:JAVA_HOME = $priorJavaHome }
-$unsigned = Join-Path $stage 'adv-host-player-unsigned.apk'
-$aligned = Join-Path $stage 'adv-host-player-aligned.apk'
-$signed = Join-Path $Output 'adv-host-player.apk'
+$unsigned = Join-Path $stage 'hitode-player-unsigned.apk'
+$aligned = Join-Path $stage 'hitode-player-aligned.apk'
+$signed = Join-Path $Output 'hitode-player.apk'
 & $aapt2 link -o $unsigned -I $androidJar --manifest $manifest --min-sdk-version 29 --target-sdk-version 36
 if ($LASTEXITCODE -ne 0) { throw 'Game shell aapt2 link failed' }
 Add-Type -AssemblyName System.IO.Compression
@@ -166,7 +166,7 @@ if ($NativeBuildInfo) {
 }
 $sourceInfo = @($sources | ForEach-Object { [ordered]@{ path = $_; sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() } })
 $metadata = [ordered]@{
-    package = 'org.advhost.player'; activity = 'org.advhost.player.GameActivity'
+    package = 'org.hitode.player'; activity = 'org.hitode.player.GameActivity'
     build_identifier = $BuildIdentifier; built_at_utc = [DateTime]::UtcNow.ToString('o')
     apk = $signed; apk_sha256 = (Get-FileHash -LiteralPath $signed -Algorithm SHA256).Hash.ToLowerInvariant()
     keystore = $Keystore; keystore_sha256 = (Get-FileHash -LiteralPath $Keystore -Algorithm SHA256).Hash.ToLowerInvariant()

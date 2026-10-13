@@ -1449,6 +1449,7 @@ mod tests {
     include!("fixed/disabled_stage_tests.rs");
 
     #[test]
+    // spec: GFX-INPUT-5
     fn programmable_raster_states_do_not_silently_change_the_fixed_path_contract() {
         let mut m = super::super::tests::machine();
         let mut env = Env {

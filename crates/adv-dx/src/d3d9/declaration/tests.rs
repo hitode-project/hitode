@@ -85,6 +85,7 @@ fn creation_copies_terminated_elements_and_holds_the_device_while_public() {
 }
 
 #[test]
+// spec: GFX-CAP-1
 fn malformed_declarations_fail_without_publishing_or_retaining_the_device() {
     let mut m = super::super::tests::machine();
     let mut env = Env {

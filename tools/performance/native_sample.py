@@ -23,7 +23,7 @@ between exports are named after the nearest direct call target (sub_RVA),
 found by tools/survey/module_profile.py when llvm-objdump is available.
 
 Suspending threads perturbs timing: read shares, not absolute times. Run
-directories hold guest addresses and stay local (docs/investigation.md §2).
+directories hold guest addresses and stay local (docs/investigation.md, "Local output").
 """
 
 from __future__ import annotations

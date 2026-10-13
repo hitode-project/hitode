@@ -1,5 +1,5 @@
 //! Traces: the guest instructions one unit covers, in emission order
-//! (execution ABI §A7).
+//! (A64-TR-3).
 //!
 //! A trace follows the fall-through path, direct jumps and direct calls. A
 //! call inlines its callee in a new frame while depth and room allow, so
@@ -10,13 +10,13 @@
 //! a loop with an internal edge; conditional branches to instructions in
 //! the trace are internal edges too, and other ones side exits.
 //!
-//! Budget (§A5.4): a region starts at the entry and at each continuation and
+//! Budget (A64-CTL-7): a region starts at the entry and at each continuation and
 //! prepays every instruction up to the next one. An edge then settles the
 //! difference between what its target region still owes and what the
 //! source region prepaid but will not complete; only an edge that owes
 //! more checks the countdown.
 //!
-//! Flags (§A3): a backward liveness pass over the trace, with every exit,
+//! Flags (A64-FLAG-3): a backward liveness pass over the trace, with every exit,
 //! fault site and countdown check observing all flags.
 
 use adv_cpu_core::memory::Memory;

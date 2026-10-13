@@ -206,6 +206,7 @@ fn native_driver_enumeration_callback_stop_flags_and_instance() {
 }
 
 #[test]
+// spec: MEDIA-AUDIO-1
 fn driver_details_queries_sizes_encoding_and_protected_outputs() {
     let mut m = fixture(false);
     ensure(&mut env(&mut m));

@@ -399,6 +399,7 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
 }
 
 #[test]
+// spec: PERS-BRIDGE-2
 fn crt_searches_use_native_rows_callbacks_late_hooks_and_owner_identity() {
     for mode in 0..7 {
         guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);

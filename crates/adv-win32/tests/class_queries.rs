@@ -284,6 +284,7 @@ fn queries<B: Backend>(cpu: B) {
 }
 
 #[test]
+// spec: WIN32-USER-10
 fn class_queries_preserve_atoms_layout_menu_snapshot_lifetime_and_stock_source() {
     queries(UnicornCpu::new(PARK_ADDR).unwrap());
     queries(JitCpu::new(PARK_ADDR, false).unwrap());

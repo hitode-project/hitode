@@ -1,5 +1,12 @@
 //! Session-owned process supervisor. Every service runs after the backend has
 //! collected its leases, never reentrantly from an API trap.
+//!
+//! Each guest process owns a `Machine` with its own CPU, address space, heaps,
+//! modules, PEB/TEB, handles and threads; host devices and file services are
+//! shared. CreateProcess maps the EXE and the main thread, and TLS and DllMain
+//! run only after resume. The loader then reads the import directory from
+//! guest memory, so Detours-style remote import rewriting works unchanged.
+//! Rules: PROC-* in docs/spec/processes.md.
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use std::{cell::Cell, rc::Rc};

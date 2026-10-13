@@ -7,6 +7,7 @@ use std::{os::windows::process::CommandExt, path::Path, process::Command};
 mod cpu;
 
 #[test]
+// spec: WIN32-OBJECT-2
 fn srw_api_pairs_and_contention_match_windows() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/investigations/srw/native-differential");

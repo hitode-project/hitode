@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-11
 fn placement_arrays_and_partial_results_match_native_for_both_encodings() {
     let (mut machine, data, dc) = fixture();
     let font_id = selected_font(&machine, dc);
@@ -170,6 +171,7 @@ fn placement_arrays_and_partial_results_match_native_for_both_encodings() {
 }
 
 #[test]
+// spec: WIN32-GDI-11
 fn placement_rejects_bad_optional_arrays_before_any_output_changes() {
     let (mut machine, data, dc) = fixture();
     machine.cpu.write(data + 128, &65u16.to_le_bytes()).unwrap();

@@ -53,5 +53,14 @@ class StagedFormatting(unittest.TestCase):
         self.assertEqual(check.staged_rust(), ["crates/c/src/lib.rs"])
 
 
+
+class LauncherGate(unittest.TestCase):
+    def test_runs_only_for_launcher_paths(self) -> None:
+        self.assertTrue(check.touches_launcher(["crates/a/src/lib.rs", "apps/adv-launcher/src/App.svelte"]))
+        self.assertTrue(check.touches_launcher(["apps/adv-launcher/src-tauri/src/lib.rs"]))
+        self.assertFalse(check.touches_launcher(["apps/adv-run/src/main.rs", "apps/adv-launcher-old/x"]))
+        self.assertFalse(check.touches_launcher([]))
+
+
 if __name__ == "__main__":
     unittest.main()

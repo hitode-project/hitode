@@ -147,6 +147,7 @@ mod tests {
         assert!(!registry.dirty);
     }
     #[test]
+    // spec: WIN32-API-5
     fn reinstall_discards_saved_hardware_overrides_and_keeps_counters_consistent() {
         let mut registry = VirtualRegistry::default();
         install(&mut registry, 123).unwrap();

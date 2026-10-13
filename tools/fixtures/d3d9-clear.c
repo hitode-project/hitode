@@ -58,6 +58,7 @@ void mainCRTStartup(void){
   black(d);state(d,D3DRS_ZENABLE,FALSE);state(d,D3DRS_STENCILENABLE,TRUE);quad(d,.5f,0xff0000ffu);capture(d,back,D3DFMT_A8R8G8B8);
   record(IDirect3DSurface9_Release(compact));
  }
+ // spec: GFX-INPUT-3
  // POSITIONT bypasses a bound collapsing VS, while the constant PS still runs.
  {IDirect3DVertexShader9 *vs=NULL,*queried=NULL;IDirect3DPixelShader9 *ps=NULL;IDirect3DVertexDeclaration9 *decl=NULL;
   const DWORD vsCode[]={0xfffe0200,0x0200001f,0x80000000,0x900f0000,0x02000001,0xc00f0000,0xa0e40000,0xffff};
@@ -74,6 +75,7 @@ void mainCRTStartup(void){
   ok(IDirect3DDevice9_SetVertexDeclaration(d,NULL));ok(IDirect3DDevice9_SetVertexShader(d,NULL));ok(IDirect3DDevice9_SetPixelShader(d,NULL));
   record(IDirect3DVertexDeclaration9_Release(decl));record(IDirect3DVertexShader9_Release(vs));record(IDirect3DPixelShader9_Release(ps));
  }
+ // spec: GFX-INPUT-4
  // Eight independent coordinate sets, mixed FLOAT1..4 component defaults.
  {DWORD fvf=D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX8,queried;float data[4][25];UINT n,v,at;
   D3DVERTEXELEMENT9 elements[11];IDirect3DVertexDeclaration9 *decl=NULL;IDirect3DVertexBuffer9 *pos=NULL;IDirect3DStateBlock9 *saved=NULL;void *mapped=NULL;

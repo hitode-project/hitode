@@ -122,6 +122,7 @@ impl Test {
 }
 
 #[test]
+// spec: PERS-SCOPE-4
 fn exhausted_object_table_reports_api_errors_without_side_effects_or_invalid_waits() {
     let mut t = Test::new("exhausted");
     t.m.sys.objects = Objects::with_limits(ObjectLimits {

@@ -59,6 +59,9 @@ pub struct OsConfig {
     /// Host directory for everything the guest writes (overlay, user profile, registry).
     pub data_dir: PathBuf,
     pub user_name: String,
+    /// Host folder behind guest `C:\Program Files`, written in place: installers
+    /// put their files straight into it rather than into the data overlay.
+    pub install_dir: Option<PathBuf>,
 }
 
 impl OsConfig {
@@ -72,6 +75,7 @@ impl OsConfig {
             exe_name: exe_name.into(),
             data_dir: data_dir.into(),
             user_name: "Player".into(),
+            install_dir: None,
         }
     }
 

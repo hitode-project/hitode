@@ -667,6 +667,7 @@ mod tests {
         );
     }
 
+    // spec: MEDIA-FAIL-2
     #[test]
     fn decode_failure_reports_error_without_successful_eos() {
         let (mut m, _, events, wake) = failure_session();
@@ -678,6 +679,7 @@ mod tests {
         assert_error_only(&mut m, events, wake, E_FAIL);
     }
 
+    // spec: MEDIA-FAIL-1, MEDIA-FAIL-2
     #[test]
     fn missing_decoder_reports_error_without_successful_eos() {
         let (mut m, _, events, wake) = failure_session();
@@ -802,6 +804,7 @@ mod tests {
         assert_eq!(audio.stream().metrics().flushes, 1);
     }
 
+    // spec: MEDIA-FAIL-3
     #[test]
     fn saturated_end_retries_without_early_completion() {
         let (mut m, graph, audio, mut reader) = audio_session();
@@ -822,6 +825,7 @@ mod tests {
         assert_eq!(audio.stream().metrics().ends, 1);
     }
 
+    // spec: MEDIA-FAIL-3
     #[test]
     fn end_retries_pending_pcm_before_sending_end() {
         let (mut m, graph, audio, mut reader) = audio_session();

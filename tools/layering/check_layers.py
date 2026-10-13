@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check workspace crate dependencies against the layering rules.
 
-The rules mirror docs/architecture.md section 1.3. A crate may depend on what
+The rules mirror the code map in ARCHITECTURE.md. A crate may depend on what
 its arrows reach, directly or through lower layers; dev-dependencies are free,
 except that test-only crates must never appear anywhere else. Transitional
 edges are allowed until the split that removes them; an entry that no longer
@@ -16,6 +16,8 @@ import sys
 RULES: dict[str, set[str]] = {
     "adv-sync": set(),
     "adv-pe": set(),
+    # The anonymous compatibility report format; no runtime knowledge.
+    "adv-report": set(),
     # Engine-neutral core; each engine builds on it; the facade picks one.
     "adv-cpu-core": {"adv-sync"},
     "adv-cpu-x64": {"adv-cpu-core"},
@@ -29,8 +31,10 @@ RULES: dict[str, set[str]] = {
     "adv-win32": {"adv-os", "adv-device"},
     "adv-dx": {"adv-os", "adv-device"},
     "adv-runtime": {"adv-win32", "adv-dx"},
-    "adv-shell": {"adv-runtime", "adv-device", "adv-sync"},
+    "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
+    # Tauri player frontend: library and in-game overlay over the native game view.
+    "adv-launcher": {"adv-shell"},
     # Standalone Android CPU acceptance app, outside the game runtime graph.
     "adv-android-probe": {"adv-cpu"},
     # Android platform frontend owns runtime, presentation and audio output.

@@ -144,6 +144,7 @@ fn display_dc_parallel_font_borrows_keep_the_live_canvas_and_independent_state()
 }
 
 #[test]
+// spec: WIN32-GDI-3
 fn hidden_parented_window_cannot_resize_the_client_after_its_last_dc_was_released() {
     let (mut m, data, _, _) = fixture(8, 8, PixelFormat::Bgra32, false);
     windows(&mut m, false);
@@ -225,6 +226,7 @@ fn display_dc_nested_paint_has_default_state_and_own_dc_retains_its_owner() {
 }
 
 #[test]
+// spec: WIN32-GDI-3
 fn visible_child_can_be_the_presentation_canvas_after_the_parent_lease_ends() {
     let (mut m, data, _, _) = fixture(8, 8, PixelFormat::Bgra32, false);
     windows(&mut m, false);

@@ -11,7 +11,7 @@ publish.workspace = true
 default = []
 device = ["dep:cpal"]
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows"]
-# FFmpeg movie decoding; needs FFMPEG_DIR (see docs/media-build.md).
+# FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
 slow-tests = []

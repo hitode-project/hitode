@@ -64,13 +64,9 @@ fn devices(
     bytes[..4].copy_from_slice(&cb.to_le_bytes());
     if found {
         let (name, label, state) = if child {
-            (r"\\.\DISPLAY1\Monitor0", "adv-host virtual monitor", 3u32)
+            (r"\\.\DISPLAY1\Monitor0", "hitode virtual monitor", 3u32)
         } else {
-            (
-                PRIMARY_DEVICE_NAME,
-                "adv-host virtual display adapter",
-                5u32,
-            )
+            (PRIMARY_DEVICE_NAME, "hitode virtual display adapter", 5u32)
         };
         field(&mut bytes, 4, name, wide);
         field(&mut bytes, description, label, wide);

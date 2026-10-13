@@ -402,6 +402,7 @@ fn copies_use_live_nt_bytes_and_close_both_owners_on_alias_collision_and_write_f
     }
 }
 
+// spec: HOST-SAVE-4
 #[test]
 fn move_copy_observes_native_flush_before_delete_and_propagates_flush_failure() {
     for mode in 4..9 {

@@ -230,6 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = Runtime::with_codec(
         &game,
         folder.join("overlay"),
+        None,
         true,
         640,
         480,

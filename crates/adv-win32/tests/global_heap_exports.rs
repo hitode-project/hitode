@@ -82,6 +82,7 @@ fn execute(machine: &mut Machine<JitCpu>, mut code: Asm) {
 }
 
 #[test]
+// spec: PERS-BRIDGE-2
 fn first_global_alloc_and_fixed_movable_realloc_size_free_reach_rtl_hooks() {
     for jit in [false, true] {
         let mut machine = machine(jit);
@@ -230,6 +231,7 @@ fn rtl_and_crt_free_realloc_retire_fixed_global_aliases() {
 }
 
 #[test]
+// spec: WIN32-OBJECT-4
 fn large_heap_exports_zero_freed_storage_without_zero_memory() {
     for jit in [false, true] {
         for moving in [false, true] {
@@ -291,6 +293,7 @@ fn large_heap_exports_zero_freed_storage_without_zero_memory() {
 }
 
 #[test]
+// spec: WIN32-OBJECT-4
 fn large_global_local_and_heap_allocations_retire_without_stale_aliases() {
     for jit in [false, true] {
         let mut machine = machine(jit);

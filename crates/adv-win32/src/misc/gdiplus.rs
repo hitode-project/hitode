@@ -482,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    // spec: DEV-IMAGE-2
     fn image_graphics_retain_backing_and_clones_have_independent_pixels() {
         let mut f = Fixture::new("gdiplus-images");
         let token = startup(&mut f);
@@ -530,6 +531,7 @@ mod tests {
     }
 
     #[test]
+    // spec: DEV-IMAGE-2
     fn hdc_drawing_preserves_gdi_alpha_and_writes_the_selected_guest_bitmap() {
         let mut f = Fixture::new("gdiplus-hdc");
         let token = startup(&mut f);

@@ -175,7 +175,7 @@ impl Memory {
             .selective_code_writes()
             .then_some(self.watched.as_slice());
         // Where a host page holds several guest pages, the window protects
-        // each with the intersection of their permissions (§A4.2).
+        // each with the intersection of their permissions (A64-MEM-4).
         #[cfg(unix)]
         if self.window.is_some() {
             let slack = self.window_slack();
@@ -537,7 +537,7 @@ impl Memory {
     }
 
     /// Guest memory placed in a 4 GiB-aligned `GuestWindow` at its guest
-    /// addresses (execution ABI §A4). `ptr` is the always accessible alias, so
+    /// addresses (A64-MEM-2). `ptr` is the always accessible alias, so
     /// every Rust and interpreter access is unchanged; the window view's host
     /// protection follows the guest's for translated code. Pages the host
     /// cannot protect exactly stay inaccessible there as soft pages.
@@ -2195,6 +2195,7 @@ mod file_page_tests {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
     }
 
+    // spec: A64-MEM-3
     #[test]
     fn first_native_access_makes_a_shared_view_resident_and_coherent() {
         let page = crate::backend::FilePage::lazy(|| Ok([0; PAGE_SIZE]));
@@ -2272,6 +2273,7 @@ mod window_tests {
     use super::*;
     use crate::virtual_memory::GuestAccess::{Read, Write};
 
+    // spec: A64-MEM-2, A64-MEM-4
     #[test]
     fn the_guest_window_view_follows_guest_permissions_on_4k_and_16k_hosts() {
         let native = crate::virtual_memory::host_page_size().unwrap();
@@ -2325,6 +2327,7 @@ mod window_tests {
     /// Native code takes a page directly only where its host page lets it:
     /// on 16K hosts a mixed or code-watched host page sends the accesses its
     /// window refuses through `Memory` instead of faulting on each one.
+    // spec: A64-MEM-3, A64-MEM-8
     #[test]
     fn native_permissions_follow_the_window_host_page() {
         let native = crate::virtual_memory::host_page_size().unwrap();

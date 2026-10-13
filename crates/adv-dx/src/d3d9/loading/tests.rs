@@ -60,6 +60,7 @@ fn bmp() -> Vec<u8> {
 }
 
 #[test]
+// spec: DEV-IMAGE-1
 fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifetime() {
     let mut m = super::super::tests::machine();
     m.sys.objects = Objects::default();

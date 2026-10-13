@@ -235,7 +235,7 @@ impl Translator<'_> {
     }
 
     /// Branches to the unit for the EIP in w16 through the indirect table,
-    /// from this site's own branch (§A5.3); `link` calls it. A miss records
+    /// from this site's own branch (A64-CTL-6); `link` calls it. A miss records
     /// a transfer of `kind`.
     fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
         self.emit_all(&[
@@ -249,7 +249,7 @@ impl Translator<'_> {
         self.emit(if link { blr(X17) } else { br(X17) });
     }
 
-    /// A return to the EIP in w16 through the shadow stack (§A5.2).
+    /// A return to the EIP in w16 through the shadow stack (A64-CTL-4).
     fn shadow_return(&mut self) {
         self.emit_all(&[
             ldp(X, crate::encode::Index::Offset, Reg::LR, X17, SHADOW, 0),
@@ -453,7 +453,7 @@ impl Translator<'_> {
         });
     }
 
-    /// A checked access (§A4.3) of `kind` at the guest address in `address`,
+    /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,
     /// whose window form is `direct`: the window takes it if it stays in
     /// one page whose class allows it, else the `access` stub does, and
     /// loads `rt` or stores it. Uses x3 and x4.
@@ -565,7 +565,7 @@ impl Translator<'_> {
     }
 
     /// `inc` or `dec` of a 32-bit memory operand: load, store the result,
-    /// then the flags from the loaded value (§A3.2).
+    /// then the flags from the loaded value (A64-FLAG-4).
     fn step_memory(&mut self, increment: bool, mem: Mem) {
         let t = self.take_temp();
         let addr = self.address(mem);
@@ -634,7 +634,7 @@ impl Translator<'_> {
     /// A 1- or 2-byte `mov` or ALU operation. Values are zero-extended into
     /// the recipe temporaries, so PF and AF recipes see their low bits; the
     /// flags come from the operands shifted to the top of a W register.
-    /// Stores precede the flags (§A3.2).
+    /// Stores precede the flags (A64-FLAG-4).
     fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part) {
         let shift = 32 - 8 * u32::from(width);
         // Both temporaries are overwritten. A fault site observes every
@@ -934,7 +934,7 @@ impl Translator<'_> {
         }
     }
 
-    /// `alu [mem], source`: load, compute, store, then the flags (§A3.2).
+    /// `alu [mem], source`: load, compute, store, then the flags (A64-FLAG-4).
     fn alu_memory(&mut self, alu: Alu, mem: Mem, source: Src) {
         let t = self.take_temp();
         // The address first: it may use w17, and the result goes to w6.

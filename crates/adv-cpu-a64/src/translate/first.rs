@@ -455,6 +455,7 @@ mod tests {
 
     /// Every instruction a first visit completes leaves what the core
     /// interpreter leaves: registers, EIP, EFLAGS and memory.
+    // spec: A64-TR-2
     #[test]
     fn first_visits_match_the_interpreter() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);

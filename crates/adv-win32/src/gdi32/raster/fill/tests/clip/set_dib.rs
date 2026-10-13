@@ -7,6 +7,7 @@ fn header(width: u32, height: i32) -> [u32; 10] {
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-9
 fn bitfield_dib32_create_draw_and_readback_match_native() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     let (mut m, data, dc, _) = fixture(2, 2, PixelFormat::Bgra32, false);
@@ -122,6 +123,7 @@ fn bitfield_dib32_create_draw_and_readback_match_native() {
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-5
 fn device_dib_upload_matches_native_scan_bands_origins_and_clipping() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     let (mut m, data, dc, pixels) = fixture(6, 6, PixelFormat::Bgra32, false);
@@ -273,6 +275,7 @@ fn device_dib_upload_matches_native_scan_bands_origins_and_clipping() {
 }
 
 #[test]
+// spec: WIN32-GDI-8
 fn true_colour_palette_flag_creates_and_uploads_real_pixels_through_both_dib_apis() {
     for bpp in [16u32, 24, 32] {
         let (mut m, data, dc, pixels) = fixture(2, 2, PixelFormat::Bgra32, false);
@@ -341,6 +344,7 @@ fn true_colour_palette_flag_creates_and_uploads_real_pixels_through_both_dib_api
 }
 
 #[test]
+// spec: WIN32-GDI-6
 fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_storage() {
     for bpp in [1u32, 4, 8] {
         let (mut m, data, dc, _) = fixture(9, 2, PixelFormat::Bgra32, false);
@@ -502,6 +506,7 @@ fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_stora
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-8, WIN32-GDI-13
 fn indexed_readback_matches_native_palette_mapping_queries_and_partial_bytes() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     for bpp in [1u32, 4, 8] {

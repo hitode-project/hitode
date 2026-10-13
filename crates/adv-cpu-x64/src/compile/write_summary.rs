@@ -99,6 +99,7 @@ mod tests {
         }
         Summary::for_region(&instructions)
     }
+    // spec: EXEC-X64-3
     #[test]
     fn implicit_and_partial_writes_are_included_without_read_only_vector_sources() {
         // mov ah,1; mul ebx; push eax; paddb xmm0,xmm1
@@ -116,6 +117,7 @@ mod tests {
             assert_eq!((s.gpr, s.xmm), (0, 0));
         }
     }
+    // spec: EXEC-X64-3
     #[test]
     fn helpers_and_mmx_aliases_require_full_canonical_state() {
         assert!(summary(&[0xf3, 0xa5]).is_none()); // rep movsd

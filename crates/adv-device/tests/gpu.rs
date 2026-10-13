@@ -174,6 +174,7 @@ fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() 
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture() {
     use adv_device::surface::{BlitRect, Snapshot, Surfaces, VideoFrame, VideoLayer};
     let mut gpu =
@@ -279,6 +280,7 @@ fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
 }
 
 #[test]
+// spec: DEV-DEPTH-1
 fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     for format in [

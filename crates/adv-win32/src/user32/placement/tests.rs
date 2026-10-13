@@ -28,6 +28,7 @@ fn input(machine: &mut Machine<JitCpu>, memory: u32, fields: [i32; 11]) {
 }
 
 #[test]
+// spec: WIN32-USER-6
 fn setter_reads_only_a_complete_structure_and_routes_geometry_through_user_callbacks() {
     let (mut m, memory, hwnd) = fixture();
     let fields = [44, 8, 4, 10, 20, 30, 40, 250, 270, 710, 630];
@@ -52,6 +53,7 @@ fn setter_reads_only_a_complete_structure_and_routes_geometry_through_user_callb
 }
 
 #[test]
+// spec: WIN32-USER-7
 fn setter_pairs_minimize_maximize_restore_and_explicit_minimum_positions() {
     let (mut m, memory, hwnd) = fixture();
     let mut messages = Vec::new();
@@ -85,6 +87,7 @@ fn setter_pairs_minimize_maximize_restore_and_explicit_minimum_positions() {
 }
 
 #[test]
+// spec: WIN32-USER-6
 fn setter_recovers_offscreen_normal_windows_but_preserves_tool_coordinates() {
     for (tool, expected) in [
         (false, [1460, 680, 1920, 1040]),
@@ -110,6 +113,7 @@ fn setter_recovers_offscreen_normal_windows_but_preserves_tool_coordinates() {
 }
 
 #[test]
+// spec: WIN32-USER-6
 fn setter_rejects_bad_lengths_and_unreadable_input_without_changing_window() {
     let (mut m, memory, hwnd) = fixture();
     let original = snapshot(&mut m, memory + 4096, hwnd);

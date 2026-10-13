@@ -177,6 +177,7 @@ fn api_loop_keeps_the_shared_cpu_and_matches_unicorn() {
     assert!(entries[1] < entries[0]);
 }
 
+// spec: PROC-MACH-3
 #[test]
 fn nested_callbacks_can_wait_then_resume_in_the_right_order() {
     let mut logs = Vec::new();

@@ -7,6 +7,7 @@ use std::{os::windows::process::CommandExt, path::Path, process::Command};
 mod cpu;
 
 #[test]
+// spec: WIN32-GDI-14
 fn paragraph_dib_pixels_and_heights_match_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/investigations/drawtext-lines/native-differential");

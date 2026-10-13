@@ -43,6 +43,7 @@ fn wide(m: &mut Machine<adv_cpu::JitCpu>, at: u32, text: &str) {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-2
 fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
@@ -120,6 +121,7 @@ fn authored_wave() -> String {
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-2
 fn file_source_uses_guest_paths_keeps_decoder_and_tracks_graph_and_caller_references() {
     let guest_path = authored_wave();
     let mut m = machine();
@@ -266,6 +268,7 @@ fn invoke(
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-4
 fn render_file_appends_through_both_interfaces_and_owns_only_graph_references() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
@@ -340,6 +343,7 @@ fn render_file_appends_through_both_interfaces_and_owns_only_graph_references() 
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-5
 fn render_ex_existing_only_rolls_back_then_retries_with_existing_audio_renderer() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
@@ -408,6 +412,7 @@ fn render_ex_existing_only_rolls_back_then_retries_with_existing_audio_renderer(
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-4
 fn render_file_movie_keeps_connected_renderers_and_appends_video_and_audio_streams() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
@@ -454,6 +459,7 @@ fn render_file_movie_keeps_connected_renderers_and_appends_video_and_audio_strea
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-5
 fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_when_busy() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)

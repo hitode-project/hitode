@@ -183,6 +183,7 @@ fn unopened_reader_refuses_stream_requests() {
 }
 
 #[test]
+// spec: MEDIA-WMV-1
 fn stream_samples_arrive_in_time_order_with_clean_point_flags() {
     let mut m = machine();
     let reader = reader_with(&mut m, Some(media()));

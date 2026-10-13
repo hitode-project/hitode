@@ -1501,6 +1501,7 @@ fn popfd_in_user_mode_preserves_privileged_bits_and_defers_new_tf_until_next_ins
     assert_eq!(initial.eip, CODE + 2);
 }
 
+// spec: EXEC-CORE-3
 #[test]
 fn bswap_word_uses_explicit_compatibility_semantics_without_changing_flags() {
     // SDM leaves the word form undefined. Expected word results follow the

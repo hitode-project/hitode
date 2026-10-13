@@ -1,4 +1,4 @@
-//! Personality invariant 2 (docs/personality-contracts.md): every version
+//! Personality invariant 2 (PERS-PROFILE-1): every version
 //! fact a guest can read is generated from one profile and agrees with it.
 //! Channels Windows also carries the version in, but that ADV does not model
 //! yet, must stay absent: whoever adds one has to generate it from the
@@ -280,7 +280,7 @@ fn check(profile: Profile) {
     assert_eq!(t.u32(verified), 1);
     assert_eq!((t.u32(product), t.u32(OUT)), (1, profile.edition));
 
-    // Deferred channels (docs/personality-contracts.md): no CurrentVersion
+    // Deferred channels (PERS-PROFILE-3): no CurrentVersion
     // registry values, no system version resources, no KUSER_SHARED_DATA.
     assert_ne!(t.u32(registry), 0, "CurrentVersion registry key appeared");
     assert_eq!(t.u32(resource), 0, "system version resource appeared");
@@ -291,11 +291,13 @@ fn check(profile: Profile) {
 }
 
 #[test]
+// spec: PERS-PROFILE-1, PERS-PROFILE-3
 fn default_profile_is_windows_7_sp1_in_every_version_fact() {
     check(WIN7_SP1);
 }
 
 #[test]
+// spec: PERS-PROFILE-1
 fn an_alternate_profile_changes_every_version_fact_together() {
     check(VISTA_SP2);
 }

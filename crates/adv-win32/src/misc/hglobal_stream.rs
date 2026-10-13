@@ -633,6 +633,7 @@ mod tests {
     use adv_machine::Resume;
 
     #[test]
+    // spec: WIN32-OBJECT-7
     fn cloned_streams_share_storage_and_keep_independent_positions() {
         let mut f = Fixture::new("hglobal-stream");
         assert_eq!(

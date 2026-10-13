@@ -1,4 +1,11 @@
-/* Authored no-window font-resource contract oracle. Only the repo font fixture. */
+/*
+ * Authored x86 private-font oracle; input is the repository-owned font-resource.ttf.
+ * Checks cover private registration, repeated references, enumeration visibility, flags, and removal.
+ * It never registers a public font or reads game data.
+ * Run from the repository root: ./tools/fixtures/build-font-resource-native.ps1
+ * The script builds with LLVM/Windows SDK, copies the font, and runs the hidden probe.
+ * Outputs: font-resource-native.bin and numeric stdout; default directory: target/font-resource-native.
+ */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 

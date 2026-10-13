@@ -1,0 +1,104 @@
+/* Design tokens and shared controls, matching the launcher design boards. */
+:root {
+  --font-ui: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-ja: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", "Noto Sans JP", "Yu Gothic UI", "Meiryo UI", var(--font-ui);
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --chart: #3767d6;
+  color-scheme: light;
+  --bg: #f4f4f2;
+  --side: #ebebe8;
+  --panel: #f9f9f7;
+  --line: rgba(24, 24, 22, 0.09);
+  --fg: #1b1b1a;
+  --fg2: #55554f;
+  --fg3: #68685f;
+  --field: rgba(24, 24, 22, 0.06);
+  --hover: rgba(24, 24, 22, 0.05);
+  --sel: rgba(24, 24, 22, 0.08);
+  --danger: #c0392b;
+  --pop: #ffffff;
+  --accent: #3767d6;
+  --on-accent: #ffffff;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #141415;
+  --side: #1b1b1d;
+  --panel: #18181a;
+  --line: rgba(255, 255, 255, 0.08);
+  --fg: #ececea;
+  --fg2: #a9a9a5;
+  --fg3: #8f8f8b;
+  --field: rgba(255, 255, 255, 0.07);
+  --hover: rgba(255, 255, 255, 0.05);
+  --sel: rgba(255, 255, 255, 0.09);
+  --danger: #ef6b5c;
+  --pop: #222224;
+  --chart: #5b86e8;
+}
+:root[data-accent="green"] { --accent: #2d7556; }
+:root[data-accent="graphite"] { --accent: #3f3f44; }
+:root[data-theme="dark"][data-accent="graphite"] { --accent: #dcdcdf; --on-accent: #141415; }
+
+/* Phone safe areas; `?phone` in a desktop browser simulates a notched phone. */
+:root { --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px); --safe-left: env(safe-area-inset-left, 0px); --safe-right: env(safe-area-inset-right, 0px); }
+:root[data-simulated] { --safe-top: 44px; --safe-bottom: 34px; }
+
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* The in-game overlay sits over the native game view: nothing may paint the page. */
+:root[data-screen="game"], :root[data-screen="game"] body { background: transparent; }
+#app { height: 100%; }
+[lang="ja"] { font-family: var(--font-ja); }
+button, input, select, textarea { font: inherit; color: inherit; }
+input, textarea { user-select: text; -webkit-user-select: text; }
+
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.scroll { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+
+.nav { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 7px; font-size: 13px; color: var(--fg2); cursor: pointer; }
+.nav:hover { background: var(--hover); }
+.nav.on { background: var(--sel); color: var(--fg); font-weight: 500; }
+.nav:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.nav .n { margin-left: auto; font-size: 12px; color: var(--fg3); font-variant-numeric: tabular-nums; }
+.navlabel { font-size: 11px; font-weight: 500; color: var(--fg3); padding: 16px 10px 6px; letter-spacing: 0.04em; }
+
+.icon-btn { all: unset; box-sizing: border-box; width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; color: var(--fg2); cursor: pointer; }
+.icon-btn:hover { background: var(--hover); color: var(--fg); }
+.icon-btn:focus-visible { outline: 2px solid var(--accent); }
+
+.field { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border-radius: 8px; background: var(--field); color: var(--fg3); box-sizing: border-box; }
+.field input { all: unset; flex: 1; min-width: 0; font-size: 13px; color: var(--fg); }
+.field input::placeholder { color: var(--fg3); }
+
+.pill { all: unset; display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 8px; font-size: 13px; color: var(--fg2); cursor: pointer; }
+.pill:hover { background: var(--hover); }
+.pill:focus-visible { outline: 2px solid var(--accent); }
+
+.primary { all: unset; box-sizing: border-box; display: flex; align-items: center; justify-content: center; gap: 8px; height: 38px; padding: 0 18px; border-radius: 19px; background: var(--accent); color: var(--on-accent); font-size: 14px; font-weight: 500; cursor: pointer; }
+.primary:hover { filter: brightness(1.08); }
+.primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.primary[aria-disabled="true"], .primary:disabled { background: var(--field); color: var(--fg3); cursor: default; filter: none; }
+.secondary { all: unset; box-sizing: border-box; display: flex; align-items: center; justify-content: center; gap: 8px; height: 38px; padding: 0 18px; border-radius: 19px; background: var(--field); color: var(--fg); font-size: 14px; cursor: pointer; }
+.secondary:hover { background: var(--sel); }
+.secondary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ghost { all: unset; box-sizing: border-box; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 19px; background: var(--field); color: var(--fg2); cursor: pointer; }
+.ghost:hover { color: var(--fg); }
+.ghost:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.quiet { all: unset; padding: 6px 8px; border-radius: 7px; font-size: 13px; color: var(--fg2); cursor: pointer; }
+.quiet:hover { background: var(--hover); color: var(--fg); }
+.quiet:focus-visible { outline: 2px solid var(--accent); }
+.link { all: unset; color: var(--fg2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; cursor: pointer; }
+.link:hover { color: var(--fg); }
+
+.notice { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 12px; background: var(--field); font-size: 13px; line-height: 18px; }
+.notice > svg { flex: 0 0 auto; margin-top: 1px; color: var(--fg2); }
+.mono { font-family: var(--font-mono); font-size: 12px; color: var(--fg3); word-break: break-all; }

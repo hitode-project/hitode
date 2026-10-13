@@ -128,6 +128,7 @@ impl WakeQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: PROC-MACH-5
     #[test]
     fn audio_can_follow_input_without_waiting_for_a_normal_turn() {
         let mut q = WakeQueue::default();
@@ -172,6 +173,7 @@ mod tests {
         assert!(!s.promoted);
         assert_eq!(cursor, Some(2));
     }
+    // spec: PROC-MACH-5
     #[test]
     fn recurring_wakes_cannot_starve_normal_workers() {
         let mut q = WakeQueue::default();

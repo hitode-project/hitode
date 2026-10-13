@@ -1,3 +1,13 @@
+<#
+Compare an authored x86 D3D9 resource, lock, draw, readback, Reset, and Present fixture.
+Inputs: d3d9.c, Windows SDK/LLVM, and an adv-run GPU build; no game or audio input.
+Build: cargo build -p adv-run --features adv-shell/gpu
+Run: pwsh -NoProfile -File tools/fixtures/test-d3d9.ps1
+Use -Runner and -OutputDirectory to select the runner and target output directory.
+Outputs include d3d9-result.bin, d3d9-pixels.bin, reports, PNGs, logs, and overlays.
+Default reports: target/architecture-acceptance/d3d9; native binaries: target/fixtures.
+Related checks: test-d3d9-capabilities.ps1 and test-d3d9-environment.ps1.
+#>
 param(
     [string]$Runner = (Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'),
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/architecture-acceptance/d3d9')

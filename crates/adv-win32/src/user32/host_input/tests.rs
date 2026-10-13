@@ -3,6 +3,7 @@ use crate::misc::test_support::{Fixture, env};
 use std::time::{Duration, Instant};
 
 #[test]
+// spec: WIN32-USER-8
 fn physical_double_clicks_use_guest_class_and_mapping_and_keep_key_state() {
     let mut f = Fixture::new("double-click-routing");
     let hwnd = f.m.ext.get::<Win32>().user.desktop;
@@ -96,6 +97,7 @@ fn paired_time_and_rectangle_apis_share_only_the_guest_profile() {
 }
 
 #[test]
+// spec: WIN32-USER-12
 fn committed_text_reaches_the_focus_as_ime_characters_then_def_window_proc_characters() {
     let mut f = Fixture::new("committed-text");
     crate::set_codepage(&mut env(&mut f.m), 932).unwrap();

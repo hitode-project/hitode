@@ -554,6 +554,9 @@ fn create_bitmap(
 }
 #[win32(gdi32, name = "CreateCompatibleBitmap", level = implement)]
 fn create_compatible_bitmap(env: &mut Env<'_>, _dc: Handle, w: i32, h: i32) -> Outcome {
+    if raster::front::provider(env.ext).is_some() {
+        return raster::front::compatible_bitmap(env, w, h);
+    }
     Outcome::Return(new_bitmap(env, w, h, 32).map_or(0, |(h, _)| h))
 }
 #[win32(gdi32, name = "GetDeviceCaps", level = state)]

@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-12
 fn ansi_kerning_filters_and_packs_the_same_pairs_as_the_native_selected_font() {
     let (mut machine, data, dc) = fixture();
     machine.ext.get_mut::<Win32>().codec =

@@ -446,7 +446,7 @@ impl<B: Backend> Runtime<B> {
 }
 
 /// What the guest asked of the personality and did not get
-/// (docs/personality-contracts.md): rejected discovery probes, reviewed
+/// (PERS-EXPORT-8): rejected discovery probes, reviewed
 /// exports answered with their failure contract, and static stub calls,
 /// whose names and callers are listed under the called API gaps.
 fn personality_gaps(report: &mut String, diagnostics: &adv_abi::ApiDiagnostics) {

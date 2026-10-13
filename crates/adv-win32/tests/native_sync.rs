@@ -188,6 +188,7 @@ fn hook(
 }
 
 #[test]
+// spec: PERS-BRIDGE-4
 fn event_frontends_execute_live_create_open_set_reset_hooks_and_native_parameter_changes() {
     for jit in [false, true] {
         let mut machine = fixture(jit);
@@ -545,6 +546,7 @@ fn wait_all_acquires_atomically_wait_any_returns_its_index_and_native_validation
 }
 
 #[test]
+// spec: PERS-BRIDGE-4
 fn multiple_wait_hooks_observe_native_kind_relative_timeout_and_change_actual_acquisition_or_error()
 {
     for jit in [false, true] {

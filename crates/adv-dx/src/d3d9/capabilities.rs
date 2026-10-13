@@ -428,6 +428,7 @@ mod tests {
         assert_eq!(bytes, [0xa5; 1100]);
     }
     #[test]
+    // spec: GFX-CAP-1, GFX-CAP-3
     fn capabilities_exclude_unimplemented_paths_and_bound_the_usable_upload() {
         let mut m = super::super::tests::machine();
         let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))

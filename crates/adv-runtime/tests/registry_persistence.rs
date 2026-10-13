@@ -379,7 +379,9 @@ fn metadata_spelling_classes_and_deletion_survive_runtime_reopen() {
     }
 }
 
+// spec: HOST-SAVE-1
 #[test]
+// spec: WIN32-OBJECT-5
 fn nonvolatile_flush_and_drop_survive_runtime_reopen_volatile_and_corruption_do_not() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

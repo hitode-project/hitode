@@ -1,7 +1,7 @@
 //! Execution owner of the a64 engine.
 //!
 //! On AArch64 hosts entries run translated code from their second visit
-//! (execution ABI §A7); elsewhere, and in interpreter-only executors, the
+//! (A64-TR-2); elsewhere, and in interpreter-only executors, the
 //! core interpreter runs blocks directly. Exits, traps, fuel and deadlines
 //! follow the x64 executor's interpreter path exactly, so both engines
 //! pass the same semantic tests.

@@ -14,18 +14,21 @@ spec.loader.exec_module(package)
 
 
 class PackageTests(unittest.TestCase):
+    # spec: HOST-PKG-2
     def test_macho_load_commands_and_versions(self):
         self.assertEqual(package.dependencies('file:\n\t@rpath/liba.dylib (compatibility version 1.0.0, current version 2.0.0)\n'), ['@rpath/liba.dylib'])
         self.assertEqual(package.minimum_os('cmd LC_BUILD_VERSION\nminos 14.0\nsdk 27.0'), (14, 0))
         self.assertEqual(package.minimum_os('cmd LC_VERSION_MIN_MACOSX\ncmdsize 16\nversion 11.0'), (11, 0))
         self.assertFalse(package.system_library('/opt/homebrew/lib/a.dylib'))
 
+    # spec: HOST-PKG-2
     def test_dynamic_runner_is_rejected(self):
         with patch.object(package, 'run', side_effect=['cmd LC_BUILD_VERSION\nminos 11.0',
                 'runner:\n\t/opt/homebrew/lib/libavcodec.dylib (compatibility version 1.0.0)']):
             with self.assertRaisesRegex(ValueError, 'non-system dylibs'):
                 package.package(Path('runner'), Path('unused'), '-', None)
 
+    # spec: HOST-PKG-4
     def test_parent_license_from_exact_crate_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -48,6 +51,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(count, 1)
             self.assertEqual((root / 'notices/LICENSE').read_bytes(), text)
 
+    # spec: HOST-PKG-3
     def test_only_jit_entitlement_and_no_adhoc_notarization(self):
         self.assertEqual(package.ENTITLEMENTS, {'com.apple.security.cs.allow-jit': True})
         with self.assertRaises(ValueError):

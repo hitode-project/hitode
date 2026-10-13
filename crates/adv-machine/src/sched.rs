@@ -649,6 +649,7 @@ mod active_tests {
         assert_eq!(machine.sys.wakes.entries().len(), 2);
     }
 
+    // spec: PROC-MACH-2
     #[test]
     fn reused_slots_keep_wake_identity_and_normal_progress() {
         let mut active = super::ActiveContexts::default();

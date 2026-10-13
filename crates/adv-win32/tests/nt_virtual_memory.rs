@@ -380,6 +380,7 @@ fn nt_vm_failures_leave_outputs_last_error_and_reservations_intact() {
 }
 
 #[test]
+// spec: WIN32-IMAGE-4
 fn nt_protect_rejects_private_copy_pages_and_publishes_noaccess_old_protection() {
     const OLD: u32 = DATA + 0x30;
     const SNAPSHOTS: u32 = DATA + 0x40;

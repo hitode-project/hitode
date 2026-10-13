@@ -449,6 +449,7 @@ fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
 }
 
 #[test]
+// spec: PERS-EXPORT-7
 fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or_code() {
     for jit in [false, true] {
         let mut machine = machine(jit);
@@ -594,6 +595,7 @@ fn real_guest_exports_and_forwarders_are_not_filtered_by_host_capability_metadat
 }
 
 #[test]
+// spec: PERS-EXPORT-1
 fn published_entries_are_real_pe_code_aliases_hookable_and_callable() {
     for jit in [false, true] {
         for patched in [false, true] {
@@ -763,6 +765,7 @@ fn generated_system_catalog_fits_the_reserved_arena_and_thunk_capacity() {
     assert!(m.sys.thunks.len() < adv_machine::layout::THUNK_CAP);
 }
 
+// spec: PROC-ISO-1
 #[test]
 fn family_system_images_share_addresses_and_keep_independent_bytes_and_references() {
     for jit in [false, true] {
@@ -877,6 +880,7 @@ fn late_native_image_follows_executable_without_replacing_existing_loader_record
 }
 
 #[test]
+// spec: WIN32-IMAGE-5
 fn peb_loader_lists_keep_stable_links_names_counts_and_dll_preferred_bases() {
     struct Files;
     impl FileSource for Files {

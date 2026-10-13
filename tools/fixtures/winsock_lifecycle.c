@@ -1,4 +1,12 @@
-/* Authored x86 Winsock initialization only; never creates a socket. */
+/*
+ * Authored x86 Winsock initialization oracle; no socket or network connection is created.
+ * Inputs cover requested versions, sentinel-filled WSADATA, null outputs, nested calls, and worker threads.
+ * Checks compare named/ordinal startup, cleanup, process references, and thread-local error APIs.
+ * Build from the repository root: ./tools/fixtures/build-winsock.ps1 using LLVM and the Windows SDK.
+ * Run fixture_winsock.exe from target/winsock-tests to write winsock-report.bin.
+ * Native/guest comparison: cargo test -p adv-runtime --test winsock
+ * Undefined last-error results for rejected startup calls are excluded from comparison.
+ */
 #include "win32_min.h"
 typedef struct { WORD version,highest; char description[257],status[129]; WORD sockets,udp; void *vendor; } DATA;
 typedef int (WINAPI *STARTUP)(WORD,DATA *);

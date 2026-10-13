@@ -729,6 +729,7 @@ mod tests {
         assert_eq!(objects.handle_flags(0), None);
     }
 
+    // spec: PROC-HANDLE-2
     #[test]
     fn inherited_numeric_aliases_refuse_collisions_and_do_not_mark_other_namespaces() {
         let mut objects = Objects::default();

@@ -39,6 +39,7 @@ fn run_guest(exe: &Path, profile: &Path, backend: &str) {
 }
 
 #[test]
+// spec: MEDIA-AUDIO-1
 fn application_function_drivers_convert_and_release_like_windows() {
     use std::os::windows::process::CommandExt;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -72,6 +73,7 @@ fn application_function_drivers_convert_and_release_like_windows() {
 }
 
 #[test]
+// spec: MEDIA-AUDIO-1
 fn pcm_and_adpcm_stream_headers_lifetime_and_samples_match_windows() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/acm-codec-tests");

@@ -103,6 +103,7 @@ mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
 
+    // spec: EXEC-X64-6
     #[test]
     fn entry_frame_and_signal_snapshot_have_fixed_c_layouts() {
         assert_eq!(offset_of!(HostContextSnapshot, sp), 256);

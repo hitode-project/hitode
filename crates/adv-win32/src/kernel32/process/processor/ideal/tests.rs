@@ -6,6 +6,7 @@ use adv_machine::Outcome;
 const CURRENT_THREAD: u32 = u32::MAX - 1;
 
 #[test]
+// spec: WIN32-API-6
 fn ideal_processor_variants_share_the_one_cpu_affinity_profile() {
     let mut f = Fixture::new("ideal-processor-profile");
     let thread = f.m.sys.contexts[0].thread_handle;

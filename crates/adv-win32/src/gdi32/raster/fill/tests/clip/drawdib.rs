@@ -217,3 +217,45 @@ fn draw_dib_invalid_inputs_preserve_pixels_and_capability_gaps_warn() {
     assert_eq!(call(&mut m, data, CLOSE, &[handle]), 1);
     assert_eq!(draw(&mut m, data, handle, dc, rect, rect, info, bits, 0), 0);
 }
+
+#[test]
+// spec: WIN32-GDI-6
+fn compatible_bitmap_drawdib_then_stretch_blt_reaches_target_pixels() {
+    let (mut m, data, target, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
+    let dc = call(&mut m, data, "gdi32.dll!CreateCompatibleDC", &[target]);
+    let bitmap = call(
+        &mut m,
+        data,
+        "gdi32.dll!CreateCompatibleBitmap",
+        &[target, 4, 4],
+    );
+    assert_ne!(bitmap, 0);
+    assert_ne!(
+        call(&mut m, data, "gdi32.dll!SelectObject", &[dc, bitmap]),
+        0
+    );
+    let handle = call(&mut m, data, OPEN, &[]);
+    let (info, bits) = source(&mut m, data, 32);
+    let rect = [0, 0, 4, 4];
+    assert_eq!(draw(&mut m, data, handle, dc, rect, rect, info, bits, 0), 1);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!StretchBlt",
+            &[target, 0, 0, 8, 8, dc, 0, 0, 4, 4, 0x00cc0020]
+        ),
+        1
+    );
+    let mut actual = [0; 256];
+    m.cpu.read(pixels, &mut actual).unwrap();
+    for y in 0..8 {
+        for x in 0..8 {
+            let i = (y / 2 * 4 + x / 2) as u8;
+            assert_eq!(
+                &actual[(y * 8 + x) * 4..(y * 8 + x) * 4 + 3],
+                &[i + 1, i + 17, i + 33]
+            );
+        }
+    }
+}

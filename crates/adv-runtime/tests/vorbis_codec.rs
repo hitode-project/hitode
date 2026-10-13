@@ -77,6 +77,7 @@ fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
 }
 
 #[test]
+// spec: DEV-AUDIO-3
 fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/vorbis-codec-tests");
@@ -142,6 +143,7 @@ fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
             let mut runtime = Runtime::with_cpu_and_codec(
                 output.join(exe),
                 &profile,
+                None,
                 cpu::Cpu::new(jit).unwrap(),
                 32,
                 32,
@@ -230,6 +232,7 @@ fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
 /// the original game DLL is read-only source material for a native baseline.
 #[test]
 #[ignore = "requires locally unpacked, authorized game sources under target"]
+// spec: DEV-AUDIO-3
 fn real_vorbis_pages_and_packet_boundaries_match_reference() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/vorbis-real-source-tests");
@@ -282,6 +285,7 @@ fn real_vorbis_pages_and_packet_boundaries_match_reference() {
             let mut runtime = Runtime::with_cpu_and_codec(
                 output.join("fixture_vorbis_decode.exe"),
                 &profile,
+                None,
                 cpu::Cpu::new(jit).unwrap(),
                 32,
                 32,

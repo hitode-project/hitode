@@ -205,6 +205,11 @@ impl Performance {
         self.last_host_present = Some(completed);
         self.last_host_serial = serial;
     }
+    /// Guest execution time per presented frame in milliseconds, most recent
+    /// window; the anonymous report's frame percentiles.
+    pub(crate) fn frame_samples(&self) -> impl Iterator<Item = f64> + '_ {
+        self.warm_active_intervals.recent.iter().copied()
+    }
     pub fn wait(&mut self, requested: Option<Duration>, elapsed: Duration, outcome: WaitOutcome) {
         if let Some(requested) = requested {
             self.wait_requested += requested;

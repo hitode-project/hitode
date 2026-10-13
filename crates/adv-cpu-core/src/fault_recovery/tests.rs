@@ -115,6 +115,7 @@ fn region<'a>(owner: &'a dyn Any, points: &'a [NativeRecoveryPoint]) -> CodeRegi
     unsafe { CodeRegion::new(owner, start, end - start, points) }.unwrap()
 }
 
+// spec: EXEC-X64-10, EXEC-X64-12, A64-MEM-9
 #[test]
 fn asynchronous_and_extended_signal_causes_are_refused() {
     unsafe {
@@ -132,6 +133,7 @@ fn asynchronous_and_extended_signal_causes_are_refused() {
     }
 }
 
+// spec: EXEC-X64-10, EXEC-X64-12
 #[test]
 fn unsupported_sites_are_rejected_before_native_execution() {
     let mut site = point(false);
@@ -163,6 +165,7 @@ fn unsupported_sites_are_rejected_before_native_execution() {
     assert!(unsafe { CodeRegion::new(&owner, start, end - start, &outside) }.is_err());
 }
 
+// spec: EXEC-X64-11
 #[test]
 fn controlled_faults_preserve_prefix_and_continue() {
     if let Ok(case) = std::env::var("ADV_CONTROLLED_FAULT_CASE") {

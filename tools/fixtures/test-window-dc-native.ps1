@@ -1,3 +1,12 @@
+<#
+Build and run an authored x86 DC-lifetime probe using LLVM and the Windows SDK.
+Inputs: invisible ordinary and CS_OWNDC windows, saved attributes, and repeated DC/paint operations.
+Checks distinguish persistent private DC state, ordinary DC reset, and independent window lifetimes.
+Run from the repository root: ./tools/fixtures/test-window-dc-native.ps1 -OutputDirectory <run-directory>
+Default output: target/investigations/window-dc/native.
+Outputs include window-dc-native.bin, results.json, a source copy, and cmd.txt with commands and hashes.
+The fixture reads no game data and does not manipulate the host cursor or cursor clipping.
+#>
 param([string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/investigations/window-dc/native'))
 $ErrorActionPreference = 'Stop'
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)

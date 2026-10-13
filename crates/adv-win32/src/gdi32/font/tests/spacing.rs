@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-10
 fn unicode_coverage_matches_native_selected_face_and_checks_complete_buffer() {
     let (mut machine, data, dc) = fixture();
     let font_id = selected_font(&machine, dc);
@@ -74,6 +75,7 @@ fn unicode_coverage_matches_native_selected_face_and_checks_complete_buffer() {
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-10
 fn glyph_spacing_matches_native_ranges_arrays_defaults_and_bitmap_fonts() {
     let (mut machine, data, dc) = fixture();
     let font_id = selected_font(&machine, dc);

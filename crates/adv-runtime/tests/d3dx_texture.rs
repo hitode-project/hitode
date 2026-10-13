@@ -7,6 +7,7 @@ use std::{os::windows::process::CommandExt, path::Path, process::Command};
 mod cpu;
 
 #[test]
+// spec: GFX-D3DX-1
 fn d3dx_texture_fronts_match_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/investigations/d3dx-texture/native-differential");

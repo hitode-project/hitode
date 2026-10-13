@@ -1,4 +1,4 @@
-# Reviewed exports (docs/personality-contracts.md), proxy lookups from docs/architecture.md §5.
+# Reviewed exports (PERS-EXPORT-3), and proxy DLL lookups.
 # dll<TAB>export. Discoverable without a frontend; calls return the failure registered
 # in failures.tsv (HRESULT defaults to E_NOTIMPL, void returns nothing) in every run mode.
 # Remove a row once a frontend implements it; adv-runtime personality_invariants enforces both.

@@ -46,6 +46,7 @@ fn stencil(reference: u32) -> DrawState {
 }
 
 #[test]
+// spec: DEV-DEPTH-1
 fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let depth = gpu.depth(8, 6, DepthFormat::Depth24Stencil8).unwrap();
@@ -112,6 +113,7 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
 }
 
 #[test]
+// spec: DEV-DEPTH-2
 fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let base = gpu.target_levels(8, 8, 3).unwrap();

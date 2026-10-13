@@ -187,6 +187,7 @@ impl Harness {
     }
 }
 
+// spec: A64-FLAG-2
 #[test]
 fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
     let mut h = Harness::new();
@@ -248,6 +249,7 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
     }
 }
 
+// spec: A64-FLAG-2
 #[test]
 fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
     let mut h = Harness::new();
@@ -288,6 +290,7 @@ fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
     }
 }
 
+// spec: A64-FP-6
 #[test]
 fn comparisons_with_identical_operands_ignore_scalar_upper_snan_lanes() {
     let mut h = Harness::new();
@@ -351,6 +354,7 @@ fn cmp_code(scalar: bool, double: bool, memory: bool, predicate: i32) -> Vec<u8>
     })
 }
 
+// spec: A64-FP-6
 #[test]
 fn floating_comparison_masks_cover_predicates_lanes_nan_and_denormal_inputs() {
     let mut h = Harness::new();
@@ -436,6 +440,7 @@ fn floating_comparison_masks_cover_predicates_lanes_nan_and_denormal_inputs() {
     }
 }
 
+// spec: A64-FP-5
 #[test]
 fn floating_guard_and_snan_bail_before_destination_or_mxcsr_commit() {
     let mut h = Harness::new();

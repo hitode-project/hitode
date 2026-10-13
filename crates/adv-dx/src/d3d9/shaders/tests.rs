@@ -50,6 +50,7 @@ fn typed_call(env: &mut Env<'_>, registry: &Registry, name: &str, args: &[u32]) 
     }
 }
 #[test]
+// spec: GFX-SHADER-3
 fn bound_shader_can_retain_zero_public_object_and_get_function_is_bounded() {
     let mut m = machine();
     let mut env = env(&mut m);
@@ -144,6 +145,7 @@ fn token_reader_skips_end_valued_comments_and_immediates_and_rejects_invalid_mem
     assert_eq!(env.sys.objects.object_count(), initial);
 }
 #[test]
+// spec: GFX-SHADER-3
 fn shader_binding_rejects_wrong_stage_foreign_device_and_faulted_outputs() {
     let mut m = machine();
     m.cpu.map(0x580000, 4096, Prot::READ).unwrap();
@@ -185,6 +187,7 @@ fn shader_binding_rejects_wrong_stage_foreign_device_and_faulted_outputs() {
     assert_eq!(release(&mut env, ps), 0);
 }
 #[test]
+// spec: GFX-SHADER-3
 fn constants_preserve_bits_check_complete_ranges_and_preserve_bool_words() {
     let mut m = machine();
     m.cpu.map(0x590000, 8192, Prot::RW).unwrap();
@@ -254,6 +257,7 @@ fn constants_preserve_bits_check_complete_ranges_and_preserve_bool_words() {
     assert_eq!(set_pixel_b(&mut env, this, 16, input.cast(), 1), INVALID);
 }
 #[test]
+// spec: GFX-SHADER-4
 fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() {
     let mut m = machine();
     let mut env = env(&mut m);
@@ -327,6 +331,7 @@ fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() 
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
 }
 #[test]
+// spec: GFX-SHADER-4
 fn reset_clears_shader_bindings_constants_and_recording_but_keeps_public_program() {
     let mut m = machine();
     let mut env = env(&mut m);
@@ -356,6 +361,7 @@ fn reset_clears_shader_bindings_constants_and_recording_but_keeps_public_program
     assert!(bound(&env, shader_id).is_none());
 }
 #[test]
+// spec: GFX-SHADER-4
 fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
     let mut m = machine();
     let mut env = env(&mut m);
@@ -404,6 +410,7 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
     }
 }
 #[test]
+// spec: GFX-SAMPLER-1
 fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state() {
     let mut m = machine();
     m.cpu.map(0x5a0000, 4096, Prot::RW).unwrap();
@@ -518,6 +525,7 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
 }
 #[test]
+// spec: GFX-SAMPLER-2
 fn neutral_sampler_defaults_pair_queries_changes_and_state_blocks_for_every_slot() {
     let mut m = machine();
     m.cpu.map(0x5a0000, 4096, Prot::RW).unwrap();

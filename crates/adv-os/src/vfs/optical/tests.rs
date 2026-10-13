@@ -17,6 +17,7 @@ fn fixture(name: &str) -> (Vfs, std::path::PathBuf) {
 }
 
 #[test]
+// spec: DEV-DISC-4, DEV-DISC-6, DEV-DISC-7
 fn optical_fixture_lists_iso_and_joliet_names_and_rejects_writes() {
     let (mut vfs, directory) = fixture("directory");
     let info = vfs.optical_drive('d').unwrap();
@@ -100,6 +101,7 @@ fn optical_fixture_lists_iso_and_joliet_names_and_rejects_writes() {
 }
 
 #[test]
+// spec: DEV-DISC-3, DEV-DISC-4
 fn optical_fixture_streams_bound_reads_and_keep_cursors_independent() {
     let (vfs, directory) = fixture("streams");
     let mut first = vfs.open_optical_file("D:/README.txt").unwrap(); // privacy: allow authored guest optical path
@@ -154,6 +156,7 @@ fn optical_fixture_streams_bound_reads_and_keep_cursors_independent() {
 }
 
 #[test]
+// spec: DEV-DISC-1
 fn optical_fixture_invalid_media_and_extents_fail_without_replacing_drive() {
     let (mut vfs, directory) = fixture("invalid");
     let serial = vfs.optical_drive('D').unwrap().serial;

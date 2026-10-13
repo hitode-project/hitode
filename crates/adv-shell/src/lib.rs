@@ -6,8 +6,20 @@ mod frontend;
 mod logging;
 #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 mod native_gpu;
+pub mod overlay;
 mod performance;
+#[cfg(target_os = "macos")]
+mod session;
 pub mod window;
+#[cfg(target_os = "macos")]
+pub use session::Session;
+
+/// How a game run ended.
+#[derive(Debug)]
+pub struct Finished {
+    pub exit_code: u8,
+    pub summary: adv_report::RunSummary,
+}
 
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
@@ -16,19 +28,20 @@ use std::time::{Duration, Instant};
 
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 
-struct Options {
+pub struct Options {
     row_workers: Option<usize>,
     row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
     no_code_cache: bool,
-    cdroms: Vec<(char, PathBuf)>,
+    pub cdroms: Vec<(char, PathBuf)>,
+    pub install_dir: Option<PathBuf>,
     jit: bool,
     compile_strategy: CompileStrategy,
     region_linking: bool,
     async_compilation: bool,
     tiered_compilation: bool,
-    codepage: u32,
+    pub codepage: u32,
     headless: bool,
     hidden: bool,
     gpu_software: bool,
@@ -50,7 +63,7 @@ struct Options {
     profile: bool,
     control_stdin: bool,
     frame_budget: bool,
-    audio: bool,
+    pub audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
     codec_kernels_explicit: bool,
@@ -88,6 +101,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
   --no-code-cache         troubleshoot startup: bypass native cache and image precompilation\n\
   --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
+  --install-dir DIR       back guest C:\\Program Files with DIR, written in place\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
   --trace PATH            write every completed guest API call to a local trace\n\
@@ -102,20 +116,16 @@ const HELP: &str = "adv-run <EXE> [options]\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
 
 impl Options {
-    fn parse() -> Result<Option<Self>, String> {
-        Self::parse_args(std::env::args().skip(1))
-    }
-
-    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
-        let mut exe = None;
-        let mut data_dir = None;
-        let mut options = Self {
+    /// CLI defaults with a data directory supplied by the host.
+    pub fn new(exe: PathBuf, data_dir: PathBuf) -> Self {
+        Self {
             row_workers: None,
             row_batching: true,
-            exe: PathBuf::new(),
-            data_dir: PathBuf::new(),
+            exe,
+            data_dir,
             no_code_cache: false,
             cdroms: Vec::new(),
+            install_dir: None,
             jit: true,
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
@@ -150,7 +160,17 @@ impl Options {
             codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
-        };
+        }
+    }
+
+    fn parse() -> Result<Option<Self>, String> {
+        Self::parse_args(std::env::args().skip(1))
+    }
+
+    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut exe = None;
+        let mut data_dir = None;
+        let mut options = Self::new(PathBuf::new(), PathBuf::new());
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
             match arg.as_str() {
@@ -177,6 +197,7 @@ impl Options {
                     }
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
+                "--install-dir" => options.install_dir = Some(PathBuf::from(value()?)),
                 "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
@@ -450,7 +471,7 @@ fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> S
     )
 }
 
-/// The report's personality gaps (docs/personality-contracts.md): rejected
+/// The report's personality gaps (PERS-EXPORT-8): rejected
 /// discovery probes and reviewed exports answered with their failure.
 fn personality_json(diagnostics: Option<&adv_runtime::ApiDiagnostics>) -> String {
     let Some(d) = diagnostics else {
@@ -857,6 +878,51 @@ fn build_report(context: ReportContext<'_>) -> String {
     )
 }
 
+/// The fault as a report shows it; backend text may name host state.
+fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
+    let pc = snapshot.fault.pc;
+    match snapshot.access() {
+        Some((access, at)) => format!("{access} {at:#010x} at {pc:#010x}"),
+        None => format!("{} at {pc:#010x}", snapshot.kind_name()),
+    }
+}
+
+/// How a run failed, for an anonymous report. `message` is the guest
+/// failure, `fault` the latest CPU fault as `cpu_fault` formats it.
+fn report_failure(
+    message: Option<&str>,
+    exit_code: Option<u32>,
+    fault: Option<String>,
+    elapsed: Duration,
+) -> Option<adv_report::Failure> {
+    use adv_report::FailureKind;
+    let (kind, api) = match message {
+        // Strict ABI stubs fail with "unimplemented: module!name (...)"
+        // (adv-abi/src/stub.rs); a child process prefixes its pid.
+        Some(message) if message.contains("unimplemented: ") => (
+            FailureKind::Api,
+            message
+                .split("unimplemented: ")
+                .nth(1)
+                .and_then(|api| api.split(" (").next())
+                .map(str::to_owned),
+        ),
+        Some(message) if message.contains("unhandled CPU") => (FailureKind::Cpu, None),
+        Some(_) => (FailureKind::Runtime, None),
+        // An unhandled guest exception ends the process with its NTSTATUS.
+        None if exit_code.is_some_and(|code| code >= 0xc000_0000) && fault.is_some() => {
+            (FailureKind::Cpu, None)
+        }
+        None => return None,
+    };
+    Some(adv_report::Failure {
+        kind,
+        api,
+        cpu_fault: fault.filter(|_| kind == FailureKind::Cpu),
+        after: adv_report::FailureAfter::from_elapsed(elapsed),
+    })
+}
+
 fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1009,6 +1075,10 @@ fn run(options: Options) -> Result<u8, String> {
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
+    #[cfg(target_os = "macos")]
+    if !options.headless {
+        return session::run_cli(options);
+    }
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
     let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
@@ -1021,70 +1091,112 @@ fn run(options: Options) -> Result<u8, String> {
         let mut service = background.start().map_err(|error| error.to_string())?;
         let result = run_execution(options, None, wake, keys, execution_sender);
         service.shutdown();
-        return result;
+        return result.map(|finished| finished.exit_code);
     }
-    // The shared worker cannot preempt an active compiler task. Interactive
-    // compilation uses measured work slices so presentation can run between
-    // jobs; headless compilation above retains the unrestricted policy.
-    background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
-    let mut window = window::Window::new(
-        &format!(
-            "ADV — {}",
-            options
-                .exe
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ),
-        options.width,
-        options.height,
-        options.hidden,
-    )?;
-    let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
-    let mut worker = worker;
-    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        // Startup is the only UI-side GPU initialization. Guest submission has
-        // not begun, so configuring the initially empty queue cannot race it.
-        let (gpu, presenter) = window.create_native(options.gpu_software)?;
-        let context = gpu.context().clone();
-        context
-            .set_execution_wake(wake.clone())
-            .map_err(|_| "GPU execution wake was already registered")?;
-        let ui_sender = background
-            .sender_with_capacity_wake(1, 1, ui.wake())
-            .map_err(|error| error.to_string())?;
-        ui.native(presenter, ui_sender);
-        worker.gpu = Some(gpu);
+        // The shared worker cannot preempt an active compiler task. Interactive
+        // compilation uses measured work slices so presentation can run between
+        // jobs; headless compilation above retains the unrestricted policy.
+        background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
+        let mut window = window::Window::new(
+            &format!(
+                "ADV — {}",
+                options
+                    .exe
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ),
+            options.width,
+            options.height,
+            options.hidden,
+        )?;
+        let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
+        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+        let mut worker = worker;
+        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+        {
+            // Startup is the only UI-side GPU initialization. Guest submission has
+            // not begun, so configuring the initially empty queue cannot race it.
+            let (gpu, presenter) = window.create_native(options.gpu_software)?;
+            let context = gpu.context().clone();
+            context
+                .set_execution_wake(wake.clone())
+                .map_err(|_| "GPU execution wake was already registered")?;
+            let ui_sender = background
+                .sender_with_capacity_wake(1, 1, ui.wake())
+                .map_err(|error| error.to_string())?;
+            ui.native(presenter, ui_sender);
+            worker.gpu = Some(gpu);
+        }
+        // All startup ports are registered before this one common worker starts.
+        // Interpretation uses it as well, even when compilation is disabled.
+        let mut service = background.start().map_err(|error| error.to_string())?;
+        let completion_wake = ui.wake();
+        let (mut tx, mut rx) = adv_sync::spsc::channel(1);
+        let execution = std::thread::Builder::new()
+            .name("adv-execution".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execution(options, Some(worker), wake, keys, execution_sender)
+                }))
+                .unwrap_or_else(|_| Err("execution worker panicked".into()));
+                let _ = tx.push(result);
+                completion_wake.signal();
+            })
+            .map_err(|e| e.to_string())?;
+        let result = ui.run(&mut window, &mut rx);
+        drop(ui);
+        execution
+            .join()
+            .map_err(|_| "execution worker panicked".to_owned())?;
+        // Accepted presenter and fence jobs return/drop their owned resources while
+        // HWND is still alive. The window is destroyed only after this join.
+        service.shutdown();
+        #[cfg(target_os = "macos")]
+        window.finish_termination();
+        result?.map(|finished| finished.exit_code)
     }
-    // All startup ports are registered before this one common worker starts.
-    // Interpretation uses it as well, even when compilation is disabled.
-    let mut service = background.start().map_err(|error| error.to_string())?;
-    let completion_wake = ui.wake();
-    let (mut tx, mut rx) = adv_sync::spsc::channel(1);
-    let execution = std::thread::Builder::new()
-        .name("adv-execution".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_execution(options, Some(worker), wake, keys, execution_sender)
-            }))
-            .unwrap_or_else(|_| Err("execution worker panicked".into()));
-            let _ = tx.push(result);
-            completion_wake.signal();
-        })
-        .map_err(|e| e.to_string())?;
-    let result = ui.run(&mut window, &mut rx);
-    drop(ui);
-    execution
-        .join()
-        .map_err(|_| "execution worker panicked".to_owned())?;
-    // Accepted presenter and fence jobs return/drop their owned resources while
-    // HWND is still alive. The window is destroyed only after this join.
-    service.shutdown();
     #[cfg(target_os = "macos")]
-    window.finish_termination();
-    result?
+    unreachable!()
+}
+
+// spec: REPORT-FAIL-1
+#[test]
+fn report_failures_are_classified_without_host_text() {
+    use adv_report::{FailureAfter, FailureKind};
+    let minute = Duration::from_secs(90);
+    let fault = || Some("read 0x00000000 at 0x00401a2c".to_owned());
+    let api = report_failure(
+        Some("process 2: unimplemented: d3d9.dll!IDirect3DDevice9::CreateVolumeTexture (strict ABI stub)"),
+        None,
+        fault(),
+        minute,
+    )
+    .unwrap();
+    assert_eq!(api.kind, FailureKind::Api);
+    assert_eq!(
+        api.api.as_deref(),
+        Some("d3d9.dll!IDirect3DDevice9::CreateVolumeTexture")
+    );
+    assert_eq!((api.cpu_fault, api.after), (None, FailureAfter::Minutes));
+    let cpu = report_failure(Some("unhandled CPU stop: Fault(..)"), None, fault(), minute).unwrap();
+    assert_eq!(
+        (cpu.kind, cpu.cpu_fault, cpu.api),
+        (FailureKind::Cpu, fault(), None)
+    );
+    let exited = report_failure(None, Some(0xc000_0005), fault(), minute).unwrap();
+    assert_eq!((exited.kind, exited.cpu_fault), (FailureKind::Cpu, fault()));
+    // Other messages may name host paths; only the kind is kept.
+    let runtime =
+        report_failure(Some("open save/data.bin: denied"), None, fault(), minute).unwrap();
+    assert_eq!(
+        (runtime.kind, runtime.api, runtime.cpu_fault),
+        (FailureKind::Runtime, None, None)
+    );
+    assert_eq!(report_failure(None, Some(0), fault(), minute), None);
+    assert_eq!(report_failure(None, Some(0xc000_0005), None, minute), None);
 }
 
 #[test]
@@ -1104,12 +1216,17 @@ fn run_execution(
     wake: window::WakeEvent,
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
-) -> Result<u8, String> {
+) -> Result<Finished, String> {
     window::initialize_dpi()?;
     let started = Instant::now();
+    if let Some(install) = &options.install_dir {
+        std::fs::create_dir_all(install)
+            .map_err(|e| format!("install folder {}: {e}", install.display()))?;
+    }
     let mut runtime = Runtime::with_codec(
         &options.exe,
         &options.data_dir,
+        options.install_dir.as_deref(),
         options.jit,
         options.width,
         options.height,
@@ -1273,6 +1390,7 @@ fn run_execution(
     let mut first_frame_seconds = None;
     let mut close_at = None;
     let mut failure = None;
+    let mut guest_error = None;
     let mut exit_code = None;
     let stop_reason;
     loop {
@@ -1289,6 +1407,12 @@ fn run_execution(
                         lparam,
                     } => {
                         inputs += u64::from(runtime.post_input(message, wparam, lparam));
+                    }
+                    #[cfg(target_os = "macos")]
+                    window::Event::Text(text, reply) => {
+                        let posted = runtime.post_text(&text);
+                        inputs += posted as u64;
+                        let _ = reply.send(posted);
                     }
                     window::Event::Close => {
                         runtime.post_input(0x10, 0, 0);
@@ -1777,6 +1901,7 @@ fn run_execution(
             }
             RunResult::Failed(error) => {
                 failure = Some(format!("{error}\n{}", error.recent.join("\n")));
+                guest_error = Some(error);
                 stop_reason = "guest_failure";
                 break;
             }
@@ -1960,6 +2085,15 @@ fn run_execution(
             .map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }
+    let summary = adv_report::RunSummary {
+        failure: report_failure(
+            guest_error.as_ref().map(|error| error.message.as_str()),
+            exit_code,
+            runtime.latest_cpu_fault().map(cpu_fault),
+            started.elapsed(),
+        ),
+        perf: adv_report::Perf::from_samples(performance.frame_samples()),
+    };
     let stats = runtime.machine.cpu.counters();
     println!(
         "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
@@ -1971,19 +2105,16 @@ fn run_execution(
         stats.interpreter_entries,
         idle_waits
     );
-    if let Some(error) = failure {
+    let exit_code = if let Some(error) = failure {
         eprintln!("{error}");
-        return Ok(1);
-    }
-    if let Some(error) = screenshot_error {
+        1
+    } else if let Some(error) = screenshot_error {
         eprintln!("screenshot: {error}");
-        return Ok(1);
-    }
-    Ok(if exit_code.is_some_and(|code| code != 0) {
         1
     } else {
-        0
-    })
+        u8::from(exit_code.is_some_and(|code| code != 0))
+    };
+    Ok(Finished { exit_code, summary })
 }
 
 /// Run the desktop/headless command-line shell with the process arguments.

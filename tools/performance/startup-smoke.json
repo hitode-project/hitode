@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Startup smoke list for personality-layer changes (docs/personality-contracts.md).",
+    "Startup smoke list for personality-layer changes (docs/investigation.md).",
     "One sample per engine; exe is relative to $ADV_SAMPLES. Run with sample_matrix.py --quick",
     "and gate with matrix_gate.py --require-frames --frame-tolerance 1; never part of CI."
   ],

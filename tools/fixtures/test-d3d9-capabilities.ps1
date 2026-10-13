@@ -1,3 +1,13 @@
+<#
+Compare authored x86 D3D9 query results across native Windows and hardware/software guest runs.
+Checks cover HRESULTs, output canaries, identity, display dimensions, formats, creation, and teardown.
+Inputs: d3d9-capabilities.c, the Windows SDK, LLVM, and an adv-run GPU build.
+Build the runner: cargo build -p adv-run --features adv-shell/gpu
+Run: pwsh -NoProfile -File tools/fixtures/test-d3d9-capabilities.ps1
+Use -Runner to select another fixed runner.
+Outputs: native d3d9-capabilities.bin under target/fixtures; variant reports, logs, and overlays
+under target/architecture-acceptance/d3d9-capabilities. Physical adapter IDs are not equality targets.
+#>
 param([string]$Runner = (Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'))
 $ErrorActionPreference='Stop'
 $Runner=[IO.Path]::GetFullPath($Runner)

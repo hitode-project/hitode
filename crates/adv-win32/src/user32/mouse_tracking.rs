@@ -266,6 +266,7 @@ mod tests {
         f.call(module, name, &[DATA])
     }
     #[test]
+    // spec: WIN32-INPUT-1
     fn hover_moves_rearms_cancels_and_leaves_over_the_real_queue_and_clock() {
         let mut f = Fixture::new("mouse-tracking-clock");
         let hwnd = f.m.ext.get::<crate::Win32>().user.desktop;
@@ -347,6 +348,7 @@ mod tests {
         f.cleanup();
     }
     #[test]
+    // spec: WIN32-INPUT-1
     fn hover_parameters_aw_feed_default_tracking_without_host_changes() {
         let mut f = Fixture::new("mouse-hover-profile");
         for api in ["SystemParametersInfoA", "SystemParametersInfoW"] {
