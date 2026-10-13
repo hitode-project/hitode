@@ -102,7 +102,7 @@ impl FileStream {
     }
 
     /// Rename this instance using host FILE_RENAME_INFO, never a source lookup.
-    pub fn rename_instance(&self, target: &Path) -> io::Result<()> {
+    pub fn rename_instance(&self, target: &Path, replace: bool) -> io::Result<()> {
         let file = self.host().ok_or(io::ErrorKind::PermissionDenied)?;
         #[cfg(windows)]
         {
@@ -131,6 +131,7 @@ impl FileStream {
             let bytes = unsafe {
                 std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), length)
             };
+            bytes[0] = u8::from(replace);
             let length_offset = std::mem::offset_of!(Header, length);
             bytes[length_offset..length_offset + 4]
                 .copy_from_slice(&(name.len() as u32 * 2).to_le_bytes());
@@ -142,10 +143,22 @@ impl FileStream {
         }
         #[cfg(not(windows))]
         {
-            let _ = (file, target);
+            let _ = (file, target, replace);
             // A path rename cannot preserve this FD's identity/no-replace
             // contract against concurrent replacement on every POSIX target.
             Err(io::ErrorKind::Unsupported.into())
         }
     }
+}
+
+/// Persist renamed directory entries before asking the device to flush its cache.
+#[cfg(not(windows))]
+pub fn sync_move(source: &Path, target: &Path) -> io::Result<()> {
+    let from = source.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let to = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    std::fs::File::open(from)?.sync_all()?;
+    if from != to {
+        std::fs::File::open(to)?.sync_all()?;
+    }
+    super::sync_file(&std::fs::File::open(target)?)
 }
