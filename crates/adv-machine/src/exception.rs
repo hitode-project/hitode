@@ -274,6 +274,7 @@ mod tests {
         );
         assert_eq!(machine.cpu.reg(Reg::Eax), 0x1234);
     }
+    // spec: PROC-MACH-3
     #[test]
     fn nonlocal_stack_escape_requires_explicit_continuation_unwind() {
         let mut machine = machine();
@@ -289,6 +290,7 @@ mod tests {
         );
         assert_eq!(machine.cpu.capture_architecture().unwrap(), before);
     }
+    // spec: PROC-MACH-3
     #[test]
     fn equal_context_numbers_in_another_machine_do_not_authorize_resume() {
         let mut source = machine();

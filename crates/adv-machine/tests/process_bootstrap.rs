@@ -194,6 +194,7 @@ fn startup<B: Backend>(cpu: B, redirected: bool) {
     );
 }
 
+// spec: PROC-CREATE-4
 #[test]
 fn suspended_visits_and_latest_redirect_preserve_startup_and_architecture() {
     backends!(startup, true);
