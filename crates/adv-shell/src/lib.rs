@@ -1162,6 +1162,7 @@ fn run(options: Options) -> Result<u8, String> {
     unreachable!()
 }
 
+// spec: REPORT-FAIL-1
 #[test]
 fn report_failures_are_classified_without_host_text() {
     use adv_report::{FailureAfter, FailureKind};

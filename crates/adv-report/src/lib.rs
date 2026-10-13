@@ -295,6 +295,7 @@ mod tests {
         }
     }
 
+    // spec: REPORT-FMT-2
     #[test]
     fn wire_format_matches_the_launcher_schema() {
         let json = serde_json::to_string(&report()).unwrap();
@@ -323,6 +324,7 @@ mod tests {
         ));
     }
 
+    // spec: REPORT-FMT-1
     #[test]
     fn unknown_fields_and_other_schemas_are_rejected() {
         let mut value = serde_json::to_value(report()).unwrap();
@@ -336,6 +338,18 @@ mod tests {
         assert!(to_json(&report()).unwrap().starts_with("{\n  \"schema\""));
     }
 
+    // spec: REPORT-FMT-3
+    #[test]
+    fn notes_over_2000_characters_are_rejected() {
+        let note = |n| Report {
+            note: Some("字".repeat(n)),
+            ..report()
+        };
+        assert!(to_json(&note(2000)).is_ok());
+        assert!(to_json(&note(2001)).is_err());
+    }
+
+    // spec: REPORT-FAIL-2
     #[test]
     fn failure_time_buckets() {
         let after = |s| FailureAfter::from_elapsed(Duration::from_secs(s));
@@ -346,6 +360,7 @@ mod tests {
         assert_eq!(after(3600), FailureAfter::Hours);
     }
 
+    // spec: REPORT-PERF-1
     #[test]
     fn percentiles_use_nearest_rank_and_round() {
         assert_eq!(Perf::from_samples([]), None);
@@ -360,6 +375,7 @@ mod tests {
         );
     }
 
+    // spec: REPORT-ID-1, REPORT-ID-2
     #[test]
     fn identity_and_dedupe_key() {
         let dir = std::env::temp_dir().join(format!("adv-report-{}", std::process::id()));
