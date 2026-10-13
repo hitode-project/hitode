@@ -214,11 +214,8 @@ impl<B: Backend> Runtime<B> {
         }
         // The initial render canvas is independent of the virtual desktop.
         // Games query the desktop before choosing their own window/backbuffer size.
-        cfg.os.codepage = if exe_name.to_ascii_lowercase().contains("chs") {
-            936
-        } else {
-            932
-        };
+        let image = std::fs::read(&exe_path).map_err(|e| format!("{}: {e}", exe_path.display()))?;
+        cfg.os.codepage = crate::codepage::detect(exe_name, &image);
         cfg.os.write_game = false;
         let files = adv_os::Vfs::new(&cfg.os);
         let selection = crate::vorbis::select_policy_with_reason(&files, exe_name, codec)?;
@@ -653,6 +650,11 @@ impl<B: Backend> Runtime<B> {
         win32.user.auto_dialog_ms = delay;
     }
     /// ANSI decoding for paths, text and font names; configure before the first step.
+    /// The guest ANSI code page.
+    pub fn codepage(&self) -> u32 {
+        self.machine.ext.get::<Win32>().codec.acp
+    }
+
     pub fn set_codepage(&mut self, codepage: u32) -> Result<(), String> {
         adv_win32::set_codepage(&mut self.env(), codepage).map_err(|error| error.to_string())
     }

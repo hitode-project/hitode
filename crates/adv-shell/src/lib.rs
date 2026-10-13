@@ -41,7 +41,8 @@ pub struct Options {
     region_linking: bool,
     async_compilation: bool,
     tiered_compilation: bool,
-    pub codepage: u32,
+    /// Guest ANSI code page; `None` keeps the one detected from the executable.
+    pub codepage: Option<u32>,
     headless: bool,
     hidden: bool,
     gpu_software: bool,
@@ -82,7 +83,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
-  --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
+  --codepage auto|932|936 guest ANSI encoding: Japanese or GBK (default: auto)\n\
   --headless              run without a host window\n\
   --codec guest|native    whole-module Vorbis provider (default: native)\n\
   --codec-kernels guest|verify|native  static codec math (default: native; allows FP rounding differences)\n\
@@ -129,7 +130,7 @@ impl Options {
             region_linking: true,
             async_compilation: true,
             tiered_compilation: true,
-            codepage: 932,
+            codepage: None,
             headless: false,
             hidden: false,
             gpu_software: false,
@@ -212,9 +213,10 @@ impl Options {
                 }
                 "--codepage" => {
                     options.codepage = match value()?.as_str() {
-                        "932" => 932,
-                        "936" => 936,
-                        _ => return Err("--codepage must be 932 or 936".into()),
+                        "auto" => None,
+                        "932" => Some(932),
+                        "936" => Some(936),
+                        _ => return Err("--codepage must be auto, 932 or 936".into()),
                     };
                 }
                 "--row-workers" => {
@@ -806,7 +808,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "null".into()
         },
         options.jit && options.region_linking && !options.profile,
-        options.codepage,
+        runtime.codepage(),
         json(stop_reason),
         exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
         started.elapsed().as_secs_f64(),
@@ -1224,7 +1226,9 @@ fn run_execution(
         options.height,
         options.codec,
     )?;
-    runtime.set_codepage(options.codepage)?;
+    if let Some(codepage) = options.codepage {
+        runtime.set_codepage(codepage)?;
+    }
     for (drive, image) in &options.cdroms {
         runtime.mount_iso(*drive, image)?;
     }

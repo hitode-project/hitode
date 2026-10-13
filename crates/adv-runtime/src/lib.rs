@@ -3,6 +3,7 @@ pub use adv_win32::avifil32 as avi;
 pub use adv_win32::codec_kernels;
 pub use adv_win32::msacm32 as acm;
 pub mod boot;
+pub mod codepage;
 pub mod compat;
 pub use adv_win32::msvcrt as crt;
 mod family;

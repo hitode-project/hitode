@@ -24,6 +24,7 @@ adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
 
 [dev-dependencies]
+encoding_rs.workspace = true
 unicorn-engine.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }
 adv-samples = { path = "../adv-samples" }
