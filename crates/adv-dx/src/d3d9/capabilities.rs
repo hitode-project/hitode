@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(bytes, [0xa5; 1100]);
     }
     #[test]
-    // spec: GFX-CAP-1, GFX-CAP-3
+    // spec: GFX-CAP-1, GFX-CAP-2, GFX-CAP-3
     fn capabilities_exclude_unimplemented_paths_and_bound_the_usable_upload() {
         let mut m = super::super::tests::machine();
         let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))
@@ -451,23 +451,12 @@ mod tests {
         );
         assert_eq!(
             (value.VertexShaderVersion, value.PixelShaderVersion),
-            (0, 0)
+            (0xfffe0200, 0xffff0200),
+            "Shader Model 2 by default"
         );
-        set_shader_caps(
-            env.ext,
-            ShaderCaps {
-                sm2: true,
-                sm3: false,
-            },
-        );
-        let sm2 = caps(&env).unwrap();
-        assert_eq!(
-            (sm2.VertexShaderVersion, sm2.PixelShaderVersion),
-            (0xfffe0200, 0xffff0200)
-        );
-        assert_eq!(sm2.MaxVertexShaderConst, 256);
-        assert_eq!(sm2.MaxPointSize, 64.0);
-        assert_eq!(sm2.MaxVertexShader30InstructionSlots, 0);
+        assert_eq!(value.MaxVertexShaderConst, 256);
+        assert_eq!(value.MaxPointSize, 64.0);
+        assert_eq!(value.MaxVertexShader30InstructionSlots, 0);
         set_shader_caps(
             env.ext,
             ShaderCaps {

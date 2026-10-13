@@ -371,7 +371,7 @@ fn mci_strings<B: Backend>(cpu: B) {
     let commands: [&[u8]; 4] = [
         b"close SiglusMCIMovie wait",
         b"seek SiglusMCIMovie to start",
-        b"open \"op.mpg\" type MPEGVideo alias SiglusMCIMovie wait",
+        b"open \"op.wav\" type waveaudio alias SiglusMCIMovie wait",
         b"status SiglusMCIMovie mode wait",
     ];
     let mut at = DATA + 0x100;
@@ -408,8 +408,9 @@ fn mci_strings<B: Backend>(cpu: B) {
     );
     call(&mut m, &mut code, "mciSendStringA", &[0, output, 64, 0], 5);
     run(&mut m, code);
-    // Unknown alias, unknown verb, a video device this build cannot open (its
-    // alias is not kept), then the W front end and a missing command string.
+    // Unknown alias, unknown verb, a device type that is not installed in any
+    // build (its alias is not kept), then the W front end and a missing
+    // command string.
     for (index, error) in [263, 261, 306, 263, 263, 267].into_iter().enumerate() {
         result(&m, index as u32, error);
     }
