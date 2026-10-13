@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Check docs/spec against the writing rules in docs/spec/README.md.
 
-Each spec file declares an ID prefix and lists rules as `### ID title` headings
-followed by fields. Rules verified by a test need a `spec: ID` marker in a
-tracked source file; every mention of an ID with a known prefix anywhere in
-the repository must name a live rule.
+  python3 tools/spec/check_spec.py    # prints one line per problem; exit 1 if any
+
+Each spec file declares an ID prefix and lists rules as `### ID Title`
+headings followed by fields. Rules verified by a test need a `spec: ID`
+marker in a tracked source file; every mention of an ID with a known prefix
+anywhere in the repository must name a live rule.
 """
 from __future__ import annotations
 
@@ -16,23 +18,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 SPEC = "docs/spec"
+RULES_DOC = f"{SPEC}/README.md"
 MAX_LINES = 400
-MAX_SENTENCE = 80
-FIELDS = ("规定", "适用", "验证", "依据")
-REQUIRED = ("规定", "验证")
-MODALS = ("必须", "不得", "应当", "可以", "只能")
-METHODS = ("测试", "检查", "审查")
-BANNED = ("只可以", "目前", "现状", "已删除", "尚未", "计划", "客体", "客户机", "生成代码")
+MAX_WORDS = 25
+MAX_SENTENCES = 3
+FIELDS = ("Rule", "Applies to", "Verification", "Basis")
+REQUIRED = ("Rule", "Verification")
+KEYWORDS = re.compile(r"\b(MUST|SHOULD|MAY)\b")
+METHODS = ("Test", "Check", "Review")
+# Status, history and plans belong in git and issues; abbreviations are ambiguous.
+BANNED = ("currently", "at present", "planned", "not yet", "TODO", "no longer",
+          "has been removed", "have been removed", "was removed", "were removed",
+          "e.g.", "i.e.", "etc.")
+# RFC 8174: only the uppercase keywords carry meaning, so the lowercase forms
+# are ambiguous; `shall` is not used at all.
+LOWERCASE = re.compile(r"\b(must|should|shall|SHALL)\b")
+# Controlled terms: what the glossary calls the thing instead.
+TERMS = {"client": "guest", "emulated program": "guest"}
 SCANNED = (".rs", ".py", ".md", ".ts", ".svelte", ".toml")
 
-PREFIX_LINE = re.compile(r"^编号前缀：([A-Z][A-Z0-9]*)$")
+PREFIX_LINE = re.compile(r"^ID prefix: ([A-Z][A-Z0-9]*)$")
 ENTRY = re.compile(r"^### (\S+) (\S.*)$")
-FIELD = re.compile(r"^\*\*(.+?)\*\*：(.*)$")
-WITHDRAWN = re.compile(r"^已撤销：(.*)$")
+FIELD = re.compile(r"^\*\*(.+?)\*\*: (.*)$")
+WITHDRAWN = re.compile(r"^Withdrawn: (.*)$")
 MARKER = re.compile(r"\bspec:\s*((?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+-\d+[,\s]*)+)")
 DATE = re.compile(r"\b20\d\d-\d\d-\d\d\b")
 CODE = re.compile(r"`[^`]*`")
 LINK = re.compile(r"\]\([^)]*\)")
+SENTENCE_END = re.compile(r"(?<=[.;!?])\s+")
 
 
 @dataclass
@@ -52,21 +65,44 @@ class Spec:
 
 
 def prose(line: str) -> str:
-    return LINK.sub("]", CODE.sub("", line))
+    return LINK.sub("]", CODE.sub("CODE", line))
 
 
 def sentences(text: str) -> list[str]:
-    return [s for s in re.split(r"[。；！？]", text) if s.strip()]
+    return [s.strip() for s in SENTENCE_END.split(text.strip()) if s.strip()]
+
+
+def check_words(line: str, err) -> None:
+    words = prose(line)
+    lower = words.lower()
+    for phrase in BANNED:
+        if re.search(rf"(?<!\w){re.escape(phrase.lower())}(?!\w)", lower):
+            err(f"banned phrase {phrase!r}")
+    if m := LOWERCASE.search(words):
+        err(f"{m.group(1)!r}: write MUST, SHOULD or MAY, or rephrase")
+    for term, use in TERMS.items():
+        if re.search(rf"\b{term}\b", lower):
+            err(f"write {use!r}, not {term!r}")
+    if DATE.search(words):
+        err("dates belong in git history")
+    if not line.startswith(("|", "#")):
+        body = FIELD.sub(r"\2", words.lstrip("-> "))
+        for s in sentences(body):
+            if len(s.split()) > MAX_WORDS:
+                err(f"sentence over {MAX_WORDS} words: {' '.join(s.split()[:5])}…")
 
 
 def parse(path: str, text: str, spec: Spec) -> None:
     lines = text.splitlines()
-    err = lambda n, msg: spec.errors.append(f"{path}:{n}: {msg}")
+
+    def err(n: int, msg: str) -> None:
+        spec.errors.append(f"{path}:{n}: {msg}")
+
     if len(lines) > MAX_LINES:
         err(len(lines), f"{len(lines)} lines; split the file (limit {MAX_LINES})")
     prefix = next((m.group(1) for l in lines if (m := PREFIX_LINE.match(l))), None)
     if prefix is None:
-        err(1, "missing the 编号前缀 line")
+        err(1, "missing the 'ID prefix:' line")
         return
     if prefix in spec.prefixes:
         err(1, f"prefix {prefix} is declared by another file")
@@ -80,20 +116,9 @@ def parse(path: str, text: str, spec: Spec) -> None:
             continue
         if fence:
             continue
-        words = prose(line)
-        for word in BANNED:
-            if word in words:
-                err(n, f"banned word {word!r}")
-        if re.search(r"(?<!宿)主机", words):
-            err(n, "write 宿主, not 主机")
-        if DATE.search(words):
-            err(n, "dates belong in git history")
-        if not line.startswith(("|", "#")):
-            for s in sentences(words):
-                if len(s.strip()) > MAX_SENTENCE:
-                    err(n, f"sentence over {MAX_SENTENCE} characters: {s.strip()[:20]}…")
+        check_words(line, lambda msg, n=n: err(n, msg))
         if m := WITHDRAWN.match(line):
-            ids = [i for i in re.split(r"[、,\s]+", m.group(1)) if i and i != "无"]
+            ids = [i for i in re.split(r"[,\s]+", m.group(1)) if i and i != "none"]
             for i in ids:
                 if not id_form.match(i):
                     err(n, f"withdrawn ID {i} does not match {prefix}-GROUP-N")
@@ -118,26 +143,29 @@ def parse(path: str, text: str, spec: Spec) -> None:
             elif name in rule.fields:
                 err(n, f"field {name} repeated")
             rule.fields[name] = value.strip()
-            order = [f for f in FIELDS if f in rule.fields]
-            if list(rule.fields) != order:
-                err(n, f"fields of {rule.id} out of order; use {'、'.join(FIELDS)}")
+            if list(rule.fields) != [f for f in FIELDS if f in rule.fields]:
+                err(n, f"fields of {rule.id} out of order; use {', '.join(FIELDS)}")
     for r in spec.rules.values():
         if r.path != path:
             continue
+
+        def rule_err(msg: str, r: Rule = r) -> None:
+            spec.errors.append(f"{path}:{r.line}: {r.id} {msg}")
+
         for name in REQUIRED:
             if name not in r.fields:
-                spec.errors.append(f"{path}:{r.line}: {r.id} lacks {name}")
-        body = r.fields.get("规定", "")
-        if body and not any(w in prose(body) for w in MODALS):
-            spec.errors.append(f"{path}:{r.line}: {r.id} 规定 has no 必须／不得／应当／可以／只能")
-        if body and len(sentences(prose(body))) > 3:
-            spec.errors.append(f"{path}:{r.line}: {r.id} 规定 has more than three sentences")
-        method = r.fields.get("验证", "")
+                rule_err(f"lacks {name}")
+        body = prose(r.fields.get("Rule", ""))
+        if body and not KEYWORDS.search(body):
+            rule_err("Rule has no MUST, SHOULD or MAY")
+        if len(sentences(body)) > MAX_SENTENCES:
+            rule_err(f"Rule has more than {MAX_SENTENCES} sentences")
+        method = r.fields.get("Verification", "")
         kind = method.split(" — ", 1)[0]
         if method and kind not in METHODS:
-            spec.errors.append(f"{path}:{r.line}: {r.id} 验证 must be one of {'、'.join(METHODS)}")
-        if kind in ("检查", "审查") and " — " not in method:
-            spec.errors.append(f"{path}:{r.line}: {r.id} {kind} needs ' — reason'")
+            rule_err(f"Verification must be one of {', '.join(METHODS)}")
+        if kind in ("Check", "Review") and " — " not in method:
+            rule_err(f"{kind} needs ' — reason'")
 
 
 def tracked_files() -> list[str]:
@@ -168,17 +196,17 @@ def check_references(spec: Spec, files: dict[str, str]) -> None:
                     if rule is None:
                         continue
                     tested.add(i)
-                    if not rule.fields.get("验证", "").startswith("测试"):
-                        spec.errors.append(f"{path}:{n}: {i} is tested here; mark it 测试")
+                    if not rule.fields.get("Verification", "").startswith("Test"):
+                        spec.errors.append(f"{path}:{n}: {i} is tested here; mark it Test")
     for r in spec.rules.values():
-        if r.fields.get("验证", "").startswith("测试") and r.id not in tested:
-            spec.errors.append(f"{r.path}:{r.line}: {r.id} is 测试 but no test has `spec: {r.id}`")
+        if r.fields.get("Verification", "").startswith("Test") and r.id not in tested:
+            spec.errors.append(f"{r.path}:{r.line}: {r.id} is Test but no test has `spec: {r.id}`")
 
 
 def check(files: dict[str, str]) -> list[str]:
     spec = Spec()
     for path in sorted(files):
-        if path.startswith(SPEC + "/") and path.endswith(".md") and path != f"{SPEC}/README.md":
+        if path.startswith(SPEC + "/") and path.endswith(".md") and path != RULES_DOC:
             parse(path, files[path], spec)
     check_references(spec, files)
     return spec.errors
