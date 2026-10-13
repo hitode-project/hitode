@@ -376,11 +376,11 @@ pub(crate) fn set(
         // The authored native nonempty-directory control completes IOSB too.
         return completion(env, iosb, status, 0);
     }
-    if prefix[0] != 0 || u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
+    if u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
         return unavailable_for(
             env,
             "ntdll.dll!NtSetInformationFile",
-            "directory rename replacement and relative RootDirectory are unavailable",
+            "directory rename relative RootDirectory is unavailable",
         );
     }
     let count = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
@@ -461,7 +461,7 @@ pub(crate) fn set(
         .backing
         .as_ref()
         .unwrap()
-        .rename_instance(&host);
+        .rename_instance(&host, false);
     if let Err(error) = result {
         let status = instance_failure(env, &error);
         return completion(env, iosb, status, 0);

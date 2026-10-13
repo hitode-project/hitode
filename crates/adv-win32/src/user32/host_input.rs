@@ -99,6 +99,48 @@ fn post_at(
     super::message::post_input(env, hwnd, message, wparam, lparam)
 }
 
+/// Text committed by a host input method, delivered the way an IME hands its
+/// result to a program without IME support: one WM_IME_CHAR per character to
+/// the keyboard focus, encoded for that window procedure (UTF-16 units, or a
+/// packed ANSI DBCS character), which DefWindowProc turns into WM_CHAR.
+/// Returns how many characters were posted; ones the guest ANSI code page
+/// cannot represent are skipped.
+pub fn post_text(env: &mut Env<'_>, text: &str) -> usize {
+    let (hwnd, wide) = {
+        let user = &env.ext.get::<Win32>().user;
+        let Some((_, hwnd)) = target(user, &env.sys.objects, super::window::wm::CHAR) else {
+            return 0;
+        };
+        let wide = user
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .is_some_and(|w| w.unicode);
+        (hwnd, wide)
+    };
+    let mut posted = 0;
+    let mut units = [0; 2];
+    for character in text.chars() {
+        let units = character.encode_utf16(&mut units);
+        let parameters: Vec<u32> = if wide {
+            units.iter().map(|&unit| u32::from(unit)).collect()
+        } else {
+            let (bytes, lossy) = env.ext.get::<Win32>().codec.from_utf16(0, units);
+            match bytes[..] {
+                [byte] if !lossy => vec![u32::from(byte)],
+                [lead, trail] if !lossy => vec![u32::from(lead) << 8 | u32::from(trail)],
+                _ => continue,
+            }
+        };
+        for parameter in parameters {
+            if !super::message::post(env, hwnd, super::window::wm::IME_CHAR, parameter, 1) {
+                return posted;
+            }
+        }
+        posted += 1;
+    }
+    posted
+}
+
 /// Release keys/buttons when the native host loses focus. Preserve toggle
 /// bits and enqueue releases so guest procedures cannot retain a held key.
 pub fn release(env: &mut Env<'_>) -> usize {

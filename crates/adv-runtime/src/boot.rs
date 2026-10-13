@@ -641,6 +641,12 @@ impl<B: Backend> Runtime<B> {
         accepted
     }
 
+    /// Post text committed by a host input method to the keyboard focus (see
+    /// [`adv_win32::user32::host_input::post_text`]); returns the characters posted.
+    pub fn post_text(&mut self, text: &str) -> usize {
+        adv_win32::user32::host_input::post_text(&mut self.env(), text)
+    }
+
     /// Immutable native-menu projection; this is called only by execution.
     pub fn menu_key(&self) -> crate::MenuKey {
         adv_win32::user32::menu::presentation_key(

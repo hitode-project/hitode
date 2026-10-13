@@ -94,3 +94,61 @@ fn paired_time_and_rectangle_apis_share_only_the_guest_profile() {
     assert_eq!(fresh.call("user32.dll", "GetSystemMetrics", &[23]), 0);
     fresh.cleanup();
 }
+
+#[test]
+fn committed_text_reaches_the_focus_as_ime_characters_then_def_window_proc_characters() {
+    let mut f = Fixture::new("committed-text");
+    crate::set_codepage(&mut env(&mut f.m), 932).unwrap();
+    let hwnd = f.m.ext.get::<Win32>().user.desktop;
+    f.m.ext.get_mut::<Win32>().user.top.push(hwnd);
+    let posted = |f: &mut Fixture| -> Vec<(u32, u32)> {
+        let queue = &mut f
+            .m
+            .ext
+            .get_mut::<Win32>()
+            .user
+            .queues
+            .get_mut(&0)
+            .unwrap()
+            .posted;
+        queue.drain(..).map(|m| (m.msg, m.wparam)).collect()
+    };
+    // An ANSI procedure gets packed Shift-JIS; U+20AC has no CP932 form and is skipped.
+    assert_eq!(post_text(&mut env(&mut f.m), "あA\u{20ac}"), 2);
+    assert_eq!(posted(&mut f), [(0x286, 0x82a0), (0x286, 0x41)]);
+    f.m.ext
+        .get_mut::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut f.m.sys.objects, &hwnd)
+        .unwrap()
+        .unicode = true;
+    assert_eq!(post_text(&mut env(&mut f.m), "あ\u{20ac}\u{1f600}"), 3);
+    assert_eq!(
+        posted(&mut f),
+        [
+            (0x286, 0x3042),
+            (0x286, 0x20ac),
+            (0x286, 0xd83d),
+            (0x286, 0xde00)
+        ]
+    );
+    // DefWindowProcA splits a DBCS character into lead and trail WM_CHAR.
+    assert_eq!(
+        f.call("user32.dll", "DefWindowProcA", &[hwnd, 0x286, 0x82a0, 1]),
+        0
+    );
+    assert_eq!(
+        f.call("user32.dll", "DefWindowProcA", &[hwnd, 0x286, 0x41, 1]),
+        0
+    );
+    assert_eq!(
+        f.call("user32.dll", "DefWindowProcW", &[hwnd, 0x286, 0x3042, 1]),
+        0
+    );
+    assert_eq!(
+        posted(&mut f),
+        [(0x102, 0x82), (0x102, 0xa0), (0x102, 0x41), (0x102, 0x3042)]
+    );
+    f.cleanup();
+}

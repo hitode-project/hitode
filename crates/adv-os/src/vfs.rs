@@ -15,6 +15,8 @@ use crate::OsConfig;
 
 mod attributes;
 mod mutation;
+#[cfg(not(windows))]
+pub use mutation::sync_move;
 mod optical;
 mod portable_saves;
 mod section;

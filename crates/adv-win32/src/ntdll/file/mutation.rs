@@ -247,11 +247,11 @@ pub(super) fn set(
             Err(error) => failure(env, error),
         };
     }
-    if prefix[0] != 0 || u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
+    if u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
         return unavailable_for(
             env,
             "ntdll.dll!NtSetInformationFile",
-            "rename replacement and RootDirectory-relative destinations are unavailable",
+            "RootDirectory-relative rename destinations are unavailable",
         );
     }
     let bytes = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
@@ -292,7 +292,7 @@ pub(super) fn set(
         return 0xc00000d4u32 as i32; // STATUS_NOT_SAME_DEVICE
     }
     let vfs = &env.ext.get::<Win32>().vfs;
-    if vfs.lookup(&target).is_some() && !source.eq_ignore_ascii_case(&target) {
+    if prefix[0] == 0 && vfs.lookup(&target).is_some() && !source.eq_ignore_ascii_case(&target) {
         return 0xc0000035u32 as i32;
     }
     let parent = target.rsplit_once('\\').map_or("", |(parent, _)| parent);
@@ -321,7 +321,7 @@ pub(super) fn set(
         .host::<FileObj>(handle.0)
         .unwrap()
         .file
-        .rename_instance(&host);
+        .rename_instance(&host, prefix[0] != 0);
     if let Err(error) = result {
         return failure(env, error);
     }

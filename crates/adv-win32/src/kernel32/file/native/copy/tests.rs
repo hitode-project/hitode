@@ -30,6 +30,8 @@ struct Provider {
     reads: usize,
     writes: usize,
     mode: u32,
+    flushed: bool,
+    deleted: bool,
 }
 
 fn install(env: &mut Env<'_>) -> Outcome {
@@ -45,7 +47,7 @@ fn open(env: &mut Env<'_>) -> Outcome {
     let disposition = env.arg(7);
     let object = env.arg(2);
     env.ext.get_mut::<Provider>().allocations.push(object);
-    let handle = if access & 0x80000000 != 0 {
+    let handle = if access & (0x80000000 | 0x10000) != 0 {
         assert_eq!(disposition, 1);
         SOURCE
     } else {
@@ -56,6 +58,11 @@ fn open(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0xc0000035);
     }
     env.cpu.write_u32(env.arg(0), handle).unwrap();
+    Outcome::Return(0)
+}
+fn open_existing(env: &mut Env<'_>) -> Outcome {
+    assert!(env.arg(1) & 0x10000 != 0);
+    env.cpu.write_u32(env.arg(0), SOURCE).unwrap();
     Outcome::Return(0)
 }
 fn query(env: &mut Env<'_>) -> Outcome {
@@ -75,6 +82,20 @@ fn volume(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 fn set(env: &mut Env<'_>) -> Outcome {
+    if env.arg(4) == 10 {
+        assert_eq!(env.cpu.read_u32(env.arg(2)).unwrap() & 0xff, 1);
+        return Outcome::Return(if env.ext.get::<Provider>().mode >= 7 {
+            0
+        } else {
+            0xc00000d4
+        });
+    }
+    if env.arg(4) == 64 {
+        let provider = env.ext.get_mut::<Provider>();
+        assert!(provider.flushed);
+        provider.deleted = true;
+        return Outcome::Return(if provider.mode == 6 { 0xc0000121 } else { 0 });
+    }
     let mut bytes = [0; 8];
     env.cpu.read(env.arg(2), &mut bytes).unwrap();
     let value = u64::from_le_bytes(bytes);
@@ -167,6 +188,26 @@ fn native<B: Backend>(machine: &mut Machine<B>, name: &str) -> u32 {
         .0
 }
 
+fn flush(env: &mut Env<'_>) -> Outcome {
+    let handle = env.arg(0);
+    let provider = env.ext.get_mut::<Provider>();
+    assert!(!provider.deleted);
+    if provider.mode >= 7 {
+        assert_eq!(handle, SOURCE);
+        assert!(provider.closes.is_empty());
+    } else {
+        assert_eq!(handle, TARGET);
+        assert_eq!(provider.target, provider.source);
+        assert_eq!(provider.closes, vec![SOURCE]);
+    }
+    provider.flushed = true;
+    Outcome::Return(if matches!(provider.mode, 5 | 8) {
+        0xc0000022
+    } else {
+        0
+    })
+}
+
 fn guest<B: Backend>(cpu: B, mode: u32) {
     let mut registry = Registry::default();
     crate::register(&mut registry);
@@ -179,6 +220,8 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
         ("read", 9, read as adv_abi::Handler),
         ("write", 9, write as adv_abi::Handler),
         ("close", 1, close as adv_abi::Handler),
+        ("flush", 2, flush as adv_abi::Handler),
+        ("open_existing", 6, open_existing as adv_abi::Handler),
     ] {
         registry.add(
             "authored-copy-provider",
@@ -227,10 +270,18 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
         ("NtReadFile", "read"),
         ("NtWriteFile", "write"),
         ("NtClose", "close"),
+        ("NtFlushBuffersFile", "flush"),
     ] {
         let entry = native(&mut machine, name);
         let target = machine
             .resolve_import("authored-copy-provider", hook)
+            .unwrap();
+        provider.hooks.push((entry, target));
+    }
+    if mode >= 4 {
+        let entry = native(&mut machine, "NtOpenFile");
+        let target = machine
+            .resolve_import("authored-copy-provider", "open_existing")
             .unwrap();
         provider.hooks.push((entry, target));
     }
@@ -241,10 +292,21 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
             .resolve_import("authored-copy-provider", "install")
             .unwrap(),
     );
-    code.push_imm(u32::from(mode == 2))
+    code.push_imm(if mode >= 4 { 11 } else { u32::from(mode == 2) })
         .push_imm(DATA + 64)
         .push_imm(DATA)
-        .call(machine.resolve_import("kernel32.dll", "CopyFileA").unwrap())
+        .call(
+            machine
+                .resolve_import(
+                    "kernel32.dll",
+                    if mode >= 4 {
+                        "MoveFileExA"
+                    } else {
+                        "CopyFileA"
+                    },
+                )
+                .unwrap(),
+        )
         .mov_mem_eax(DATA + 128);
     code.call(
         machine
@@ -262,7 +324,18 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     let provider = machine.ext.get::<Provider>();
     assert!(machine.sys.objects.get(SOURCE).is_none() && machine.sys.objects.get(TARGET).is_none());
-    if mode == 0 {
+    if mode >= 7 {
+        assert_eq!(
+            machine.cpu.read_u32(DATA + 128).unwrap(),
+            u32::from(mode == 7)
+        );
+        if mode == 8 {
+            assert_eq!(machine.cpu.read_u32(DATA + 132).unwrap(), 5);
+        }
+        assert_eq!(provider.reads, 0);
+        assert_eq!(provider.writes, 0);
+        assert!(provider.flushed && !provider.deleted);
+    } else if mode == 0 || matches!(mode, 4 | 6) {
         assert_eq!(machine.cpu.read_u32(DATA + 128).unwrap(), 1);
         assert_eq!(provider.target, payload);
         assert!(provider.reads >= 3 && provider.writes > 2);
@@ -273,17 +346,29 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
             match mode {
                 1 => 32,
                 2 => 80,
-                3 => 5,
+                3 | 5 => 5,
                 _ => unreachable!(),
             }
         );
-        if mode != 3 {
+        if mode == 5 {
+            assert_eq!(provider.target, payload);
+        } else if mode != 3 {
             assert_eq!(provider.target, old);
         }
     }
     assert_eq!(
         provider.closes,
-        if mode == 2 {
+        if mode >= 7 {
+            vec![SOURCE]
+        } else if mode >= 4 {
+            assert!(provider.flushed);
+            assert_eq!(provider.deleted, mode != 5);
+            if mode == 5 {
+                vec![SOURCE, TARGET, SOURCE]
+            } else {
+                vec![SOURCE, TARGET, SOURCE, SOURCE]
+            }
+        } else if mode == 2 {
             vec![SOURCE]
         } else {
             vec![TARGET, SOURCE]
@@ -312,6 +397,14 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
 #[test]
 fn copies_use_live_nt_bytes_and_close_both_owners_on_alias_collision_and_write_failures() {
     for mode in 0..4 {
+        guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
+        guest(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
+    }
+}
+
+#[test]
+fn move_copy_observes_native_flush_before_delete_and_propagates_flush_failure() {
+    for mode in 4..9 {
         guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
         guest(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
     }

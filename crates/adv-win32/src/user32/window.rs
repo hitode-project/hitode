@@ -87,6 +87,7 @@ pub mod wm {
     pub const RBUTTONUP: u32 = 0x205;
     pub const MOUSEWHEEL: u32 = 0x20a;
     pub const PARENTNOTIFY: u32 = 0x210;
+    pub const IME_CHAR: u32 = 0x286;
     pub const DWMNCRENDERINGCHANGED: u32 = 0x31f;
 }
 
