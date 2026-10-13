@@ -1133,6 +1133,7 @@ mod native {
     mod presentation_tests {
         use super::*;
 
+        // spec: HOST-VIEW-2
         #[test]
         fn composing_a_frame_keeps_the_previous_output_until_commit() {
             let target = Dib::new(16, 16).unwrap();
@@ -1166,6 +1167,7 @@ mod native {
             assert_eq!(unsafe { GetPixel(target.dc, 8, 0) }, 0);
         }
 
+        // spec: HOST-VIEW-2
         #[test]
         fn retained_pixels_survive_caller_reuse_and_invalid_frames_but_allow_black() {
             let target = Dib::new(8, 6).unwrap();
@@ -1219,6 +1221,7 @@ mod native {
             u32::from(x as u16) | (u32::from(y as u16) << 16)
         }
 
+        // spec: HOST-VIEW-1
         #[test]
         fn native_frame_size_is_physical_and_resize_input_uses_the_letterbox() {
             let mut window = Window::new("physical pixel regression", 640, 480, true).unwrap();
@@ -1315,6 +1318,7 @@ mod native {
             );
         }
 
+        // spec: HOST-VIEW-1
         #[test]
         fn gdi_native_pixels_and_integer_upscale_remain_exact_with_black_bars() {
             initialize_dpi().unwrap();

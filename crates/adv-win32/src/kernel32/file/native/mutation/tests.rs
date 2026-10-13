@@ -670,6 +670,7 @@ fn move_ex_aw_exports_move_files_and_directories() {
     }
 }
 
+// spec: HOST-SAVE-4
 #[test]
 fn move_copy_flushes_destination_and_keeps_source_if_delete_is_denied() {
     let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());

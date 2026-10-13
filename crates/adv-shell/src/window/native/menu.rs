@@ -305,6 +305,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-MENU-1
     #[test]
     fn hidden_popup_preserves_attached_bar_and_retires_its_private_tree() {
         let mut window = Window::new("authored popup", 320, 180, true).unwrap();
@@ -364,6 +365,7 @@ mod tests {
             "popup ownership is retired with the UI projection"
         );
     }
+    // spec: HOST-MENU-1
     #[test]
     fn native_menu_preserves_client_size_states_and_specific_guest_target() {
         let mut window = Window::new("authored host menu", 320, 180, true).unwrap();
