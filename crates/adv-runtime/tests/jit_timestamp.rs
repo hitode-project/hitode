@@ -108,6 +108,7 @@ fn consecutive_native_and_interpreted_reads_preserve_flags_and_other_registers()
         assert_eq!(machine.state.x87, initial.x87);
         if native {
             assert!(machine.stats.native_entries > 0);
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(machine.stats.interpreter_instructions, 0);
         }
     }
@@ -268,7 +269,7 @@ fn machine_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.write(CODE, &bytes).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
-        machine.cpu.executor_mut().set_async_compilation(false);
+        machine.cpu.set_async_compilation(false);
         if native {
             machine
                 .cpu

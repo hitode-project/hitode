@@ -243,6 +243,7 @@ fn legacy_controller_enumeration_is_empty_without_callback_or_owner_side_effects
                 let mut region = Region::new(code_address, code.bytes.len());
                 region.reachable = true;
                 m.cpu.executor_mut().add_region(region).unwrap();
+                #[cfg(target_arch = "x86_64")]
                 m.cpu.executor_mut().enable_auto_jit(false);
             }
             m.spawn("legacy controller enumeration", code_address, &[], 65536)
@@ -335,6 +336,7 @@ fn sdk_legacy_slots_execute_through_both_guest_vtables_and_preserve_stack() {
                 let mut region = Region::new(code_address, code.bytes.len());
                 region.reachable = true;
                 m.cpu.executor_mut().add_region(region).unwrap();
+                #[cfg(target_arch = "x86_64")]
                 m.cpu.executor_mut().enable_auto_jit(false);
             }
             m.spawn("legacy DirectInput guest", code_address, &[], 65536)

@@ -18,10 +18,18 @@ fn omission_reason(name: &str) -> &'static str {
         || module == "<win32>"
             && matches!(
                 export,
-                "startup_enter" | "startup_leave" | "thread_start" | "thread_exception_handler"
+                "startup_enter"
+                    | "startup_leave"
+                    | "thread_start"
+                    | "thread_exception_handler"
+                    | "dll_init"
             )
     {
         "personality-internal guest entry"
+    } else if module == "kernelbase.dll"
+        && adv_abi::signature::lookup("kernel32.dll", export).is_some()
+    {
+        "KernelBase export with kernel32 SDK signature"
     } else if module == "kernel32.dll" && export == "GetEnvironmentStringsA" {
         "SDK/export name alias"
     } else if module == "kernel32.dll"
@@ -73,10 +81,31 @@ fn vcomp_conv(export: &str) -> Option<adv_abi::Conv> {
 
 /// x86 native contracts verified against SDK 10.0.26100.0 decorated imports
 /// and public System Informer phnt declarations for newer thread/APC entries.
+/// Loader, RTL synchronization and named-object additions also checked against
+/// https://github.com/winsiderss/phnt/blob/master/ntldr.h,
+/// https://github.com/winsiderss/phnt/blob/master/ntrtl.h and
+/// https://github.com/winsiderss/phnt/blob/master/ntexapi.h.
 /// Zw aliases share the corresponding Nt contract.
 fn native_argc(export: &str) -> Option<u8> {
     match export {
         "LdrUnloadDll" => return Some(1),
+        "LdrGetDllHandle" => return Some(4),
+        "LdrGetDllHandleEx" => return Some(5),
+        "LdrAddRefDll" | "RtlPcToFileHeader" => return Some(2),
+        "RtlGetVersion"
+        | "RtlSetUnhandledExceptionFilter"
+        | "RtlInitializeSRWLock"
+        | "RtlAcquireSRWLockExclusive"
+        | "RtlAcquireSRWLockShared"
+        | "RtlReleaseSRWLockExclusive"
+        | "RtlReleaseSRWLockShared"
+        | "RtlTryAcquireSRWLockExclusive"
+        | "RtlTryAcquireSRWLockShared"
+        | "RtlInitializeConditionVariable"
+        | "RtlWakeConditionVariable"
+        | "RtlWakeAllConditionVariable" => return Some(1),
+        "RtlCompareMemory" | "RtlSleepConditionVariableCS" => return Some(3),
+        "RtlSleepConditionVariableSRW" => return Some(4),
         "RtlRaiseException" | "RtlRemoveVectoredExceptionHandler" => return Some(1),
         "RtlAddVectoredExceptionHandler" | "RtlInterlockedPushEntrySList" => return Some(2),
         "RtlEncodePointer"
@@ -102,6 +131,10 @@ fn native_argc(export: &str) -> Option<u8> {
         .or_else(|| export.strip_prefix("Zw"))?;
     let bytes = match name {
         "Close" => 4,
+        "CreateMutant" => 16,
+        "OpenMutant" | "OpenSemaphore" | "ReleaseSemaphore" => 12,
+        "ReleaseMutant" => 8,
+        "CreateSemaphore" => 20,
         "Continue" | "FlushBuffersFile" => 8,
         "QueueApcThread" => 20,
         "TestAlert" => 0,
@@ -170,6 +203,15 @@ fn all_fronts_signature_audit() {
             let reason = omission_reason(name);
             if reason == "uncategorized metadata gap" {
                 uncategorized.push(name);
+            }
+            if let Some(export) = name.strip_prefix("kernelbase.dll!") {
+                if let Some(signature) = adv_abi::signature::lookup("kernel32.dll", export) {
+                    assert_eq!(
+                        Some(registry.get("kernelbase.dll", export).unwrap().conv),
+                        signature.conv,
+                        "{name}"
+                    );
+                }
             }
             if let Some(conv) = name.strip_prefix("vcomp140.dll!").and_then(vcomp_conv) {
                 let export = name.split_once('!').unwrap().1;
