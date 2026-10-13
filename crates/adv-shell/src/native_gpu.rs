@@ -1106,6 +1106,7 @@ mod tests {
     use adv_device::surface::Rect;
     use std::time::Duration;
 
+    // spec: HOST-VIEW-3
     #[test]
     fn video_load_pass_preserves_native_base_and_restores_it_without_a_window() {
         use adv_device::surface::{BlitRect, VideoFrame};
@@ -1471,6 +1472,7 @@ mod tests {
         drop(window);
     }
 
+    // spec: HOST-VIEW-3
     #[test]
     fn native_composition_preserves_encoded_colors_opaque_alpha_and_letterbox_on_both_adapters() {
         for fallback in [false, true]

@@ -673,6 +673,7 @@ impl Drop for Window {
 mod tests {
     use super::*;
 
+    // spec: HOST-VIEW-1
     #[test]
     fn viewport_letterboxes_and_maps_back_to_canvas_pixels() {
         let viewport = Viewport::fit((800.0, 800.0), 800, 600);

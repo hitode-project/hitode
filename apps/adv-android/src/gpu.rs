@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use adv_device::surface::Snapshot;
 
+    // spec: HOST-AND-5
     #[test]
     fn identical_software_pixels_do_not_publish_a_new_bitmap() {
         let previous = Frame {
@@ -229,6 +230,7 @@ mod tests {
         assert_eq!(changed.bgra, snapshot.bgra);
     }
 
+    // spec: HOST-AND-5
     #[test]
     fn software_dimensions_and_first_frame_are_always_published() {
         let previous = Frame {
@@ -248,6 +250,7 @@ mod tests {
         assert!(software_frame(&snapshot, None).is_some());
     }
 
+    // spec: HOST-AND-5
     #[test]
     fn no_frame_has_no_capture_timer_even_after_previous_deadline_expires() {
         let mut capture = Capture::new();
