@@ -1,6 +1,6 @@
-﻿# 试玩启动器：选择预设游戏或游戏 EXE、代码页和附加参数，然后用同目录的 adv-run.exe 启动。
-# 预设来自同目录的 games.json（可选）；存档写入本目录 saves\，游戏目录本身不会被写入；
-# 每次运行的日志在 logs\。
+﻿# Playtest launcher: select a preset or game EXE, code page, and extra arguments; launch with the adjacent adv-run.exe.
+# Optional presets come from games.json; saves go to saves\ here without writing to the game directory.
+# Each run writes logs under logs\.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing

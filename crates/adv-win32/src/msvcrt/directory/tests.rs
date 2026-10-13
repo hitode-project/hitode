@@ -108,7 +108,7 @@ fn actual<B: Backend>(cpu: B, name: &str) {
         let w = a + 0x80;
         let mut ansi_path = b"C:\\Game\\existing\\".to_vec();
         ansi_path.extend_from_slice(&[0xc8, 0xd5, 0xb1, 0xbe]);
-        ansi_path.extend_from_slice(index.to_string().as_bytes()); // 日本, GBK/Win32 ACP936.
+        ansi_path.extend_from_slice(index.to_string().as_bytes()); // U+65E5 U+672C, GBK/Win32 ACP936.
         ansi(&mut machine, a, &ansi_path);
         wide(
             &mut machine,
