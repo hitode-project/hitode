@@ -5,10 +5,16 @@
 //! never reach the guest, so the overlay's pause menu is opened by ⌘. from
 //! the macOS application menu, which emits a `pause` event to the webview.
 //! Windows and Linux have no menu bar yet; the overlay's pause button stays.
+//!
+//! The predefined Quit item sends `terminate:`, which tao's delegate does not
+//! intercept, so the process would exit without letting a running game save.
+//! It is replaced by an item that calls AppHandle::exit; the game module then
+//! defers the exit until the game has closed.
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 const PAUSE: &str = "pause";
+const QUIT: &str = "quit";
 
 /// The pause item, enabled only while the game screen is shown.
 pub struct PauseItem<R: Runtime>(MenuItem<R>);
@@ -21,14 +27,23 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         // About, separator, then the pause item in its own group.
         app_menu.insert(&pause, 2)?;
         app_menu.insert(&PredefinedMenuItem::separator(app)?, 3)?;
+        if let Some(MenuItemKind::Predefined(quit)) = app_menu.items()?.last() {
+            let text = quit.text()?;
+            app_menu.remove(quit)?;
+            app_menu.append(&MenuItem::with_id(app, QUIT, text, true, Some("Cmd+Q"))?)?;
+        }
     }
     app.manage(PauseItem(pause));
     Ok(menu)
 }
 
 pub fn on_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
-    if id == PAUSE {
-        let _ = app.emit(PAUSE, ());
+    match id {
+        PAUSE => {
+            let _ = app.emit(PAUSE, ());
+        }
+        QUIT => app.exit(0),
+        _ => {}
     }
 }
 

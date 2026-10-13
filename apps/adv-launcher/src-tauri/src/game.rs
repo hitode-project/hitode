@@ -5,16 +5,46 @@ use adv_shell::{
     Options, Session,
     window::{GameContainer, GameView},
 };
-use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, NSObject, ProtocolObject},
+    sel,
+};
 use objc2_app_kit::{
     NSView, NSWindow, NSWindowDidChangeOcclusionStateNotification,
     NSWindowDidDeminiaturizeNotification, NSWindowDidMiniaturizeNotification,
-    NSWindowOcclusionState,
+    NSWindowOcclusionState, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSWorkspaceWillPowerOffNotification, NSWorkspaceWillSleepNotification,
 };
-use objc2_foundation::{NSNotificationCenter, NSObjectProtocol, NSOperationQueue};
+use objc2_foundation::{
+    NSAppleEventManager, NSNotificationCenter, NSObjectProtocol, NSOperationQueue,
+};
 use serde::Serialize;
 use std::{cell::RefCell, path::PathBuf};
 use tauri::{Emitter, Manager, WebviewWindow};
+
+/// `kCoreEventClass` and `kAEQuitApplication`.
+const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+const QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
+
+define_class!(
+    // tao's application delegate has no applicationShouldTerminate:, so the
+    // default quit event (Dock Quit, logout, restart, shut down) would end the
+    // process without asking the game. This handler routes it through
+    // AppHandle::exit, which run_event can defer until the game has closed.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = tauri::AppHandle]
+    struct QuitHandler;
+    unsafe impl NSObjectProtocol for QuitHandler {}
+    impl QuitHandler {
+        #[unsafe(method(handleQuit:withReplyEvent:))]
+        fn handle_quit(&self, _event: &AnyObject, _reply: &AnyObject) {
+            self.ivars().exit(0);
+        }
+    }
+);
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -24,8 +54,14 @@ struct Host {
     session: Option<Session>,
     close_window: bool,
     exit: Option<i32>,
-    observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+    quit: Retained<QuitHandler>,
+    observers: Vec<Observer>,
 }
+/// A block observer and the notification center it is registered with.
+type Observer = (
+    Retained<NSNotificationCenter>,
+    Retained<ProtocolObject<dyn NSObjectProtocol>>,
+);
 impl Host {
     fn focus(&self, target: Target) {
         let views = self.container.subviews();
@@ -42,8 +78,8 @@ impl Host {
 }
 impl Drop for Host {
     fn drop(&mut self) {
-        for observer in &self.observers {
-            unsafe { NSNotificationCenter::defaultCenter().removeObserver((&**observer).as_ref()) };
+        for (center, observer) in &self.observers {
+            unsafe { center.removeObserver((**observer).as_ref()) };
         }
     }
 }
@@ -52,11 +88,11 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     let window = app.get_webview_window("main").unwrap();
     let handle = app.handle().clone();
     window.with_webview(move |native| {
-        MainThreadMarker::new().unwrap();
         // with_webview supplies the retained WKWebView on the main thread.
         let webview = unsafe { &*native.inner().cast::<NSView>() };
         let container =
             GameContainer::new(webview, handle.state::<OverlayState>().router.clone()).unwrap();
+        let mtm = MainThreadMarker::new().unwrap();
         let native_window = container.window().unwrap();
         native_window.setAcceptsMouseMovedEvents(true);
         let center = NSNotificationCenter::defaultCenter();
@@ -89,21 +125,56 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                     });
                 },
             );
-            observers.push(unsafe {
+            observers.push((center.clone(), unsafe {
                 center.addObserverForName_object_queue_usingBlock(
                     Some(name),
                     Some(&native_window),
                     Some(&NSOperationQueue::mainQueue()),
                     &block,
                 )
-            });
+            }));
         }
+        let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
+        for name in unsafe {
+            [
+                NSWorkspaceWillSleepNotification,
+                NSWorkspaceDidWakeNotification,
+                NSWorkspaceWillPowerOffNotification,
+            ]
+        } {
+            let block = block2::RcBlock::new(
+                move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    HOST.with_borrow(|host| {
+                        if let Some(session) = host.as_ref().and_then(|host| host.session.as_ref())
+                        {
+                            if name == unsafe { NSWorkspaceWillPowerOffNotification } {
+                                // Workspace does not distinguish logout, restart and power-off.
+                                session.power_off();
+                            } else {
+                                session.sleep(name == unsafe { NSWorkspaceWillSleepNotification });
+                            }
+                        }
+                    });
+                },
+            );
+            observers.push((workspace.clone(), unsafe {
+                workspace.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    None,
+                    Some(&NSOperationQueue::mainQueue()),
+                    &block,
+                )
+            }));
+        }
+        let quit = QuitHandler::alloc(mtm).set_ivars(handle.clone());
+        let quit: Retained<QuitHandler> = unsafe { msg_send![super(quit), init] };
         HOST.with_borrow_mut(|host| {
             *host = Some(Host {
                 container,
                 session: None,
                 close_window: false,
                 exit: None,
+                quit,
                 observers,
             })
         });
@@ -192,6 +263,17 @@ pub async fn start_game(
                                 .contains(NSWindowOcclusionState::Visible),
                         );
                         host.session = Some(session);
+                        // AppKit installs its own quit handler while the app
+                        // finishes launching; replace it once a game starts.
+                        unsafe {
+                            let _: () = msg_send![
+                                &*NSAppleEventManager::sharedAppleEventManager(),
+                                setEventHandler: &*host.quit,
+                                andSelector: sel!(handleQuit:withReplyEvent:),
+                                forEventClass: CORE_EVENT_CLASS,
+                                andEventID: QUIT_APPLICATION
+                            ];
+                        }
                         host.focus(host_window.state::<OverlayState>().router().keyboard());
                         Ok(())
                     }
@@ -266,8 +348,13 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
                 && let Some(session) = &host.session
             {
                 api.prevent_exit();
-                host.exit = Some(code.unwrap_or(0));
-                session.request_close();
+                // A second quit while the game is still closing forces it,
+                // as the standalone shell's Quit item does.
+                if host.exit.replace(code.unwrap_or(0)).is_some() {
+                    session.force_close();
+                } else {
+                    session.request_close();
+                }
             }
         });
     }
