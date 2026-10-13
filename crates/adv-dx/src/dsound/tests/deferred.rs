@@ -10,6 +10,7 @@ fn status(m: &mut Machine<JitCpu>, buffer: u32) -> u32 {
 }
 
 #[test]
+// spec: MEDIA-AUDIO-3
 fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() {
     let mut m = machine();
     let dev = device(&mut m);

@@ -322,6 +322,7 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-3
 fn guest_render_validates_direction_connection_and_graph_owner_before_connecting() {
     for (direction, owner, peer, expected) in [
         (INPUT, SOURCE, 0, VFW_E_INVALID_DIRECTION),
@@ -347,6 +348,7 @@ fn guest_render_validates_direction_connection_and_graph_owner_before_connecting
 }
 
 #[test]
+// spec: MEDIA-GRAPH-6
 fn guest_render_failed_pull_and_probe_release_reader_and_remove_temporary_filters() {
     for fail_reads in [true, false] {
         let (mut m, graph) = fixture(vec![0x55; 32]);
@@ -374,6 +376,7 @@ fn guest_render_failed_pull_and_probe_release_reader_and_remove_temporary_filter
 }
 
 #[test]
+// spec: MEDIA-GRAPH-6
 fn file_source_render_failure_restores_media_owner_and_disconnects_the_source() {
     let mut m = machine();
     let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
@@ -440,6 +443,7 @@ fn wave() -> Vec<u8> {
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-3
 fn guest_render_builds_the_common_audio_pipeline_and_disconnect_returns_source_references() {
     let (mut m, graph) = fixture(wave());
     let outcome = pin(&mut env(&mut m), graph, OUTPUT_PIN);
@@ -480,6 +484,7 @@ fn guest_render_builds_the_common_audio_pipeline_and_disconnect_returns_source_r
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-GRAPH-6
 fn guest_render_downstream_failure_rolls_back_an_accepted_pull_connection() {
     let (mut m, graph) = fixture(wave());
     m.ext.get_mut::<PullSource>().suppress_outputs = true;
@@ -533,6 +538,7 @@ fn invoke(
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-STREAM-1
 fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_releases_source_refs() {
     use crate::dshow::{tests::query, video};
     use adv_machine::{Resume, WakeReason};

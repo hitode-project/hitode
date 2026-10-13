@@ -183,6 +183,7 @@ fn failed_task_memory_outputs_leave_the_shared_allocation_ledger_unchanged() {
 }
 
 #[test]
+// spec: MEDIA-STREAM-2
 fn pushed_samples_are_rejected_and_processed_output_is_checked_and_cleared() {
     let mut m = machine();
     let decoder = activate(&mut m, CLSID_MPEG_VIDEO_CODEC, IID_IBASEFILTER);
@@ -230,6 +231,7 @@ fn pushed_samples_are_rejected_and_processed_output_is_checked_and_cleared() {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-1
 fn graph_faces_share_identity_and_report_state() {
     let mut m = machine();
     let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
@@ -315,6 +317,7 @@ fn system_filters_expose_pins_and_join_the_graph() {
 }
 
 #[test]
+// spec: MEDIA-STREAM-1
 fn rgb_conversion_writes_bottom_up_rows() {
     let frame = adv_device::media::VideoFrame {
         pts_us: 0,
@@ -335,6 +338,7 @@ fn rgb_conversion_writes_bottom_up_rows() {
 /// enumeration and event results here as under native quartz.
 #[cfg(windows)]
 #[test]
+// spec: MEDIA-GRAPH-1
 fn sdk_compiled_empty_graph_matches_native_identity_state_enumeration_and_event_contract() {
     use adv_machine::RunResult;
     use adv_os::Process;
@@ -425,6 +429,7 @@ fn compressed_media_types_round_trip_codec_formats() {
 }
 
 #[test]
+// spec: MEDIA-DMO-1
 fn dmo_wrapper_publishes_decoder_pins_once_for_windows_media_decoders() {
     let mut m = machine();
     let filter = activate(&mut m, dmo::CLSID_DMO_WRAPPER, IID_IBASEFILTER);

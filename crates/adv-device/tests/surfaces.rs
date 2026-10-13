@@ -100,6 +100,7 @@ fn video_layer() -> VideoLayer {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     let mut store = store();
     let mut memory = Memory::new(false);
@@ -213,6 +214,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     let mut store = store();
     let (producer, mut consumer) = frame_mailbox();

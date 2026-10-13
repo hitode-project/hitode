@@ -12,6 +12,7 @@ use std::{
 mod cpu;
 
 #[test]
+// spec: MEDIA-MCI-1
 fn digital_video_open_wait_status_and_close_match_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/mci-video-tests");

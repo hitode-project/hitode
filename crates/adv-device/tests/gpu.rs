@@ -174,6 +174,7 @@ fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() 
 }
 
 #[test]
+// spec: MEDIA-VIDEO-4
 fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture() {
     use adv_device::surface::{BlitRect, Snapshot, Surfaces, VideoFrame, VideoLayer};
     let mut gpu =

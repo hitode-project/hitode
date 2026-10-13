@@ -54,6 +54,7 @@ fn provider(m: &mut Machine<JitCpu>, fail: bool) {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-3
 fn empty_graph_keeps_video_distributor_no_interface_contract() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -70,6 +71,7 @@ fn empty_graph_keeps_video_distributor_no_interface_contract() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-2
 fn position_getters_validate_every_output_before_writing_any() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -103,6 +105,7 @@ fn position_getters_validate_every_output_before_writing_any() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-2
 fn double_outputs_require_all_eight_bytes_and_return_actual_frame_time() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -134,6 +137,7 @@ fn double_outputs_require_all_eight_bytes_and_return_actual_frame_time() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-1
 fn invalid_rectangles_and_automation_booleans_do_not_change_state() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -197,6 +201,7 @@ fn invalid_rectangles_and_automation_booleans_do_not_change_state() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-1
 fn embedded_window_sequence_preserves_owner_geometry_visibility_and_cursor() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -262,6 +267,7 @@ fn embedded_window_sequence_preserves_owner_geometry_visibility_and_cursor() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-1
 fn invalid_owner_and_failed_presentation_leave_window_state_unchanged() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -283,6 +289,7 @@ fn invalid_owner_and_failed_presentation_leave_window_state_unchanged() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-2
 fn source_and_destination_are_independent_and_default_destination_follows_resize() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -403,6 +410,7 @@ fn source_and_destination_are_independent_and_default_destination_follows_resize
 }
 
 #[test]
+// spec: MEDIA-VIDEO-6
 fn unsupported_window_modes_report_failure_and_preserve_geometry() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
@@ -433,6 +441,7 @@ fn unsupported_window_modes_report_failure_and_preserve_geometry() {
 }
 
 #[test]
+// spec: MEDIA-VIDEO-3
 fn snapshot_crops_source_and_writes_bottom_up_rows_with_checked_capacity() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
