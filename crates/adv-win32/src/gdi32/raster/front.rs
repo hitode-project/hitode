@@ -537,6 +537,40 @@ fn create_dc(env: &mut Env<'_>, source: Handle) -> Outcome {
     }
     raster_call(env, |r, s, d, o, m| r.create_dc(s, d, o, m, source.0))
 }
+pub(in crate::gdi32) fn compatible_bitmap(env: &mut Env<'_>, w: i32, h: i32) -> Outcome {
+    use adv_device::surface::PixelFormat;
+    if w < 0 || h < 0 {
+        return Outcome::Return(0);
+    }
+    let (w, h, format) = if w == 0 || h == 0 {
+        (1, 1, PixelFormat::Indexed1)
+    } else {
+        (w as u32, h as u32, PixelFormat::Bgra32)
+    };
+    raster_call(env, |r, s, d, o, m| {
+        let bitmap = match s.create(w, h, true, format, m) {
+            Ok(bitmap) => bitmap,
+            Err(_) => return Ok(r.fail(8)),
+        };
+        let surface = s.get(bitmap).unwrap();
+        let metadata = adv_os::gdi::GdiObj::Bitmap {
+            width: w as i32,
+            height: h as i32,
+            bpp: format.bits() as u16,
+            bits: surface.pixels,
+            stride: surface.pitch,
+            owned: false,
+            mapping_view: None,
+            dib_colors: 0,
+        };
+        if !d.register_bitmap(o, bitmap, metadata) {
+            s.delete(bitmap);
+            return Ok(r.fail(8));
+        }
+        Ok(bitmap)
+    })
+}
+
 #[win32(gdi32, name = "CreateDIBSection", level = implement)]
 fn create_dib(
     env: &mut Env<'_>,
