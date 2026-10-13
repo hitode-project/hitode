@@ -11,11 +11,13 @@ const VIDEO: u32 = 144;
 const EVENTS: u32 = 148;
 const SEEKING: u32 = 152;
 const BASIC: u32 = 156;
+const AUDIO: u32 = 164;
 const PARAMS: u32 = 192;
 const PATH: u32 = 256;
 const UNSUPPORTED: u32 = 274;
 const FILE_NOT_FOUND: u32 = 275;
 const INTERNAL: u32 = 289;
+const OUT_OF_RANGE: u32 = 282;
 
 #[derive(Clone, Copy)]
 struct Device {
@@ -26,6 +28,8 @@ struct Device {
     format: u32,
     notification: u32,
     generation: u32,
+    /// MCI left and right volume, 0 to 1000.
+    volume: [u32; 2],
 }
 #[derive(Default)]
 struct Devices {
@@ -107,7 +111,7 @@ fn fail_open(e: &mut Env<'_>, block: u32, code: u32) -> Outcome {
     release(
         e,
         block,
-        vec![128, 132, 136, 140, 144, 148, 152, 156, 160],
+        vec![128, 132, 136, 140, 144, 148, 152, 156, 160, AUDIO],
         move |e| {
             free(e, block);
             Outcome::Return(code)
@@ -228,6 +232,7 @@ fn open(e: &mut Env<'_>, output: u32, flags: u32, path: String) -> Outcome {
             ),
         ),
         (96, guid(0x56a868b5, 0x0ad4, 0x11ce, quartz)),
+        (112, guid(0x56a868b3, 0x0ad4, 0x11ce, quartz)),
     ] {
         let _ = e.cpu.write(block + at, &id);
     }
@@ -286,6 +291,7 @@ fn interfaces(e: &mut Env<'_>, block: u32, index: usize, output: u32, flags: u32
         (64, EVENTS),
         (80, SEEKING),
         (96, BASIC),
+        (112, AUDIO),
     ];
     if let Some(&(guid, out)) = pairs.get(index) {
         return method(
@@ -379,6 +385,7 @@ fn interfaces(e: &mut Env<'_>, block: u32, index: usize, output: u32, flags: u32
                                     format: 0,
                                     notification: 0,
                                     generation: 0,
+                                    volume: [1000; 2],
                                 },
                             ) else {
                                 return api(e, "DestroyWindow", vec![window], move |e, _| {
@@ -412,7 +419,7 @@ fn command(e: &mut Env<'_>, id: u32, d: Device, message: u32, flags: u32, p: u32
                         release(
                             e,
                             d.block,
-                            vec![GRAPH, CONTROL, VIDEO, EVENTS, SEEKING, BASIC],
+                            vec![GRAPH, CONTROL, VIDEO, EVENTS, SEEKING, BASIC, AUDIO],
                             move |e| {
                                 free(e, d.block);
                                 Outcome::Return(0)
@@ -442,6 +449,8 @@ fn command(e: &mut Env<'_>, id: u32, d: Device, message: u32, flags: u32, p: u32
         16
     } else if matches!(message, 0x842 | 0x843) {
         20
+    } else if message == 0x873 {
+        24
     } else {
         12
     };
@@ -663,6 +672,35 @@ fn command(e: &mut Env<'_>, id: u32, d: Device, message: u32, flags: u32, p: u32
                 )
             }
         }
+        0x873 => {
+            // MCI_DGV_SETAUDIO volume, optionally for one side only.
+            if flags & !(0x800000 | 0x1000000 | 0x200000 | 0x400000 | 2) != 0
+                || flags & 0x1800000 != 0x1800000
+                || value != 0x4002
+            {
+                return Outcome::Return(UNSUPPORTED);
+            }
+            let level = e.cpu.read_u32(p + 8).unwrap_or(0);
+            if level > 1000 {
+                return Outcome::Return(OUT_OF_RANGE);
+            }
+            let mut volume = d.volume;
+            match flags & 0x600000 {
+                0x200000 => volume[0] = level,
+                0x400000 => volume[1] = level,
+                _ => volume = [level; 2],
+            }
+            change(e, id, |d| d.volume = volume);
+            let (volume, balance) = basic_audio(volume);
+            method(e, d.block, AUDIO, 7, vec![volume as u32], move |e, hr| {
+                if hr & 0x80000000 != 0 {
+                    return Outcome::Return(UNSUPPORTED);
+                }
+                method(e, d.block, AUDIO, 9, vec![balance as u32], |_, hr| {
+                    Outcome::Return(if hr & 0x80000000 == 0 { 0 } else { UNSUPPORTED })
+                })
+            })
+        }
         _ => {
             adv_abi::warn_unavailable(
                 e,
@@ -672,6 +710,28 @@ fn command(e: &mut Env<'_>, id: u32, d: Device, message: u32, flags: u32, p: u32
             Outcome::Return(UNSUPPORTED)
         }
     }
+}
+/// MCI volume is a linear level out of 1000 per side. IBasicAudio takes the
+/// louder side as volume and the quieter side's attenuation as balance, both
+/// in hundredths of a decibel; a positive balance attenuates the left side.
+fn basic_audio([left, right]: [u32; 2]) -> (i32, i32) {
+    let decibels = |level: u32, full: u32| {
+        if level == 0 {
+            -10000
+        } else {
+            (2000.0 * (level as f32 / full as f32).log10()).round() as i32
+        }
+    };
+    let loud = left.max(right);
+    if loud == 0 {
+        return (-10000, 0);
+    }
+    let balance = if left >= right {
+        decibels(right, loud)
+    } else {
+        -decibels(left, loud)
+    };
+    (decibels(loud, 1000), balance)
 }
 fn monitor(e: &mut Env<'_>, id: u32, generation: u32, waiting: bool) -> Outcome {
     if waiting {
@@ -765,4 +825,20 @@ fn worker(e: &mut Env<'_>) -> Outcome {
 }
 pub(super) fn register(r: &mut Registry) {
     r.add("winmm.dll", WORKER, Conv::Stdcall { argc: 2 }, worker);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::basic_audio;
+
+    #[test]
+    // spec: MEDIA-MCI-1
+    fn side_volumes_become_volume_and_balance() {
+        assert_eq!(basic_audio([1000, 1000]), (0, 0));
+        assert_eq!(basic_audio([500, 500]), (-602, 0));
+        assert_eq!(basic_audio([1000, 500]), (0, -602));
+        assert_eq!(basic_audio([100, 1000]), (0, 2000));
+        assert_eq!(basic_audio([0, 0]), (-10000, 0));
+        assert_eq!(basic_audio([0, 1000]), (0, 10000));
+    }
 }

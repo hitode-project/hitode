@@ -100,12 +100,9 @@ fn plan(text: &str) -> Result<Plan, u32> {
             | "where"
             | "status"
             | "set"
+            | "setaudio"
     ) {
-        return Err(if verb == "setaudio" {
-            UNSUPPORTED_FUNCTION
-        } else {
-            UNRECOGNIZED_COMMAND
-        });
+        return Err(UNRECOGNIZED_COMMAND);
     }
     let name = words.next().ok_or(MISSING_DEVICE_NAME)?.clone();
     let mut plan = Plan {
@@ -119,6 +116,7 @@ fn plan(text: &str) -> Result<Plan, u32> {
     let (mut from, mut to, mut item) = (None, None, None);
     let mut rect = None;
     let (mut handle, mut destination) = (None, false);
+    let (mut side, mut level) = (0, None);
     while let Some(word) = words.next() {
         let word = word.to_ascii_lowercase();
         match (verb.as_str(), word.as_str()) {
@@ -137,6 +135,10 @@ fn plan(text: &str) -> Result<Plan, u32> {
                 }
                 rect = Some(values);
             }
+            ("setaudio", "left") => side = 0x200000,
+            ("setaudio", "right") => side = 0x400000,
+            ("setaudio", "volume") => item = Some((0x4002, Reply::Empty)),
+            ("setaudio", "to") => level = Some(number(words.next())?),
             ("status", "mode") => item = Some((4, Reply::Mode)),
             ("status", "length") => item = Some((1, Reply::Number)),
             ("status", "position") => item = Some((2, Reply::Number)),
@@ -202,6 +204,20 @@ fn plan(text: &str) -> Result<Plan, u32> {
             plan.flags |= 0x100;
             plan.fields = vec![Field::Word(0), Field::Word(item), Field::Word(0)];
             plan.reply = reply;
+        }
+        "setaudio" => {
+            let (Some((item, _)), Some(level)) = (item, level) else {
+                return Err(UNSUPPORTED_FUNCTION);
+            };
+            plan.message = 0x873;
+            plan.flags |= 0x800000 | 0x1000000 | side;
+            plan.fields = vec![
+                Field::Word(item),
+                Field::Word(level),
+                Field::Word(0),
+                Field::Word(0),
+                Field::Word(0),
+            ];
         }
         "set" if item.is_some() => {
             plan.message = 0x80d;
@@ -411,6 +427,9 @@ mod tests {
             (0x814, 0x102, Reply::Mode)
         );
         assert_eq!(plan("close SiglusMCIMovie wait").unwrap().message, 0x804);
+        let left = plan("setaudio SiglusMCIMovie left volume to 750").unwrap();
+        assert_eq!((left.message, left.flags), (0x873, 0x1a00000));
+        assert_eq!(left.fields[..2], [Field::Word(0x4002), Field::Word(750)]);
     }
 
     #[test]
@@ -419,7 +438,8 @@ mod tests {
         for (text, error) in [
             ("", MISSING_COMMAND_STRING),
             ("play", MISSING_DEVICE_NAME),
-            ("setaudio movie left volume to 10", UNSUPPORTED_FUNCTION),
+            ("setaudio movie left volume", UNSUPPORTED_FUNCTION),
+            ("setaudio movie bass to 10", UNRECOGNIZED_KEYWORD),
             ("play movie loudly", UNRECOGNIZED_KEYWORD),
             ("seek movie", UNRECOGNIZED_COMMAND),
             ("open \"a.mpg alias movie", NO_CLOSING_QUOTE),
