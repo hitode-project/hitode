@@ -371,8 +371,10 @@ fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     filetime_to_systemtime(ft as u64)
 }
 
-/// Back-to-back reads which prove a context is only polling the clock.
-const POLL_STREAK: u32 = 64;
+/// Back-to-back reads which prove a context is only polling the clock. Bounded
+/// per-item loops read the clock back to back too: Siglus stamps each of 256
+/// keys, twice a frame, and a 64-read streak stretched its frames to 200 ms.
+const POLL_STREAK: u32 = 2048;
 /// Longest gap between two reads of one poll: a loop doing real work between
 /// reads is not a busy-wait, however often it asks for the time.
 const POLL_GAP_US: u64 = 50;

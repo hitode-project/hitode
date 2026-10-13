@@ -212,23 +212,25 @@ fn clock_polling_spins_idle_and_skip_like_any_timed_wait() {
 }
 
 #[test]
+// spec: PROC-CLOCK-3
 fn reads_between_other_calls_are_not_a_spin() {
     let (_, polled) = spin(
         Clock::virtual_time(),
         "kernel32.dll",
         "GetTickCount",
-        2,
+        6,
         false,
     );
     let (machine, working) = spin(
         Clock::virtual_time(),
         "kernel32.dll",
         "GetTickCount",
-        2,
+        6,
         true,
     );
-    // Virtual time advances 1 us per read: only a detected spin waits for the tick.
-    assert!(polled < 200, "{polled}");
-    assert!(working > 1_000, "{working}");
+    // Virtual time advances 1 us per read: only a detected spin waits for the
+    // tick, and only after a streak longer than a 256-key scan read twice.
+    assert!((520..2_200).contains(&polled), "{polled}");
+    assert!(working > 4_000, "{working}");
     assert_eq!(machine.sys.scheduling.active_time_skips, 0);
 }
