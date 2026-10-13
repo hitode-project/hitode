@@ -1,6 +1,6 @@
 //! A game session driven by the host's main AppKit run loop.
 use crate::{
-    Options, frontend,
+    Finished, Options, frontend,
     window::{Event, GameView, Projection, Window},
 };
 use adv_runtime::{DialogEvent, DialogSet, MenuBar, MenuEvent, MenuItem};
@@ -31,11 +31,11 @@ struct Driver {
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     view: Retained<GameView>,
     ui: RefCell<Option<frontend::Ui>>,
-    done: RefCell<spsc::Consumer<Result<u8, String>>>,
-    pending: RefCell<Option<Result<u8, String>>>,
+    done: RefCell<spsc::Consumer<Result<Finished, String>>>,
+    pending: RefCell<Option<Result<Finished, String>>>,
     execution: RefCell<Option<std::thread::JoinHandle<()>>>,
     service: RefCell<adv_sync::background::Service>,
-    on_finished: RefCell<Option<Box<dyn FnOnce(Result<u8, String>)>>>,
+    on_finished: RefCell<Option<Box<dyn FnOnce(Result<Finished, String>)>>>,
     timer: RefCell<Option<CFRetained<CFRunLoopTimer>>>,
     wake: WakeEvent,
     /// Guest menus and dialogs; borrowed across a nested popup loop.
@@ -48,7 +48,7 @@ impl Session {
     pub fn new(
         view: Retained<GameView>,
         options: Options,
-        on_finished: Box<dyn FnOnce(Result<u8, String>)>,
+        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
     ) -> Result<Self, String> {
         let projection = Rc::new(RefCell::new(Projection::embedded(view.clone())?));
         Self::start(view, options, on_finished, projection)
@@ -56,7 +56,7 @@ impl Session {
     fn start(
         view: Retained<GameView>,
         options: Options,
-        on_finished: Box<dyn FnOnce(Result<u8, String>)>,
+        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
         projection: Rc<RefCell<Projection>>,
     ) -> Result<Self, String> {
         let wake = WakeEvent::new().map_err(|e| e.to_string())?;
@@ -317,7 +317,7 @@ impl Driver {
         }
         false
     }
-    fn finish(&self, mut result: Result<u8, String>) {
+    fn finish(&self, mut result: Result<Finished, String>) {
         drop(self.ui.borrow_mut().take());
         // Retires guest menus and dialogs unless a nested loop still holds them.
         drop(self.projection.borrow_mut().take());
@@ -440,4 +440,5 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
         .borrow_mut()
         .take()
         .unwrap_or_else(|| Err("application run loop stopped before the game finished".into()))
+        .map(|finished| finished.exit_code)
 }

@@ -4,6 +4,7 @@
 #[cfg(desktop)]
 mod menu;
 pub mod overlay;
+mod report;
 
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -59,6 +60,8 @@ pub fn run() {
                 post_text,
                 start_game,
                 overlay::set_overlay_input,
+                report::report_base,
+                report::save_report,
                 menu::set_pause_available
             ]);
     #[cfg(all(desktop, not(target_os = "macos")))]
@@ -66,13 +69,17 @@ pub fn run() {
         host_info,
         post_text,
         overlay::set_overlay_input,
+        report::report_base,
+        report::save_report,
         menu::set_pause_available
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         host_info,
         post_text,
-        overlay::set_overlay_input
+        overlay::set_overlay_input,
+        report::report_base,
+        report::save_report
     ]);
     let app = builder
         .build(tauri::generate_context!())

@@ -12,6 +12,7 @@ members = [
     "crates/adv-machine",
     "crates/adv-os",
     "crates/adv-pe",
+    "crates/adv-report",
     "crates/adv-runtime",
     "crates/adv-samples",
     "crates/adv-shell",

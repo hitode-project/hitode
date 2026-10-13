@@ -162,8 +162,10 @@ dependencies = [
 name = "adv-launcher"
 version = "0.1.0"
 dependencies = [
+ "adv-report",
  "adv-shell",
  "block2",
+ "getrandom 0.3.4",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -211,6 +213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-report"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "adv-run"
 version = "0.1.0"
 dependencies = [
@@ -255,6 +266,7 @@ dependencies = [
  "adv-device",
  "adv-machine",
  "adv-os",
+ "adv-report",
  "adv-runtime",
  "adv-sync",
  "block2",

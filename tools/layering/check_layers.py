@@ -16,6 +16,8 @@ import sys
 RULES: dict[str, set[str]] = {
     "adv-sync": set(),
     "adv-pe": set(),
+    # The anonymous compatibility report format; no runtime knowledge.
+    "adv-report": set(),
     # Engine-neutral core; each engine builds on it; the facade picks one.
     "adv-cpu-core": {"adv-sync"},
     "adv-cpu-x64": {"adv-cpu-core"},
@@ -29,7 +31,7 @@ RULES: dict[str, set[str]] = {
     "adv-win32": {"adv-os", "adv-device"},
     "adv-dx": {"adv-os", "adv-device"},
     "adv-runtime": {"adv-win32", "adv-dx"},
-    "adv-shell": {"adv-runtime", "adv-device", "adv-sync"},
+    "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
     # Tauri player frontend: library and in-game overlay over the native game view.
     "adv-launcher": {"adv-shell"},

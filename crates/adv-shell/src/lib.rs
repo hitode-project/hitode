@@ -14,6 +14,13 @@ pub mod window;
 #[cfg(target_os = "macos")]
 pub use session::Session;
 
+/// How a game run ended.
+#[derive(Debug)]
+pub struct Finished {
+    pub exit_code: u8,
+    pub summary: adv_report::RunSummary,
+}
+
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
 use std::path::PathBuf;
@@ -871,6 +878,51 @@ fn build_report(context: ReportContext<'_>) -> String {
     )
 }
 
+/// The fault as a report shows it; backend text may name host state.
+fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
+    let pc = snapshot.fault.pc;
+    match snapshot.access() {
+        Some((access, at)) => format!("{access} {at:#010x} at {pc:#010x}"),
+        None => format!("{} at {pc:#010x}", snapshot.kind_name()),
+    }
+}
+
+/// How a run failed, for an anonymous report. `message` is the guest
+/// failure, `fault` the latest CPU fault as `cpu_fault` formats it.
+fn report_failure(
+    message: Option<&str>,
+    exit_code: Option<u32>,
+    fault: Option<String>,
+    elapsed: Duration,
+) -> Option<adv_report::Failure> {
+    use adv_report::FailureKind;
+    let (kind, api) = match message {
+        // Strict ABI stubs fail with "unimplemented: module!name (...)"
+        // (adv-abi/src/stub.rs); a child process prefixes its pid.
+        Some(message) if message.contains("unimplemented: ") => (
+            FailureKind::Api,
+            message
+                .split("unimplemented: ")
+                .nth(1)
+                .and_then(|api| api.split(" (").next())
+                .map(str::to_owned),
+        ),
+        Some(message) if message.contains("unhandled CPU") => (FailureKind::Cpu, None),
+        Some(_) => (FailureKind::Runtime, None),
+        // An unhandled guest exception ends the process with its NTSTATUS.
+        None if exit_code.is_some_and(|code| code >= 0xc000_0000) && fault.is_some() => {
+            (FailureKind::Cpu, None)
+        }
+        None => return None,
+    };
+    Some(adv_report::Failure {
+        kind,
+        api,
+        cpu_fault: fault.filter(|_| kind == FailureKind::Cpu),
+        after: adv_report::FailureAfter::from_elapsed(elapsed),
+    })
+}
+
 fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1039,7 +1091,7 @@ fn run(options: Options) -> Result<u8, String> {
         let mut service = background.start().map_err(|error| error.to_string())?;
         let result = run_execution(options, None, wake, keys, execution_sender);
         service.shutdown();
-        return result;
+        return result.map(|finished| finished.exit_code);
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1104,10 +1156,46 @@ fn run(options: Options) -> Result<u8, String> {
         service.shutdown();
         #[cfg(target_os = "macos")]
         window.finish_termination();
-        result?
+        result?.map(|finished| finished.exit_code)
     }
     #[cfg(target_os = "macos")]
     unreachable!()
+}
+
+#[test]
+fn report_failures_are_classified_without_host_text() {
+    use adv_report::{FailureAfter, FailureKind};
+    let minute = Duration::from_secs(90);
+    let fault = || Some("read 0x00000000 at 0x00401a2c".to_owned());
+    let api = report_failure(
+        Some("process 2: unimplemented: d3d9.dll!IDirect3DDevice9::CreateVolumeTexture (strict ABI stub)"),
+        None,
+        fault(),
+        minute,
+    )
+    .unwrap();
+    assert_eq!(api.kind, FailureKind::Api);
+    assert_eq!(
+        api.api.as_deref(),
+        Some("d3d9.dll!IDirect3DDevice9::CreateVolumeTexture")
+    );
+    assert_eq!((api.cpu_fault, api.after), (None, FailureAfter::Minutes));
+    let cpu = report_failure(Some("unhandled CPU stop: Fault(..)"), None, fault(), minute).unwrap();
+    assert_eq!(
+        (cpu.kind, cpu.cpu_fault, cpu.api),
+        (FailureKind::Cpu, fault(), None)
+    );
+    let exited = report_failure(None, Some(0xc000_0005), fault(), minute).unwrap();
+    assert_eq!((exited.kind, exited.cpu_fault), (FailureKind::Cpu, fault()));
+    // Other messages may name host paths; only the kind is kept.
+    let runtime =
+        report_failure(Some("open save/data.bin: denied"), None, fault(), minute).unwrap();
+    assert_eq!(
+        (runtime.kind, runtime.api, runtime.cpu_fault),
+        (FailureKind::Runtime, None, None)
+    );
+    assert_eq!(report_failure(None, Some(0), fault(), minute), None);
+    assert_eq!(report_failure(None, Some(0xc000_0005), None, minute), None);
 }
 
 #[test]
@@ -1127,7 +1215,7 @@ fn run_execution(
     wake: window::WakeEvent,
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
-) -> Result<u8, String> {
+) -> Result<Finished, String> {
     window::initialize_dpi()?;
     let started = Instant::now();
     if let Some(install) = &options.install_dir {
@@ -1301,6 +1389,7 @@ fn run_execution(
     let mut first_frame_seconds = None;
     let mut close_at = None;
     let mut failure = None;
+    let mut guest_error = None;
     let mut exit_code = None;
     let stop_reason;
     loop {
@@ -1811,6 +1900,7 @@ fn run_execution(
             }
             RunResult::Failed(error) => {
                 failure = Some(format!("{error}\n{}", error.recent.join("\n")));
+                guest_error = Some(error);
                 stop_reason = "guest_failure";
                 break;
             }
@@ -1994,6 +2084,15 @@ fn run_execution(
             .map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }
+    let summary = adv_report::RunSummary {
+        failure: report_failure(
+            guest_error.as_ref().map(|error| error.message.as_str()),
+            exit_code,
+            runtime.latest_cpu_fault().map(cpu_fault),
+            started.elapsed(),
+        ),
+        perf: adv_report::Perf::from_samples(performance.frame_samples()),
+    };
     let stats = runtime.machine.cpu.counters();
     println!(
         "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
@@ -2005,19 +2104,16 @@ fn run_execution(
         stats.interpreter_entries,
         idle_waits
     );
-    if let Some(error) = failure {
+    let exit_code = if let Some(error) = failure {
         eprintln!("{error}");
-        return Ok(1);
-    }
-    if let Some(error) = screenshot_error {
+        1
+    } else if let Some(error) = screenshot_error {
         eprintln!("screenshot: {error}");
-        return Ok(1);
-    }
-    Ok(if exit_code.is_some_and(|code| code != 0) {
         1
     } else {
-        0
-    })
+        u8::from(exit_code.is_some_and(|code| code != 0))
+    };
+    Ok(Finished { exit_code, summary })
 }
 
 /// Run the desktop/headless command-line shell with the process arguments.

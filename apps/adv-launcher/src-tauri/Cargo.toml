@@ -20,6 +20,8 @@ tauri-build = { version = "=2.7.2", features = [] }
 
 [dependencies]
 adv-shell = { path = "../../../crates/adv-shell" }
+adv-report = { path = "../../../crates/adv-report" }
+getrandom = "0.3"
 tauri = { version = "=2.12.3", features = ["macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 

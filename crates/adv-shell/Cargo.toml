@@ -17,6 +17,7 @@ adv-runtime = { path = "../adv-runtime" }
 adv-machine = { path = "../adv-machine" }
 adv-os = { path = "../adv-os" }
 adv-sync = { path = "../adv-sync" }
+adv-report = { path = "../adv-report" }
 png = "0.17"
 wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl"] }
 pollster = { version = "0.4", optional = true }

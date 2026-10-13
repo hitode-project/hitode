@@ -230,6 +230,8 @@ enum Finished {
     Exit {
         #[serde(rename = "exitCode")]
         exit_code: u8,
+        /// Failure and frame timing for the anonymous report.
+        summary: adv_report::RunSummary,
     },
     Error {
         error: String,
@@ -272,7 +274,10 @@ pub async fn start_game(
                             (std::mem::take(&mut host.close_window), host.exit.take())
                         });
                         let payload = match result {
-                            Ok(exit_code) => Finished::Exit { exit_code },
+                            Ok(finished) => Finished::Exit {
+                                exit_code: finished.exit_code,
+                                summary: finished.summary,
+                            },
                             Err(error) => Finished::Error { error },
                         };
                         let _ = finished_window.emit("game_finished", payload);

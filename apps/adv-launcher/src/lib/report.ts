@@ -38,7 +38,8 @@ export interface ReportGame {
 }
 
 export interface ReportFailure {
-  kind: "api" | "cpu";
+  /** "runtime": any other runtime failure; its message stays local. */
+  kind: "api" | "cpu" | "runtime";
   /** The unimplemented or failing API, e.g. "d3d9.dll!IDirect3DDevice9::CreateVolumeTexture". */
   api: string | null;
   cpu_fault: string | null;
