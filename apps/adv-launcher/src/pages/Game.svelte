@@ -122,8 +122,8 @@
     }
   }
 
+  /** Without a native game view (a browser preview) there is no game to close. */
   function quit() {
-    // Not wired to the runtime yet: closing the guest will return here once it exits.
     nav.home();
   }
 
@@ -227,7 +227,13 @@
           </div>
           <div class="sep"></div>
           <div class="group" style="padding-bottom: 10px">
-            <button class="qrow danger" onclick={() => (view = "confirm")}>退出游戏</button>
+            {#if gameView}
+              <!-- The host has no command to close a running game yet; the game quits from its own menu. -->
+              <button class="qrow" disabled aria-describedby="pz-quit-in-game">退出游戏</button>
+              <div id="pz-quit-in-game" class="qnote">请在游戏内退出</div>
+            {:else}
+              <button class="qrow danger" onclick={() => (view = "confirm")}>退出游戏</button>
+            {/if}
           </div>
         </div>
       {:else}
@@ -625,6 +631,16 @@
   }
   .qrow.danger {
     color: var(--danger);
+  }
+  .qrow:disabled {
+    color: var(--fg3);
+    cursor: default;
+    background: none;
+  }
+  .qnote {
+    padding: 0 10px 4px;
+    font-size: 12px;
+    color: var(--fg3);
   }
   .qrow.danger:hover {
     background: rgba(255, 139, 126, 0.1);

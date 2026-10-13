@@ -13,6 +13,8 @@ export interface Game {
   codepage: number;
   /** Folder of the game as mounted; shown when it is offline. */
   path: string;
+  /** Main program, relative to `path`. */
+  exe: string;
   /** Unix milliseconds of the last session end; null if never started. */
   lastPlayed: number | null;
   playMinutes: number;

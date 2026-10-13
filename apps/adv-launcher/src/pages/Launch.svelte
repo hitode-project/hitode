@@ -1,21 +1,14 @@
 <script lang="ts">
-  import { untrack } from "svelte";
   import ReportBackdrop from "../components/ReportBackdrop.svelte";
-  import { FAKE_FAILURE_LABEL } from "../lib/fake-report";
-  import { LaunchFlow, UNSUPPORTED_REASON, type LaunchState } from "../lib/launch.svelte";
+  import { LaunchFlow } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
 
-  interface Props {
-    gameId: string;
-    initial?: LaunchState;
-  }
-
-  let { gameId, initial }: Props = $props();
+  let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const flow = new LaunchFlow(() => gameId, untrack(() => initial));
+  const flow = new LaunchFlow(() => gameId);
 </script>
 
 <div class="launch">
@@ -28,25 +21,13 @@
 
       {#if flow.view === "prepare"}
         <div class="state fade">
-          <div class="msg">首次准备中</div>
-          <div
-            class="track"
-            role="progressbar"
-            aria-label="首次准备"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            aria-valuenow={flow.pct}
-            style="margin-top: 32px"
-          >
-            <span class="fill" style="width: {flow.pct}%"></span>
-          </div>
-          <div class="pct">{flow.pct}%</div>
-          <div style="margin-top: 36px"><button class="btn quiet" onclick={() => nav.back()}>取消</button></div>
+          <div class="msg">正在启动</div>
+          <div class="track" role="progressbar" aria-label="正在启动" style="margin-top: 32px"><span class="fill"></span></div>
         </div>
       {:else if flow.view === "failed"}
         <div class="state fade">
           <div class="msg">游戏已停止</div>
-          <div class="mono why">{FAKE_FAILURE_LABEL}</div>
+          <div class="mono why">{flow.reason}</div>
           <div class="acts">
             <button class="btn primary" onclick={() => flow.retry()}>再试一次</button>
             <button class="btn quiet" onclick={() => flow.report()}>报告问题…</button>
@@ -56,7 +37,7 @@
       {:else}
         <div class="state fade">
           <div class="msg">暂不支持</div>
-          <div class="mono why">{UNSUPPORTED_REASON}</div>
+          <div class="mono why">{flow.reason}</div>
           <div class="acts">
             <button class="btn primary" onclick={() => nav.back()}>返回</button>
             <button class="btn quiet" onclick={() => flow.changeExe()}>更换主程序</button>
@@ -126,12 +107,6 @@
     font-size: 14px;
     color: var(--fg2);
   }
-  .pct {
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--fg3);
-    font-variant-numeric: tabular-nums;
-  }
   .why {
     margin-top: 20px;
     padding: 6px 12px;
@@ -170,11 +145,21 @@
     background: var(--field);
     overflow: hidden;
   }
+  /* The host does not report preparation progress: an indeterminate bar. */
   .fill {
     display: block;
+    width: 35%;
     height: 100%;
     background: var(--fg);
-    transition: width 0.4s ease;
+    animation: slide 1.2s ease-in-out infinite;
+  }
+  @keyframes slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(290%);
+    }
   }
   .fade {
     animation: fade 0.24s ease;
@@ -194,7 +179,9 @@
       animation: none;
     }
     .fill {
-      transition: none;
+      animation: none;
+      width: 100%;
+      opacity: 0.4;
     }
   }
 </style>

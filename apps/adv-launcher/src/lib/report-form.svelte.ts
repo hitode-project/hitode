@@ -1,5 +1,9 @@
-import { saveReportFile, submitReport, type ReportContext } from "./fake-report";
-import { buildReport, PERF_ISSUES, type PerfIssue, type Report, type Situation } from "./report";
+import { call, inTauri } from "./bridge";
+import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
+import { codepageLabel } from "./format";
+import type { RunSummary } from "./host";
+import { buildReport, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportFailure, type ReportPerf, type Situation } from "./report";
+import type { Game } from "./types";
 
 // The report form shared by the desktop and phone report screens: what the
 // user picked, the rows of "将发送的内容", the assembled report and the
@@ -25,6 +29,70 @@ export const ISSUE_LABELS: Record<PerfIssue, string> = {
   input_latency: "输入延迟",
 };
 
+/** What the report screen shows and sends besides the user's own choices. */
+export interface ReportContext {
+  base: ReportBase;
+  /** Header line under the game title. */
+  build: string;
+  /** Read-only rows of "将发送的内容". */
+  exeLabel: string;
+  versionLabel: string;
+  platformLabel: string;
+  codepageLabel: string;
+  failureLabel: string;
+  /** From the last run this session; null when it recorded none. */
+  failure: ReportFailure | null;
+  perfLabel: string;
+  perf: ReportPerf | null;
+}
+
+const OS_NAMES: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS" };
+const NOT_RUN = "未运行过";
+
+function failureLabel(summary: RunSummary | null | undefined): string {
+  if (!summary) return NOT_RUN;
+  const f = summary.failure;
+  if (!f) return "没有记录到失败";
+  if (f.kind === "api") return `未实现 · ${f.api ?? "未知接口"}`;
+  if (f.kind === "cpu") return `CPU 异常 · ${f.cpu_fault ?? "未知"}`;
+  return "运行时错误";
+}
+
+function perfLabel(summary: RunSummary | null | undefined): string {
+  if (!summary) return NOT_RUN;
+  const p = summary.perf;
+  if (!p) return "没有帧时间记录";
+  return `帧时间 p50 ${p.frame_ms_p50.toFixed(1)} ms · p95 ${p.frame_ms_p95.toFixed(1)} ms`;
+}
+
+/**
+ * The report context of `game`: the host identifies the build, platform and
+ * main program (report_base), and the failure and frame timing come from the
+ * game's last run this session (`summary`; missing when it has not run).
+ */
+export async function loadReportContext(game: Game, summary: RunSummary | null | undefined, phone: boolean): Promise<ReportContext> {
+  const base = await call<ReportBase>(
+    "report_base",
+    { exe: `${game.path}/${game.exe}`, codepage: game.codepage },
+    fakeReportBase(game, phone),
+  );
+  const { app, platform } = base;
+  const sha = base.game.exe_sha256;
+  const platformName = `${OS_NAMES[platform.os] ?? platform.os} ${platform.os_major} · ${platform.arch === "aarch64" ? "arm64" : "x64"}`;
+  return {
+    base,
+    build: `hitode ${app.version} · ${platformName}`,
+    exeLabel: `sha256 ${sha.slice(0, 4)}…${sha.slice(-4)} · ${(base.game.exe_size / 1048576).toFixed(1)} MB`,
+    versionLabel: `${app.version} (${app.build})`,
+    platformLabel: platformName,
+    codepageLabel: `${base.game.codepage} ${codepageLabel(base.game.codepage)}`,
+    failureLabel: failureLabel(summary),
+    failure: summary?.failure ?? null,
+    perfLabel: perfLabel(summary),
+    perf: summary?.perf ?? null,
+  };
+}
+
 export interface ReportRow {
   id: string;
   label: string;
@@ -45,11 +113,34 @@ export class ReportForm {
   off = $state<Record<Optional, boolean>>({ failure: false, perf: false, note: false });
   rawOpen = $state(false);
   savedPath = $state("");
+  /** Null while loading. */
+  context = $state<ReportContext | null>(null);
+  /** Why the context could not be loaded (e.g. the main program is gone). */
+  loadError = $state("");
 
-  #ctx: () => ReportContext | null;
+  #ctx = (): ReportContext | null => this.context;
 
-  constructor(ctx: () => ReportContext | null) {
-    this.#ctx = ctx;
+  /** Create during component initialisation: loads the context of the game `game()` returns. */
+  constructor(game: () => Game | undefined, summary: () => RunSummary | null | undefined, phone: boolean) {
+    $effect(() => {
+      const g = game();
+      const s = summary();
+      this.context = null;
+      this.loadError = "";
+      if (!g) return;
+      let live = true;
+      loadReportContext(g, s, phone).then(
+        (ctx) => {
+          if (live) this.context = ctx;
+        },
+        (error: unknown) => {
+          if (live) this.loadError = String(error);
+        },
+      );
+      return () => {
+        live = false;
+      };
+    });
   }
 
   readonly isPerf = $derived(this.situation === "perf");
@@ -83,7 +174,7 @@ export class ReportForm {
       situation,
       perfIssues: PERF_ISSUES.filter((k) => this.issues[k]),
       note: trimmed && !off.note ? trimmed : null,
-      failure: keepFailure ? { ...ctx.failure, after: situation === "fail" ? "lt_1m" : "1m_10m" } : null,
+      failure: keepFailure ? ctx.failure : null,
       perf: isPerf && !off.perf ? ctx.perf : null,
     });
   });
@@ -98,13 +189,19 @@ export class ReportForm {
     const report = this.report;
     if (!report || this.sending) return;
     this.view = "sending";
-    this.view = await submitReport(report);
+    // There is no report service yet: inside the app sending always fails,
+    // which offers saving the report as a file instead.
+    this.view = inTauri ? "error" : await fakeSubmit(report);
   }
 
   async save(): Promise<void> {
     const report = this.report;
     if (!report || this.sending) return;
-    this.savedPath = await saveReportFile(report);
-    this.view = "saved";
+    try {
+      this.savedPath = await call<string>("save_report", { report }, fakeSavedPath());
+      this.view = "saved";
+    } catch (error) {
+      console.error("save_report failed", error);
+    }
   }
 }

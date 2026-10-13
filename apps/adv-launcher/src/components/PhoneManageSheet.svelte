@@ -55,7 +55,7 @@
   }
 
   function remove() {
-    library.remove(game.id);
+    void library.remove(game.id);
     onremoved();
   }
 
@@ -108,10 +108,15 @@
             <span class="ic"><Icon name="sliders" size={20} stroke={1.3} /></span>
             <span>此游戏的设置…</span>
           </button>
-          <button class="si" role="menuitemcheckbox" aria-checked={game.favorite} onclick={() => library.toggleFavorite(game.id)}>
+          <button class="si" role="menuitemcheckbox" aria-checked={game.favorite} onclick={() => void library.toggleFavorite(game.id)}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill={game.favorite ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.2l1.7 3.6 3.9.5-2.9 2.7.7 3.9L8 11l-3.4 1.9.7-3.9L2.4 6.3l3.9-.5z"></path></svg>
             <span>收藏</span>
             <span class="r ck" class:on={game.favorite}><Icon name="check" size={20} stroke={1.7} /></span>
+          </button>
+          <button class="si" role="menuitemcheckbox" aria-checked={game.nsfw} onclick={() => void library.toggleNsfw(game.id)}>
+            <span class="ic"><Icon name="eye-off" size={20} stroke={1.3} /></span>
+            <span>隐藏封面</span>
+            <span class="r ck" class:on={game.nsfw}><Icon name="check" size={20} stroke={1.7} /></span>
           </button>
           <button class="si" role="menuitem" aria-haspopup="dialog" onclick={openSaves}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>

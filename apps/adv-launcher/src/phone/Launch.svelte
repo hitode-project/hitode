@@ -1,20 +1,13 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import { FAKE_FAILURE_LABEL } from "../lib/fake-report";
-  import { LaunchFlow, UNSUPPORTED_REASON, type LaunchState } from "../lib/launch.svelte";
+  import { LaunchFlow } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
 
-  interface Props {
-    gameId: string;
-    initial?: LaunchState;
-  }
-
-  let { gameId, initial }: Props = $props();
+  let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const flow = new LaunchFlow(() => gameId, untrack(() => initial));
+  const flow = new LaunchFlow(() => gameId);
   const blurred = $derived(!!game && game.nsfw && prefs.blurAdult && !library.revealed[game.id]);
 </script>
 
@@ -30,28 +23,18 @@
 
         {#if flow.view === "prepare"}
           <div class="state fade">
-            <div class="msg">首次准备中</div>
-            <div
-              class="track"
-              role="progressbar"
-              aria-label="首次准备"
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={flow.pct}
-            >
-              <span class="fill" style="width: {flow.pct}%"></span>
-            </div>
-            <div class="pct">{flow.pct}%</div>
+            <div class="msg">正在启动</div>
+            <div class="track" role="progressbar" aria-label="正在启动"><span class="fill"></span></div>
           </div>
         {:else if flow.view === "failed"}
           <div class="state fade">
             <div class="msg">游戏已停止</div>
-            <div class="chip mono">{FAKE_FAILURE_LABEL}</div>
+            <div class="chip mono">{flow.reason}</div>
           </div>
         {:else}
           <div class="state fade">
             <div class="msg">暂不支持</div>
-            <div class="chip mono">{UNSUPPORTED_REASON}</div>
+            <div class="chip mono">{flow.reason}</div>
           </div>
         {/if}
       {:else}
@@ -62,7 +45,7 @@
     {#if !game}
       <div class="acts"><button class="btn primary" onclick={() => nav.home()}>返回</button></div>
     {:else if flow.view === "prepare"}
-      <div class="acts"><button class="btn quiet" onclick={() => nav.back()}>取消</button></div>
+      <!-- A starting game cannot be cancelled. -->
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>再试一次</button>
@@ -167,17 +150,21 @@
     background: var(--field);
     overflow: hidden;
   }
+  /* The host does not report preparation progress: an indeterminate bar. */
   .fill {
     display: block;
+    width: 35%;
     height: 100%;
     background: var(--fg);
-    transition: width 0.4s ease;
+    animation: slide 1.2s ease-in-out infinite;
   }
-  .pct {
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--fg3);
-    font-variant-numeric: tabular-nums;
+  @keyframes slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(290%);
+    }
   }
   .chip {
     margin-top: 18px;
@@ -235,7 +222,9 @@
       animation: none;
     }
     .fill {
-      transition: none;
+      animation: none;
+      width: 100%;
+      opacity: 0.4;
     }
   }
 </style>

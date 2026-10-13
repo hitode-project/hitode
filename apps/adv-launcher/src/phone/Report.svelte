@@ -1,6 +1,6 @@
 <script lang="ts">
   import PhoneReportResult from "../components/PhoneReportResult.svelte";
-  import { fakeReportContext, revealFile } from "../lib/fake-report";
+  import { runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
@@ -10,8 +10,8 @@
   let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const ctx = $derived(game ? fakeReportContext(game, true) : null);
-  const form = new ReportForm(() => ctx);
+  const form = new ReportForm(() => game, () => runs.summaries[gameId], true);
+  const ctx = $derived(form.context);
   const sending = $derived(form.sending);
 
   function close() {
@@ -46,7 +46,19 @@
 />
 
 <div class="report" bind:this={root}>
-  {#if !game || !ctx}
+  {#if game && form.loadError}
+    <PhoneReportResult id="pr-load" title="读不到游戏程序" onclose={() => nav.back()}>
+      {#snippet badge()}
+        <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
+      {/snippet}
+      <div class="path mono">{form.loadError}</div>
+      {#snippet actions()}
+        <button class="primary big" onclick={() => nav.back()}>返回</button>
+      {/snippet}
+    </PhoneReportResult>
+  {:else if game && !ctx}
+    <!-- The host is identifying the main program. -->
+  {:else if !game || !ctx}
     <PhoneReportResult id="pr-none" title="找不到这个游戏" onclose={() => nav.home()}>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
@@ -180,7 +192,6 @@
       <div class="path mono">{form.savedPath}</div>
       {#snippet actions()}
         <button class="primary big" data-autofocus onclick={() => nav.back()}>完成</button>
-        <button class="reveal" onclick={() => revealFile(form.savedPath)}>在文件夹中显示</button>
       {/snippet}
     </PhoneReportResult>
   {/if}

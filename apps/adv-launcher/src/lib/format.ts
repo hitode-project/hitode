@@ -1,5 +1,10 @@
 const DAY = 86_400_000;
 
+/** "Brand · 2004" with whichever of the two is known; empty when neither is. */
+export function bylineLabel(brand: string, year: number): string {
+  return [brand, year > 0 ? String(year) : ""].filter(Boolean).join(" · ");
+}
+
 /** "昨天", "3 天前", "上周" … relative to `now`, or "未开始". */
 export function lastPlayedLabel(at: number | null, now: number): string {
   if (at === null) return "未开始";

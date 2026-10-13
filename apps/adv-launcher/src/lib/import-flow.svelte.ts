@@ -1,28 +1,44 @@
+import { inTauri } from "./bridge";
 import {
-  addScanned,
   addToLibrary,
-  chooseInstallSource,
   defaultInstallTarget,
   encChoices,
-  IMPORT_CANDIDATE,
+  fakeInspection,
+  fakeScan,
+  FAKE_SCAN_ROOT,
   pickInstallFolder,
-  scanFolder,
   takeInstallSource,
   type Enc,
-  type Meta,
-  type ScanFound,
 } from "./fake-import";
+import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type ScanFound } from "./host";
+import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 
 // UI state of the three adding flows, shared by the desktop and phone pages.
 // Construct each class during component initialisation: they own effects.
+// Folder picking, inspection, scanning and adding go to the host (library_*
+// commands); in a plain browser (`pnpm dev`) they use fake results instead.
+
+const CODEPAGES: Record<Enc, Codepage> = { ja: 932, zh: 936 };
+export const encOfCodepage = (codepage: number): Enc => (codepage === 936 ? "zh" : "ja");
+
+/** Where the flow is: the folder picker is open, the host is reading, or a result. */
+export type Phase = "picking" | "reading" | "ready" | "error";
+
+async function pickFolder(): Promise<string | null> {
+  return inTauri ? libraryPickFolder() : FAKE_SCAN_ROOT;
+}
+
+function sizeLabel(bytes: number): string {
+  return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
 
 /* ---------- Folder scan ---------- */
 
-export const SCAN_DEPTHS = [0, 1, 2, 3, 4] as const;
+export const SCAN_DEPTHS = [1, 2, 3] as const;
 
 export function depthLabel(n: number): string {
-  return n === 0 ? "只看所选文件夹" : `${n} 层子文件夹`;
+  return `${n} 层子文件夹`;
 }
 
 export const SCAN_ENC_OPTIONS: { value: Enc; label: string }[] = [
@@ -30,32 +46,69 @@ export const SCAN_ENC_OPTIONS: { value: Enc; label: string }[] = [
   { value: "zh", label: "简中" },
 ];
 
-/** Results that cannot be ticked: already added, no main program, or an installer. */
-export function scanLocked(g: ScanFound): boolean {
-  return !!g.inLib || !!g.noExe || !!g.setup;
+/** A scan result as the pages list it. */
+export interface ScanRow {
+  /** The game folder; unique within one scan. */
+  id: string;
+  name: string;
+  /** Path relative to the scanned folder. */
+  path: string;
+  exe: string;
+  inLib: boolean;
+  noExe: boolean;
+  /** Only an installer was found. */
+  setup: boolean;
+  found: ScanFound;
 }
 
-export function scanNote(g: ScanFound): string {
-  return g.inLib ? "已在游戏库" : "未找到主程序";
+function scanRow(f: ScanFound): ScanRow {
+  return {
+    id: f.folder,
+    name: f.title,
+    path: f.relative || ".",
+    exe: f.exe?.path ?? "",
+    inLib: f.inLibrary !== null,
+    noExe: f.exe === null && !f.setup,
+    setup: f.setup,
+    found: f,
+  };
+}
+
+/** Results that cannot be ticked: already added, no main program, or an installer. */
+export function scanLocked(g: ScanRow): boolean {
+  return g.inLib || g.noExe || g.setup;
+}
+
+export function scanNote(g: ScanRow): string {
+  return g.inLib ? "已在库中" : "没找到程序";
 }
 
 export class ScanPick {
-  readonly found = scanFolder();
+  phase = $state<Phase>("picking");
+  error = $state("");
+  root = $state("");
+  rows = $state<ScanRow[]>([]);
   depth = $state(2);
   watch = $state(true);
   /** Results the user unticked. */
   off = $state<Record<string, boolean>>({});
   /** Encodings the user changed from the detected one. */
   enc = $state<Record<string, Enc>>({});
+  /** The installer row whose "暂不支持安装" note is showing. */
+  installNote = $state<string | null>(null);
+  adding = $state(false);
   done = $state(false);
 
-  readonly list = $derived(this.found.filter((g) => g.depth <= this.depth));
+  readonly list = $derived(this.rows);
   readonly pickable = $derived(this.list.filter((g) => !scanLocked(g)));
   readonly chosen = $derived(this.pickable.filter((g) => !this.off[g.id]));
   readonly allOn = $derived(this.chosen.length === this.pickable.length);
   readonly addLabel = $derived(
-    this.done ? "已添加" : this.chosen.length ? `添加 ${this.chosen.length} 个游戏` : "添加",
+    this.done ? "已添加" : this.adding ? "正在添加…" : this.chosen.length ? `添加 ${this.chosen.length} 个游戏` : "添加",
   );
+
+  #began = false;
+  #scan = 0;
 
   constructor() {
     // After the "已添加" confirmation, return to the library.
@@ -66,25 +119,62 @@ export class ScanPick {
     });
   }
 
-  isOn(g: ScanFound): boolean {
+  /** Opens the folder picker once; cancelling it leaves the screen. */
+  async begin(): Promise<void> {
+    if (this.#began) return;
+    this.#began = true;
+    try {
+      const root = await pickFolder();
+      if (!root) {
+        nav.back();
+        return;
+      }
+      this.root = root;
+      await this.#run();
+    } catch (error) {
+      this.#fail(error);
+    }
+  }
+
+  async #run(): Promise<void> {
+    const run = ++this.#scan;
+    this.phase = "reading";
+    try {
+      const found = inTauri ? await libraryScan(this.root, this.depth) : fakeScan(this.depth);
+      if (run !== this.#scan) return;
+      this.rows = found.map(scanRow);
+      this.phase = "ready";
+    } catch (error) {
+      if (run === this.#scan) this.#fail(error);
+    }
+  }
+
+  #fail(error: unknown): void {
+    this.error = String(error);
+    this.phase = "error";
+  }
+
+  isOn(g: ScanRow): boolean {
     return !scanLocked(g) && !this.off[g.id];
   }
 
-  encOf(g: ScanFound): Enc {
-    return this.enc[g.id] ?? g.enc ?? "ja";
+  encOf(g: ScanRow): Enc {
+    return this.enc[g.id] ?? encOfCodepage(g.found.exe?.codepage ?? 932);
   }
 
   setDepth(n: number): void {
+    if (n === this.depth) return;
     this.depth = n;
     this.done = false;
+    if (this.root) void this.#run();
   }
 
-  toggle(g: ScanFound): void {
+  toggle(g: ScanRow): void {
     this.off[g.id] = !this.off[g.id];
     this.done = false;
   }
 
-  setEnc(g: ScanFound, v: Enc): void {
+  setEnc(g: ScanRow, v: Enc): void {
     this.enc[g.id] = v;
     this.done = false;
   }
@@ -96,40 +186,113 @@ export class ScanPick {
     this.done = false;
   }
 
-  install(g: ScanFound): void {
-    chooseInstallSource(g.id);
-    nav.go({ name: "install" });
+  /** Installing is not wired to the host yet. */
+  install(g: ScanRow): void {
+    this.installNote = g.id;
   }
 
-  add(): void {
-    if (this.done) return;
-    addScanned(this.chosen.map((g) => ({ found: g, enc: this.encOf(g) })));
-    this.done = true;
+  /** Adds the ticked games one by one; a failure stops and is shown. */
+  async add(): Promise<void> {
+    if (this.done || this.adding) return;
+    this.adding = true;
+    try {
+      for (const g of this.chosen) {
+        const exe = g.found.exe;
+        if (!exe) continue;
+        const codepage = CODEPAGES[this.encOf(g)];
+        if (inTauri) {
+          const added = await libraryAdd(g.found.folder, exe.path, codepage, g.name);
+          if (added) library.put(added);
+        } else {
+          addToLibrary(g.name, this.encOf(g), g.found.folder);
+        }
+      }
+      await library.refresh();
+      this.done = true;
+    } catch (error) {
+      this.#fail(error);
+    } finally {
+      this.adding = false;
+    }
   }
 }
 
 /* ---------- Single game ---------- */
 
-const VNDB = /(vndb\.org\/|^)v\d+/;
+/** A main program candidate as the import page lists it. */
+export interface ExeRow {
+  name: string;
+  size: string;
+  /** 64-bit programs cannot run. */
+  disabled: boolean;
+  candidate: ExeCandidate;
+}
 
 export class ImportPick {
-  readonly game = IMPORT_CANDIDATE;
-  readonly encs = encChoices(IMPORT_CANDIDATE.title, IMPORT_CANDIDATE.mojibake);
-  /** `match` indexes the matches, then the manual search / link row, then "no online data". */
-  readonly LINK = IMPORT_CANDIDATE.matches.length;
-  readonly NONE = IMPORT_CANDIDATE.matches.length + 1;
-
-  exe = $state(0);
+  phase = $state<Phase>("picking");
+  error = $state("");
+  inspection = $state<FolderInspection | null>(null);
+  exe = $state(-1);
   enc = $state<Enc>("ja");
-  match = $state(0);
-  link = $state("");
-  res = $state(0);
+  title = $state("");
+  adding = $state(false);
   /** Library id once added; the button then starts the game. */
   addedId = $state<string | null>(null);
 
-  readonly linkOk = $derived(VNDB.test(this.link.trim()));
-  readonly linkId = $derived(/v(\d+)/.exec(this.link)?.[1] ?? "");
-  readonly searchOn = $derived(this.link.trim() !== "" && !this.linkOk);
+  readonly exes = $derived<ExeRow[]>(
+    (this.inspection?.exes ?? []).map((e) => ({
+      name: e.path,
+      size: sizeLabel(e.size),
+      disabled: e.arch === "x64",
+      candidate: e,
+    })),
+  );
+  /** No program that can run: the "没找到程序" state. */
+  readonly noExe = $derived(this.phase === "ready" && !this.exes.some((e) => !e.disabled));
+  readonly encs = $derived(encChoices(this.title || (this.inspection?.title ?? "")));
+  readonly canAdd = $derived(this.phase === "ready" && !this.noExe && this.exe >= 0 && this.title.trim() !== "" && !this.adding);
+
+  constructor() {
+    void this.pick();
+  }
+
+  /** Opens the folder picker; cancelling it the first time leaves the screen. */
+  async pick(): Promise<void> {
+    const first = this.inspection === null;
+    this.phase = "picking";
+    try {
+      const folder = await pickFolder();
+      if (!folder) {
+        if (first) nav.back();
+        else this.phase = "ready";
+        return;
+      }
+      this.phase = "reading";
+      const inspection = inTauri ? await libraryInspect(folder) : fakeInspection();
+      if (!inspection) throw new Error("读不到这个文件夹");
+      if (inspection.inLibrary !== null) {
+        // Already added: go to its entry instead.
+        library.focus = inspection.inLibrary;
+        nav.home();
+        return;
+      }
+      this.#show(inspection);
+    } catch (error) {
+      this.error = String(error);
+      this.phase = "error";
+    }
+  }
+
+  #show(inspection: FolderInspection): void {
+    this.inspection = inspection;
+    this.title = inspection.title;
+    this.addedId = null;
+    const usable = inspection.exes.findIndex((e) => e.arch !== "x64");
+    const suggested = inspection.suggested;
+    this.exe = suggested !== null && inspection.exes[suggested]?.arch !== "x64" ? suggested : usable;
+    this.enc = encOfCodepage(inspection.exes[this.exe]?.codepage ?? 932);
+    this.phase = "ready";
+  }
 
   /** Any change after adding asks to add again with the new choices. */
   #edit(apply: () => void): void {
@@ -137,42 +300,48 @@ export class ImportPick {
     this.addedId = null;
   }
 
+  /** Choosing a program also takes its detected encoding. */
   pickExe(i: number): void {
-    this.#edit(() => (this.exe = i));
+    const row = this.exes[i];
+    if (!row || row.disabled) return;
+    this.#edit(() => {
+      this.exe = i;
+      this.enc = encOfCodepage(row.candidate.codepage);
+    });
   }
   pickEnc(v: Enc): void {
     this.#edit(() => (this.enc = v));
   }
-  pickMatch(i: number): void {
-    this.#edit(() => (this.match = i));
-  }
-  setLink(v: string): void {
-    this.#edit(() => (this.link = v));
-  }
-  pickRes(i: number): void {
-    this.#edit(() => (this.res = i));
-  }
-
-  chosenMeta(): Meta {
-    const game = this.game;
-    const none: Meta = { title: game.title, brand: "", year: 0, cover: "" };
-    if (this.match < this.LINK) return game.matches[this.match] ?? none;
-    if (this.match === this.LINK && this.linkOk) return game.linked;
-    if (this.match === this.LINK && this.searchOn) return game.results[this.res] ?? none;
-    return none;
+  setTitle(v: string): void {
+    this.#edit(() => (this.title = v));
   }
 
   /** Adds to the library; once added, starts the game instead. */
-  add(): void {
+  async add(): Promise<void> {
     if (this.addedId) {
       nav.replace({ name: "launch", gameId: this.addedId });
       return;
     }
-    this.addedId = addToLibrary(this.chosenMeta(), this.enc, this.game.folder);
+    const inspection = this.inspection;
+    const exe = this.exes[this.exe];
+    if (!this.canAdd || !inspection || !exe) return;
+    this.adding = true;
+    try {
+      const title = this.title.trim();
+      if (inTauri) {
+        const added = await libraryAdd(inspection.folder, exe.name, CODEPAGES[this.enc], title);
+        if (added) this.addedId = library.put(added).id;
+      } else {
+        this.addedId = addToLibrary(title, this.enc, inspection.folder);
+      }
+    } catch (error) {
+      this.error = String(error);
+      this.phase = "error";
+    } finally {
+      this.adding = false;
+    }
   }
 }
-
-export const metaLine = (m: Meta): string => `${m.brand} · ${m.year}`;
 
 /* ---------- Installer / disc image ---------- */
 
@@ -256,6 +425,6 @@ export class InstallFlow {
       nav.replace({ name: "launch", gameId: this.addedId });
       return;
     }
-    this.addedId = addToLibrary(this.source.meta, this.enc, this.target);
+    this.addedId = addToLibrary(this.source.meta.title, this.enc, this.target, this.source.meta);
   }
 }

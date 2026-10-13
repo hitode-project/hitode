@@ -1,7 +1,7 @@
 <script lang="ts">
   import ReportBackdrop from "../components/ReportBackdrop.svelte";
   import ReportResult from "../components/ReportResult.svelte";
-  import { fakeReportContext, revealFile } from "../lib/fake-report";
+  import { runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
@@ -11,8 +11,8 @@
   let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const ctx = $derived(game ? fakeReportContext(game) : null);
-  const form = new ReportForm(() => ctx);
+  const form = new ReportForm(() => game, () => runs.summaries[gameId], false);
+  const ctx = $derived(form.context);
   const sending = $derived(form.sending);
 
   function close() {
@@ -39,7 +39,17 @@
   <ReportBackdrop cover={game?.cover ?? "cv1"} dim />
 
   <div class="stage" bind:this={stage}>
-    {#if !game || !ctx}
+    {#if game && form.loadError}
+      <ReportResult id="rp-load" title="读不到游戏程序" onclose={() => nav.back()}>
+        {#snippet badge()}
+          <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
+        {/snippet}
+        <div class="path mono">{form.loadError}</div>
+        <div class="acts"><button class="primary big" onclick={() => nav.back()}>返回</button></div>
+      </ReportResult>
+    {:else if game && !ctx}
+      <!-- The host is identifying the main program. -->
+    {:else if !game || !ctx}
       <ReportResult id="rp-none" title="找不到这个游戏" onclose={() => nav.home()}>
         {#snippet badge()}
           <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
@@ -169,7 +179,6 @@
         {/snippet}
         <div class="path mono">{form.savedPath}</div>
         <div class="acts">
-          <button class="reveal" onclick={() => revealFile(form.savedPath)}>在文件夹中显示</button>
           <button class="primary big" data-autofocus onclick={() => nav.back()} style="min-width: 96px">完成</button>
         </div>
       </ReportResult>

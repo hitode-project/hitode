@@ -9,21 +9,30 @@
     onpick: () => void;
     /** Show the trailing check mark when selected. */
     check?: boolean;
+    /** Shown but not choosable. */
+    disabled?: boolean;
     style?: string;
     children: Snippet;
   }
 
-  let { name, checked, onpick, check = true, style = "", children }: Props = $props();
+  let { name, checked, onpick, check = true, disabled = false, style = "", children }: Props = $props();
 </script>
 
 <!-- One choice of a radio group, drawn as a selectable row. -->
-<label class="opt" class:on={checked} {style}>
-  <input type="radio" {name} {checked} onchange={onpick} />
+<label class="opt" class:on={checked} class:disabled {style}>
+  <input type="radio" {name} {checked} {disabled} onchange={onpick} />
   {@render children()}
   {#if check}<span class="chk"><Icon name="check" stroke={1.8} /></span>{/if}
 </label>
 
 <style>
+  .opt.disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .opt.disabled:hover {
+    background: none;
+  }
   .opt {
     position: relative;
     display: flex;
