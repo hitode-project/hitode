@@ -1511,6 +1511,16 @@ fn run_execution(
                             Err("key has no guest target window".into())
                         }
                     }
+                    control::Command::Text(text) => {
+                        let posted = runtime.post_text(&text);
+                        inputs += posted as u64;
+                        let total = text.chars().count();
+                        if posted == total {
+                            Ok(format!("text {posted}"))
+                        } else {
+                            Err(format!("text posted {posted} of {total} characters"))
+                        }
+                    }
                     control::Command::Memory(address, len) => {
                         runtime.inspect_memory(address, len).map(|bytes| {
                             let hex = bytes

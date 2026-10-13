@@ -2328,6 +2328,20 @@ pub(super) fn def_window_proc_encoded(
             };
         }
         wm::NCHITTEST => 1, // HTCLIENT
+        wm::IME_CHAR => {
+            // DefWindowProcA posts a packed DBCS character as lead then trail byte.
+            let (source, characters) = if wide {
+                (PostSource::Unicode, vec![wp & 0xffff])
+            } else if wp & 0xff00 != 0 {
+                (PostSource::Ansi, vec![wp >> 8 & 0xff, wp & 0xff])
+            } else {
+                (PostSource::Ansi, vec![wp & 0xff])
+            };
+            for character in characters {
+                post_kind(env, hwnd, wm::CHAR, character, lp, source);
+            }
+            0
+        }
         wm::MOUSEACTIVATE => 1,
         wm::ACTIVATE if wp & 0xffff != 0 => {
             return window::set_focus(env, hwnd, move |env, _| then(env, 0));
