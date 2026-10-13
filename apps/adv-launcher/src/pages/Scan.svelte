@@ -3,18 +3,18 @@
   import ImportMini from "../components/ImportMini.svelte";
   import ImportSwitch from "../components/ImportSwitch.svelte";
   import Icon from "../components/Icon.svelte";
-  import { SCAN_ROOT } from "../lib/fake-import";
   import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
   const scan = new ScanPick();
+  void scan.begin();
 </script>
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="col">
     <header>
       <h1>添加文件夹</h1>
-      <div class="mono" style="margin-top: 8px">{SCAN_ROOT}</div>
+      <div class="mono" style="margin-top: 8px">{scan.root}</div>
     </header>
 
     <section class="opts">
@@ -34,7 +34,10 @@
       </div>
     </section>
 
-    <section aria-labelledby="h-found" style="display: flex; flex-direction: column; gap: 10px">
+    {#if scan.phase !== "ready"}
+      <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? "正在选择文件夹…" : "正在查找游戏…"}</div>
+    {:else}
+        <section aria-labelledby="h-found" style="display: flex; flex-direction: column; gap: 10px">
       <div style="display: flex; align-items: baseline; gap: 12px; padding: 0 2px">
         <h2 id="h-found" class="lbl">找到 {scan.list.length} 个</h2>
         <div style="flex: 1"></div>
@@ -63,7 +66,11 @@
               <ImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label="{g.name} 的编码" onpick={(v) => scan.setEnc(g, v)} />
             {/if}
             {#if g.setup}
-              <button class="link" style="font-size: 13px" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
+              {#if scan.installNote === g.id}
+                <span class="note" role="status">暂不支持安装</span>
+              {:else}
+                <button class="link" style="font-size: 13px" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
+              {/if}
             {/if}
             {#if locked && !g.setup}
               <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{scanNote(g)}</span>
@@ -72,15 +79,30 @@
         {/each}
       </div>
     </section>
+    {/if}
   </div>
 </main>
 
 <ImportFooter width={720}>
   <button class="quiet" onclick={() => nav.back()}>取消</button>
-  <button class="primary" onclick={() => scan.add()} disabled={!scan.done && scan.chosen.length === 0}>{scan.addLabel}</button>
+  <button class="primary" onclick={() => scan.add()} disabled={scan.adding || (!scan.done && scan.chosen.length === 0)}>{scan.addLabel}</button>
 </ImportFooter>
 
 <style>
+  .status {
+    padding: 36px 0;
+    text-align: center;
+    font-size: 14px;
+    color: var(--fg2);
+  }
+  .status.err {
+    color: var(--danger);
+  }
+  .note {
+    font-size: 12px;
+    color: var(--fg3);
+    white-space: nowrap;
+  }
   .col {
     max-width: 720px;
     margin: 0 auto;

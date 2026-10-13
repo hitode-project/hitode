@@ -7,7 +7,7 @@
   import PhoneImportPermission from "../components/PhoneImportPermission.svelte";
   import PhoneImportSwitch from "../components/PhoneImportSwitch.svelte";
   import { device } from "../lib/device.svelte";
-  import { hasStoragePermission, SCAN_ROOT } from "../lib/fake-import";
+  import { hasStoragePermission } from "../lib/fake-import";
   import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
@@ -17,6 +17,10 @@
   let asking = $state(device.platform === "ios" || !hasStoragePermission());
 
   const scan = new ScanPick();
+  // The folder picker opens once storage access is settled.
+  $effect(() => {
+    if (!asking) void scan.begin();
+  });
 </script>
 
 <PhoneImportPage>
@@ -26,7 +30,7 @@
     <main class="scroll body">
       <div>
         <h1>添加文件夹</h1>
-        {#if !asking}<div class="mono" style="margin-top: 6px">{SCAN_ROOT}</div>{/if}
+        {#if !asking}<div class="mono" style="margin-top: 6px">{scan.root}</div>{/if}
       </div>
 
       {#if !asking}
@@ -45,7 +49,10 @@
           </div>
         </div>
 
-        <section aria-labelledby="p-h-found" style="display: flex; flex-direction: column; gap: 6px">
+        {#if scan.phase !== "ready"}
+          <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? "正在选择文件夹…" : "正在查找游戏…"}</div>
+        {:else}
+                <section aria-labelledby="p-h-found" style="display: flex; flex-direction: column; gap: 6px">
           <div style="display: flex; align-items: center; gap: 12px">
             <h2 id="p-h-found" class="lbl" style="margin: 0; flex: 1">找到 {scan.list.length} 个</h2>
             {#if scan.pickable.length > 0}
@@ -73,7 +80,11 @@
                   <PhoneImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label="{g.name} 的编码" onpick={(v) => scan.setEnc(g, v)} />
                 {/if}
                 {#if g.setup}
-                  <button class="link" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
+                  {#if scan.installNote === g.id}
+                    <span class="note" role="status">暂不支持安装</span>
+                  {:else}
+                    <button class="link" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
+                  {/if}
                 {/if}
                 {#if locked && !g.setup}
                   <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{scanNote(g)}</span>
@@ -82,12 +93,13 @@
             </div>
           {/each}
         </section>
+        {/if}
       {/if}
     </main>
 
     {#if !asking}
       <PhoneImportFooter>
-        <button class="primary" onclick={() => scan.add()} disabled={!scan.done && scan.chosen.length === 0}>{scan.addLabel}</button>
+        <button class="primary" onclick={() => scan.add()} disabled={scan.adding || (!scan.done && scan.chosen.length === 0)}>{scan.addLabel}</button>
       </PhoneImportFooter>
     {/if}
   </div>
@@ -98,6 +110,20 @@
 </PhoneImportPage>
 
 <style>
+  .status {
+    padding: 36px 0;
+    text-align: center;
+    font-size: 14px;
+    color: var(--fg2);
+  }
+  .status.err {
+    color: var(--danger);
+  }
+  .note {
+    font-size: 12px;
+    color: var(--fg3);
+    white-space: nowrap;
+  }
   .base {
     position: absolute;
     inset: 0;

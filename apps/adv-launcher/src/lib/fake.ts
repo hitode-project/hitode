@@ -1,9 +1,10 @@
 import type { Game } from "./types";
 
-// Fake library until the launcher reads the real one from the Rust side.
+// Fake library for the browser preview (`pnpm dev`); in the app the library
+// comes from the Rust side.
 
 const DAY = 86_400_000;
-const now = Date.UTC(2026, 9, 13, 12);
+const now = Date.now();
 
 interface Seed {
   title: string;
@@ -68,6 +69,7 @@ function fakeGame(s: Seed, i: number): Game {
     engine: s.engine,
     codepage: 932,
     path: s.path ?? `~/Games/${s.title}`,
+    exe: "Game.exe",
     lastPlayed: s.last === null ? null : now - s.last * DAY,
     playMinutes: Math.max(Math.round(s.hours * 60), recent),
     favorite: s.favorite ?? false,
@@ -77,5 +79,3 @@ function fakeGame(s: Seed, i: number): Game {
     sessions30: s.sessions ?? 0,
   };
 }
-
-export const FAKE_NOW = now;

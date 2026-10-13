@@ -2,7 +2,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
-  import { lastPlayedLabel, playTimeLabel } from "../lib/format";
+  import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game, LibraryFilter } from "../lib/types";
@@ -20,7 +20,7 @@
   let query = $state("");
   let searchInput = $state<HTMLInputElement | null>(null);
   /** The game whose detail page is open. */
-  let openId = $state<string | null>(null);
+  let openId = $state<string | null>(library.takeFocus());
   let more = $state(false);
   /** "已从游戏库移除" with undo, shown for a few seconds after a removal. */
   let undoToast = $state(false);
@@ -52,7 +52,7 @@
   }
 
   function remove(game: Game) {
-    library.remove(game.id);
+    void library.remove(game.id);
     removed();
   }
 
@@ -192,7 +192,7 @@
           {/snippet}
         </Cover>
         <h2 lang="ja">{game.title}</h2>
-        <div class="byline"><span lang="ja">{game.brand}</span> · {game.year}</div>
+        {#if bylineLabel(game.brand, game.year)}<div class="byline" lang="ja">{bylineLabel(game.brand, game.year)}</div>{/if}
       </div>
 
       {#if game.offline}
@@ -207,7 +207,7 @@
 
       <div class="actions" style="margin-top: {game.offline ? 12 : 26}px">
         {#if game.offline === "missing"}
-          <button class="primary" onclick={() => library.relocate(game.id)}>
+          <button class="primary" onclick={() => void library.relocate(game.id)}>
             <Icon name="folder" size={16} stroke={1.5} />
             <span>重新定位…</span>
           </button>
@@ -254,7 +254,7 @@
 {#if undoToast}
   <div class="toast" role="status">
     <span style="flex: 1">已从游戏库移除</span>
-    <button onclick={() => { library.undoRemove(); undoToast = false; }}>撤销</button>
+    <button onclick={() => { void library.undoRemove(); undoToast = false; }}>撤销</button>
   </div>
 {/if}
 

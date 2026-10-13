@@ -1,8 +1,10 @@
+import type { FolderInspection, ScanFound } from "./host";
 import { library } from "./library.svelte";
 import type { Game } from "./types";
 
-// Fake data and simulated host actions for adding games (scan, single import,
-// installer). Every call that will go to the Rust side lives in this file.
+// Fake data and simulated host actions for adding games. Scanning and single
+// imports use them only in a plain browser (`pnpm dev`); the installer and the
+// phone storage access are not wired to the host yet and use them everywhere.
 
 /** Guest text encoding offered when adding a game. */
 export type Enc = "ja" | "zh";
@@ -17,8 +19,11 @@ export interface EncChoice {
   preview: string;
 }
 
-/** `mojibake` is the Shift-JIS title read as GBK, which is what the wrong choice shows. */
-export function encChoices(title: string, mojibake: string): EncChoice[] {
+/**
+ * `mojibake` is the Shift-JIS title read as GBK, which is what the wrong
+ * choice shows; without it (nothing to decode it from) both show the title.
+ */
+export function encChoices(title: string, mojibake = title): EncChoice[] {
   return [
     { k: "ja", label: "日文", lang: "ja", preview: title },
     { k: "zh", label: "简体中文", lang: "zh-CN", preview: mojibake },
@@ -35,41 +40,24 @@ export interface Meta {
 
 /* ---------- Folder scan ---------- */
 
-export interface ScanFound {
-  id: string;
-  name: string;
-  /** Path relative to the scanned folder. */
-  path: string;
-  exe: string;
-  /** Subfolder depth below the scanned folder. */
-  depth: number;
-  meta: Meta;
-  inLib?: boolean;
-  enc?: Enc;
-  noExe?: boolean;
-  /** Only an installer was found; installing leads to the install flow. */
-  setup?: boolean;
+export const FAKE_SCAN_ROOT = "[所选文件夹]/ADV";
+
+function exe(path: string, codepage: 932 | 936 = 932): ScanFound["exe"] {
+  return { path, size: 3_400_000, arch: "x86", codepage };
 }
 
-export const SCAN_ROOT = "[所选文件夹]/ADV";
+const FAKE_FOUND: ScanFound[] = [
+  { relative: "夏影のアルバム", depth: 1, title: "夏影のアルバム", exe: exe("Natsukage.exe"), setup: false, inLibrary: "g1" },
+  { relative: "Lapis Soft/星屑レター", depth: 2, title: "星屑レター", exe: exe("Hoshikuzu.exe"), setup: false, inLibrary: null },
+  { relative: "鈴音堂/硝子の街と七つの鐘 汉化版", depth: 2, title: "硝子の街と七つの鐘 汉化版", exe: exe("GlassBell_chs.exe", 936), setup: false, inLibrary: null },
+  { relative: "旧作/2003/灯台守のいない島", depth: 3, title: "灯台守のいない島", exe: exe("Toudai.exe"), setup: false, inLibrary: null },
+  { relative: "旧作/2010/雨音ステップ", depth: 3, title: "雨音ステップ", exe: null, setup: false, inLibrary: null },
+  { relative: "旧作/2005/蒼の残響", depth: 3, title: "蒼の残響", exe: null, setup: true, inLibrary: null },
+].map((f) => ({ ...f, folder: `${FAKE_SCAN_ROOT}/${f.relative}` }));
 
-/** Simulates scanning the folder the user picked, up to the deepest offered depth. */
-export function scanFolder(): ScanFound[] {
-  const m = (title: string, brand: string, year: number, cover: string): Meta => ({ title, brand, year, cover });
-  return [
-    { id: "a", name: "夏影のアルバム", path: "夏影のアルバム", exe: "Natsukage.exe", depth: 1, inLib: true, meta: m("夏影のアルバム", "月下工房", 2004, "cv1") },
-    { id: "b", name: "星屑レター", path: "Lapis Soft/星屑レター", exe: "Hoshikuzu.exe", depth: 2, enc: "ja", meta: m("星屑レター", "Lapis Soft", 2007, "cv2") },
-    { id: "c", name: "硝子の街と七つの鐘", path: "鈴音堂/硝子の街と七つの鐘 汉化版", exe: "GlassBell_chs.exe", depth: 2, enc: "zh", meta: m("硝子の街と七つの鐘", "鈴音堂", 2009, "cv4") },
-    { id: "d", name: "灯台守のいない島", path: "旧作/2003/灯台守のいない島", exe: "Toudai.exe", depth: 3, enc: "ja", meta: m("灯台守のいない島", "白波ソフト", 2003, "cv8") },
-    { id: "e", name: "雨音ステップ", path: "旧作/2010/雨音ステップ", exe: "", depth: 3, noExe: true, meta: m("雨音ステップ", "白波ソフト", 2010, "cv10") },
-    { id: "f", name: "蒼の残響", path: "旧作/2005/蒼の残響", exe: "SETUP.EXE", depth: 3, setup: true, meta: m("蒼の残響", "鈴音堂", 2005, "cv7") },
-  ];
-}
-
-/** Adds the picked scan results; returns how many were added. */
-export function addScanned(picked: { found: ScanFound; enc: Enc }[]): number {
-  for (const { found, enc } of picked) addToLibrary(found.meta, enc, `${SCAN_ROOT}/${found.path}`);
-  return picked.length;
+/** What library_scan would find under the fake root, `depth` levels down. */
+export function fakeScan(depth: number): ScanFound[] {
+  return FAKE_FOUND.filter((f) => f.depth <= depth);
 }
 
 /* ---------- Phone storage access ---------- */
@@ -91,34 +79,25 @@ export const COPY_SIZE = "2.3 GB";
 
 /** iOS: what the Files picker returns; part of the picked game is still in iCloud. */
 export function pickFolderIos(): { name: string; inCloud: boolean } {
-  return { name: IMPORT_CANDIDATE.title, inCloud: true };
+  return { name: "夏影のアルバム", inCloud: true };
 }
 
 /* ---------- Single game ---------- */
 
-export const IMPORT_CANDIDATE = {
-  title: "夏影のアルバム",
-  mojibake: "壞塭偺傾儖僶儉",
-  folder: "[所选文件夹]",
-  size: "2.1 GB",
-  exes: [
-    { name: "Natsukage.exe", size: "3.4 MB" },
-    { name: "config.exe", size: "412 KB" },
-  ],
-  /** Metadata matches found by folder name. */
-  matches: [
-    { title: "夏影のアルバム", brand: "月下工房", year: 2004, cover: "cv1" },
-    { title: "夏影のアルバム ～遠い日の約束～", brand: "月下工房", year: 2006, cover: "cv11" },
-    { title: "夏影 -Summer Shade-", brand: "Lapis Soft", year: 2012, cover: "cv6" },
-  ] satisfies Meta[],
-  /** Results of a manual title search. */
-  results: [
-    { title: "夏影のアルバム ファンディスク", brand: "月下工房", year: 2005, cover: "cv11" },
-    { title: "夏影のアルバム 体験版", brand: "月下工房", year: 2004, cover: "cv6" },
-  ] satisfies Meta[],
-  /** What a pasted VNDB link resolves to. */
-  linked: { title: "夏影のアルバム", brand: "月下工房", year: 2004, cover: "cv1" } satisfies Meta,
-};
+/** What library_inspect would return for a picked game folder. */
+export function fakeInspection(): FolderInspection {
+  return {
+    folder: "[所选文件夹]/夏影のアルバム",
+    title: "夏影のアルバム",
+    exes: [
+      { path: "Natsukage.exe", size: 3_400_000, arch: "x86", codepage: 932 },
+      { path: "Natsukage64.exe", size: 3_900_000, arch: "x64", codepage: 932 },
+      { path: "config.exe", size: 412_000, arch: "x86", codepage: 932 },
+    ],
+    suggested: 0,
+    inLibrary: null,
+  };
+}
 
 /* ---------- Installer / disc image ---------- */
 
@@ -157,7 +136,7 @@ const SOURCES: Record<string, InstallSource> = {
   f: {
     kind: "setup",
     label: "蒼の残響",
-    path: `${SCAN_ROOT}/旧作/2005/蒼の残響`,
+    path: `${FAKE_SCAN_ROOT}/旧作/2005/蒼の残響`,
     detail: "安装程序 · 584 MB",
     setup: "SETUP.EXE",
     drive: "",
@@ -199,21 +178,22 @@ export function pickInstallFolder(current: string, title: string): string {
  * Simulates adding a game to the library and returns its id. A game already in
  * the fake library (same title) is reused, and found again if it was offline.
  */
-export function addToLibrary(meta: Meta, enc: Enc, path: string): string {
-  const existing = library.games.find((g) => g.title === meta.title);
+export function addToLibrary(title: string, enc: Enc, path: string, meta?: Meta): string {
+  const existing = library.games.find((g) => g.title === title);
   if (existing) {
-    if (existing.offline) library.relocate(existing.id);
+    if (existing.offline) existing.offline = null;
     return existing.id;
   }
   const game: Game = {
     id: `add-${library.games.length + 1}-${Date.now().toString(36)}`,
-    title: meta.title,
-    brand: meta.brand,
-    year: meta.year,
-    cover: meta.cover,
+    title,
+    brand: meta?.brand ?? "",
+    year: meta?.year ?? 0,
+    cover: meta?.cover ?? "cv1",
     engine: "",
     codepage: CODEPAGE[enc],
     path,
+    exe: "Game.exe",
     lastPlayed: null,
     playMinutes: 0,
     favorite: false,

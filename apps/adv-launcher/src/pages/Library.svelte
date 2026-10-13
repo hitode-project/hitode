@@ -4,7 +4,7 @@
   import Icon from "../components/Icon.svelte";
   import ManageMenu from "../components/ManageMenu.svelte";
   import ManageSaves from "../components/ManageSaves.svelte";
-  import { codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
+  import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game, LibraryFilter } from "../lib/types";
@@ -28,7 +28,7 @@
 
   let query = $state("");
   let sort = $state<Sort>("recent");
-  let selectedId = $state<string | null>(null);
+  let selectedId = $state<string | null>(library.takeFocus());
   /** The detail panel is a sheet over the grid on narrow windows. */
   let sheet = $state(false);
   /** The "更多操作" menu or the saves dialog it opens. */
@@ -64,7 +64,7 @@
   function remove(game: Game) {
     const index = items.findIndex((g) => g.id === game.id);
     selectedId = (items[index + 1] ?? items[index - 1])?.id ?? null;
-    library.remove(game.id);
+    void library.remove(game.id);
     popup = "none";
   }
 
@@ -148,7 +148,7 @@
             </Cover>
             <div class="names">
               <span class="ttl" lang="ja">{game.title}</span>
-              <span class="sub" lang="ja">{game.brand}</span>
+              {#if game.brand}<span class="sub" lang="ja">{game.brand}</span>{/if}
             </div>
           </button>
         {/each}
@@ -181,7 +181,7 @@
             {/snippet}
           </Cover>
           <h2 lang="ja">{game.title}</h2>
-          <div class="byline"><span lang="ja">{game.brand}</span> · {game.year}</div>
+          {#if bylineLabel(game.brand, game.year)}<div class="byline" lang="ja">{bylineLabel(game.brand, game.year)}</div>{/if}
 
           {#if game.offline}
             <div class="notice" role="status" style="margin-top: 22px">
@@ -197,7 +197,7 @@
 
           <div class="actions" style="margin-top: {game.offline ? 12 : 22}px">
             {#if game.offline === "missing"}
-              <button class="primary" onclick={() => library.relocate(game.id)}>
+              <button class="primary" onclick={() => void library.relocate(game.id)}>
                 <Icon name="folder" size={15} stroke={1.5} />
                 <span>重新定位…</span>
               </button>
@@ -235,7 +235,7 @@
           <dl class="meta">
             <dt>上次游玩</dt><dd>{lastPlayedLabel(game.lastPlayed, library.now)}</dd>
             <dt>累计时长</dt><dd>{playTimeLabel(game.playMinutes)}</dd>
-            <dt>引擎</dt><dd>{game.engine}</dd>
+            {#if game.engine}<dt>引擎</dt><dd>{game.engine}</dd>{/if}
             <dt>编码</dt><dd>{codepageLabel(game.codepage)}</dd>
           </dl>
           {#if game.lastPlayed !== null}

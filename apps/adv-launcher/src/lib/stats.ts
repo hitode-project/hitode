@@ -1,8 +1,8 @@
 import type { Game } from "./types";
 
-// Play statistics as pure functions of the library, so they can run on the
-// real per-day play log once the Rust side records one. The library only
-// carries the last 30 days (`Game.daily`); older days are faked below.
+// Play statistics as pure functions of the library. The host keeps play
+// sessions for the last 30 days only (`Game.daily`); older days are empty in
+// the app and faked below for the browser preview.
 
 export type StatsRange = "week" | "month" | "year";
 
@@ -172,14 +172,19 @@ export function defaultBucket(buckets: StatsBucket[]): number {
 }
 
 /** Play logs for the library: older days (from `older`) followed by `Game.daily`. */
-export function playLogs(games: Game[], now: number, older: (game: Game, now: number) => number[] = fakeOlderDays): PlayLog[] {
+export function playLogs(games: Game[], now: number, older: (game: Game, now: number) => number[] = noOlderDays): PlayLog[] {
   return games.map((game) => ({ game, days: [...older(game, now), ...game.daily] }));
 }
 
-// ---- Fake history before the 30-day window -------------------------------
+// ---- History before the 30-day window ------------------------------------
 
 /** Days of fake history before `Game.daily`: back past January 1 of last year. */
 const HISTORY_DAYS = 700;
+
+/** No play recorded before the 30-day window: what the host knows. */
+export function noOlderDays(): number[] {
+  return Array.from({ length: HISTORY_DAYS }, () => 0);
+}
 
 /**
  * Deterministic fake minutes per day before the 30-day window: `playMinutes`

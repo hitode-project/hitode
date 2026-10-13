@@ -22,11 +22,11 @@ export function hostInfo(): Promise<HostInfo> {
 }
 
 /** Subscribes to an event the Rust side emits (e.g. "pause" from the menu); a no-op outside Tauri. */
-export function onHostEvent(name: string, handler: () => void): () => void {
+export function onHostEvent<T = unknown>(name: string, handler: (payload: T) => void): () => void {
   if (!inTauri) return () => {};
   let unlisten: (() => void) | null = null;
   let dropped = false;
-  void listen(name, handler).then((stop) => {
+  void listen<T>(name, (event) => handler(event.payload)).then((stop) => {
     if (dropped) stop();
     else unlisten = stop;
   });

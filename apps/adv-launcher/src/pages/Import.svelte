@@ -2,102 +2,88 @@
   import ImportEncoding from "../components/ImportEncoding.svelte";
   import ImportFooter from "../components/ImportFooter.svelte";
   import ImportOption from "../components/ImportOption.svelte";
-  import Icon from "../components/Icon.svelte";
-  import { ImportPick, metaLine } from "../lib/import-flow.svelte";
+  import { ImportPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
   const pick = new ImportPick();
-  const { game, LINK, NONE } = pick;
 </script>
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="col">
-    <header>
-      <h1 lang="ja">{game.title}</h1>
-      <div class="mono" style="margin-top: 8px">{game.folder} · {game.size}</div>
-    </header>
+    {#if pick.phase === "ready" && pick.inspection}
+      <header>
+        <h1 lang="ja">{pick.title.trim() || pick.inspection.title}</h1>
+        <div class="mono" style="margin-top: 8px">{pick.inspection.folder}</div>
+      </header>
 
-    <fieldset>
-      <legend class="lbl">主程序</legend>
-      <div class="stack">
-        {#each game.exes as x, i (x.name)}
-          <ImportOption name="exe" checked={pick.exe === i} onpick={() => pick.pickExe(i)}>
-            <span class="mono" style="font-size: 14px; color: var(--fg)">{x.name}</span>
-            <span class="side-n">{x.size}</span>
-          </ImportOption>
-        {/each}
-      </div>
-    </fieldset>
-
-    <ImportEncoding choices={pick.encs} value={pick.enc} onpick={(v) => pick.pickEnc(v)} />
-
-    <fieldset>
-      <legend class="lbl">资料</legend>
-      <div class="stack">
-        {#each game.matches as m, i (m.title)}
-          <ImportOption name="match" checked={pick.match === i} onpick={() => pick.pickMatch(i)} style="min-height: 60px">
-            <span class="th"><span class="art {m.cover}"></span></span>
-            <span class="two">
-              <span lang="ja" class="ell" style="font-size: 14px">{m.title}</span>
-              <span lang="ja" class="sub">{metaLine(m)}</span>
-            </span>
-          </ImportOption>
-        {/each}
-        <ImportOption name="match" checked={pick.match === LINK} onpick={() => pick.pickMatch(LINK)} style="min-height: 60px">
-          <span class="glyph"><Icon name="search" size={18} /></span>
-          <span style="font-size: 14px">手动搜索或链接</span>
-        </ImportOption>
-        {#if pick.match === LINK}
-          <div class="linkbox">
-            <label class="linkf">
-              <input
-                type="search"
-                aria-label="搜索标题或粘贴 VNDB 链接"
-                placeholder="搜索标题，或粘贴 VNDB 链接"
-                value={pick.link}
-                oninput={(e) => pick.setLink(e.currentTarget.value)}
-              />
-            </label>
-            {#if pick.linkOk}
-              <div style="display: flex; align-items: center; gap: 14px; min-height: 52px">
-                <span class="th"><span class="art {game.linked.cover}"></span></span>
-                <span class="two">
-                  <span lang="ja" style="font-size: 14px">{game.linked.title}</span>
-                  <span class="sub"><span lang="ja">{game.linked.brand}</span> · {game.linked.year} · v{pick.linkId}</span>
-                </span>
-              </div>
-            {/if}
-            {#if pick.searchOn}
-              <div class="stack">
-                {#each game.results as r, i (r.title)}
-                  <button class="res" class:on={pick.res === i} aria-pressed={pick.res === i} onclick={() => pick.pickRes(i)}>
-                    <span class="th"><span class="art {r.cover}"></span></span>
-                    <span class="two">
-                      <span lang="ja" class="ell" style="font-size: 14px">{r.title}</span>
-                      <span lang="ja" class="sub">{metaLine(r)}</span>
-                    </span>
-                    <span class="chk"><Icon name="check" stroke={1.8} /></span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
+      {#if pick.noExe}
+        <div class="empty" role="status">
+          <div class="msg">没找到程序</div>
+          <div class="hint">这个文件夹里没有能运行的 32 位 Windows 程序</div>
+          <button class="quiet" style="margin-left: -12px" onclick={() => void pick.pick()}>重新选择文件夹…</button>
+        </div>
+      {:else}
+        <fieldset>
+          <legend class="lbl">主程序</legend>
+          <div class="stack">
+            {#each pick.exes as x, i (x.name)}
+              <ImportOption name="exe" checked={pick.exe === i} disabled={x.disabled} onpick={() => pick.pickExe(i)}>
+                <span class="mono" style="font-size: 14px; color: var(--fg)">{x.name}</span>
+                <span class="side-n">{x.disabled ? "64 位程序" : x.size}</span>
+              </ImportOption>
+            {/each}
           </div>
-        {/if}
-        <ImportOption name="match" checked={pick.match === NONE} onpick={() => pick.pickMatch(NONE)} style="min-height: 60px">
-          <span class="th"><span class="art cvx"></span></span>
-          <span style="font-size: 14px">不使用在线资料</span>
-        </ImportOption>
+        </fieldset>
+
+        <ImportEncoding choices={pick.encs} value={pick.enc} onpick={(v) => pick.pickEnc(v)} />
+
+        <fieldset>
+          <legend class="lbl">标题</legend>
+          <label class="linkf">
+            <input type="text" lang="ja" aria-label="标题" value={pick.title} oninput={(e) => pick.setTitle(e.currentTarget.value)} />
+          </label>
+        </fieldset>
+      {/if}
+    {:else}
+      <div class="status" class:err={pick.phase === "error"} role="status">
+        {pick.phase === "error" ? pick.error : pick.phase === "picking" ? "正在选择文件夹…" : "正在读取文件夹…"}
       </div>
-    </fieldset>
+      {#if pick.phase === "error"}
+        <button class="quiet" style="align-self: center" onclick={() => void pick.pick()}>重新选择文件夹…</button>
+      {/if}
+    {/if}
   </div>
 </main>
 
 <ImportFooter width={600}>
   <button class="quiet" onclick={() => nav.back()}>取消</button>
-  <button class="primary" onclick={() => pick.add()}>{pick.addedId ? "开始游戏" : "添加到游戏库"}</button>
+  <button class="primary" disabled={!pick.addedId && !pick.canAdd} onclick={() => void pick.add()}>{pick.addedId ? "开始游戏" : "添加到游戏库"}</button>
 </ImportFooter>
 
 <style>
+  .status {
+    padding: 48px 0;
+    text-align: center;
+    font-size: 14px;
+    color: var(--fg2);
+  }
+  .status.err {
+    color: var(--danger);
+  }
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .empty .msg {
+    font-size: 15px;
+    font-weight: 500;
+  }
+  .empty .hint {
+    font-size: 13px;
+    color: var(--fg3);
+  }
   .col {
     max-width: 600px;
     margin: 0 auto;
@@ -137,50 +123,6 @@
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
-  .th {
-    position: relative;
-    flex: 0 0 auto;
-    width: 30px;
-    aspect-ratio: 5 / 7;
-    border-radius: 4px;
-    overflow: hidden;
-    box-shadow: 0 0 0 1px var(--line);
-  }
-  .art {
-    position: absolute;
-    inset: 0;
-  }
-  .cvx {
-    background: var(--field);
-  }
-  .two {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    min-width: 0;
-  }
-  .sub {
-    font-size: 12px;
-    color: var(--fg3);
-  }
-  .ell {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .glyph {
-    flex: 0 0 auto;
-    width: 30px;
-    display: grid;
-    place-items: center;
-    color: var(--fg2);
-  }
-  .linkbox {
-    padding: 4px 16px 10px 60px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
   .linkf {
     display: flex;
     align-items: center;
@@ -202,36 +144,5 @@
   }
   .linkf input::placeholder {
     color: var(--fg3);
-  }
-  .res {
-    all: unset;
-    box-sizing: border-box;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    min-height: 52px;
-    padding: 0 14px;
-    border-radius: 10px;
-    cursor: pointer;
-  }
-  .res:hover {
-    background: var(--hover);
-  }
-  .res.on {
-    background: var(--sel);
-  }
-  .res:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .chk {
-    flex: 0 0 auto;
-    margin-left: auto;
-    display: flex;
-    color: var(--accent);
-    opacity: 0;
-  }
-  .res.on .chk {
-    opacity: 1;
   }
 </style>
