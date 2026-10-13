@@ -142,6 +142,7 @@ fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
             let mut runtime = Runtime::with_cpu_and_codec(
                 output.join(exe),
                 &profile,
+                None,
                 cpu::Cpu::new(jit).unwrap(),
                 32,
                 32,
@@ -282,6 +283,7 @@ fn real_vorbis_pages_and_packet_boundaries_match_reference() {
             let mut runtime = Runtime::with_cpu_and_codec(
                 output.join("fixture_vorbis_decode.exe"),
                 &profile,
+                None,
                 cpu::Cpu::new(jit).unwrap(),
                 32,
                 32,

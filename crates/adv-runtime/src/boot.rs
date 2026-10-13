@@ -106,10 +106,29 @@ pub(crate) fn input_snapshot(
     })
 }
 
+/// Guest root of a game inside the install folder: the path it was installed to.
+fn installed_root(game_dir: &Path, install: &Path) -> Result<Option<String>, String> {
+    let Ok(installed) = game_dir.strip_prefix(install) else {
+        return Ok(None);
+    };
+    let parts = installed
+        .iter()
+        .map(|c| c.to_str())
+        .collect::<Option<Vec<_>>>()
+        .ok_or("installed game path is not valid Unicode")?;
+    Ok(Some(
+        std::iter::once("C:\\Program Files")
+            .chain(parts)
+            .collect::<Vec<_>>()
+            .join("\\"),
+    ))
+}
+
 impl Runtime<JitCpu> {
     pub fn with_codec(
         exe: impl AsRef<Path>,
         data: impl AsRef<Path>,
+        install: Option<&Path>,
         jit: bool,
         width: u32,
         height: u32,
@@ -118,6 +137,7 @@ impl Runtime<JitCpu> {
         Self::with_cpu_and_codec(
             exe,
             data,
+            install,
             JitCpu::new(adv_machine::layout::PARK_ADDR, jit)?,
             width,
             height,
@@ -154,6 +174,7 @@ impl<B: Backend> Runtime<B> {
         Self::with_cpu_and_codec(
             exe_path,
             data_dir,
+            None,
             cpu,
             width,
             height,
@@ -161,9 +182,12 @@ impl<B: Backend> Runtime<B> {
         )
     }
 
+    /// `install` backs guest `C:\Program Files` (see [`adv_os::OsConfig::install_dir`]);
+    /// a game inside it runs from the guest path it was installed to.
     pub fn with_cpu_and_codec(
         exe_path: impl AsRef<Path>,
         data_dir: impl AsRef<Path>,
+        install: Option<&Path>,
         cpu: B,
         width: u32,
         height: u32,
@@ -179,6 +203,15 @@ impl<B: Backend> Runtime<B> {
             .and_then(|n| n.to_str())
             .ok_or("invalid executable filename")?;
         let mut cfg = Win32Config::new(game_dir, exe_name, data_dir.as_ref());
+        if let Some(install) = install {
+            let install = install
+                .canonicalize()
+                .map_err(|e| format!("install folder {}: {e}", install.display()))?;
+            if let Some(root) = installed_root(game_dir, &install)? {
+                cfg.os.guest_root = root;
+            }
+            cfg.os.install_dir = Some(install);
+        }
         // The initial render canvas is independent of the virtual desktop.
         // Games query the desktop before choosing their own window/backbuffer size.
         cfg.os.codepage = if exe_name.to_ascii_lowercase().contains("chs") {
@@ -697,6 +730,23 @@ impl<B: Backend> Runtime<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_games_run_from_their_install_path() {
+        let install = Path::new("/library/install");
+        assert_eq!(
+            installed_root(Path::new("/library/install/Co/ゲーム"), install),
+            Ok(Some("C:\\Program Files\\Co\\ゲーム".into()))
+        );
+        assert_eq!(
+            installed_root(install, install),
+            Ok(Some("C:\\Program Files".into()))
+        );
+        assert_eq!(
+            installed_root(Path::new("/library/other"), install),
+            Ok(None)
+        );
+    }
 
     fn looping_executable_runtime() -> Runtime<JitCpu> {
         // A standalone authored PE exercises with_cpu, loader and startup policy

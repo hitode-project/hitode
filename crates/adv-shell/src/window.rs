@@ -1390,9 +1390,9 @@ mod native {
 pub use native::{Window, initialize_dpi};
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{Window, initialize_dpi};
+pub use macos::{GameView, Window, initialize_dpi};
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn initialize_dpi() -> Result<(), String> {

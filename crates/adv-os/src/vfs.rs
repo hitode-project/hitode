@@ -3,6 +3,7 @@
 //! * Game files are writable in portable mode; isolated mode uses a data overlay.
 //!   Read-only replacements always use copy-on-write in the data overlay.
 //! * An optional read-only resource directory sits between guest writes and game files.
+//! * An optional install folder backs `C:\Program Files` and is written in place.
 //! * Every other `C:\` path (user profile, Windows dir, ...) maps into a writable host
 //!   directory, created on demand.
 //! * Path components match case-insensitively; `/` and `\` are equivalent.
@@ -61,6 +62,8 @@ pub struct FileObj {
 enum Loc {
     /// Under the game root: relative components.
     Game(Vec<String>),
+    /// Under `C:\Program Files` with an install folder: relative components.
+    Install(Vec<String>),
     /// Elsewhere on C:.
     Other(Vec<String>),
 }
@@ -77,6 +80,7 @@ pub struct Vfs {
     user_name: String,
     resources: Option<PathBuf>,
     overlay: PathBuf,
+    install: Option<PathBuf>,
     other: PathBuf,
     optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
 }
@@ -140,6 +144,7 @@ impl Vfs {
             user_name: cfg.user_name.clone(),
             resources: cfg.resource_dir.clone(),
             overlay: cfg.data_dir.join("overlay"),
+            install: cfg.install_dir.clone(),
             other: cfg.data_dir.join("c"),
             optical: BTreeMap::new(),
         }
@@ -222,7 +227,13 @@ impl Vfs {
             .filter(|d| d.eq_ignore_ascii_case("C:"))
             .map(|_| {
                 let rel = comps(&n[2..]);
-                if self.portable_saves
+                if self.install.is_some()
+                    && rel
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case("Program Files"))
+                {
+                    Loc::Install(rel[1..].to_vec())
+                } else if self.portable_saves
                     && let Some(save) = portable_saves::relative(&rel, &self.user_name)
                 {
                     Loc::Game(save.to_vec())
@@ -241,6 +252,7 @@ impl Vfs {
             Loc::Game(rel) => ci_find(&self.overlay, &rel)
                 .or_else(|| self.resources.as_ref().and_then(|p| ci_find(p, &rel)))
                 .or_else(|| ci_find(&self.game_host, &rel)),
+            Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_find(&self.other, &rel),
         }
     }
@@ -281,6 +293,7 @@ impl Vfs {
                 };
                 ci_path(base, &rel)
             }
+            Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
         };
         if let Some(parent) = p.parent() {
@@ -297,6 +310,7 @@ impl Vfs {
         }
         let path = match self.locate(guest)? {
             Loc::Game(rel) => ci_path(&self.overlay, &rel),
+            Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
         };
         std::fs::create_dir_all(path.parent()?).ok()?;
@@ -363,6 +377,7 @@ impl Vfs {
             .flatten()
             .filter(|p| p.is_dir())
             .collect(),
+            Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel).into_iter().collect(),
             Loc::Other(rel) => ci_find(&self.other, &rel).into_iter().collect(),
         };
         if dirs.is_empty() {
@@ -538,6 +553,69 @@ mod tests {
             1
         );
         assert!(names.iter().any(|n| n == "Save"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn install_folder_backs_program_files_and_yields_to_an_installed_game_root() {
+        let tmp = std::env::temp_dir().join(format!("adv-install-vfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("setup")).unwrap();
+        std::fs::create_dir_all(tmp.join("install")).unwrap();
+        let config = |game: &str, root: &str| {
+            let mut cfg = OsConfig::new(tmp.join(game), "x.exe", tmp.join("data"));
+            cfg.guest_root = root.into();
+            cfg.install_dir = Some(tmp.join("install"));
+            Vfs::new(&cfg)
+        };
+        // The installer writes straight into the install folder, not the overlay.
+        let setup = config("setup", "C:\\Game");
+        let w = setup
+            .write_path("C:\\Program Files\\Co\\Game\\data.pac")
+            .unwrap();
+        assert_eq!(w, tmp.join("install/Co/Game/data.pac"));
+        std::fs::write(&w, "installed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                setup
+                    .lookup("c:\\PROGRAM FILES\\co\\game\\DATA.PAC")
+                    .unwrap()
+            )
+            .unwrap(),
+            "installed"
+        );
+        assert!(!setup.is_base_only("C:\\Program Files\\Co\\Game\\data.pac"));
+        assert!(setup.is_dir("C:\\Program Files"));
+        let names: Vec<_> = setup
+            .list("C:\\Program Files")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["Co"]);
+        assert!(
+            setup
+                .write_path("C:\\Windows\\setup.ini")
+                .unwrap()
+                .starts_with(tmp.join("data/c"))
+        );
+        // The installed game keeps its own folder behind the overlay; the rest of
+        // Program Files is still the install folder.
+        let game = config("install/Co/Game", "C:\\Program Files\\Co\\Game");
+        assert_eq!(
+            std::fs::read_to_string(game.lookup("data.pac").unwrap()).unwrap(),
+            "installed"
+        );
+        assert!(
+            game.write_path("C:\\Program Files\\Co\\Game\\data.pac")
+                .unwrap()
+                .starts_with(tmp.join("data/overlay"))
+        );
+        assert_eq!(
+            game.write_path("C:\\Program Files\\Co\\Shared\\x.dll")
+                .unwrap(),
+            tmp.join("install/Co/Shared/x.dll")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
