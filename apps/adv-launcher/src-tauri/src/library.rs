@@ -147,79 +147,96 @@ impl Library {
         self.games.insert(index.min(self.games.len()), game);
         self.save()
     }
-    fn inspect(&self, folder: &Path) -> io::Result<FolderInspection> {
-        let folder = fs::canonicalize(folder)?;
-        let mut exes = Vec::new();
-        for entry in fs::read_dir(&folder)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !path.is_file() || !name.to_ascii_lowercase().ends_with(".exe") {
-                continue;
-            }
-            exes.push(ExeCandidate {
-                path: name,
-                size: entry.metadata()?.len(),
-                arch: machine(&path),
-                codepage: adv_shell::detect_codepage(&path)?,
-            });
+    /// Folders and ids already in the library, so discovery can run unlocked.
+    fn known(&self) -> Known {
+        self.games
+            .iter()
+            .map(|g| (g.folder.clone(), g.id.clone()))
+            .collect()
+    }
+}
+type Known = Vec<(PathBuf, String)>;
+fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
+    let folder = fs::canonicalize(folder)?;
+    let mut exes = Vec::new();
+    for entry in fs::read_dir(&folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !path.is_file() || !name.to_ascii_lowercase().ends_with(".exe") {
+            continue;
         }
-        exes.sort_by_key(|e| std::cmp::Reverse(e.size));
-        let suggested = exes.iter().position(|e| {
-            e.arch == "x86" && !prefixed(&e.path, &["setup", "install", "unins", "config"])
+        // An unreadable executable is not a candidate; it must not hide the others.
+        let (Ok(metadata), Ok(codepage)) = (entry.metadata(), adv_shell::detect_codepage(&path))
+        else {
+            continue;
+        };
+        exes.push(ExeCandidate {
+            path: name,
+            size: metadata.len(),
+            arch: machine(&path),
+            codepage,
         });
-        let name = folder.file_name().unwrap_or_default();
-        let title = name.to_string_lossy().into();
-        let existing = self.games.iter().find(|g| g.folder == folder);
-        let in_library = existing.map(|g| g.id.clone());
-        Ok(FolderInspection {
-            folder,
-            title,
-            exes,
-            suggested,
-            in_library,
-        })
     }
-    fn scan(&self, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
-        if !(1..=3).contains(&depth) {
-            return Err(io::Error::other("depth must be between 1 and 3"));
-        }
-        let root = fs::canonicalize(root)?;
-        let mut queue = VecDeque::from([(root.clone(), 0)]);
-        let mut found = Vec::new();
-        while let Some((folder, level)) = queue.pop_front() {
-            let info = self.inspect(&folder)?;
-            if !info.exes.is_empty() {
-                let exes = &info.exes;
-                let installer = exes
-                    .iter()
-                    .any(|e| prefixed(&e.path, &["setup", "install"]));
-                let setup = info.suggested.is_none() && installer;
-                let relative = folder.strip_prefix(&root).unwrap().to_string_lossy();
-                found.push(ScanFound {
-                    relative: relative.replace('\\', "/"),
-                    folder: info.folder,
-                    depth: level,
-                    title: info.title,
-                    exe: info.suggested.map(|i| info.exes[i].clone()),
-                    setup,
-                    in_library: info.in_library,
-                });
-                if found.len() == 500 {
-                    break;
-                }
-            } else if level < depth {
-                for entry in fs::read_dir(folder)? {
-                    let entry = entry?;
-                    let visible = !entry.file_name().to_string_lossy().starts_with('.');
-                    if entry.file_type()?.is_dir() && visible {
-                        queue.push_back((entry.path(), level + 1));
-                    }
+    exes.sort_by_key(|e| std::cmp::Reverse(e.size));
+    let suggested = exes.iter().position(|e| {
+        e.arch == "x86" && !prefixed(&e.path, &["setup", "install", "unins", "config"])
+    });
+    let name = folder.file_name().unwrap_or_default();
+    let title = name.to_string_lossy().into();
+    let existing = known.iter().find(|(known, _)| *known == folder);
+    let in_library = existing.map(|(_, id)| id.clone());
+    Ok(FolderInspection {
+        folder,
+        title,
+        exes,
+        suggested,
+        in_library,
+    })
+}
+fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
+    if !(1..=3).contains(&depth) {
+        return Err(io::Error::other("depth must be between 1 and 3"));
+    }
+    let root = fs::canonicalize(root)?;
+    let mut queue = VecDeque::from([(root.clone(), 0)]);
+    let mut found = Vec::new();
+    while let Some((folder, level)) = queue.pop_front() {
+        // Only the root's errors are reported; an unreadable subfolder is skipped.
+        let info = match inspect(known, &folder) {
+            Ok(info) => info,
+            Err(e) if level == 0 => return Err(e),
+            Err(_) => continue,
+        };
+        if !info.exes.is_empty() {
+            let exes = &info.exes;
+            let installer = exes
+                .iter()
+                .any(|e| prefixed(&e.path, &["setup", "install"]));
+            let setup = info.suggested.is_none() && installer;
+            let relative = folder.strip_prefix(&root).unwrap().to_string_lossy();
+            found.push(ScanFound {
+                relative: relative.replace('\\', "/"),
+                folder: info.folder,
+                depth: level,
+                title: info.title,
+                exe: info.suggested.map(|i| info.exes[i].clone()),
+                setup,
+                in_library: info.in_library,
+            });
+            if found.len() == 500 {
+                break;
+            }
+        } else if level < depth {
+            for entry in fs::read_dir(folder)?.flatten() {
+                let visible = !entry.file_name().to_string_lossy().starts_with('.');
+                if entry.file_type().is_ok_and(|t| t.is_dir()) && visible {
+                    queue.push_back((entry.path(), level + 1));
                 }
             }
         }
-        Ok(found)
     }
+    Ok(found)
 }
 fn offline(folder: &Path) -> Option<Offline> {
     if folder.exists() {
@@ -315,13 +332,20 @@ pub fn library_list(state: Store<'_>) -> Reply<Vec<LibraryGame>> {
     }
     Ok(games)
 }
+// Discovery reads whole executables to detect their code page. Synchronous
+// commands run on the main thread, which also runs the game, so these run on
+// a blocking worker and release the library lock first.
 #[tauri::command]
-pub fn library_inspect(state: Store<'_>, folder: PathBuf) -> Reply<FolderInspection> {
-    reply(state.lock().unwrap().inspect(&folder))
+pub async fn library_inspect(state: Store<'_>, folder: PathBuf) -> Reply<FolderInspection> {
+    let known = state.lock().unwrap().known();
+    let inspected = tauri::async_runtime::spawn_blocking(move || inspect(&known, &folder));
+    reply(inspected.await.map_err(|e| e.to_string())?)
 }
 #[tauri::command]
-pub fn library_scan(state: Store<'_>, root: PathBuf, depth: u8) -> Reply<Vec<ScanFound>> {
-    reply(state.lock().unwrap().scan(root, depth))
+pub async fn library_scan(state: Store<'_>, root: PathBuf, depth: u8) -> Reply<Vec<ScanFound>> {
+    let known = state.lock().unwrap().known();
+    let found = tauri::async_runtime::spawn_blocking(move || scan(&known, root, depth));
+    reply(found.await.map_err(|e| e.to_string())?)
 }
 #[tauri::command]
 pub fn library_add(
@@ -436,15 +460,22 @@ mod tests {
         fs::create_dir(dir.join("nested")).unwrap();
         fs::write(dir.join("nested/hidden.exe"), b"invalid").unwrap();
         let game = lib.add(&dir, "game_chs.EXE", 936, "Game").unwrap();
-        let inspect = lib.inspect(&dir).unwrap();
-        let arch: Vec<_> = inspect.exes.iter().map(|e| e.arch).collect();
+        #[cfg(unix)]
+        {
+            // An unreadable executable is skipped rather than failing the folder.
+            use std::os::unix::fs::PermissionsExt;
+            pe(&dir, "locked.exe", 0x14c, 500);
+            fs::set_permissions(dir.join("locked.exe"), fs::Permissions::from_mode(0)).unwrap();
+        }
+        let found = inspect(&lib.known(), &dir).unwrap();
+        let arch: Vec<_> = found.exes.iter().map(|e| e.arch).collect();
         assert_eq!(arch, ["x86", "x64", "x86", "x86", "other", "other"]);
-        assert_eq!(inspect.suggested, Some(2));
-        assert_eq!(inspect.exes[2].codepage, 936);
-        assert_eq!(inspect.in_library, Some(game.id));
+        assert_eq!(found.suggested, Some(2));
+        assert_eq!(found.exes[2].codepage, 936);
+        assert_eq!(found.in_library, Some(game.id));
         fs::remove_file(dir.join("game_chs.EXE")).unwrap();
-        assert!(lib.inspect(&dir).unwrap().suggested.is_none());
-        assert!(lib.scan(dir.clone(), 1).unwrap()[0].setup);
+        assert!(inspect(&lib.known(), &dir).unwrap().suggested.is_none());
+        assert!(scan(&lib.known(), dir.clone(), 1).unwrap()[0].setup);
         fs::remove_dir_all(dir).unwrap();
     }
 }
