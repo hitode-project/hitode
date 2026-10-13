@@ -298,6 +298,9 @@
     flex: 1 1 0;
     min-width: 0;
     overflow: auto;
+    /* Keep the scrollbar's room even when nothing scrolls, so the grid does
+       not change scale between a long list and a short one. */
+    scrollbar-gutter: stable;
     padding: 10px 32px 48px;
   }
   .grid {

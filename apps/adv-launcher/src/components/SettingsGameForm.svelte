@@ -3,90 +3,19 @@
   import Icon from "./Icon.svelte";
   import ManageSaves from "./ManageSaves.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
-  import {
-    GAME_DEFAULTS,
-    codepagePreview,
-    loadGameSetup,
-    pickDiscImage,
-    pickFont,
-    revealFolder,
-    saveGameSetup,
-    type GameValues,
-    type OverrideKey,
-  } from "../lib/fake-settings";
+  import { revealFolder, type OverrideKey } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
-  import { prefs } from "../lib/prefs.svelte";
+  import { GameForm } from "../lib/settings-form.svelte";
   import type { Game } from "../lib/types";
 
   let { game }: { game: Game } = $props();
 
   let saves = $state(false);
 
-  const LETTERS = ["D:", "E:", "F:", "G:"];
-
   // The parent re-creates this form when the game changes.
-  let setup = $state(untrack(() => loadGameSetup(game.id, game.codepage)));
-  $effect(() => saveGameSetup(game.id, $state.snapshot(setup)));
-
-  /** Global values the per-game settings fall back to. */
-  const global = $derived<GameValues>({
-    scale: prefs.scale,
-    filter: prefs.filter,
-    ff: prefs.fastForward,
-    ...GAME_DEFAULTS,
-  });
-
-  function value<K extends OverrideKey>(key: K): GameValues[K] {
-    return setup.overrides[key] ?? global[key];
-  }
-  function overridden(key: OverrideKey): boolean {
-    return value(key) !== global[key];
-  }
-  function pick<K extends OverrideKey>(key: K, v: GameValues[K]): void {
-    if (v === global[key]) delete setup.overrides[key];
-    else setup.overrides[key] = v;
-  }
-  const anyOverridden = $derived((Object.keys(global) as OverrideKey[]).some(overridden));
-
-  const encPreview = $derived(codepagePreview(game.title, setup.nativeCodepage, game.codepage));
-
-  function addDisc(): void {
-    if (setup.discs.length >= LETTERS.length) return;
-    setup.discs.push(pickDiscImage(setup.exe, setup.discs));
-  }
-
-  type FontKey = "gothic" | "mincho";
-  const fonts: { key: FontKey; name: string }[] = [
-    { key: "gothic", name: "ＭＳ ゴシック" },
-    { key: "mincho", name: "ＭＳ 明朝" },
-  ];
-  /** Local or imported fonts picked this session, offered in both menus. */
-  let picked = $state<string[]>([]);
-  const extraFonts = $derived(
-    [...new Set([...picked, ...fonts.map((f) => value(f.key)).filter((v) => v.startsWith("font:")).map((v) => v.slice(5))])],
-  );
-
-  async function changeFont(key: FontKey, select: HTMLSelectElement): Promise<void> {
-    const next = select.value;
-    if (next !== "local" && next !== "import") {
-      pick(key, next);
-      return;
-    }
-    // Keep showing the current choice while the host dialog is open.
-    select.value = value(key);
-    const family = await pickFont(next);
-    if (!family) return;
-    if (!picked.includes(family)) picked.push(family);
-    pick(key, `font:${family}`);
-  }
-
-  function fontFamily(choice: string): string {
-    if (choice === "serif") return 'var(--font-serif-ja)';
-    if (choice.startsWith("font:")) return `"${choice.slice(5)}", var(--font-ja)`;
-    return "var(--font-ja)";
-  }
-
-  const smoothCls = $derived(value("smooth") === "on" ? "sm-on" : value("smooth") === "off" ? "sm-off" : "");
+  const form = new GameForm(untrack(() => game));
+  const setup = $derived(form.setup);
+  const fonts = GameForm.FONTS;
 </script>
 
 <svelte:window
@@ -100,9 +29,9 @@
 
 {#snippet head(key: OverrideKey, label: string, lang?: string)}
   <span class="t">
-    <i class="dot" aria-hidden="true"></i><span {lang}>{label}</span>{#if overridden(key)}<span class="sr">（已单独设置）</span>{/if}
+    <i class="dot" aria-hidden="true"></i><span {lang}>{label}</span>{#if form.overridden(key)}<span class="sr">（已单独设置）</span>{/if}
   </span>
-  <button class="quiet rst" aria-label="{label} 恢复为全局设置" onclick={() => pick(key, global[key])}>恢复</button>
+  <button class="quiet rst" aria-label="{label} 恢复为全局设置" onclick={() => form.reset(key)}>恢复</button>
 {/snippet}
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
@@ -133,10 +62,10 @@
         <div class="row" style="min-height: 64px">
           <span class="t" style="display: flex; flex-direction: column; gap: 3px">
             <span>编码</span>
-            <span class="enc ellipsis" lang={game.codepage === 932 ? "ja" : "zh-CN"}>{encPreview}</span>
+            <span class="enc ellipsis" lang={game.codepage === 932 ? "ja" : "zh-CN"}>{form.encPreview}</span>
           </span>
           <SettingsSeg
-            compact
+            variant="sheet"
             label="编码"
             value={game.codepage === 936 ? "936" : "932"}
             onpick={(v) => (game.codepage = Number(v))}
@@ -152,13 +81,13 @@
         </div>
         {#each setup.discs as disc, i (disc)}
           <div class="row sm">
-            <span class="drv">{LETTERS[i] ?? ""}</span>
+            <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
             <span class="disc ellipsis">{disc}</span>
-            <button class="quiet" aria-label="移除 {disc}" onclick={() => setup.discs.splice(i, 1)}>移除</button>
+            <button class="quiet" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
           </div>
         {/each}
         <div class="row sm">
-          <button class="quiet" style="margin-left: -10px" onclick={addDisc} disabled={setup.discs.length >= LETTERS.length}>
+          <button class="quiet" style="margin-left: -10px" onclick={() => form.addDisc()} disabled={form.discsFull}>
             添加光盘镜像…
           </button>
         </div>
@@ -166,13 +95,13 @@
 
       <section class="sec" aria-labelledby="gs-view">
         <h2 id="gs-view">画面</h2>
-        <div class="row" class:ov={overridden("scale")}>
+        <div class="row" class:ov={form.overridden("scale")}>
           {@render head("scale", "缩放")}
           <SettingsSeg
-            compact
+            variant="sheet"
             label="缩放"
-            value={value("scale")}
-            onpick={(v) => pick("scale", v)}
+            value={form.value("scale")}
+            onpick={(v) => form.pick("scale", v)}
             options={[
               { value: "fit", label: "适应" },
               { value: "int", label: "整数倍" },
@@ -180,13 +109,13 @@
             ]}
           />
         </div>
-        <div class="row" class:ov={overridden("filter")}>
+        <div class="row" class:ov={form.overridden("filter")}>
           {@render head("filter", "过滤")}
           <SettingsSeg
-            compact
+            variant="sheet"
             label="过滤"
-            value={value("filter")}
-            onpick={(v) => pick("filter", v)}
+            value={form.value("filter")}
+            onpick={(v) => form.pick("filter", v)}
             options={[
               { value: "smooth", label: "平滑" },
               { value: "sharp", label: "锐利" },
@@ -198,16 +127,16 @@
       <section class="sec" aria-labelledby="gs-font">
         <h2 id="gs-font">字体</h2>
         {#each fonts as f (f.key)}
-          {@const cur = value(f.key)}
-          <div class="row" class:ov={overridden(f.key)}>
+          {@const cur = form.value(f.key)}
+          <div class="row" class:ov={form.overridden(f.key)}>
             {@render head(f.key, f.name, "ja")}
             <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9.5 4.5L13 8l-3.5 3.5"></path></svg>
             <span class="selw">
-              <select aria-label="{f.name} 的替换字体" onchange={(e) => changeFont(f.key, e.currentTarget)}>
+              <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
                 <option value="auto" selected={cur === "auto"}>自动</option>
                 <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
                 <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
-                {#each extraFonts as name (name)}
+                {#each form.extraFonts as name (name)}
                   <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
                 {/each}
                 <option value="local">本机字体…</option>
@@ -218,22 +147,22 @@
           </div>
         {/each}
         <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
-          <div class="pv {smoothCls}" role="group" aria-label="字体预览">
+          <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
             {#each fonts as f (f.key)}
               <div class="pvr">
                 <span lang="ja" style="font-size: 12px; color: var(--fg3); white-space: nowrap">{f.name}</span>
-                <span class="pvl" lang="ja" style:font-family={fontFamily(value(f.key))}>「……また、夏が来るね」</span>
+                <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
               </div>
             {/each}
           </div>
         </div>
-        <div class="row" class:ov={overridden("smooth")}>
+        <div class="row" class:ov={form.overridden("smooth")}>
           {@render head("smooth", "字形平滑")}
           <SettingsSeg
-            compact
+            variant="sheet"
             label="字形平滑"
-            value={value("smooth")}
-            onpick={(v) => pick("smooth", v)}
+            value={form.value("smooth")}
+            onpick={(v) => form.pick("smooth", v)}
             options={[
               { value: "game", label: "跟随游戏" },
               { value: "on", label: "开" },
@@ -245,13 +174,13 @@
 
       <section class="sec" aria-labelledby="gs-input">
         <h2 id="gs-input">输入</h2>
-        <div class="row" class:ov={overridden("ff")}>
+        <div class="row" class:ov={form.overridden("ff")}>
           {@render head("ff", "快进键")}
           <SettingsSeg
-            compact
+            variant="sheet"
             label="快进键"
-            value={value("ff")}
-            onpick={(v) => pick("ff", v)}
+            value={form.value("ff")}
+            onpick={(v) => form.pick("ff", v)}
             options={[
               { value: "hold", label: "按住" },
               { value: "toggle", label: "切换" },
@@ -279,7 +208,7 @@
     </div>
 
     <div class="foot">
-      <button class="quiet" style="margin-left: -10px" disabled={!anyOverridden} onclick={() => (setup.overrides = {})}>全部恢复默认</button>
+      <button class="quiet" style="margin-left: -10px" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
       <div style="flex: 1"></div>
       <button class="primary" onclick={() => nav.back()}>完成</button>
     </div>

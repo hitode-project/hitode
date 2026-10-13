@@ -1,6 +1,8 @@
 //! The player frontend: a Tauri window whose webview draws the game library
 //! and, while a game runs, a transparent in-game overlay above the native game
 //! view that adv-shell presents into (decision 25).
+#[cfg(desktop)]
+mod menu;
 pub mod overlay;
 
 use serde::Serialize;
@@ -36,20 +38,37 @@ fn post_text(text: String) -> Result<usize, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
-    #[cfg(target_os = "macos")]
+    #[cfg(desktop)]
     let builder = builder
         .setup(|app| {
+            let menu = menu::build(app.handle())?;
+            if cfg!(target_os = "macos") {
+                app.set_menu(menu)?;
+            }
+            #[cfg(target_os = "macos")]
             game::setup(app)?;
             Ok(())
         })
-        .on_window_event(game::window_event)
-        .invoke_handler(tauri::generate_handler![
-            host_info,
-            post_text,
-            start_game,
-            overlay::set_overlay_input
-        ]);
-    #[cfg(not(target_os = "macos"))]
+        .on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()));
+    #[cfg(target_os = "macos")]
+    let builder =
+        builder
+            .on_window_event(game::window_event)
+            .invoke_handler(tauri::generate_handler![
+                host_info,
+                post_text,
+                start_game,
+                overlay::set_overlay_input,
+                menu::set_pause_available
+            ]);
+    #[cfg(all(desktop, not(target_os = "macos")))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        host_info,
+        post_text,
+        overlay::set_overlay_input,
+        menu::set_pause_available
+    ]);
+    #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         host_info,
         post_text,

@@ -40,6 +40,10 @@
 :root[data-accent="graphite"] { --accent: #3f3f44; }
 :root[data-theme="dark"][data-accent="graphite"] { --accent: #dcdcdf; --on-accent: #141415; }
 
+/* Phone safe areas; `?phone` in a desktop browser simulates a notched phone. */
+:root { --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px); --safe-left: env(safe-area-inset-left, 0px); --safe-right: env(safe-area-inset-right, 0px); }
+:root[data-simulated] { --safe-top: 44px; --safe-bottom: 34px; }
+
 html, body { margin: 0; height: 100%; }
 body {
   font-family: var(--font-ui);

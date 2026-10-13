@@ -28,8 +28,25 @@ class Library {
     return this.filtered(filter, "").length;
   }
 
+  #removed: { game: Game; index: number } | null = null;
+
+  /** Removes a game from the library (its files stay); the last removal can be undone. */
   remove(id: string): void {
+    const index = this.games.findIndex((g) => g.id === id);
+    const game = this.games[index];
+    if (!game) return;
+    this.#removed = { game, index };
     this.games = this.games.filter((g) => g.id !== id);
+  }
+
+  /** Puts the last removed game back where it was. */
+  undoRemove(): void {
+    const removed = this.#removed;
+    if (!removed) return;
+    this.#removed = null;
+    const games = [...this.games];
+    games.splice(Math.min(removed.index, games.length), 0, removed.game);
+    this.games = games;
   }
 
   /** Pretends the user pointed a missing game at its new folder. */

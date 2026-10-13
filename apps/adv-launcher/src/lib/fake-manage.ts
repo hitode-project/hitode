@@ -34,6 +34,11 @@ export function backupNow(index: number): Backup {
   return { id: `n${index}`, when: "刚刚", kind: "手动", size: "1.2 MB" };
 }
 
+/** The backups after 立即备份: the new one first, an earlier "刚刚" one aged. */
+export function withNewBackup(backups: Backup[], index: number): Backup[] {
+  return [backupNow(index), ...backups.map((b) => (b.when === "刚刚" ? { ...b, when: "1 分钟前" } : b))];
+}
+
 /** Pretends to restore a backup over the current saves. */
 export function restoreBackup(game: Game, backup: Backup): void {
   void game;

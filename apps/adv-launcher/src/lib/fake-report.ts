@@ -6,7 +6,7 @@ import type { Game } from "./types";
 // Fake report context and host actions until the launcher reads them from the
 // Rust side (adv-report) and submits through it.
 
-/** The failure the fake launch shows for the game that fails (see Launch.svelte). */
+/** The failure the fake launch shows for the game that fails (see launch.svelte.ts). */
 export const FAKE_FAILURE_LABEL = "未实现 · Direct3D 9 体积纹理";
 const FAKE_FAILURE: Omit<ReportFailure, "after"> = {
   kind: "api",
@@ -46,20 +46,35 @@ function sizeLabel(bytes: number): string {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
-export function fakeReportContext(game: Game): ReportContext {
+/** The fake host platform: a Windows PC, or an Android phone for the phone layout. */
+const PLATFORMS = {
+  desktop: {
+    platform: { os: "windows", os_major: "11", arch: "x86_64", cpu_engine: "x64", graphics: "gpu" },
+    label: "Windows 11 · x64",
+    build: "adv-host 0.4.2 · Windows 11 x64",
+  },
+  phone: {
+    platform: { os: "android", os_major: "15", arch: "aarch64", cpu_engine: "a64", graphics: "gpu" },
+    label: "Android 15 · arm64",
+    build: "adv-host 0.4.2 · Android 15 · arm64",
+  },
+} satisfies Record<string, { platform: ReportBase["platform"]; label: string; build: string }>;
+
+export function fakeReportContext(game: Game, phone = false): ReportContext {
   const sha = fakeSha(game.id);
   const size = game.id === "g1" ? 1887437 : 600000 + (hash(game.id, 99) % 3000000);
+  const host = phone ? PLATFORMS.phone : PLATFORMS.desktop;
   return {
     base: {
       dedupe_key: "q3V9sJk2" + hash(game.id, 7).toString(36).padStart(7, "0"),
       app: { version: "0.4.2", build: "a1b2c3d", channel: "preview" },
-      platform: { os: "windows", os_major: "11", arch: "x86_64", cpu_engine: "x64", graphics: "gpu" },
+      platform: host.platform,
       game: { exe_sha256: sha, exe_size: size, codepage: game.codepage },
     },
-    build: "adv-host 0.4.2 · Windows 11 x64",
+    build: host.build,
     exeLabel: `sha256 ${sha.slice(0, 4)}…${sha.slice(-4)} · ${sizeLabel(size)}`,
     versionLabel: "0.4.2 (a1b2c3d)",
-    platformLabel: "Windows 11 · x64",
+    platformLabel: host.label,
     codepageLabel: `${game.codepage} ${codepageLabel(game.codepage)}`,
     failureLabel: FAKE_FAILURE_LABEL,
     failure: FAKE_FAILURE,

@@ -1,97 +1,19 @@
 <script lang="ts">
   import ReportBackdrop from "../components/ReportBackdrop.svelte";
   import ReportResult from "../components/ReportResult.svelte";
-  import { fakeReportContext, revealFile, saveReportFile, submitReport } from "../lib/fake-report";
+  import { fakeReportContext, revealFile } from "../lib/fake-report";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
-  import { buildReport, PERF_ISSUES, type PerfIssue, type Situation } from "../lib/report";
+  import { PERF_ISSUES } from "../lib/report";
+  import { ISSUE_LABELS, ReportForm, SITUATIONS } from "../lib/report-form.svelte";
 
   let { gameId }: { gameId: string } = $props();
 
-  type View = "form" | "sending" | "sent" | "error" | "saved";
-  /** Rows the user may leave out of the report. */
-  type Optional = "failure" | "perf" | "note";
-
-  const SITUATIONS: [Situation, string][] = [
-    ["fail", "无法启动"],
-    ["crash", "中途出错"],
-    ["perf", "能玩，但有性能问题"],
-    ["ok", "能正常玩"],
-  ];
-  const ISSUE_LABELS: Record<PerfIssue, string> = {
-    stutter: "卡顿",
-    fast_forward: "快进时卡",
-    first_launch: "首次启动慢",
-    loading: "加载慢",
-    audio_dropout: "声音断续",
-    input_latency: "输入延迟",
-  };
-
   const game = $derived(library.get(gameId));
   const ctx = $derived(game ? fakeReportContext(game) : null);
-
-  let view = $state<View>("form");
-  let situation = $state<Situation>("fail");
-  let issues = $state<Record<string, boolean>>({});
-  let note = $state("");
-  let off = $state<Record<Optional, boolean>>({ failure: false, perf: false, note: false });
-  let rawOpen = $state(false);
-  let savedPath = $state("");
-
-  const isPerf = $derived(situation === "perf");
-  const hasFail = $derived(situation === "fail" || situation === "crash");
-  const trimmed = $derived(note.trim());
-  const sending = $derived(view === "sending");
-
-  interface Row {
-    id: string;
-    label: string;
-    value: string;
-    txt?: boolean;
-    locked: boolean;
-    optional?: Optional;
-  }
-
-  const rows = $derived.by((): Row[] => {
-    if (!ctx) return [];
-    const list: Row[] = [
-      { id: "exe", label: "程序指纹", value: ctx.exeLabel, locked: true },
-      { id: "ver", label: "版本", value: ctx.versionLabel, locked: true },
-      { id: "plat", label: "平台", value: ctx.platformLabel, locked: true },
-      { id: "cp", label: "编码", value: ctx.codepageLabel, locked: true },
-    ];
-    // A launch failure is the point of the report, so it cannot be left out.
-    if (hasFail) list.push({ id: "fail", label: "失败信息", value: ctx.failureLabel, locked: situation === "fail", optional: "failure" });
-    if (isPerf) list.push({ id: "perf", label: "性能", value: ctx.perfLabel, locked: false, optional: "perf" });
-    if (trimmed) list.push({ id: "note", label: "备注", value: trimmed, txt: true, locked: false, optional: "note" });
-    return list;
-  });
-
-  const report = $derived.by(() => {
-    if (!ctx) return null;
-    const keepFailure = hasFail && (situation === "fail" || !off.failure);
-    return buildReport(ctx.base, {
-      situation,
-      perfIssues: PERF_ISSUES.filter((k) => issues[k]),
-      note: trimmed && !off.note ? trimmed : null,
-      failure: keepFailure ? { ...ctx.failure, after: situation === "fail" ? "lt_1m" : "1m_10m" } : null,
-      perf: isPerf && !off.perf ? ctx.perf : null,
-    });
-  });
-  const raw = $derived(report ? JSON.stringify(report, null, 2) : "");
-
-  async function submit() {
-    if (!report || sending) return;
-    view = "sending";
-    view = await submitReport(report);
-  }
-
-  async function save() {
-    if (!report || sending) return;
-    savedPath = await saveReportFile(report);
-    view = "saved";
-  }
+  const form = new ReportForm(() => ctx);
+  const sending = $derived(form.sending);
 
   function close() {
     if (!sending) nav.back();
@@ -100,7 +22,7 @@
   // Move focus into each result dialog as it appears.
   let stage = $state<HTMLElement>();
   $effect(() => {
-    if (view === "form" || view === "sending") return;
+    if (form.view === "form" || form.view === "sending") return;
     stage?.querySelector<HTMLElement>("[data-autofocus]")?.focus();
   });
 </script>
@@ -108,7 +30,7 @@
 <svelte:window
   onkeydown={(e) => {
     if (e.key !== "Escape") return;
-    if (view === "error") view = "form";
+    if (form.view === "error") form.view = "form";
     else close();
   }}
 />
@@ -124,7 +46,7 @@
         {/snippet}
         <div class="acts"><button class="primary big" onclick={() => nav.home()}>返回</button></div>
       </ReportResult>
-    {:else if view === "form" || view === "sending"}
+    {:else if form.view === "form" || form.view === "sending"}
       <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="rp-title" aria-busy={sending}>
         <header class="head">
           <div class="who">
@@ -149,17 +71,17 @@
             <p class="lbl" id="rp-sit">情况</p>
             <div class="tiles" role="radiogroup" aria-labelledby="rp-sit">
               {#each SITUATIONS as [key, label] (key)}
-                <label class="tile" class:on={situation === key}>
-                  <input type="radio" name="sit" value={key} bind:group={situation} />
+                <label class="tile" class:on={form.situation === key}>
+                  <input type="radio" name="sit" value={key} bind:group={form.situation} />
                   <span>{label}</span>
                 </label>
               {/each}
             </div>
-            {#if isPerf}
+            {#if form.isPerf}
               <div class="chips fade" role="group" aria-label="性能问题">
                 {#each PERF_ISSUES as key (key)}
-                  <button class="chip" class:on={issues[key]} aria-pressed={issues[key] ?? false} onclick={() => (issues[key] = !issues[key])}>
-                    {#if issues[key]}
+                  <button class="chip" class:on={form.issues[key]} aria-pressed={form.issues[key] ?? false} onclick={() => form.toggleIssue(key)}>
+                    {#if form.issues[key]}
                       <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>
                     {/if}
                     <span>{ISSUE_LABELS[key]}</span>
@@ -170,16 +92,15 @@
           </div>
 
           <div>
-            <textarea class="note" rows="2" aria-label="补充说明（可选）" placeholder="补充说明（可选）" bind:value={note}></textarea>
+            <textarea class="note" rows="2" aria-label="补充说明（可选）" placeholder="补充说明（可选）" bind:value={form.note}></textarea>
             <div class="ttl">30 天后删除</div>
           </div>
 
           <div>
             <p class="lbl">将发送的内容</p>
             <div class="list">
-              {#each rows as r (r.id)}
-                {@const removed = !r.locked && r.optional !== undefined && off[r.optional]}
-                <div class="rw" class:off={removed}>
+              {#each form.rows as r (r.id)}
+                <div class="rw" class:off={r.removed}>
                   <span class="k">{r.label}</span>
                   <span class="v" class:mono={!r.txt} class:txt={r.txt} title={r.value}>{r.value}</span>
                   {#if r.locked}
@@ -188,10 +109,10 @@
                     </span>
                   {:else if r.optional}
                     {@const key = r.optional}
-                    {#if removed}
-                      <button class="addback" aria-label="加回{r.label}" onclick={() => (off[key] = false)}>加回</button>
+                    {#if r.removed}
+                      <button class="addback" aria-label="加回{r.label}" onclick={() => (form.off[key] = false)}>加回</button>
                     {:else}
-                      <button class="act" aria-label="不发送{r.label}" onclick={() => (off[key] = true)}>
+                      <button class="act" aria-label="不发送{r.label}" onclick={() => (form.off[key] = true)}>
                         <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"></path></svg>
                       </button>
                     {/if}
@@ -201,20 +122,20 @@
             </div>
             <div class="foot-note">
               <span>不含文件路径、用户名、截图和存档</span>
-              <button class="rawbtn" class:open={rawOpen} aria-expanded={rawOpen} aria-controls="rp-raw" onclick={() => (rawOpen = !rawOpen)}>
+              <button class="rawbtn" class:open={form.rawOpen} aria-expanded={form.rawOpen} aria-controls="rp-raw" onclick={() => (form.rawOpen = !form.rawOpen)}>
                 <span>查看原始数据</span>
                 <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"></path></svg>
               </button>
             </div>
-            {#if rawOpen}
-              <pre id="rp-raw" class="raw mono fade scroll" aria-label="原始数据">{raw}</pre>
+            {#if form.rawOpen}
+              <pre id="rp-raw" class="raw mono fade scroll" aria-label="原始数据">{form.raw}</pre>
             {/if}
           </div>
         </div>
 
         <footer class="foot">
-          <button class="secondary big" onclick={save} disabled={sending}>保存为文件</button>
-          <button class="primary big" onclick={submit} disabled={sending} style="min-width: 116px">
+          <button class="secondary big" onclick={() => form.save()} disabled={sending}>保存为文件</button>
+          <button class="primary big" onclick={() => form.submit()} disabled={sending} style="min-width: 116px">
             {#if sending}
               <span class="spin" aria-hidden="true"></span><span>正在提交</span>
             {:else}
@@ -223,7 +144,7 @@
           </button>
         </footer>
       </div>
-    {:else if view === "sent"}
+    {:else if form.view === "sent"}
       <ReportResult id="rp-sent" title="已提交" ok>
         {#snippet badge()}
           <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>
@@ -231,14 +152,14 @@
         <p class="sub">可在 设置 › 反馈与隐私 中撤回</p>
         <div class="acts"><button class="primary big" data-autofocus onclick={() => nav.back()} style="min-width: 116px">完成</button></div>
       </ReportResult>
-    {:else if view === "error"}
-      <ReportResult id="rp-err" title="没有连上服务器" onclose={() => (view = "form")}>
+    {:else if form.view === "error"}
+      <ReportResult id="rp-err" title="没有连上服务器" onclose={() => (form.view = "form")}>
         {#snippet badge()}
           <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5a8 8 0 0 1 11 0M4.6 8.8a5 5 0 0 1 6.8 0M7 11.2a1.6 1.6 0 0 1 2 0"></path><path d="M2.5 2.5l11 11"></path></svg>
         {/snippet}
         <div class="acts">
-          <button class="secondary big" onclick={save}>保存为文件</button>
-          <button class="primary big" data-autofocus onclick={submit} style="min-width: 96px">重试</button>
+          <button class="secondary big" onclick={() => form.save()}>保存为文件</button>
+          <button class="primary big" data-autofocus onclick={() => form.submit()} style="min-width: 96px">重试</button>
         </div>
       </ReportResult>
     {:else}
@@ -246,9 +167,9 @@
         {#snippet badge()}
           <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7"></path><path d="M3 12.5h10"></path></svg>
         {/snippet}
-        <div class="path mono">{savedPath}</div>
+        <div class="path mono">{form.savedPath}</div>
         <div class="acts">
-          <button class="reveal" onclick={() => revealFile(savedPath)}>在文件夹中显示</button>
+          <button class="reveal" onclick={() => revealFile(form.savedPath)}>在文件夹中显示</button>
           <button class="primary big" data-autofocus onclick={() => nav.back()} style="min-width: 96px">完成</button>
         </div>
       </ReportResult>
