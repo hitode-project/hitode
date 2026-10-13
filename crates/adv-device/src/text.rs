@@ -804,17 +804,7 @@ impl Text {
         &mut self,
         request: &FontRequest,
     ) -> Result<(TextMetrics, [u16; 4]), TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.unicode_metrics()
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = request;
-            Err(TextError::Font(
-                "Unicode character metrics are not exposed by the portable font backend".into(),
-            ))
-        }
+        self.font(request)?.unicode_metrics()
     }
     /// Measure the entire run with the same owned font used for glyph requests.
     /// Individual glyph advances are insufficient for a shaped or kerned run.

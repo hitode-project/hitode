@@ -917,6 +917,40 @@ impl Font {
     pub(super) fn metrics(&self) -> TextMetrics {
         self.metrics.clone()
     }
+    /// GetTextMetricsW's UTF-16 first, last, default and break characters of
+    /// the primary face, by the rules native GDI shows (recorded in Wine's
+    /// gdi32 font tests). First and last span the Unicode cmap below U+FFFF;
+    /// break follows OS/2 usFirstCharIndex and default is the code before it.
+    /// Symbol cmaps report the F000 private-use page.
+    pub(super) fn unicode_metrics(&self) -> Result<(TextMetrics, [u16; 4]), TextError> {
+        let font = self.primary.font()?;
+        let charmap = font.charmap();
+        let mut codes = charmap
+            .mappings()
+            .map(|(code, _)| code)
+            .filter(|&code| code <= 0xfffe);
+        let first = codes
+            .next()
+            .ok_or_else(|| TextError::Font("font has no Unicode character map".into()))?;
+        let last = codes.last().unwrap_or(first);
+        let characters = if charmap.is_symbol() || (0xf000..0xf100).contains(&first) {
+            [0, 0xf0ff, 0x1f, 0x20]
+        } else {
+            let os2_first = font.os2().map_or(0x20, |os2| os2.us_first_char_index());
+            let break_character = match os2_first {
+                0 | 1 => os2_first + 2,
+                0x100.. => 0x20,
+                code => code,
+            };
+            [
+                first as u16,
+                last as u16,
+                break_character - 1,
+                break_character,
+            ]
+        };
+        Ok((self.metrics(), characters))
+    }
     /// GDI's outline metrics of the primary face: typographic values from
     /// OS/2, Mac values from hhea, the box and minimum size from head and
     /// the underline and italic angle from post, scaled to this font's em

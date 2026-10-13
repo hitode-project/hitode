@@ -159,6 +159,28 @@ fn loaded() -> (Text, FontRequest) {
 }
 
 #[test]
+// spec: WIN32-GDI-12
+fn wide_metric_characters_follow_the_cmap_and_os2_first_character() {
+    // The fixture maps U+0020 and U+0041..U+0042; OS/2 usFirstCharIndex
+    // (offset 464) is 0x20. Native GDI takes break from that index, with
+    // 0 and 1 shifted by two and values above 0xFF replaced by space.
+    for (os2_first, characters) in [
+        (0x20u16, [0x20, 0x42, 0x1f, 0x20]),
+        (0x01, [0x20, 0x42, 0x02, 0x03]),
+        (0x3000, [0x20, 0x42, 0x1f, 0x20]),
+    ] {
+        let mut bytes = SINGLE.to_vec();
+        bytes[464..466].copy_from_slice(&os2_first.to_be_bytes());
+        let mut text = Text::with_font_directories(&[]);
+        text.add_resource(&bytes).unwrap();
+        let request = font("ADV Resource Fixture");
+        let (metrics, wide) = text.unicode_metrics(&request).unwrap();
+        assert_eq!(wide, characters, "usFirstCharIndex {os2_first:#x}");
+        assert_eq!(metrics.height, text.metrics(&request).unwrap().height);
+    }
+}
+
+#[test]
 fn outline_metrics_scale_the_design_tables_to_the_selected_em() {
     let (mut text, mut font) = loaded();
     // The fixture: 1000 units per em, typographic and hhea 800/-200, box
