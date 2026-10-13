@@ -62,7 +62,7 @@ impl Loaded {
                 let length = std::fs::metadata(&path)
                     .map_err(|error| format!("{}: {error}", path.display()))?
                     .len();
-                if length > MAX_FONT_RESOURCE_BYTES as u64 {
+                if length > MAX_SYSTEM_FONT_BYTES as u64 {
                     return Err(format!(
                         "font profile file exceeds data limit: {}",
                         path.display()
@@ -71,7 +71,7 @@ impl Loaded {
                 let data =
                     std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                 total_bytes = total_bytes.saturating_add(data.len());
-                if data.len() > MAX_FONT_RESOURCE_BYTES || total_bytes > 128 * 1024 * 1024 {
+                if data.len() > MAX_SYSTEM_FONT_BYTES || total_bytes > 128 * 1024 * 1024 {
                     return Err("font profile data budget exceeded".into());
                 }
                 let digest = hash(&data);
