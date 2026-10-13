@@ -188,6 +188,11 @@ impl Session {
     pub fn sleep(&self, sleeping: bool) {
         self.driver.view.hub().sleep(sleeping);
     }
+    /// Pause or resume the game, as the launcher's pause menu does. A close
+    /// request resumes it so the guest can answer.
+    pub fn set_paused(&self, paused: bool) {
+        self.driver.view.hub().pause(paused);
+    }
     pub fn request_close(&self) {
         self.driver.view.hub().request_close();
     }

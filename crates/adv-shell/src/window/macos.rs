@@ -167,6 +167,9 @@ impl Hub {
         self.push(Event::AudioSuspended(sleeping));
         self.push(Event::Repaint);
     }
+    pub(crate) fn pause(&self, paused: bool) {
+        self.push(Event::Paused(paused));
+    }
     pub(crate) fn request_close(&self) {
         self.close_requested.set(true);
         self.push(Event::Close);

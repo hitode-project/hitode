@@ -25,6 +25,10 @@ pub enum Event {
     FocusLost,
     #[cfg(target_os = "macos")]
     AudioSuspended(bool),
+    /// The launcher paused the game: no guest execution, frozen guest time
+    /// and suspended audio until it resumes.
+    #[cfg(target_os = "macos")]
+    Paused(bool),
     Repaint,
 }
 pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;

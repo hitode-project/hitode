@@ -38,7 +38,7 @@ export interface RunSummary {
 }
 export type GameFinished =
   | { gameId: string; exitCode: number; summary: RunSummary }
-  | { gameId: string; error: string };
+  | { gameId: string; error: string; summary: RunSummary };
 
 export function libraryPickFolder(): Promise<string | null> {
   return call("library_pick_folder", {}, null);
@@ -66,4 +66,8 @@ export function libraryRestore(game: LibraryGame, index: number): Promise<void> 
 }
 export function startGame(id: string): Promise<void> {
   return call("start_game", { id }, undefined);
+}
+/** Pause or resume the running game, e.g. while the pause menu or report page is open. */
+export function pauseGame(paused: boolean): Promise<void> {
+  return call("pause_game", { paused }, undefined);
 }

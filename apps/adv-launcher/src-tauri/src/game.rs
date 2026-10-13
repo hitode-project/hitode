@@ -240,6 +240,8 @@ enum Finished {
         #[serde(rename = "gameId")]
         game_id: String,
         error: String,
+        /// The failure kind and time bucket; never the error text.
+        summary: adv_report::RunSummary,
     },
 }
 
@@ -292,7 +294,11 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
                                 exit_code: finished.exit_code,
                                 summary: finished.summary,
                             },
-                            Err(error) => Finished::Error { game_id: id, error },
+                            Err(error) => Finished::Error {
+                                game_id: id,
+                                summary: adv_shell::error_summary(&error, started_at.elapsed()),
+                                error,
+                            },
                         };
                         let _ = finished_window.emit("game_finished", payload);
                         if let Some(code) = exit {
@@ -359,6 +365,29 @@ pub async fn post_text(window: WebviewWindow, text: String) -> Result<usize, Str
                     .ok_or_else(|| "no game is running".to_string())
             });
             let _ = reply.send(posted);
+        })
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        result.recv().map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Pause or resume the running game while the overlay's pause menu or report
+/// page is open.
+#[tauri::command]
+pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), String> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let done = HOST.with_borrow(|host| {
+                host.as_ref()
+                    .and_then(|host| host.session.as_ref())
+                    .map(|session| session.set_paused(paused))
+                    .ok_or_else(|| "no game is running".to_string())
+            });
+            let _ = reply.send(done);
         })
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {

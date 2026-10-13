@@ -890,6 +890,15 @@ fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
     }
 }
 
+/// The report summary of a run that ended with a host-side error after
+/// `elapsed`, classified like a guest failure; no frame timing is kept.
+pub fn error_summary(error: &str, elapsed: Duration) -> adv_report::RunSummary {
+    adv_report::RunSummary {
+        failure: report_failure(Some(error), None, None, elapsed),
+        perf: None,
+    }
+}
+
 /// How a run failed, for an anonymous report. `message` is the guest
 /// failure, `fault` the latest CPU fault as `cpu_fault` formats it.
 fn report_failure(
@@ -1194,6 +1203,13 @@ fn report_failures_are_classified_without_host_text() {
     // Other messages may name host paths; only the kind is kept.
     let runtime =
         report_failure(Some("open save/data.bin: denied"), None, fault(), minute).unwrap();
+    // spec: REPORT-FAIL-3
+    let ended = error_summary("UI stopped while the guest was running", minute);
+    assert_eq!(ended.perf, None);
+    assert_eq!(
+        ended.failure.map(|f| (f.kind, f.after)),
+        Some((FailureKind::Runtime, FailureAfter::Minutes))
+    );
     assert_eq!(
         (runtime.kind, runtime.api, runtime.cpu_fault),
         (FailureKind::Runtime, None, None)
@@ -1211,6 +1227,38 @@ fn native_cache_is_default_and_has_one_diagnostic_bypass() {
     };
     assert!(!parse(&["fixture.exe"]).no_code_cache);
     assert!(parse(&["fixture.exe", "--no-code-cache"]).no_code_cache);
+}
+
+/// Host reasons the game is not playing. System sleep only silences the
+/// output; a launcher pause also stops guest execution and guest time.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Suspension {
+    sleeping: bool,
+    paused: bool,
+}
+#[cfg(target_os = "macos")]
+impl Suspension {
+    fn set(
+        &mut self,
+        runtime: &mut Runtime,
+        audio: &mut audio::AudioOutput,
+        sleeping: Option<bool>,
+        paused: Option<bool>,
+    ) {
+        let was_paused = self.paused;
+        self.sleeping = sleeping.unwrap_or(self.sleeping);
+        self.paused = paused.unwrap_or(self.paused);
+        // Runtime::set_suspended requires the device callback stopped first
+        // and reopened only after resuming.
+        if self.paused && !was_paused {
+            audio.set_suspended(true);
+            runtime.set_suspended(true);
+        } else if !self.paused && was_paused {
+            runtime.set_suspended(false);
+        }
+        audio.set_suspended(self.sleeping || self.paused);
+    }
 }
 
 fn run_execution(
@@ -1379,6 +1427,8 @@ fn run_execution(
         runtime.set_gpu_background(gpu_background, wake.clone());
     }
     let mut audio = audio::AudioOutput::new(options.audio, options.headless, &runtime);
+    #[cfg(target_os = "macos")]
+    let mut suspension = Suspension::default();
     let mut control = options
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
@@ -1420,12 +1470,20 @@ fn run_execution(
                         let _ = reply.send(posted);
                     }
                     window::Event::Close => {
+                        #[cfg(target_os = "macos")]
+                        suspension.set(&mut runtime, &mut audio, None, Some(false));
                         runtime.post_input(0x10, 0, 0);
                         #[cfg(not(target_os = "macos"))]
                         close_at.get_or_insert_with(Instant::now);
                     }
                     #[cfg(target_os = "macos")]
-                    window::Event::AudioSuspended(suspended) => audio.set_suspended(suspended),
+                    window::Event::AudioSuspended(sleeping) => {
+                        suspension.set(&mut runtime, &mut audio, Some(sleeping), None)
+                    }
+                    #[cfg(target_os = "macos")]
+                    window::Event::Paused(paused) => {
+                        suspension.set(&mut runtime, &mut audio, None, Some(paused))
+                    }
                     #[cfg(target_os = "macos")]
                     window::Event::ForceClose => unreachable!("force close is consumed by the UI"),
                     window::Event::Repaint => {}
@@ -1796,6 +1854,14 @@ fn run_execution(
         if close_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(2)) {
             stop_reason = "host_window_closed";
             break;
+        }
+        #[cfg(target_os = "macos")]
+        if suspension.paused {
+            // Input stays queued; only a resume, close or diagnostic command wakes this.
+            if !control.as_ref().is_some_and(control::Control::has_pending) {
+                wake.wait(None).map_err(|e| e.to_string())?;
+            }
+            continue;
         }
         if scene_gate.frozen() {
             // Input is queued while frozen. Diagnostics share the same retained

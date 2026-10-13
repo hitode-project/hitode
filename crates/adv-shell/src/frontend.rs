@@ -217,7 +217,9 @@ impl Ui {
                     continue;
                 }
                 #[cfg(target_os = "macos")]
-                window::Event::AudioSuspended(_) | window::Event::Text(..) => {}
+                window::Event::AudioSuspended(_)
+                | window::Event::Paused(_)
+                | window::Event::Text(..) => {}
                 #[cfg(target_os = "macos")]
                 window::Event::ForceClose => {
                     self.stopped.store(true, Ordering::Release);

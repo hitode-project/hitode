@@ -66,6 +66,7 @@ pub fn run() {
                 host_info,
                 post_text,
                 start_game,
+                game::pause_game,
                 overlay::set_overlay_input,
                 report::report_base,
                 report::save_report,
