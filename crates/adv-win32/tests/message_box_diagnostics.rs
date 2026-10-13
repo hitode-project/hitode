@@ -186,6 +186,25 @@ fn message_box_records_guest_codepage_quotes_newlines_and_unchanged_defaults() {
 }
 
 #[test]
+// spec: WIN32-USER-15
+fn message_box_shows_text_a_patch_left_in_the_other_dbcs_encoding() {
+    let mut machine = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), 932);
+    let (text, caption) = ("确定要结束游戏吗？", "结束游戏");
+    let gbk = adv_os::nls::Codec::new(936);
+    for (address, value) in [(TEXT, text), (CAPTION, caption)] {
+        let bytes = [gbk.encode(value), vec![0]].concat();
+        machine.cpu.write(address, &bytes).unwrap();
+    }
+    let mut code = Asm::new(CODE);
+    call(&mut machine, &mut code, TEXT, CAPTION, 0, 0);
+    run(&mut machine, code);
+    let diagnostics = machine.ext.get::<ApiDiagnostics>();
+    let record = diagnostics.message_boxes.back().unwrap();
+    assert_eq!(record.caption, caption);
+    assert_eq!(record.text, text);
+}
+
+#[test]
 fn message_box_preserves_null_and_unreadable_string_fallbacks() {
     let mut machine = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), 932);
     let mut code = Asm::new(CODE);

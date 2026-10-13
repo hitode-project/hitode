@@ -96,8 +96,8 @@ fn message_box_a_named(env: &mut Env<'_>, api: &str) -> Outcome {
     let (text, caption, ty) = (env.arg(1), env.arg(2), env.arg(3));
     let c = env.ext.get::<Win32>().codec;
     let (t, cap) = (
-        c.decode(&cstr(env.cpu, text)),
-        c.decode(&cstr(env.cpu, caption)),
+        c.decode_for_display(&cstr(env.cpu, text)),
+        c.decode_for_display(&cstr(env.cpu, caption)),
     );
     message_box(env, t, cap, ty, api)
 }

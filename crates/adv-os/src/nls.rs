@@ -3,6 +3,8 @@
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
 
 mod case_table;
+mod evidence;
+pub use evidence::{TextScore, text_score};
 
 pub const CP_ACP: u32 = 0;
 pub const CP_OEMCP: u32 = 1;
@@ -120,6 +122,23 @@ impl Codec {
     /// Guest ANSI bytes (ACP) to a Rust string, for paths and logs.
     pub fn decode(&self, bytes: &[u8]) -> String {
         String::from_utf16_lossy(&self.to_utf16(CP_ACP, bytes))
+    }
+
+    /// Guest ANSI bytes the host only displays. A translation patch can leave
+    /// a string in the other DBCS encoding: when the ACP reading is not
+    /// ordinary text and the 932/936 counterpart is, show the counterpart.
+    pub fn decode_for_display(&self, bytes: &[u8]) -> String {
+        let other = match self.acp {
+            932 => 936,
+            936 => 932,
+            _ => return self.decode(bytes),
+        };
+        let is_text = |codepage| text_score(codepage, bytes).is_some_and(|s| s.is_text(2));
+        if !is_text(self.acp) && is_text(other) {
+            String::from_utf16_lossy(&self.to_utf16(other, bytes))
+        } else {
+            self.decode(bytes)
+        }
     }
 
     /// Rust string to guest ANSI bytes (ACP).
@@ -308,6 +327,30 @@ mod tests {
         }
         assert_eq!(gbk.to_utf16_checked(CP_ACP, b"\x82"), (vec![0x3f], true));
         assert_eq!(gbk.to_utf16_checked(CP_ACP, b"?"), (vec![0x3f], false));
+    }
+
+    #[test]
+    // spec: WIN32-USER-15
+    fn displayed_text_falls_back_to_the_other_dbcs_encoding() {
+        let japanese = "タイトル画面に戻る(&T)";
+        let chinese = "确定要结束游戏吗？";
+        for acp in [932, 936] {
+            let codec = Codec::new(acp);
+            for text in [japanese, chinese, "Quit?"] {
+                let bytes = if text == japanese {
+                    Codec::new(932).encode(text)
+                } else {
+                    Codec::new(936).encode(text)
+                };
+                assert_eq!(codec.decode_for_display(&bytes), text, "{acp} {text}");
+            }
+        }
+        // Text that reads as neither keeps the ACP reading.
+        let sjis = Codec::new(932);
+        assert_eq!(
+            sjis.decode_for_display(b"\xb1\xb2"),
+            sjis.decode(b"\xb1\xb2")
+        );
     }
 
     #[test]

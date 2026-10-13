@@ -2,6 +2,7 @@
 //! recognized by a name marker such as `_chs`, or by non-executable sections
 //! holding clearly more GB2312 text than Shift_JIS text. Everything else runs
 //! as Japanese. Text that lives only in archives is not visible here.
+use adv_os::nls;
 use std::collections::BTreeSet;
 
 const JAPANESE: u32 = 932;
@@ -53,13 +54,12 @@ fn text_evidence(image: &[u8]) -> (usize, usize) {
             {
                 continue;
             }
-            for (classify, found) in [
-                (shift_jis as fn(&[u8]) -> Option<Score>, &mut japanese),
-                (gbk, &mut chinese),
+            for (codepage, found) in [
+                (JAPANESE, &mut japanese),
+                (SIMPLIFIED_CHINESE, &mut chinese),
             ] {
-                if let Some(score) = classify(text)
-                    && score.common.len() >= 3
-                    && score.common.len() >= 4 * score.rare
+                if let Some(score) = nls::text_score(codepage, text)
+                    && score.is_text(3)
                 {
                     found.extend(score.common);
                 }
@@ -67,81 +67,6 @@ fn text_evidence(image: &[u8]) -> (usize, usize) {
         }
     }
     (japanese.len(), chinese.len())
-}
-
-struct Score {
-    common: BTreeSet<[u8; 2]>,
-    /// Characters the other encoding's text produces when misread as this one.
-    rare: usize,
-}
-
-/// Kana, punctuation and JIS level 1 kanji are common; half-width katakana and
-/// user-defined characters are rare. Invalid sequences reject the string.
-fn shift_jis(text: &[u8]) -> Option<Score> {
-    let mut score = Score {
-        common: BTreeSet::new(),
-        rare: 0,
-    };
-    let mut at = 0;
-    while let Some(&lead) = text.get(at) {
-        if lead < 0x80 {
-            at += 1;
-            continue;
-        }
-        if (0xa1..=0xdf).contains(&lead) {
-            score.rare += 1;
-            at += 1;
-            continue;
-        }
-        let trail = *text.get(at + 1)?;
-        if !matches!(lead, 0x81..=0x9f | 0xe0..=0xfc) || !matches!(trail, 0x40..=0x7e | 0x80..=0xfc)
-        {
-            return None;
-        }
-        let common = match lead {
-            0x81 => trail <= 0xac,
-            0x82 => (0x4f..=0xf1).contains(&trail),
-            0x83 => trail <= 0x96,
-            0x88 => trail >= 0x9f,
-            0x89..=0x97 => true,
-            0x98 => trail <= 0x72,
-            _ => false,
-        };
-        if common {
-            score.common.insert([lead, trail]);
-        } else if (0xf0..=0xf9).contains(&lead) {
-            score.rare += 1;
-        }
-        at += 2;
-    }
-    Some(score)
-}
-
-/// GB2312 punctuation, full-width ASCII and level 1 hanzi are common; the GBK
-/// extension areas and user-defined rows are rare.
-fn gbk(text: &[u8]) -> Option<Score> {
-    let mut score = Score {
-        common: BTreeSet::new(),
-        rare: 0,
-    };
-    let mut at = 0;
-    while let Some(&lead) = text.get(at) {
-        if lead < 0x80 {
-            at += 1;
-            continue;
-        }
-        let trail = *text.get(at + 1)?;
-        if !(0x81..=0xfe).contains(&lead) || !(0x40..=0xfe).contains(&trail) || trail == 0x7f {
-            return None;
-        }
-        if trail >= 0xa1 && matches!(lead, 0xa1 | 0xa3 | 0xb0..=0xd7) {
-            score.common.insert([lead, trail]);
-        } else if lead <= 0xa0 || trail <= 0xa0 || lead >= 0xf8 {
-            score.rare += 1;
-        }
-        at += 2;
-    }
-    Some(score)
 }
 
 #[cfg(test)]
