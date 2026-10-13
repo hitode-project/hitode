@@ -127,12 +127,20 @@ pub struct State {
     shader_stats: ShaderStats,
     shader_cache: Option<std::path::PathBuf>,
 }
-/// Explicit milestone capability gates. Production leaves both disabled until
-/// the differential and engine matrix checks pass for the corresponding model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Shader model capability gates. SM2 passed its differential fixtures and the
+/// engine matrix and is reported by default; SM3 stays an explicit opt-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShaderCaps {
     pub sm2: bool,
     pub sm3: bool,
+}
+impl Default for ShaderCaps {
+    fn default() -> Self {
+        Self {
+            sm2: true,
+            sm3: false,
+        }
+    }
 }
 pub fn set_shader_caps(ext: &mut Ext, caps: ShaderCaps) {
     ext.get_mut::<State>().shader_caps = caps;

@@ -78,7 +78,7 @@ foreach($variant in @('interpreter','jit','software-interpreter','software-jit')
     $report=Join-Path $OutputDirectory "$variant.json"
     foreach($name in @("$variant.json","$variant.log")){Remove-FixtureOutput $OutputDirectory $name}
     foreach($name in @('overlay/d3d9-clear.bin','overlay/d3d9-clear-pixels.bin')){Remove-FixtureOutput $overlay $name}
-    $arguments=@($fixture,'--hidden','--backend',$backend,'--seconds','15','--d3d9-sm2','--data-dir',$overlay,'--report',$report)
+    $arguments=@($fixture,'--hidden','--backend',$backend,'--seconds','15','--data-dir',$overlay,'--report',$report)
     if($variant.StartsWith('software')){$arguments+='--gpu-software'}
     "command=$Runner $($arguments -join ' ')" | Add-Content -LiteralPath (Join-Path $OutputDirectory 'cmd.txt')
     & $Runner @arguments *> (Join-Path $OutputDirectory "$variant.log")

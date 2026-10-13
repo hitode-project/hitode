@@ -550,7 +550,7 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", type=Path, help="reviewed S1-S4 evidence keyed by sample id, tied to report SHA-256")
     parser.add_argument("--trace", action="store_true", help="diagnostic API trace, not a performance measurement")
     parser.add_argument("--runner-arg", action="append", default=[],
-                        help="explicit candidate option, e.g. --runner-arg=--d3d9-sm2")
+                        help="explicit candidate option, e.g. --runner-arg=--d3d9-sm3")
     options = parser.parse_args()
     if options.seconds is None:
         options.seconds = 10 if options.quick else 20

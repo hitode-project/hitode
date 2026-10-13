@@ -92,7 +92,7 @@ $preset.Add_SelectedIndexChanged({
         $extra.Text = "$($game.args)"
         $note.Text = "$($game.note)"
     } else {
-        $note.Text = '手动选择游戏 EXE；需要时在“附加参数”中填写 --d3d9-sm2 或 --d3d9-sm3 等选项。'
+        $note.Text = '手动选择游戏 EXE；需要时在“附加参数”中填写 --d3d9-sm3 等选项。'
     }
 })
 $chosen = [Array]::IndexOf(@($presets | ForEach-Object { $_.name }), $(if ($last.Count -ge 4) { $last[3] } else { $null }))
