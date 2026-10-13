@@ -1082,6 +1082,8 @@ fn run(options: Options) -> Result<u8, String> {
     // Accepted presenter and fence jobs return/drop their owned resources while
     // HWND is still alive. The window is destroyed only after this join.
     service.shutdown();
+    #[cfg(target_os = "macos")]
+    window.finish_termination();
     result?
 }
 
@@ -1290,8 +1292,13 @@ fn run_execution(
                     }
                     window::Event::Close => {
                         runtime.post_input(0x10, 0, 0);
+                        #[cfg(not(target_os = "macos"))]
                         close_at.get_or_insert_with(Instant::now);
                     }
+                    #[cfg(target_os = "macos")]
+                    window::Event::AudioSuspended(suspended) => audio.set_suspended(suspended),
+                    #[cfg(target_os = "macos")]
+                    window::Event::ForceClose => unreachable!("force close is consumed by the UI"),
                     window::Event::Repaint => {}
                     window::Event::FocusLost => inputs += runtime.release_input() as u64,
                     window::Event::Menu(event) => {

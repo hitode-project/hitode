@@ -195,6 +195,14 @@ impl Ui {
                     repaint = true;
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                window::Event::AudioSuspended(_) => {}
+                #[cfg(target_os = "macos")]
+                window::Event::ForceClose => {
+                    self.stopped.store(true, Ordering::Release);
+                    self.execution_wake.signal();
+                    continue;
+                }
                 window::Event::Menu(_) | window::Event::Dialog(_) => {}
             }
             had_input = true;

@@ -139,6 +139,7 @@ impl Menus {
         let application = item(mtm, "ADV", None, "");
         let submenu = menu(mtm, "ADV");
         submenu.setAutoenablesItems(true);
+        submenu.addItem(&item(mtm, "Hide ADV", Some(sel!(hide:)), "h"));
         let quit = item(mtm, "Quit", Some(sel!(hostQuit:)), "q");
         // SAFETY: the target outlives the menu; both live as long as `Window`.
         unsafe { quit.setTarget(Some(target)) };

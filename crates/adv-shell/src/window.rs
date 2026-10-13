@@ -18,7 +18,11 @@ pub enum Event {
         lparam: u32,
     },
     Close,
+    #[cfg(target_os = "macos")]
+    ForceClose,
     FocusLost,
+    #[cfg(target_os = "macos")]
+    AudioSuspended(bool),
     Repaint,
 }
 pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;

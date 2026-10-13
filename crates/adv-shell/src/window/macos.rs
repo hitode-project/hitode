@@ -9,20 +9,22 @@
 use super::*;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSControl,
-    NSControlTextEditingDelegate, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags,
-    NSEventType, NSMenu, NSMenuDelegate, NSMenuItem, NSTextFieldDelegate, NSWindow,
-    NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSBackingStoreType, NSControl, NSControlTextEditingDelegate,
+    NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSTextFieldDelegate, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
+    NSWindowOcclusionState, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSWorkspaceWillPowerOffNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_core_foundation::{
     CFFileDescriptor, CFFileDescriptorContext, CFOptionFlags, CFRetained, CFRunLoop,
     CFRunLoopSource, kCFRunLoopCommonModes,
 };
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSTimer,
+    NSActivityOptions, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol,
+    NSPoint, NSProcessInfo, NSRect, NSSize, NSString, NSTimer,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -107,7 +109,11 @@ pub(crate) fn native_viewport(
 pub(super) struct Hub {
     main: Cell<usize>,
     events: RefCell<VecDeque<Event>>,
-    closed: Cell<bool>,
+    close_requested: Cell<bool>,
+    terminating: Cell<bool>,
+    occluded: Cell<bool>,
+    sleeping: Cell<bool>,
+    canvas: Cell<(u32, u32)>,
     focus_check: Cell<bool>,
     menus: RefCell<menu::Runtime>,
     menu_sink: RefCell<Option<MenuSink>>,
@@ -116,6 +122,30 @@ pub(super) struct Hub {
 impl Hub {
     fn push(&self, event: Event) {
         self.events.borrow_mut().push_back(event);
+    }
+    fn activate(&self, active: bool) {
+        self.push(Event::Input {
+            message: 0x1c,
+            wparam: u32::from(active),
+            lparam: 0,
+        });
+        if !active {
+            self.push(Event::FocusLost);
+        }
+    }
+    fn minimized(&self, minimized: bool) {
+        let (width, height) = self.canvas.get();
+        self.push(Event::Input {
+            message: 5,
+            wparam: u32::from(minimized),
+            lparam: if minimized {
+                0
+            } else {
+                width.min(65535) | height.min(65535) << 16
+            },
+        });
+        self.occluded.set(minimized);
+        self.push(Event::Repaint);
     }
     fn menu_event(&self, event: adv_runtime::MenuEvent) {
         let sink = self.menu_sink.borrow_mut().take();
@@ -145,15 +175,30 @@ define_class!(
         fn window_should_close(&self, sender: &NSWindow) -> bool {
             let hub = self.ivars();
             if sender as *const NSWindow as usize == hub.main.get() {
-                if !hub.closed.replace(true) {
-                    hub.push(Event::Close);
-                }
-                sender.orderOut(None);
+                hub.close_requested.set(true);
+                hub.push(Event::Close);
             } else {
                 // Closing is a guest request; only a later snapshot retires it.
                 hub.dialogs.close(sender);
             }
             false
+        }
+        #[unsafe(method(windowDidMiniaturize:))]
+        fn window_did_miniaturize(&self, note: &NSNotification) {
+            if notification_window(note) == self.ivars().main.get() { self.ivars().minimized(true); }
+        }
+        #[unsafe(method(windowDidDeminiaturize:))]
+        fn window_did_deminiaturize(&self, note: &NSNotification) {
+            if notification_window(note) == self.ivars().main.get() { self.ivars().minimized(false); }
+        }
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion(&self, note: &NSNotification) {
+            if notification_window(note) == self.ivars().main.get() {
+                // SAFETY: the notification was checked against our retained window.
+                let window = unsafe { &*(self.ivars().main.get() as *const NSWindow) };
+                self.ivars().occluded.set(!window.occlusionState().contains(NSWindowOcclusionState::Visible));
+                self.ivars().push(Event::Repaint);
+            }
         }
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, notification: &NSNotification) {
@@ -192,6 +237,30 @@ define_class!(
         }
     }
 
+    unsafe impl NSApplicationDelegate for Target {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
+            self.ivars().terminating.set(true);
+            if !self.ivars().close_requested.replace(true) { self.ivars().push(Event::Close); }
+            NSApplicationTerminateReply::TerminateLater
+        }
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn application_did_become_active(&self, _note: &NSNotification) { self.ivars().activate(true); }
+        #[unsafe(method(applicationDidResignActive:))]
+        fn application_did_resign_active(&self, _note: &NSNotification) { self.ivars().activate(false); }
+        #[unsafe(method(applicationDidHide:))]
+        fn application_did_hide(&self, _note: &NSNotification) {
+            self.ivars().activate(false);
+            self.ivars().occluded.set(true);
+            self.ivars().push(Event::Repaint);
+        }
+        #[unsafe(method(applicationDidUnhide:))]
+        fn application_did_unhide(&self, _note: &NSNotification) {
+            self.ivars().occluded.set(false);
+            self.ivars().push(Event::Repaint);
+        }
+    }
+
     unsafe impl NSMenuDelegate for Target {
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, menu: &NSMenu) {
@@ -211,6 +280,24 @@ define_class!(
     unsafe impl NSTextFieldDelegate for Target {}
 
     impl Target {
+        #[unsafe(method(hostWillPowerOff:))]
+        fn host_will_power_off(&self, _note: &NSNotification) {
+            // Workspace does not distinguish logout, restart and power-off.
+            self.ivars().push(Event::Input { message: 0x11, wparam: 0, lparam: 0 });
+            self.ivars().push(Event::Input { message: 0x16, wparam: 1, lparam: 0 });
+        }
+        #[unsafe(method(hostWillSleep:))]
+        fn host_will_sleep(&self, _note: &NSNotification) {
+            self.ivars().sleeping.set(true);
+            self.ivars().push(Event::AudioSuspended(true));
+            self.ivars().push(Event::Repaint);
+        }
+        #[unsafe(method(hostDidWake:))]
+        fn host_did_wake(&self, _note: &NSNotification) {
+            self.ivars().sleeping.set(false);
+            self.ivars().push(Event::AudioSuspended(false));
+            self.ivars().push(Event::Repaint);
+        }
         #[unsafe(method(guestMenuCommand:))]
         fn guest_menu_command(&self, item: &NSMenuItem) {
             let event = self.ivars().menus.borrow_mut().command(item.tag());
@@ -221,8 +308,11 @@ define_class!(
         #[unsafe(method(hostQuit:))]
         fn host_quit(&self, _item: &NSMenuItem) {
             let hub = self.ivars();
-            if !hub.closed.replace(true) {
+            if hub.close_requested.replace(true) {
+                hub.push(Event::ForceClose);
+            } else {
                 hub.push(Event::Close);
+                _item.setTitle(&NSString::from_str("Force Quit (guest is closing)"));
             }
         }
         #[unsafe(method(popupPoll:))]
@@ -299,6 +389,7 @@ pub struct Window {
     app: Retained<NSApplication>,
     window: Retained<NSWindow>,
     target: Retained<Target>,
+    activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     hub: Rc<Hub>,
     width: u32,
     height: u32,
@@ -332,6 +423,34 @@ impl Window {
         app.finishLaunching();
         let hub = Rc::new(Hub::default());
         let target = Target::new(hub.clone(), mtm);
+        hub.canvas.set((width, height));
+        app.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // SAFETY: selectors accept notifications; registration ends before target drops.
+        unsafe {
+            center.addObserver_selector_name_object(
+                &target,
+                sel!(hostWillPowerOff:),
+                Some(NSWorkspaceWillPowerOffNotification),
+                None,
+            );
+            center.addObserver_selector_name_object(
+                &target,
+                sel!(hostWillSleep:),
+                Some(NSWorkspaceWillSleepNotification),
+                None,
+            );
+            center.addObserver_selector_name_object(
+                &target,
+                sel!(hostDidWake:),
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+            );
+        }
+        let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+            &NSString::from_str("Guest execution and audio playback"),
+        );
         // SAFETY: the window is retained by `Window` and not released on close.
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -361,6 +480,7 @@ impl Window {
             app,
             window,
             target,
+            activity,
             hub,
             width,
             height,
@@ -381,6 +501,14 @@ impl Window {
             this.app.activateIgnoringOtherApps(true);
         }
         Ok(this)
+    }
+
+    /// Reply only after the execution worker and background service have joined:
+    /// guest files are closed and the registry snapshot has been persisted.
+    pub fn finish_termination(&self) {
+        if self.hub.terminating.replace(false) {
+            self.app.replyToApplicationShouldTerminate(true);
+        }
     }
 
     fn client(&self) -> (f64, f64) {
@@ -703,6 +831,9 @@ impl Window {
     }
 
     pub fn native_client_size(&self) -> Result<(u32, u32), String> {
+        if self.hub.occluded.get() || self.hub.sleeping.get() {
+            return Ok((0, 0));
+        }
         let (width, height) = self.client();
         let scale = self.window.backingScaleFactor();
         Ok((
@@ -715,6 +846,7 @@ impl Window {
         if canvas.0 == 0 || canvas.1 == 0 {
             return Ok(false);
         }
+        self.hub.canvas.set(canvas);
         self.width = canvas.0;
         self.height = canvas.1;
         let changed = self.frame_size != Some(canvas);
@@ -732,6 +864,7 @@ impl Window {
 
     pub fn hide(&mut self) {
         self.hidden = true;
+        self.hub.occluded.set(true);
         self.dialogs.hide();
         self.window.orderOut(None);
     }
@@ -818,6 +951,14 @@ impl Drop for Window {
             NSCursor::unhide();
         }
         self.menus.clear(&self.app);
+        self.app.setDelegate(None);
+        // SAFETY: these are the observer and activity registered by this window.
+        unsafe {
+            NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .removeObserver(&self.target);
+            NSProcessInfo::processInfo().endActivity(&self.activity);
+        }
         self.window.setDelegate(None);
         self.window.orderOut(None);
         if let Some(wake) = &self.wake {

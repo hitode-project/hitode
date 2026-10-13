@@ -763,3 +763,22 @@ mod tests {
         std::fs::remove_dir_all(tmp).unwrap();
     }
 }
+
+/// Flush an explicitly requested durable file barrier, including drive caches.
+pub fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+        // Darwin's F_FULLFSYNC asks the drive to flush its volatile cache.
+        // SAFETY: this command takes no third argument; the live file owns fd.
+        if unsafe { fcntl(file.as_raw_fd(), 51) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.sync_all()
+}

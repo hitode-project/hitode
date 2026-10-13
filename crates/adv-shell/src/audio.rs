@@ -3,6 +3,8 @@ use adv_runtime::boot::Runtime;
 use std::time::{Duration, Instant};
 
 pub struct AudioOutput {
+    #[cfg(target_os = "macos")]
+    suspended: bool,
     #[cfg(any(windows, target_os = "macos"))]
     output: Option<adv_device::Output>,
 }
@@ -16,7 +18,11 @@ impl AudioOutput {
             } else {
                 None
             };
-            Self { output }
+            Self {
+                output,
+                #[cfg(target_os = "macos")]
+                suspended: false,
+            }
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         {
@@ -30,7 +36,18 @@ impl AudioOutput {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_suspended(&mut self, suspended: bool) {
+        self.suspended = suspended;
+        if let Some(output) = self.output.as_mut() {
+            output.suspend();
+        }
+    }
     pub fn update(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.suspended {
+            return;
+        }
         #[cfg(any(windows, target_os = "macos"))]
         if let Some(output) = self.output.as_mut() {
             output.update();

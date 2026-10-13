@@ -25,7 +25,7 @@ mod mac {
         NSApplication, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSPopUpButton,
         NSTextField, NSView, NSWindow,
     };
-    use objc2_foundation::{NSPoint, NSString};
+    use objc2_foundation::{NSNotification, NSPoint, NSString};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -463,7 +463,91 @@ mod mac {
         assert_eq!(inputs(window.pump()).len(), 1);
         println!("ok dialogs");
 
+        // Exercise delegate notifications without showing a window, sleeping
+        // the machine, or terminating the test process.
+        let delegate = native.delegate().unwrap();
+        let note = unsafe {
+            NSNotification::notificationWithName_object(
+                &NSString::from_str("test lifecycle"),
+                Some(&native),
+            )
+        };
+        window.pump();
+        let _: () = unsafe { msg_send![&*delegate, windowDidMiniaturize: &*note] };
+        assert!(inputs(window.pump()).contains(&(5, 1, 0)));
+        assert_eq!(window.native_client_size().unwrap(), (0, 0));
+        let _: () = unsafe { msg_send![&*delegate, windowDidDeminiaturize: &*note] };
+        assert!(
+            inputs(window.pump())
+                .iter()
+                .any(|&(message, state, _)| message == 5 && state == 0)
+        );
+        assert_ne!(window.native_client_size().unwrap(), (0, 0));
+        let _: () = unsafe { msg_send![&*delegate, windowDidChangeOcclusionState: &*note] };
+        assert_eq!(window.native_client_size().unwrap(), (0, 0));
+        println!("ok minimize, restore and occlusion");
+
+        let app = NSApplication::sharedApplication(mtm);
+        let application = app.delegate().unwrap();
+        let _: () = unsafe { msg_send![&*application, applicationDidHide: &*note] };
+        assert!(inputs(window.pump()).contains(&(0x1c, 0, 0)));
+        assert_eq!(window.native_client_size().unwrap(), (0, 0));
+        let _: () = unsafe { msg_send![&*application, applicationDidUnhide: &*note] };
+        let _: () = unsafe { msg_send![&*application, applicationDidBecomeActive: &*note] };
+        assert!(inputs(window.pump()).contains(&(0x1c, 1, 0)));
+        let _: () = unsafe { msg_send![&*application, applicationDidResignActive: &*note] };
+        assert!(inputs(window.pump()).contains(&(0x1c, 0, 0)));
+        println!("ok hide and activation");
+
+        let center = objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter();
+        unsafe {
+            center
+                .postNotificationName_object(objc2_app_kit::NSWorkspaceWillSleepNotification, None);
+        }
+        assert!(
+            window
+                .pump()
+                .iter()
+                .any(|e| matches!(e, Event::AudioSuspended(true)))
+        );
+        assert_eq!(window.native_client_size().unwrap(), (0, 0));
+        unsafe {
+            center.postNotificationName_object(objc2_app_kit::NSWorkspaceDidWakeNotification, None);
+        }
+        assert!(
+            window
+                .pump()
+                .iter()
+                .any(|e| matches!(e, Event::AudioSuspended(false)))
+        );
+        assert_ne!(window.native_client_size().unwrap(), (0, 0));
+        println!("ok synthetic sleep and wake");
+
+        let reply: objc2_app_kit::NSApplicationTerminateReply =
+            unsafe { msg_send![&*application, applicationShouldTerminate: &*app] };
+        assert_eq!(
+            reply,
+            objc2_app_kit::NSApplicationTerminateReply::TerminateLater
+        );
+        assert!(window.pump().iter().any(|e| matches!(e, Event::Close)));
+        native.performClose(None);
+        assert!(window.pump().iter().any(|e| matches!(e, Event::Close)));
+        // A second Cmd+Q is the explicit escape from an unresponsive guest.
+        let quit = objc2_app_kit::NSMenuItem::new(mtm);
+        let _: () = unsafe { msg_send![&*application, hostQuit: &*quit] };
+        assert!(window.pump().iter().any(|e| matches!(e, Event::ForceClose)));
+        unsafe {
+            center.postNotificationName_object(
+                objc2_app_kit::NSWorkspaceWillPowerOffNotification,
+                None,
+            );
+        }
+        let ending = inputs(window.pump());
+        assert_eq!(ending, vec![(0x11, 0, 0), (0x16, 1, 0)]);
+        println!("ok logout and shutdown notifications");
+        println!("ok close and application quit");
         drop(window);
+        assert!(app.delegate().is_none());
         println!("ok all");
     }
 }
