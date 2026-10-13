@@ -1655,6 +1655,7 @@ fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     native
 }
 
+// spec: A64-ISA-4, A64-REG-5, A64-FLAG-2, A64-FLAG-3, A64-FLAG-4, A64-FLAG-5, A64-MEM-7, A64-CTL-4, A64-CTL-7, A64-CTL-9, A64-FP-2, A64-FP-3, A64-FP-4, A64-TR-4, A64-VER-1
 #[cfg(native)]
 #[test]
 fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
@@ -1683,6 +1684,7 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
 /// MSVC control word with `ftol`'s switch to chop: it matches the
 /// interpreter, and none of its x87 instructions leaves translated code
 /// or calls a helper.
+// spec: A64-FLAG-6, A64-FP-1, A64-FP-3
 #[cfg(native)]
 #[test]
 fn x87_loops_run_natively() {
@@ -1789,6 +1791,7 @@ fn x87_loops_run_natively() {
 
 /// Data on a code page: each store faults until the instruction is checked,
 /// then takes `access` without leaving translated code.
+// spec: A64-MEM-6, A64-MEM-7, A64-CTL-10
 #[cfg(native)]
 #[test]
 fn stores_to_data_on_a_code_page_stop_faulting() {

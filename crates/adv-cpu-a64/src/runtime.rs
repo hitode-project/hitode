@@ -1,5 +1,5 @@
 //! The execution thread's runtime context and the stubs that move guest
-//! state between `CpuState` and the mapped host registers (execution ABI §A2).
+//! state between `CpuState` and the mapped host registers (A64-REG-1).
 //!
 //! `enter` saves the host's callee-saved registers, loads the guest and
 //! branches to translated code. Translated code leaves through `exit` with
@@ -14,16 +14,16 @@
 //! which returns the unit to continue at, or 0 to leave through `exit`.
 //!
 //! Dynamic transfers carry the guest EIP in w16. `lookup` probes the
-//! indirect table (§A5.3), which the helper fills, and `lookup_slow` asks
+//! indirect table (A64-CTL-6), which the helper fills, and `lookup_slow` asks
 //! the helper. A site that misses the table first loads x4 with its
 //! source EIP and kind (`Runtime::branch`) on its cold path, so the owner
 //! records the indirect branch without a cost on hits.
-//! Returns pop the shadow stack (§A5.2) at x28, whose entries
+//! Returns pop the shadow stack (A64-CTL-4) at x28, whose entries
 //! are {host continuation, guest return EIP} and grow down to a guard page;
 //! `ret_miss` resynchronizes with a few entries below the top before it
 //! looks up, and `shadow_reset` empties the stack after an overflow.
 //!
-//! Checked accesses (§A4.3) call `access` when the page class table rules
+//! Checked accesses (A64-MEM-7) call `access` when the page class table rules
 //! out the window: it saves every register translated code may keep live,
 //! has the owner's `access` helper perform the access, and returns the
 //! loaded value in w0; when the owner refuses, it leaves as the fault stub
@@ -37,9 +37,9 @@
 //! Units keep `CpuState` current for MMX and XMM registers and cache them
 //! in d8-d15 and v16-v23 (`translate::simd`), so only `access`, which
 //! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
-//! in the canonical block-exit form of §A3: NZCV in subtraction sense, x10 a
+//! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
-//! x12 DF. x87 state stays in `CpuState` (execution ABI §A6.1).
+//! x12 DF. x87 state stays in `CpuState` (A64-FP-1).
 
 use std::mem::offset_of;
 
@@ -129,7 +129,7 @@ pub enum Exit {
     Dispatch = 1,
     /// A host fault at a side-table site. EIP is not set; the owner takes it
     /// from the site, where guest state is exactly that before the
-    /// instruction (§A3.2).
+    /// instruction (A64-FLAG-4).
     Fault = 2,
     /// The `interpret` helper left a step for the owner to complete.
     Stepped = 3,
@@ -697,6 +697,7 @@ mod tests {
         asm.b(exit);
     }
 
+    // spec: A64-REG-2, A64-REG-3
     #[test]
     fn every_mapped_flag_combination_and_register_round_trips() {
         for bits in 0..1u32 << 7 {
@@ -718,8 +719,9 @@ mod tests {
         }
     }
 
+    // spec: A64-REG-1
     #[test]
-    fn translated_code_sees_the_section_four_register_map() {
+    fn translated_code_sees_the_register_map() {
         let cpu = guest();
         let (emu, run) = run(&cpu, |asm, exit| {
             // Capture the mapping in temporaries the exit stub leaves alone.
@@ -749,6 +751,7 @@ mod tests {
 
     /// `cmp ecx, edx` in subtraction sense, with the canonical PF/AF sources,
     /// must leave the eflags the interpreter computes for the same compare.
+    // spec: A64-REG-3
     #[test]
     fn a_native_compare_exits_with_the_interpreters_flags() {
         let pairs = [

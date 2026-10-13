@@ -393,6 +393,7 @@ fn binary(opcode: Opcode) -> Option<Operation> {
 mod tests {
     use super::*;
 
+    // spec: EXEC-X64-7
     #[test]
     fn only_proven_constant_selects_enter_the_recovery_recipe() {
         let mut function = ir::Function::new();

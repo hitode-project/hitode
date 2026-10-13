@@ -1,4 +1,4 @@
-//! MMX and SSE instructions in NEON (execution ABI §A2, §A6).
+//! MMX and SSE instructions in NEON (A64-REG-5, A64-FP-4, A64-FP-5).
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it and

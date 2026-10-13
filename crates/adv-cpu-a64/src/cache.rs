@@ -1,4 +1,4 @@
-//! Executable storage for translated code (execution ABI §A5.1).
+//! Executable storage for translated code (A64-CTL-1, A64-CTL-2).
 //!
 //! One contiguous range, so a direct `B`/`BL` reaches every unit. Code is
 //! never writable and executable through the same mapping at once:
@@ -326,6 +326,7 @@ mod tests {
         function()
     }
 
+    // spec: A64-CTL-2
     #[test]
     fn appended_code_runs_and_patches_take_effect() {
         let mut cache = CodeCache::new(page_size().unwrap()).unwrap();
@@ -346,6 +347,7 @@ mod tests {
         assert_eq!(cache.next(), second);
     }
 
+    // spec: A64-CTL-1
     #[test]
     fn a_full_cache_refuses_more_code() {
         let page = page_size().unwrap();

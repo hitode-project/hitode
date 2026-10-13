@@ -2676,6 +2676,7 @@ mod fault_address_tests {
     use super::fault_address;
     use crate::{Memory, READ, WRITE};
 
+    // spec: A64-MEM-5
     #[test]
     fn page_split_faults_name_the_first_inaccessible_byte() {
         let mut memory = Memory::new(0x10000, 0x3000).unwrap();

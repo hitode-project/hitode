@@ -1111,6 +1111,7 @@ mod tests {
         assert!(pages.committed[HOST_16K / GUEST]);
     }
 
+    // spec: A64-MEM-3
     #[test]
     fn guest_aligned_reservation_rounds_host_tail() {
         let mut pages = UnixPages::new(5 * GUEST, HOST_16K).unwrap();

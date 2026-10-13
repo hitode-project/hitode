@@ -321,6 +321,7 @@ mod tests {
         }
     }
 
+    // spec: EXEC-X64-9
     #[test]
     fn rmw_requires_read_and_write_but_unknown_aliasing_stores_are_allowed() {
         let code = decode(|a| {

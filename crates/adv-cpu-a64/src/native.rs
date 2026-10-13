@@ -10,16 +10,16 @@
 //! fills, and returns through the shadow stack; both are emptied whenever a
 //! unit is dropped, so they only ever lead to live units.
 //!
-//! Faults (§A4.3, §A4.4): every host instruction that may fault has a side-table
+//! Faults (A64-MEM-5, A64-MEM-9): every host instruction that may fault has a side-table
 //! site naming its guest instruction. The signal handler only checks that the
 //! PC is such a site, records it, and resumes at the fault stub. Because a
 //! translated instruction commits nothing before its last possible fault
-//! (§A3.2), the owner then rebuilds the flags from the site's carry and
+//! (A64-FLAG-3), the owner then rebuilds the flags from the site's carry and
 //! PF/AF recipe and interprets that one instruction from the exact prior
 //! state: the interpreter either completes it (a soft page) or reports the
 //! precise guest fault.
 //!
-//! Soft pages (§A4.3): an instruction whose unchecked sites fault
+//! Soft pages (A64-MEM-6): an instruction whose unchecked sites fault
 //! `CHECK_AFTER` times is checked from then on. The unit that faulted goes,
 //! and its next translation checks each access of the instruction against
 //! the page class table, a snapshot of `Memory::native_permissions` the
@@ -58,13 +58,13 @@ type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
 
-/// Faults at unchecked sites after which an instruction is checked (§A4.3).
+/// Faults at unchecked sites after which an instruction is checked (A64-MEM-6).
 pub(crate) const CHECK_AFTER: u32 = 8;
 
 /// Page class table entries: every guest page.
 const CLASSES: usize = 1 << 20;
 
-/// Which guest accesses check their page first (§A4.3).
+/// Which guest accesses check their page first (A64-MEM-7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Checks {
@@ -856,7 +856,7 @@ impl Native {
         self.clear();
     }
 
-    /// Clears the cache as a whole (§A5.1).
+    /// Clears the cache as a whole (A64-CTL-1).
     fn clear(&mut self) {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
@@ -1083,6 +1083,7 @@ mod tests {
         cpu
     }
 
+    // spec: A64-REG-6, A64-MEM-1
     #[test]
     fn the_window_is_aligned_and_biases_the_stack_registers() {
         let (memory, native) = native();
@@ -1114,6 +1115,7 @@ mod tests {
         assert_eq!(cpu.eip, 0x1003);
     }
 
+    // spec: A64-MEM-1, A64-MEM-5, A64-MEM-9
     #[test]
     fn faults_in_guards_and_inaccessible_pages_resume_at_the_site() {
         let (mut memory, mut native) = native();
@@ -1147,6 +1149,7 @@ mod tests {
         }
     }
 
+    // spec: A64-FLAG-3, A64-FLAG-5, A64-MEM-10
     #[test]
     fn a_fault_rebuilds_flags_from_the_sites_sense_and_recipe() {
         let mut cpu = cpu(0, 0, 0);

@@ -1152,6 +1152,7 @@ mod tests {
         assert!(restore_snapshot(&current, &image).is_err());
     }
 
+    // spec: EXEC-X64-15
     #[test]
     fn native_image_rejects_corruption_options_permissions_and_location_changes() {
         let (mut memory, snapshot) = fixture(&[0x90, 0x90]);
@@ -1172,6 +1173,7 @@ mod tests {
         assert!(restore_snapshot(&changed, &image).is_err());
     }
 
+    // spec: EXEC-X64-15
     #[test]
     fn identical_code_rejects_other_guest_images_and_bases() {
         let (_, mut snapshot) = fixture(&[0x90, 0x90]);

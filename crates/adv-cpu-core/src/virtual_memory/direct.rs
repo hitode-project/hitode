@@ -1165,6 +1165,7 @@ mod tests {
 mod planner_tests {
     use super::*;
 
+    // spec: A64-MEM-4
     #[test]
     fn both_host_sizes_intersect_every_guest_subpage_and_code_barrier() {
         for host in [GUEST_PAGE_SIZE, 4 * GUEST_PAGE_SIZE] {

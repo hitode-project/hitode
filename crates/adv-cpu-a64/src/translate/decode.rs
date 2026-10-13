@@ -1068,6 +1068,7 @@ pub(super) mod tests {
         plan(&instruction).map(|op| (op, instruction.len() as u32))
     }
 
+    // spec: A64-TR-1
     #[test]
     fn quick_agrees_with_iced() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);

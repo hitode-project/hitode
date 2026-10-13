@@ -2137,6 +2137,7 @@ mod snapshot_tests {
         );
     }
 
+    // spec: EXEC-GIR-5
     #[test]
     fn snapshots_copy_only_the_region_and_tail_and_keep_old_versions() {
         let mut memory = Memory::new(0x10000, 0x10000).unwrap();
@@ -2238,6 +2239,7 @@ mod tests {
         }
     }
 
+    // spec: EXEC-X64-9, EXEC-X64-14
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     #[test]
     fn first_scalar_load_has_a_verified_machine_fault_site_without_hot_checkpoints() {
@@ -2252,6 +2254,7 @@ mod tests {
         assert_eq!(compiled.fault_sites[0].guest_pc, 0x10000);
     }
 
+    // spec: EXEC-X64-9, EXEC-X64-14
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     #[test]
     fn incomplete_merge_recipes_and_default_memory_keep_checked_scalar_loads() {
@@ -2274,6 +2277,7 @@ mod tests {
         }
     }
 
+    // spec: EXEC-X64-13
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     #[test]
     fn production_owner_registers_body_and_wrapper_and_retires_tables_first() {
