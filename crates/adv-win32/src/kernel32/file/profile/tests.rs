@@ -275,7 +275,7 @@ fn actual_guest<B: Backend>(cpu: B, name: &str) {
     wide(&mut machine, DATA + 0x410, "k");
     wide(&mut machine, DATA + 0x430, ".\\ansi.ini");
     ansi(&mut machine, DATA + 0x480, b"S");
-    ansi(&mut machine, DATA + 0x490, &[0x93, 0xfa, 0x96, 0x7b]); // U+65E5 U+672C, CP932.
+    ansi(&mut machine, DATA + 0x490, &[0x93, 0xfa, 0x96, 0x7b]); // 日本, CP932.
     ansi(&mut machine, DATA + 0x500, b".\\unicode.ini");
     ansi(&mut machine, DATA + 0x600, b"S");
     ansi(&mut machine, DATA + 0x610, b"k");
