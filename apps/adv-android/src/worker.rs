@@ -317,6 +317,7 @@ pub fn run(
     let mut runtime = Runtime::with_codec(
         exe,
         data,
+        None,
         true,
         640,
         480,
