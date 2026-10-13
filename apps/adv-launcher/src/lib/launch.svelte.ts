@@ -99,10 +99,11 @@ class Runs {
   }
 
   /**
-   * Asks the game to quit; a second call forces it. A game still starting is
-   * stopped once it has started. The end arrives as game_finished.
+   * Asks the game to quit; a second call, or `force`, ends it at once. A game
+   * still starting is stopped once it has started. The end arrives as
+   * game_finished.
    */
-  async stop(gameId: string): Promise<void> {
+  async stop(gameId: string, force = false): Promise<void> {
     this.stopping[gameId] = true;
     const starting = this.#starting[gameId];
     if (starting) {
@@ -115,6 +116,7 @@ class Runs {
       }
     }
     await quiet(stopGame(), "stop_game");
+    if (force) await quiet(stopGame(), "stop_game");
   }
 
   /** The summary of the game's last run: this session's, else the library's record. */
@@ -215,10 +217,13 @@ export class LaunchFlow {
     this.reason = reason;
   }
 
-  /** 取消: stops the game once it has started and goes back to its detail. */
+  /**
+   * 取消: ends the game once it has started and goes back to its detail. It is
+   * forced: a quit prompt from a game the user never saw could not be answered.
+   */
   cancel(): void {
     const id = this.#gameId();
-    void runs.stop(id);
+    void runs.stop(id, true);
     library.focus = id;
     nav.home();
   }
