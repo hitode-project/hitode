@@ -39,7 +39,7 @@ fn recursive(env: &mut Env<'_>, paths: Vec<String>, index: usize, then: Done) ->
         "Shell recursive directory",
         Box::new(move |env, attributes| match attributes {
             Ok(bits) if bits & 0x10 != 0 => recursive(env, paths, index + 1, then),
-            Ok(_) => then(env, Err(183)),
+            Ok(_) => then(env, Err(if index + 1 < paths.len() { 3 } else { 183 })),
             Err(2 | 3) => file::native::directory::create(
                 env,
                 path,
@@ -176,12 +176,18 @@ fn create_w(
     let text = String::from_utf16_lossy(&path.read(env.cpu, 32768)?);
     Ok(create(env, text, security.addr()))
 }
+#[win32(shell32,name="SHCreateDirectory",level=implement)]
+fn create_plain(env: &mut Env<'_>, _owner: Handle, path: WideStr) -> Result<Outcome, MemFault> {
+    let text = String::from_utf16_lossy(&path.read(env.cpu, 32768)?);
+    Ok(create(env, text, 0))
+}
 pub(super) fn register(reg: &mut Registry) {
     for api in [
         image_ensure_ABI,
         debug_ensure_ABI,
         create_a_ABI,
         create_w_ABI,
+        create_plain_ABI,
     ] {
         reg.register(api);
     }
@@ -256,12 +262,9 @@ mod tests {
         for (api, wide) in [
             ("SHCreateDirectoryExA", false),
             ("SHCreateDirectoryExW", true),
+            ("SHCreateDirectory", true),
         ] {
-            let value = if wide {
-                "C:\\Game\\wide\\nested"
-            } else {
-                "C:\\Game\\ansi\\nested"
-            };
+            let value = format!("C:\\Game\\{api}\\nested");
             if wide {
                 f.m.cpu
                     .write(
@@ -274,11 +277,16 @@ mod tests {
                     )
                     .unwrap();
             } else {
-                ansi(&mut f, value);
+                ansi(&mut f, &value);
             }
-            assert_eq!(f.call("shell32.dll", api, &[0, DATA, 0]), 0);
-            assert!(f.m.ext.get::<Win32>().vfs.is_dir(value));
-            assert_eq!(f.call("shell32.dll", api, &[0, DATA, 0]), 183);
+            let args = if api == "SHCreateDirectory" {
+                &[0, DATA][..]
+            } else {
+                &[0, DATA, 0][..]
+            };
+            assert_eq!(f.call("shell32.dll", api, args), 0);
+            assert!(f.m.ext.get::<Win32>().vfs.is_dir(&value));
+            assert_eq!(f.call("shell32.dll", api, args), 183);
         }
         ansi(&mut f, "relative\\dir");
         assert_eq!(
