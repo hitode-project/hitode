@@ -17,8 +17,8 @@ impl From<ff::Error> for Error {
 }
 
 /// Input must be dropped before its custom AVIO buffer and reader.
-struct Input {
-    context: format::context::Input,
+pub(super) struct Input {
+    pub context: format::context::Input,
     _io: Io,
 }
 
@@ -80,7 +80,7 @@ unsafe extern "C" fn seek(opaque: *mut c_void, off: i64, whence: i32) -> i64 {
 }
 
 impl Input {
-    fn open(reader: Box<dyn ReadSeek>) -> Result<Self, Error> {
+    pub fn open(reader: Box<dyn ReadSeek>) -> Result<Self, Error> {
         let mut reader = Box::new(reader);
         unsafe {
             let buffer = ff::ffi::av_malloc(32768).cast::<u8>();

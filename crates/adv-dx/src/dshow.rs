@@ -10,10 +10,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use adv_abi::{AnsiStr, Registry, win32};
 use adv_cpu::backend::{GuestExt, MemFault, Prot};
+use adv_device::media::CodecFormat;
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use adv_os::com::{Com, Iid, QueryError};
 
+mod dmo;
 #[cfg(test)]
 mod error_text_tests;
 mod filter;
@@ -69,7 +71,7 @@ const fn amovie(d1: u32) -> Iid {
         [0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70],
     )
 }
-const fn fourcc_type(d1: u32) -> Iid {
+pub(crate) const fn fourcc_type(d1: u32) -> Iid {
     guid(
         d1,
         0x0000,
@@ -205,9 +207,10 @@ pub(crate) enum Face {
     EnumMediaTypes,
     MemAllocator,
     MediaSample,
+    DmoWrapper,
 }
 
-const FACES: [(Face, &str); 19] = [
+const FACES: [(Face, &str); 20] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -227,6 +230,7 @@ const FACES: [(Face, &str); 19] = [
     (Face::EnumMediaTypes, "IEnumMediaTypes"),
     (Face::MemAllocator, "IMemAllocator"),
     (Face::MediaSample, "IMediaSample"),
+    (Face::DmoWrapper, "IDMOWrapperFilter"),
 ];
 
 impl Face {
@@ -255,6 +259,7 @@ impl Face {
             Face::EnumMediaTypes => &[IID_IENUMMEDIATYPES],
             Face::MemAllocator => &[IID_IMEMALLOCATOR],
             Face::MediaSample => &[IID_IMEDIASAMPLE],
+            Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
         }
     }
 }
@@ -346,6 +351,7 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(CLSID_MPEG_AUDIO_CODEC, filter::create_audio_decoder);
     classes.register(CLSID_DSOUND_RENDER, filter::create_audio_renderer);
     classes.register(CLSID_AUDIO_RENDER, filter::create_audio_renderer);
+    classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
 }
 
 fn initialize(env: &mut Env<'_>) -> Result<(), String> {
@@ -498,12 +504,14 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             self::state(env).graphs.remove(&canonical);
         }
         Obj::Filter => {
-            let handle = state
-                .filters
-                .remove(&canonical)
-                .and_then(|f| f.source.and_then(|s| s.file_handle));
-            if let Some(handle) = handle {
+            let Some(filter) = state.filters.remove(&canonical) else {
+                return;
+            };
+            if let Some(handle) = filter.source.and_then(|s| s.file_handle) {
                 env.sys.objects.close(handle);
+            }
+            if let Some(dmo) = filter.dmo {
+                dmo::destroyed(env, dmo);
             }
         }
         Obj::Pin => {
@@ -568,7 +576,8 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::EnumPins
         | Face::Pin
         | Face::MemInputPin
-        | Face::EnumMediaTypes => filter::call(env, face, &method, this),
+        | Face::EnumMediaTypes
+        | Face::DmoWrapper => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
     };
     outcome.unwrap_or_else(|| {
@@ -829,6 +838,115 @@ impl MediaType {
         }
     }
 
+    /// A compressed stream as Windows Media and DMO decoders describe it: a
+    /// FourCC or wave-format-tag subtype with the codec data after the header.
+    pub fn compressed(format: &CodecFormat, bit_rate: u32) -> Self {
+        match format {
+            CodecFormat::Video {
+                fourcc,
+                width,
+                height,
+                bit_count,
+                frame_100ns,
+                extradata,
+            } => {
+                let mut block = vec![0u8; 88];
+                for (at, value) in [(8, *width), (12, *height), (24, *width), (28, *height)] {
+                    block[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                block[32..36].copy_from_slice(&bit_rate.to_le_bytes());
+                block[40..48].copy_from_slice(&frame_100ns.to_le_bytes());
+                let header = &mut block[48..88];
+                header[0..4].copy_from_slice(&(40 + extradata.len() as u32).to_le_bytes());
+                header[4..8].copy_from_slice(&width.to_le_bytes());
+                header[8..12].copy_from_slice(&height.to_le_bytes());
+                header[12..14].copy_from_slice(&1u16.to_le_bytes());
+                header[14..16].copy_from_slice(&bit_count.to_le_bytes());
+                header[16..20].copy_from_slice(&fourcc.to_le_bytes());
+                let image = width * height * u32::from(*bit_count) / 8;
+                header[20..24].copy_from_slice(&image.to_le_bytes());
+                block.extend_from_slice(extradata);
+                Self {
+                    major: MEDIATYPE_VIDEO,
+                    sub: fourcc_type(*fourcc),
+                    fixed_size: false,
+                    temporal: true,
+                    sample_size: 0,
+                    format_type: FORMAT_VIDEOINFO,
+                    format: block,
+                }
+            }
+            CodecFormat::Audio {
+                format_tag,
+                rate,
+                channels,
+                block_align,
+                bits,
+                bytes_per_second,
+                extradata,
+            } => {
+                let mut block = Vec::with_capacity(18 + extradata.len());
+                block.extend_from_slice(&format_tag.to_le_bytes());
+                block.extend_from_slice(&channels.to_le_bytes());
+                block.extend_from_slice(&rate.to_le_bytes());
+                block.extend_from_slice(&bytes_per_second.to_le_bytes());
+                block.extend_from_slice(&block_align.to_le_bytes());
+                block.extend_from_slice(&bits.to_le_bytes());
+                block.extend_from_slice(&(extradata.len() as u16).to_le_bytes());
+                block.extend_from_slice(extradata);
+                Self {
+                    major: MEDIATYPE_AUDIO,
+                    sub: fourcc_type(u32::from(*format_tag)),
+                    fixed_size: true,
+                    temporal: false,
+                    sample_size: u32::from(*block_align),
+                    format_type: FORMAT_WAVEFORMATEX,
+                    format: block,
+                }
+            }
+        }
+    }
+
+    /// The decoder input a compressed VIDEOINFOHEADER or WAVEFORMATEX type names.
+    pub fn codec_format(&self) -> Option<CodecFormat> {
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(
+                self.format.get(at..at + 4)?.try_into().ok()?,
+            ))
+        };
+        let half = |at: usize| -> Option<u16> {
+            Some(u16::from_le_bytes(
+                self.format.get(at..at + 2)?.try_into().ok()?,
+            ))
+        };
+        if self.major == MEDIATYPE_VIDEO && self.format_type == FORMAT_VIDEOINFO {
+            let size = word(48)?;
+            let extra = self.format.get(88..48 + (size.max(40) as usize))?.to_vec();
+            let height = word(56)?;
+            Some(CodecFormat::Video {
+                fourcc: word(64)?,
+                width: word(52)?,
+                height: (height as i32).unsigned_abs(),
+                bit_count: half(62)?,
+                frame_100ns: u64::from_le_bytes(self.format.get(40..48)?.try_into().ok()?),
+                extradata: extra,
+            })
+        } else if self.major == MEDIATYPE_AUDIO && self.format_type == FORMAT_WAVEFORMATEX {
+            let extra = usize::from(half(16)?);
+            Some(CodecFormat::Audio {
+                format_tag: half(0)?,
+                channels: half(2)?,
+                rate: word(4)?,
+                bytes_per_second: word(8)?,
+                block_align: half(12)?,
+                bits: half(14)?,
+                extradata: self.format.get(18..18 + extra)?.to_vec(),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Image geometry of a VIDEOINFOHEADER type: width, signed height, bit depth.
     pub fn video_geometry(&self) -> Option<(u32, i32, u16)> {
         if self.format_type != FORMAT_VIDEOINFO || self.format.len() < 88 {
@@ -844,4 +962,4 @@ impl MediaType {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
