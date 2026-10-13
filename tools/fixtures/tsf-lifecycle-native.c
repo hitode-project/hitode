@@ -1,4 +1,13 @@
-/* Authored SDK-only x86 TSF lifecycle probe. No window, text store or IME setting. */
+/*
+ * Authored SDK-only x86 TSF lifecycle probe using an STA COM apartment.
+ * Checks cover manager activation, document/context creation, identity, references, and retired-owner calls.
+ * Inputs are SDK interfaces and synthetic argument combinations; no window, text store, or IME setting is changed.
+ * Run from the repository root: ./tools/fixtures/build-tsf-lifecycle-native.ps1
+ * Build requires LLVM, the Windows SDK, and MSVC libraries; -OutputDirectory selects the output directory.
+ * Outputs: tsf-lifecycle-native.log and tsf-lifecycle-native.stderr.log beside the executable.
+ * Each stdout row contains a label and four hexadecimal words: result, value1, value2, and caught SEH code.
+ * Caught exceptions are distinct from returned HRESULTs.
+ */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

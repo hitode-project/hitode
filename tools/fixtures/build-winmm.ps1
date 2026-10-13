@@ -1,3 +1,13 @@
+<#
+Build authored x86 multimedia-timer fixtures with LLVM and the Windows SDK.
+winmm_timers.c checks arguments, callbacks, cancellation, worker reuse, and event actions against native Windows.
+winmm_budget.c checks guest timer capacity, reuse, and scheduling with synthetic waits.
+Run from the repository root: ./tools/fixtures/build-winmm.ps1
+Outputs: fixture_winmm.exe and fixture_winmm_budget.exe under target/winmm-tests by default.
+Run the native fixture from that directory; it writes winmm-report.bin.
+Guest comparison: cargo test --release -p adv-runtime --test winmm -- --test-threads=1
+Neither fixture opens a window, audio device, game, or network connection.
+#>
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/winmm-tests'),
     [string]$LlvmBin = 'C:\Program Files\LLVM\bin',

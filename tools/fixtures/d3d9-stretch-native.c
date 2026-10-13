@@ -1,3 +1,12 @@
+/*
+ * Authored x86 StretchRect oracle with a hidden offscreen window and no Present or game data.
+ * Inputs: a synthetic 4x4 A8R8G8B8 source, source/destination rectangles, filters, and HAL/REF selection.
+ * Run from the repository root: ./tools/fixtures/build-d3d9-stretch-native.ps1 -Run
+ * Add -Reference for REF. Build requires LLVM and the Windows SDK.
+ * Default output: target/fixtures/d3d9-stretch-native; environment.json records source and executable hashes.
+ * native.jsonl records source data, rectangles, filters, HRESULTs, and 64 ARGB readback pixels per case.
+ * Failed StretchRect calls are driver rejections; compilation, setup, or readback failures exit nonzero.
+ */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

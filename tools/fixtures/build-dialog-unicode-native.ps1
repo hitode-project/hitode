@@ -1,3 +1,13 @@
+<#
+Build and run authored x86 Unicode-dialog probes using LLVM and Windows SDK 10.0.26100.0.
+Inputs: synthetic dialog templates, controls, and named/ordinal string resources.
+Checks cover UTF-16 buffers, callback arguments, integer text, owner restoration, lifetime, and resource errors.
+Run from the repository root: ./tools/fixtures/build-dialog-unicode-native.ps1
+Three executables and their DWORD transcripts/JSON reports go to target/fixtures-dialog-unicode by default.
+Use -OutputDirectory to choose another output directory.
+Modeless windows are invisible; modal callbacks end the dialog during WM_INITDIALOG.
+This is a native reference probe, not a guest execution of these same binaries.
+#>
 param([string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/fixtures-dialog-unicode'))
 $ErrorActionPreference = 'Stop'
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)

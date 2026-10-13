@@ -1,3 +1,13 @@
+<#
+Check x86 FPU controls across D3D9 creation, Reset, Present, and Release, plus guest refresh pacing.
+Inputs: authored d3d9-environment.c variants, Windows SDK, LLVM, and an adv-run GPU build.
+Build: cargo build -p adv-run --features adv-shell/gpu
+Run: pwsh -NoProfile -File tools/fixtures/test-d3d9-environment.ps1
+Use -GuestVisible, -HoldControl, and -NoTimeSkip to select pacing cases.
+Native execution remains hidden; guest visibility is logical inside a hidden shell.
+Outputs: d3d9-environment.bin under target/fixtures and per-variant reports, logs, and overlays.
+-OutputDirectory defaults to target/architecture-acceptance/d3d9-environment.
+#>
 param(
     [string]$Runner = (Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'),
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/architecture-acceptance/d3d9-environment'),
