@@ -15,6 +15,8 @@ use std::{
 };
 use zeno::{Command, Vector};
 
+#[cfg(target_os = "macos")]
+mod discovery;
 mod enumeration;
 mod profile;
 
@@ -83,6 +85,9 @@ impl Backend {
                     }
                     None
                 } else {
+                    #[cfg(target_os = "macos")]
+                    discovery::load_system_fonts(&mut db);
+                    #[cfg(not(target_os = "macos"))]
                     db.load_system_fonts();
                     // fontdb's system discovery intentionally excludes Android.
                     #[cfg(target_os = "android")]

@@ -673,3 +673,71 @@ fn failed_block_retain_rolls_back_partial_ownership_and_unchanged_capture_reuses
     assert!(bound(&env, pixel_id).is_none());
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
 }
+
+// spec: GFX-SHADER-3, GFX-CACHE-5
+#[test]
+fn repeated_programs_share_translation_but_keep_distinct_objects() {
+    let mut m = machine();
+    let mut env = env(&mut m);
+    let (device, _, _, _) = super::super::tests::setup(&mut env);
+    for (tokens, stage) in [(VS, Stage::Vertex), (PS, Stage::Pixel)] {
+        let first = shader_object(&mut env, device, tokens, stage);
+        let second = shader_object(&mut env, device, tokens, stage);
+        assert_ne!(first, second);
+        let a = shader(&env, first).unwrap();
+        let b = shader(&env, second).unwrap();
+        assert_eq!(a.parsed.bytecode(), tokens);
+        assert_eq!(b.parsed.bytecode(), tokens);
+        assert!(Arc::ptr_eq(
+            a.translation.as_ref().unwrap(),
+            b.translation.as_ref().unwrap()
+        ));
+        assert_eq!(release(&mut env, first), 0);
+        assert!(shader(&env, second).is_some());
+        assert_eq!(release(&mut env, second), 0);
+    }
+    assert_eq!(env.ext.get::<State>().shader_translations.entries.len(), 2);
+}
+
+// spec: GFX-CACHE-5
+#[test]
+fn translation_cache_evicts_without_changing_retained_programs() {
+    let mut cache = TranslationCache::default();
+    let first = crate::shader::Shader::parse(PS).unwrap();
+    let retained = cache.translate(&first, None).unwrap();
+    for index in 0..256 {
+        let mut tokens = PS[..PS.len() - 1].to_vec();
+        // Comments change bytecode identity without changing the authored shader.
+        tokens.extend_from_slice(&[0x0001fffe, index, 0xffff]);
+        let parsed = crate::shader::Shader::parse(&tokens).unwrap();
+        assert_eq!(
+            cache.translate(&parsed, None).unwrap().source,
+            retained.source
+        );
+    }
+    assert_eq!(cache.entries.len(), 1);
+    let replacement = cache.translate(&first, None).unwrap();
+    assert!(!Arc::ptr_eq(&retained, &replacement));
+    assert_eq!(retained.source, replacement.source);
+}
+
+// spec: GFX-CACHE-5
+#[test]
+fn translation_cache_bounds_large_bytecode_payloads() {
+    let mut cache = TranslationCache::default();
+    for index in 0..40 {
+        let mut tokens = PS[..PS.len() - 1].to_vec();
+        for _ in 0..2 {
+            tokens.push((32_000 << 16) | 0xfffe);
+            tokens.extend(std::iter::repeat_n(index, 32_000));
+        }
+        tokens.push(0xffff);
+        let shader = crate::shader::Shader::parse(&tokens).unwrap();
+        cache.translate(&shader, None).unwrap();
+        assert!(cache.bytes <= 8 * 1024 * 1024);
+    }
+    assert!(
+        cache.entries.len() < 40,
+        "byte budget must evict before the entry limit"
+    );
+}

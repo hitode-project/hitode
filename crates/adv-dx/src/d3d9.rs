@@ -125,6 +125,7 @@ pub struct State {
     copy: bool,
     shader_caps: ShaderCaps,
     shader_stats: ShaderStats,
+    shader_translations: shaders::TranslationCache,
     shader_cache: Option<std::path::PathBuf>,
 }
 /// Shader model capability gates. SM2 passed its differential fixtures and the
@@ -327,6 +328,7 @@ pub fn install<B: Backend>(
         copy: true,
         shader_caps: ShaderCaps::default(),
         shader_stats: ShaderStats::default(),
+        shader_translations: shaders::TranslationCache::default(),
         shader_cache: None,
     });
     Ok(())

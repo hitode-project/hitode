@@ -15,6 +15,44 @@ const IID_PIXEL: Iid = [
     0xdc, 0xdb, 0x3b, 0x6d, 0x02, 0x5b, 0x15, 0x44, 0xb8, 0x52, 0xce, 0x5e, 0x8b, 0xcc, 0xb2, 0x89,
 ];
 
+#[derive(Default)]
+pub(super) struct TranslationCache {
+    entries: BTreeMap<Vec<u32>, Arc<crate::shader::Translation>>,
+    bytes: usize,
+}
+impl TranslationCache {
+    fn translate(
+        &mut self,
+        shader: &crate::shader::Shader,
+        directory: Option<&std::path::Path>,
+    ) -> Result<Arc<crate::shader::Translation>, String> {
+        if let Some(translation) = self.entries.get(shader.bytecode()) {
+            return Ok(Arc::clone(translation));
+        }
+        let translation = Arc::new(
+            match directory {
+                Some(directory) => shader.translate_cached(directory),
+                None => shader.translate(),
+            }
+            .map_err(|error| error.to_string())?,
+        );
+        let bytes = shader.bytecode().len() * 4
+            + translation.source.len()
+            + translation.samplers.len() * std::mem::size_of::<crate::shader::SamplerBinding>();
+        const MAX_BYTES: usize = 8 * 1024 * 1024;
+        if bytes <= MAX_BYTES {
+            if self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
+                self.entries.clear();
+                self.bytes = 0;
+            }
+            self.entries
+                .insert(shader.bytecode().to_vec(), Arc::clone(&translation));
+            self.bytes += bytes;
+        }
+        Ok(translation)
+    }
+}
+
 pub(super) struct Shader {
     pub pointer: u32,
     pub device: Id,
@@ -181,12 +219,10 @@ fn create_shader(
             return INVALID;
         }
     };
-    let translation = match env.ext.get::<State>().shader_cache.as_deref() {
-        Some(directory) => parsed.translate_cached(directory),
-        None => parsed.translate(),
-    }
-    .map(Arc::new)
-    .map_err(|e| e.to_string());
+    let state = env.ext.get_mut::<State>();
+    let translation = state
+        .shader_translations
+        .translate(&parsed, state.shader_cache.as_deref());
     let translated = translation.is_ok();
     let model = match (parsed.version.major, parsed.version.minor) {
         (1, minor) => minor as usize - 1,
