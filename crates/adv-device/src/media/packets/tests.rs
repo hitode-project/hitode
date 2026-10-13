@@ -6,109 +6,12 @@ const HEIGHT: u32 = 48;
 const FRAMES: i64 = 10;
 const RATE: i32 = 22050;
 
-/// Encode a small WMV2 + WMA2 ASF file, as Windows Media 8 tools wrote them.
+/// Authored grey ramp plus sine wave, generated outside the decode-only player:
+/// ffmpeg -f lavfi -i "nullsrc=size=64x48:rate=10:duration=1,geq=lum='40+16*N':cb=128:cr=128"
+/// -f lavfi -i "sine=frequency=440:sample_rate=22050:duration=1"
+/// -c:v wmv2 -b:v 400k -c:a wmav2 -b:a 32k -ar 22050 -ac 1 -flags +global_header -f asf ramp.wmv
 fn asf_fixture() -> Vec<u8> {
-    ff::init().unwrap();
-    let path = std::env::temp_dir().join(format!("adv-device-packets-{}.wmv", std::process::id()));
-    let mut output = format::output_as(&path, "asf").unwrap();
-
-    let video_codec = ff::encoder::find(codec::Id::WMV2).unwrap();
-    let mut video = codec::Context::new_with_codec(video_codec)
-        .encoder()
-        .video()
-        .unwrap();
-    video.set_width(WIDTH);
-    video.set_height(HEIGHT);
-    video.set_format(format::Pixel::YUV420P);
-    video.set_time_base((1, 10));
-    video.set_frame_rate(Some((10, 1)));
-    video.set_bit_rate(400_000);
-    video.set_flags(codec::flag::Flags::GLOBAL_HEADER);
-    let mut video = video.open_as(video_codec).unwrap();
-
-    let audio_codec = ff::encoder::find(codec::Id::WMAV2).unwrap();
-    let mut audio = codec::Context::new_with_codec(audio_codec)
-        .encoder()
-        .audio()
-        .unwrap();
-    audio.set_rate(RATE);
-    audio.set_channel_layout(ff::ChannelLayout::MONO);
-    audio.set_format(format::Sample::F32(format::sample::Type::Planar));
-    audio.set_bit_rate(32_000);
-    audio.set_time_base((1, RATE));
-    audio.set_flags(codec::flag::Flags::GLOBAL_HEADER);
-    let mut audio = audio.open_as(audio_codec).unwrap();
-
-    output
-        .add_stream(video_codec)
-        .unwrap()
-        .set_parameters(&video);
-    output
-        .add_stream(audio_codec)
-        .unwrap()
-        .set_parameters(&audio);
-    output.write_header().unwrap();
-    let (video_tb, audio_tb) = (
-        output.stream(0).unwrap().time_base(),
-        output.stream(1).unwrap().time_base(),
-    );
-
-    let drain_video = |encoder: &mut ff::encoder::Video, output: &mut format::context::Output| {
-        let mut packet = ff::Packet::empty();
-        while encoder.receive_packet(&mut packet).is_ok() {
-            packet.set_stream(0);
-            packet.rescale_ts((1, 10), video_tb);
-            packet.write_interleaved(output).unwrap();
-        }
-    };
-    for i in 0..FRAMES {
-        let mut picture = frame::Video::new(format::Pixel::YUV420P, WIDTH, HEIGHT);
-        let luma = 40 + i as u8 * 16;
-        for plane in 0..3 {
-            let fill = if plane == 0 { luma } else { 128 };
-            picture.data_mut(plane).fill(fill);
-        }
-        picture.set_pts(Some(i));
-        video.send_frame(&picture).unwrap();
-        drain_video(&mut video, &mut output);
-    }
-    video.send_eof().unwrap();
-    drain_video(&mut video, &mut output);
-
-    let drain_audio = |encoder: &mut ff::encoder::Audio, output: &mut format::context::Output| {
-        let mut packet = ff::Packet::empty();
-        while encoder.receive_packet(&mut packet).is_ok() {
-            packet.set_stream(1);
-            packet.rescale_ts((1, RATE), audio_tb);
-            packet.write_interleaved(output).unwrap();
-        }
-    };
-    let chunk = audio.frame_size() as usize;
-    let total = RATE as usize; // one second
-    let mut at = 0;
-    while at < total {
-        let mut samples = frame::Audio::new(
-            format::Sample::F32(format::sample::Type::Planar),
-            chunk,
-            ff::ChannelLayout::MONO,
-        );
-        samples.set_rate(RATE as u32);
-        let plane = samples.plane_mut::<f32>(0);
-        for (n, value) in plane.iter_mut().enumerate() {
-            *value = ((at + n) as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.5;
-        }
-        samples.set_pts(Some(at as i64));
-        audio.send_frame(&samples).unwrap();
-        drain_audio(&mut audio, &mut output);
-        at += chunk;
-    }
-    audio.send_eof().unwrap();
-    drain_audio(&mut audio, &mut output);
-    output.write_trailer().unwrap();
-    drop(output);
-    let bytes = std::fs::read(&path).unwrap();
-    let _ = std::fs::remove_file(&path);
-    bytes
+    include_bytes!("ramp.wmv").to_vec()
 }
 
 #[test]
