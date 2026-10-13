@@ -289,7 +289,7 @@ fn native_disposition_is_cancellable_and_invalid_setters_preserve_bytes() {
     );
     for (replace, root_handle, length, status) in [
         (0, 0, 11, 0xc0000004u32),
-        (1, 0, 24, 0xc00000bb),
+        (1, 0, 24, 0xc000000d),
         (0, 1, 24, 0xc00000bb),
     ] {
         machine.cpu.write(DATA, &[0; 24]).unwrap();
@@ -522,4 +522,186 @@ fn live_mutation_hooks_change_parameters_suspend_and_report_failures() {
         hooks(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
         hooks(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
     }
+}
+
+#[test]
+fn move_ex_replaces_a_save_without_changing_live_source_identity() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("authored move", PARK_ADDR, &[], 65536)
+        .unwrap();
+    let dir = root.join("data/overlay");
+    std::fs::write(dir.join("source.dat"), b"new save").unwrap();
+    std::fs::write(dir.join("target.dat"), b"old save").unwrap();
+    let h =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "source.dat", 0x80000000, 3, 7);
+    let identity = machine
+        .sys
+        .objects
+        .host::<crate::FileObj>(h)
+        .unwrap()
+        .file
+        .cached_identity();
+    assert_eq!(
+        returned(move_ex(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            Some("target.dat".into()),
+            8
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 183);
+    assert_eq!(std::fs::read(dir.join("target.dat")).unwrap(), b"old save");
+    assert_eq!(
+        returned(move_ex(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            Some("target.dat".into()),
+            9
+        )),
+        1
+    );
+    assert!(!dir.join("source.dat").exists());
+    assert_eq!(std::fs::read(dir.join("target.dat")).unwrap(), b"new save");
+    let owner = machine.sys.objects.host::<crate::FileObj>(h).unwrap();
+    assert_eq!(owner.file.cached_identity(), identity);
+    assert_eq!(owner.guest_path, r"C:\Game\target.dat");
+    crate::ntdll::file::close(&mut env(&mut machine), Handle(h));
+    assert_eq!(machine.sys.objects.all_hosts::<crate::FileObj>().count(), 0);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn move_ex_refuses_live_destination_and_unsupported_flags_before_mutation() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("authored move failures", PARK_ADDR, &[], 65536)
+        .unwrap();
+    let dir = root.join("data/overlay");
+    std::fs::write(dir.join("source.dat"), b"new").unwrap();
+    std::fs::write(dir.join("target.dat"), b"old").unwrap();
+    let h =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "target.dat", 0x80000000, 3, 7);
+    assert_eq!(
+        returned(move_ex(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            Some("target.dat".into()),
+            1
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 5);
+    crate::ntdll::file::close(&mut env(&mut machine), Handle(h));
+    for (target, flags, error) in [
+        (None, 0, 87),
+        (None, 4, 50),
+        (Some("target.dat"), 6, 87),
+        (Some("target.dat"), 0x40, 87),
+        (Some("target.dat"), 32, 50),
+    ] {
+        assert_eq!(
+            returned(move_ex(
+                &mut env(&mut machine),
+                "source.dat".into(),
+                target.map(str::to_owned),
+                flags
+            )),
+            0
+        );
+        assert_eq!(last(&mut machine), error);
+    }
+    assert_eq!(std::fs::read(dir.join("source.dat")).unwrap(), b"new");
+    assert_eq!(std::fs::read(dir.join("target.dat")).unwrap(), b"old");
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn move_ex_aw_exports_move_files_and_directories() {
+    for wide in [false, true] {
+        let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+        let dir = root.join("data/overlay");
+        let source = if wide { "保存" } else { "save" };
+        let target = if wide { "新保存" } else { "new-save" };
+        std::fs::create_dir(dir.join(source)).unwrap();
+        std::fs::write(dir.join(source).join("slot.dat"), b"save").unwrap();
+        for (offset, name) in [(0, source), (128, target)] {
+            let bytes: Vec<u8> = if wide {
+                name.encode_utf16()
+                    .chain([0])
+                    .flat_map(u16::to_le_bytes)
+                    .collect()
+            } else {
+                [name.as_bytes(), &[0]].concat()
+            };
+            machine.cpu.write(DATA + offset, &bytes).unwrap();
+        }
+        let api = machine
+            .resolve_import(
+                "kernel32.dll",
+                if wide { "MoveFileExW" } else { "MoveFileExA" },
+            )
+            .unwrap();
+        let mut code = Asm::new(CODE);
+        code.push_imm(8)
+            .push_imm(DATA + 128)
+            .push_imm(DATA)
+            .call(api)
+            .mov_mem_eax(DATA + 256);
+        code.bytes.extend([0x31, 0xc0]);
+        code.ret();
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        machine
+            .spawn("authored move export", CODE, &[], 65536)
+            .unwrap();
+        let result = machine.run_virtual(1_000_000);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        assert_eq!(machine.cpu.read_u32(DATA + 256).unwrap(), 1);
+        assert!(!dir.join(source).exists());
+        assert_eq!(
+            std::fs::read(dir.join(target).join("slot.dat")).unwrap(),
+            b"save"
+        );
+        drop(machine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn move_copy_flushes_destination_and_keeps_source_if_delete_is_denied() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("authored copy move", PARK_ADDR, &[], 65536)
+        .unwrap();
+    let dir = root.join("data/overlay");
+    std::fs::write(dir.join("source.dat"), b"new save").unwrap();
+    let h =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "source.dat", 0x80000000, 3, 1);
+    assert_eq!(
+        returned(super::super::copy::move_copy(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "target.dat".into(),
+            10
+        )),
+        1
+    );
+    assert_eq!(std::fs::read(dir.join("target.dat")).unwrap(), b"new save");
+    assert!(dir.join("source.dat").exists());
+    crate::ntdll::file::close(&mut env(&mut machine), Handle(h));
+    assert_eq!(
+        returned(super::super::copy::move_copy(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "target.dat".into(),
+            11
+        )),
+        1
+    );
+    assert!(!dir.join("source.dat").exists());
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
 }

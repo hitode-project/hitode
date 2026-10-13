@@ -48,10 +48,24 @@ struct Copy {
     copied: u64,
     count: u32,
     written: u32,
+    moving: Option<String>,
+    write_through: bool,
 }
 
 impl Copy {
     fn finish(self, env: &mut Env<'_>, result: Result<(), u32>) -> Outcome {
+        if result.is_ok() && self.write_through {
+            operations::flush(
+                env,
+                self.target,
+                Box::new(move |env, result| self.close(env, result)),
+            )
+        } else {
+            self.close(env, result)
+        }
+    }
+
+    fn close(self, env: &mut Env<'_>, result: Result<(), u32>) -> Outcome {
         operations::close(
             env,
             self.target,
@@ -63,7 +77,10 @@ impl Copy {
                     Box::new(move |env, source| {
                         self.scratch.free(env);
                         match result.and(source) {
-                            Ok(()) => Outcome::Return(1),
+                            Ok(()) => match self.moving {
+                                Some(source) => super::mutation::delete_copied(env, source),
+                                None => Outcome::Return(1),
+                            },
                             Err(status) => failed(env, status),
                         }
                     }),
@@ -197,6 +214,21 @@ pub(in crate::kernel32) fn copy(
     target: String,
     fail_if_exists: bool,
 ) -> Outcome {
+    copy_options(env, source, target, fail_if_exists, false, false)
+}
+
+pub(super) fn move_copy(env: &mut Env<'_>, source: String, target: String, flags: u32) -> Outcome {
+    copy_options(env, source, target, flags & 1 == 0, true, flags & 8 != 0)
+}
+
+fn copy_options(
+    env: &mut Env<'_>,
+    source: String,
+    target: String,
+    fail_if_exists: bool,
+    moving: bool,
+    write_through: bool,
+) -> Outcome {
     let source = env.ext.get::<Win32>().vfs.normalize(&source);
     let target = env.ext.get::<Win32>().vfs.normalize(&target);
     if source.eq_ignore_ascii_case(&target) {
@@ -230,6 +262,7 @@ pub(in crate::kernel32) fn copy(
             return Outcome::Return(0);
         }
     }
+    let move_source = moving.then(|| source.clone());
     operations::open(
         env,
         &source,
@@ -301,6 +334,8 @@ pub(in crate::kernel32) fn copy(
                                         copied: 0,
                                         count: 0,
                                         written: 0,
+                                        moving: move_source,
+                                        write_through,
                                     };
                                     match target_id {
                                         Ok(target_id) if target_id == source_id => {

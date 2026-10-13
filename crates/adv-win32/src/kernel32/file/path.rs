@@ -476,6 +476,36 @@ fn move_w(env: &mut Env<'_>, source: WideStr, target: WideStr) -> Result<Outcome
     let t = wide(env, target)?;
     Ok(copy_file(env, s, t, true, true))
 }
+#[win32(kernel32, name = "MoveFileExA", level = implement)]
+fn move_ex_a(
+    env: &mut Env<'_>,
+    source: AnsiStr,
+    target: AnsiStr,
+    flags: u32,
+) -> Result<Outcome, MemFault> {
+    let source = ansi(env, source)?;
+    let target = if target.0.is_null() {
+        None
+    } else {
+        Some(ansi(env, target)?)
+    };
+    Ok(native::mutation::move_ex(env, source, target, flags))
+}
+#[win32(kernel32, name = "MoveFileExW", level = implement)]
+fn move_ex_w(
+    env: &mut Env<'_>,
+    source: WideStr,
+    target: WideStr,
+    flags: u32,
+) -> Result<Outcome, MemFault> {
+    let source = wide(env, source)?;
+    let target = if target.0.is_null() {
+        None
+    } else {
+        Some(wide(env, target)?)
+    };
+    Ok(native::mutation::move_ex(env, source, target, flags))
+}
 pub(super) fn register(reg: &mut Registry) {
     name::register(reg);
     for api in [
@@ -509,6 +539,8 @@ pub(super) fn register(reg: &mut Registry) {
         copy_w_ABI,
         move_a_ABI,
         move_w_ABI,
+        move_ex_a_ABI,
+        move_ex_w_ABI,
     ] {
         reg.register(api);
     }
