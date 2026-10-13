@@ -284,16 +284,21 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
                                 host.exit.take().flatten(),
                             )
                         });
+                        let elapsed = started_at.elapsed();
+                        let summary = match &result {
+                            Ok(finished) => finished.summary.clone(),
+                            Err(error) => adv_shell::error_summary(error, elapsed),
+                        };
                         if let Err(error) = finished_window
                             .state::<Mutex<Library>>()
                             .lock()
                             .unwrap()
                             .finished(
                                 &id,
-                                started_at.elapsed().as_secs() as u32,
+                                elapsed.as_secs() as u32,
                                 LastRun {
                                     ended: library::now(),
-                                    summary: result.as_ref().ok().map(|f| f.summary.clone()),
+                                    summary: Some(summary.clone()),
                                     error: result.as_ref().err().cloned(),
                                 },
                             )
@@ -304,11 +309,11 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
                             Ok(finished) => Finished::Exit {
                                 game_id: id,
                                 exit_code: finished.exit_code,
-                                summary: finished.summary,
+                                summary,
                             },
                             Err(error) => Finished::Error {
                                 game_id: id,
-                                summary: adv_shell::error_summary(&error, started_at.elapsed()),
+                                summary,
                                 error,
                             },
                         };
