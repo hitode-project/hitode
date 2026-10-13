@@ -173,6 +173,7 @@ fn minification_and_clamped_first_level_sample_written_lower_mips() {
 }
 
 #[test]
+// spec: DEV-DEPTH-2
 fn replacing_a_public_target_image_revalidates_the_depth_attachment() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let original = gpu.target(4, 4, true).unwrap();

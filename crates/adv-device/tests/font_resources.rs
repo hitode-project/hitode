@@ -43,6 +43,7 @@ fn glyph() -> GlyphRequest {
 }
 
 #[test]
+// spec: DEV-FONT-1
 fn loaded_faces_change_real_matching_and_cache_then_retire_with_selected_fonts() {
     let _lock = RESOURCES.lock().unwrap();
     let mut text = Text::default();

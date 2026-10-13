@@ -202,6 +202,7 @@ impl Fixture {
 }
 
 #[test]
+// spec: DEV-UPDATE-1
 fn tail_mips_upload_to_gpu_and_dynamic_shadow_and_clean_source_is_a_noop() {
     let mut f = Fixture::new();
     let source = f.texture(8, 4, 4, 2, 22);
@@ -254,6 +255,7 @@ fn tail_mips_upload_to_gpu_and_dynamic_shadow_and_clean_source_is_a_noop() {
 }
 
 #[test]
+// spec: DEV-UPDATE-1
 fn invalid_pool_format_mip_shape_and_locks_or_dc_preserve_source_marks() {
     let mut f = Fixture::new();
     let source = f.texture(8, 4, 4, 2, 22);
@@ -309,6 +311,7 @@ fn invalid_pool_format_mip_shape_and_locks_or_dc_preserve_source_marks() {
 }
 
 #[test]
+// spec: DEV-UPDATE-1
 fn inaccessible_staging_and_late_shadow_failure_restore_marks_for_retry() {
     let mut f = Fixture::new();
     let source = f.texture(4, 4, 3, 2, 21);
@@ -361,6 +364,7 @@ fn inaccessible_staging_and_late_shadow_failure_restore_marks_for_retry() {
 }
 
 #[test]
+// spec: DEV-UPDATE-1
 fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
     let mut f = Fixture::new();
     let source = f.texture(4, 4, 3, 2, 22);
@@ -448,6 +452,7 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
 }
 
 #[test]
+// spec: DEV-UPDATE-2
 fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
     let mut f = Fixture::new();
     let source = f.texture(8, 4, 1, 2, 21);
@@ -499,6 +504,7 @@ fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
 }
 
 #[test]
+// spec: DEV-UPDATE-4
 fn partial_dirty_marks_copy_matching_tail_mips_and_no_dirty_lock_stays_clean() {
     let mut f = Fixture::new();
     let source = f.texture(16, 8, 5, 2, 21);
@@ -629,6 +635,7 @@ fn updated_render_target_texture_is_visible_to_get_render_target_data() {
 }
 
 #[test]
+// spec: DEV-UPDATE-2
 fn successive_sizes_formats_and_mip_chains_keep_original_shadow_and_gpu_pixels() {
     let mut f = Fixture::new();
     for (width, height, levels, format) in

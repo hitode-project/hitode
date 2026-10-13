@@ -2568,6 +2568,7 @@ mod tests {
         assert_eq!(muted[10..], [0.0; 10]);
     }
     #[test]
+    // spec: DEV-AUDIO-1
     fn stop_seek_and_buffer_reuse_cannot_emit_an_older_voice_generation() {
         let mut m = machine();
         let format = Format {
@@ -2699,6 +2700,7 @@ mod tests {
         assert_eq!(position(&mut m, voice), 500);
     }
     #[test]
+    // spec: DEV-AUDIO-1
     fn releasing_a_voice_cannot_leak_its_queue_into_the_next_buffer() {
         let mut m = machine();
         let format = Format {
@@ -2742,6 +2744,7 @@ mod tests {
         assert_eq!(out, [-0.25; 20]);
     }
     #[test]
+    // spec: DEV-AUDIO-2
     fn a_single_release_reclaims_its_mapping_after_a_saturated_command_lane_recovers() {
         let mut m = machine();
         let voice = buffer(
@@ -2791,6 +2794,7 @@ mod tests {
         );
     }
     #[test]
+    // spec: DEV-AUDIO-2
     fn saturated_controls_preserve_buffer_state_and_stop_notifications() {
         let mut m = machine();
         let b = buffer(
@@ -2920,6 +2924,7 @@ mod tests {
         assert_eq!(voice.cursor(0, generation), Some(100));
     }
     #[test]
+    // spec: DEV-AUDIO-2
     fn notifications_wrap_and_natural_stop_signal_real_events() {
         let mut m = machine();
         let b = buffer(

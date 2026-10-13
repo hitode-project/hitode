@@ -279,6 +279,7 @@ fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
 }
 
 #[test]
+// spec: DEV-DEPTH-1
 fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     for format in [

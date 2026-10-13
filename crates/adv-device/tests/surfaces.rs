@@ -667,6 +667,7 @@ fn shrink_modes_combine_removed_pixels_before_format_conversion() {
 }
 
 #[test]
+// spec: DEV-FRAME-2
 fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels() {
     for format in [
         PixelFormat::Bgra32,

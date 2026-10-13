@@ -6,6 +6,7 @@ use adv_runtime::api;
 use pipeline::*;
 
 #[test]
+// spec: DEV-FRAME-1
 fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces() {
     for mailbox in [false, true] {
         let mut f = fixture(true, 4, 2, false);
@@ -58,6 +59,7 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
 }
 
 #[test]
+// spec: DEV-FRAME-1
 fn gdi_and_directdraw_render_guest_pixels_to_the_same_presenter() {
     for ddraw in [false, true] {
         for unicorn in [false, true] {
@@ -111,6 +113,7 @@ fn selected_bitmaps_cannot_be_deleted_and_handles_can_be_released() {
 }
 
 #[test]
+// spec: DEV-FRAME-2
 fn directdraw_locking_enforces_busy_and_unlock_states() {
     let mut f = fixture(true, 64, 32, false);
     f.run().unwrap();

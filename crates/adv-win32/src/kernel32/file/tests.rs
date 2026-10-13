@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 #[test]
+// spec: DEV-DISC-3, DEV-DISC-6, DEV-DISC-7
 fn optical_volume_file_copy_and_mapping_share_read_only_media() {
     let (mut machine, root) = fixture("optical");
     let image = root.join("media.iso");

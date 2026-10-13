@@ -379,6 +379,7 @@ fn hot_switch_new_source_frequency_seek_release_and_owned_pcm_allocate_only_off_
 }
 
 #[test]
+// spec: DEV-AUDIO-1
 fn stream_reuse_silences_old_generation_but_full_preloaded_static_loops_keep_their_tail() {
     let control = AudioControl::new(false);
     let view = Arc::new(View((0..900).map(|_| AtomicU8::new(192)).collect()));

@@ -271,6 +271,7 @@ fn authored_outline_gray_levels_mono_packing_and_transforms_are_real() {
 }
 
 #[test]
+// spec: DEV-FONT-1
 fn em_cell_sizing_counted_encoding_and_font_width_use_one_selected_font() {
     let (mut text, mut font) = loaded();
     let metrics = text.metrics(&font).unwrap();

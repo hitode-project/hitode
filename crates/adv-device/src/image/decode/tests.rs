@@ -38,6 +38,7 @@ fn dds(format: u32, block: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+// spec: DEV-IMAGE-1
 fn image_metadata_and_bgra_decode_match_authored_native_samples_and_reject_truncation() {
     // D3DX9_43 native evidence is ignored target/.../d3dx-texture-native/native.jsonl:
     // RGB22/RGBA21/P8=41/L8=50/A8L8=51, source metadata stays unexpanded.
