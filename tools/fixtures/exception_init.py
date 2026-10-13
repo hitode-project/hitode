@@ -24,6 +24,7 @@ CASES = tuple(range(14))
 RECOVERABLE_CASES = tuple(case for case in range(10) if case != 5)
 
 
+# spec: WIN32-EXC-2, WIN32-EXC-4, WIN32-EXC-5
 def expected(case: int) -> list[int]:
     """Expected observations; RF belongs to faults, DF to saved context only."""
     if case not in CASES:

@@ -97,6 +97,7 @@ pub(crate) fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     }
 }
 
+// spec: MEDIA-FAIL-1
 #[test]
 fn disabled_or_invalid_source_rejects_connection_without_publishing_streams() {
     let mut m = machine();
