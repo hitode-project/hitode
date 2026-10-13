@@ -1,5 +1,5 @@
 //! Full-state region boundary benchmark, including guest work and guarded stack
-//! accesses. This is not the minimal Tail ABI microbenchmark in architecture.md.
+//! accesses. This is not the minimal Tail ABI microbenchmark.
 #[path = "../tests/support/mod.rs"]
 pub(crate) mod oracle_support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
