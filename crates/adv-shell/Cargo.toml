@@ -31,9 +31,11 @@ wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl
 pollster = "0.4"
 log = "0.4"
 objc2 = "0.6.4"
+block2 = "0.6.2"
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-foundation = "0.3.2"
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
 
 [dev-dependencies]
 pollster = "0.4"

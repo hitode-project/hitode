@@ -735,7 +735,7 @@ impl Window {
         *self.hub.dialogs.sink.borrow_mut() = Some(sink);
     }
     pub fn set_dialogs(&mut self, set: &DialogSet) -> Result<(), String> {
-        self.dialogs.update(
+        self.dialogs.borrow_mut().update(
             self.mtm,
             &self.target,
             &self.hub,
@@ -743,6 +743,9 @@ impl Window {
             set,
             self.hidden,
         );
+        self.hub
+            .main_enabled
+            .set(self.dialogs.borrow().main_enabled());
         Ok(())
     }
 }
