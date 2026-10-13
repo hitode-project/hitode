@@ -1,4 +1,5 @@
 //! macOS game ownership on Tauri's main AppKit thread.
+use crate::library::{self, Library};
 use crate::overlay::OverlayState;
 use adv_shell::overlay::Target;
 use adv_shell::{
@@ -23,7 +24,7 @@ use objc2_foundation::{
     NSAppleEventManager, NSNotificationCenter, NSObjectProtocol, NSOperationQueue,
 };
 use serde::Serialize;
-use std::{cell::RefCell, path::PathBuf};
+use std::{cell::RefCell, sync::Mutex, time::Instant};
 use tauri::{Emitter, Manager, WebviewWindow};
 
 /// `kCoreEventClass` and `kAEQuitApplication`.
@@ -228,24 +229,28 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
 #[serde(untagged)]
 enum Finished {
     Exit {
+        #[serde(rename = "gameId")]
+        game_id: String,
         #[serde(rename = "exitCode")]
         exit_code: u8,
         /// Failure and frame timing for the anonymous report.
         summary: adv_report::RunSummary,
     },
     Error {
+        #[serde(rename = "gameId")]
+        game_id: String,
         error: String,
     },
 }
 
 #[tauri::command]
-pub async fn start_game(
-    window: WebviewWindow,
-    exe: PathBuf,
-    data_dir: PathBuf,
-    install_dir: Option<PathBuf>,
-    cdroms: Option<Vec<(char, PathBuf)>>,
-) -> Result<(), String> {
+pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String> {
+    let (exe, data_dir, codepage) = window
+        .state::<Mutex<Library>>()
+        .lock()
+        .unwrap()
+        .launch(&id)
+        .map_err(|e| e.to_string())?;
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let host_window = window.clone();
     window
@@ -256,12 +261,12 @@ pub async fn start_game(
                     return Err("a game is already running".into());
                 }
                 let mut options = Options::new(exe, data_dir);
-                options.install_dir = install_dir;
-                options.cdroms = cdroms.unwrap_or_default();
+                options.codepage = Some(codepage);
                 options.audio = true;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
+                let started_at = Instant::now();
                 let session = Session::new(
                     view,
                     options,
@@ -273,12 +278,21 @@ pub async fn start_game(
                             host.focus(Target::Overlay);
                             (std::mem::take(&mut host.close_window), host.exit.take())
                         });
+                        if let Err(error) = finished_window
+                            .state::<Mutex<Library>>()
+                            .lock()
+                            .unwrap()
+                            .finished(&id, library::now(), started_at.elapsed().as_secs() as u32)
+                        {
+                            eprintln!("could not save play session: {error}");
+                        }
                         let payload = match result {
                             Ok(finished) => Finished::Exit {
+                                game_id: id,
                                 exit_code: finished.exit_code,
                                 summary: finished.summary,
                             },
-                            Err(error) => Finished::Error { error },
+                            Err(error) => Finished::Error { game_id: id, error },
                         };
                         let _ = finished_window.emit("game_finished", payload);
                         if let Some(code) = exit {

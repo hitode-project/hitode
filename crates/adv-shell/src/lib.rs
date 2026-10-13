@@ -23,8 +23,17 @@ pub struct Finished {
 
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// The ANSI code page `--codepage auto` would pick for this executable.
+pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
+    let bytes = std::fs::read(exe)?;
+    Ok(adv_runtime::codepage::detect(
+        &exe.file_name().unwrap_or_default().to_string_lossy(),
+        &bytes,
+    ))
+}
 
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 

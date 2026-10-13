@@ -2,6 +2,8 @@
 //! and, while a game runs, a transparent in-game overlay above the native game
 //! view that adv-shell presents into (decision 25).
 #[cfg(desktop)]
+mod library;
+#[cfg(desktop)]
 mod menu;
 pub mod overlay;
 mod report;
@@ -41,7 +43,12 @@ pub fn run() {
     let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
     #[cfg(desktop)]
     let builder = builder
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            use tauri::Manager;
+            app.manage(std::sync::Mutex::new(library::Library::load(
+                app.path().app_data_dir()?,
+            )?));
             let menu = menu::build(app.handle())?;
             if cfg!(target_os = "macos") {
                 app.set_menu(menu)?;
@@ -62,7 +69,15 @@ pub fn run() {
                 overlay::set_overlay_input,
                 report::report_base,
                 report::save_report,
-                menu::set_pause_available
+                menu::set_pause_available,
+                library::library_pick_folder,
+                library::library_list,
+                library::library_inspect,
+                library::library_scan,
+                library::library_add,
+                library::library_update,
+                library::library_remove,
+                library::library_restore
             ]);
     #[cfg(all(desktop, not(target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -71,7 +86,15 @@ pub fn run() {
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,
-        menu::set_pause_available
+        menu::set_pause_available,
+        library::library_pick_folder,
+        library::library_list,
+        library::library_inspect,
+        library::library_scan,
+        library::library_add,
+        library::library_update,
+        library::library_remove,
+        library::library_restore
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
