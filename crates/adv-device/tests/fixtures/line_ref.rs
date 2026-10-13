@@ -1,5 +1,5 @@
 //! Authored D3D9 REF integer-line oracle; HAL state readback is not pixel semantics.
-//! Provenance: tools/fixtures/d3d9-lastpixel-native.md (15 integer templates, two states).
+//! Provenance: tools/fixtures/d3d9-lastpixel-native.c (15 integer templates, two states).
 //! Native source SHA256: A32779199DD3531701E09EFF571C25D6C180390AA378F6D333CDAB205C6C4110.
 pub struct Case {
     pub name: &'static str,

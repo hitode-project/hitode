@@ -1,3 +1,12 @@
+<#
+Build the authored x86 menu graph/resource fixture from menu_graph.c and menu_graph.rc.
+Checks cover recursive edits, popup metadata, ownership, child IDs, templates, and class menu resources.
+Inputs are synthetic menu resources; windows remain invisible and no interactive popup is opened.
+Run from the repository root: ./tools/fixtures/build-menu-graph.ps1
+Build requires LLVM and the Windows SDK; default output is target/menu-graph-tests.
+Run fixture_menu_graph.exe from that directory to write menu-graph.bin.
+Native/guest comparison: cargo test --release -p adv-runtime --test menu_graph -- --test-threads=1
+#>
 param([string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/menu-graph-tests'))
 $ErrorActionPreference='Stop'
 $OutputDirectory=[System.IO.Path]::GetFullPath($OutputDirectory)

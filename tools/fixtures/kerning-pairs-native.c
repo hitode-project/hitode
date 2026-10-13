@@ -1,4 +1,12 @@
-/* Authored no-window selected-font kerning boundary oracle. No font installation. */
+/*
+ * Authored x86 kerning boundary oracle using installed Arial at height -32 in a private memory DC.
+ * Inputs: null and bounded output buffers, sentinel bytes, and valid/invalid DCs.
+ * Checks cover pair counts, partial copies, guard preservation, and LastError.
+ * Run from the repository root: ./tools/fixtures/build-kerning-pairs-native.ps1
+ * The LLVM/Windows SDK build script runs the probe and prints numeric observations.
+ * Output: kerning-pairs-native.bin under target/kerning-pairs-native by default.
+ * No window is created and no font is installed.
+ */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 static DWORD values[64], used;

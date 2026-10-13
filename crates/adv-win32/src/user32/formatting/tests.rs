@@ -132,7 +132,7 @@ fn windows_mixed_strings_characters_integer_modifiers_and_guest_codepage_match_n
     machine
         .cpu
         .write(ansi, &[0xd6, 0xd0, 0xce, 0xc4, 0])
-        .unwrap(); // GBK 中文.
+        .unwrap(); // GBK U+4E2D U+6587.
     let count = invoke(
         &mut machine,
         "wvsprintfW",

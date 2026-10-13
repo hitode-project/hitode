@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn dbcs_trail_backslash_is_not_a_separator() {
         let c = Codec::new(932);
-        // "C:\表" where 表 = 95 5C: the only separator is at offset 2.
+        // Drive root followed by U+8868 (95 5C in CP932): the only separator is at offset 2.
         let s = [b'C', b':', b'\\', 0x95, 0x5c];
         assert_eq!(last_sep(&c, &s), Some(2));
         let s = [b'a', 0x95, 0x5c, b'.', b't', b'x', b't'];

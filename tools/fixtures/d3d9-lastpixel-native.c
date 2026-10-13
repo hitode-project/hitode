@@ -1,3 +1,13 @@
+/*
+ * Authored x86 LASTPIXEL oracle using a hidden offscreen window, without Present or game data.
+ * Inputs: line geometries, state values, diffuse colors, blending, and a D16 depth case.
+ * Build from the repository root: ./tools/fixtures/build-d3d9-lastpixel-native.ps1
+ * Add -Run to execute HAL and REF cases; LLVM and the Windows SDK are required.
+ * Default output: target/fixtures/d3d9-lastpixel-native.
+ * environment.json records toolchain details and hashes; native.jsonl records HRESULTs,
+ * state readback, device labels, pixel coordinates, and ARGB values after GetRenderTargetData.
+ * HAL and REF results are separate observations, not interchangeable expected output.
+ */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

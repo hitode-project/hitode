@@ -2,8 +2,14 @@
 """Compare the version hierarchy model with native Windows mixed conditions.
 
 This is a read-only host ABI probe, not an emulated CPU test. The model follows
-pal-win32/kernel32/osversion.rs, using the version observed by this process so
+adv-win32/src/kernel32/osversion.rs, using the version observed by this process so
 the comparison does not assume that Windows is the guest's Windows 7 persona.
+Inputs: this process's native version and mixed major/minor/service-pack comparisons.
+Output: JSON at target/version-condition-probe/report.json by default, with mismatch examples.
+Exit codes: 0 for agreement, 1 for mismatches, 2 for native API or setup failure.
+Run on Windows: python tools/performance/version_condition_probe.py
+Test: python -m unittest discover -s tools/performance/tests -p test_version_condition_probe.py -v
+The probe checks Boolean results and LastError without modifying host configuration.
 """
 from __future__ import annotations
 
