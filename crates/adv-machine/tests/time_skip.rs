@@ -83,6 +83,7 @@ fn move_wait(env: &mut adv_machine::Env<'_>) -> Outcome {
     }
 }
 
+// spec: PROC-CLOCK-1
 #[test]
 fn held_input_skips_sleep_and_explicit_timer_waits_on_both_clocks() {
     for jit in [false, true] {
@@ -119,6 +120,7 @@ fn release_is_observed_before_the_next_deadline_without_a_guest_message() {
     }
 }
 
+// spec: PROC-CLOCK-1
 #[test]
 fn synchronization_timeouts_and_paused_clocks_do_not_skip() {
     let (mut machine, _) = fixture(true, false, false, true, false);
@@ -131,6 +133,7 @@ fn synchronization_timeouts_and_paused_clocks_do_not_skip() {
     assert_eq!(paused.sys.clock.now_us(), before);
 }
 
+// spec: PROC-CLOCK-1
 #[test]
 fn runnable_signal_producer_runs_before_any_time_skip() {
     let (mut machine, _) = fixture(true, false, false, true, true);

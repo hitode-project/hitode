@@ -63,6 +63,7 @@ fn blocked_waiters(manual: bool, count: usize) -> (Machine<UnicornCpu>, u32) {
     (machine, event)
 }
 
+// spec: PROC-MACH-2
 #[test]
 fn auto_reset_grant_cannot_be_stolen_or_revoked_before_waiter_resumes() {
     let (mut machine, event) = blocked_waiters(false, 2);

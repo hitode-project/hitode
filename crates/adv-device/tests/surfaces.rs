@@ -237,6 +237,7 @@ fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     assert!(store.presenter.bgra.iter().all(|byte| *byte == 0));
 }
 
+// spec: PROC-DEV-1
 #[test]
 fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
     let mut parent = store();

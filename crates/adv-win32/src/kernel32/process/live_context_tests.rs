@@ -262,6 +262,7 @@ fn writes<B: Backend>(make: impl Fn() -> B) {
         }
     }
 }
+// spec: PROC-CREATE-4
 #[test]
 fn live_set_still_requires_an_external_suspend() {
     for jit in [false, true] {

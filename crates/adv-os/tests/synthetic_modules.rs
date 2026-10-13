@@ -765,6 +765,7 @@ fn generated_system_catalog_fits_the_reserved_arena_and_thunk_capacity() {
     assert!(m.sys.thunks.len() < adv_machine::layout::THUNK_CAP);
 }
 
+// spec: PROC-ISO-1
 #[test]
 fn family_system_images_share_addresses_and_keep_independent_bytes_and_references() {
     for jit in [false, true] {

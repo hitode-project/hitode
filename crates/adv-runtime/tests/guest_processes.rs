@@ -17,6 +17,7 @@ fn target_directory(root: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| root.join("target"))
 }
 
+// spec: PROC-ISO-1, PROC-CREATE-2, PROC-CREATE-3, PROC-MEM-1, PROC-HANDLE-1, PROC-SCHED-3
 #[test]
 fn isolated_processes_match_windows_and_survive_loader_exit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -112,6 +113,7 @@ fn isolated_processes_match_windows_and_survive_loader_exit() {
     }
 }
 
+// spec: PROC-CREATE-3
 #[test]
 #[ignore = "requires a local unmodified Microsoft Detours checkout and Visual Studio x86 tools"]
 fn upstream_detours_injects_before_entry_and_survives_parent_exit() {
