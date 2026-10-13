@@ -22,6 +22,7 @@ pub enum GpuBackend {
     Vulkan,
     Gl,
     Direct3D12,
+    Metal,
 }
 
 /// Whether sampled alpha is stored or implicitly one (RGBX color images).

@@ -4,7 +4,7 @@ mod control;
 mod frontend;
 #[cfg(any(windows, target_os = "macos"))]
 mod logging;
-#[cfg(all(windows, feature = "gpu"))]
+#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 mod native_gpu;
 mod performance;
 pub mod window;
@@ -270,7 +270,7 @@ impl Options {
             }
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
-        #[cfg(not(feature = "gpu"))]
+        #[cfg(not(any(feature = "gpu", target_os = "macos")))]
         if options.headless_gpu
             || options.d3d9_sm2
             || options.d3d9_sm3
@@ -649,7 +649,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
     );
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
         let versions = |counts: [u64; 7]| {
@@ -677,7 +677,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             shader_versions
         )
     };
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
     let gpu_diagnostics = "null";
     let mut codec = adv_runtime::vorbis::stats(&runtime.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),
@@ -866,7 +866,7 @@ fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Resu
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     if runtime.has_native_frame() {
         return capture_native_after_stop(runtime, wake);
     }
@@ -937,7 +937,7 @@ fn acknowledge_scene_gate(
     control::acknowledge(result);
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", target_os = "macos"))]
 fn capture_native_after_stop(
     runtime: &mut Runtime,
     wake: &window::WakeEvent,
@@ -1005,7 +1005,7 @@ fn run(options: Options) -> Result<u8, String> {
     if options.frame_budget && !options.headless {
         return Err("--frame-budget requires headless execution".into());
     }
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
@@ -1041,9 +1041,9 @@ fn run(options: Options) -> Result<u8, String> {
         options.hidden,
     )?;
     let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
     let mut worker = worker;
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
     {
         // Startup is the only UI-side GPU initialization. Guest submission has
         // not begun, so configuring the initially empty queue cannot race it.
@@ -1192,9 +1192,9 @@ fn run_execution(
     }
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     runtime.set_d3d9_shader_caps(options.d3d9_sm2, options.d3d9_sm3);
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
     runtime.machine.sys.stats.services_enabled =
         options.host_profile.is_some() || options.schedule_profile.is_some();
@@ -1232,11 +1232,11 @@ fn run_execution(
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
     }
-    #[cfg(feature = "gpu")]
-    if cfg!(windows) || options.headless_gpu {
-        #[cfg(windows)]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    if cfg!(windows) || (cfg!(target_os = "macos") && window.is_some()) || options.headless_gpu {
+        #[cfg(any(windows, target_os = "macos"))]
         let supplied_gpu = window.as_mut().and_then(|worker| worker.gpu.take());
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let supplied_gpu = None;
         let gpu = match supplied_gpu {
             Some(gpu) => gpu,
@@ -1837,7 +1837,7 @@ fn run_execution(
             }
         }
     }
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     runtime.cancel_pending_graphics();
     runtime.machine.sys.trace.flush();
     if options.profile {
@@ -1884,15 +1884,15 @@ fn run_execution(
             }
         }
     }
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", target_os = "macos"))]
     let native_frame = runtime.has_native_frame();
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
     let native_frame = false;
     if let Err(error) = runtime.machine.cpu.persist() {
         eprintln!("warning: {error}");
     }
     if native_frame {
-        #[cfg(feature = "gpu")]
+        #[cfg(any(feature = "gpu", target_os = "macos"))]
         if options.screenshot.is_some() || options.report.is_some() {
             capture_native_after_stop(&mut runtime, &wake)?;
         }

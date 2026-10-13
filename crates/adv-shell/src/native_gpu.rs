@@ -17,7 +17,7 @@ pub(crate) enum DrawResult {
     Reconfigure,
 }
 
-pub(crate) struct WindowPresenter {
+pub struct WindowPresenter {
     surface: wgpu::Surface<'static>,
     context: NativeContext,
     configuration: wgpu::SurfaceConfiguration,
@@ -29,8 +29,9 @@ pub(crate) struct WindowPresenter {
 impl WindowPresenter {
     /// HWND is owned by the calling UI thread and must outlive this presenter,
     /// including any temporary move to a backend configuration job.
+    #[cfg(windows)]
     unsafe fn surface(
-        hwnd: windows_sys::Win32::Foundation::HWND,
+        hwnd: *mut std::ffi::c_void,
         instance: &wgpu::Instance,
     ) -> Result<wgpu::Surface<'static>, String> {
         use std::num::NonZeroIsize;
@@ -59,13 +60,35 @@ impl WindowPresenter {
         Ok(surface)
     }
 
+    #[cfg(target_os = "macos")]
+    unsafe fn surface(
+        view: *mut std::ffi::c_void,
+        instance: &wgpu::Instance,
+    ) -> Result<wgpu::Surface<'static>, String> {
+        let view = std::ptr::NonNull::new(view).ok_or("null GPU view")?;
+        // SAFETY: the UI owner keeps NSView alive until all surface jobs finish.
+        unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(wgpu::rwh::AppKitDisplayHandle::new().into()),
+                raw_window_handle: wgpu::rwh::AppKitWindowHandle::new(view).into(),
+            })
+        }
+        .map_err(|error| error.to_string())
+    }
+
     pub(crate) async unsafe fn request(
-        hwnd: windows_sys::Win32::Foundation::HWND,
+        hwnd: *mut std::ffi::c_void,
         width: u32,
         height: u32,
         fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, Self), String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        #[cfg(target_os = "macos")]
+        let descriptor = wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..descriptor
+        };
+        let instance = wgpu::Instance::new(descriptor);
         let surface = unsafe { Self::surface(hwnd, &instance)? };
         let gpu =
             match adv_device::gpu::Gpu::request_presenting(instance.clone(), &surface, fallback)
@@ -81,9 +104,9 @@ impl WindowPresenter {
         Ok((gpu, presenter))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) unsafe fn new(
-        hwnd: windows_sys::Win32::Foundation::HWND,
+        hwnd: *mut std::ffi::c_void,
         context: NativeContext,
         width: u32,
         height: u32,
@@ -1086,7 +1109,7 @@ mod tests {
     #[test]
     fn video_load_pass_preserves_native_base_and_restores_it_without_a_window() {
         use adv_device::surface::{BlitRect, VideoFrame};
-        let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
         let target = gpu.target(6, 2, false).unwrap();
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
         let base = gpu.present(&target.image, 1).unwrap();
@@ -1224,6 +1247,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     fn completed(ui: &mut UiPresenter, wake: &WakeEvent) -> Completed {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1239,13 +1263,18 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn owned_window_jobs_coalesce_before_conversion_retry_full_and_drain_resize_before_destroy() {
-        for fallback in [false, true] {
+        for fallback in [false, true]
+            .into_iter()
+            .filter(|fallback| !cfg!(target_os = "macos") || !fallback)
+        {
             owned_window_regression(fallback);
         }
     }
 
+    #[cfg(windows)]
     fn owned_window_regression(fallback: bool) {
         use adv_device::surface::{PixelFormat, SurfaceMemory, Surfaces, frame_mailbox};
         use std::borrow::Cow;
@@ -1423,6 +1452,7 @@ mod tests {
         drop(window);
     }
 
+    #[cfg(windows)]
     #[test]
     fn startup_selects_a_surface_compatible_adapter_and_rejects_a_destroyed_device() {
         let mut window =
@@ -1443,7 +1473,10 @@ mod tests {
 
     #[test]
     fn native_composition_preserves_encoded_colors_opaque_alpha_and_letterbox_on_both_adapters() {
-        for fallback in [false, true] {
+        for fallback in [false, true]
+            .into_iter()
+            .filter(|fallback| !cfg!(target_os = "macos") || !fallback)
+        {
             let mut gpu = pollster::block_on(Gpu::request(fallback)).unwrap();
             let image = gpu.image(2, 2).unwrap();
             let colors = [

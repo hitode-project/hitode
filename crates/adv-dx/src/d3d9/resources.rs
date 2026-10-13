@@ -1149,7 +1149,7 @@ mod tests {
             .get_mut::<State>()
             .tables
             .insert("IDirect3DTexture9", 0);
-        let gpu = pollster::block_on(Gpu::request(true)).unwrap();
+        let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
         m.ext.insert(TestTarget(gpu.target(4, 2, false).unwrap()));
         m.ext.get_mut::<State>().provider.target =
             |ext, id| (id == 7).then(|| ext.get::<TestTarget>().0.clone());

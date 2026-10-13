@@ -47,7 +47,7 @@ fn stencil(reference: u32) -> DrawState {
 
 #[test]
 fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let depth = gpu.depth(8, 6, DepthFormat::Depth24Stencil8).unwrap();
     let large = gpu
         .target(8, 6, false)
@@ -113,7 +113,7 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
 
 #[test]
 fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let base = gpu.target_levels(8, 8, 3).unwrap();
     gpu.clear(&base, Some([1., 0., 0., 1.]), None).unwrap();
     let mip = base
@@ -164,7 +164,7 @@ fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch
 
 #[test]
 fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu
         .target(4, 4, false)
         .unwrap()

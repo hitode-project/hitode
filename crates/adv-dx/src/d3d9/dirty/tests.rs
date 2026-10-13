@@ -30,7 +30,8 @@ fn machine(gpu: bool) -> (Machine<JitCpu>, u32) {
     m.spawn("fixture", 0x400000, &[], 65536).unwrap();
     m.ext.insert(Surfaces::default());
     if gpu {
-        m.ext.get_mut::<State>().gpu = Some(pollster::block_on(Gpu::request(true)).unwrap());
+        m.ext.get_mut::<State>().gpu =
+            Some(pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap());
     }
     let state = m.ext.get_mut::<State>();
     state.tables.insert("IDirect3DTexture9", 0);

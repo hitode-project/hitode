@@ -17,18 +17,13 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
-    CFData, CFFileDescriptor, CFFileDescriptorContext, CFOptionFlags, CFRetained, CFRunLoop,
+    CFFileDescriptor, CFFileDescriptorContext, CFOptionFlags, CFRetained, CFRunLoop,
     CFRunLoopSource, kCFRunLoopCommonModes,
-};
-use objc2_core_graphics::{
-    CGBitmapInfo, CGColor, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
-    CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 use objc2_foundation::{
     NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
     NSSize, NSString, NSTimer,
 };
-use objc2_quartz_core::{CALayer, CATransaction, kCAFilterNearest};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -85,6 +80,25 @@ impl Viewport {
             ((y - self.y) * f64::from(height) / self.height.max(1.0)).floor() as i32,
         )
     }
+}
+
+pub(crate) fn native_viewport(
+    width: u32,
+    height: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> [f32; 4] {
+    let viewport = Viewport::fit(
+        (f64::from(width), f64::from(height)),
+        canvas_width,
+        canvas_height,
+    );
+    [
+        viewport.x as f32,
+        viewport.y as f32,
+        viewport.width as f32,
+        viewport.height as f32,
+    ]
 }
 
 /// UI state the Objective-C callbacks reach. Callbacks run inside AppKit
@@ -150,6 +164,20 @@ define_class!(
         }
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, notification: &NSNotification) {
+            let hub = self.ivars();
+            if notification_window(notification) == hub.main.get() {
+                hub.push(Event::Repaint);
+            }
+        }
+        #[unsafe(method(windowDidEnterFullScreen:))]
+        fn window_did_enter_full_screen(&self, notification: &NSNotification) {
+            let hub = self.ivars();
+            if notification_window(notification) == hub.main.get() {
+                hub.push(Event::Repaint);
+            }
+        }
+        #[unsafe(method(windowDidExitFullScreen:))]
+        fn window_did_exit_full_screen(&self, notification: &NSNotification) {
             let hub = self.ivars();
             if notification_window(notification) == hub.main.get() {
                 hub.push(Event::Repaint);
@@ -270,7 +298,6 @@ pub struct Window {
     mtm: MainThreadMarker,
     app: Retained<NSApplication>,
     window: Retained<NSWindow>,
-    image: Retained<CALayer>,
     target: Retained<Target>,
     hub: Rc<Hub>,
     width: u32,
@@ -327,24 +354,12 @@ impl Window {
         window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
         window.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         hub.main.set(Retained::as_ptr(&window) as usize);
-        let view = window
-            .contentView()
-            .ok_or("window without a content view")?;
-        view.setWantsLayer(true);
-        let root = view.layer().ok_or("content view without a layer")?;
-        let black = CGColor::new_generic_gray(0.0, 1.0);
-        root.setBackgroundColor(Some(&black));
-        let image = CALayer::new();
-        image.setMagnificationFilter(unsafe { kCAFilterNearest });
-        image.setMinificationFilter(unsafe { kCAFilterNearest });
-        root.addSublayer(&image);
         window.center();
         let menus = menu::Menus::new(mtm, &app, &target)?;
         let this = Self {
             mtm,
             app,
             window,
-            image,
             target,
             hub,
             width,
@@ -360,7 +375,6 @@ impl Window {
             menus,
             dialogs: dialog::Dialogs::default(),
         };
-        this.layout();
         if !hidden {
             this.window.makeKeyAndOrderFront(None);
             #[allow(deprecated)]
@@ -374,20 +388,6 @@ impl Window {
             let size = view.bounds().size;
             (size.width, size.height)
         })
-    }
-
-    /// Places the canvas layer in the letterboxed viewport, without animation.
-    fn layout(&self) {
-        let (cw, ch) = self.client();
-        let viewport = Viewport::fit((cw, ch), self.width, self.height);
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        // The layer's origin is bottom-left.
-        self.image.setFrame(NSRect::new(
-            NSPoint::new(viewport.x, ch - viewport.y - viewport.height),
-            NSSize::new(viewport.width, viewport.height),
-        ));
-        CATransaction::commit();
     }
 
     fn set_canvas_size(&mut self, width: u32, height: u32) {
@@ -678,52 +678,51 @@ impl Window {
         Ok(())
     }
 
-    pub fn present(&mut self, frame: &Snapshot) -> Result<(), String> {
-        let length = (frame.width as usize)
-            .checked_mul(frame.height as usize)
-            .and_then(|n| n.checked_mul(4));
-        if frame.width == 0 || frame.height == 0 || length != Some(frame.bgra.len()) {
-            return Err("invalid guest frame dimensions or pixels".into());
-        }
-        // SAFETY: the bytes are copied into the CFData before this returns.
-        let data = unsafe { CFData::new(None, frame.bgra.as_ptr(), frame.bgra.len() as isize) }
-            .ok_or("CFDataCreate failed")?;
-        let provider = CGDataProvider::with_cf_data(Some(&data)).ok_or("CGDataProvider failed")?;
-        let space = CGColorSpace::new_device_rgb().ok_or("CGColorSpace failed")?;
-        // Packed BGRA rows; the guest's alpha byte is not coverage.
-        let info =
-            CGBitmapInfo(CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0);
-        // SAFETY: no decode array; the provider holds width * height * 4 bytes.
-        let image = unsafe {
-            CGImage::new(
-                frame.width as usize,
-                frame.height as usize,
-                8,
-                32,
-                frame.width as usize * 4,
-                Some(&space),
-                info,
-                Some(&provider),
-                std::ptr::null(),
-                false,
-                CGColorRenderingIntent::RenderingIntentDefault,
+    /// Create the Metal surface on the UI thread before guest submissions begin.
+    pub fn create_native(
+        &mut self,
+        fallback: bool,
+    ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
+        let view = self
+            .window
+            .contentView()
+            .ok_or("window without a content view")?;
+        let (width, height) = self.native_client_size()?;
+        // SAFETY: the window retains NSView until the background service joins
+        // and the presenter drops. Surface creation stays on the main thread.
+        let (gpu, mut presenter) = pollster::block_on(unsafe {
+            crate::native_gpu::WindowPresenter::request(
+                Retained::as_ptr(&view) as *mut std::ffi::c_void,
+                width.max(1),
+                height.max(1),
+                fallback,
             )
+        })?;
+        presenter.configure_exclusive(width.max(1), height.max(1))?;
+        Ok((gpu, presenter))
+    }
+
+    pub fn native_client_size(&self) -> Result<(u32, u32), String> {
+        let (width, height) = self.client();
+        let scale = self.window.backingScaleFactor();
+        Ok((
+            (width * scale).round() as u32,
+            (height * scale).round() as u32,
+        ))
+    }
+
+    pub fn native_canvas(&mut self, canvas: (u32, u32)) -> Result<bool, String> {
+        if canvas.0 == 0 || canvas.1 == 0 {
+            return Ok(false);
         }
-        .ok_or("CGImageCreate failed")?;
-        self.width = frame.width;
-        self.height = frame.height;
-        if self.frame_size != Some((frame.width, frame.height)) {
-            self.set_canvas_size(frame.width, frame.height);
-            self.frame_size = Some((frame.width, frame.height));
+        self.width = canvas.0;
+        self.height = canvas.1;
+        let changed = self.frame_size != Some(canvas);
+        if changed {
+            self.set_canvas_size(canvas.0, canvas.1);
+            self.frame_size = Some(canvas);
         }
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        let contents: &AnyObject = image.as_ref();
-        // SAFETY: a CGImage is valid layer contents.
-        unsafe { self.image.setContents(Some(contents)) };
-        CATransaction::commit();
-        self.layout();
-        Ok(())
+        Ok(changed)
     }
 
     #[allow(dead_code)]

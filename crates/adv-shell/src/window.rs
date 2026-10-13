@@ -1,5 +1,8 @@
+#[cfg(not(target_os = "macos"))]
 use adv_runtime::Snapshot;
 pub use adv_sync::WakeEvent;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::native_viewport;
 #[cfg(all(windows, feature = "gpu"))]
 pub(crate) use native::native_viewport;
 use std::sync::Arc;

@@ -108,7 +108,8 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
         "vulkan" => (false, GpuBackend::Vulkan),
         "gles" => (false, GpuBackend::Gl),
         "dx12" => (false, GpuBackend::Direct3D12),
-        _ => (true, GpuBackend::Automatic),
+        "metal" => (false, GpuBackend::Metal),
+        _ => (!cfg!(target_os = "macos"), GpuBackend::Automatic),
     };
     let mut gpu = pollster::block_on(Gpu::request_backend(fallback, backend))
         .expect("differential GPU adapter");

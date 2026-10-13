@@ -13,10 +13,11 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     let backend = match std::env::var("ADV_TEST_GPU_BACKEND").as_deref() {
         Ok("vulkan") => GpuBackend::Vulkan,
         Ok("gles") => GpuBackend::Gl,
+        Ok("metal") => GpuBackend::Metal,
         _ => GpuBackend::Automatic,
     };
     let mut gpu = pollster::block_on(Gpu::request_backend(
-        matches!(backend, GpuBackend::Automatic),
+        matches!(backend, GpuBackend::Automatic) && !cfg!(target_os = "macos"),
         backend,
     ))
     .unwrap();

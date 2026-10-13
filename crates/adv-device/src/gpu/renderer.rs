@@ -410,10 +410,14 @@ impl Gpu {
     pub async fn request_backend(fallback: bool, backend: GpuBackend) -> Result<Self, Error> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = match backend {
+            #[cfg(target_os = "macos")]
+            GpuBackend::Automatic => wgpu::Backends::METAL,
+            #[cfg(not(target_os = "macos"))]
             GpuBackend::Automatic => wgpu::Backends::all(),
             GpuBackend::Vulkan => wgpu::Backends::VULKAN,
             GpuBackend::Gl => wgpu::Backends::GL,
             GpuBackend::Direct3D12 => wgpu::Backends::DX12,
+            GpuBackend::Metal => wgpu::Backends::METAL,
         };
         let instance = wgpu::Instance::new(descriptor);
         Self::request_from(instance, None, fallback).await
@@ -1030,6 +1034,25 @@ impl Gpu {
         }
         validate(target, vertices, &state)?;
         let inclusive = line::prepare(vertices, image, &state)?;
+        // Metal chooses the lower pixel at exact aliased-line ties. Move up
+        // 1/128 pixel to match D3D9 REF's upper-edge choice, below the supported
+        // integer endpoint grid. Point endpoints retain their pixel coverage.
+        let adjusted;
+        let vertices = if matches!(state.topology, Topology::Lines | Topology::LineStrip)
+            && self.context.adapter.get_info().backend == wgpu::Backend::Metal
+        {
+            adjusted = vertices
+                .iter()
+                .map(|vertex| {
+                    let mut vertex = *vertex;
+                    vertex.position[1] += vertex.position[3] / (64. * state.viewport.height);
+                    vertex
+                })
+                .collect::<Vec<_>>();
+            adjusted.as_slice()
+        } else {
+            vertices
+        };
         if state.stencil.is_some()
             && target
                 .depth
@@ -1754,7 +1777,7 @@ mod cache_tests {
 
     #[test]
     fn full_pipeline_cache_evicts_fifo_and_submitted_commands_remain_valid() {
-        let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
         assert_eq!(gpu.pipeline_limit, 512);
         assert_eq!(gpu.pipeline_limit, MAX_PIPELINES);
         gpu.pipeline_limit = 2;

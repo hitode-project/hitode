@@ -3,7 +3,8 @@ use super::*;
 #[test]
 fn binding_public_zero_getter_parent_retain_failures_and_final_release_are_one_common_owner() {
     let mut machine = super::super::tests::machine();
-    let gpu = pollster::block_on(Gpu::request(true)).expect("software depth adapter");
+    let gpu =
+        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test depth adapter");
     let image = gpu.depth(16, 12, DepthFormat::Depth24Stencil8).unwrap();
     let equal = gpu.target(16, 12, false).unwrap();
     let smaller = gpu.target(8, 6, false).unwrap();

@@ -58,3 +58,6 @@ workspace = true
 [[test]]
 name = "gpu"
 required-features = ["gpu"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["metal"] }

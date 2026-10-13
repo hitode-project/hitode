@@ -102,7 +102,7 @@ impl Fixture {
             Ok(())
         };
         if gpu {
-            state.gpu = Some(pollster::block_on(Gpu::request(true)).unwrap());
+            state.gpu = Some(pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap());
         }
         let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
         let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();

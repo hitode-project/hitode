@@ -96,7 +96,7 @@ fn cpu_multistream_fixed_input_preserves_offsets_indices_uv_pixels_and_rejection
     m.spawn("multistream fixture", 0x400000, &[], 65536)
         .unwrap();
     m.ext.insert(Views::default());
-    let gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu.target(16, 12, false).unwrap();
     let state = m.ext.get_mut::<State>();
     state.gpu = Some(gpu);

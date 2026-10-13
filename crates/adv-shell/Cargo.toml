@@ -25,14 +25,15 @@ pollster = { version = "0.4", optional = true }
 adv-device = { path = "../adv-device", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-adv-device = { path = "../adv-device", features = ["device"] }
+adv-device = { path = "../adv-device", features = ["device", "gpu"] }
+adv-runtime = { path = "../adv-runtime", features = ["gpu"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "metal"] }
+pollster = "0.4"
 log = "0.4"
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
-objc2-core-graphics = "0.3.2"
 objc2-foundation = "0.3.2"
-objc2-quartz-core = "0.3.2"
 
 [dev-dependencies]
 pollster = "0.4"

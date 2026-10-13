@@ -15,7 +15,7 @@ fn main() {
 mod mac {
     use adv_runtime::{
         DialogControl, DialogEvent, DialogSet, DialogTarget, DialogWindow, MenuBar, MenuCommand,
-        MenuEvent, MenuItem, MenuKey, Snapshot,
+        MenuEvent, MenuItem, MenuKey,
     };
     use adv_shell::window::{Event, WaitOutcome, WakeEvent, Window};
     use objc2::rc::Retained;
@@ -90,17 +90,24 @@ mod mac {
         let mut window = Window::new("adv macos window test", 320, 240, true).unwrap();
         let native = find_window(mtm, "adv macos window test");
 
-        // Presenting sizes the content to the canvas in points.
-        let frame = Snapshot {
-            width: 320,
-            height: 240,
-            bgra: vec![0x80; 320 * 240 * 4],
-            frames: 1,
-        };
-        window.present(&frame).unwrap();
+        let (gpu, presenter) = window.create_native(false).unwrap();
+        window.native_canvas((320, 240)).unwrap();
         let size = native.contentView().unwrap().bounds().size;
+        let scale = native.backingScaleFactor();
         assert_eq!((size.width, size.height), (320.0, 240.0));
-        println!("ok present sizes the canvas");
+        assert_eq!(
+            window.native_client_size().unwrap(),
+            ((320.0 * scale) as u32, (240.0 * scale) as u32)
+        );
+        window.native_canvas((1600, 900)).unwrap();
+        assert_eq!(
+            window.native_client_size().unwrap(),
+            ((1600.0 * scale) as u32, (900.0 * scale) as u32)
+        );
+        window.native_canvas((320, 240)).unwrap();
+        drop(presenter);
+        drop(gpu);
+        println!("ok Metal surface and backing pixel dimensions");
 
         // Keys: positions become VK, scan code and the Win32 lParam layout.
         window.pump();
@@ -212,6 +219,11 @@ mod mac {
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         thread.join().unwrap();
+        // Surface setup can enqueue AppKit events before the asynchronous wake.
+        // A following wait must still observe and drain that retained wake.
+        window
+            .wait_with_wake(Some(Duration::ZERO), Some(&wake))
+            .unwrap();
         window.pump();
         // The wake was consumed. AppKit may still post its own events, so
         // the pipe is checked rather than another wait.
