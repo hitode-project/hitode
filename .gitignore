@@ -14,3 +14,5 @@ __pycache__/
 /tools/windows/launch-trial.ps1
 /tools/windows/trial-readme.txt
 .DS_Store
+# Launcher app icons are source assets.
+!/apps/adv-launcher/src-tauri/icons/*.png

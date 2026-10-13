@@ -21,6 +21,7 @@ members = [
     "apps/adv-run",
     "apps/adv-android-probe",
     "apps/adv-android",
+    "apps/adv-launcher/src-tauri",
 ]
 exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]
 

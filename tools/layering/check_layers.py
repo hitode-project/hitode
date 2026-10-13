@@ -31,6 +31,8 @@ RULES: dict[str, set[str]] = {
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync"},
     "adv-run": {"adv-shell"},
+    # Tauri player frontend: library and in-game overlay over the native game view.
+    "adv-launcher": {"adv-shell"},
     # Standalone Android CPU acceptance app, outside the game runtime graph.
     "adv-android-probe": {"adv-cpu"},
     # Android platform frontend owns runtime, presentation and audio output.
