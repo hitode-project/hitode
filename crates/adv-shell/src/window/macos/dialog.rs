@@ -730,16 +730,20 @@ fn retire(output: &Output, dialog: &HostDialog) {
     dialog.window.orderOut(None);
 }
 
-impl Window {
-    pub fn set_dialog_event_sink(&mut self, sink: DialogSink) {
+impl Projection {
+    pub(crate) fn set_dialog_event_sink(&mut self, sink: DialogSink) {
         *self.hub.dialogs.sink.borrow_mut() = Some(sink);
     }
-    pub fn set_dialogs(&mut self, set: &DialogSet) -> Result<(), String> {
+    pub(crate) fn set_dialogs(&mut self, set: &DialogSet) -> Result<(), String> {
+        // Dialogs are children of the window that shows the game.
+        let Some(main) = self.view.window() else {
+            return Ok(());
+        };
         self.dialogs.borrow_mut().update(
             self.mtm,
             &self.target,
             &self.hub,
-            &self.window,
+            &main,
             set,
             self.hidden,
         );

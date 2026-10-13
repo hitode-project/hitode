@@ -1,7 +1,7 @@
 //! A game session driven by the host's main AppKit run loop.
 use crate::{
     Options, frontend,
-    window::{Event, GameView, Window},
+    window::{Event, GameView, Projection, Window},
 };
 use adv_runtime::{DialogEvent, DialogSet, MenuBar, MenuEvent, MenuItem};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
@@ -38,13 +38,26 @@ struct Driver {
     on_finished: RefCell<Option<Box<dyn FnOnce(Result<u8, String>)>>>,
     timer: RefCell<Option<CFRetained<CFRunLoopTimer>>>,
     wake: WakeEvent,
+    /// Guest menus and dialogs; borrowed across a nested popup loop.
+    projection: RefCell<Option<Rc<RefCell<Projection>>>>,
     cli: RefCell<Option<Rc<RefCell<Window>>>>,
 }
 impl Session {
+    /// Starts a game in `view`. Guest menus join the application's main menu
+    /// after its first item and guest dialogs open over the view's window.
     pub fn new(
         view: Retained<GameView>,
         options: Options,
         on_finished: Box<dyn FnOnce(Result<u8, String>)>,
+    ) -> Result<Self, String> {
+        let projection = Rc::new(RefCell::new(Projection::embedded(view.clone())?));
+        Self::start(view, options, on_finished, projection)
+    }
+    fn start(
+        view: Retained<GameView>,
+        options: Options,
+        on_finished: Box<dyn FnOnce(Result<u8, String>)>,
+        projection: Rc<RefCell<Projection>>,
     ) -> Result<Self, String> {
         let wake = WakeEvent::new().map_err(|e| e.to_string())?;
         let keys = Arc::new(KeyState::default());
@@ -63,6 +76,7 @@ impl Session {
             .sender_with_capacity_wake(1, 1, ui.wake())
             .map_err(|e| e.to_string())?;
         ui.native(presenter, sender);
+        ui.install_sinks(&mut projection.borrow_mut());
         worker.gpu = Some(gpu);
         let service = background.start().map_err(|e| e.to_string())?;
         let completion_wake = ui.wake();
@@ -93,6 +107,7 @@ impl Session {
             service: RefCell::new(service),
             on_finished: RefCell::new(Some(on_finished)),
             timer: RefCell::new(None),
+            projection: RefCell::new(Some(projection)),
             cli: RefCell::new(None),
         });
         let info = Rc::as_ptr(&driver) as *mut c_void;
@@ -155,8 +170,14 @@ impl Session {
             .as_mut()
             .map_or(0, |ui| ui.post_text(text))
     }
+    /// Application activation, delivered to the guest as WM_ACTIVATEAPP.
     pub fn set_active(&self, active: bool) {
         self.driver.view.hub().activate(active);
+    }
+    /// The window showing the game lost key status. A guest dialog taking it
+    /// keeps the guest's focus; another window removes it.
+    pub fn resign_key(&self) {
+        self.driver.view.hub().resign_key();
     }
     pub fn set_minimized(&self, minimized: bool) {
         self.driver.view.hub().minimized(minimized);
@@ -215,17 +236,17 @@ impl Session {
 }
 impl Driver {
     fn tick(&self) -> Result<Option<Instant>, String> {
-        let cli = self.cli.borrow().clone();
+        let projection = self.projection.borrow().clone();
         if self.finish_pending() {
             return Ok(None);
         }
-        if let Some(cli) = &cli {
-            if let Ok(mut window) = cli.try_borrow_mut() {
-                let events = window.pump();
-                if let Some(ui) = self.ui.borrow_mut().as_mut() {
-                    for event in events {
-                        ui.input(event)?;
-                    }
+        if let Some(projection) = &projection
+            && let Ok(mut projection) = projection.try_borrow_mut()
+        {
+            let events = projection.pump();
+            if let Some(ui) = self.ui.borrow_mut().as_mut() {
+                for event in events {
+                    ui.input(event)?;
                 }
             }
         }
@@ -236,27 +257,31 @@ impl Driver {
             };
             ui.tick(&self.view)?;
         }
-        if let Some(cli) = cli {
-            // A native popup runs a nested AppKit loop. Its input sinks remain
-            // usable while projection is borrowed by the outer invocation.
-            if let Ok(mut window) = cli.try_borrow_mut() {
-                let (menu, dialogs) = {
-                    let mut ui = self.ui.borrow_mut();
-                    let Some(ui) = ui.as_mut() else {
-                        return Ok(None);
-                    };
-                    (
-                        std::mem::take(&mut ui.menu_changed).then(|| ui.menu_snapshot().clone()),
-                        std::mem::take(&mut ui.dialog_changed)
-                            .then(|| ui.dialog_snapshot().clone()),
-                    )
+        // A native popup runs a nested AppKit loop. Its input sinks remain
+        // usable while projection is borrowed by the outer invocation.
+        if let Some(projection) = &projection
+            && let Ok(mut projection) = projection.try_borrow_mut()
+        {
+            let (menu, dialogs) = {
+                let mut ui = self.ui.borrow_mut();
+                let Some(ui) = ui.as_mut() else {
+                    return Ok(None);
                 };
-                if let Some(menu) = menu {
-                    window.set_menu_bar(&menu)?;
-                }
-                if let Some(dialogs) = dialogs {
-                    window.set_dialogs(&dialogs)?;
-                }
+                (
+                    std::mem::take(&mut ui.menu_changed).then(|| ui.menu_snapshot().clone()),
+                    std::mem::take(&mut ui.dialog_changed).then(|| ui.dialog_snapshot().clone()),
+                )
+            };
+            if let Some(menu) = menu {
+                projection.set_menu_bar(&menu)?;
+            }
+            if let Some(dialogs) = dialogs {
+                projection.set_dialogs(&dialogs)?;
+            }
+            // The CLI window's own borrow reaches the projection when hiding.
+            drop(projection);
+            if let Some(cli) = self.cli.borrow().clone() {
+                let mut window = cli.borrow_mut();
                 window.native_canvas(self.view.canvas_size())?;
                 if self.view.isHidden() {
                     window.hide();
@@ -274,10 +299,10 @@ impl Driver {
     }
     fn finish_pending(&self) -> bool {
         if self
-            .cli
+            .projection
             .borrow()
             .as_ref()
-            .is_some_and(|window| window.try_borrow().is_err())
+            .is_some_and(|projection| projection.try_borrow().is_err())
         {
             return false;
         }
@@ -294,6 +319,8 @@ impl Driver {
     }
     fn finish(&self, mut result: Result<u8, String>) {
         drop(self.ui.borrow_mut().take());
+        // Retires guest menus and dialogs unless a nested loop still holds them.
+        drop(self.projection.borrow_mut().take());
         if let Some(execution) = self.execution.borrow_mut().take() {
             if execution.join().is_err() {
                 result = Err("execution worker panicked".into());
@@ -388,8 +415,12 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
     let result = Rc::new(RefCell::new(None));
     let output = result.clone();
     let closing = window.clone();
-    let session = Session::new(
-        window.borrow().view.clone(),
+    let (view, projection) = {
+        let window = window.borrow();
+        (window.view.clone(), window.projection.clone())
+    };
+    let session = Session::start(
+        view,
         options,
         Box::new(move |value| {
             *output.borrow_mut() = Some(value);
@@ -400,14 +431,8 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
                 app.postEvent_atStart(&event, false);
             }
         }),
+        projection,
     )?;
-    session
-        .driver
-        .ui
-        .borrow()
-        .as_ref()
-        .unwrap()
-        .install_sinks(&mut window.borrow_mut());
     *session.driver.cli.borrow_mut() = Some(window);
     NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).run();
     drop(session);

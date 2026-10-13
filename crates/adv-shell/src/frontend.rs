@@ -11,6 +11,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use std::{cell::RefCell, rc::Rc};
+/// Owner of the native menu and dialog projection the sinks are given to.
+#[cfg(target_os = "macos")]
+type SinkTarget = window::Projection;
+#[cfg(not(target_os = "macos"))]
+type SinkTarget = window::Window;
 
 enum Request {
     Hide,
@@ -317,7 +322,7 @@ impl Ui {
     pub(crate) fn dialog_snapshot(&self) -> &DialogSet {
         self.dialogs.current()
     }
-    pub(crate) fn install_sinks(&self, window: &mut window::Window) {
+    pub(crate) fn install_sinks(&self, window: &mut SinkTarget) {
         // Menu modal dispatch still runs on this UI thread. Its callbacks can
         // enqueue events immediately without waiting for the outer paint loop.
         let events = self.events.clone();

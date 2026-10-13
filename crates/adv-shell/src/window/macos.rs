@@ -150,6 +150,14 @@ impl Hub {
         self.occluded.set(minimized);
         self.push(Event::Repaint);
     }
+    /// The game's window lost key status; focus is lost unless a guest
+    /// dialog took it, which the next pump checks.
+    pub(crate) fn resign_key(&self) {
+        self.focus_check.set(true);
+        if let Some(wake) = self.wake.borrow().as_ref() {
+            wake.signal();
+        }
+    }
     pub(crate) fn set_occluded(&self, occluded: bool) {
         self.occluded.set(occluded);
         self.push(Event::Repaint);
@@ -233,7 +241,7 @@ define_class!(
         fn window_did_resign_key(&self, notification: &NSNotification) {
             let hub = self.ivars();
             if notification_window(notification) == hub.main.get() {
-                hub.focus_check.set(true);
+                hub.resign_key();
             }
         }
         #[unsafe(method(windowDidResize:))]
@@ -383,20 +391,106 @@ pub(crate) fn wake_event() -> Option<Retained<NSEvent>> {
 }
 
 pub struct Window {
-    mtm: MainThreadMarker,
     app: Retained<NSApplication>,
     window: Retained<NSWindow>,
     target: Retained<Target>,
     hub: Rc<Hub>,
-    width: u32,
-    height: u32,
     frame_size: Option<(u32, u32)>,
-    hidden: bool,
     pub(crate) view: Retained<GameView>,
+    pub(crate) projection: Rc<RefCell<Projection>>,
+}
 
+/// Guest menus and dialogs projected around a game view: menus into the
+/// application's main menu after its first item, dialogs as child windows of
+/// the view's window. The CLI window and an embedding host share it.
+pub(crate) struct Projection {
+    mtm: MainThreadMarker,
+    app: Retained<NSApplication>,
+    target: Retained<Target>,
+    hub: Rc<Hub>,
+    view: Retained<GameView>,
+    hidden: bool,
     menus: menu::Menus,
     dialogs: Rc<RefCell<dialog::Dialogs>>,
     monitor: Retained<AnyObject>,
+}
+impl Projection {
+    fn new(
+        view: Retained<GameView>,
+        target: Retained<Target>,
+        menus: menu::Menus,
+        hidden: bool,
+    ) -> Result<Self, String> {
+        let mtm = view.mtm();
+        let hub = view.hub();
+        let dialogs = Rc::new(RefCell::new(dialog::Dialogs::default()));
+        let monitored = dialogs.clone();
+        let input_hub = hub.clone();
+        let block = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
+            let event_ref = unsafe { event.as_ref() };
+            if let Some(wake) = input_hub.wake.borrow().as_ref() {
+                wake.signal();
+            }
+            if monitored.borrow().intercept(mtm, &input_hub, event_ref) {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            }
+        });
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Any, &block)
+        }
+        .ok_or("could not install dialog event monitor")?;
+        Ok(Self {
+            mtm,
+            app: NSApplication::sharedApplication(mtm),
+            target,
+            hub,
+            view,
+            hidden,
+            menus,
+            dialogs,
+            monitor,
+        })
+    }
+
+    /// Projects into the host's existing main menu and the view's window.
+    pub(crate) fn embedded(view: Retained<GameView>) -> Result<Self, String> {
+        let mtm = view.mtm();
+        let target = Target::new(view.hub(), mtm);
+        let menus = menu::Menus::attach(mtm, &NSApplication::sharedApplication(mtm));
+        Self::new(view, target, menus, false)
+    }
+
+    /// Drain translated events; AppKit dispatch belongs to the host run loop.
+    pub(crate) fn pump(&mut self) -> Vec<Event> {
+        if self.hub.focus_check.replace(false) {
+            let key = self.app.keyWindow();
+            let ours = key.as_ref().is_some_and(|key| {
+                Retained::as_ptr(key) as usize == self.hub.main.get()
+                    || self.dialogs.borrow().owns(key)
+            });
+            if !ours {
+                self.hub.push(Event::FocusLost);
+            }
+        }
+        self.dialogs.borrow_mut().poll_focus(&self.hub);
+        let mut events: Vec<_> = self.hub.events.borrow_mut().drain(..).collect();
+        events.extend(self.hub.dialogs.take_events().map(Event::Dialog));
+        events
+    }
+
+    pub(crate) fn hide(&mut self) {
+        self.hidden = true;
+        self.dialogs.borrow_mut().hide();
+    }
+}
+impl Drop for Projection {
+    fn drop(&mut self) {
+        unsafe { NSEvent::removeMonitor(&self.monitor) };
+        self.dialogs.borrow_mut().clear(&self.hub);
+        self.menus.clear();
+    }
 }
 
 /// Device-dependent modifier bits (`NX_DEVICE*KEYMASK`) and Caps Lock.
@@ -467,39 +561,16 @@ impl Window {
         window.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         hub.main.set(Retained::as_ptr(&window) as usize);
         window.center();
-        let menus = menu::Menus::new(mtm, &app, &target)?;
-        let dialogs = Rc::new(RefCell::new(dialog::Dialogs::default()));
-        let monitored = dialogs.clone();
-        let input_hub = hub.clone();
-        let block = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
-            let event_ref = unsafe { event.as_ref() };
-            if let Some(wake) = input_hub.wake.borrow().as_ref() {
-                wake.signal();
-            }
-            if monitored.borrow().intercept(mtm, &input_hub, event_ref) {
-                std::ptr::null_mut()
-            } else {
-                event.as_ptr()
-            }
-        });
-        let monitor = unsafe {
-            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Any, &block)
-        }
-        .ok_or("could not install dialog event monitor")?;
+        let menus = menu::Menus::new(mtm, &app, &target);
+        let projection = Projection::new(view.clone(), target.clone(), menus, hidden)?;
         let this = Self {
-            mtm,
             app,
             window,
             target,
             hub,
-            width,
-            height,
             frame_size: None,
-            hidden,
             view,
-            menus,
-            dialogs,
-            monitor,
+            projection: Rc::new(RefCell::new(projection)),
         };
         if !hidden {
             this.window.makeKeyAndOrderFront(None);
@@ -517,13 +588,6 @@ impl Window {
         }
     }
 
-    fn client(&self) -> (f64, f64) {
-        self.window.contentView().map_or((0.0, 0.0), |view| {
-            let size = view.bounds().size;
-            (size.width, size.height)
-        })
-    }
-
     fn set_canvas_size(&mut self, width: u32, height: u32) {
         let full = self
             .window
@@ -535,22 +599,20 @@ impl Window {
         }
     }
 
-    /// Drain translated events; AppKit dispatch belongs to the host run loop.
     pub fn pump(&mut self) -> Vec<Event> {
-        if self.hub.focus_check.replace(false) {
-            let key = self.app.keyWindow();
-            let ours = key.as_ref().is_some_and(|key| {
-                Retained::as_ptr(key) as usize == self.hub.main.get()
-                    || self.dialogs.borrow().owns(key)
-            });
-            if !ours {
-                self.hub.push(Event::FocusLost);
-            }
-        }
-        self.dialogs.borrow_mut().poll_focus(&self.hub);
-        let mut events: Vec<_> = self.hub.events.borrow_mut().drain(..).collect();
-        events.extend(self.hub.dialogs.take_events().map(Event::Dialog));
-        events
+        self.projection.borrow_mut().pump()
+    }
+    pub fn set_menu_event_sink(&mut self, sink: MenuSink) {
+        self.projection.borrow_mut().set_menu_event_sink(sink);
+    }
+    pub fn set_menu_bar(&mut self, bar: &adv_runtime::MenuBar) -> Result<(), String> {
+        self.projection.borrow_mut().set_menu_bar(bar)
+    }
+    pub fn set_dialog_event_sink(&mut self, sink: DialogSink) {
+        self.projection.borrow_mut().set_dialog_event_sink(sink);
+    }
+    pub fn set_dialogs(&mut self, set: &adv_runtime::DialogSet) -> Result<(), String> {
+        self.projection.borrow_mut().set_dialogs(set)
     }
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
@@ -578,8 +640,6 @@ impl Window {
             return Ok(false);
         }
         self.view.canvas(canvas.0, canvas.1);
-        self.width = canvas.0;
-        self.height = canvas.1;
         let changed = self.frame_size != Some(canvas);
         if changed {
             self.set_canvas_size(canvas.0, canvas.1);
@@ -589,18 +649,14 @@ impl Window {
     }
 
     pub fn hide(&mut self) {
-        self.hidden = true;
         self.hub.occluded.set(true);
-        self.dialogs.borrow_mut().hide();
+        self.projection.borrow_mut().hide();
         self.window.orderOut(None);
     }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        unsafe { NSEvent::removeMonitor(&self.monitor) };
-        self.dialogs.borrow_mut().clear(&self.hub);
-        self.menus.clear(&self.app);
         self.app.setDelegate(None);
         // SAFETY: this is the observer registered by this window.
         unsafe {

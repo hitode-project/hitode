@@ -99,7 +99,7 @@ impl Runtime {
     }
 }
 
-/// The application menu and the guest's top-level items in the menu bar.
+/// The guest's top-level items in the menu bar, after the application menu.
 pub(super) struct Menus {
     main: Retained<NSMenu>,
     guest: Vec<Retained<NSMenuItem>>,
@@ -130,11 +130,8 @@ fn menu(mtm: MainThreadMarker, title: &str) -> Retained<NSMenu> {
 }
 
 impl Menus {
-    pub(super) fn new(
-        mtm: MainThreadMarker,
-        app: &NSApplication,
-        target: &Target,
-    ) -> Result<Self, String> {
+    /// Builds the CLI window's application menu.
+    pub(super) fn new(mtm: MainThreadMarker, app: &NSApplication, target: &Target) -> Self {
         let main = menu(mtm, "");
         let application = item(mtm, "ADV", None, "");
         let submenu = menu(mtm, "ADV");
@@ -154,14 +151,34 @@ impl Menus {
         application.setSubmenu(Some(&submenu));
         main.addItem(&application);
         app.setMainMenu(Some(&main));
-        Ok(Self {
+        Self {
             main,
             guest: Vec::new(),
-        })
+        }
     }
-    pub(super) fn clear(&mut self, _app: &NSApplication) {
+    /// Uses the embedding host's main menu, which keeps its own items.
+    pub(super) fn attach(mtm: MainThreadMarker, app: &NSApplication) -> Self {
+        let main = app.mainMenu().unwrap_or_else(|| {
+            let main = menu(mtm, "");
+            app.setMainMenu(Some(&main));
+            main
+        });
+        Self {
+            main,
+            guest: Vec::new(),
+        }
+    }
+    fn add(&mut self, item: Retained<NSMenuItem>) {
+        let at = (self.guest.len() + 1).min(self.main.numberOfItems() as usize);
+        self.main.insertItem_atIndex(&item, at as isize);
+        self.guest.push(item);
+    }
+    pub(super) fn clear(&mut self) {
         for item in self.guest.drain(..) {
-            self.main.removeItem(&item);
+            // The host may have replaced its main menu meanwhile.
+            if self.main.indexOfItem(&item) >= 0 {
+                self.main.removeItem(&item);
+            }
         }
     }
 }
@@ -218,12 +235,12 @@ fn build(
     Ok(())
 }
 
-impl Window {
-    pub fn set_menu_event_sink(&mut self, sink: MenuSink) {
+impl Projection {
+    pub(crate) fn set_menu_event_sink(&mut self, sink: MenuSink) {
         *self.hub.menu_sink.borrow_mut() = Some(sink);
     }
 
-    pub fn set_menu_bar(&mut self, bar: &MenuBar) -> Result<(), String> {
+    pub(crate) fn set_menu_bar(&mut self, bar: &MenuBar) -> Result<(), String> {
         let present = bar.key.menu != 0 && !bar.items.is_empty();
         if let Some(popup) = &bar.popup {
             // A transient popup does not own or detach the window's menu bar.
@@ -270,7 +287,7 @@ impl Window {
             runtime.open = 0;
             return tracked;
         }
-        self.menus.clear(&self.app);
+        self.menus.clear();
         let mut runtime = Runtime {
             key: bar.key,
             ..Runtime::default()
@@ -308,8 +325,7 @@ impl Window {
                 }
                 top.setSubmenu(Some(&child));
                 top.setEnabled(bar.key.enabled && source.supported && source.flags & 3 == 0);
-                self.menus.main.addItem(&top);
-                self.menus.guest.push(top);
+                self.menus.add(top);
             }
         }
         *self.hub.menus.borrow_mut() = runtime;
@@ -323,14 +339,11 @@ impl Window {
     }
 
     fn track_popup(&mut self, bar: &MenuBar, popup: &PopupPresentation) -> Result<(), String> {
-        let view = self
-            .window
-            .contentView()
-            .ok_or("window without a content view")?;
-        let (_, ch) = self.client();
-        let viewport = Viewport::fit(self.client(), self.width, self.height);
-        let x = viewport.x + f64::from(popup.x) * viewport.width / f64::from(self.width.max(1));
-        let y = viewport.y + f64::from(popup.y) * viewport.height / f64::from(self.height.max(1));
+        let (width, height) = self.hub.canvas.get();
+        let client = self.view.client();
+        let viewport = Viewport::fit(client, width, height);
+        let x = viewport.x + f64::from(popup.x) * viewport.width / f64::from(width.max(1));
+        let y = viewport.y + f64::from(popup.y) * viewport.height / f64::from(height.max(1));
         let native = self
             .hub
             .menus
@@ -357,8 +370,8 @@ impl Window {
         };
         native.popUpMenuPositioningItem_atLocation_inView(
             None,
-            NSPoint::new(x, ch - y),
-            Some(&view),
+            NSPoint::new(x, client.1 - y),
+            Some(&self.view),
         );
         timer.invalidate();
         if !popup.active.load(Ordering::Acquire) {

@@ -12,10 +12,12 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSView, NSWindow, NSWindowDidChangeOcclusionStateNotification,
-    NSWindowDidDeminiaturizeNotification, NSWindowDidMiniaturizeNotification,
-    NSWindowOcclusionState, NSWorkspace, NSWorkspaceDidWakeNotification,
-    NSWorkspaceWillPowerOffNotification, NSWorkspaceWillSleepNotification,
+    NSApplication, NSApplicationDidBecomeActiveNotification,
+    NSApplicationDidResignActiveNotification, NSView, NSWindow,
+    NSWindowDidChangeOcclusionStateNotification, NSWindowDidDeminiaturizeNotification,
+    NSWindowDidMiniaturizeNotification, NSWindowOcclusionState, NSWorkspace,
+    NSWorkspaceDidWakeNotification, NSWorkspaceWillPowerOffNotification,
+    NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     NSAppleEventManager, NSNotificationCenter, NSObjectProtocol, NSOperationQueue,
@@ -129,6 +131,35 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 center.addObserverForName_object_queue_usingBlock(
                     Some(name),
                     Some(&native_window),
+                    Some(&NSOperationQueue::mainQueue()),
+                    &block,
+                )
+            }));
+        }
+        for name in unsafe {
+            [
+                NSApplicationDidBecomeActiveNotification,
+                NSApplicationDidResignActiveNotification,
+            ]
+        } {
+            // Activation follows the application, as in the CLI shell: a guest
+            // dialog taking key status from the game window keeps it active.
+            let block = block2::RcBlock::new(
+                move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    HOST.with_borrow(|host| {
+                        if let Some(session) = host.as_ref().and_then(|host| host.session.as_ref())
+                        {
+                            session.set_active(
+                                name == unsafe { NSApplicationDidBecomeActiveNotification },
+                            );
+                        }
+                    });
+                },
+            );
+            observers.push((center.clone(), unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    None,
                     Some(&NSOperationQueue::mainQueue()),
                     &block,
                 )
@@ -255,7 +286,10 @@ pub async fn start_game(
                 match session {
                     Ok(session) => {
                         let native = host.container.window().unwrap();
-                        session.set_active(native.isKeyWindow());
+                        session.set_active(
+                            NSApplication::sharedApplication(MainThreadMarker::new().unwrap())
+                                .isActive(),
+                        );
                         session.set_minimized(native.isMiniaturized());
                         session.set_occluded(
                             !native
@@ -324,12 +358,10 @@ pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
             && let Some(session) = &host.session
         {
             match event {
-                tauri::WindowEvent::Focused(active) => {
-                    session.set_active(*active);
-                    if *active {
-                        host.focus(window.state::<OverlayState>().router().keyboard());
-                    }
+                tauri::WindowEvent::Focused(true) => {
+                    host.focus(window.state::<OverlayState>().router().keyboard());
                 }
+                tauri::WindowEvent::Focused(false) => session.resign_key(),
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     host.close_window = true;
