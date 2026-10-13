@@ -15,6 +15,7 @@ mod texture_create;
 type Matrix = [f32; 16];
 type Vector = [f32; 3];
 type Vector4 = [f32; 4];
+type Vector2 = [f32; 2];
 
 pub fn register(registry: &mut Registry) {
     for api in [
@@ -24,15 +25,24 @@ pub fn register(registry: &mut Registry) {
         translation_ABI,
         rotation_yaw_pitch_roll_ABI,
         rotation_y_ABI,
+        rotation_x_ABI,
+        rotation_z_ABI,
         perspective_fov_lh_ABI,
         transform4_ABI,
         transform3_ABI,
         transform_coord_ABI,
+        transform2_ABI,
+        transform2_coord_ABI,
+        transform2_normal_ABI,
         catmull_rom_ABI,
         look_at_ABI,
         project_ABI,
     ] {
         registry.register(api);
+        registry.register(adv_abi::Api {
+            module: "d3dx9_29.dll",
+            ..api
+        });
     }
     buffer::register(registry);
     effect::register(registry);
@@ -155,6 +165,101 @@ fn rotation_y(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestP
         cos, 0., -sin, 0., 0., 1., 0., 0., sin, 0., cos, 0., 0., 0., 0., 1.,
     ];
     if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixRotationX", level = implement)]
+fn rotation_x(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
+    let (s, c) = angle.sin_cos();
+    let value = [1., 0., 0., 0., 0., c, s, 0., 0., -s, c, 0., 0., 0., 0., 1.];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixRotationZ", level = implement)]
+fn rotation_z(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
+    let (s, c) = angle.sin_cos();
+    let value = [c, s, 0., 0., -s, c, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+fn transform2_value(vector: Vector2, matrix: Matrix, translate: bool) -> Vector4 {
+    std::array::from_fn(|column| {
+        // Vec2 never reads Z terms; normal transformation also omits translation.
+        let value = vector[0] * matrix[column] + vector[1] * matrix[4 + column];
+        if translate {
+            value + matrix[12 + column]
+        } else {
+            value
+        }
+    })
+}
+
+#[win32(d3dx9_43, name = "D3DXVec2Transform", level = implement)]
+fn transform2(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector4>,
+    vector: GuestPtr<Vector2>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector4> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    if output
+        .write(env.cpu, transform2_value(vector, matrix, true))
+        .is_ok()
+    {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec2TransformCoord", level = implement)]
+fn transform2_coord(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector2>,
+    vector: GuestPtr<Vector2>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector2> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    let clip = transform2_value(vector, matrix, true);
+    let value = if clip[3] == 0. {
+        [f32::from_bits(0xffc00000); 2]
+    } else {
+        [clip[0] / clip[3], clip[1] / clip[3]]
+    };
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec2TransformNormal", level = implement)]
+fn transform2_normal(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector2>,
+    vector: GuestPtr<Vector2>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector2> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    let value = transform2_value(vector, matrix, false);
+    if output.write(env.cpu, [value[0], value[1]]).is_ok() {
         output
     } else {
         GuestPtr::default()

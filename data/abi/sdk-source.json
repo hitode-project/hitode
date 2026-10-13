@@ -225,6 +225,18 @@
     ],
     "native_verification": "Authored hidden fixture, no sample input: 375 scalar observations of default dimensions, mip correction, optional pointers, usage/pool, mip descriptors, byte lock write/read, final Release and both SDK versions; native/interpreter/JIT/Unicorn agree. No new GPU capability or storage implementation."
   },
+  "legacy_d3dx_math2": {
+    "source": "Microsoft Learn D3dx9math.h prototypes; same x86 WINAPI contracts in February 2006 and June 2010 SDK DLLs",
+    "target": "RotationX/Z: pointer output plus FLOAT angle, pointer return; Vec2Transform/Coord/Normal: three pointers, VECTOR4 output for homogeneous transform and VECTOR2 output otherwise",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationx",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationz",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec2transform",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec2transformcoord",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec2transformnormal"
+    ],
+    "native_verification": "Authored scalar fixture for both DLLs: 44 calls, 384 floating-point components; native/interpreter/JIT/Unicorn agree within 2e-6, pointer identity and sizes exact. Includes in-place Vec2 input/output, zero homogeneous W and NaN terms omitted by normal transformation. Existing verified SDK math declarations are also projected to the older DLL."
+  },
   "legacy_d3dx_texture_memory": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
     "header_sha256": "64dfa1f26d6df792f6cf261c79f737e6e5c7670787ba6abfe0f76aba348e9422",
