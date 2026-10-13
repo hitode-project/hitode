@@ -2,7 +2,7 @@
 use super::{user, user_mut};
 use crate::{Win32, util::set_last_error};
 use adv_abi::{AnsiStr, Env, GuestPtr, Registry, WideStr, win32};
-use adv_cpu::backend::Prot;
+use adv_cpu::backend::{GuestExt, Prot};
 
 pub struct IconFont {
     header: [u8; 28],
@@ -26,6 +26,34 @@ fn fail(env: &mut Env<'_>, error: u32) -> i32 {
     0
 }
 fn parameters(env: &mut Env<'_>, action: u32, parameter: u32, output: u32, wide: bool) -> i32 {
+    if matches!(action, 0x62 | 0x64 | 0x66) {
+        if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err() {
+            return fail(env, 87);
+        }
+        let hover = &user(env).hover;
+        let value = match action {
+            0x62 => hover.width,
+            0x64 => hover.height,
+            _ => hover.time,
+        };
+        return if env.cpu.write_u32(output, value).is_ok() {
+            1
+        } else {
+            fail(env, 87)
+        };
+    }
+    if matches!(action, 0x63 | 0x65 | 0x67) {
+        if parameter == 0 || parameter > i32::MAX as u32 {
+            return fail(env, 87);
+        }
+        let hover = &mut user_mut(env).hover;
+        match action {
+            0x63 => hover.width = parameter,
+            0x65 => hover.height = parameter,
+            _ => hover.time = parameter,
+        };
+        return 1;
+    }
     match action {
         0x1d => user_mut(env).double_click.width = parameter,
         0x1e => user_mut(env).double_click.height = parameter,

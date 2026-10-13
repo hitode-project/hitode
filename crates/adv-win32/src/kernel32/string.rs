@@ -101,6 +101,7 @@ fn lstrcat_w(env: &mut Env<'_>, dst: WideStr, src: WideStr) -> Outcome {
     })
 }
 
+#[cfg(test)]
 fn cmp_ci(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.iter()
         .map(u8::to_ascii_lowercase)
@@ -123,8 +124,30 @@ fn name_bytes(cpu: &dyn Guest, pointer: u32) -> Cow<'_, [u8]> {
     Cow::Owned(cstr(cpu, pointer))
 }
 
+#[cfg(test)]
 fn sign(o: std::cmp::Ordering) -> u32 {
     o as i32 as u32
+}
+
+fn linguistic(env: &mut Env<'_>, wide: bool, ignore_case: bool) -> Outcome {
+    let (a, b) = if wide {
+        (wstr(env.cpu, env.arg(0)), wstr(env.cpu, env.arg(1)))
+    } else {
+        match (
+            super::nlsapi::decode_comparison(env, &name_bytes(env.cpu, env.arg(0))),
+            super::nlsapi::decode_comparison(env, &name_bytes(env.cpu, env.arg(1))),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(error), _) | (_, Err(error)) => {
+                crate::util::set_last_error(env, error);
+                return Outcome::Return((-2i32) as u32);
+            }
+        }
+    };
+    let locale = super::nlsapi::lcid(env);
+    Outcome::Return(
+        super::nlsapi::compare(env, locale, u32::from(ignore_case), &a, &b).wrapping_sub(2),
+    )
 }
 
 pub(super) fn register(reg: &mut Registry) {
@@ -152,27 +175,10 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(lstrcpyn_w_ABI);
     stdcall(reg, K32, "lstrcatA", 2, lstrcat_a);
     reg.register(lstrcat_w_ABI);
-    stdcall(reg, K32, "lstrcmpA", 2, |e| {
-        Outcome::Return(sign(cstr(e.cpu, e.arg(0)).cmp(&cstr(e.cpu, e.arg(1)))))
-    });
-    stdcall(reg, K32, "lstrcmpiA", 2, |e| {
-        Outcome::Return(sign(cmp_ci(
-            &name_bytes(e.cpu, e.arg(0)),
-            &name_bytes(e.cpu, e.arg(1)),
-        )))
-    });
-    stdcall(reg, K32, "lstrcmpW", 2, |e| {
-        Outcome::Return(sign(wstr(e.cpu, e.arg(0)).cmp(&wstr(e.cpu, e.arg(1)))))
-    });
-    stdcall(reg, K32, "lstrcmpiW", 2, |e| {
-        use adv_os::nls::unit_case;
-        Outcome::Return(sign(
-            wstr(e.cpu, e.arg(0))
-                .iter()
-                .map(|&u| unit_case(u, false))
-                .cmp(wstr(e.cpu, e.arg(1)).iter().map(|&u| unit_case(u, false))),
-        ))
-    });
+    stdcall(reg, K32, "lstrcmpA", 2, |e| linguistic(e, false, false));
+    stdcall(reg, K32, "lstrcmpiA", 2, |e| linguistic(e, false, true));
+    stdcall(reg, K32, "lstrcmpW", 2, |e| linguistic(e, true, false));
+    stdcall(reg, K32, "lstrcmpiW", 2, |e| linguistic(e, true, true));
     stdcall(reg, K32, "MulDiv", 3, |e| {
         let (a, b, c) = (
             e.arg(0) as i32 as i64,

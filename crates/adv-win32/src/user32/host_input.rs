@@ -96,6 +96,7 @@ fn post_at(
             .double_click
             .message(hwnd, style, message, wparam, user.cursor_pos, time);
     }
+    super::mouse_tracking::poll(env);
     super::message::post_input(env, hwnd, message, wparam, lparam)
 }
 

@@ -394,6 +394,7 @@ pub struct Queue {
     pub focus: u32,
     pub active: u32,
     pub capture: u32,
+    pub(super) mouse_tracking: Option<super::mouse_tracking::Tracking>,
     pub last_time: u32,
     pub last_pos: (i32, i32),
     /// Application value, replaced on retrieval by the untagged message's zero.
@@ -455,6 +456,7 @@ pub struct User {
     /// The guest's installed input profile, shared by all its current threads.
     pub keyboard_layout: u32,
     pub(super) double_click: super::input::double_click::DoubleClick,
+    pub(super) hover: super::mouse_tracking::Hover,
     pub icon_title_font: super::system_parameters::IconFont,
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
@@ -497,6 +499,7 @@ impl User {
             swap_buttons: false,
             keyboard_layout: 0x0411_0411,
             double_click: super::input::double_click::DoubleClick::default(),
+            hover: super::mouse_tracking::Hover::default(),
             icon_title_font: super::system_parameters::IconFont::default(),
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
@@ -696,6 +699,12 @@ impl User {
                 }
             }
             q.timers.retain(|t| t.hwnd != hwnd);
+            if q.mouse_tracking
+                .as_ref()
+                .is_some_and(|track| track.hwnd == hwnd)
+            {
+                q.mouse_tracking = None;
+            }
         }
     }
 }

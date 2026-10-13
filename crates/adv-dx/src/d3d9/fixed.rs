@@ -233,6 +233,7 @@ impl Fixed {
                 (156, 0),
                 (166, 64f32.to_bits()),
                 (29, 0), // SPECULARENABLE: supported FVFs supply zero specular RGB.
+                (26, 0), // DITHERENABLE: the renderer does not dither.
                 (52, 0),
                 (53, 1),
                 (54, 1),
@@ -244,6 +245,7 @@ impl Fixed {
                 (128, 0), // WRAP0: texture coordinate wrapping is disabled.
                 (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
+                (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
                 (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
                 (146, 2),
                 (147, 0),
@@ -475,7 +477,12 @@ fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> 
             1 | 3 => return UNAVAILABLE,
             _ => false,
         },
-        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 161 | 174 | 185 | 206 => value <= 1,
+        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 141 | 161 | 174 | 185 | 206 => value <= 1,
+        26 => match value {
+            0 => true,
+            1 => return UNAVAILABLE,
+            _ => false,
+        },
         28 | 156 => value <= 1,
         34 => true,
         35 | 140 => value <= 3,

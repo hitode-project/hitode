@@ -114,21 +114,21 @@ fn stretch(
     {
         return unavailable(env, "depth-stencil and multisample blits are unavailable");
     }
-    if src.container.is_some() || dst.container.is_some() {
+    if src.container.is_some() {
         return unavailable(
             env,
             "texture-level StretchRect requires an unsupported texture-source profile",
         );
     }
-    // The shared color images implement these byte-compatible formats. X in
-    // format 22 is unused. Conversion 22 -> 21 would need defined alpha.
+    // RGBX-to-ARGB conversion samples the existing opaque image interpretation;
+    // it must not expose the physical unused X byte as stored alpha.
     if !matches!(
         (src.desc.Format, dst.desc.Format),
-        (21, 21) | (22, 22) | (21, 22)
+        (21, 21) | (22, 22) | (21, 22) | (22, 21)
     ) {
         return unavailable(
             env,
-            "color blits support 21/22 and 21-to-22; other format conversions are unavailable",
+            "color blits support 21/22; other format conversions are unavailable",
         );
     }
     if dst.desc.Usage == 0 && src.desc.Usage != 0 {
@@ -154,6 +154,9 @@ fn stretch(
     let destination_id = com(env)
         .identity::<Payload>(&env.sys.objects, destination.addr())
         .unwrap();
+    if dst.container.is_some() && dst.desc.Usage & 1 == 0 {
+        return unavailable(env, "texture destinations require render-target usage");
+    }
     if source_id == destination_id {
         return unavailable(env, "same-surface StretchRect is unavailable");
     }
@@ -165,15 +168,15 @@ fn stretch(
     else {
         return unavailable(env, "source surface has no shared GPU image");
     };
-    let Some(destination) = dst
-        .surface
-        .and_then(|id| (provider.target)(env.ext, id))
-        .map(|t| t.image)
-    else {
+    let Some(destination) = dst.surface.and_then(|id| (provider.target)(env.ext, id)) else {
         return unavailable(env, "destination surface has no shared GPU image");
     };
     // Equal-size copies stay exact. Scaled copies use the isolated neutral
     // scaling state; guest scene/blend/alpha/depth state is not involved.
+    let resources = [
+        resources::binding_owner(env, source_id),
+        resources::binding_owner(env, destination_id),
+    ];
     dispatch(
         env,
         owner,
@@ -187,8 +190,83 @@ fn stretch(
             } else {
                 adv_device::gpu::Filter::Nearest
             },
-            resources: [source_id, destination_id],
+            resources,
         },
+    )
+}
+
+/// Format interpretation belongs to this frontend; neutral drawing already
+/// samples opaque images with alpha one and never uses guest render state.
+pub(super) fn copy(
+    gpu: &mut Gpu,
+    source: &adv_device::gpu::Image,
+    from: Rect,
+    destination: &Target,
+    to: Rect,
+    filter: adv_device::gpu::Filter,
+) -> Result<(), adv_device::gpu::Error> {
+    use adv_device::gpu::{AlphaMode, DrawState, Filter, TextureOp, Vertex};
+    if source.alpha_mode() != AlphaMode::Opaque
+        || destination.image.alpha_mode() != AlphaMode::Stored
+    {
+        return gpu.blit(source, from, &destination.image, to, filter);
+    }
+    let coordinates = |offset: u32, size: u32, total: u32, output: u32| {
+        if size == output {
+            (
+                offset as f32 / total as f32,
+                (offset + size) as f32 / total as f32,
+            )
+        } else if output <= size {
+            (0., 1.)
+        } else if size == 1 {
+            (0.5, 0.5)
+        } else {
+            (
+                0.,
+                output as f32 * (size - 1) as f32 / (size as f32 * (output - 1) as f32),
+            )
+        }
+    };
+    let (u0, u1) = coordinates(from.x, from.w, source.width(), to.w);
+    let (v0, v1) = coordinates(from.y, from.h, source.height(), to.h);
+    let (w, h) = (destination.image.width(), destination.image.height());
+    let (x0, x1) = (
+        to.x as f32 * 2. / w as f32 - 1.,
+        (to.x + to.w) as f32 * 2. / w as f32 - 1.,
+    );
+    let (y0, y1) = (
+        1. - to.y as f32 * 2. / h as f32,
+        1. - (to.y + to.h) as f32 * 2. / h as f32,
+    );
+    let vertex = |x, y, u, v| Vertex {
+        position: [x, y, 0., 1.],
+        color: [1.; 4],
+        uv: [u, v],
+    };
+    let vertices = [
+        vertex(x0, y0, u0, v0),
+        vertex(x1, y0, u1, v0),
+        vertex(x1, y1, u1, v1),
+        vertex(x0, y0, u0, v0),
+        vertex(x1, y1, u1, v1),
+        vertex(x0, y1, u0, v1),
+    ];
+    let mut state = DrawState::new(w, h);
+    state.texture_op = TextureOp::Texture;
+    state.alpha_texture_op = TextureOp::Texture;
+    state.sampler.min = if filter == Filter::Linear {
+        Filter::Linear
+    } else {
+        Filter::Nearest
+    };
+    state.sampler.mag = state.sampler.min;
+    state.scissor = Some(to);
+    gpu.draw(
+        &destination.clone().with_depth(None)?,
+        &vertices,
+        Some(source),
+        state,
     )
 }
 

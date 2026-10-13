@@ -196,35 +196,37 @@ fn output(
     if length != 0 && env.cpu.read(input, &mut bytes).is_err() {
         return fail(env, 87);
     }
-    paint(env, dc, x, y, options, r, &bytes, ansi, 1)
+    paint(env, dc, x, y, options, r, &bytes, ansi, 1, None)
 }
 
 /// DrawText supplies already formatted Unicode, the same selected font/DC and
 /// a logical clipping rectangle. No temporary guest buffer or second provider.
-pub(super) fn singleline(
+pub(super) fn formatted(
     env: &mut Env<'_>,
     dc: u32,
     rectangle: [i32; 4],
-    units: &[u16],
+    lines: &[Vec<u16>],
+    line_height: i32,
+    clip: bool,
     height: u32,
 ) -> Outcome {
     let [left, top, right, bottom] = rectangle;
-    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
     paint(
         env,
         dc,
         left,
         top,
-        4,
+        if clip { 4 } else { 0 },
         Some(TextBox {
             left,
             top,
             right,
             bottom,
         }),
-        &bytes,
+        &[],
         false,
         height,
+        Some((lines, line_height)),
     )
 }
 
@@ -239,6 +241,7 @@ fn paint(
     bytes: &[u8],
     ansi: bool,
     success: u32,
+    formatted: Option<(&[Vec<u16>], i32)>,
 ) -> Outcome {
     if super::super::raster::front::pixels_unavailable(env, dc) {
         let thunk = env.sys.thunks.get(env.thunk);
@@ -377,7 +380,24 @@ fn paint(
         let surface = surface.clone();
         let mut raw = (provider.memory)(env.cpu);
         let mut memory = super::super::raster::clip::ClippedMemory::new(&mut raw, surface, &clip);
-        let result = store.draw_text(target, &mut memory, &mut fonts.text, &font, paint);
+        // Paint the entire paragraph before presenting or yielding to the host.
+        let result = (|| {
+            if let Some((lines, line_height)) = formatted {
+                let mut changed = false;
+                for (index, line) in lines.iter().enumerate() {
+                    let mut line_paint = paint;
+                    line_paint.input = TextInput::Unicode(line);
+                    line_paint.origin.y = y
+                        .checked_add(index as i32 * line_height)
+                        .ok_or("translated paragraph exceeds the device coordinate range")?;
+                    changed |=
+                        store.draw_text(target, &mut memory, &mut fonts.text, &font, line_paint)?;
+                }
+                Ok(changed)
+            } else {
+                store.draw_text(target, &mut memory, &mut fonts.text, &font, paint)
+            }
+        })();
         let before = store.stats.presentations;
         let result = result.and_then(|changed| {
             if changed && window {

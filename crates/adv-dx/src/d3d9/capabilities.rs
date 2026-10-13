@@ -265,7 +265,7 @@ fn check_conversion(
     if !factory(env, this.addr(), adapter) || kind != 1 {
         return INVALID;
     }
-    if available(env) && matches!(source, 21 | 22) && target == 22 {
+    if available(env) && matches!(source, 21 | 22) && matches!(target, 21 | 22) {
         0
     } else {
         UNAVAILABLE

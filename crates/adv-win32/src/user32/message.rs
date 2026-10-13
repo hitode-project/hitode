@@ -950,6 +950,7 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
 }
 
 pub(super) fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
+    super::mouse_tracking::poll(env);
     let sent = u32::from(sent::pending(env, ctx)) * sent::QS_SEND;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
@@ -1025,6 +1026,7 @@ fn is_descendant(
 
 /// The next message for the current thread, removed from the queue with `remove`.
 fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
+    super::mouse_tracking::poll(env);
     let message = next_message_inner(env, f, remove);
     if message.is_some() {
         // Posted/generated messages and the supported host-input path carry no
@@ -1178,7 +1180,13 @@ fn next_deadline(env: &mut Env<'_>, f: Filter) -> Option<u64> {
         .map(|t| t.due_us)
         .min();
     let dialog = headless_deadline(u, &env.sys.objects, ctx);
-    [timers, dialog].into_iter().flatten().min()
+    let hover = u
+        .queues
+        .get(&ctx)
+        .and_then(|q| q.mouse_tracking)
+        .filter(|t| f.range(0x2a1) && f.matches_hwnd(u, &env.sys.objects, t.hwnd))
+        .and_then(|t| t.due_us);
+    [timers, dialog, hover].into_iter().flatten().min()
 }
 
 // ---- headless dialog policy ----

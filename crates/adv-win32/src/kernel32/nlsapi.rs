@@ -12,10 +12,11 @@ use crate::util::{
 use crate::{Win32, stdcall};
 use adv_os::nls::{ctype1, is_valid_codepage, lead_byte_ranges};
 
+mod collation;
 mod preferred_ui;
 
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.
-fn lcid(env: &Env<'_>) -> u32 {
+pub(super) fn lcid(env: &Env<'_>) -> u32 {
     if env.ext.get::<Win32>().codec.acp == 936 {
         0x804
     } else {
@@ -299,55 +300,75 @@ fn get_locale_info(env: &mut Env<'_>, wide: bool) -> Outcome {
     Outcome::Return(n)
 }
 
-/// CompareStringW(lcid, flags, s1, n1, s2, n2): code-unit order, NORM_IGNORECASE folding
-/// through `char::to_lowercase` for single-unit results. CSTR_LESS_THAN/EQUAL/GREATER_THAN.
+pub(super) fn compare(env: &mut Env<'_>, locale: u32, flags: u32, a: &[u16], b: &[u16]) -> u32 {
+    let locale = if matches!(locale, 0 | 0x400 | 0x800 | 0xc00 | 0x1000 | 0x1400) {
+        lcid(env)
+    } else {
+        locale
+    };
+    match collation::compare(locale, flags, a, b) {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(env, error);
+            0
+        }
+    }
+}
+
+pub(super) fn decode_comparison(env: &Env<'_>, bytes: &[u8]) -> Result<Vec<u16>, u32> {
+    let codec = env.ext.get::<Win32>().codec;
+    collation::decode(codec, codec.acp, bytes)
+}
+
 fn compare_string_w(env: &mut Env<'_>) -> Outcome {
-    const NORM_IGNORECASE: u32 = 1;
+    let locale = env.arg(0);
     let flags = env.arg(1);
     let a = units_or_wstr(env.cpu, env.arg(2), env.arg(3) as i32);
     let b = units_or_wstr(env.cpu, env.arg(4), env.arg(5) as i32);
-    let fold = |u: u16| {
-        if flags & NORM_IGNORECASE == 0 {
-            return u;
-        }
-        char::from_u32(u32::from(u))
-            .and_then(|c| {
-                let mut l = c.to_lowercase();
-                match (l.next(), l.next()) {
-                    (Some(x), None) if (x as u32) < 0x1_0000 => Some(x as u16),
-                    _ => None,
-                }
-            })
-            .unwrap_or(u)
-    };
-    let ord = a.iter().map(|&u| fold(u)).cmp(b.iter().map(|&u| fold(u)));
-    Outcome::Return((ord as i32 + 2) as u32)
+    Outcome::Return(compare(env, locale, flags, &a, &b))
 }
 
 fn compare_string_a(env: &mut Env<'_>) -> Outcome {
-    const NORM_IGNORECASE: u32 = 1;
+    let locale = env.arg(0);
     let flags = env.arg(1);
     let a_bytes = bytes_or_cstr(env.cpu, env.arg(2), env.arg(3) as i32);
     let b_bytes = bytes_or_cstr(env.cpu, env.arg(4), env.arg(5) as i32);
     let codec = env.ext.get::<Win32>().codec;
-    let a = codec.to_utf16(0, &a_bytes);
-    let b = codec.to_utf16(0, &b_bytes);
-    let fold = |u: u16| {
-        if flags & NORM_IGNORECASE == 0 {
-            return u;
-        }
-        char::from_u32(u32::from(u))
-            .and_then(|c| {
-                let mut l = c.to_lowercase();
-                match (l.next(), l.next()) {
-                    (Some(x), None) if (x as u32) < 0x1_0000 => Some(x as u16),
-                    _ => None,
-                }
-            })
-            .unwrap_or(u)
+    let resolved = if matches!(locale, 0 | 0x400 | 0x800 | 0xc00 | 0x1000 | 0x1400) {
+        lcid(env)
+    } else {
+        locale
     };
-    let ord = a.iter().map(|&u| fold(u)).cmp(b.iter().map(|&u| fold(u)));
-    Outcome::Return((ord as i32 + 2) as u32)
+    let result = collation::compare_ansi(resolved, flags, codec, &a_bytes, &b_bytes);
+    Outcome::Return(match result {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(env, error);
+            0
+        }
+    })
+}
+
+fn compare_string_ex(env: &mut Env<'_>) -> Outcome {
+    if env.arg(6) != 0 || env.arg(7) != 0 || env.arg(8) != 0 {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
+    let locale = if env.arg(0) == 0 {
+        lcid(env)
+    } else {
+        let name = units_or_wstr(env.cpu, env.arg(0), -1);
+        match collation::locale(&name, lcid(env)) {
+            Ok(locale) => locale,
+            Err(error) => {
+                set_last_error(env, error);
+                return Outcome::Return(0);
+            }
+        }
+    };
+    let a = units_or_wstr(env.cpu, env.arg(2), env.arg(3) as i32);
+    let b = units_or_wstr(env.cpu, env.arg(4), env.arg(5) as i32);
+    Outcome::Return(compare(env, locale, env.arg(1), &a, &b))
 }
 
 pub(super) fn register(reg: &mut Registry) {
@@ -356,7 +377,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "CompareStringW", 6, compare_string_w);
     // Same leading layout with a locale name; the version, reserved and
     // lParam arguments must be null and do not affect the comparison.
-    stdcall(reg, K32, "CompareStringEx", 9, compare_string_w);
+    stdcall(reg, K32, "CompareStringEx", 9, compare_string_ex);
     // Enumerates nothing: callers probing for a locale name find none and use their default.
     stdcall(reg, K32, "EnumSystemLocalesW", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetACP", 0, |e| {

@@ -21,6 +21,7 @@ mod layered;
 pub mod menu;
 pub mod message;
 mod monitor;
+mod mouse_tracking;
 mod placement;
 mod property;
 mod rectangle;
@@ -782,6 +783,7 @@ pub fn register(reg: &mut Registry) {
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
+    mouse_tracking::register(reg);
     caret::register(reg);
     image::register(reg);
     clipboard::register(reg);

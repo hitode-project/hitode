@@ -1,4 +1,4 @@
-//! USER DrawText measurement and single-line painting share the selected GDI
+//! USER DrawText measurement and paragraph painting share the selected GDI
 //! font, guest ACP and CPU text surface. Advanced paragraph layout is explicit.
 use super::*;
 use adv_cpu::backend::Prot;
@@ -64,10 +64,10 @@ fn render(
     flags: u32,
     ansi: bool,
 ) -> Outcome {
-    if flags & SINGLE == 0 || flags & !(SINGLE | NO_PREFIX) != 0 {
+    if flags & !(SINGLE | NO_PREFIX | LEADING | 0x100) != 0 {
         return unavailable(
             env,
-            "painting supports DT_SINGLELINE left/top clipping only; paragraph layout, tabs and ellipses are unavailable",
+            "painting supports left/top lines; wrapping, tabs, alignment and ellipses are unavailable",
         );
     }
     if adv_abi::guest::check_range(env.cpu, rect.addr(), 16, Prot::READ).is_err() {
@@ -83,7 +83,7 @@ fn render(
         );
     }
     if ansi && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
-        return unavailable(env, "single-line painting ANSI code page is unavailable");
+        return unavailable(env, "painting ANSI code page is unavailable");
     }
     if count == 0 {
         if ansi {
@@ -120,10 +120,13 @@ fn render(
             .collect()
     };
     if units.len() > text::MAX_PAINT_UNITS {
-        return unavailable(env, "single-line painting exceeds 8192 UTF-16 units");
+        return unavailable(env, "painting exceeds 8192 UTF-16 units");
     }
-    if units.iter().any(|&unit| unit < 32) {
-        return unavailable(env, "single-line control-character layout is unavailable");
+    if units
+        .iter()
+        .any(|&unit| unit < 32 && (flags & SINGLE != 0 || !matches!(unit, 10 | 13)))
+    {
+        return unavailable(env, "control-character layout is unavailable");
     }
     if flags & NO_PREFIX == 0 {
         let mut at = 0;
@@ -140,16 +143,53 @@ fn render(
             at += 1;
         }
     }
-    let formatted = lines(&units, flags).pop().unwrap();
+    let mut formatted = lines(&units, flags);
     let request = font_request(env, dc);
-    let height = match env.ext.get_mut::<Fonts>().text.metrics(&request) {
-        Ok(metrics) => metrics.height.max(1) as u32,
+    let line_height = match env.ext.get_mut::<Fonts>().text.metrics(&request) {
+        Ok(metrics) => {
+            metrics.height.max(1)
+                + if flags & LEADING != 0 {
+                    metrics.external_leading
+                } else {
+                    0
+                }
+        }
         Err(TextError::Unavailable) => {
             return unavailable(env, "selected font metrics are unavailable");
         }
         Err(_) => return fail(env),
     };
-    super::paint::singleline(env, dc, rectangle, &formatted, height)
+    if units.first().is_none_or(|&unit| unit == 0) && flags & SINGLE == 0 {
+        return Outcome::Return(1);
+    }
+    let mut extra_empty = 0;
+    if flags & (SINGLE | 0x100) == 0 {
+        let visible = ((i64::from(rectangle[3]) - i64::from(rectangle[1]) - 1)
+            / i64::from(line_height))
+        .max(0) as usize
+            + 1;
+        if formatted.len() > visible {
+            // USER counts one terminal empty line even when bottom clipping
+            // stops paragraph output earlier. It does not paint that line.
+            extra_empty = usize::from(formatted.last().is_some_and(Vec::is_empty));
+            formatted.truncate(visible);
+        }
+    }
+    let Some(height) = line_height.checked_mul((formatted.len() + extra_empty) as i32) else {
+        return fail(env);
+    };
+    if rectangle[1].checked_add(height).is_none() {
+        return fail(env);
+    }
+    super::paint::formatted(
+        env,
+        dc,
+        rectangle,
+        &formatted,
+        line_height,
+        flags & 0x100 == 0,
+        height as u32,
+    )
 }
 
 fn lines(input: &[u16], flags: u32) -> Vec<Vec<u16>> {

@@ -199,7 +199,7 @@ enum Operation {
     Copy {
         source: adv_device::gpu::Image,
         rectangle: adv_device::surface::Rect,
-        destination: adv_device::gpu::Image,
+        destination: Target,
         region: adv_device::surface::Rect,
         filter: adv_device::gpu::Filter,
         resources: [Id; 2],
@@ -1205,8 +1205,7 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
             region,
             filter,
             ..
-        } => gpu
-            .blit(source, *rectangle, destination, *region, *filter)
+        } => stretch::copy(&mut gpu, source, *rectangle, destination, *region, *filter)
             .map(|()| Completion::Command),
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);

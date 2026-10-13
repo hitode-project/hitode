@@ -56,7 +56,7 @@ pub(super) fn descendant(user: &User, objects: &Objects, root: u32, point: (i32,
     0
 }
 
-fn from_point(user: &User, objects: &Objects, point: (i32, i32)) -> u32 {
+pub(super) fn from_point(user: &User, objects: &Objects, point: (i32, i32)) -> u32 {
     let root = user.top.iter().copied().find(|hwnd| {
         user.windows.get(objects, hwnd).is_some_and(|window| {
             window.visible()
