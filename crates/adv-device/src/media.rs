@@ -102,6 +102,131 @@ pub struct Stats {
 mod audio_clock;
 #[cfg(feature = "media")]
 mod native;
+#[cfg(feature = "media")]
+mod packets;
+
+/// How a container describes a compressed stream: enough to rebuild a decoder
+/// and the BITMAPINFOHEADER or WAVEFORMATEX a Windows media type carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodecFormat {
+    Video {
+        fourcc: u32,
+        width: u32,
+        height: u32,
+        bit_count: u16,
+        /// Nominal frame duration; zero when the container gives none.
+        frame_100ns: u64,
+        extradata: Vec<u8>,
+    },
+    Audio {
+        format_tag: u16,
+        rate: u32,
+        channels: u16,
+        block_align: u16,
+        bits: u16,
+        bytes_per_second: u32,
+        extradata: Vec<u8>,
+    },
+}
+
+/// One compressed sample. Times are relative to the start of the media.
+#[derive(Clone, Debug)]
+pub struct Packet {
+    pub time_100ns: u64,
+    pub duration_100ns: u64,
+    pub key: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PacketStream {
+    /// The container's stream number (ASF numbers start at 1).
+    pub number: u16,
+    pub format: CodecFormat,
+    pub bit_rate: u32,
+    pub max_packet: u32,
+    pub packets: Vec<Packet>,
+}
+
+/// A whole container split into per-stream compressed samples.
+#[derive(Clone, Debug)]
+pub struct Demuxed {
+    pub container: String,
+    pub duration_100ns: u64,
+    pub streams: Vec<PacketStream>,
+}
+
+/// Split a whole in-memory container into its audio and video samples.
+pub fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
+    #[cfg(feature = "media")]
+    {
+        packets::demux(bytes)
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = bytes;
+        Err(Error::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+pub enum Decoded {
+    Video(VideoFrame),
+    Audio(AudioFrame),
+}
+
+/// Decodes the samples of one stream as they arrive, in decode order. Frame
+/// times come from the sample times given to [`PacketDecoder::decode`].
+pub struct PacketDecoder {
+    #[cfg(feature = "media")]
+    inner: packets::Decoder,
+}
+
+impl PacketDecoder {
+    pub fn open(format: &CodecFormat) -> Result<Self, Error> {
+        #[cfg(feature = "media")]
+        {
+            Ok(Self {
+                inner: packets::Decoder::open(format)?,
+            })
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = format;
+            Err(Error::Unavailable)
+        }
+    }
+
+    pub fn decode(&mut self, data: &[u8], time_100ns: Option<u64>) -> Result<Vec<Decoded>, Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.decode(data, time_100ns)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = (data, time_100ns);
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Output every frame still held for reordering, then accept a new stream.
+    pub fn drain(&mut self) -> Result<Vec<Decoded>, Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.drain()
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Discard held frames, as after a flush or seek.
+    pub fn reset(&mut self) {
+        #[cfg(feature = "media")]
+        self.inner.reset();
+    }
+}
 
 /// A seekable source holding at most one future decoded video frame. `frame_at`
 /// decodes only through the first frame after the requested time; repeated calls

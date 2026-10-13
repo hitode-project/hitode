@@ -20,6 +20,7 @@ pub enum Command {
     Key(u32),
     KeyDown(u32),
     KeyUp(u32),
+    Text(String),
     Menus,
     Menu(u32),
     Dialogs,
@@ -49,6 +50,7 @@ impl Command {
                 | Self::Key(_)
                 | Self::KeyDown(_)
                 | Self::KeyUp(_)
+                | Self::Text(_)
                 | Self::Menu(_)
                 | Self::Dialog(_)
                 | Self::DialogTrack(..)
@@ -107,6 +109,7 @@ impl Command {
                     _ => Self::Key(key),
                 })
             }
+            "text" if !rest.is_empty() => Ok(Self::Text(rest.to_owned())),
             "memory" => {
                 let mut fields = rest.split_whitespace();
                 let address = fields.next().ok_or("memory requires ADDRESS LENGTH")?;
@@ -141,7 +144,7 @@ impl Command {
             "await-frame" => Ok(Self::AwaitFrame(FrameGateSpec::parse(rest)?)),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click/move X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
+                "expected click/move X Y, key/key-down/key-up VK, text STRING, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
                     .into(),
             ),
         }
@@ -765,6 +768,12 @@ mod tests {
         assert!(Command::RightMouseUp(0, 0).interrupts_guest());
         assert_eq!(Command::parse("key-down 0x11"), Ok(Command::KeyDown(17)));
         assert_eq!(Command::parse("key-up 17"), Ok(Command::KeyUp(17)));
+        assert_eq!(
+            Command::parse("text  なまえ A "),
+            Ok(Command::Text("なまえ A".into()))
+        );
+        assert!(Command::parse("text").is_err());
+        assert!(Command::Text("a".into()).interrupts_guest());
         assert_eq!(Command::parse("menus"), Ok(Command::Menus));
         assert_eq!(Command::parse("menu 100"), Ok(Command::Menu(100)));
         assert_eq!(Command::parse("dialogs"), Ok(Command::Dialogs));

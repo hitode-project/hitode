@@ -164,6 +164,16 @@ fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     let stats = runtime.machine.cpu.stats();
+    #[cfg(target_arch = "x86_64")]
+    let (compile_seconds, pending, stale, failures, peak_pending) = (
+        format!("{:.6}", stats.compile_time.as_secs_f64()),
+        stats.pending_compilations.to_string(),
+        stats.stale_compilations.to_string(),
+        stats.compile_failures.to_string(),
+        stats.peak_pending_compilations.to_string(),
+    );
+    #[cfg(target_arch = "aarch64")]
+    let (compile_seconds, pending, stale, failures, peak_pending) = ("-", "-", "-", "-", "-");
     let intervals = runtime.frame_intervals();
     let warm = &intervals[intervals.len().min(29)..];
     let mut times: Vec<_> = warm.iter().map(Duration::as_secs_f64).collect();
@@ -177,9 +187,9 @@ fn run() -> Result<(), String> {
         "backend,compile_strategy,frames,width,height,fnv1a64,wall_seconds,first_frame_seconds,guest_seconds,compile_seconds,native_entries,interpreter_entries,steps,warm_frames,warm_frame_mean_ms,warm_frame_p95_ms,warm_fps,compilations,native_code_bytes,region_linking,interpreter_instructions,async_compilation,pending_compilations,stale_compilations,compile_failures,peak_pending_compilations"
     );
     println!(
-        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.4},{:.4},{:.2},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{},{},{},{},{},{:.4},{:.4},{:.2},{},{},{},{},{},{},{},{},{}",
         backend,
-        if !jit {
+        if !jit || cfg!(target_arch = "aarch64") {
             "-"
         } else {
             match compile_strategy {
@@ -193,7 +203,7 @@ fn run() -> Result<(), String> {
         elapsed.as_secs_f64(),
         first_frame.unwrap().as_secs_f64(),
         (runtime.machine.sys.clock.now_us() - clock_start) as f64 / 1e6,
-        stats.compile_time.as_secs_f64(),
+        compile_seconds,
         stats.native_entries,
         stats.interpreter_entries,
         steps,
@@ -203,13 +213,13 @@ fn run() -> Result<(), String> {
         if mean > 0.0 { 1.0 / mean } else { 0.0 },
         stats.compilations,
         stats.native_code_bytes,
-        jit && region_linking && !profile,
+        jit && (cfg!(target_arch = "aarch64") || (region_linking && !profile)),
         stats.interpreter_instructions,
-        jit && async_compilation,
-        stats.pending_compilations,
-        stats.stale_compilations,
-        stats.compile_failures,
-        stats.peak_pending_compilations
+        jit && async_compilation && cfg!(target_arch = "x86_64"),
+        pending,
+        stale,
+        failures,
+        peak_pending
     );
     if profile {
         eprintln!(

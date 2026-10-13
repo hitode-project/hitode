@@ -1,4 +1,6 @@
 //! Host-boundary fixtures use the same ABI registry and scheduler in every backend.
+//! Eager compilation, zero interpreter entries and linking comparisons belong to x64;
+//! a64 executes first visits before translating and invalidates only translated code.
 #[path = "support/cpu.rs"]
 mod cpu;
 
@@ -98,6 +100,7 @@ fn fixture(backend: &str) -> (Machine<Cpu>, [u32; 5]) {
     });
     if let Some(jit) = m.cpu.jit_mut() {
         jit.set_async_compilation(false);
+        #[cfg(target_arch = "x86_64")]
         jit.executor_mut().enable_auto_jit(false);
         if backend == "jit" {
             let mut thunks = Region::new(THUNK_BASE, (m.sys.thunks.len() * THUNK_STRIDE) as usize);
@@ -145,9 +148,7 @@ fn api_loop_keeps_the_shared_cpu_and_matches_unicorn() {
         ("unicorn", false),
     ] {
         let (mut m, [leaf, ..]) = fixture(backend);
-        if let Some(jit) = m.cpu.jit_mut() {
-            jit.set_region_linking(linked);
-        }
+        m.cpu.set_region_linking(linked);
         program(&mut m, CODE, |a| {
             let mut again = a.create_label();
             a.mov(ecx, 1000).unwrap();
@@ -165,12 +166,14 @@ fn api_loop_keeps_the_shared_cpu_and_matches_unicorn() {
         exited(m.run(), 507500);
         assert_eq!(m.sys.host_calls, 1000);
         if backend == "jit" {
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
             entries[usize::from(linked)] = m.cpu.stats().native_entries;
         }
         logs.push(m.ext.get::<Calls>().log.clone());
     }
     assert!(logs.iter().all(|log| *log == logs[0]));
+    #[cfg(target_arch = "x86_64")]
     assert!(entries[1] < entries[0]);
 }
 
@@ -227,6 +230,7 @@ fn nested_callbacks_can_wait_then_resume_in_the_right_order() {
             m.cpu.read_u32(DATA).unwrap(),
             m.cpu.read_u32(DATA + 4).unwrap()
         );
+        #[cfg(target_arch = "x86_64")]
         if backend == "jit" {
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
         }
@@ -278,6 +282,7 @@ fn relocated_api_trap_in_an_inline_hook_trampoline_keeps_its_identity() {
         spawn(&mut m);
         exited(m.run(), 116);
         assert_eq!(m.ext.get::<Calls>().log, ["call:leaf"]);
+        #[cfg(target_arch = "x86_64")]
         if backend == "jit" {
             assert!(m.cpu.stats().invalidations > 0);
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
@@ -337,6 +342,7 @@ fn cdecl_callback_and_deadline_resume_invalidate_warm_code() {
             m.ext.get::<Calls>().log,
             ["call:callback", "returned:16", "deadline"]
         );
+        #[cfg(target_arch = "x86_64")]
         if backend == "jit" {
             assert!(m.cpu.stats().invalidations > 0);
         }
@@ -357,6 +363,7 @@ fn handler_code_write_exits_before_executing_stale_native_code() {
         spawn(&mut m);
         exited(m.run(), 99);
         assert_eq!(m.sys.host_calls, 1);
+        #[cfg(target_arch = "x86_64")]
         if backend == "jit" {
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
             assert!(m.cpu.stats().invalidations > 0);
@@ -374,9 +381,7 @@ fn callback_return_trap_is_dispatched_after_cross_region_tail_calls() {
         ("unicorn", false),
     ] {
         let (mut m, [_, callback, ..]) = fixture(backend);
-        if let Some(jit) = m.cpu.jit_mut() {
-            jit.set_region_linking(linked);
-        }
+        m.cpu.set_region_linking(linked);
         program(&mut m, COLD, |a| {
             a.inc(eax).unwrap();
             a.ret().unwrap();
@@ -397,10 +402,12 @@ fn callback_return_trap_is_dispatched_after_cross_region_tail_calls() {
         exited(m.run(), 149);
         assert_eq!(m.ext.get::<Calls>().log, ["call:callback", "returned:42"]);
         if backend == "jit" {
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
             entries[usize::from(linked)] = m.cpu.stats().native_entries;
         }
     }
+    #[cfg(target_arch = "x86_64")]
     assert!(entries[1] < entries[0]);
 }
 
@@ -428,9 +435,7 @@ fn floating_execution_keeps_native_regions_and_delivers_callbacks_in_order() {
         m.cpu.map(DATA + 4096, 0x9000, Prot::RW).unwrap();
         m.cpu.write(SOURCE, &source).unwrap();
         m.cpu.write(SCALE, &32768.0f32.to_le_bytes()).unwrap();
-        if let Some(jit) = m.cpu.jit_mut() {
-            jit.set_region_linking(linked);
-        }
+        m.cpu.set_region_linking(linked);
         program(&mut m, CODE, |a| {
             a.mov(ecx, SAMPLES).unwrap();
             a.mov(esi, SOURCE).unwrap();
@@ -488,6 +493,7 @@ fn floating_execution_keeps_native_regions_and_delivers_callbacks_in_order() {
         assert_eq!(m.ext.get::<Calls>().log, ["call:callback", "returned:13"]);
         if backend == "jit" {
             assert!(m.cpu.stats().native_entries > 0);
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(m.cpu.stats().interpreter_instructions, 0);
         }
     }

@@ -174,8 +174,30 @@ impl Memory {
         let watched = self
             .selective_code_writes()
             .then_some(self.watched.as_slice());
+        // Where a host page holds several guest pages, the window protects
+        // each with the intersection of their permissions (§A4.2).
+        #[cfg(unix)]
+        if self.window.is_some() {
+            let slack = self.window_slack();
+            let view = self.reservation.as_ref().unwrap().direct_fault_view();
+            if let Some(view) = view.filter(|view| view.host_page_size() > PAGE_SIZE) {
+                use crate::virtual_memory::GuestAccess;
+                let allows = |page: usize| {
+                    let offset = slack + page * PAGE_SIZE;
+                    u8::from(view.host_allows(offset, GuestAccess::Read)) * READ
+                        | u8::from(view.host_allows(offset, GuestAccess::Write)) * WRITE
+                };
+                let span = view.host_page_size() / PAGE_SIZE;
+                return self.fast.snapshot(
+                    &self.perms,
+                    watched,
+                    &self.private_copy_pages,
+                    Some((span, &allows)),
+                );
+            }
+        }
         self.fast
-            .snapshot(&self.perms, watched, &self.private_copy_pages)
+            .snapshot(&self.perms, watched, &self.private_copy_pages, None)
     }
 
     /// Register sampled code bytes before reading or reusing them. This is
@@ -2300,26 +2322,83 @@ mod window_tests {
         }
     }
 
+    /// Native code takes a page directly only where its host page lets it:
+    /// on 16K hosts a mixed or code-watched host page sends the accesses its
+    /// window refuses through `Memory` instead of faulting on each one.
+    #[test]
+    fn native_permissions_follow_the_window_host_page() {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(0x10000, 0x8000, host).unwrap();
+            memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
+            // [0x10000, 0x14000): one guest page is read-only, one is inaccessible.
+            memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
+            memory.protect(0x13000, PAGE_SIZE, 0).unwrap();
+            // [0x14000, 0x18000): code is observed on one page.
+            memory.watch_code(0x14000, 1);
+            let classes = memory.native_permissions();
+            let mixed = host == 16384;
+            assert_eq!(
+                classes[1] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
+            );
+            assert_eq!(
+                classes[1] & SHARED != 0,
+                mixed,
+                "{host}: unreadable host page"
+            );
+            assert_eq!(
+                classes[5] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
+            );
+            assert_eq!(classes[5] & SHARED, 0, "{host}");
+            // Restoring the neighbour refreshes every guest page of its host page.
+            memory.protect(0x13000, PAGE_SIZE, READ | WRITE).unwrap();
+            let classes = memory.native_permissions();
+            assert_eq!(classes[1] & SHARED, 0, "{host}");
+            assert_eq!(
+                classes[2] & 7,
+                READ | WRITE | if mixed { EXEC } else { 0 },
+                "{host}"
+            );
+        }
+    }
+
     /// The native permission snapshot lets translated code read owned
     /// private copies directly, so the window must too; stores still trap
     /// until the copy is privatized.
     #[test]
     fn the_window_reads_owned_private_copies_and_traps_their_stores() {
-        let mut memory = Memory::window(0x10000, 0x4000).unwrap();
-        memory
-            .map_private_copy_pages(0x10000, &[0x37; 2 * PAGE_SIZE], READ | WRITE)
-            .unwrap();
-        let window = memory.window_base().unwrap();
-        let reservation = memory.reservation.as_ref().unwrap();
-        let start = reservation.ptr.as_ptr() as usize - window;
-        let allows = |memory: &Memory, addr: usize, access| {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            // One host page of copies, so only their own state sets its protection.
+            let mut memory = Memory::window_at_host_size(0x10000, 0x4000, host).unwrap();
+            memory
+                .map_private_copy_pages(0x10000, &vec![0x37; host], READ | WRITE)
+                .unwrap();
+            let window = memory.window_base().unwrap();
             let reservation = memory.reservation.as_ref().unwrap();
-            let view = reservation.direct_fault_view().unwrap();
-            view.window_allows(addr - start, PAGE_SIZE, access)
-        };
-        assert!(allows(&memory, 0x10000, Read) && !allows(&memory, 0x10000, Write));
-        memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
-        assert!(allows(&memory, 0x10000, Write));
-        assert!(allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write));
+            let start = reservation.ptr.as_ptr() as usize - window;
+            let allows = |memory: &Memory, addr: usize, access| {
+                let reservation = memory.reservation.as_ref().unwrap();
+                let view = reservation.direct_fault_view().unwrap();
+                view.window_allows(addr - start, PAGE_SIZE, access)
+            };
+            assert!(
+                allows(&memory, 0x10000, Read) && !allows(&memory, 0x10000, Write),
+                "{host}"
+            );
+            memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
+            // A host page with a copy left still traps every store.
+            assert_eq!(allows(&memory, 0x10000, Write), host == 4096, "{host}");
+            assert!(
+                allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write),
+                "{host}"
+            );
+            memory.privatize_copy_pages(0x10000, host).unwrap();
+            assert!(allows(&memory, 0x10000, Write), "{host}");
+        }
     }
 }

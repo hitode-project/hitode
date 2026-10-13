@@ -87,6 +87,7 @@ pub mod wm {
     pub const RBUTTONUP: u32 = 0x205;
     pub const MOUSEWHEEL: u32 = 0x20a;
     pub const PARENTNOTIFY: u32 = 0x210;
+    pub const IME_CHAR: u32 = 0x286;
     pub const DWMNCRENDERINGCHANGED: u32 = 0x31f;
 }
 
@@ -388,6 +389,8 @@ pub struct Queue {
     pub message_wait_notification: Handle,
     pub message_wait_mask: u32,
     pub timers: Vec<super::message::Timer>,
+    /// Next generated thread timer ID; zero until the first one.
+    pub next_timer_id: u32,
     pub focus: u32,
     pub active: u32,
     pub capture: u32,

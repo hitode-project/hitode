@@ -430,7 +430,8 @@ mod tests {
     #[test]
     fn capabilities_exclude_unimplemented_paths_and_bound_the_usable_upload() {
         let mut m = super::super::tests::machine();
-        let gpu = pollster::block_on(Gpu::request(true)).expect("capability GPU fixture adapter");
+        let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))
+            .expect("capability GPU fixture adapter");
         set_gpu(&mut m.ext, gpu).unwrap();
         let mut env = Env {
             context: m.sys.current,

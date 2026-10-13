@@ -59,6 +59,8 @@ pub(crate) struct Graph {
     pub expected: u32,
     pub completed: u32,
     complete_sent: bool,
+    /// Duration reported by a guest source filter feeding a host decoder.
+    pub guest_duration: i64,
     pub video: video::window::WindowState,
     pub video_frame: Option<adv_device::surface::VideoFrame>,
     pub video_geometry: Option<VideoWindowGeometry>,
@@ -129,6 +131,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             expected: 0,
             completed: 0,
             complete_sent: false,
+            guest_duration: 0,
             video: video::window::WindowState::default(),
             video_frame: None,
             video_geometry: None,
@@ -460,12 +463,26 @@ fn each_guest_filter(
     args: Vec<u32>,
     then: Then,
 ) -> Outcome {
-    let calls = g(env, graph)
+    // Guest sources pushing into host decoders start after, and stop before,
+    // every other guest filter, as a graph orders filters downstream-first.
+    let sources = super::dmo::upstream_filters(env, graph);
+    let (mut feeding, mut rest): (Vec<u32>, Vec<u32>) = g(env, graph)
         .members
         .iter()
         .rev()
         .filter(|m| m.host.is_none())
-        .map(|m| Call(m.filter, slot, args.clone()))
+        .map(|m| m.filter)
+        .partition(|filter| sources.contains(filter));
+    let order = if slot == 4 {
+        feeding.append(&mut rest);
+        feeding
+    } else {
+        rest.append(&mut feeding);
+        rest
+    };
+    let calls = order
+        .into_iter()
+        .map(|filter| Call(filter, slot, args.clone()))
         .collect();
     chain(env, calls, Vec::new(), then)
 }
@@ -479,6 +496,7 @@ fn set_host_states(env: &mut Env<'_>, graph: u32, value: u32) {
     for host in hosts {
         if let Some(filter) = state(env).filters.get_mut(&host) {
             filter.state = value;
+            super::dmo::state_changed(env, host, value);
         }
     }
 }
@@ -495,6 +513,9 @@ pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             return Outcome::Return(hr);
         }
     }
+    // Downstream first: host decoders fed by a guest source must accept the
+    // samples its streaming threads push as soon as it pauses.
+    set_host_states(env, graph, PAUSED);
     each_guest_filter(
         env,
         graph,
@@ -505,7 +526,6 @@ pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             graph_state.position = graph_state.position(now);
             graph_state.origin = None;
             graph_state.state = PAUSED;
-            set_host_states(env, graph, PAUSED);
             if previous == STOPPED {
                 start_sessions(env, graph);
             } else {
@@ -568,6 +588,7 @@ fn start_sessions(env: &mut Env<'_>, graph: u32) {
     for host in hosts {
         expected += stream::start(env, graph, host);
     }
+    expected += super::dmo::renderers(env, graph);
     let graph_state = g(env, graph);
     graph_state.expected = expected;
     graph_state.completed = 0;
@@ -802,6 +823,7 @@ pub(crate) fn duration(env: &Env<'_>, graph: u32) -> i64 {
         .map(|s| s.duration_us as i64 * 10)
         .max()
         .unwrap_or(0)
+        .max(state.graphs[&graph].guest_duration)
 }
 
 pub(crate) fn current(env: &Env<'_>, graph: u32) -> i64 {
@@ -840,6 +862,47 @@ fn seek(env: &mut Env<'_>, graph: u32, position: Option<i64>, stop_position: Opt
             stream::seek(env, id, position);
         }
     }
+}
+
+/// Guest sources feeding host decoders seek themselves and flush downstream;
+/// pass them the absolute positions the graph just took.
+fn seek_guests(
+    env: &mut Env<'_>,
+    graph: u32,
+    position: Option<i64>,
+    stop: Option<i64>,
+    then: Then,
+) -> Outcome {
+    const ABSOLUTE: u32 = 1;
+    let seekers = super::dmo::upstream_seekers(env, graph);
+    if seekers.is_empty() || (position.is_none() && stop.is_none()) {
+        return then(env, Vec::new());
+    }
+    let Some(scratch) = alloc(env, 16) else {
+        return then(env, Vec::new());
+    };
+    write_i64(env, scratch, position.unwrap_or(0));
+    write_i64(env, scratch + 8, stop.unwrap_or(0));
+    let flags = |value: Option<i64>| if value.is_some() { ABSOLUTE } else { 0 };
+    let calls = seekers
+        .into_iter()
+        .map(|seeker| {
+            Call(
+                seeker,
+                14,
+                vec![scratch, flags(position), scratch + 8, flags(stop)],
+            )
+        })
+        .collect();
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |env, results| {
+            free(env, scratch);
+            then(env, results)
+        }),
+    )
 }
 
 fn resolve_position(current: i64, value: i64, flags: u32) -> Option<i64> {
@@ -938,15 +1001,23 @@ fn seeking(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> {
             let stop_position = read_i64(env, stop_pointer)
                 .and_then(|value| resolve_position(stop_now, value, stop_flags));
             seek(env, graph, position, stop_position);
-            if current_flags & 8 != 0 {
-                let value = current(env, graph);
-                write_i64(env, a1, value);
-            }
-            if stop_flags & 8 != 0 {
-                let value = g(env, graph).stop.unwrap_or(duration(env, graph));
-                write_i64(env, stop_pointer, value);
-            }
-            r(S_OK)
+            Some(seek_guests(
+                env,
+                graph,
+                position,
+                stop_position,
+                Box::new(move |env, _| {
+                    if current_flags & 8 != 0 {
+                        let value = current(env, graph);
+                        write_i64(env, a1, value);
+                    }
+                    if stop_flags & 8 != 0 {
+                        let value = g(env, graph).stop.unwrap_or(duration(env, graph));
+                        write_i64(env, stop_pointer, value);
+                    }
+                    Outcome::Return(S_OK)
+                }),
+            ))
         }
         "GetPositions" => {
             let value = current(env, graph);
@@ -1009,7 +1080,13 @@ fn position_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcom
         "put_CurrentPosition" => {
             let value = (arg_f64(env, 1) * 10_000_000.0) as i64;
             seek(env, graph, Some(value), None);
-            r(S_OK)
+            Some(seek_guests(
+                env,
+                graph,
+                Some(value),
+                None,
+                Box::new(|_, _| Outcome::Return(S_OK)),
+            ))
         }
         "get_StopTime" => {
             let value = seconds(g(env, graph).stop.unwrap_or(duration(env, graph)));
@@ -1019,7 +1096,13 @@ fn position_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcom
         "put_StopTime" => {
             let value = (arg_f64(env, 1) * 10_000_000.0) as i64;
             seek(env, graph, None, Some(value));
-            r(S_OK)
+            Some(seek_guests(
+                env,
+                graph,
+                None,
+                Some(value),
+                Box::new(|_, _| Outcome::Return(S_OK)),
+            ))
         }
         "get_PrerollTime" => {
             write(env, 0.0);

@@ -624,14 +624,24 @@ fn live<B: Backend>(cpu: B) {
         DATA + 12,
     );
     run(&mut m, code);
+    // Hooked entries take the delete-pending path, which only a Windows host
+    // provides. Elsewhere removal fails explicitly, so the directory stays
+    // and the CRT's mkdir finds it.
+    let removed = cfg!(windows);
+    let results = if removed {
+        [1, 1, 0, 0]
+    } else {
+        [1, 0, u32::MAX, u32::MAX]
+    };
     assert_eq!(
         (0..4).map(|i| value(&m, DATA + i * 4)).collect::<Vec<_>>(),
-        [1, 1, 0, 0]
+        results
     );
     assert_eq!(value(&m, DATA + 0x800), 2);
     assert_eq!(value(&m, DATA + 0x840), 2);
     assert_eq!(value(&m, DATA + 0x880), 4);
-    assert_eq!(value(&m, DATA + 0x8c0), 4);
+    // The failed mkdir opens no handle to close.
+    assert_eq!(value(&m, DATA + 0x8c0), if removed { 4 } else { 3 });
     for (offset, expected) in [
         (0x808, 0x100001),
         (0x81c, 3),
@@ -648,7 +658,7 @@ fn live<B: Backend>(cpu: B) {
             "native argument {offset:#x}"
         );
     }
-    assert!(!root.join("game/front").exists());
+    assert_eq!(root.join("game/front").exists(), !removed);
 }
 #[test]
 fn directory_win32_and_crt_fronts_follow_live_native_entries_and_ex_fallback() {

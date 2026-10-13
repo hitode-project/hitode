@@ -31,7 +31,8 @@ fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
 
 #[test]
 fn child_gpu_reuses_host_context_and_survives_parent_teardown() {
-    let mut parent = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut parent =
+        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test GPU adapter");
     parent.set_readback_limit(1).unwrap();
     let mut child = parent.fork().unwrap();
     let parent_target = parent.target(2, 1, false).unwrap();
@@ -83,7 +84,8 @@ fn child_gpu_reuses_host_context_and_survives_parent_teardown() {
 
 #[test]
 fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_losing_the_device() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut gpu =
+        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test GPU adapter");
     gpu.set_readback_limit(1).unwrap();
     let target = gpu.target(2, 2, false).unwrap();
     gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
@@ -103,7 +105,8 @@ fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_los
 #[test]
 fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() {
     use adv_device::surface::{Snapshot, Surfaces};
-    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut gpu =
+        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test GPU adapter");
     let mut surfaces = Surfaces::new(2, 2, 0x1000, 0x10000, Snapshot::default()).unwrap();
     surfaces.set_deferred_presentation(true).unwrap();
     let first = surfaces.create_native(&gpu, 2, 2, false).unwrap();
@@ -173,7 +176,8 @@ fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() 
 #[test]
 fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture() {
     use adv_device::surface::{BlitRect, Snapshot, Surfaces, VideoFrame, VideoLayer};
-    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut gpu =
+        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test GPU adapter");
     let mut surfaces = Surfaces::new(3, 1, 0x1000, 0x10000, Snapshot::default()).unwrap();
     surfaces.set_deferred_presentation(true).unwrap();
     let target = surfaces.create_native(&gpu, 3, 1, false).unwrap();
@@ -276,7 +280,7 @@ fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
 
 #[test]
 fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     for format in [
         DepthFormat::Float32,
         DepthFormat::Unorm16,
@@ -323,7 +327,7 @@ fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
             .with_depth(Some(gpu.depth(3, 4, DepthFormat::Float32).unwrap())),
         Err(Error::Invalid(_))
     ));
-    let foreign = pollster::block_on(Gpu::request(true))
+    let foreign = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))
         .unwrap()
         .depth(4, 4, DepthFormat::Float32)
         .unwrap();
@@ -339,7 +343,7 @@ fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
 
 #[test]
 fn stencil_operations_masks_and_failure_paths_write_the_shared_attachment() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu
         .target(4, 4, false)
         .unwrap()
@@ -464,7 +468,7 @@ fn stencil_operations_masks_and_failure_paths_write_the_shared_attachment() {
 #[test]
 fn opaque_images_sample_one_and_preserve_semantics_across_frame_rotation() {
     use adv_device::surface::{Snapshot, Surfaces, frame_mailbox};
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let opaque = gpu
         .target(2, 2, false)
         .unwrap()
@@ -720,6 +724,7 @@ fn invalid_commands_are_rejected_before_gpu_submission_and_context_can_be_rebuil
     );
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn actual_software_adapter_clear_and_draw() {
     color_texture_blend_clip_depth_and_native_frame_readback(true);

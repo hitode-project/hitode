@@ -3,35 +3,52 @@ use adv_runtime::boot::Runtime;
 use std::time::{Duration, Instant};
 
 pub struct AudioOutput {
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    suspended: bool,
+    #[cfg(any(windows, target_os = "macos"))]
     output: Option<adv_device::Output>,
 }
 
 impl AudioOutput {
     pub fn new(enabled: bool, headless: bool, runtime: &Runtime) -> Self {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let output = if enabled && !headless {
                 Some(adv_device::Output::new(runtime.audio_stream()))
             } else {
                 None
             };
-            Self { output }
+            Self {
+                output,
+                #[cfg(target_os = "macos")]
+                suspended: false,
+            }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = runtime;
             if enabled && !headless {
                 eprintln!(
-                    "audio: native output is available on Windows; continuing with simulated PCM"
+                    "audio: native output is available on Windows and macOS; continuing with simulated PCM"
                 );
             }
             Self {}
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_suspended(&mut self, suspended: bool) {
+        self.suspended = suspended;
+        if let Some(output) = self.output.as_mut() {
+            output.suspend();
+        }
+    }
     pub fn update(&mut self) {
-        #[cfg(windows)]
+        #[cfg(target_os = "macos")]
+        if self.suspended {
+            return;
+        }
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(output) = self.output.as_mut() {
             output.update();
             if output.is_running() {
@@ -42,15 +59,15 @@ impl AudioOutput {
     }
 
     pub fn wait_duration(&self, delay: Option<Duration>) -> Option<Duration> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let wake = self.output.as_ref().and_then(adv_device::Output::next_wake);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let wake = None;
         cap_delay(delay, wake, Instant::now())
     }
 
     pub fn json(&self) -> String {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let Some(output) = &self.output else {
@@ -87,7 +104,7 @@ impl AudioOutput {
                 metrics.capture_dropped.load(Relaxed)
             )
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             "{\"device_requested\": false, \"device_running\": false}".into()
         }

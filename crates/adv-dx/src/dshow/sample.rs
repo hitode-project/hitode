@@ -27,8 +27,13 @@ pub(crate) struct Sample {
     pub discontinuity: bool,
 }
 
+/// Bounds for buffers an upstream filter asks an empty allocator for.
+const MAX_BUFFERS: u32 = 64;
+const MAX_BUFFER_SIZE: u32 = 64 << 20;
+
 /// An allocator with `count` committed buffers of `size` bytes. The caller owns
-/// the returned (canonical) reference.
+/// the returned (canonical) reference. With no buffers, the first
+/// SetProperties decides them, as for an allocator given to an upstream filter.
 pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Result<u32, u32> {
     let faces = super::create(env, &[Face::MemAllocator], Obj::Allocator)?;
     let allocator = faces[0];
@@ -42,6 +47,12 @@ pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Resu
             committed: true,
         },
     );
+    add_samples(env, allocator, count, size)?;
+    Ok(allocator)
+}
+
+fn add_samples(env: &mut Env<'_>, allocator: u32, count: u32, size: u32) -> Result<(), u32> {
+    state(env).allocators.get_mut(&allocator).unwrap().size = size;
     for _ in 0..count {
         let Some(buffer) = alloc(env, size) else {
             return Err(E_OUTOFMEMORY);
@@ -71,7 +82,7 @@ pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Resu
         // Dropping the creation reference puts the sample on the free list.
         release(env, sample);
     }
-    Ok(allocator)
+    Ok(())
 }
 
 /// A free sample with one reference held by the caller.
@@ -122,9 +133,27 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
         env.cpu.write(output, &raw).is_ok()
     };
     match method {
-        // Buffers are fixed by the connection; report what exists.
+        // Buffers are fixed once they exist; report what does.
         "SetProperties" => {
             let output = env.arg(2);
+            if state(env).allocators[&this].samples.is_empty() {
+                let mut request = [0u8; 16];
+                if env.cpu.read(a1, &mut request).is_err() {
+                    return r(E_POINTER);
+                }
+                let word = |at: usize| u32::from_le_bytes(request[at..at + 4].try_into().unwrap());
+                let (count, size) = (word(0) as i32, word(4) as i32);
+                if count <= 0
+                    || size <= 0
+                    || count as u32 > MAX_BUFFERS
+                    || size as u32 > MAX_BUFFER_SIZE
+                {
+                    return r(E_INVALIDARG);
+                }
+                if let Err(error) = add_samples(env, this, count as u32, size as u32) {
+                    return r(error);
+                }
+            }
             r(if properties(env, output) {
                 S_OK
             } else {

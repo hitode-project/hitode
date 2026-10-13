@@ -7005,6 +7005,7 @@ winspool.drv	UploadPrinterDriverPackageW	stdcall	i32	Windows.Win32.Foundation.HR
 winspool.drv	WaitForPrinterChange	stdcall	u32	u32	hPrinter:Windows.Win32.Graphics.Printing.PRINTER_HANDLE:aggregate:1|Flags:u32:u32:1
 winspool.drv	WritePrinter	stdcall	i32	Windows.Win32.Foundation.BOOL	hPrinter:Windows.Win32.Graphics.Printing.PRINTER_HANDLE:aggregate:1|pBuf:void*:ptr:1|cbBuf:u32:u32:1|pcWritten:u32*:ptr:1
 winspool.drv	XcvDataW	stdcall	i32	Windows.Win32.Foundation.BOOL	hXcv:Windows.Win32.Foundation.HANDLE:handle:1|pszDataName:Windows.Win32.Foundation.PWSTR:str16:1|pInputData:u8*:ptr:1|cbInputData:u32:u32:1|pOutputData:u8*:ptr:1|cbOutputData:u32:u32:1|pcbOutputNeeded:u32*:ptr:1|pdwStatus:u32*:ptr:1
+wmvcore.dll	WMCreateSyncReader	stdcall	i32	Windows.Win32.Foundation.HRESULT	pUnkCert:Windows.Win32.System.Com.IUnknown:ptr:1|dwRights:u32:u32:1|ppSyncReader:Windows.Win32.Media.WindowsMediaFormat.IWMSyncReader*:ptr:1
 ws2_32.dll	FreeAddrInfoEx	stdcall	void	void	pAddrInfoEx:Windows.Win32.Networking.WinSock.ADDRINFOEXA*:ptr:1
 ws2_32.dll	FreeAddrInfoExW	stdcall	void	void	pAddrInfoEx:Windows.Win32.Networking.WinSock.ADDRINFOEXW*:ptr:1
 ws2_32.dll	FreeAddrInfoW	stdcall	void	void	pAddrInfo:Windows.Win32.Networking.WinSock.ADDRINFOW*:ptr:1

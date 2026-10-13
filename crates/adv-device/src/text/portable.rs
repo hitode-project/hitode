@@ -18,6 +18,9 @@ use zeno::{Command, Vector};
 mod enumeration;
 mod profile;
 
+// System TTCs such as PingFang exceed the guest font-resource budget.
+const MAX_SYSTEM_FONT_BYTES: usize = 128 * 1024 * 1024;
+
 type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 #[derive(Default)]
 struct FaceStore {
@@ -429,17 +432,17 @@ fn load_face(
                 Arc::clone(bytes)
             } else {
                 let length = std::fs::metadata(path).map_err(font_error)?.len();
-                if length > MAX_FONT_RESOURCE_BYTES as u64 {
+                if length > MAX_SYSTEM_FONT_BYTES as u64 {
                     return Err(TextError::Font("system font exceeds data limit".into()));
                 }
                 let bytes: FontBytes = Arc::new(std::fs::read(path).map_err(font_error)?);
                 let length = bytes.as_ref().as_ref().len();
-                if length > MAX_FONT_RESOURCE_BYTES {
+                if length > MAX_SYSTEM_FONT_BYTES {
                     return Err(TextError::Font("system font exceeds data limit".into()));
                 }
                 // Keep a bounded number of shared collection files. Font owners
                 // independently retain data after this lookup cache is cleared.
-                if store.files.len() >= 32 || store.file_bytes + length > 128 * 1024 * 1024 {
+                if store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
                     store.faces.clear();
                     store.files.clear();
                     store.digests.clear();
@@ -532,6 +535,15 @@ fn normalized_weight(request: &FontRequest) -> i32 {
         request.weight.clamp(1, 1000)
     }
 }
+fn macos_cjk_families(region: &str) -> &'static [&'static str] {
+    match region {
+        "SC" => &["PingFang SC", "Hiragino Sans GB", "Songti SC", "STHeiti"],
+        "TC" => &["PingFang TC", "Songti TC"],
+        "KR" => &["Apple SD Gothic Neo", "AppleMyungjo"],
+        _ => &[],
+    }
+}
+
 fn families(request: &FontRequest) -> Vec<String> {
     let name = request.face.to_lowercase();
     let named_sans = matches!(
@@ -636,6 +648,11 @@ fn families(request: &FontRequest) -> Vec<String> {
             "Noto {} {region}",
             if serif { "Serif" } else { "Sans" }
         ));
+        names.extend(
+            macos_cjk_families(region)
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
     }
     if japanese {
         names.extend(
@@ -717,6 +734,11 @@ fn families(request: &FontRequest) -> Vec<String> {
             names.push(format!("Noto Serif CJK {region}"));
         }
         names.push(format!("Noto Sans CJK {region}"));
+        names.extend(
+            macos_cjk_families(region)
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
     }
     names.push("Droid Sans Fallback".to_owned());
     names
@@ -1826,4 +1848,87 @@ fn blend(pixels: &mut Pixels<'_>, x: i64, y: i64, color: [u8; 3], coverage: u32)
     }
     let encoded = pixels.format.encode(pixel);
     target.copy_from_slice(&encoded[..bytes]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn font(face: &str) -> FontRequest {
+        FontRequest {
+            default: None,
+            face: face.into(),
+            height: -40,
+            width: 0,
+            baseline_angle: 0,
+            glyph_angle: 0,
+            weight: 400,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            encoding: Encoding::Latin,
+            precision: Precision::Default,
+            clipping: Clipping {
+                precision: ClipPrecision::Default,
+                transform_rotation: false,
+                force_outline: false,
+                disable_association: false,
+                embedded: false,
+            },
+            quality: Quality::Antialiased,
+            pitch: Pitch::Default,
+            family: Family::Default,
+        }
+    }
+
+    #[test]
+    fn regional_macos_families_follow_noto_and_preserve_requested_family_priority() {
+        for (encoding, region, expected) in [
+            (
+                Encoding::SimplifiedChinese,
+                "SC",
+                &["PingFang SC", "Hiragino Sans GB", "Songti SC", "STHeiti"][..],
+            ),
+            (
+                Encoding::TraditionalChinese,
+                "TC",
+                &["PingFang TC", "Songti TC"][..],
+            ),
+            (
+                Encoding::Korean,
+                "KR",
+                &["Apple SD Gothic Neo", "AppleMyungjo"][..],
+            ),
+            (
+                Encoding::Johab,
+                "KR",
+                &["Apple SD Gothic Neo", "AppleMyungjo"][..],
+            ),
+        ] {
+            for family in [Family::SansSerif, Family::Serif] {
+                let mut request = font("Guest Family");
+                request.encoding = encoding;
+                request.family = family;
+                let names = families(&request);
+                assert_eq!(names[0], "Guest Family");
+                let start = names.iter().position(|name| name == expected[0]).unwrap();
+                assert_eq!(&names[start..start + expected.len()], expected);
+                let noto = format!(
+                    "Noto {} {region}",
+                    if family == Family::Serif {
+                        "Serif"
+                    } else {
+                        "Sans"
+                    }
+                );
+                assert_eq!(names[start - 1], noto);
+                assert!(
+                    start
+                        < names
+                            .iter()
+                            .position(|name| name == "Times New Roman" || name == "Arial")
+                            .unwrap()
+                );
+            }
+        }
+    }
 }

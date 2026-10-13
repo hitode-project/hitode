@@ -28,7 +28,7 @@ fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
 
 #[test]
 fn integer_lines_match_reference_pixels_for_both_endpoint_states() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu
         .target(SIZE, SIZE, false)
         .unwrap()
@@ -111,7 +111,7 @@ fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
 
 #[test]
 fn endpoint_commands_preserve_list_order_scissor_alpha_test_and_stencil() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu
         .target(SIZE, SIZE, false)
         .unwrap()
@@ -215,7 +215,7 @@ fn endpoint_commands_preserve_list_order_scissor_alpha_test_and_stencil() {
 
 #[test]
 fn unsupported_inclusive_profiles_fail_before_submission_and_triangles_ignore_the_flag() {
-    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
     let target = gpu.target(SIZE, SIZE, false).unwrap();
     gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
     let mut state = DrawState::new(SIZE, SIZE);

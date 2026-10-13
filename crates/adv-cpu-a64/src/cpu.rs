@@ -66,6 +66,10 @@ impl Cpu {
         self.inner.stats.clone()
     }
 
+    /// Translation is always synchronous here, so there is nothing to turn
+    /// off; callers shared with the x64 engine need no target cfg.
+    pub fn set_async_compilation(&mut self, _enabled: bool) {}
+
     /// Install the execution owner's retained event before the first run.
     pub fn set_waker(&mut self, wake: WakeEvent) -> Result<(), String> {
         if let Some(sender) = &self.sender

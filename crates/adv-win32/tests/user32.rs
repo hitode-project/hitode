@@ -954,6 +954,57 @@ fn queue_status_distinguishes_pending_changed_and_range_filtered_observation() {
 }
 
 #[test]
+fn thread_timers_rearm_by_id_and_never_reuse_a_live_id() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let first = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    let rearmed = t.call(&mut a, "SetTimer", &[I(0), M(first), I(20), I(0)]);
+    let second = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    let third = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    // An unknown ID is ignored for a fresh one.
+    let unknown = t.call(&mut a, "SetTimer", &[I(0), I(0x1234), I(10), I(0)]);
+    t.call(&mut a, "KillTimer", &[I(0), M(second)]);
+    let refill = t.call(&mut a, "SetTimer", &[I(0), I(0), I(10), I(0)]);
+    // Re-arming replaced the first timer: one kill removes it.
+    let killed = t.call(&mut a, "KillTimer", &[I(0), M(first)]);
+    let gone = t.call(&mut a, "KillTimer", &[I(0), M(first)]);
+    t.run(a);
+    assert_eq!(t.u32(rearmed), t.u32(first));
+    let live = [t.u32(first), t.u32(third), t.u32(unknown), t.u32(refill)];
+    assert_ne!(t.u32(unknown), 0x1234);
+    for (index, id) in live.iter().enumerate() {
+        // Generated IDs fit the WORD that Delphi's hint timer keeps.
+        assert!((0x7fff..=0xffff).contains(id), "{live:x?}");
+        assert!(!live[index + 1..].contains(id), "{live:x?}");
+    }
+    assert_eq!((t.u32(killed), t.u32(gone)), (1, 0));
+}
+
+#[test]
+fn a_word_sized_thread_timer_id_kills_its_timer() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let mut kills = Vec::new();
+    // The hint timer pattern: kill the previous ID, then start a new one.
+    let first = t.call(&mut a, "SetTimer", &[I(0), I(0), I(500), I(0)]);
+    let mut previous = first;
+    for _ in 0..3 {
+        a.mov_eax_mem(previous);
+        a.bytes.extend_from_slice(&[0x25, 0xff, 0xff, 0, 0]); // and eax,0xffff
+        a.mov_mem_eax(previous);
+        kills.push(t.call(&mut a, "KillTimer", &[I(0), M(previous)]));
+        previous = t.call(&mut a, "SetTimer", &[I(0), I(0), I(500), I(0)]);
+    }
+    let last = t.call(&mut a, "KillTimer", &[I(0), M(previous)]);
+    let empty = t.call(&mut a, "GetQueueStatus", &[I(0x10)]);
+    t.run(a);
+    for kill in kills {
+        assert_eq!(t.u32(kill), 1);
+    }
+    assert_eq!((t.u32(last), t.u32(empty)), (1, 0));
+}
+
+#[test]
 fn generated_timer_expiry_becomes_new_again_after_removal() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);

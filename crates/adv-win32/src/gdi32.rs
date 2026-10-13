@@ -271,7 +271,7 @@ fn unrealize_object(_env: &mut Env<'_>, _h: Handle) -> Outcome {
     Outcome::Return(1)
 }
 
-pub(super) fn delete_object_value(env: &mut Env<'_>, h: u32) -> Outcome {
+pub(crate) fn delete_object_value(env: &mut Env<'_>, h: u32) -> Outcome {
     if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h)
         || crate::user32::system_colors::is_system_brush(h)
     {
@@ -472,6 +472,26 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
         return None;
     }
     Some((h, bits))
+}
+
+/// A bitmap owning `rows`: top-down, at the DWORD-aligned stride GDI keeps.
+pub(crate) fn bitmap_from_rows(
+    env: &mut Env<'_>,
+    width: u32,
+    height: u32,
+    bpp: u16,
+    rows: &[u8],
+) -> Option<u32> {
+    let stride = width.checked_mul(u32::from(bpp))?.div_ceil(32) * 4;
+    if width == 0 || height == 0 || rows.len() != stride.checked_mul(height)? as usize {
+        return None;
+    }
+    let (bitmap, bits) = new_bitmap(env, width.try_into().ok()?, height.try_into().ok()?, bpp)?;
+    if env.cpu.write(bits, rows).is_err() {
+        delete_object_value(env, bitmap);
+        return None;
+    }
+    Some(bitmap)
 }
 
 #[win32(gdi32, name = "CreateBitmap", level = implement)]

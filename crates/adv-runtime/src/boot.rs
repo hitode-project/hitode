@@ -71,6 +71,7 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     adv_dx::dsound::register(&mut registry);
     adv_dx::d3dx9::register(&mut registry);
     adv_dx::dshow::register(&mut registry);
+    adv_dx::wmvcore::register(&mut registry);
     adv_dx::dxdiag::register(&mut registry);
     adv_dx::dinput::register(&mut registry);
     #[cfg(feature = "gpu")]
@@ -638,6 +639,12 @@ impl<B: Backend> Runtime<B> {
             adv_dx::dinput::post_input(&mut self.env(), message, wparam, lparam);
         }
         accepted
+    }
+
+    /// Post text committed by a host input method to the keyboard focus (see
+    /// [`adv_win32::user32::host_input::post_text`]); returns the characters posted.
+    pub fn post_text(&mut self, text: &str) -> usize {
+        adv_win32::user32::host_input::post_text(&mut self.env(), text)
     }
 
     /// Immutable native-menu projection; this is called only by execution.

@@ -489,6 +489,17 @@ impl DirectFaultView<'_> {
         }
     }
 
+    pub fn host_page_size(&self) -> usize {
+        self.pages.host_page_size
+    }
+
+    /// Whether the host page holding `offset` takes `access` in the window,
+    /// whatever the guest permissions of its subpages.
+    pub fn host_allows(&self, offset: usize, access: GuestAccess) -> bool {
+        let direct = self.pages.direct.as_ref().unwrap();
+        direct.host[offset / self.pages.host_page_size].allows(access)
+    }
+
     /// Whether an entire operand is accessible in the protected guest window.
     pub fn window_allows(&self, offset: usize, len: usize, access: GuestAccess) -> bool {
         let Ok(range) = self.validate(offset, len, access) else {

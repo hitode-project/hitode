@@ -908,15 +908,9 @@ fn maximum_suspend_count_and_invalid_creation_outputs_leave_thread_state_unchang
             &[I(0), I(0), I(WORKER), I(0), I(4), I(0xfffffff0)],
             DATA + 20,
         );
+        // Extra Win32 creation flags are accepted, so only the unwritable
+        // thread id output remains an invalid creation here.
         call(&mut machine, &mut code, "GetLastError", &[], DATA + 24);
-        call(
-            &mut machine,
-            &mut code,
-            "CreateThread",
-            &[I(0), I(0), I(WORKER), I(0), I(8), I(0)],
-            DATA + 28,
-        );
-        call(&mut machine, &mut code, "GetLastError", &[], DATA + 32);
         call(&mut machine, &mut code, "ExitProcess", &[I(0)], 0);
         run(&mut machine, None, &services, code);
         assert_eq!(
@@ -928,15 +922,7 @@ fn maximum_suspend_count_and_invalid_creation_outputs_leave_thread_state_unchang
             ),
             (u32::MAX, 156, 127, 1)
         );
-        assert_eq!(
-            (
-                word(&machine, 20),
-                word(&machine, 24),
-                word(&machine, 28),
-                word(&machine, 32)
-            ),
-            (0, 998, 0, 87)
-        );
+        assert_eq!((word(&machine, 20), word(&machine, 24)), (0, 998));
         assert_eq!(
             machine.sys.contexts.len(),
             2,

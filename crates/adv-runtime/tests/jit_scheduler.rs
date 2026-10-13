@@ -135,6 +135,7 @@ fn callback_event_wait_thread_join_and_fs_survive_real_scheduler_switches() {
             "auto-reset event must be consumed"
         );
         if jit {
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(m.cpu.stats().interpreter_entries, 0);
         }
     }

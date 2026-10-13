@@ -23,6 +23,8 @@ fn compile(cpu: &mut JitCpu, start: u32, len: usize) {
     let mut region = Region::new(start, len);
     region.reachable = true;
     cpu.executor_mut().add_region(region).unwrap();
+    // a64 has no automatic-region policy to switch off.
+    #[cfg(not(target_arch = "aarch64"))]
     cpu.executor_mut().enable_auto_jit(false);
 }
 fn burst<B: Backend>(

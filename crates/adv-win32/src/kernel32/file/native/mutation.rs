@@ -22,9 +22,9 @@ fn result(env: &mut Env<'_>, class: u32, status: Result<(), u32>) -> Outcome {
 pub(in crate::kernel32) fn delete(env: &mut Env<'_>, path: String) -> Outcome {
     #[cfg(not(windows))]
     if portable_active(env) {
-        return portable(env, path, None);
+        return portable(env, path, None, 0);
     }
-    mutate(env, path, 64, vec![])
+    mutate(env, path, 64, vec![], None)
 }
 
 /// Modern Win32 uses POSIX disposition first. NT_SUCCESS is final; every
@@ -43,10 +43,16 @@ pub(crate) fn set_disposition(env: &mut Env<'_>, handle: u32, then: Done<()>) ->
 }
 
 pub(in crate::kernel32) fn rename(env: &mut Env<'_>, source: String, target: String) -> Outcome {
+    rename_options(env, source, target, 0)
+}
+
+fn rename_options(env: &mut Env<'_>, source: String, target: String, flags: u32) -> Outcome {
     let target = env.ext.get::<Win32>().vfs.normalize(&target);
     #[cfg(not(windows))]
-    if portable_active(env) {
-        return portable(env, source, Some(target));
+    if portable_active(env)
+        && (flags & 8 == 0 || !super::metadata::active(env, &["NtFlushBuffersFile"]))
+    {
+        return portable(env, source, Some(target), flags);
     }
     let name = if let Some(unc) = target.strip_prefix(r"\\") {
         format!(r"\??\UNC\{unc}")
@@ -54,10 +60,17 @@ pub(in crate::kernel32) fn rename(env: &mut Env<'_>, source: String, target: Str
         format!(r"\??\{target}")
     };
     let name: Vec<_> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut input = vec![0; 12]; // x86 FILE_RENAME_INFORMATION, no replacement/root.
+    let mut input = vec![0; 12]; // x86 FILE_RENAME_INFORMATION, no root.
+    input[0] = (flags & 1) as u8;
     input[8..12].copy_from_slice(&(name.len() as u32).to_le_bytes());
     input.extend(name);
-    mutate(env, source, 10, input)
+    mutate(
+        env,
+        source.clone(),
+        10,
+        input,
+        Some((source, target, flags)),
+    )
 }
 
 #[cfg(not(windows))]
@@ -76,7 +89,7 @@ fn portable_active(env: &mut Env<'_>) -> bool {
 }
 
 #[cfg(not(windows))]
-fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcome {
+fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u32) -> Outcome {
     use crate::{FileObj, util::set_last_error};
     let source = env.ext.get::<Win32>().vfs.normalize(&source);
     let error = |env: &mut Env<'_>, code| {
@@ -99,15 +112,19 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
         return error(env, 2);
     };
     if !from.is_file() {
-        if target.is_some() {
-            warn_unavailable(
-                env,
-                "kernel32.dll!MoveFile",
-                "directory rename owners are unavailable",
-            );
-            return error(env, 50);
-        }
-        return error(env, 5);
+        return match target {
+            Some(target) => {
+                let outcome = super::directory::portable_rename(env, source, target.clone());
+                if matches!(outcome, Outcome::Return(1)) && flags & 8 != 0 {
+                    let to = env.ext.get::<Win32>().vfs.lookup(&target).unwrap();
+                    if let Err(e) = adv_os::vfs::sync_move(&from, &to) {
+                        return error(env, crate::kernel32::file::io_code(&e));
+                    }
+                }
+                outcome
+            }
+            None => error(env, 5),
+        };
     }
     let identity =
         match std::fs::File::open(&from).and_then(|file| adv_os::vfs::file_identity(&file)) {
@@ -135,10 +152,44 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
             }
         };
         if volume(&source) != volume(&target) {
-            return error(env, 17);
+            return if flags & 2 != 0 {
+                super::copy::move_copy(env, source, target, flags)
+            } else {
+                error(env, 17)
+            };
         }
-        if vfs.lookup(&target).is_some() && !source.eq_ignore_ascii_case(&target) {
-            return error(env, 183);
+        if let Some(destination) = vfs.lookup(&target)
+            && !source.eq_ignore_ascii_case(&target)
+        {
+            if flags & 1 == 0 {
+                return error(env, 183);
+            }
+            if destination.is_dir()
+                || destination
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().readonly())
+            {
+                return error(env, 5);
+            }
+            let target_id = match std::fs::File::open(&destination)
+                .and_then(|file| adv_os::vfs::file_identity(&file))
+            {
+                Ok(id) => id,
+                Err(e) => return error(env, crate::kernel32::file::io_code(&e)),
+            };
+            if target_id != identity
+                && (env
+                    .sys
+                    .objects
+                    .all_hosts::<FileObj>()
+                    .any(|(_, f)| f.file.cached_identity() == Some(target_id))
+                    || vfs.sections.lookup(target_id).is_some())
+            {
+                return error(env, 5);
+            }
+        }
+        if vfs.is_optical_path(&target) {
+            return error(env, 19);
         }
         if vfs.has_read_only_underlay(&target) {
             warn_unavailable(
@@ -160,16 +211,14 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
         let Some(mut to) = vfs.write_path(&target) else {
             return error(env, 3);
         };
-        if let Some(leaf) = target.rsplit('\\').next() {
+        if (source.eq_ignore_ascii_case(&target) || !to.exists())
+            && let Some(leaf) = target.rsplit('\\').next()
+        {
             to.set_file_name(leaf);
         }
-        std::fs::rename(from, to).map(|()| Some(target))
-    } else {
-        std::fs::remove_file(from).map(|()| None)
-    };
-    match changed {
-        Ok(target) => {
-            if let Some(target) = target {
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {
+                // Retarget live owners even if the subsequent durability request fails.
                 for (_, file) in env.sys.objects.all_hosts_mut::<FileObj>() {
                     if file.file.cached_identity() == Some(identity)
                         && file.guest_path.eq_ignore_ascii_case(&source)
@@ -177,9 +226,22 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
                         file.guest_path = target.clone();
                     }
                 }
+                if flags & 8 != 0 {
+                    adv_os::vfs::sync_move(&from, &to)
+                } else {
+                    Ok(())
+                }
             }
-            Outcome::Return(1)
+            Err(e) if e.raw_os_error() == Some(18) && flags & 2 != 0 => {
+                return super::copy::move_copy(env, source, target, flags);
+            }
+            Err(e) => Err(e),
         }
+    } else {
+        std::fs::remove_file(from)
+    };
+    match changed {
+        Ok(()) => Outcome::Return(1),
         Err(e) => error(
             env,
             if e.raw_os_error() == Some(18) {
@@ -191,20 +253,46 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>) -> Outcom
     }
 }
 
-fn mutate(env: &mut Env<'_>, path: String, class: u32, input: Vec<u8>) -> Outcome {
+fn mutate(
+    env: &mut Env<'_>,
+    path: String,
+    class: u32,
+    input: Vec<u8>,
+    moving: Option<(String, String, u32)>,
+) -> Outcome {
+    let write_through = moving.as_ref().is_some_and(|(_, _, flags)| flags & 8 != 0);
     let then: Done<u32> = Box::new(move |env, opened| {
         let handle = match opened {
             Ok(handle) => handle,
             Err(status) => return result(env, class, Err(status)),
         };
         let done: Done<()> = Box::new(move |env, changed| {
-            close(
-                env,
-                handle,
-                // Win32 decides the mutation result from NtSetInformationFile;
-                // native cleanup still runs, but its status is not propagated.
-                Box::new(move |env, _closed| result(env, class, changed)),
-            )
+            let finish: Done<()> = Box::new(move |env, changed| {
+                close(
+                    env,
+                    handle,
+                    // Win32 decides the mutation result from NtSetInformationFile;
+                    // native cleanup still runs, but its status is not propagated.
+                    Box::new(move |env, _closed| {
+                        if let Some((source, target, flags)) = moving
+                            && changed == Err(0xc00000d4)
+                            && flags & 2 != 0
+                        {
+                            return super::copy::move_copy(env, source, target, flags);
+                        }
+                        result(env, class, changed)
+                    }),
+                )
+            });
+            if changed.is_ok()
+                && write_through
+                && (env.sys.objects.get(handle).is_none()
+                    || env.sys.objects.host::<crate::FileObj>(handle).is_some())
+            {
+                operations::flush(env, handle, finish)
+            } else {
+                finish(env, changed)
+            }
         });
         if class == 64 {
             set_disposition(env, handle, done)
@@ -220,7 +308,7 @@ fn mutate(env: &mut Env<'_>, path: String, class: u32, input: Vec<u8>) -> Outcom
         if class == 64 {
             0x0001_0080
         } else {
-            0x0011_0080
+            0x0011_0080 | if write_through { 0x40000000 } else { 0 }
         },
         7,
         if class == 10 {
@@ -234,3 +322,52 @@ fn mutate(env: &mut Env<'_>, path: String, class: u32, input: Vec<u8>) -> Outcom
 
 #[cfg(test)]
 mod tests;
+
+/// MOVEFILE_DELAY_UNTIL_REBOOT requires a guest boot queue which this runtime does not own.
+pub(in crate::kernel32) fn move_ex(
+    env: &mut Env<'_>,
+    source: String,
+    target: Option<String>,
+    flags: u32,
+) -> Outcome {
+    let code = if flags & !0x3f != 0 || flags & 6 == 6 {
+        87
+    } else if flags & (4 | 16 | 32) != 0 {
+        50
+    } else if target.is_none() {
+        87
+    } else {
+        0
+    };
+    if code != 0 {
+        crate::util::set_last_error(env, code);
+        return Outcome::Return(0);
+    }
+    rename_options(env, source, target.unwrap(), flags)
+}
+
+/// A successful cross-volume copy remains successful if deleting the source fails.
+pub(super) fn delete_copied(env: &mut Env<'_>, source: String) -> Outcome {
+    #[cfg(not(windows))]
+    if portable_active(env) {
+        let _ = portable(env, source, None, 0);
+        return Outcome::Return(1);
+    }
+    open_existing(
+        env,
+        &source,
+        0x00010080,
+        7,
+        0x00204040,
+        Box::new(move |env, opened| {
+            let Ok(handle) = opened else {
+                return Outcome::Return(1);
+            };
+            set_disposition(
+                env,
+                handle,
+                Box::new(move |env, _| close(env, handle, Box::new(|_, _| Outcome::Return(1)))),
+            )
+        }),
+    )
+}

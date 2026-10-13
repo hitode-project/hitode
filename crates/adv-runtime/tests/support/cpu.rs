@@ -40,24 +40,29 @@ impl Cpu {
     }
     pub fn profile(&self) -> std::collections::BTreeMap<u32, adv_cpu::ProfileSample> {
         match self {
-            Self::Jit(cpu) => cpu.profile(),
+            Self::Jit(cpu) => adv_cpu::Engine::profile(cpu.as_ref()),
             Self::Unicorn(_) => std::collections::BTreeMap::new(),
         }
     }
     pub fn set_profiling(&mut self, enabled: bool) {
         match self {
+            #[cfg(target_arch = "x86_64")]
             Self::Jit(cpu) => cpu.set_profiling(enabled),
+            #[cfg(target_arch = "aarch64")]
+            Self::Jit(cpu) => cpu.set_block_profile(enabled),
             Self::Unicorn(cpu) => cpu.set_block_profile(enabled),
         }
     }
-    pub fn set_auto_compile_strategy(&mut self, strategy: CompileStrategy) {
+    pub fn set_auto_compile_strategy(&mut self, _strategy: CompileStrategy) {
+        #[cfg(target_arch = "x86_64")]
         if let Self::Jit(cpu) = self {
-            cpu.set_auto_compile_strategy(strategy);
+            cpu.set_auto_compile_strategy(_strategy);
         }
     }
-    pub fn set_region_linking(&mut self, enabled: bool) {
+    pub fn set_region_linking(&mut self, _enabled: bool) {
+        #[cfg(target_arch = "x86_64")]
         if let Self::Jit(cpu) = self {
-            cpu.set_region_linking(enabled);
+            cpu.set_region_linking(_enabled);
         }
     }
     pub fn set_async_compilation(&mut self, enabled: bool) {

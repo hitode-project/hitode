@@ -1,11 +1,14 @@
+#[cfg(not(target_os = "macos"))]
 use adv_runtime::Snapshot;
 pub use adv_sync::WakeEvent;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::native_viewport;
 #[cfg(all(windows, feature = "gpu"))]
 pub(crate) use native::native_viewport;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub enum Event {
     Menu(adv_runtime::MenuEvent),
     Dialog(adv_runtime::DialogEvent),
@@ -15,14 +18,18 @@ pub enum Event {
         lparam: u32,
     },
     Close,
+    #[cfg(target_os = "macos")]
+    ForceClose,
     FocusLost,
+    #[cfg(target_os = "macos")]
+    AudioSuspended(bool),
     Repaint,
 }
 pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;
 pub type DialogSink = Box<dyn FnMut(adv_runtime::DialogEvent) -> Result<(), String>>;
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub enum WaitOutcome {
     Input,
     Deadline,
@@ -1382,14 +1389,19 @@ mod native {
 #[cfg(windows)]
 pub use native::{Window, initialize_dpi};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{Window, initialize_dpi};
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn initialize_dpi() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct Window;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl Window {
     pub fn set_video_cursor_regions(&mut self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
     pub fn set_cursor_visible(&mut self, _: bool) {}

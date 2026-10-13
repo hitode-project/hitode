@@ -24,3 +24,4 @@ dwmapi.dll	DwmSetWindowAttribute	dwmapi.dll	DwmSetWindowAttribute	4
 # ImageHlp exposes the same directory utility declaration as DbgHelp.
 dbghelp.dll	MakeSureDirectoryPathExists	dbghelp.dll	MakeSureDirectoryPathExists	1
 imagehlp.dll	MakeSureDirectoryPathExists	dbghelp.dll	MakeSureDirectoryPathExists	1
+wmvcore.dll	WMCreateSyncReader	wmvcore.dll	WMCreateSyncReader	3

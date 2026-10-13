@@ -67,7 +67,7 @@ fn follow(env: &Env<'_>, mut out: u32) -> Option<End> {
             Role::VideoDecoder | Role::AudioDecoder => {
                 out = *filter.pins.iter().find(|p| state.pins[p].dir == OUTPUT)?;
             }
-            Role::Splitter | Role::FileSource => return None,
+            Role::Splitter | Role::FileSource | Role::DmoDecoder => return None,
         }
     }
     None
@@ -186,12 +186,13 @@ pub(crate) fn apply_volume(env: &mut Env<'_>, graph: u32) {
     } else {
         (base, base * gain(g.balance))
     };
-    let streams: Vec<u64> = state(env)
+    let mut streams: Vec<u64> = state(env)
         .sessions
         .values()
         .filter(|s| s.graph == graph)
         .filter_map(|s| s.audio)
         .collect();
+    streams.extend(super::dmo::audio_streams(env, graph));
     if let Some(sound) = env.ext.try_get_mut::<Sound>() {
         for stream in streams {
             sound.audio.set_stereo_gain(stream, [left, right]);

@@ -332,7 +332,13 @@ fn same_device(a: &cpal::Device, b: &cpal::Device) -> bool {
             (a.as_inner(), b.as_inner());
         a == b
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let (cpal::platform::DeviceInner::CoreAudio(a), cpal::platform::DeviceInner::CoreAudio(b)) =
+            (a.as_inner(), b.as_inner());
+        a == b
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         a.name()
             .ok()

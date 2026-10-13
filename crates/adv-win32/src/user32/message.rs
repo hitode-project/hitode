@@ -2137,11 +2137,35 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let interval_us = u64::from(ms.max(10)) * 1000;
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let q = u.queue(ctx);
-    let id = if hwnd == 0 {
-        0x7fff_0000 + q.timers.len() as u32 + 1
+    // A thread timer keeps an ID that names one of its own timers; any other
+    // ID is ignored for a fresh one, so re-arming never adds a timer.
+    // Generated IDs cycle through 0x7fff..=0xffff: callers that keep only a
+    // WORD (Delphi's hint timer) must be able to kill them.
+    let live =
+        |q: &super::window::Queue, id: u32| q.timers.iter().any(|t| t.hwnd == 0 && t.id == id);
+    let id = if hwnd != 0 || live(q, id) {
+        Some(id)
     } else {
-        id
+        let next = |id: u32| if id >= 0xffff { 0x7fff } else { id + 1 };
+        let start = q.next_timer_id.max(0x7fff);
+        let mut candidate = start;
+        while live(q, candidate) {
+            candidate = next(candidate);
+            if candidate == start {
+                break;
+            }
+        }
+        (!live(q, candidate)).then(|| {
+            q.next_timer_id = next(candidate);
+            candidate
+        })
     };
+    let Some(id) = id else {
+        // Every generated thread timer ID is live.
+        crate::util::set_last_error(env, 8);
+        return Outcome::Return(0);
+    };
+    let q = env.ext.get_mut::<crate::Win32>().user.queue(ctx);
     q.timers.retain(|t| !(t.hwnd == hwnd && t.id == id));
     q.timers.push(Timer {
         hwnd,
@@ -2304,6 +2328,20 @@ pub(super) fn def_window_proc_encoded(
             };
         }
         wm::NCHITTEST => 1, // HTCLIENT
+        wm::IME_CHAR => {
+            // DefWindowProcA posts a packed DBCS character as lead then trail byte.
+            let (source, characters) = if wide {
+                (PostSource::Unicode, vec![wp & 0xffff])
+            } else if wp & 0xff00 != 0 {
+                (PostSource::Ansi, vec![wp >> 8 & 0xff, wp & 0xff])
+            } else {
+                (PostSource::Ansi, vec![wp & 0xff])
+            };
+            for character in characters {
+                post_kind(env, hwnd, wm::CHAR, character, lp, source);
+            }
+            0
+        }
         wm::MOUSEACTIVATE => 1,
         wm::ACTIVATE if wp & 0xffff != 0 => {
             return window::set_focus(env, hwnd, move |env, _| then(env, 0));

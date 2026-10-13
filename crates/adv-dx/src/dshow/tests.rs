@@ -5,14 +5,15 @@ use adv_machine::{Clock, Env, Machine, Outcome};
 
 use super::*;
 
-const DATA: u32 = 0x500000;
-const STACK: u32 = 0x600000;
+pub(crate) const DATA: u32 = 0x500000;
+pub(crate) const STACK: u32 = 0x600000;
 
-pub(super) fn machine() -> Machine<JitCpu> {
+pub(crate) fn machine() -> Machine<JitCpu> {
     let mut reg = Registry::default();
     adv_win32::register(&mut reg);
     adv_win32::ole32::register(&mut reg);
     register(&mut reg);
+    crate::wmvcore::register(&mut reg);
     let mut m = Machine::new(
         JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
         reg,
@@ -30,7 +31,7 @@ pub(super) fn machine() -> Machine<JitCpu> {
     m
 }
 
-fn handle(m: &mut Machine<JitCpu>, module: &str, name: &str, args: &[u32]) -> u32 {
+pub(crate) fn handle(m: &mut Machine<JitCpu>, module: &str, name: &str, args: &[u32]) -> u32 {
     m.resolve_import(module, name).unwrap();
     let thunk = m
         .sys
@@ -85,7 +86,7 @@ pub(super) fn query(m: &mut Machine<JitCpu>, object: u32, iid: Iid) -> u32 {
     m.cpu.read_u32(DATA + 128).unwrap()
 }
 
-pub(super) fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
+pub(crate) fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     let thunk = m.sys.thunks.iter().next().unwrap().0;
     Env {
         context: m.sys.current,
@@ -395,4 +396,93 @@ fn sdk_compiled_empty_graph_matches_native_identity_state_enumeration_and_event_
             .map_or(0, |diagnostics| diagnostics.stub_calls);
         assert_eq!(stubs, 0);
     }
+}
+
+#[test]
+fn compressed_media_types_round_trip_codec_formats() {
+    for format in [
+        CodecFormat::Video {
+            fourcc: u32::from_le_bytes(*b"WMV3"),
+            width: 640,
+            height: 480,
+            bit_count: 24,
+            frame_100ns: 333_667,
+            extradata: vec![0x4f, 0xd1, 0x1a, 0x01],
+        },
+        CodecFormat::Audio {
+            format_tag: 0x161,
+            channels: 2,
+            rate: 44_100,
+            bytes_per_second: 16_000,
+            block_align: 2_973,
+            bits: 16,
+            extradata: vec![0, 0x88, 0, 0, 0x17, 0, 0, 0, 0, 0],
+        },
+    ] {
+        let mt = MediaType::compressed(&format, 128_000);
+        assert_eq!(mt.codec_format(), Some(format));
+    }
+}
+
+#[test]
+fn dmo_wrapper_publishes_decoder_pins_once_for_windows_media_decoders() {
+    let mut m = machine();
+    let filter = activate(&mut m, dmo::CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+    let wrapper = query(&mut m, filter, dmo::IID_IDMOWRAPPERFILTER);
+    let pins = |m: &mut Machine<JitCpu>| {
+        assert_eq!(method(m, "IBaseFilter::EnumPins", &[filter, DATA]), S_OK);
+        let pins = m.cpu.read_u32(DATA).unwrap();
+        method(m, "IEnumPins::Next", &[pins, 4, DATA + 16, DATA + 8]);
+        m.cpu.read_u32(DATA + 8).unwrap()
+    };
+    assert_eq!(pins(&mut m), 0);
+    // Category GUIDs are ignored; the DMO class alone selects the decoder.
+    m.cpu.write(DATA + 64, &[0x11; 16]).unwrap();
+    m.cpu.write(DATA + 80, &[0; 16]).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IDMOWrapperFilter::Init",
+            &[wrapper, DATA + 64, DATA + 80]
+        ),
+        dmo::REGDB_E_CLASSNOTREG
+    );
+    assert_eq!(pins(&mut m), 0);
+    m.cpu.write(DATA + 64, &dmo::CLSID_WMV_DECODER).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IDMOWrapperFilter::Init",
+            &[wrapper, DATA + 64, DATA + 80]
+        ),
+        S_OK
+    );
+    assert_eq!(pins(&mut m), 2);
+    let (input, output) = (
+        m.cpu.read_u32(DATA + 16).unwrap(),
+        m.cpu.read_u32(DATA + 20).unwrap(),
+    );
+    for (pin, dir) in [(input, filter::INPUT), (output, filter::OUTPUT)] {
+        assert_eq!(method(&mut m, "IPin::QueryDirection", &[pin, DATA]), S_OK);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), dir);
+    }
+    // An unconnected decoder offers no output types.
+    assert_eq!(
+        method(&mut m, "IPin::EnumMediaTypes", &[output, DATA]),
+        S_OK
+    );
+    let types = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(
+        method(&mut m, "IEnumMediaTypes::Next", &[types, 1, DATA + 16, 0]),
+        S_FALSE
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IDMOWrapperFilter::Init",
+            &[wrapper, DATA + 64, DATA + 80]
+        ),
+        VFW_E_WRONG_STATE
+    );
+    assert_eq!(pins(&mut m), 2);
 }

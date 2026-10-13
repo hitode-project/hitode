@@ -25,6 +25,17 @@ fn failure(error: &std::io::Error) -> i32 {
         },
     }
 }
+/// Hosts without opened-instance mutation report it, as files do.
+fn instance_failure(env: &mut Env<'_>, error: &std::io::Error) -> i32 {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        warn_unavailable(
+            env,
+            "ntdll.dll!NtSetInformationFile",
+            "opened-instance rename/delete-pending is unavailable on this host platform",
+        );
+    }
+    failure(error)
+}
 fn mutable(env: &mut Env<'_>, path: &str) -> Result<(), i32> {
     let vfs = &env.ext.get::<Win32>().vfs;
     if vfs.is_optical_path(path) {
@@ -360,16 +371,16 @@ pub(crate) fn set(
         };
         let status = match result {
             Ok(()) => 0,
-            Err(error) => failure(&error),
+            Err(error) => instance_failure(env, &error),
         };
         // The authored native nonempty-directory control completes IOSB too.
         return completion(env, iosb, status, 0);
     }
-    if prefix[0] != 0 || u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
+    if u32::from_le_bytes(prefix[4..8].try_into().unwrap()) != 0 {
         return unavailable_for(
             env,
             "ntdll.dll!NtSetInformationFile",
-            "directory rename replacement and relative RootDirectory are unavailable",
+            "directory rename relative RootDirectory is unavailable",
         );
     }
     let count = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
@@ -450,9 +461,10 @@ pub(crate) fn set(
         .backing
         .as_ref()
         .unwrap()
-        .rename_instance(&host);
+        .rename_instance(&host, false);
     if let Err(error) = result {
-        return completion(env, iosb, failure(&error), 0);
+        let status = instance_failure(env, &error);
+        return completion(env, iosb, status, 0);
     }
     retarget_owners(env, &source, &target);
     completion(env, iosb, 0, 0)

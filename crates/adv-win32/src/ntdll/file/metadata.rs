@@ -284,7 +284,7 @@ pub(crate) fn flush(env: &mut Env<'_>, handle: Handle, iosb: GuestPtr<()>) -> i3
     let Some(backing) = file.file.host() else {
         return ACCESS_DENIED;
     };
-    if let Err(error) = backing.sync_all() {
+    if let Err(error) = adv_os::vfs::sync_file(backing) {
         return failure(env, error);
     }
     completion(env, iosb, 0, 0)

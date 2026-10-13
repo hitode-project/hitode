@@ -25,6 +25,8 @@
 //! destination changes, which also settles x86's negative default NaN and
 //! its tininess after rounding. Inexact sets PE, and a denormal operand,
 //! which A64 does not report without FZ, sets DE from a check of the bits.
+//! Single- and double-precision comparisons use the same guard. Scalar
+//! forms ignore upper lanes; NaN signaling follows each x86 predicate.
 
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -81,6 +83,8 @@ pub enum Kind {
     Emms,
     /// `addps`-style arithmetic on every lane, or on the low one (`true`).
     Float(Float, bool),
+    /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
+    Compare(bool, bool),
     /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
     MinMax(bool, bool),
     /// `cvtps2pi`, or `cvttps2pi` (true).
@@ -120,7 +124,7 @@ impl Simd {
     pub fn floating(&self) -> bool {
         matches!(
             self.kind,
-            Kind::Float(..) | Kind::MinMax(..) | Kind::ToInt(_)
+            Kind::Float(..) | Kind::Compare(..) | Kind::MinMax(..) | Kind::ToInt(_)
         )
     }
 
@@ -259,6 +263,10 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Subss => Kind::Float(Float::Fsub, true),
         M::Mulss => Kind::Float(Float::Fmul, true),
         M::Divss => Kind::Float(Float::Fdiv, true),
+        M::Cmpps => Kind::Compare(false, false),
+        M::Cmpss => Kind::Compare(true, false),
+        M::Cmppd => Kind::Compare(false, true),
+        M::Cmpsd => Kind::Compare(true, true),
         M::Maxps => Kind::MinMax(true, false),
         M::Minps => Kind::MinMax(false, false),
         M::Maxss => Kind::MinMax(true, true),
@@ -281,14 +289,16 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         Kind::Emms => true,
         Kind::ToInt(_) => d == 1 && (s == 2 || src == Loc::Mem),
         Kind::Half(_) => d == 2 && src == Loc::Mem || dst == Loc::Mem && s == 2,
-        Kind::Float(..) | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
+        Kind::Float(..) | Kind::Compare(..) | Kind::MinMax(..) => {
+            d == 2 && (s == 2 || src == Loc::Mem)
+        }
         Kind::Move => match (d, s) {
             (1 | 2, 0) | (0, 1 | 2) | (1 | 2, 3) | (3, 1 | 2) => true,
             _ => d == s && matches!(d, 1 | 2),
         },
         _ => matches!(d, 1 | 2) && (s == d || src == Loc::Mem || src == Loc::Imm),
     };
-    let three = matches!(kind, Kind::Shuffle(_) | Kind::Shufps);
+    let three = matches!(kind, Kind::Shuffle(_) | Kind::Shufps | Kind::Compare(..));
     let imm_ok = match kind {
         Kind::ShiftImm(..) => instruction.op_count() == 2,
         _ if three => instruction.op_count() == 3 && instruction.op_kind(2) == OpKind::Immediate8,
@@ -405,7 +415,7 @@ impl Translator<'_> {
             }
             Kind::Move => return self.simd_move(simd, address),
             Kind::Half(high) => return self.half(simd, high, address),
-            Kind::Float(..) | Kind::MinMax(..) | Kind::ToInt(_) => {
+            Kind::Float(..) | Kind::Compare(..) | Kind::MinMax(..) | Kind::ToInt(_) => {
                 return self.floating(simd, address);
             }
             Kind::ShiftImm(op, log2) => {
@@ -532,6 +542,7 @@ impl Translator<'_> {
             | Kind::ShiftBy(..)
             | Kind::Emms
             | Kind::Float(..)
+            | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::ToInt(_)
             | Kind::Half(_) => unreachable!(),
@@ -597,7 +608,7 @@ impl Translator<'_> {
         }
     }
 
-    /// Single-precision arithmetic and conversions under the default
+    /// Single-precision arithmetic/conversions and binary32/64 compares under the default
     /// MXCSR, leaving for the interpreter on any exception but inexact.
     /// Uses x13, x14 and v0-v6.
     fn floating(&mut self, simd: Simd, address: Reg) {
@@ -619,29 +630,40 @@ impl Translator<'_> {
             }
             loc => self.register(loc),
         };
+        let double = matches!(simd.kind, Kind::Compare(_, true));
+        let log2 = if double { 3 } else { 2 };
         let (scalar, inputs) = match simd.kind {
-            Kind::Float(_, scalar) | Kind::MinMax(_, scalar) => {
+            Kind::Float(_, scalar) | Kind::Compare(scalar, _) | Kind::MinMax(_, scalar) => {
                 (scalar, [Some(self.register(simd.dst)), Some(s)])
             }
             _ => (false, [None, Some(s)]),
         };
-        // DE: a lane whose bits shifted left once lie in 1..0x00ffffff,
-        // so x - 1 saturates 0x00ffffff - (x - 1) above zero.
+        // DE: after shifting away the sign, a nonzero subnormal is below
+        // 2^24 (binary32) or 2^53 (binary64). Scalar upper lanes are ignored.
         let (lanes, arr) = match simd.kind {
             Kind::ToInt(_) => (2, Arr::S2),
+            _ if double => (if scalar { 1 } else { 2 }, Arr::D2),
             _ if scalar => (1, Arr::S2),
             _ => (4, Arr::S4),
         };
         self.emit_all(&[
-            movz(W, X16, 1, 0),
+            movz(X, X16, 1, 0),
             vdup(arr, v4, X16),
             movz(W, X16, 0xffff, 0),
-            movk(W, X16, 0x00ff, 16),
-            vdup(arr, v5, X16),
         ]);
+        if double {
+            self.emit_all(&[
+                movk(X, X16, 0xffff, 16),
+                movk(X, X16, 0xffff, 32),
+                movk(X, X16, 0x001f, 48),
+            ]);
+        } else {
+            self.emit(movk(W, X16, 0x00ff, 16));
+        }
+        self.emit(vdup(arr, v5, X16));
         for (n, input) in inputs.into_iter().flatten().enumerate() {
             let x = if lanes == 1 {
-                self.emit_all(&[vzero(false, v3), vins(2, v3, 0, input, 0)]);
+                self.emit_all(&[vzero(true, v3), vins(log2, v3, 0, input, 0)]);
                 v3
             } else {
                 input
@@ -658,14 +680,42 @@ impl Translator<'_> {
         }
         // The 64-bit forms clear the high half.
         let clean = self.asm.label();
-        self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X17, v6)]);
-        self.asm.cbz(W, false, X17, clean);
+        if double {
+            self.emit_all(&[
+                vumov(3, X14, v6, 0),
+                vumov(3, X17, v6, 1),
+                orr(X, X17, X17, X14, Shift::Lsl, 0),
+            ]);
+        } else {
+            self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X17, v6)]);
+        }
+        self.asm.cbz(X, false, X17, clean);
         self.emit(orr_imm(W, X13, X13, 2));
         self.asm.bind(clean);
         self.emit(msr_fpsr(Reg::ZR));
         match simd.kind {
             Kind::Float(op, false) => self.emit(vfloat(op, true, V0, inputs[0].unwrap(), s)),
             Kind::Float(op, true) => self.emit(sfloat(op, V0, inputs[0].unwrap(), s)),
+            Kind::Compare(scalar, double) => {
+                let d = inputs[0].unwrap();
+                // ARM equality is quiet for QNaN; relational comparisons signal.
+                // x86 negated predicates include unordered lanes, so invert the
+                // corresponding ordered test rather than reverse its operands.
+                match simd.imm & 7 {
+                    0 | 4 => self.emit(vcompare(Float::Fcmeq, scalar, double, V0, d, s)),
+                    1 | 5 => self.emit(vcompare(Float::Fcmgt, scalar, double, V0, s, d)),
+                    2 | 6 => self.emit(vcompare(Float::Fcmge, scalar, double, V0, s, d)),
+                    3 | 7 => self.emit_all(&[
+                        vcompare(Float::Fcmeq, scalar, double, V0, d, d),
+                        vcompare(Float::Fcmeq, scalar, double, V2, s, s),
+                        vlogic(Logic::And, true, V0, V0, V2),
+                    ]),
+                    _ => unreachable!(),
+                }
+                if matches!(simd.imm & 7, 3..=6) {
+                    self.emit(vnot(true, V0, V0));
+                }
+            }
             Kind::MinMax(max, scalar) => {
                 let d = inputs[0].unwrap();
                 // The first source where it compares above (max) or
@@ -694,6 +744,7 @@ impl Translator<'_> {
         ]);
         let d = self.destination(simd.dst, false);
         self.emit(match simd.kind {
+            Kind::Compare(true, double) => vins(if double { 3 } else { 2 }, d, 0, V0, 0),
             Kind::Float(_, true) | Kind::MinMax(_, true) => vins(2, d, 0, V0, 0),
             Kind::ToInt(_) => vmov(false, d, V0),
             _ => vmov(true, d, V0),

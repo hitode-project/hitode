@@ -13,3 +13,4 @@ __pycache__/
 /tools/windows/package-trial.ps1
 /tools/windows/launch-trial.ps1
 /tools/windows/trial-readme.txt
+.DS_Store

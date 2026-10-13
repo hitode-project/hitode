@@ -374,10 +374,13 @@ fn waveform_exports_state_and_safe_fail_levels_match_the_absent_front() {
         registry.level("winmm.dll", "waveOutGetNumDevs"),
         Some(ImplementationLevel::State)
     );
-    assert_eq!(
-        registry.level("winmm.dll", "mciGetErrorStringA"),
-        Some(ImplementationLevel::Implement)
-    );
+    // MCI digital video commands are implemented; wave output stays absent.
+    for name in ["mciGetErrorStringA", "mciSendCommandA"] {
+        assert_eq!(
+            registry.level("winmm.dll", name),
+            Some(ImplementationLevel::Implement)
+        );
+    }
     for name in [
         "waveOutGetDevCapsA",
         "waveOutOpen",
@@ -388,7 +391,6 @@ fn waveform_exports_state_and_safe_fail_levels_match_the_absent_front() {
         "waveOutRestart",
         "waveOutReset",
         "waveOutClose",
-        "mciSendCommandA",
     ] {
         assert_eq!(
             registry.level("winmm.dll", name),

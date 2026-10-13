@@ -287,6 +287,11 @@ pub const fn clz(size: Size, rd: Reg, rn: Reg) -> u32 {
     0x5AC0_1000 | size.sf() | rn.number() << 5 | rd.number()
 }
 
+/// `rbit rd, rn`.
+pub const fn rbit(size: Size, rd: Reg, rn: Reg) -> u32 {
+    0x5AC0_0000 | size.sf() | rn.number() << 5 | rd.number()
+}
+
 /// `mov rd, rn` where either side may be SP.
 pub const fn mov_sp(rd: Reg, rn: Reg) -> u32 {
     add_imm(Size::X, rd, rn, 0, false)
@@ -882,7 +887,13 @@ pub enum Same {
 /// `<op> vd.<arr>, vn.<arr>, vm.<arr>`.
 pub const fn vsame(op: Same, arr: Arr, rd: VReg, rn: VReg, rm: VReg) -> u32 {
     let (u, opcode) = ((op as u32) >> 5, op as u32 & 0x1f);
-    assert!(arr.log2() < 3 || matches!(op, Same::Add | Same::Sub | Same::Sshl | Same::Ushl));
+    assert!(
+        arr.log2() < 3
+            || matches!(
+                op,
+                Same::Add | Same::Sub | Same::Sshl | Same::Ushl | Same::Uqsub
+            )
+    );
     0x0E20_0400
         | arr.q()
         | u << 29
@@ -944,6 +955,12 @@ pub const fn vfloat(op: Float, full: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 
         | opcode << 11
         | rn.number() << 5
         | rd.number()
+}
+
+/// Floating compare masks in .4s/.2d, or the scalar S/D form.
+pub const fn vcompare(op: Float, scalar: bool, double: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    assert!(matches!(op, Float::Fcmeq | Float::Fcmge | Float::Fcmgt));
+    vfloat(op, true, rd, rn, rm) | (scalar as u32) << 28 | (double as u32) << 22
 }
 
 /// Double-precision `fadd`/`fsub`/`fmul`/`fdiv dd, dn, dm`.
@@ -1506,6 +1523,61 @@ mod tests {
             ),
             (rev(W, r(19), r(22)), "rev w19, w22"),
             (clz(X, r(17), r(17)), "clz x17, x17"),
+            (clz(W, r(6), r(6)), "clz w6, w6"),
+            (rbit(W, r(6), r(7)), "rbit w6, w7"),
+            (rbit(X, r(16), r(17)), "rbit x16, x17"),
+            (
+                vsame(Same::Uqsub, Arr::D2, v(3), v(4), v(5)),
+                "uqsub v3.2d, v4.2d, v5.2d",
+            ),
+            (
+                vcompare(Float::Fcmeq, false, false, v(3), v(4), v(5)),
+                "fcmeq v3.4s, v4.4s, v5.4s",
+            ),
+            (
+                vcompare(Float::Fcmgt, false, false, v(3), v(4), v(5)),
+                "fcmgt v3.4s, v4.4s, v5.4s",
+            ),
+            (
+                vcompare(Float::Fcmge, false, false, v(3), v(4), v(5)),
+                "fcmge v3.4s, v4.4s, v5.4s",
+            ),
+            (
+                vcompare(Float::Fcmeq, false, true, v(3), v(4), v(5)),
+                "fcmeq v3.2d, v4.2d, v5.2d",
+            ),
+            (
+                vcompare(Float::Fcmgt, false, true, v(3), v(4), v(5)),
+                "fcmgt v3.2d, v4.2d, v5.2d",
+            ),
+            (
+                vcompare(Float::Fcmge, false, true, v(3), v(4), v(5)),
+                "fcmge v3.2d, v4.2d, v5.2d",
+            ),
+            (
+                vcompare(Float::Fcmeq, true, false, v(3), v(4), v(5)),
+                "fcmeq s3, s4, s5",
+            ),
+            (
+                vcompare(Float::Fcmgt, true, false, v(3), v(4), v(5)),
+                "fcmgt s3, s4, s5",
+            ),
+            (
+                vcompare(Float::Fcmge, true, false, v(3), v(4), v(5)),
+                "fcmge s3, s4, s5",
+            ),
+            (
+                vcompare(Float::Fcmeq, true, true, v(3), v(4), v(5)),
+                "fcmeq d3, d4, d5",
+            ),
+            (
+                vcompare(Float::Fcmgt, true, true, v(3), v(4), v(5)),
+                "fcmgt d3, d4, d5",
+            ),
+            (
+                vcompare(Float::Fcmge, true, true, v(3), v(4), v(5)),
+                "fcmge d3, d4, d5",
+            ),
             (asr_imm(W, r(16), r(3), 7), "asr w16, w3, #7"),
             (ror_imm(W, r(19), r(19), 29), "ror w19, w19, #29"),
             (ror_imm(X, r(1), r(2), 63), "ror x1, x2, #63"),

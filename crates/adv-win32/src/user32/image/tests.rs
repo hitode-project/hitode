@@ -1,5 +1,6 @@
 //! Guest LoadImage calls and common USER image-owner observations.
 mod copying;
+mod icon_info;
 
 use super::*;
 use adv_cpu::{

@@ -51,14 +51,18 @@ fn run() -> Result<(), String> {
         }
         if let Some(pcm) = runtime.audio_pcm_digests().first() {
             let stats = runtime.machine.cpu.stats();
+            #[cfg(target_arch = "x86_64")]
+            let compile_seconds = format!("{:.6}", stats.compile_time.as_secs_f64());
+            #[cfg(target_arch = "aarch64")]
+            let compile_seconds = "-";
             println!(
                 "backend,wall_seconds,compile_seconds,frames,rate,channels,bits,bytes,pcm_fnv1a64,interpreter_entries,interpreter_instructions"
             );
             println!(
-                "{},{:.6},{:.6},{},{},{},{},{},{:016x},{},{}",
+                "{},{:.6},{},{},{},{},{},{},{:016x},{},{}",
                 args[1],
                 started.elapsed().as_secs_f64(),
-                stats.compile_time.as_secs_f64(),
+                compile_seconds,
                 runtime.frame().frames,
                 pcm.sample_rate,
                 pcm.channels,

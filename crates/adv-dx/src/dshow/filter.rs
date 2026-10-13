@@ -25,6 +25,8 @@ pub(crate) enum Role {
     AudioDecoder,
     AudioRenderer,
     VideoRenderer,
+    /// IDMOWrapperFilter around a Windows Media decoder; push-mode input.
+    DmoDecoder,
 }
 
 /// Demuxed media owned by a splitter. Failed probes never attach a source;
@@ -45,6 +47,7 @@ pub(crate) struct Filter {
     pub state: u32,
     pub source: Option<Source>,
     pub source_path: Vec<u16>,
+    pub dmo: Option<super::dmo::Dmo>,
 }
 
 pub(crate) struct Pin {
@@ -147,10 +150,10 @@ fn create_filter(
 }
 
 pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u32, u32> {
-    let faces: &[Face] = if role == Role::FileSource {
-        &[Face::BaseFilter, Face::FileSource]
-    } else {
-        &[Face::BaseFilter]
+    let faces: &[Face] = match role {
+        Role::FileSource => &[Face::BaseFilter, Face::FileSource],
+        Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper],
+        _ => &[Face::BaseFilter],
     };
     let base = super::create(env, faces, Obj::Filter)?[0];
     state(env).filters.insert(
@@ -164,6 +167,7 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
             state: graph::STOPPED,
             source: None,
             source_path: Vec::new(),
+            dmo: None,
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
@@ -179,6 +183,8 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
         ],
         Role::AudioRenderer => &[(INPUT, "Audio Input pin (rendered)", MEDIATYPE_AUDIO)],
         Role::VideoRenderer => &[(INPUT, "Video Input pin (rendered)", MEDIATYPE_VIDEO)],
+        // Pins follow the decoder chosen by IDMOWrapperFilter::Init.
+        Role::DmoDecoder => &[],
     };
     for &(dir, name, major) in pins {
         if let Err(error) = new_pin(env, base, dir, name, major, None) {
@@ -226,6 +232,11 @@ pub(super) fn new_pin(
     Ok(pin)
 }
 
+fn role_of(env: &Env<'_>, pin: u32) -> Role {
+    let state = env.ext.get::<State>();
+    state.filters[&state.pins[&pin].filter].role
+}
+
 pub(crate) fn host_pin(env: &Env<'_>, pointer: u32) -> Option<u32> {
     let pin = canonical(env, pointer)?;
     env.ext
@@ -253,7 +264,11 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         )),
         Face::BaseFilter => filter_method(env, host_filter(env, this)?, method),
         Face::Pin => pin_method(env, host_pin(env, this)?, method),
-        Face::MemInputPin => input_method(env, method),
+        Face::MemInputPin => {
+            let pin = host_pin(env, this)?;
+            input_method(env, pin, method)
+        }
+        Face::DmoWrapper => super::dmo::wrapper_method(env, host_filter(env, this)?, method),
         Face::EnumPins | Face::EnumMediaTypes | Face::EnumFilters => {
             enumerator(env, face, method, this)
         }
@@ -280,6 +295,7 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 _ => graph::RUNNING,
             };
             state(env).filters.get_mut(&filter).unwrap().state = value;
+            super::dmo::state_changed(env, filter, value);
             r(S_OK)
         }
         "GetState" => {
@@ -371,6 +387,15 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
 
 fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
+    if role_of(env, pin) == Role::DmoDecoder
+        && matches!(
+            method,
+            "EndOfStream" | "BeginFlush" | "EndFlush" | "NewSegment"
+        )
+        && let Some(outcome) = super::dmo::pin_method(env, pin, method)
+    {
+        return Some(outcome);
+    }
     let a1 = env.arg(1);
     match method {
         "Connect" => Some(connect(env, pin, a1, env.arg(2))),
@@ -479,8 +504,11 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
 
 /// IMemInputPin on host inputs. Media is pulled from IAsyncReader; unsupported
 /// pushed samples are rejected explicitly rather than accepted and discarded.
-fn input_method(env: &mut Env<'_>, method: &str) -> Option<Outcome> {
+fn input_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
+    if role_of(env, pin) == Role::DmoDecoder {
+        return super::dmo::input_method(env, pin, method);
+    }
     match method {
         "GetAllocator" => {
             let _ = env.cpu.write_u32(env.arg(1), 0);
@@ -517,8 +545,15 @@ fn input_method(env: &mut Env<'_>, method: &str) -> Option<Outcome> {
 }
 
 fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
-    let p = &env.ext.get::<State>().pins[&pin];
-    p.major == GUID_NULL || mt.major == p.major
+    let state = env.ext.get::<State>();
+    let p = &state.pins[&pin];
+    if p.major != GUID_NULL && mt.major != p.major {
+        return false;
+    }
+    if p.dir == INPUT && state.filters[&p.filter].role == Role::DmoDecoder {
+        return super::dmo::accepts_input(mt).is_some();
+    }
+    true
 }
 
 /// Types a pin proposes. Decoder outputs depend on their connected input.
@@ -539,6 +574,7 @@ fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
         (Some(Role::Splitter | Role::FileSource), OUTPUT) => p.mt.iter().cloned().collect(),
         (Some(Role::VideoDecoder), OUTPUT) => decoded_video_types(env, pin),
         (Some(Role::AudioDecoder), OUTPUT) => decoded_audio_type(env, pin).into_iter().collect(),
+        (Some(Role::DmoDecoder), OUTPUT) => super::dmo::output_types(env, pin),
         _ => Vec::new(),
     }
 }
@@ -630,6 +666,18 @@ fn connect_hosts(env: &mut Env<'_>, out: u32, input: u32) -> u32 {
     if i.major != GUID_NULL && i.major != mt.major {
         return VFW_E_TYPE_NOT_ACCEPTED;
     }
+    let (out_role, in_role) = (
+        state.filters[&state.pins[&out].filter].role,
+        state.filters[&i.filter].role,
+    );
+    // DMO video is pushed only to input pins that receive samples.
+    if out_role == Role::DmoDecoder && in_role == Role::VideoRenderer {
+        return VFW_E_NO_ACCEPTABLE_TYPES;
+    }
+    if in_role == Role::DmoDecoder && !super::dmo::connect_input(env, input, &mt) {
+        return VFW_E_TYPE_NOT_ACCEPTED;
+    }
+    let state = self::state(env);
     let o = state.pins.get_mut(&out).unwrap();
     o.peer = input;
     o.mt = Some(mt.clone());
@@ -814,10 +862,15 @@ pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
     let p = &state(env).pins[&pin];
     let (peer, mem, reader) = (p.peer, p.mem, p.reader);
     let guest_peer = peer != 0 && host_pin(env, peer).is_none();
+    let seeking = if role_of(env, pin) == Role::DmoDecoder {
+        super::dmo::take_upstream(env, pin)
+    } else {
+        0
+    };
     disconnect_host(env, pin);
     state(env).pins.get_mut(&pin).unwrap().reader = 0;
     let mut calls = VecDeque::new();
-    for pointer in [mem, reader] {
+    for pointer in [mem, reader, seeking] {
         if pointer != 0 {
             calls.push_back(Call(pointer, 2, vec![]));
         }
@@ -856,6 +909,8 @@ fn disconnect_host(env: &mut Env<'_>, pin: u32) -> u32 {
     if p.peer == 0 {
         return S_FALSE;
     }
+    super::dmo::disconnected(env, pin);
+    let p = state(env).pins.get_mut(&pin).unwrap();
     p.peer = 0;
     p.mem = 0;
     let allocator = std::mem::take(&mut p.allocator);
@@ -891,11 +946,23 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
         return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
     }
     let filter = state(env).pins[&pin].filter;
+    if state(env).filters[&filter].role == Role::DmoDecoder
+        && !super::dmo::connect_input(env, pin, &mt)
+    {
+        return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
+    }
     if state(env).filters[&filter].role != Role::Splitter {
         let p = state(env).pins.get_mut(&pin).unwrap();
         p.peer = connector;
         p.mt = Some(mt);
-        return guest_call(env, connector, 1, vec![], |_, _| Outcome::Return(S_OK));
+        let dmo = state(env).filters[&filter].role == Role::DmoDecoder;
+        return guest_call(env, connector, 1, vec![], move |env, _| {
+            if dmo {
+                super::dmo::learn_upstream(env, pin, connector)
+            } else {
+                Outcome::Return(S_OK)
+            }
+        });
     }
     // A pull-mode source: query IAsyncReader during the connection, as the
     // stock splitter does (the async source refuses to complete otherwise).

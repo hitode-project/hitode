@@ -6,7 +6,9 @@ use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_machine::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, PARK_ADDR};
+use adv_machine::layout::PARK_ADDR;
+#[cfg(not(target_arch = "aarch64"))]
+use adv_machine::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE};
 use adv_machine::{Clock, Machine, RunResult};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
@@ -210,10 +212,18 @@ fn emulate<B: Backend>(cpu: B, guest_code: bool) -> (Outcome, Machine<B>) {
 fn jit() -> JitCpu {
     let mut cpu = JitCpu::new(PARK_ADDR, true).unwrap();
     cpu.set_async_compilation(false);
+    #[cfg(not(target_arch = "aarch64"))]
     cpu.set_profiling(true);
     cpu
 }
 
+/// a64 keeps no per-address profile; any native entry stands in for it.
+#[cfg(target_arch = "aarch64")]
+fn ran_native_guest_code(cpu: &JitCpu) -> bool {
+    cpu.stats().native_entries > 0
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn ran_native_guest_code(cpu: &JitCpu) -> bool {
     cpu.profile().iter().any(|(&pc, p)| {
         (GUEST_CODE_BASE..GUEST_CODE_BASE + GUEST_CODE_SIZE).contains(&pc) && p.native_entries > 0

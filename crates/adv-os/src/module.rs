@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn dependency_cycles_release_as_a_group_and_explicit_references_keep_them_alive() {
-        let mut cpu = adv_cpu::backend::jit::JitCpu::new(0x1000, false).unwrap();
+        let mut cpu = adv_cpu::JitCpu::new(0x1000, false).unwrap();
         let mut modules = Modules::default();
         let a = modules.add(image("a.dll", 0x10000));
         let b = modules.add(image("b.dll", 0x20000));

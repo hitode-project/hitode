@@ -11,7 +11,6 @@ description = "Guest GDI/DirectDraw software surfaces and a common presentation 
 default = []
 gpu = ["adv-dx/gpu", "adv-device/gpu"]
 media = ["adv-dx/media"]
-# Migration comparison, deleted at a64 M3: see adv-cpu.
 
 [dependencies]
 adv-abi = { path = "../adv-abi" }
