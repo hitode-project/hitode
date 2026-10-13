@@ -16,6 +16,7 @@ use crate::OsConfig;
 
 mod attributes;
 mod mutation;
+mod names;
 #[cfg(not(windows))]
 pub use mutation::sync_move;
 mod optical;
@@ -93,11 +94,7 @@ fn ci_find(base: &Path, comps: &[String]) -> Option<PathBuf> {
         cur = if exact.exists() {
             exact
         } else {
-            std::fs::read_dir(&cur)
-                .ok()?
-                .flatten()
-                .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(c))?
-                .path()
+            names::find(&cur, c)?
         };
     }
     // With no components the base itself may not exist yet (an overlay nothing was written to).
