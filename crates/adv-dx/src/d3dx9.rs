@@ -10,6 +10,7 @@ mod matrix_stack;
 mod preshader;
 mod save_file;
 mod texture;
+mod texture_create;
 
 type Matrix = [f32; 16];
 type Vector = [f32; 3];
@@ -37,6 +38,7 @@ pub fn register(registry: &mut Registry) {
     effect::register(registry);
     matrix_stack::register(registry);
     texture::register(registry);
+    texture_create::register(registry);
     save_file::register(registry);
 }
 

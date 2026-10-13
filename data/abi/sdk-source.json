@@ -216,6 +216,15 @@
     "layouts": "SDK DIDATAFORMAT is six 32-bit fields; DIOBJECTDATAFORMAT four; legacy DIMOUSESTATE is three LONG axes and four BYTE buttons",
     "limitations": "Keyboard and mouse use the runtime's shared input provider; unsupported formats and properties fail explicitly. No host controller or native input device is opened."
   },
+  "legacy_d3dx_texture_create": {
+    "source": "Microsoft Learn D3dx9tex.h declarations and authored native x86 probes against February 2006 d3dx9_29.dll and June 2010 d3dx9_43.dll",
+    "target": "WINAPI x86 stdcall; HRESULT return; D3DXCreateTexture eight 32-bit arguments, D3DXCheckTextureRequirements seven; UINT/DWORD unsigned and D3DFORMAT/D3DPOOL signed enums",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexture",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxchecktexturerequirements"
+    ],
+    "native_verification": "Authored hidden fixture, no sample input: 375 scalar observations of default dimensions, mip correction, optional pointers, usage/pool, mip descriptors, byte lock write/read, final Release and both SDK versions; native/interpreter/JIT/Unicorn agree. No new GPU capability or storage implementation."
+  },
   "legacy_d3dx_texture_memory": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
     "header_sha256": "64dfa1f26d6df792f6cf261c79f737e6e5c7670787ba6abfe0f76aba348e9422",

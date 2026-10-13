@@ -271,7 +271,7 @@ fn check_conversion(
         UNAVAILABLE
     }
 }
-fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
+pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
     let g = env.ext.get::<State>().gpu.as_ref().ok_or(UNAVAILABLE)?;
     g.context().check().map_err(|_| DEVICE_LOST)?;
     // Full-square textures must also fit the 16 MiB upload limit. Drawing uses

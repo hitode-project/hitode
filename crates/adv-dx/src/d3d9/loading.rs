@@ -12,6 +12,39 @@ pub(crate) fn valid_device(env: &Env<'_>, pointer: u32) -> bool {
     env.ext.try_get::<State>().is_some() && device(env, pointer).is_some()
 }
 
+pub(crate) fn texture_caps(env: &Env<'_>, pointer: u32) -> Result<adv_abi::types::D3DCAPS9, u32> {
+    if !valid_device(env, pointer) {
+        return Err(INVALID);
+    }
+    super::capabilities::caps(env)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_empty(
+    env: &mut Env<'_>,
+    device: u32,
+    width: u32,
+    height: u32,
+    levels: u32,
+    usage: u32,
+    format: u32,
+    pool: i32,
+    output: GuestPtr<u32>,
+) -> Outcome {
+    resources::create_texture(
+        env,
+        GuestPtr::new(device),
+        width,
+        height,
+        levels,
+        usage,
+        format,
+        pool,
+        output,
+        GuestPtr::default(),
+    )
+}
+
 pub(crate) fn release_texture(env: &mut Env<'_>, pointer: u32) {
     release(env, pointer);
 }
