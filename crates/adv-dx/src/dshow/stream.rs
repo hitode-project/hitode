@@ -280,7 +280,7 @@ fn process_update(
         s.pending_audio.extend(update.audio);
     }
     if !paused {
-        push_audio(env, id, media_us);
+        push_audio(env, id);
     }
     let past_stop = state(env).graphs[&graph]
         .stop
@@ -429,8 +429,7 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     let (graph, video, audio) = (s.graph, s.video, s.audio);
     // Pending PCM must precede End in the same FIFO; an accepted End cannot
     // strand frames that were refused by the data queue on the previous pass.
-    let media_us = (graph::stream_position(env, graph).max(0) / 10) as u64;
-    push_audio(env, id, media_us);
+    push_audio(env, id);
     if !session(env, id).pending_audio.is_empty() {
         let deadline = env.sys.clock.now_us() + POLL_US;
         return wait(env, id, Some(deadline));
@@ -478,15 +477,18 @@ fn follow_audio(env: &mut Env<'_>, id: u32) -> bool {
         .any(|out| matches!(follow(env, out), Some(End::AudioRenderer)))
 }
 
-fn push_audio(env: &mut Env<'_>, id: u32, media_us: u64) {
+fn push_audio(env: &mut Env<'_>, id: u32) {
     let now = env.sys.clock.now_us();
+    let graph = session(env, id).graph;
+    // Use the same instant for graph position and guest PTS, after decoding.
+    let media_us = state(env).graphs[&graph].position(now).max(0) / 10;
     let Some(stream) = session(env, id).audio else {
         return;
     };
     while let Some(frame) = session(env, id).pending_audio.pop_front() {
         let block = PcmBlock {
             stream_id: stream,
-            guest_pts_us: now + frame.pts_us.saturating_sub(media_us),
+            guest_pts_us: (now as i64 + frame.pts_us as i64 - media_us).max(0) as u64,
             sample_rate: frame.sample_rate,
             channels: frame.channels,
             samples: frame.samples,
@@ -633,6 +635,44 @@ mod tests {
             },
         );
         (m, graph, events, wake)
+    }
+
+    // spec: MEDIA-STREAM-1, DEV-AUDIO-5
+    #[test]
+    fn decoded_audio_keeps_its_timeline_after_producer_work() {
+        let (mut m, graph, _, _) = failure_session();
+        crate::dsound::register(m.sys.thunks.resolver_mut::<adv_abi::Registry>().unwrap());
+        crate::dsound::install(&mut m).unwrap();
+        let control = query(&mut m, graph, IID_IMEDIACONTROL);
+        assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+        let audio = m.ext.get::<Sound>().audio.clone();
+        audio.sync_clock(m.sys.clock.now_us());
+        let mut reader = audio.stream().device_reader(1000, 1).unwrap();
+        let s = m.ext.get_mut::<State>().sessions.get_mut(&1).unwrap();
+        s.audio = Some(1);
+        s.video = None;
+        for (pts, value) in [(0, 0.25), (24_000, 0.5)] {
+            let position = graph::stream_position(&env(&mut m), graph);
+            // frame_at can spend time decoding before process_update receives PCM.
+            m.sys.clock.advance_to(m.sys.clock.now_us() + 10_000);
+            let update = adv_device::media::Update {
+                video: None,
+                audio: vec![AudioFrame {
+                    pts_us: pts,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples: vec![value; 24],
+                }],
+                ended: false,
+            };
+            let _ = process_update(&mut env(&mut m), 1, Some(Ok(update)), position, false);
+        }
+        audio.end_pcm(1);
+        let mut out = [0.0; 48];
+        reader.read(&mut out, 0);
+        assert_eq!(&out[..24], &[0.25; 24]);
+        assert_eq!(&out[24..], &[0.5; 24]);
+        assert_eq!(audio.stream().metrics().missing_output_frames, 0);
     }
 
     fn assert_error_only(m: &mut Machine<JitCpu>, events: u32, wake: Handle, hresult: u32) {

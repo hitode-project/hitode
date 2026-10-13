@@ -218,6 +218,7 @@ struct Control {
     pending_events: VecDeque<AudioEvent>,
     retired_owners: BTreeSet<u32>,
     guest_us: u64,
+    device_us: u64,
 }
 /// Clone only within the execution thread. The SPSC endpoint itself is never cloned.
 #[derive(Clone)]
@@ -270,6 +271,7 @@ impl AudioControl {
                 pending_events: VecDeque::new(),
                 retired_owners: BTreeSet::new(),
                 guest_us: 0,
+                device_us: 0,
             })),
             stream,
         }
@@ -384,7 +386,11 @@ impl AudioControl {
         self.stream.shared.clock.clone()
     }
     pub fn sync_clock(&self, guest_us: u64) {
-        self.local.borrow_mut().guest_us = guest_us;
+        {
+            let mut local = self.local.borrow_mut();
+            local.guest_us = guest_us;
+            local.device_us = self.stream.shared.clock.now_us(guest_us);
+        }
         self.maintain();
         if let Some(mut reader) = self.stream.claim() {
             if !reader.shared.clock.uses_device_time() {
@@ -573,15 +579,16 @@ impl AudioControl {
         }
         let guest_now = self.local.borrow().guest_us;
         if self.stream.shared.clock.uses_device_time() {
-            block.guest_pts_us = self
-                .stream
-                .shared
-                .clock
-                .now_us(guest_now)
-                .saturating_add(block.guest_pts_us.saturating_sub(guest_now));
+            // Both sides of the clock translation were sampled by sync_clock.
+            // Sampling only device time here would add producer work to each PTS.
+            block.guest_pts_us = (i128::from(self.local.borrow().device_us)
+                + i128::from(block.guest_pts_us)
+                - i128::from(guest_now))
+            .max(0) as u64;
         }
         let source = block.stream_id;
         let existing = self.local.borrow().formats.get(&source).cloned();
+        let queue_us;
         let command = if let Some((frequency, state)) = existing {
             if frequency != block.sample_rate
                 || state.queued_blocks.load(Ordering::Acquire) >= 128
@@ -589,7 +596,7 @@ impl AudioControl {
             {
                 return Err(block);
             }
-            state.queued_us.fetch_add(duration, Ordering::Relaxed);
+            queue_us = state.queued_us.fetch_add(duration, Ordering::Relaxed) + duration;
             state.queued_blocks.fetch_add(1, Ordering::Release);
             Command::Pcm(block)
         } else {
@@ -597,6 +604,7 @@ impl AudioControl {
                 return Err(block);
             }
             let frequency = block.sample_rate;
+            queue_us = duration;
             let state = Arc::new(SourceState::default());
             state.queued_us.store(duration, Ordering::Relaxed);
             state.queued_blocks.store(1, Ordering::Relaxed);
@@ -652,7 +660,7 @@ impl AudioControl {
             .shared
             .counters
             .max_stream_queue_us
-            .fetch_max(duration, Ordering::Relaxed);
+            .fetch_max(queue_us, Ordering::Relaxed);
         Ok(())
     }
 }

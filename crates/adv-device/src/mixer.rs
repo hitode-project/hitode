@@ -20,6 +20,7 @@ pub struct PcmMetrics {
     pub flushes: u64,
     pub ends: u64,
     pub removals: u64,
+    /// Maximum total queued PCM duration for one owned stream.
     pub max_stream_queue_us: u64,
     /// Sum across streams lacking coverage after their first PTS. Pauses,
     /// flushed streams and the drained tail of ended streams are excluded.

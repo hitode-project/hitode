@@ -965,6 +965,32 @@ fn owned_output(
     out
 }
 
+// spec: DEV-AUDIO-5
+#[test]
+fn owned_pcm_clock_translation_does_not_add_producer_delay() {
+    let control = AudioControl::new(true);
+    control.sync_clock(1_000_000);
+    let block = |pts, value| adv_device::mixer::PcmBlock {
+        stream_id: 1,
+        guest_pts_us: pts,
+        sample_rate: 1000,
+        channels: 1,
+        samples: vec![value; 24],
+    };
+    control.push_pcm(block(1_000_000, 0.25)).ok().unwrap();
+    let mut reader = control.stream().device_reader(1000, 1).unwrap();
+    // Device time advances while the producer works after its clock sync.
+    control.playback_clock().publish_device(1_010_000, 0);
+    control.push_pcm(block(1_024_000, 0.5)).ok().unwrap();
+    assert_eq!(control.stream().metrics().max_stream_queue_us, 48_000);
+    control.end_pcm(1);
+    let mut out = [0.0; 48];
+    reader.read(&mut out, 0);
+    assert_eq!(&out[..24], &[0.25; 24]);
+    assert_eq!(&out[24..], &[0.5; 24]);
+    assert_eq!(control.stream().metrics().missing_output_frames, 0);
+}
+
 #[test]
 fn owned_pcm_rounded_timestamps_join_and_real_overlap_is_trimmed() {
     let control = AudioControl::new(false);
