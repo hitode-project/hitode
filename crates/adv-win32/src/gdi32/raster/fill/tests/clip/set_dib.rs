@@ -506,7 +506,7 @@ fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_stora
 
 #[test]
 #[cfg(windows)]
-// spec: WIN32-GDI-8
+// spec: WIN32-GDI-8, WIN32-GDI-13
 fn indexed_readback_matches_native_palette_mapping_queries_and_partial_bytes() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     for bpp in [1u32, 4, 8] {
