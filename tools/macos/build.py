@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build an ARM macOS runner with a pinned, decode-only static FFmpeg.
 
+ffmpeg-sys-next cannot select FFmpeg components in its source build, so this
+script runs configure itself and hands the installed static libraries to the
+crate's prebuilt-library path.
+
 Usage: python3 tools/macos/build.py [--jobs N] [--ffmpeg-only]
 Input: ffmpeg.json, Xcode Command Line Tools, Rust, cmake for test dependencies.
 Output: target/macos/adv-run and its build.json, source/configuration and static

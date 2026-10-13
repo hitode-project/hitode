@@ -1,4 +1,4 @@
-//! The Windows identity a guest observes (docs/personality-contracts.md).
+//! The Windows identity a guest observes (PERS-PROFILE-1).
 //! One profile generates every version fact. As on native Windows, the PEB
 //! carries the version at runtime and the version APIs read it back, so a
 //! patched PEB and the APIs cannot disagree.

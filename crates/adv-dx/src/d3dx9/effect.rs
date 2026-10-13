@@ -1,6 +1,9 @@
 //! Native precompiled D3DX Effect objects over the existing D3D9 COM device.
 //! Shader and state changes execute through the device's guest-visible vtable,
 //! preserving hooked methods and the machine continuation/ownership rules.
+//! Every observed `D3DXCreateEffect` input was a precompiled FXO, so Effects run
+//! natively and HLSL source compilation fails explicitly (GFX-EFFECT-2). Source
+//! input would need a compiler, such as Wine's d3dcompiler built as a guest DLL.
 use super::*;
 use adv_abi::{AnsiStr, guest::check_range};
 use adv_cpu::backend::{GuestExt, Prot};

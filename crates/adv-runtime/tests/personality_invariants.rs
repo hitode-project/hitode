@@ -1,4 +1,4 @@
-//! Personality invariant 1 (docs/personality-contracts.md) over the production
+//! Personality invariant 1 (PERS-EXPORT-2, PERS-EXPORT-3) over the production
 //! fronts: discovery exposes only implemented or reviewed names, and every
 //! review names a callable ABI with a registered failure.
 use adv_abi::{personality, signature, stub, system_exports};

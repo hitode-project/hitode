@@ -1,5 +1,10 @@
 //! Userland ISO9660/Joliet optical media. The image is one read-only host file;
 //! guest streams retain only bounded extent metadata and independent cursors.
+//! hadris-iso is the only ISO parser, built with just the read features.
+//! CDFS volume serials follow Wine's mountmgr
+//! (https://github.com/wine-mirror/wine/blob/master/dlls/mountmgr.sys/device.c),
+//! and volume flags and name limits follow the MS-FSA CDFS definitions instead
+//! of the ISO authoring limits.
 use super::{DirEntry, FileIdentity, FileStream, Vfs};
 use hadris_iso::file::EntryType;
 use hadris_iso::sync::directory::{DirectoryRecord, DirectoryRef};

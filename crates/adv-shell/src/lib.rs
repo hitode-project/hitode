@@ -471,7 +471,7 @@ fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> S
     )
 }
 
-/// The report's personality gaps (docs/personality-contracts.md): rejected
+/// The report's personality gaps (PERS-EXPORT-8): rejected
 /// discovery probes and reviewed exports answered with their failure.
 fn personality_json(diagnostics: Option<&adv_runtime::ApiDiagnostics>) -> String {
     let Some(d) = diagnostics else {

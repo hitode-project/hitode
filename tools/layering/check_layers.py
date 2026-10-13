@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check workspace crate dependencies against the layering rules.
 
-The rules mirror docs/architecture.md section 1.3. A crate may depend on what
+The rules mirror the code map in ARCHITECTURE.md. A crate may depend on what
 its arrows reach, directly or through lower layers; dev-dependencies are free,
 except that test-only crates must never appear anywhere else. Transitional
 edges are allowed until the split that removes them; an entry that no longer

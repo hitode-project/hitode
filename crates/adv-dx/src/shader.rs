@@ -1,5 +1,11 @@
 //! Bounded Direct3D 9 shader bytecode frontend and WGSL library translator.
 //!
+//! The translator is written here instead of linking vkd3d-shader or Wine. SM1-3
+//! bytecode is regular, and its semantic details need differential tests either
+//! way; vkd3d-shader is an LGPL C library that would need dynamic linking, an
+//! Android cross-build and a SPIR-V to naga hop. Both remain semantic references.
+//! naga validates the WGSL and stays on the same version as wgpu.
+//!
 //! No game bytecode is embedded here. The token layout follows Microsoft's
 //! Instruction/Source/Destination Parameter Token and Relative Addressing specs.
 //! Translation deliberately fails for semantics requiring unavailable host state.
