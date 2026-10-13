@@ -314,7 +314,10 @@ impl Window {
         }
         *self.hub.menus.borrow_mut() = runtime;
         if bar.key.window != 0 {
-            self.dialogs.set_main_enabled(bar.key.enabled);
+            self.dialogs.borrow_mut().set_main_enabled(bar.key.enabled);
+            self.hub
+                .main_enabled
+                .set(self.dialogs.borrow().main_enabled());
         }
         Ok(())
     }

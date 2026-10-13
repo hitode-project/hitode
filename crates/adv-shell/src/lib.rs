@@ -7,7 +7,11 @@ mod logging;
 #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 mod native_gpu;
 mod performance;
+#[cfg(target_os = "macos")]
+mod session;
 pub mod window;
+#[cfg(target_os = "macos")]
+pub use session::Session;
 
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
@@ -16,20 +20,20 @@ use std::time::{Duration, Instant};
 
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 
-struct Options {
+pub struct Options {
     row_workers: Option<usize>,
     row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
     no_code_cache: bool,
-    cdroms: Vec<(char, PathBuf)>,
-    install_dir: Option<PathBuf>,
+    pub cdroms: Vec<(char, PathBuf)>,
+    pub install_dir: Option<PathBuf>,
     jit: bool,
     compile_strategy: CompileStrategy,
     region_linking: bool,
     async_compilation: bool,
     tiered_compilation: bool,
-    codepage: u32,
+    pub codepage: u32,
     headless: bool,
     hidden: bool,
     gpu_software: bool,
@@ -51,7 +55,7 @@ struct Options {
     profile: bool,
     control_stdin: bool,
     frame_budget: bool,
-    audio: bool,
+    pub audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
     codec_kernels_explicit: bool,
@@ -104,18 +108,13 @@ const HELP: &str = "adv-run <EXE> [options]\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
 
 impl Options {
-    fn parse() -> Result<Option<Self>, String> {
-        Self::parse_args(std::env::args().skip(1))
-    }
-
-    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
-        let mut exe = None;
-        let mut data_dir = None;
-        let mut options = Self {
+    /// CLI defaults with a data directory supplied by the host.
+    pub fn new(exe: PathBuf, data_dir: PathBuf) -> Self {
+        Self {
             row_workers: None,
             row_batching: true,
-            exe: PathBuf::new(),
-            data_dir: PathBuf::new(),
+            exe,
+            data_dir,
             no_code_cache: false,
             cdroms: Vec::new(),
             install_dir: None,
@@ -153,7 +152,17 @@ impl Options {
             codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
-        };
+        }
+    }
+
+    fn parse() -> Result<Option<Self>, String> {
+        Self::parse_args(std::env::args().skip(1))
+    }
+
+    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut exe = None;
+        let mut data_dir = None;
+        let mut options = Self::new(PathBuf::new(), PathBuf::new());
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
             match arg.as_str() {
@@ -1013,6 +1022,10 @@ fn run(options: Options) -> Result<u8, String> {
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
+    #[cfg(target_os = "macos")]
+    if !options.headless {
+        return session::run_cli(options);
+    }
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
     let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
@@ -1027,68 +1040,73 @@ fn run(options: Options) -> Result<u8, String> {
         service.shutdown();
         return result;
     }
-    // The shared worker cannot preempt an active compiler task. Interactive
-    // compilation uses measured work slices so presentation can run between
-    // jobs; headless compilation above retains the unrestricted policy.
-    background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
-    let mut window = window::Window::new(
-        &format!(
-            "ADV — {}",
-            options
-                .exe
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ),
-        options.width,
-        options.height,
-        options.hidden,
-    )?;
-    let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
-    let mut worker = worker;
-    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        // Startup is the only UI-side GPU initialization. Guest submission has
-        // not begun, so configuring the initially empty queue cannot race it.
-        let (gpu, presenter) = window.create_native(options.gpu_software)?;
-        let context = gpu.context().clone();
-        context
-            .set_execution_wake(wake.clone())
-            .map_err(|_| "GPU execution wake was already registered")?;
-        let ui_sender = background
-            .sender_with_capacity_wake(1, 1, ui.wake())
-            .map_err(|error| error.to_string())?;
-        ui.native(presenter, ui_sender);
-        worker.gpu = Some(gpu);
+        // The shared worker cannot preempt an active compiler task. Interactive
+        // compilation uses measured work slices so presentation can run between
+        // jobs; headless compilation above retains the unrestricted policy.
+        background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
+        let mut window = window::Window::new(
+            &format!(
+                "ADV — {}",
+                options
+                    .exe
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ),
+            options.width,
+            options.height,
+            options.hidden,
+        )?;
+        let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
+        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+        let mut worker = worker;
+        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+        {
+            // Startup is the only UI-side GPU initialization. Guest submission has
+            // not begun, so configuring the initially empty queue cannot race it.
+            let (gpu, presenter) = window.create_native(options.gpu_software)?;
+            let context = gpu.context().clone();
+            context
+                .set_execution_wake(wake.clone())
+                .map_err(|_| "GPU execution wake was already registered")?;
+            let ui_sender = background
+                .sender_with_capacity_wake(1, 1, ui.wake())
+                .map_err(|error| error.to_string())?;
+            ui.native(presenter, ui_sender);
+            worker.gpu = Some(gpu);
+        }
+        // All startup ports are registered before this one common worker starts.
+        // Interpretation uses it as well, even when compilation is disabled.
+        let mut service = background.start().map_err(|error| error.to_string())?;
+        let completion_wake = ui.wake();
+        let (mut tx, mut rx) = adv_sync::spsc::channel(1);
+        let execution = std::thread::Builder::new()
+            .name("adv-execution".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_execution(options, Some(worker), wake, keys, execution_sender)
+                }))
+                .unwrap_or_else(|_| Err("execution worker panicked".into()));
+                let _ = tx.push(result);
+                completion_wake.signal();
+            })
+            .map_err(|e| e.to_string())?;
+        let result = ui.run(&mut window, &mut rx);
+        drop(ui);
+        execution
+            .join()
+            .map_err(|_| "execution worker panicked".to_owned())?;
+        // Accepted presenter and fence jobs return/drop their owned resources while
+        // HWND is still alive. The window is destroyed only after this join.
+        service.shutdown();
+        #[cfg(target_os = "macos")]
+        window.finish_termination();
+        result?
     }
-    // All startup ports are registered before this one common worker starts.
-    // Interpretation uses it as well, even when compilation is disabled.
-    let mut service = background.start().map_err(|error| error.to_string())?;
-    let completion_wake = ui.wake();
-    let (mut tx, mut rx) = adv_sync::spsc::channel(1);
-    let execution = std::thread::Builder::new()
-        .name("adv-execution".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_execution(options, Some(worker), wake, keys, execution_sender)
-            }))
-            .unwrap_or_else(|_| Err("execution worker panicked".into()));
-            let _ = tx.push(result);
-            completion_wake.signal();
-        })
-        .map_err(|e| e.to_string())?;
-    let result = ui.run(&mut window, &mut rx);
-    drop(ui);
-    execution
-        .join()
-        .map_err(|_| "execution worker panicked".to_owned())?;
-    // Accepted presenter and fence jobs return/drop their owned resources while
-    // HWND is still alive. The window is destroyed only after this join.
-    service.shutdown();
     #[cfg(target_os = "macos")]
-    window.finish_termination();
-    result?
+    unreachable!()
 }
 
 #[test]
