@@ -13,7 +13,7 @@ session.json records whether the hardware was requested to be muted.
 
 Tracing is off by default; --trace writes api.trace for compatibility diagnosis
 and marks the session unsuitable for performance comparison.
---d3d9-sm2/--d3d9-sm3 explicitly opt into the runner's shader capability profiles.
+--d3d9-sm3 explicitly opts into the runner's SM3 capability profile; SM2 is the default.
 Native caching/static discovery are default; --no-code-cache diagnoses failures.
 --warm-code-cache
 imports a previous local archive into the new overlay. --cold clears both caches.
@@ -139,9 +139,8 @@ def run(args: argparse.Namespace) -> None:
         command.append("--no-tiering")
     if args.trace:
         command.extend(["--trace", str(output / "api.trace")])
-    for feature in ("d3d9_sm2", "d3d9_sm3"):
-        if getattr(args, feature, False):
-            command.append("--" + feature.replace("_", "-"))
+    if getattr(args, "d3d9_sm3", False):
+        command.append("--d3d9-sm3")
     if getattr(args, "cold", False):
         (output / "overlay" / "jit-warm.bin").unlink(missing_ok=True)
         (output / "overlay" / "jit-code.bin").unlink(missing_ok=True)
@@ -300,7 +299,6 @@ if __name__ == "__main__":
                         help="mute hardware output without diagnostics; requires --audio and --mode hidden/window")
     parser.add_argument("--capture-audio", action="store_true", help="capture actual callbacks and source PCM; hardware receives zeros; excludes performance comparisons")
     parser.add_argument("--trace", action="store_true", help="write API trace in the session output for compatibility diagnosis; excludes performance comparisons")
-    parser.add_argument("--d3d9-sm2", action="store_true", help="enable the runner's SM2 shader capability profile")
     parser.add_argument("--d3d9-sm3", action="store_true", help="enable the runner's SM3 shader capability profile")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--frame-budget", action="store_true")

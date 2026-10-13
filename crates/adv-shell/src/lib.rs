@@ -46,7 +46,6 @@ pub struct Options {
     hidden: bool,
     gpu_software: bool,
     headless_gpu: bool,
-    d3d9_sm2: bool,
     d3d9_sm3: bool,
     d3d9_shader_cache: Option<PathBuf>,
     width: u32,
@@ -92,7 +91,6 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
   --headless-gpu         opt in to a GPU frontend without a window\n\
-  --d3d9-sm2             opt in to the SM2 capability milestone (default: off)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
@@ -136,7 +134,6 @@ impl Options {
             hidden: false,
             gpu_software: false,
             headless_gpu: false,
-            d3d9_sm2: false,
             d3d9_sm3: false,
             d3d9_shader_cache: None,
             width: 640,
@@ -243,7 +240,6 @@ impl Options {
                 "--hidden" => options.hidden = true,
                 "--gpu-software" => options.gpu_software = true,
                 "--headless-gpu" => options.headless_gpu = true,
-                "--d3d9-sm2" => options.d3d9_sm2 = true,
                 "--d3d9-sm3" => options.d3d9_sm3 = true,
                 "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
                 "--self-test-input" => options.self_test_input = true,
@@ -292,11 +288,7 @@ impl Options {
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
         #[cfg(not(any(feature = "gpu", target_os = "macos")))]
-        if options.headless_gpu
-            || options.d3d9_sm2
-            || options.d3d9_sm3
-            || options.d3d9_shader_cache.is_some()
-        {
+        if options.headless_gpu || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
             return Err("D3D9 shader capability switches require the gpu feature".into());
         }
         if options.headless_gpu && !options.headless {
@@ -1312,7 +1304,7 @@ fn run_execution(
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     #[cfg(any(feature = "gpu", target_os = "macos"))]
-    runtime.set_d3d9_shader_caps(options.d3d9_sm2, options.d3d9_sm3);
+    runtime.set_d3d9_shader_caps(options.d3d9_sm3);
     #[cfg(any(feature = "gpu", target_os = "macos"))]
     runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
     runtime.machine.sys.stats.services_enabled =

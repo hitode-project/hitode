@@ -366,6 +366,63 @@ fn mci_boundary<B: Backend>(cpu: B) {
     );
 }
 
+fn mci_strings<B: Backend>(cpu: B) {
+    let mut m = machine(cpu);
+    let commands: [&[u8]; 4] = [
+        b"close SiglusMCIMovie wait",
+        b"seek SiglusMCIMovie to start",
+        b"open \"op.mpg\" type MPEGVideo alias SiglusMCIMovie wait",
+        b"status SiglusMCIMovie mode wait",
+    ];
+    let mut at = DATA + 0x100;
+    let mut pointers = Vec::new();
+    for command in commands {
+        m.cpu.write(at, command).unwrap();
+        m.cpu.write(at + command.len() as u32, &[0]).unwrap();
+        pointers.push(at);
+        at += 0x60;
+    }
+    let wide: Vec<u8> = "close SiglusMCIMovie wait\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    m.cpu.write(DATA + 0x400, &wide).unwrap();
+    let output = DATA + 0x500;
+    m.cpu.write(output, &[0x77; 64]).unwrap();
+    let mut code = start();
+    for (index, &pointer) in pointers.iter().enumerate() {
+        call(
+            &mut m,
+            &mut code,
+            "mciSendStringA",
+            &[pointer, output, 64, 0],
+            index as u32,
+        );
+    }
+    call(
+        &mut m,
+        &mut code,
+        "mciSendStringW",
+        &[DATA + 0x400, output, 32, 0],
+        4,
+    );
+    call(&mut m, &mut code, "mciSendStringA", &[0, output, 64, 0], 5);
+    run(&mut m, code);
+    // Unknown alias, unknown verb, a video device this build cannot open (its
+    // alias is not kept), then the W front end and a missing command string.
+    for (index, error) in [263, 261, 306, 263, 263, 267].into_iter().enumerate() {
+        result(&m, index as u32, error);
+    }
+    assert_eq!(bytes(&m, output, 64), vec![0x77; 64]);
+}
+
+#[test]
+// spec: MEDIA-MCI-3
+fn mci_strings_share_device_names_and_report_parser_errors() {
+    mci_strings(JitCpu::new(PARK_ADDR, false).unwrap());
+    mci_strings(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
 #[test]
 fn waveform_exports_state_and_safe_fail_levels_match_the_absent_front() {
     let registry = registry();

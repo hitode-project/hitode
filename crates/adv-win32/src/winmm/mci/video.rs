@@ -46,12 +46,12 @@ fn change(e: &mut Env<'_>, id: u32, f: impl FnOnce(&mut Device)) {
         f(e.sys.objects.owned_mut(key).unwrap());
     }
 }
-fn alloc(e: &mut Env<'_>, size: u32) -> Option<u32> {
+pub(super) fn alloc(e: &mut Env<'_>, size: u32) -> Option<u32> {
     e.ext
         .get_mut::<Heaps>()
         .alloc(e.cpu, &mut e.sys.vm, 0, size, true)
 }
-fn free(e: &mut Env<'_>, p: u32) {
+pub(super) fn free(e: &mut Env<'_>, p: u32) {
     let heaps = e.ext.get_mut::<Heaps>();
     heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, p);
 }
