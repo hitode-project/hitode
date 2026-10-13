@@ -496,6 +496,7 @@ pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-SES-2
     #[cfg(target_os = "macos")]
     #[test]
     fn tick_deadline_is_only_armed_for_a_visible_pending_refresh() {
@@ -510,6 +511,7 @@ mod tests {
             Some(overdue)
         );
     }
+    // spec: HOST-SES-3
     #[test]
     fn menu_mailbox_coalesces_and_commands_use_the_existing_waking_input_channel() {
         let wake = WakeEvent::new().unwrap();
@@ -555,6 +557,7 @@ mod tests {
         assert_eq!(keys.get(0x11), 0, "menu clicks do not change physical Ctrl");
     }
 
+    // spec: HOST-SES-4
     #[cfg(target_os = "macos")]
     #[test]
     fn post_text_uses_input_delivery_and_returns_the_guest_count() {
@@ -573,6 +576,7 @@ mod tests {
         execution.join().unwrap();
     }
 
+    // spec: HOST-SES-2
     #[test]
     fn repaint_and_telemetry_do_not_wake_execution_but_real_input_does() {
         let wake = WakeEvent::new().unwrap();
@@ -628,6 +632,7 @@ mod tests {
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
     }
 
+    // spec: HOST-SES-3
     #[test]
     fn saturated_telemetry_keeps_reserved_input_capacity_and_reports_drops() {
         let wake = WakeEvent::new().unwrap();

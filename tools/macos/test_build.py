@@ -10,6 +10,7 @@ spec.loader.exec_module(build)
 
 
 class BuildTests(unittest.TestCase):
+    # spec: HOST-PKG-1
     def test_decode_only_configuration_covers_media_contract(self):
         profile = json.loads(build.PROFILE.read_text())
         args = build.configure(profile, Path('/build/install'))

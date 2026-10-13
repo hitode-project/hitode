@@ -171,6 +171,7 @@ mod tests {
         }
     }
 
+    // spec: HOST-OVL-2
     #[test]
     fn rect_edges_are_half_open() {
         let r = rect(10.0, 10.0, 40.0, 20.0);
@@ -181,6 +182,7 @@ mod tests {
         assert!(!rect(0.0, 0.0, 0.0, 10.0).contains(0.0, 5.0));
     }
 
+    // spec: HOST-OVL-2
     #[test]
     fn presses_follow_regions_and_modal() {
         let mut input = button();
@@ -195,6 +197,7 @@ mod tests {
         );
     }
 
+    // spec: HOST-OVL-5
     #[test]
     fn keyboard_follows_wants_keyboard() {
         let mut input = button();
@@ -203,6 +206,7 @@ mod tests {
         assert_eq!(input.keyboard(), Target::Overlay);
     }
 
+    // spec: HOST-OVL-3
     #[test]
     fn a_press_keeps_its_target_until_release() {
         let mut router = Router::new(button());
@@ -215,6 +219,7 @@ mod tests {
         assert_eq!(router.moved(0, 20.0, 20.0), Target::Game);
     }
 
+    // spec: HOST-OVL-3
     #[test]
     fn a_game_press_ignores_a_modal_that_opens_under_it() {
         let mut router = Router::new(button());
@@ -228,6 +233,7 @@ mod tests {
         assert_eq!(router.down(0, 200.0, 200.0), Target::Overlay);
     }
 
+    // spec: HOST-OVL-4
     #[test]
     fn pointers_are_routed_independently() {
         let mut router = Router::new(button());
@@ -238,6 +244,7 @@ mod tests {
         assert_eq!(router.up(1, 20.0, 20.0), Target::Game);
     }
 
+    // spec: HOST-OVL-3
     #[test]
     fn a_repeated_down_reroutes_and_an_unknown_up_uses_regions() {
         let mut router = Router::new(button());

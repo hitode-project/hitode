@@ -116,6 +116,7 @@ mod tests {
         serde_json::from_str::<InputMessage>(json).unwrap().into()
     }
 
+    // spec: HOST-OVL-1
     #[test]
     fn decodes_the_webview_message() {
         let input = parse(
@@ -134,6 +135,7 @@ mod tests {
         assert_eq!(input.keyboard(), Target::Overlay);
     }
 
+    // spec: HOST-OVL-1
     #[test]
     fn rejects_unknown_fields_and_drops_empty_regions() {
         assert!(
@@ -148,6 +150,7 @@ mod tests {
         assert!(input.regions.is_empty());
     }
 
+    // spec: HOST-OVL-6
     #[test]
     fn starts_exclusive_and_notifies_only_on_change() {
         let state = OverlayState::default();

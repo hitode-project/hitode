@@ -747,6 +747,7 @@ impl Window {
 mod tests {
     use super::*;
 
+    // spec: HOST-MENU-2
     #[test]
     fn native_dialog_projects_guest_state_without_feedback_and_keeps_guest_identity() {
         let mut window = Window::new("dialog projection", 320, 180, true).unwrap();

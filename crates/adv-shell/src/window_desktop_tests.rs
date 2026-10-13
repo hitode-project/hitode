@@ -239,6 +239,7 @@ fn warmup_presenter_resources() -> u32 {
     unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
 }
 
+// spec: HOST-VIEW-2
 #[test]
 #[ignore = "interactive Windows desktop: visible topmost test HWND for about 8 seconds; no audio"]
 fn native_desktop_repaint_retains_pixels_without_new_guest_frame() {

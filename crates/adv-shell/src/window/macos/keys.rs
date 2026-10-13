@@ -161,6 +161,7 @@ pub(super) fn message(key: Key, down: bool, repeat: bool, alt: bool) -> (u32, u3
 mod tests {
     use super::*;
 
+    // spec: HOST-VIEW-5
     #[test]
     fn positions_carry_us_virtual_keys_and_set_1_scan_codes() {
         assert_eq!(
@@ -219,6 +220,7 @@ mod tests {
         assert_eq!(key(0x3f), None);
     }
 
+    // spec: HOST-VIEW-5
     #[test]
     fn no_two_positions_share_a_scan_code() {
         let mut seen = std::collections::BTreeMap::new();
@@ -229,6 +231,7 @@ mod tests {
         }
     }
 
+    // spec: HOST-VIEW-5
     #[test]
     fn messages_follow_the_win32_lparam_layout() {
         let ctrl = key(0x3b).unwrap();

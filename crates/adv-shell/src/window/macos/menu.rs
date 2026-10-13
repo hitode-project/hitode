@@ -408,6 +408,7 @@ impl Projection {
 mod tests {
     use super::*;
 
+    // spec: HOST-MENU-1
     #[test]
     fn titles_drop_mnemonics_and_the_accelerator_column() {
         let wide = |s: &str| s.encode_utf16().collect::<Vec<_>>();
