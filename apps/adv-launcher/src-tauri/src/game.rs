@@ -1,5 +1,5 @@
 //! macOS game ownership on Tauri's main AppKit thread.
-use crate::library::{self, Library};
+use crate::library::{self, LastRun, Library};
 use crate::overlay::OverlayState;
 use adv_shell::overlay::Target;
 use adv_shell::{
@@ -56,7 +56,8 @@ struct Host {
     container: Retained<GameContainer>,
     session: Option<Session>,
     close_window: bool,
-    exit: Option<i32>,
+    // Pending game close, with an exit code only when the application should quit.
+    exit: Option<Option<i32>>,
     quit: Retained<QuitHandler>,
     observers: Vec<Observer>,
 }
@@ -278,13 +279,24 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
                             host.session.take();
                             host.container.set_game(None);
                             host.focus(Target::Overlay);
-                            (std::mem::take(&mut host.close_window), host.exit.take())
+                            (
+                                std::mem::take(&mut host.close_window),
+                                host.exit.take().flatten(),
+                            )
                         });
                         if let Err(error) = finished_window
                             .state::<Mutex<Library>>()
                             .lock()
                             .unwrap()
-                            .finished(&id, library::now(), started_at.elapsed().as_secs() as u32)
+                            .finished(
+                                &id,
+                                started_at.elapsed().as_secs() as u32,
+                                LastRun {
+                                    ended: library::now(),
+                                    summary: result.as_ref().ok().map(|f| f.summary.clone()),
+                                    error: result.as_ref().err().cloned(),
+                                },
+                            )
                         {
                             eprintln!("could not save play session: {error}");
                         }
@@ -351,6 +363,30 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn stop_game(window: WebviewWindow) -> Result<(), String> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let stopped = HOST.with_borrow_mut(|host| {
+                let host = host.as_mut().ok_or("no game is running")?;
+                let session = host.session.as_ref().ok_or("no game is running")?;
+                if host.exit.is_some() || host.close_window {
+                    session.force_close();
+                } else {
+                    host.exit = Some(None);
+                    session.request_close();
+                }
+                Ok(())
+            });
+            let _ = reply.send(stopped);
+        })
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || result.recv().map_err(|e| e.to_string())?)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -430,7 +466,7 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
                 api.prevent_exit();
                 // A second quit while the game is still closing forces it,
                 // as the standalone shell's Quit item does.
-                if host.exit.replace(code.unwrap_or(0)).is_some() {
+                if host.exit.replace(Some(code.unwrap_or(0))).is_some() {
                     session.force_close();
                 } else {
                     session.request_close();

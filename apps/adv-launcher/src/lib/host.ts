@@ -2,14 +2,17 @@ import { call } from "./bridge";
 
 export type Codepage = 932 | 936;
 export interface PlaySession { ended: number; seconds: number }
+export interface LastRun { ended: number; summary: RunSummary | null; error: string | null }
 export interface LibraryGame {
   id: string; title: string; folder: string; exe: string; codepage: Codepage;
   addedAt: number; lastPlayed: number | null; playSeconds: number;
   favorite: boolean; nsfw: boolean; sessions: PlaySession[];
   offline: "disk" | "missing" | null;
+  daily: Record<string, number>; lastRun: LastRun | null;
 }
 export interface ExeCandidate {
   path: string; size: number; arch: "x86" | "x64" | "other"; codepage: Codepage;
+  inLibrary: string | null;
 }
 export interface FolderInspection {
   folder: string; title: string; exes: ExeCandidate[];
@@ -70,4 +73,10 @@ export function startGame(id: string): Promise<void> {
 /** Pause or resume the running game, e.g. while the pause menu or report page is open. */
 export function pauseGame(paused: boolean): Promise<void> {
   return call("pause_game", { paused }, undefined);
+}
+export function stopGame(): Promise<void> {
+  return call("stop_game", {}, undefined);
+}
+export function revealPath(path: string): Promise<void> {
+  return call("reveal_path", { path }, undefined);
 }

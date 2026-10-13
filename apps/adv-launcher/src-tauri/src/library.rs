@@ -1,7 +1,8 @@
 //! Desktop game library and executable discovery.
+use chrono::{Duration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -34,6 +35,10 @@ pub struct LibraryGame {
     pub favorite: bool,
     pub nsfw: bool,
     pub sessions: Vec<PlaySession>,
+    #[serde(default)]
+    pub daily: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub last_run: Option<LastRun>,
     #[serde(skip_deserializing)]
     pub offline: Option<Offline>,
 }
@@ -41,6 +46,12 @@ pub struct LibraryGame {
 pub struct PlaySession {
     ended: u64,
     seconds: u32,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LastRun {
+    pub ended: u64,
+    pub summary: Option<adv_report::RunSummary>,
+    pub error: Option<String>,
 }
 type Offline = &'static str;
 #[derive(Serialize, Deserialize)]
@@ -60,7 +71,24 @@ impl Library {
         };
         match fs::read(&lib.path) {
             Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
-                Ok(saved) => lib.games = saved.games,
+                Ok(mut saved) => {
+                    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+                    let mut migrated = false;
+                    for (game, fields) in
+                        saved.games.iter_mut().zip(raw["games"].as_array().unwrap())
+                    {
+                        if fields.get("daily").is_none() {
+                            for session in &game.sessions {
+                                add_daily(&mut game.daily, session.ended, session.seconds, &Local);
+                            }
+                            migrated = true;
+                        }
+                    }
+                    lib.games = saved.games;
+                    if migrated {
+                        lib.save()?;
+                    }
+                }
                 Err(e) => {
                     let bad = dir.join(format!("library.json.bad-{}", now()));
                     fs::rename(&lib.path, bad)?;
@@ -90,12 +118,15 @@ impl Library {
         let data = self.path.parent().unwrap().join("games").join(id);
         Ok((game.folder.join(&game.exe), data, game.codepage))
     }
-    pub fn finished(&mut self, id: &str, ended: u64, seconds: u32) -> io::Result<()> {
+    pub fn finished(&mut self, id: &str, seconds: u32, run: LastRun) -> io::Result<()> {
+        let ended = run.ended;
         let i = self.game(id)?;
         let game = &mut self.games[i];
         game.sessions.push(PlaySession { ended, seconds });
         game.last_played = Some(ended);
         game.play_seconds += u64::from(seconds);
+        game.last_run = Some(run);
+        add_daily(&mut game.daily, ended, seconds, &Local);
         self.prune(ended);
         self.save()
     }
@@ -147,15 +178,15 @@ impl Library {
         self.games.insert(index.min(self.games.len()), game);
         self.save()
     }
-    /// Folders and ids already in the library, so discovery can run unlocked.
+    /// Folder, executable and id snapshots, so discovery can run unlocked.
     fn known(&self) -> Known {
         self.games
             .iter()
-            .map(|g| (g.folder.clone(), g.id.clone()))
+            .map(|g| (g.folder.clone(), g.exe.clone(), g.id.clone()))
             .collect()
     }
 }
-type Known = Vec<(PathBuf, String)>;
+type Known = Vec<(PathBuf, String, String)>;
 fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
     let folder = fs::canonicalize(folder)?;
     let mut exes = Vec::new();
@@ -172,6 +203,10 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
             continue;
         };
         exes.push(ExeCandidate {
+            in_library: known
+                .iter()
+                .find(|(dir, exe, _)| *dir == folder && exe.eq_ignore_ascii_case(&name))
+                .map(|(_, _, id)| id.clone()),
             path: name,
             size: metadata.len(),
             arch: machine(&path),
@@ -184,8 +219,8 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
     });
     let name = folder.file_name().unwrap_or_default();
     let title = name.to_string_lossy().into();
-    let existing = known.iter().find(|(known, _)| *known == folder);
-    let in_library = existing.map(|(_, id)| id.clone());
+    let existing = known.iter().find(|(known, _, _)| *known == folder);
+    let in_library = existing.map(|(_, _, id)| id.clone());
     Ok(FolderInspection {
         folder,
         title,
@@ -215,14 +250,16 @@ fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
                 .any(|e| prefixed(&e.path, &["setup", "install"]));
             let setup = info.suggested.is_none() && installer;
             let relative = folder.strip_prefix(&root).unwrap().to_string_lossy();
+            let exe = info.suggested.map(|i| info.exes[i].clone());
+            let in_library = exe.as_ref().and_then(|e| e.in_library.clone());
             found.push(ScanFound {
                 relative: relative.replace('\\', "/"),
                 folder: info.folder,
                 depth: level,
                 title: info.title,
-                exe: info.suggested.map(|i| info.exes[i].clone()),
+                exe,
                 setup,
-                in_library: info.in_library,
+                in_library,
             });
             if found.len() == 500 {
                 break;
@@ -238,6 +275,34 @@ fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
     }
     Ok(found)
 }
+/// Allocate elapsed whole seconds to local calendar days, including DST boundaries.
+fn add_daily<T: TimeZone>(daily: &mut BTreeMap<String, u64>, ended: u64, seconds: u32, tz: &T) {
+    let end = tz.timestamp_opt((ended / 1000) as i64, 0).single().unwrap();
+    let mut start = end.clone() - Duration::seconds(i64::from(seconds));
+    while start < end {
+        let day = start.date_naive();
+        let mut midnight = day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+        // Some local days begin after midnight when clocks advance there.
+        let next = loop {
+            if let Some(next) = tz.from_local_datetime(&midnight).earliest() {
+                break next;
+            }
+            midnight += Duration::minutes(1);
+        };
+        let until = next.min(end.clone());
+        *daily.entry(day.to_string()).or_default() += (until.clone() - start).num_seconds() as u64;
+        start = until;
+    }
+}
+
+#[tauri::command]
+pub fn reveal_path(path: PathBuf) -> Reply<()> {
+    if !path.exists() {
+        return Err("path does not exist".into());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string())
+}
+
 fn offline(folder: &Path) -> Option<Offline> {
     if folder.exists() {
         return None;
@@ -273,11 +338,13 @@ fn machine(path: &Path) -> &'static str {
     }
 }
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExeCandidate {
     path: String,
     size: u64,
     arch: &'static str,
     codepage: u32,
+    in_library: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -416,7 +483,16 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("save"), b"save").unwrap();
         for (ended, seconds) in [(1, 10), (MONTH + 1, 20), (MONTH + 2, 30)] {
-            lib.finished(&game.id, ended, seconds).unwrap();
+            lib.finished(
+                &game.id,
+                seconds,
+                LastRun {
+                    ended,
+                    summary: None,
+                    error: None,
+                },
+            )
+            .unwrap();
         }
         let app_dir = dir.join("app");
         let saved = fs::read_to_string(&lib.path).unwrap();
@@ -476,6 +552,100 @@ mod tests {
         fs::remove_file(dir.join("game_chs.EXE")).unwrap();
         assert!(inspect(&lib.known(), &dir).unwrap().suggested.is_none());
         assert!(scan(&lib.known(), dir.clone(), 1).unwrap()[0].setup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-1, HOST-LIB-3
+    #[test]
+    fn daily_splits_elapsed_seconds_at_local_midnight() {
+        let tz = chrono::FixedOffset::east_opt(-5 * 3600).unwrap();
+        let end = tz.with_ymd_and_hms(2026, 10, 14, 0, 0, 10).unwrap();
+        let mut daily = BTreeMap::new();
+        add_daily(&mut daily, end.timestamp_millis() as u64 + 500, 30, &tz);
+        assert_eq!(daily["2026-10-13"], 20);
+        assert_eq!(daily["2026-10-14"], 10);
+        add_daily(&mut daily, end.timestamp_millis() as u64, 90_000, &tz);
+        assert_eq!(daily.values().sum::<u64>(), 90_030);
+    }
+    // spec: HOST-LIB-1, HOST-LIB-3
+    #[test]
+    fn old_library_backfills_daily_once_and_defaults_last_run() {
+        let (dir, mut lib) = fixture("migration");
+        let game = lib.add(&dir, "game.exe", 932, "Game").unwrap();
+        let end = Local.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).unwrap();
+        lib.games[0].sessions.push(PlaySession {
+            ended: end.timestamp_millis() as u64,
+            seconds: 15,
+        });
+        lib.save().unwrap();
+        assert!(
+            Library::load(dir.join("app")).unwrap().games[0]
+                .daily
+                .is_empty()
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lib.path).unwrap()).unwrap();
+        let fields = json["games"][0].as_object_mut().unwrap();
+        fields.remove("daily");
+        fields.remove("lastRun");
+        fs::write(&lib.path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut loaded = Library::load(dir.join("app")).unwrap();
+        assert_eq!(loaded.games[0].daily["2026-10-13"], 15);
+        assert!(loaded.games[0].last_run.is_none());
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lib.path).unwrap()).unwrap();
+        assert_eq!(stored["games"][0]["daily"]["2026-10-13"], 15);
+        loaded.prune(end.timestamp_millis() as u64 + MONTH + 1);
+        loaded.save().unwrap();
+        let reloaded = Library::load(dir.join("app")).unwrap();
+        assert_eq!(reloaded.games[0].daily["2026-10-13"], 15);
+        assert!(reloaded.games[0].sessions.is_empty());
+        assert_eq!(reloaded.games[0].id, game.id);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-3
+    #[test]
+    fn last_run_round_trips_summary_and_error() {
+        let (dir, mut lib) = fixture("last-run");
+        let game = lib.add(&dir, "game.exe", 932, "Game").unwrap();
+        for run in [
+            LastRun {
+                ended: now(),
+                summary: Some(adv_report::RunSummary::default()),
+                error: None,
+            },
+            LastRun {
+                ended: now(),
+                summary: None,
+                error: Some("execution failed".into()),
+            },
+        ] {
+            lib.finished(&game.id, 1, run.clone()).unwrap();
+            let loaded = Library::load(dir.join("app")).unwrap();
+            assert_eq!(loaded.games[0].last_run, Some(run));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-2
+    #[test]
+    fn discovery_matches_the_selected_executable() {
+        let (dir, mut lib) = fixture("exe-matching");
+        pe(&dir, "other.exe", 0x14c, 80);
+        pe(&dir, "game.exe", 0x14c, 100);
+        let other = lib.add(&dir, "OTHER.EXE", 932, "Other").unwrap();
+        let found = inspect(&lib.known(), &dir.join(".")).unwrap();
+        assert_eq!(found.in_library, Some(other.id.clone()));
+        assert_eq!(found.exes[1].in_library, Some(other.id));
+        assert!(found.exes[0].in_library.is_none());
+        assert!(
+            scan(&lib.known(), dir.clone(), 1).unwrap()[0]
+                .in_library
+                .is_none()
+        );
+        let game = lib.add(&dir, "GAME.EXE", 932, "Game").unwrap();
+        assert_eq!(
+            scan(&lib.known(), dir.clone(), 1).unwrap()[0].in_library,
+            Some(game.id)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

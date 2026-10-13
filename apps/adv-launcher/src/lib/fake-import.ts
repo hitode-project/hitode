@@ -43,7 +43,7 @@ export interface Meta {
 export const FAKE_SCAN_ROOT = "[所选文件夹]/ADV";
 
 function exe(path: string, codepage: 932 | 936 = 932): ScanFound["exe"] {
-  return { path, size: 3_400_000, arch: "x86", codepage };
+  return { path, size: 3_400_000, arch: "x86", codepage, inLibrary: null };
 }
 
 const FAKE_FOUND: ScanFound[] = [
@@ -90,9 +90,9 @@ export function fakeInspection(): FolderInspection {
     folder: "[所选文件夹]/夏影のアルバム",
     title: "夏影のアルバム",
     exes: [
-      { path: "Natsukage.exe", size: 3_400_000, arch: "x86", codepage: 932 },
-      { path: "Natsukage64.exe", size: 3_900_000, arch: "x64", codepage: 932 },
-      { path: "config.exe", size: 412_000, arch: "x86", codepage: 932 },
+      { path: "Natsukage.exe", size: 3_400_000, arch: "x86", codepage: 932, inLibrary: null },
+      { path: "Natsukage64.exe", size: 3_900_000, arch: "x64", codepage: 932, inLibrary: null },
+      { path: "config.exe", size: 412_000, arch: "x86", codepage: 932, inLibrary: null },
     ],
     suggested: 0,
     inLibrary: null,

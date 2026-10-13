@@ -12,7 +12,7 @@ use serde::Serialize;
 #[cfg(target_os = "macos")]
 mod game;
 #[cfg(target_os = "macos")]
-use game::{post_text, start_game};
+use game::{post_text, start_game, stop_game};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +44,7 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             use tauri::Manager;
             app.manage(std::sync::Mutex::new(library::Library::load(
@@ -67,6 +68,7 @@ pub fn run() {
                 post_text,
                 start_game,
                 game::pause_game,
+                stop_game,
                 overlay::set_overlay_input,
                 report::report_base,
                 report::save_report,
@@ -78,7 +80,8 @@ pub fn run() {
                 library::library_add,
                 library::library_update,
                 library::library_remove,
-                library::library_restore
+                library::library_restore,
+                library::reveal_path
             ]);
     #[cfg(all(desktop, not(target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -95,7 +98,8 @@ pub fn run() {
         library::library_add,
         library::library_update,
         library::library_remove,
-        library::library_restore
+        library::library_restore,
+        library::reveal_path
     ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
