@@ -23,6 +23,7 @@
         <div class="state fade">
           <div class="msg">正在启动</div>
           <div class="track" role="progressbar" aria-label="正在启动" style="margin-top: 32px"><span class="fill"></span></div>
+          <div style="margin-top: 36px"><button class="btn quiet" onclick={() => flow.cancel()}>取消</button></div>
         </div>
       {:else if flow.view === "failed"}
         <div class="state fade">

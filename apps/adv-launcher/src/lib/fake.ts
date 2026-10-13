@@ -77,5 +77,7 @@ function fakeGame(s: Seed, i: number): Game {
     offline: s.offline ?? null,
     daily: days,
     sessions30: s.sessions ?? 0,
+    history: {},
+    lastSummary: null,
   };
 }

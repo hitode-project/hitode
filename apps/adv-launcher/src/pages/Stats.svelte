@@ -5,11 +5,11 @@
   import StatsRank from "../components/StatsRank.svelte";
   import { library } from "../lib/library.svelte";
   import { inTauri } from "../lib/bridge";
-  import { STATS_RANGES, defaultBucket, fakeOlderDays, noOlderDays, playLogs, rangeStats, type StatsRange } from "../lib/stats";
+  import { STATS_RANGES, defaultBucket, fakeOlderDays, historyOlderDays, playLogs, rangeStats, type StatsRange } from "../lib/stats";
 
   let range = $state<StatsRange>("month");
   let pick = $state<number | null>(null);
-  const data = $derived(rangeStats(playLogs(library.games, library.now, inTauri ? noOlderDays : fakeOlderDays), range, new Date(library.now)));
+  const data = $derived(rangeStats(playLogs(library.games, library.now, inTauri ? historyOlderDays : fakeOlderDays), range, new Date(library.now)));
   const selected = $derived(pick ?? defaultBucket(data.buckets));
 </script>
 

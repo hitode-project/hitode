@@ -14,6 +14,7 @@
       <header>
         <h1 lang="ja">{pick.title.trim() || pick.inspection.title}</h1>
         <div class="mono" style="margin-top: 8px">{pick.inspection.folder}</div>
+        {#if pick.inspection.inLibrary !== null}<div class="hint" style="margin-top: 6px">这个文件夹里已有游戏</div>{/if}
       </header>
 
       {#if pick.noExe}
@@ -29,7 +30,7 @@
             {#each pick.exes as x, i (x.name)}
               <ImportOption name="exe" checked={pick.exe === i} disabled={x.disabled} onpick={() => pick.pickExe(i)}>
                 <span class="mono" style="font-size: 14px; color: var(--fg)">{x.name}</span>
-                <span class="side-n">{x.disabled ? "64 位程序" : x.size}</span>
+                <span class="side-n">{x.disabled ? "64 位程序" : x.candidate.inLibrary !== null ? "已在库中" : x.size}</span>
               </ImportOption>
             {/each}
           </div>
@@ -57,7 +58,7 @@
 
 <ImportFooter width={600}>
   <button class="quiet" onclick={() => nav.back()}>取消</button>
-  <button class="primary" disabled={!pick.addedId && !pick.canAdd} onclick={() => void pick.add()}>{pick.addedId ? "开始游戏" : "添加到游戏库"}</button>
+  <button class="primary" disabled={!pick.addedId && !pick.canAdd} onclick={() => void pick.add()}>{pick.addedId ? "开始游戏" : pick.chosenInLibrary !== null ? "在游戏库中查看" : "添加到游戏库"}</button>
 </ImportFooter>
 
 <style>
@@ -80,7 +81,7 @@
     font-size: 15px;
     font-weight: 500;
   }
-  .empty .hint {
+  .hint {
     font-size: 13px;
     color: var(--fg3);
   }

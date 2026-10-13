@@ -4,6 +4,7 @@
   import ManageSaves from "./ManageSaves.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
+  import { canReveal, reveal } from "../lib/reveal";
   import { nav } from "../lib/nav.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
   import type { Game } from "../lib/types";
@@ -200,10 +201,17 @@
           <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
           <span>存档…</span>
         </button>
-        <button class="quiet" onclick={() => revealFolder(game.path)}>
-          <Icon name="folder" size={15} />
-          <span>打开所在文件夹</span>
-        </button>
+        {#if canReveal()}
+          <button class="quiet" title={game.path} disabled={game.offline !== null} onclick={() => reveal(game.path)}>
+            <Icon name="folder" size={15} />
+            <span>在访达中显示</span>
+          </button>
+        {:else}
+          <button class="quiet" onclick={() => revealFolder(game.path)}>
+            <Icon name="folder" size={15} />
+            <span>打开所在文件夹</span>
+          </button>
+        {/if}
       </nav>
     </div>
 

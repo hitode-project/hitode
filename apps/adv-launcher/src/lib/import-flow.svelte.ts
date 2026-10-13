@@ -247,6 +247,8 @@ export class ImportPick {
       candidate: e,
     })),
   );
+  /** The library entry of the chosen program, if it was added before. */
+  readonly chosenInLibrary = $derived(this.exes[this.exe]?.candidate.inLibrary ?? null);
   /** No program that can run: the "没找到程序" state. */
   readonly noExe = $derived(this.phase === "ready" && !this.exes.some((e) => !e.disabled));
   readonly encs = $derived(encChoices(this.title || (this.inspection?.title ?? "")));
@@ -270,12 +272,6 @@ export class ImportPick {
       this.phase = "reading";
       const inspection = inTauri ? await libraryInspect(folder) : fakeInspection();
       if (!inspection) throw new Error("读不到这个文件夹");
-      if (inspection.inLibrary !== null) {
-        // Already added: go to its entry instead.
-        library.focus = inspection.inLibrary;
-        nav.home();
-        return;
-      }
       this.#show(inspection);
     } catch (error) {
       this.error = String(error);
@@ -316,10 +312,15 @@ export class ImportPick {
     this.#edit(() => (this.title = v));
   }
 
-  /** Adds to the library; once added, starts the game instead. */
+  /** Adds to the library; once added, starts the game instead. A program already added opens its entry. */
   async add(): Promise<void> {
     if (this.addedId) {
       nav.replace({ name: "launch", gameId: this.addedId });
+      return;
+    }
+    if (this.chosenInLibrary !== null) {
+      library.focus = this.chosenInLibrary;
+      nav.home();
       return;
     }
     const inspection = this.inspection;

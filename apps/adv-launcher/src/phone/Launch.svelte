@@ -45,7 +45,7 @@
     {#if !game}
       <div class="acts"><button class="btn primary" onclick={() => nav.home()}>返回</button></div>
     {:else if flow.view === "prepare"}
-      <!-- A starting game cannot be cancelled. -->
+      <div class="acts"><button class="btn quiet" onclick={() => flow.cancel()}>取消</button></div>
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>再试一次</button>

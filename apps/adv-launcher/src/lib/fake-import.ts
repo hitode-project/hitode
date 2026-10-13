@@ -201,6 +201,8 @@ export function addToLibrary(title: string, enc: Enc, path: string, meta?: Meta)
     offline: null,
     daily: Array.from({ length: 30 }, () => 0),
     sessions30: 0,
+    history: {},
+    lastSummary: null,
   };
   library.games = [...library.games, game];
   return game.id;
