@@ -1,9 +1,10 @@
 //! Digital-video MCI delegates to the existing media graph. Other device types
 //! keep an explicit unavailable boundary; no host MCI activation is performed.
-use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, guest::check_range, win32};
+use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
 use adv_machine::Outcome;
+mod string;
 mod video;
 
 const MCI_OPEN: u32 = 0x803;
@@ -77,6 +78,41 @@ fn send(env: &mut Env<'_>, message: u32, flags: u32, parameters: u32, wide: bool
     DEVICE_NOT_INSTALLED
 }
 
+#[win32(winmm, name = "mciSendStringA", level = implement)]
+fn string_a(
+    env: &mut Env<'_>,
+    command: AnsiStr,
+    output: AnsiStr,
+    capacity: u32,
+    callback: Handle,
+) -> Outcome {
+    string::send(
+        env,
+        command.0.addr(),
+        output.0.addr(),
+        capacity,
+        callback.0,
+        false,
+    )
+}
+#[win32(winmm, name = "mciSendStringW", level = implement)]
+fn string_w(
+    env: &mut Env<'_>,
+    command: WideStr,
+    output: WideStr,
+    capacity: u32,
+    callback: Handle,
+) -> Outcome {
+    string::send(
+        env,
+        command.0.addr(),
+        output.0.addr(),
+        capacity,
+        callback.0,
+        true,
+    )
+}
+
 #[win32(winmm, name = "mciGetErrorStringA", level = implement)]
 fn error_string_a(env: &mut Env<'_>, error: u32, output: AnsiStr, capacity: u32) -> i32 {
     error_string(env, error, output.0.addr(), capacity, false)
@@ -126,6 +162,8 @@ pub(super) fn register(registry: &mut Registry) {
     video::register(registry);
     registry.register(send_a_ABI);
     registry.register(send_w_ABI);
+    registry.register(string_a_ABI);
+    registry.register(string_w_ABI);
     registry.register(error_string_a_ABI);
     registry.register(error_string_w_ABI);
 }
