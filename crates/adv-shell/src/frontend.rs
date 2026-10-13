@@ -286,15 +286,20 @@ impl Ui {
                 self.repaint = false;
                 self.next = window.next_refresh();
             }
-            let delay = refresh_deadline(
-                self.next,
-                native.in_flight(),
-                native.has_update() || self.repaint,
-                dimensions,
-            );
-            return Ok(delay);
         }
-        Ok(None)
+        self.deadline(window)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {
+        let Some(native) = &self.native else {
+            return Ok(None);
+        };
+        Ok(refresh_deadline(
+            self.next,
+            native.in_flight(),
+            native.has_update() || self.repaint,
+            window.native_client_size()?,
+        ))
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn menu_snapshot(&self) -> &MenuBar {

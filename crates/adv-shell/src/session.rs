@@ -32,6 +32,7 @@ struct Driver {
     view: Retained<GameView>,
     ui: RefCell<Option<frontend::Ui>>,
     done: RefCell<spsc::Consumer<Result<u8, String>>>,
+    pending: RefCell<Option<Result<u8, String>>>,
     execution: RefCell<Option<std::thread::JoinHandle<()>>>,
     service: RefCell<adv_sync::background::Service>,
     on_finished: RefCell<Option<Box<dyn FnOnce(Result<u8, String>)>>>,
@@ -87,6 +88,7 @@ impl Session {
             wake: ui.wake(),
             ui: RefCell::new(Some(ui)),
             done: RefCell::new(rx),
+            pending: RefCell::new(None),
             execution: RefCell::new(Some(execution)),
             service: RefCell::new(service),
             on_finished: RefCell::new(Some(on_finished)),
@@ -206,15 +208,8 @@ impl Session {
 impl Driver {
     fn tick(&self) -> Result<Option<Instant>, String> {
         let cli = self.cli.borrow().clone();
-        if cli
-            .as_ref()
-            .is_none_or(|window| window.try_borrow().is_ok())
-        {
-            let result = self.done.borrow_mut().pop();
-            if let Some(result) = result {
-                self.finish(result);
-                return Ok(None);
-            }
+        if self.finish_pending() {
+            return Ok(None);
         }
         if let Some(cli) = &cli {
             if let Ok(mut window) = cli.try_borrow_mut() {
@@ -226,13 +221,13 @@ impl Driver {
                 }
             }
         }
-        let next = {
+        {
             let mut ui = self.ui.borrow_mut();
             let Some(ui) = ui.as_mut() else {
                 return Ok(None);
             };
-            ui.tick(&self.view)?
-        };
+            ui.tick(&self.view)?;
+        }
         if let Some(cli) = cli {
             // A native popup runs a nested AppKit loop. Its input sinks remain
             // usable while projection is borrowed by the outer invocation.
@@ -260,19 +255,34 @@ impl Driver {
                 }
             }
         }
+        if self.finish_pending() {
+            return Ok(None);
+        }
+        let ui = self.ui.borrow();
+        match ui.as_ref() {
+            Some(ui) => ui.deadline(&self.view),
+            None => Ok(None),
+        }
+    }
+    fn finish_pending(&self) -> bool {
         if self
             .cli
             .borrow()
             .as_ref()
-            .is_none_or(|window| window.try_borrow().is_ok())
+            .is_some_and(|window| window.try_borrow().is_err())
         {
-            let result = self.done.borrow_mut().pop();
-            if let Some(result) = result {
-                self.finish(result);
-                return Ok(None);
-            }
+            return false;
         }
-        Ok(next)
+        let result = self
+            .pending
+            .borrow_mut()
+            .take()
+            .or_else(|| self.done.borrow_mut().pop());
+        if let Some(result) = result {
+            self.finish(result);
+            return true;
+        }
+        false
     }
     fn finish(&self, mut result: Result<u8, String>) {
         drop(self.ui.borrow_mut().take());
@@ -290,7 +300,8 @@ impl Driver {
         let next = match self.tick() {
             Ok(next) => next,
             Err(error) => {
-                self.finish(Err(error));
+                self.pending.borrow_mut().get_or_insert(Err(error));
+                self.finish_pending();
                 None
             }
         };
