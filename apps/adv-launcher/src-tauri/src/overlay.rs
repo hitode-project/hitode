@@ -3,7 +3,7 @@
 //! The routing rules themselves are in [`adv_shell::overlay`].
 use adv_shell::overlay::{OverlayInput, Rect, Router};
 use serde::Deserialize;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// `OverlayInput` as the webview sends it.
 #[derive(Debug, Deserialize)]
@@ -52,14 +52,14 @@ type Listener = Box<dyn Fn(&OverlayInput) + Send + Sync>;
 /// view. It starts exclusive: the webview owns all input until the game
 /// screen publishes its regions.
 pub struct OverlayState {
-    router: Mutex<Router>,
+    pub(crate) router: Arc<Mutex<Router>>,
     listeners: Mutex<Vec<Listener>>,
 }
 
 impl Default for OverlayState {
     fn default() -> Self {
         Self {
-            router: Mutex::new(Router::new(OverlayInput::exclusive())),
+            router: Arc::new(Mutex::new(Router::new(OverlayInput::exclusive()))),
             listeners: Mutex::default(),
         }
     }

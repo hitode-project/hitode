@@ -24,6 +24,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
+mod container;
+pub use container::GameContainer;
 mod dialog;
 mod game_view;
 pub use game_view::GameView;

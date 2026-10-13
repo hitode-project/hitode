@@ -212,7 +212,7 @@ impl Ui {
                     continue;
                 }
                 #[cfg(target_os = "macos")]
-                window::Event::AudioSuspended(_) => {}
+                window::Event::AudioSuspended(_) | window::Event::Text(..) => {}
                 #[cfg(target_os = "macos")]
                 window::Event::ForceClose => {
                     self.stopped.store(true, Ordering::Release);
@@ -232,6 +232,14 @@ impl Ui {
             ));
         }
         Ok(repaint)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn post_text(&mut self, text: &str) -> usize {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        if self.input(window::Event::Text(text.into(), reply)).is_err() {
+            return 0;
+        }
+        result.recv().unwrap_or(0)
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn input(&mut self, event: window::Event) -> Result<(), String> {
@@ -540,6 +548,24 @@ mod tests {
         let mut performance = performance::Performance::default();
         assert!(worker.pump(&mut performance).into_iter().any(|event|matches!(event,window::Event::Menu(adv_runtime::MenuEvent::Command(actual)) if actual==command)));
         assert_eq!(keys.get(0x11), 0, "menu clicks do not change physical Ctrl");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_text_uses_input_delivery_and_returns_the_guest_count() {
+        let wake = WakeEvent::new().unwrap();
+        let (mut worker, mut ui) = channel(wake.clone(), Arc::new(KeyState::default())).unwrap();
+        let execution = std::thread::spawn(move || {
+            assert!(wake.wait(Some(Duration::from_secs(1))).unwrap());
+            let events = worker.pump(&mut performance::Performance::default());
+            let window::Event::Text(text, reply) = &events[0] else {
+                panic!("expected text input")
+            };
+            assert_eq!(text, "あいう");
+            reply.send(2).unwrap();
+        });
+        assert_eq!(ui.post_text("あいう"), 2);
+        execution.join().unwrap();
     }
 
     #[test]

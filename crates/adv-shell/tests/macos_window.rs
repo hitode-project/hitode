@@ -247,6 +247,95 @@ mod mac {
         );
         println!("ok mouse");
 
+        // The embedded container routes top-left logical points, while Router
+        // owns captures even when regions change between mouse down and up.
+        {
+            use adv_shell::overlay::{OverlayInput, Rect, Router, Target};
+            use adv_shell::window::{GameContainer, GameView};
+            use objc2::{MainThreadOnly, msg_send};
+            use std::sync::{Arc, Mutex};
+            let game = native
+                .contentView()
+                .unwrap()
+                .downcast::<GameView>()
+                .unwrap();
+            let root: Retained<NSView> =
+                unsafe { msg_send![NSView::alloc(mtm), initWithFrame: game.frame()] };
+            let overlay: Retained<NSView> =
+                unsafe { msg_send![NSView::alloc(mtm), initWithFrame: root.bounds()] };
+            native.setContentView(Some(&root));
+            root.addSubview(&overlay);
+            let router = Arc::new(Mutex::new(Router::new(OverlayInput {
+                regions: vec![Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 40.0,
+                    height: 20.0,
+                }],
+                ..Default::default()
+            })));
+            let container = GameContainer::new(&overlay, router.clone()).unwrap();
+            container.set_game(Some(&game));
+            assert_eq!(
+                container.hitTest(NSPoint::new(20.0, 220.0)).as_deref(),
+                Some(&*overlay)
+            );
+            assert_eq!(
+                container.hitTest(NSPoint::new(200.0, 40.0)).as_deref(),
+                Some(game.as_ref() as &NSView)
+            );
+            let mouse = |kind, x, y| {
+                NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                kind, NSPoint::new(x, y), NSEventModifierFlags::empty(), 0.0,
+                native.windowNumber(), None, 0, 1, 1.0).unwrap()
+            };
+            let app = NSApplication::sharedApplication(mtm);
+            dispatch(&mut window);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDown, 20.0, 220.0), false);
+            assert!(inputs(dispatch(&mut window)).is_empty());
+            assert_eq!(router.lock().unwrap().captured(0), Some(Target::Overlay));
+            router.lock().unwrap().set_input(OverlayInput::default());
+            assert_eq!(
+                container.hitTest(NSPoint::new(200.0, 40.0)).as_deref(),
+                Some(&*overlay)
+            );
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDragged, 200.0, 40.0), false);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseUp, 200.0, 40.0), false);
+            assert!(inputs(dispatch(&mut window)).is_empty());
+            assert_eq!(router.lock().unwrap().captured(0), None);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDown, 200.0, 40.0), false);
+            dispatch(&mut window);
+            assert_eq!(router.lock().unwrap().captured(0), Some(Target::Game));
+            // Hidden windows do not dispatch canvas events; deliver to the
+            // actual hit-test result as in the physical input checks above.
+            let receiver = container.hitTest(NSPoint::new(200.0, 40.0)).unwrap();
+            receiver.mouseDown(&mouse(NSEventType::LeftMouseDown, 200.0, 40.0));
+            assert!(
+                inputs(dispatch(&mut window))
+                    .iter()
+                    .any(|event| event.0 == 0x201)
+            );
+            router.lock().unwrap().set_input(OverlayInput::exclusive());
+            assert_eq!(
+                container.hitTest(NSPoint::new(20.0, 220.0)).as_deref(),
+                Some(game.as_ref() as &NSView)
+            );
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseDragged, 20.0, 220.0), false);
+            app.postEvent_atStart(&mouse(NSEventType::LeftMouseUp, 20.0, 220.0), false);
+            dispatch(&mut window);
+            receiver.mouseDragged(&mouse(NSEventType::LeftMouseDragged, 20.0, 220.0));
+            receiver.mouseUp(&mouse(NSEventType::LeftMouseUp, 20.0, 220.0));
+            let events = inputs(dispatch(&mut window));
+            assert!(events.iter().any(|event| event.0 == 0x200));
+            assert!(events.iter().any(|event| event.0 == 0x202));
+            assert_eq!(router.lock().unwrap().captured(0), None);
+            container.set_game(None);
+            native.setContentView(Some(&game));
+            native.makeFirstResponder(Some(&game));
+            dispatch(&mut window);
+        }
+        println!("ok container hitTest, logical coordinates and mouse capture");
+
         // Menus: the guest bar follows the application menu.
         let menus = Rc::new(RefCell::new(Vec::new()));
         let sink = menus.clone();

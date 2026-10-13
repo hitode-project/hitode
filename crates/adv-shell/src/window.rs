@@ -17,6 +17,8 @@ pub enum Event {
         wparam: u32,
         lparam: u32,
     },
+    #[cfg(target_os = "macos")]
+    Text(String, std::sync::mpsc::SyncSender<usize>),
     Close,
     #[cfg(target_os = "macos")]
     ForceClose,
@@ -1392,7 +1394,7 @@ pub use native::{Window, initialize_dpi};
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{GameView, Window, initialize_dpi};
+pub use macos::{GameContainer, GameView, Window, initialize_dpi};
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn initialize_dpi() -> Result<(), String> {

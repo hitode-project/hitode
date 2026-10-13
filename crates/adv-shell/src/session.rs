@@ -147,6 +147,14 @@ impl Session {
             timer,
         })
     }
+    /// Post confirmed IME text through the input channel and return the guest's count.
+    pub fn post_text(&self, text: &str) -> usize {
+        self.driver
+            .ui
+            .borrow_mut()
+            .as_mut()
+            .map_or(0, |ui| ui.post_text(text))
+    }
     pub fn set_active(&self, active: bool) {
         self.driver.view.hub().activate(active);
     }

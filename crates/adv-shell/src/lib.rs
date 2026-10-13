@@ -1318,6 +1318,12 @@ fn run_execution(
                     } => {
                         inputs += u64::from(runtime.post_input(message, wparam, lparam));
                     }
+                    #[cfg(target_os = "macos")]
+                    window::Event::Text(text, reply) => {
+                        let posted = runtime.post_text(&text);
+                        inputs += posted as u64;
+                        let _ = reply.send(posted);
+                    }
                     window::Event::Close => {
                         runtime.post_input(0x10, 0, 0);
                         #[cfg(not(target_os = "macos"))]
