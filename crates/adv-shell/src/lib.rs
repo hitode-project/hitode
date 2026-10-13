@@ -27,6 +27,7 @@ pub struct Options {
     data_dir: PathBuf,
     no_code_cache: bool,
     pub cdroms: Vec<(char, PathBuf)>,
+    pub install_dir: Option<PathBuf>,
     jit: bool,
     compile_strategy: CompileStrategy,
     region_linking: bool,
@@ -92,6 +93,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
   --no-code-cache         troubleshoot startup: bypass native cache and image precompilation\n\
   --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
+  --install-dir DIR       back guest C:\\Program Files with DIR, written in place\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
   --trace PATH            write every completed guest API call to a local trace\n\
@@ -115,6 +117,7 @@ impl Options {
             data_dir,
             no_code_cache: false,
             cdroms: Vec::new(),
+            install_dir: None,
             jit: true,
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
@@ -186,6 +189,7 @@ impl Options {
                     }
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
+                "--install-dir" => options.install_dir = Some(PathBuf::from(value()?)),
                 "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
@@ -1125,9 +1129,14 @@ fn run_execution(
 ) -> Result<u8, String> {
     window::initialize_dpi()?;
     let started = Instant::now();
+    if let Some(install) = &options.install_dir {
+        std::fs::create_dir_all(install)
+            .map_err(|e| format!("install folder {}: {e}", install.display()))?;
+    }
     let mut runtime = Runtime::with_codec(
         &options.exe,
         &options.data_dir,
+        options.install_dir.as_deref(),
         options.jit,
         options.width,
         options.height,
