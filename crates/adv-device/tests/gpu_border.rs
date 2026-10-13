@@ -162,6 +162,7 @@ fn verify(backend: GpuBackend) {
     assert!(gpu.check().is_ok());
 }
 #[test]
+// spec: GFX-SAMPLER-1
 fn border_nearest_linear_mixed_address_and_mips_are_portable() {
     verify(GpuBackend::Vulkan);
     verify(GpuBackend::Gl);

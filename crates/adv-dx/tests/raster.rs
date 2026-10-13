@@ -39,6 +39,7 @@ struct Fixture {
 }
 
 #[test]
+// spec: GFX-DDRAW-1
 fn write_only_surface_locks_pair_with_unlock_and_preserve_readonly_versioning() {
     let mut f = Fixture::new();
     let (surface, pixels, _) = f.surface(8, 8, PixelFormat::Bgra32, false);

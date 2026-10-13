@@ -14,6 +14,7 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 
 #[test]
+// spec: GFX-DDRAW-1
 fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachment() {
     #[derive(Clone, Copy)]
     struct WindowPoint(i32, i32);
@@ -377,6 +378,7 @@ fn mode_filters_and_invalid_inputs_do_not_create_surfaces_or_call_guest() {
 }
 
 #[test]
+// spec: GFX-DDRAW-2
 fn activated_device_initialization_identity_and_release_share_the_function_owner() {
     let (mut m, created) = setup(false, false, Registry::default());
     assert!(matches!(

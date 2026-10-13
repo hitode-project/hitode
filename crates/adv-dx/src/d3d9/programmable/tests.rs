@@ -9,6 +9,7 @@ fn vertex() -> Shader {
     .unwrap()
 }
 #[test]
+// spec: GFX-INPUT-1
 fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     let backend = match std::env::var("ADV_TEST_GPU_BACKEND").as_deref() {
         Ok("vulkan") => GpuBackend::Vulkan,

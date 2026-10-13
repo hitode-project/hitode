@@ -160,6 +160,7 @@ fn save(directory: &Path, path: &Path, key: &str, tr: &Translation) -> std::io::
 mod tests {
     use super::*;
     #[test]
+    // spec: GFX-CACHE-2
     fn corrupted_and_version_cache_regenerates() {
         let shader = Shader::parse(&[
             0xfffe0200, 0x0200001f, 0x80000000, 0x900f0000, 0x02000001, 0xc00f0000, 0x90e40000,

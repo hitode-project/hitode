@@ -457,6 +457,7 @@ mod tests {
         bytemuck::cast_slice(&output).to_vec()
     }
     #[test]
+    // spec: GFX-EFFECT-1
     fn bounded_binary_reader_preserves_parameter_layout_and_rejects_all_prefixes() {
         let data = simple();
         let effect = Effect::parse(&data).unwrap();
@@ -475,6 +476,7 @@ mod tests {
         }
     }
     #[test]
+    // spec: GFX-EFFECT-1
     fn configured_authored_fxc_effect_matches_native_description_and_preshader() {
         let Some(path) = std::env::var_os("ADV_TEST_AUTHORED_EFFECT_FXO") else {
             return;

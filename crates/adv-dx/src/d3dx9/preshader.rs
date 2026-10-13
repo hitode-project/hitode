@@ -273,6 +273,7 @@ mod tests {
         );
     }
     #[test]
+    // spec: GFX-EFFECT-1
     fn all_truncated_expression_prefixes_and_unknown_opcodes_fail_bounded() {
         let data = expression(&[1, 0x10000001, 1, 0, 1, 0, 0, 4, 0], &[1.0]);
         for len in 0..data.len() {

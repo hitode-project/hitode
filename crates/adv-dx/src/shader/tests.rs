@@ -55,6 +55,7 @@ fn validate(s: &Shader) {
     }
 }
 #[test]
+// spec: GFX-SHADER-1, GFX-BUFFER-3
 fn versions_comments_end_and_immediates() {
     for (stage, major, minor) in [
         (Stage::Vertex, 1, 1),
@@ -81,6 +82,7 @@ fn versions_comments_end_and_immediates() {
     validate(&s);
 }
 #[test]
+// spec: GFX-SHADER-1, GFX-BUFFER-3
 fn malformed_is_bounded() {
     for words in [
         &[][..],
@@ -119,6 +121,7 @@ fn arithmetic_all_validates() {
     }
 }
 #[test]
+// spec: GFX-SHADER-1
 fn modifiers_masks_and_relative() {
     let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(6, 0)]);
     body.extend(instruction(Opcode::Mova, &[dst(3, 0), src(2, 0)]));
@@ -145,6 +148,7 @@ fn modifiers_masks_and_relative() {
     assert_eq!(out.position, constants.f[1]);
 }
 #[test]
+// spec: GFX-SHADER-1
 fn control_flow_predicates_calls() {
     let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(6, 0)]);
     body.extend(instruction(Opcode::Defi, &[dst(7, 0), 3, 1, 2, 0]));
@@ -225,6 +229,7 @@ fn sm3_outputs_normalized() {
     assert_eq!(out.colors[0], [3.0; 4]);
 }
 #[test]
+// spec: GFX-SHADER-1
 fn illegal_recursive_and_broken_flow() {
     for body in [
         instruction(Opcode::Break, &[]),
@@ -245,6 +250,7 @@ fn illegal_recursive_and_broken_flow() {
     }
 }
 #[test]
+// spec: GFX-SHADER-1
 fn arbitrary_words_never_panic() {
     let mut seed = 0xabcdef01u32;
     for len in 0..256 {
