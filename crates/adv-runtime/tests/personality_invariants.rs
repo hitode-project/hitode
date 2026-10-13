@@ -4,6 +4,7 @@
 use adv_abi::{personality, signature, stub, system_exports};
 
 #[test]
+// spec: PERS-EXPORT-2, PERS-EXPORT-3
 fn discovery_exposes_only_implemented_or_completely_reviewed_names() {
     for policy in [
         adv_runtime::vorbis::Policy::Guest,

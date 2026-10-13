@@ -25,6 +25,7 @@ fn named(name: &str) -> ImportName {
 }
 
 #[test]
+// spec: PERS-EXPORT-6
 fn uninitialized_data_is_a_named_failure_until_guest_patches_the_cell_or_eat() {
     for jit in [false, true] {
         let mut machine = Machine::new(

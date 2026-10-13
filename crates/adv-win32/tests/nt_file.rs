@@ -224,6 +224,7 @@ fn default_case_and_open_if_attributes_match_native_file_opens() {
 }
 
 #[test]
+// spec: PERS-BRIDGE-2
 fn native_handles_read_counted_unicode_names_and_share_the_win32_owner() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

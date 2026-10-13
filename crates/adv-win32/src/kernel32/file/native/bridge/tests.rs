@@ -339,6 +339,7 @@ fn outputs(machine: &Machine<JitCpu>, expected: &[(u32, u32)]) {
 }
 
 #[test]
+// spec: PERS-BRIDGE-1
 fn a_w_live_nt_handles_keep_provider_size_cursor_and_original_vfs_independent() {
     for wide in [false, true] {
         let (mut machine, root) = fixture(if wide { "wide" } else { "ansi" });

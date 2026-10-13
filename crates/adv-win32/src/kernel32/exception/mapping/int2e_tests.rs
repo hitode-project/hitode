@@ -178,6 +178,7 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
 }
 
 #[test]
+// spec: PERS-PROFILE-5
 fn raw_int2e_native_x86_fails_without_guessing_services_or_touching_other_state() {
     for prefix in [false, true] {
         for selector in [0, 0xfff, 0x1000, 0x1fff, 0x4000_0000, 0x4000_1000] {

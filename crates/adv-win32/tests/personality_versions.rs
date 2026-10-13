@@ -291,11 +291,13 @@ fn check(profile: Profile) {
 }
 
 #[test]
+// spec: PERS-PROFILE-1, PERS-PROFILE-3
 fn default_profile_is_windows_7_sp1_in_every_version_fact() {
     check(WIN7_SP1);
 }
 
 #[test]
+// spec: PERS-PROFILE-1
 fn an_alternate_profile_changes_every_version_fact_together() {
     check(VISTA_SP2);
 }

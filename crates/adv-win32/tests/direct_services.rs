@@ -400,6 +400,7 @@ fn exercise<B: LabCpu>(factory: impl Fn() -> B, dir: &Path) {
 }
 
 #[test]
+// spec: PERS-PROFILE-4, PERS-PROFILE-5, PERS-PROFILE-6
 fn native_services_share_owners_and_preserve_nonlocal_control_flow() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch/nt-service-tests");
     exercise(|| JitCpu::new(PARK_ADDR, false).unwrap(), &dir);

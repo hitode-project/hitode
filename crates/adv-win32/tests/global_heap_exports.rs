@@ -82,6 +82,7 @@ fn execute(machine: &mut Machine<JitCpu>, mut code: Asm) {
 }
 
 #[test]
+// spec: PERS-BRIDGE-2
 fn first_global_alloc_and_fixed_movable_realloc_size_free_reach_rtl_hooks() {
     for jit in [false, true] {
         let mut machine = machine(jit);

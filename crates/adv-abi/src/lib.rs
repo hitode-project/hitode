@@ -727,6 +727,7 @@ mod named_alias_tests {
     }
 
     #[test]
+    // spec: PERS-ABI-1
     fn fixed_public_alias_requires_a_direct_target_and_checks_available_metadata() {
         let mut registry = registry();
         registry.add_with_data(

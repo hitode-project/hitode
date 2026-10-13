@@ -488,6 +488,7 @@ fn terminal_registration_declines_unhandled_exceptions_and_unwind_notifications(
 }
 
 #[test]
+// spec: PERS-BRIDGE-3
 fn create_thread_observes_live_native_hooks_parameter_changes_and_failure_status() {
     for jit in [false, true] {
         for deny in [false, true] {

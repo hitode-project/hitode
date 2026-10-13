@@ -815,6 +815,7 @@ fn picker_pairs_report_initialization_failure_and_keep_errors_bound_to_the_threa
 }
 
 #[test]
+// spec: PERS-PROFILE-6, PERS-ABI-3
 fn missing_zw_pairs_are_discoverable_before_install_and_share_transport_identity() {
     let names = [
         "Continue",

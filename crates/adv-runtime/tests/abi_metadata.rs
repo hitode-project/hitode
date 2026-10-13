@@ -159,6 +159,7 @@ fn native_argc(export: &str) -> Option<u8> {
 }
 
 #[test]
+// spec: PERS-ABI-1
 fn all_fronts_signature_audit() {
     let mut report = vec!["# policy\tqualified export\tomission category".to_owned()];
     for policy in [

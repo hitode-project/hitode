@@ -449,6 +449,7 @@ fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
 }
 
 #[test]
+// spec: PERS-EXPORT-7
 fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or_code() {
     for jit in [false, true] {
         let mut machine = machine(jit);
@@ -594,6 +595,7 @@ fn real_guest_exports_and_forwarders_are_not_filtered_by_host_capability_metadat
 }
 
 #[test]
+// spec: PERS-EXPORT-1
 fn published_entries_are_real_pe_code_aliases_hookable_and_callable() {
     for jit in [false, true] {
         for patched in [false, true] {

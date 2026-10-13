@@ -340,6 +340,7 @@ fn malformed_remote_headers_end_only_the_child_and_retain_diagnostics() {
 }
 
 #[test]
+// spec: PERS-SCOPE-6
 fn structural_mismatch_in_a_child_disqualifies_the_family_after_retirement() {
     let (mut runtime, spec, exe) = fixture();
     let parent = runtime.machine.sys.pid;

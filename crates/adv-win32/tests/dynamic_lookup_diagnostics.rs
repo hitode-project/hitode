@@ -311,6 +311,7 @@ fn guest_system_named_dll_missing_sdk_export_is_a_guest_missing_export() {
 }
 
 #[test]
+// spec: PERS-EXPORT-7
 fn a_live_guest_hook_on_an_unimplemented_sdk_export_still_resolves_without_a_failure_record() {
     for jit in [false, true] {
         let mut test = Test::new(

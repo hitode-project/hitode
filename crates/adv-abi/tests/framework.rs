@@ -14,6 +14,7 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+// spec: PERS-EXPORT-6
 fn data_declarations_have_width_and_cannot_be_function_bindings() {
     use adv_machine::Resolver;
     let mut registry = Registry::default();
@@ -68,6 +69,7 @@ fn data_declarations_have_width_and_cannot_be_function_bindings() {
 }
 
 #[test]
+// spec: PERS-EXPORT-2
 fn dynamic_availability_exposes_fixed_names_only_with_capability() {
     let mut registry = Registry::default();
     registry.set_expose_fixed_exports(false);
@@ -110,6 +112,7 @@ fn dynamic_availability_exposes_fixed_names_only_with_capability() {
 }
 
 #[test]
+// spec: PERS-EXPORT-2
 fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
     let mut registry = Registry::default();
     registry.set_expose_fixed_exports(false);
@@ -322,6 +325,7 @@ fn guest_pointers_reject_null_overflow_and_protected_writes() {
 }
 
 #[test]
+// spec: PERS-EXPORT-5
 fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     let mut machine = machine(Registry::default());
     let thunk = machine
@@ -359,6 +363,7 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
 }
 
 #[test]
+// spec: PERS-EXPORT-5
 fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
     let mut registry = Registry::default();
     registry.set_mode(RunMode::Discovery);
@@ -401,6 +406,7 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
 }
 
 #[test]
+// spec: PERS-EXPORT-4
 fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_call() {
     let mut machine = machine(Registry::default());
     let thunk = machine
@@ -434,6 +440,7 @@ fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_ca
 }
 
 #[test]
+// spec: PERS-EXPORT-5
 fn discovery_refuses_unknown_failure_contract_instead_of_guessing_zero() {
     let mut registry = Registry::default();
     registry.set_mode(RunMode::Discovery);

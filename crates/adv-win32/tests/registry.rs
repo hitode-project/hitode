@@ -635,6 +635,7 @@ fn nested_case_insensitive_keys_distinct_handles_close_and_machine_isolation() {
 }
 
 #[test]
+// spec: PERS-SCOPE-4
 fn object_exhaustion_does_not_create_a_key_or_write_output_handles() {
     let mut f = Fixture::new(932);
     // The only available object will be the executing guest thread.

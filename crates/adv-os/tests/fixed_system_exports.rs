@@ -157,6 +157,7 @@ const NT_NAMES: [&str; 56] = [
 ];
 
 #[test]
+// spec: PERS-EXPORT-1
 fn fixed_names_are_image_code_hidden_until_implemented_and_unknown_names_remain_absent() {
     for jit in [false, true] {
         let mut machine = machine(jit);

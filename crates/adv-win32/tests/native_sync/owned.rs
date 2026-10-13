@@ -260,6 +260,7 @@ fn mutant_and_semaphore_names_native_opens_counts_recursion_and_errors_share_one
 }
 
 #[test]
+// spec: PERS-BRIDGE-4
 fn all_six_native_boundaries_execute_live_hooks_and_obey_changed_inputs_and_statuses() {
     for jit in [false, true] {
         let mut machine = fixture(jit);
