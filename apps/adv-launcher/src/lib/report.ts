@@ -1,10 +1,10 @@
 /**
  * The anonymous compatibility report, mirroring the JSON the launcher sends
- * (schema "adv-host.report/1"). Field names and order match the wire format so
+ * (schema "hitode.report/1"). Field names and order match the wire format so
  * the value can later come straight from the Rust adv-report crate.
  */
 
-export const REPORT_SCHEMA = "adv-host.report/1";
+export const REPORT_SCHEMA = "hitode.report/1";
 
 export type Outcome = "ok" | "issues" | "failed";
 export type Issue = "crash" | "performance";

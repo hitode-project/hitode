@@ -8,7 +8,7 @@ import struct
 import subprocess
 import time
 
-PACKAGE = 'org.advhost.player'
+PACKAGE = 'org.hitode.player'
 DATA = 'files/data/shell-probe/'
 
 def main():

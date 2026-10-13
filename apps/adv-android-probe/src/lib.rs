@@ -405,7 +405,7 @@ pub fn run_probe(directory: &Path, device: Value) -> Result<String, String> {
         "schema": 1,
         "probe": "adv-cpu-android-application-process",
         "status": "running",
-        "package": "org.advhost.cpuprobe",
+        "package": "org.hitode.cpuprobe",
         "build": {
             "version": env!("CARGO_PKG_VERSION"),
             "identifier": option_env!("ADV_ANDROID_PROBE_BUILD").unwrap_or("unlabelled"),
@@ -519,7 +519,7 @@ pub fn run_probe(directory: &Path, device: Value) -> Result<String, String> {
 /// JNI owns all Java references on the calling background thread. Every Rust
 /// panic is caught before returning through this ABI; Java catches JNI errors.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_cpuprobe_ProbeActivity_nativeRun(
+pub extern "system" fn Java_org_hitode_cpuprobe_ProbeActivity_nativeRun(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     directory: JString<'_>,

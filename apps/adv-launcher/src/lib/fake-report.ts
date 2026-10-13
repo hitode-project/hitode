@@ -51,12 +51,12 @@ const PLATFORMS = {
   desktop: {
     platform: { os: "windows", os_major: "11", arch: "x86_64", cpu_engine: "x64", graphics: "gpu" },
     label: "Windows 11 · x64",
-    build: "adv-host 0.4.2 · Windows 11 x64",
+    build: "hitode 0.4.2 · Windows 11 x64",
   },
   phone: {
     platform: { os: "android", os_major: "15", arch: "aarch64", cpu_engine: "a64", graphics: "gpu" },
     label: "Android 15 · arm64",
-    build: "adv-host 0.4.2 · Android 15 · arm64",
+    build: "hitode 0.4.2 · Android 15 · arm64",
   },
 } satisfies Record<string, { platform: ReportBase["platform"]; label: string; build: string }>;
 

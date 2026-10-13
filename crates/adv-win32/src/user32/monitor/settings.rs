@@ -41,7 +41,7 @@ fn settings(
     }
     let (width, height) = super::super::user(env).screen;
     let mut bytes = vec![0u8; size as usize];
-    let label = "adv-host virtual display";
+    let label = "hitode virtual display";
     if wide {
         for (i, unit) in label.encode_utf16().enumerate() {
             bytes[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());

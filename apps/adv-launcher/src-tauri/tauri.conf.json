@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ADV Host",
+  "productName": "Hitode",
   "mainBinaryName": "adv-launcher",
-  "identifier": "dev.adv-host.launcher",
+  "identifier": "org.hitode.launcher",
   "build": {
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "ADV Host",
+        "title": "Hitode",
         "width": 1280,
         "height": 800,
         "minWidth": 720,

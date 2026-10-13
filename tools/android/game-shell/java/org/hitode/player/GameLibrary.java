@@ -1,4 +1,4 @@
-package org.advhost.player;
+package org.hitode.player;
 
 import android.content.ContentResolver;
 import android.content.Context;

@@ -4,7 +4,7 @@ import type { FastForward, Filter } from "./prefs.svelte";
 // library folders, storage and reports. Host actions are simulated here.
 
 export const APP_VERSION = "0.1.0";
-export const DATA_DIR = "~/Library/Application Support/adv-host";
+export const DATA_DIR = "~/Library/Application Support/org.hitode.launcher";
 
 export interface LibraryRoot {
   id: string;
@@ -34,7 +34,7 @@ export const fakeReports: SentReport[] = [
 /** What every report sends; mirrors the report screen's list. */
 export const reportContents: { label: string; note: string }[] = [
   { label: "程序指纹", note: "主程序的 sha256 与大小" },
-  { label: "版本", note: "adv-host 版本与构建号" },
+  { label: "版本", note: "hitode 版本与构建号" },
   { label: "平台", note: "系统与处理器架构" },
   { label: "编码", note: "游戏使用的代码页" },
   { label: "失败信息", note: "无法启动或中途出错时" },

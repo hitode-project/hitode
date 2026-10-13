@@ -207,7 +207,7 @@
       {/if}
     </section>
 
-    <footer>adv-host {APP_VERSION} · GPL-3.0-or-later</footer>
+    <footer>hitode {APP_VERSION} · GPL-3.0-or-later</footer>
   </div>
 </main>
 

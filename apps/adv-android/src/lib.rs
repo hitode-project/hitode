@@ -230,7 +230,7 @@ fn string(env: &mut JNIEnv<'_>, value: &JString<'_>) -> Result<String, String> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeInit(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     application: JObject<'_>,
@@ -280,7 +280,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStart(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeStart(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     exe: JString<'_>,
@@ -372,7 +372,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStart(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCommand(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeCommand(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -389,7 +389,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCommand(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativePoll(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativePoll(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -412,7 +412,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativePoll(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStop(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeStop(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -454,7 +454,7 @@ unsafe extern "C" {
     fn AndroidBitmap_unlockPixels(env: *mut jni::sys::JNIEnv, bitmap: jni::sys::jobject) -> i32;
 }
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeFrameInfo(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
@@ -491,7 +491,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCopyFrame(
+pub extern "system" fn Java_org_hitode_player_GameActivity_nativeCopyFrame(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,

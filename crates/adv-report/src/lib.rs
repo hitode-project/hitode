@@ -1,4 +1,4 @@
-//! The anonymous compatibility report (schema `adv-host.report/1`) that the
+//! The anonymous compatibility report (schema `hitode.report/1`) that the
 //! launcher saves or submits, and the run summary the shell derives it from.
 //!
 //! Field names and order are the wire format shared with
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path, time::Duration};
 
-pub const SCHEMA: &str = "adv-host.report/1";
+pub const SCHEMA: &str = "hitode.report/1";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,7 +130,7 @@ impl Game {
 /// installation and never leaves it.
 pub fn dedupe_key(secret: &[u8; 32], exe_sha256: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"adv-host.report/1 dedupe\0");
+    hasher.update(b"hitode.report/1 dedupe\0");
     hasher.update(secret);
     hasher.update(exe_sha256.as_bytes());
     hex(&hasher.finalize()[..8])
@@ -300,7 +300,7 @@ mod tests {
     fn wire_format_matches_the_launcher_schema() {
         let json = serde_json::to_string(&report()).unwrap();
         let expected = [
-            r#"{"schema":"adv-host.report/1","dedupe_key":"0123456789abcdef","#,
+            r#"{"schema":"hitode.report/1","dedupe_key":"0123456789abcdef","#,
             r#""app":{"version":"0.1.0","build":"8c048ed6","channel":"preview"},"#,
             r#""platform":{"os":"macos","os_major":"26","arch":"aarch64","cpu_engine":"a64","graphics":"gpu"},"#,
             &format!(r#""game":{{"exe_sha256":"{}","exe_size":1887437,"codepage":932}},"#, "ab".repeat(32)),
@@ -331,7 +331,7 @@ mod tests {
         value["game"]["path"] = "C:\\Games\\AQUA.exe".into();
         assert!(serde_json::from_value::<Report>(value).is_err());
         let other = Report {
-            schema: "adv-host.report/2".into(),
+            schema: "hitode.report/2".into(),
             ..report()
         };
         assert!(to_json(&other).is_err());

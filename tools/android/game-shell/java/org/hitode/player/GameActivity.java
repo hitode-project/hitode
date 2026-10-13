@@ -1,4 +1,4 @@
-package org.advhost.player;
+package org.hitode.player;
 
 import android.app.Activity;
 import android.app.AlertDialog;

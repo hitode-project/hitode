@@ -1,6 +1,6 @@
 [package]
 name = "adv-report"
-description = "The anonymous compatibility report (adv-host.report/1) and the run summary it is built from"
+description = "The anonymous compatibility report (hitode.report/1) and the run summary it is built from"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

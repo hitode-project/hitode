@@ -1,4 +1,4 @@
-package org.advhost.cpuprobe;
+package org.hitode.cpuprobe;
 
 import android.app.Activity;
 import android.os.Build;

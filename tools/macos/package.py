@@ -156,11 +156,11 @@ def notices(resources: Path, build: dict) -> tuple[int, int]:
     source.mkdir(exist_ok=True)
     (source / 'dependencies.json').write_text(json.dumps(sources, indent=2) + '\n')
     sha = run('git', 'rev-parse', 'HEAD').strip()
-    subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(source / 'adv-host.tar.gz'), 'HEAD'],
+    subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(source / 'hitode.tar.gz'), 'HEAD'],
                    cwd=ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (source / 'README.txt').write_text(
         f'ADV source revision: {sha}\n'
-        'adv-host.tar.gz contains the GPL project source, Cargo.lock and build scripts.\n'
+        'hitode.tar.gz contains the GPL project source, Cargo.lock and build scripts.\n'
         'dependencies.json lists exact upstream source URLs and the FFmpeg checksum/configuration.\n'
         'Download those URLs to obtain dependency sources. tools/macos/ffmpeg.json pins the decode-only configuration.\n'
         'Build on macOS with Xcode Command Line Tools and Rust:\n'
@@ -187,7 +187,7 @@ def package(binary: Path, output: Path, identity: str, profile: str | None) -> d
         path.mkdir(parents=True)
     executable = macos / 'adv-run'
     shutil.copy2(binary, executable)
-    plist = {'CFBundleExecutable': 'adv-run', 'CFBundleIdentifier': 'org.advhost.player',
+    plist = {'CFBundleExecutable': 'adv-run', 'CFBundleIdentifier': 'org.hitode.player',
              'CFBundleName': 'ADV', 'CFBundlePackageType': 'APPL',
              'CFBundleVersion': '1', 'CFBundleShortVersionString': '0.1.0',
              'LSMinimumSystemVersion': '.'.join(map(str, minimum)),
