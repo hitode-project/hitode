@@ -6,6 +6,7 @@ mod frontend;
 mod logging;
 #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 mod native_gpu;
+pub mod overlay;
 mod performance;
 pub mod window;
 
