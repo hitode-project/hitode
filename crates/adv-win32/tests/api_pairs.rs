@@ -64,6 +64,7 @@ fn write_wide(machine: &mut Machine<JitCpu>, pointer: u32, units: &[u16]) {
 }
 
 #[test]
+// spec: WIN32-API-7
 fn wide_strings_keep_code_units_packed_characters_and_native_traversal_boundaries() {
     let mut m = machine();
     write_wide(&mut m, DATA, &[b'a' as u16, 0x301, 0x302, 0xd800, 0x62]);
@@ -119,6 +120,7 @@ fn wide_strings_keep_code_units_packed_characters_and_native_traversal_boundarie
 }
 
 #[test]
+// spec: WIN32-API-8
 fn console_reads_and_codepage_setters_preserve_the_no_console_boundary() {
     let mut m = machine();
     m.cpu.write(DATA, &[0xaa; 32]).unwrap();
@@ -305,6 +307,7 @@ fn wide_no_device_queries_and_property_sheets_fail_without_publishing_owners() {
 }
 
 #[test]
+// spec: WIN32-API-7
 fn wide_string_resources_keep_embedded_nuls_and_return_the_original_resource_pointer() {
     use adv_os::module::{Lifetime, Module, ModuleKind, Modules};
     use adv_pe::{ResId, ResourceData, ResourceDir, ResourceEntry, ResourceNode};
@@ -553,6 +556,7 @@ fn the_new_pairs_are_public_registry_entries_before_process_installation() {
 }
 
 #[test]
+// spec: WIN32-API-9
 fn shell_path_pairs_preserve_relative_syntax_dbcs_characters_and_output_limits() {
     let mut m = machine();
     write_wide(&mut m, DATA, &r"a\b".encode_utf16().collect::<Vec<_>>());
@@ -643,6 +647,7 @@ fn shell_path_pairs_preserve_relative_syntax_dbcs_characters_and_output_limits()
 }
 
 #[test]
+// spec: WIN32-USER-10
 fn class_scalar_pairs_share_one_class_and_refuse_unavailable_procedure_thunks() {
     use adv_win32::user32::window::ClassKey;
     let mut m = machine();
@@ -777,6 +782,7 @@ fn class_scalar_pairs_share_one_class_and_refuse_unavailable_procedure_thunks() 
 }
 
 #[test]
+// spec: WIN32-API-10
 fn picker_pairs_report_initialization_failure_and_keep_errors_bound_to_the_thread() {
     let mut m = machine();
     let count = m.sys.objects.object_count();

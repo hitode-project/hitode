@@ -76,6 +76,7 @@ fn words(machine: &Machine<JitCpu>, address: u32) -> [u32; 7] {
 }
 
 #[test]
+// spec: WIN32-IMAGE-3
 fn relocated_image_publishes_its_base_and_frees_the_granule_tail() {
     for jit in [false, true] {
         let mut registry = Registry::default();
@@ -343,6 +344,7 @@ fn image_copy_contract<B: Backend>(cpu: B) {
     );
 }
 #[test]
+// spec: WIN32-IMAGE-2
 fn image_copy_protection_tracks_first_stores_atomic_rep_and_code_reexecution() {
     for jit in [false, true] {
         image_copy_contract(JitCpu::new(PARK_ADDR, jit).unwrap());
@@ -407,6 +409,7 @@ fn import_initial_copy<B: Backend>(cpu: B) {
     );
 }
 #[test]
+// spec: WIN32-IMAGE-2
 fn bound_imports_initialize_their_section_private_without_dirtying_relocation_pages() {
     for jit in [false, true] {
         import_initial_copy(JitCpu::new(PARK_ADDR, jit).unwrap());

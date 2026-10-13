@@ -11,6 +11,7 @@ use adv_machine::{
 use adv_win32::{Win32, Win32Config};
 
 #[test]
+// spec: WIN32-EXC-7
 fn unhandled_first_chance_reenters_live_nt_raise_once_with_false() {
     for (jit, observed) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut registry = Registry::default();

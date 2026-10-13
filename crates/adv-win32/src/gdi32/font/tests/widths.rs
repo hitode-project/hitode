@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 #[cfg(windows)]
+// spec: WIN32-GDI-12
 fn ansi_widths_match_native_and_dbcs_ranges_use_the_selected_charset() {
     let (mut machine, data, dc) = fixture();
     machine.ext.get_mut::<Win32>().codec =

@@ -192,6 +192,7 @@ fn initialize(code: &mut Asm, machine: &mut Machine<JitCpu>, heap: u32) {
 }
 
 #[test]
+// spec: WIN32-OBJECT-4
 fn heap_and_rtl_fronts_share_zeroing_oom_continuation_and_realloc_preservation() {
     for jit in [false, true] {
         for front in 0..3 {

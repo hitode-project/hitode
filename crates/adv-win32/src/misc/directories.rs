@@ -194,6 +194,7 @@ mod tests {
     use adv_cpu::backend::Guest;
     use adv_machine::Resume;
     #[test]
+    // spec: WIN32-API-1
     fn recursive_directory_fronts_resume_through_a_modified_native_create_entry() {
         let mut f = Fixture::new("recursive-directories-hook");
         Win32::prepare_process_infrastructure(&mut f.m).unwrap();

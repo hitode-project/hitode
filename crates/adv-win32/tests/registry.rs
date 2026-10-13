@@ -18,6 +18,7 @@ const PROCESSOR_KEY: &str = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+// spec: WIN32-API-5
 fn processor_configuration_uses_shared_a_w_nt_handles_and_checked_query_sizes() {
     let mut f = Fixture::new(932);
     let path_a = f.a(&PROCESSOR_KEY.to_lowercase(), 932);
@@ -96,6 +97,7 @@ fn processor_configuration_uses_shared_a_w_nt_handles_and_checked_query_sizes() 
 }
 
 #[test]
+// spec: WIN32-API-5
 fn processor_configuration_rejects_writes_creation_deletion_and_nt_write_opens() {
     let mut f = Fixture::new(932);
     let path = f.w(PROCESSOR_KEY);

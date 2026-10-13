@@ -557,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    // spec: WIN32-OBJECT-5
     fn install_folder_backs_program_files_and_yields_to_an_installed_game_root() {
         let tmp = std::env::temp_dir().join(format!("adv-install-vfs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -620,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    // spec: WIN32-OBJECT-5
     fn portable_saves_survive_reopen_and_replacements_stay_read_only() {
         let tmp = std::env::temp_dir().join(format!("pal-portable-vfs-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join("game/Save")).unwrap();

@@ -219,6 +219,7 @@ fn draw_dib_invalid_inputs_preserve_pixels_and_capability_gaps_warn() {
 }
 
 #[test]
+// spec: WIN32-GDI-6
 fn compatible_bitmap_drawdib_then_stretch_blt_reaches_target_pixels() {
     let (mut m, data, target, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
     let dc = call(&mut m, data, "gdi32.dll!CreateCompatibleDC", &[target]);

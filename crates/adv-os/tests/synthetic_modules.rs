@@ -880,6 +880,7 @@ fn late_native_image_follows_executable_without_replacing_existing_loader_record
 }
 
 #[test]
+// spec: WIN32-IMAGE-5
 fn peb_loader_lists_keep_stable_links_names_counts_and_dll_preferred_bases() {
     struct Files;
     impl FileSource for Files {

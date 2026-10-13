@@ -240,6 +240,7 @@ fn timed_out_send_is_removed_before_receiver_pumps_and_preserves_output() {
 }
 
 #[test]
+// spec: WIN32-USER-11
 fn wide_timeout_value_and_text_sends_use_the_existing_callback_and_encoding_owner() {
     let mut m = fixture();
     m.ext.get_mut::<crate::Win32>().codec = adv_os::Codec::new(936);

@@ -126,6 +126,7 @@ fn rtl_startup_filter<B: TestCpu>(cpu: B) {
 }
 
 #[test]
+// spec: WIN32-EXC-6
 fn rtl_startup_filter_is_independent_and_can_continue_an_exception() {
     rtl_startup_filter(UnicornCpu::new(PARK_ADDR).unwrap());
     rtl_startup_filter(jit());

@@ -222,6 +222,7 @@ mod tests {
     }
     use adv_os::com::TaskMemory;
     #[test]
+    // spec: WIN32-OBJECT-6
     fn shell_and_ole_share_process_allocator_and_task_memory_lifecycle() {
         let mut m = fixture();
         const OUT: u32 = 0x410000;

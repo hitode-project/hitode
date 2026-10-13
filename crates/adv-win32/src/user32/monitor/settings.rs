@@ -137,6 +137,7 @@ mod tests {
     use crate::misc::test_support::{DATA, Fixture};
     use adv_cpu::backend::Guest;
     #[test]
+    // spec: WIN32-GDI-1
     fn a_w_display_modes_preserve_tails_and_reject_bad_buffers_without_partial_output() {
         let mut f = Fixture::new("display-modes");
         for (api, size, size_at, bits) in [

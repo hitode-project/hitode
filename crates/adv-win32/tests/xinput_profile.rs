@@ -108,6 +108,7 @@ fn absent_controllers<B: Backend>(cpu: B) {
 }
 
 #[test]
+// spec: WIN32-API-2
 fn no_controller_queries_preserve_outputs_and_last_error_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
@@ -118,6 +119,7 @@ fn no_controller_queries_preserve_outputs_and_last_error_on_all_backends() {
 }
 
 #[test]
+// spec: WIN32-API-2
 fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
     let registry = registry();
     for dll in DLLS {

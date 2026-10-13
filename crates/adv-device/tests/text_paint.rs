@@ -464,6 +464,7 @@ fn packed_text_quantizes_into_actual_bits_and_keeps_clipped_edges_and_padding() 
 }
 
 #[test]
+// spec: WIN32-GDI-7
 fn monochrome_text_matches_native_duplicate_palettes_colours_quality_and_partial_clips() {
     use windows_sys::Win32::Graphics::Gdi as gdi;
     let input = [b'A' as u16, b'W' as u16, 0x3042];

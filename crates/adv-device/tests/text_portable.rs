@@ -13,6 +13,7 @@ const SINGLE: &[u8] = include_bytes!("fixtures/font-resource.ttf");
 const COLLECTION: &[u8] = include_bytes!("fixtures/font-resource.ttc");
 
 #[test]
+// spec: WIN32-GDI-10
 fn selected_face_spacing_defaults_and_unicode_coverage_share_the_font() {
     let mut text = Text::with_font_directories(&[]);
     text.add_file_resource(SINGLE, true).unwrap();
