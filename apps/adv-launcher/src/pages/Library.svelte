@@ -406,6 +406,8 @@
     position: relative;
     flex: 0 0 340px;
     overflow: hidden;
+    isolation: isolate;
+    contain: paint;
     background: var(--panel);
     border-left: 1px solid var(--line);
   }
@@ -414,6 +416,9 @@
     inset: -25%;
     filter: blur(60px) saturate(1.2);
     opacity: 0.75;
+    /* Its own layer, so WebKit does not re-rasterize the blur when a hovered card recomposites. */
+    transform: translateZ(0);
+    will-change: transform;
   }
   .dscrim {
     position: absolute;
