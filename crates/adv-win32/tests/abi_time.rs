@@ -207,7 +207,10 @@ fn clock_polling_spins_idle_and_skip_like_any_timed_wait() {
             machine.sys.scheduling.active_time_skip_us >= 500_000,
             "{api}"
         );
-        assert!(iterations < 10_000, "{api}: {iterations} polls");
+        // About 3,000 polls on an idle host. Under load, real time can end a
+        // tick between polls and restart detection; spinning through the
+        // second instead would take about a million.
+        assert!(iterations < 50_000, "{api}: {iterations} polls");
     }
 }
 

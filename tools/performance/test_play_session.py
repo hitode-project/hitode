@@ -48,7 +48,7 @@ class PlaySessionTests(unittest.TestCase):
 
     def test_native_cache_import_and_switches_use_only_the_new_overlay(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             native = root / "jit-code.bin"
             native.write_bytes(b"authored native cache")
             args = self.args(root, compile_threads=4, warm_code_cache=native)
@@ -59,13 +59,13 @@ class PlaySessionTests(unittest.TestCase):
 
     def test_native_cache_diagnostic_bypass_reaches_the_runner(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = self.args(Path(directory), no_code_cache=True)
+            args = self.args(Path(directory).resolve(), no_code_cache=True)
             (command, _), _ = self.launch(args)
             self.assertIn("--no-code-cache", command)
 
     def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = self.args(Path(directory))
+            args = self.args(Path(directory).resolve())
             args.cdrom = ["D=authored image.iso", "F=second.iso"]
             args.auto_dialog_ms = 0
             (command, _), metadata = self.launch(args)
@@ -77,7 +77,7 @@ class PlaySessionTests(unittest.TestCase):
     def test_shader_profiles_are_only_forwarded_when_explicit(self):
         for sm3 in (False, True):
             with tempfile.TemporaryDirectory() as directory:
-                args = self.args(Path(directory), d3d9_sm3=sm3)
+                args = self.args(Path(directory).resolve(), d3d9_sm3=sm3)
                 (command, _), metadata = self.launch(args)
                 self.assertEqual("--d3d9-sm3" in command, sm3)
                 self.assertEqual(metadata["command"], command)
@@ -121,7 +121,7 @@ class PlaySessionTests(unittest.TestCase):
     def test_muted_hidden_and_window_launch_keep_device_without_diagnostics(self):
         for mode in ("hidden", "window"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                args = self.args(Path(directory), mode=mode, mute_audio=True)
+                args = self.args(Path(directory).resolve(), mode=mode, mute_audio=True)
                 (command, kwargs), metadata = self.launch(args)
                 self.assertIn("--audio", command)
                 self.assertNotIn("--headless", command)
@@ -141,7 +141,7 @@ class PlaySessionTests(unittest.TestCase):
     def test_default_audio_modes_still_scrub_mute_and_capture(self):
         for mode, audio in (("hidden", True), ("window", True), ("headless", False)):
             with self.subTest(mode=mode, audio=audio), tempfile.TemporaryDirectory() as directory:
-                args = self.args(Path(directory), mode=mode, audio=audio)
+                args = self.args(Path(directory).resolve(), mode=mode, audio=audio)
                 (command, kwargs), metadata = self.launch(args)
                 self.assertEqual("--audio" in command, audio)
                 for name in DIAGNOSTICS:
@@ -153,7 +153,7 @@ class PlaySessionTests(unittest.TestCase):
     def test_muting_without_audio_or_in_headless_mode_fails_before_launch(self):
         for mode, audio in (("hidden", False), ("window", False), ("headless", True)):
             with self.subTest(mode=mode, audio=audio), tempfile.TemporaryDirectory() as directory:
-                args = self.args(Path(directory), mode=mode, audio=audio, mute_audio=True)
+                args = self.args(Path(directory).resolve(), mode=mode, audio=audio, mute_audio=True)
                 with patch("play_session.subprocess.Popen") as launch:
                     with self.assertRaisesRegex(ValueError, "--mute-audio requires --audio and --mode hidden/window"):
                         play_session.run(args)
@@ -162,7 +162,7 @@ class PlaySessionTests(unittest.TestCase):
 
     def test_explicit_capture_retains_its_existing_muted_diagnostic_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = self.args(Path(directory), capture_audio=True)
+            args = self.args(Path(directory).resolve(), capture_audio=True)
             (_, kwargs), metadata = self.launch(args)
             self.assertEqual(kwargs["env"]["ADV_AUDIO_MUTE_DEVICE"], "1")
             self.assertEqual(kwargs["env"]["ADV_AUDIO_CAPTURE_CALLBACK"], str(args.output / "actual.f32"))
@@ -179,7 +179,7 @@ class ReplayDiagnosticsTest(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         for trace in (False, True):
             with self.subTest(trace=trace), tempfile.TemporaryDirectory(dir=scratch) as temporary:
-                root = Path(temporary)
+                root = Path(temporary).resolve()
                 binary, game = root / "runner.exe", root / "authored.exe"
                 binary.write_bytes(b"authored runner")
                 game.write_bytes(b"authored guest")

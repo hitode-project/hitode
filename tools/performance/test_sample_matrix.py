@@ -48,14 +48,14 @@ class CampaignTests(unittest.TestCase):
 
     def test_relative_samples_are_read_only_inputs_under_the_samples_root(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             (root / "fixture.exe").write_bytes(b"fixture")
             with patch.dict(os.environ, {"ADV_SAMPLES": str(root)}):
                 self.assertEqual(sample_exe({"exe": "fixture.exe"}), root / "fixture.exe")
 
     def test_warm_archives_require_matching_inputs_and_copy_only_cache_files(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             source = root / "cold"
             overlay = source / "one" / "overlay"
             overlay.mkdir(parents=True)
@@ -82,7 +82,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_min_seconds_requires_a_reason(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             manifest = root / "samples.json"
             manifest.write_text(json.dumps({"samples": [
                 {"id": "one", "exe": str(root / "x.exe"), "min_seconds": 5}]}), encoding="utf-8")
@@ -108,7 +108,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_quick_run_launches_only_the_gate_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             game = root / "game" / "fixture.exe"
             game.parent.mkdir()
             game.write_bytes(b"Not executed: subprocess is mocked")
@@ -141,7 +141,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_multiple_samples_keep_review_evidence_separate_from_failure_text(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             game = root / "game" / "fixture.exe"
             game.parent.mkdir()
             game.write_bytes(b"Not executed: subprocess is mocked")
@@ -175,7 +175,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_campaign_copies_elapsed_time_so_sparse_time_limit_frames_remain_undiagnosed(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             game = root / "game" / "fixture.exe"
             game.parent.mkdir()
             game.write_bytes(b"Mocked executable")
@@ -204,7 +204,7 @@ class CampaignTests(unittest.TestCase):
     def test_exit_diagnostic_hint_names_only_available_reports_and_optional_trace(self):
         for trace in (False, True):
             with self.subTest(trace=trace), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 game = root / "game" / "fixture.exe"
                 game.parent.mkdir()
                 game.write_bytes(b"Mocked executable")

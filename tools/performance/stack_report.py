@@ -17,8 +17,7 @@ import argparse
 import bisect
 from collections import Counter
 import json
-import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 
 from attribute_pc import SYMBOLIZER, exports, nearest_export, symbolize
@@ -58,7 +57,8 @@ class Namer:
         rva = address - module["base"]
         if module is self.runner:
             return [short(name) for name in self.symbols.get(rva, [])] or [f"adv-run+{rva:#x}"]
-        name = os.path.basename(module["path"])
+        # Split on either separator: module paths may come from a Windows host.
+        name = PureWindowsPath(module["path"]).name
         export = nearest_export(self.exports.get(module["path"], []), rva).split("+")[0]
         return [f"{name}!{export}"]
 

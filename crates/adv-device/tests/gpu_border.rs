@@ -164,6 +164,12 @@ fn verify(backend: GpuBackend) {
 #[test]
 // spec: GFX-SAMPLER-1
 fn border_nearest_linear_mixed_address_and_mips_are_portable() {
-    verify(GpuBackend::Vulkan);
-    verify(GpuBackend::Gl);
+    // Every backend the host build provides; macOS builds Metal only.
+    #[cfg(target_os = "macos")]
+    verify(GpuBackend::Metal);
+    #[cfg(not(target_os = "macos"))]
+    {
+        verify(GpuBackend::Vulkan);
+        verify(GpuBackend::Gl);
+    }
 }
