@@ -20,7 +20,6 @@ members = [
     "crates/adv-unicorn",
     "crates/adv-win32",
     "apps/adv-run",
-    "apps/adv-android-probe",
     "apps/adv-android",
     "apps/adv-launcher/src-tauri",
 ]

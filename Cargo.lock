@@ -46,17 +46,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adv-android-probe"
-version = "0.1.0"
-dependencies = [
- "adv-cpu",
- "iced-x86",
- "jni",
- "libc",
- "serde_json",
-]
-
-[[package]]
 name = "adv-cpu"
 version = "0.1.0"
 dependencies = [

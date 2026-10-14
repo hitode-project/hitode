@@ -35,8 +35,6 @@ RULES: dict[str, set[str]] = {
     "adv-run": {"adv-shell"},
     # Tauri player frontend: library and in-game overlay over the native game view.
     "adv-launcher": {"adv-shell"},
-    # Standalone Android CPU acceptance app, outside the game runtime graph.
-    "adv-android-probe": {"adv-cpu"},
     # Android platform frontend owns runtime, presentation and audio output.
     "adv-android": {"adv-runtime", "adv-device", "adv-sync"},
     "adv-tune": {"adv-abi", "adv-device"},
@@ -45,7 +43,7 @@ RULES: dict[str, set[str]] = {
     "adv-samples": {"adv-pe"},
 }
 ALIASES: dict[str, str] = {}
-TEST_ONLY = {"adv-unicorn", "adv-samples", "adv-android-probe"}
+TEST_ONLY = {"adv-unicorn", "adv-samples"}
 TRANSITIONAL: dict[tuple[str, str], str] = {}
 
 
