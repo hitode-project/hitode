@@ -100,11 +100,11 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
     if vfs.is_optical_path(&source) {
         return error(env, 19);
     }
-    if vfs.has_read_only_underlay(&source) {
+    if target.is_some() && vfs.has_read_only_underlay(&source) {
         warn_unavailable(
             env,
             "kernel32.dll!<file mutation>",
-            "deleting or renaming read-only VFS layers requires persistent whiteouts",
+            "renaming read-only VFS layers requires persistent whiteouts",
         );
         return error(env, 50);
     }
@@ -238,7 +238,8 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
             Err(e) => Err(e),
         }
     } else {
-        std::fs::remove_file(from)
+        // A read-only game file is hidden by a persistent whiteout instead.
+        env.ext.get::<Win32>().vfs.delete_file(&source)
     };
     match changed {
         Ok(()) => Outcome::Return(1),

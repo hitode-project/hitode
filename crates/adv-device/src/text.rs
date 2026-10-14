@@ -162,6 +162,8 @@ pub struct EnumeratedFont {
     pub script: String,
     pub design: Option<FontDesign>,
     pub signature: Option<FontSignature>,
+    /// The requested family is not installed; this is the face that draws it.
+    pub substitute: bool,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FontSignature {
@@ -762,6 +764,17 @@ impl Text {
             self.fonts.insert(request.clone(), font);
         }
         Ok(&self.fonts[request])
+    }
+    /// Name enumerated families in the guest UI language (a BCP 47 tag such
+    /// as "zh-Hans") when a font provides it, as GDI does. Native GDI already
+    /// follows the real UI language.
+    pub fn set_language(&mut self, tag: &'static str) {
+        #[cfg(not(windows))]
+        {
+            self.backend.language = Some(tag);
+        }
+        #[cfg(windows)]
+        let _ = tag;
     }
     /// Use only these discovery directories on portable hosts. This provides a
     /// deterministic font environment for comparisons; guest resources still

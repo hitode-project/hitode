@@ -975,6 +975,34 @@ fn get_console_cp(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
+/// MAKELONG(minor, major) of the subsystem version in the mapped process
+/// image header, read from guest memory as RtlImageNtHeader does.
+fn get_process_version(env: &mut Env<'_>) -> Outcome {
+    let pid = env.arg(0);
+    if pid != 0 && pid != env.sys.pid {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!GetProcessVersion",
+            "only the calling process's image header is readable",
+        );
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
+    let version = super::module::module_of(env, 0)
+        .map(|id| adv_os::modules(env.ext).get(id).base)
+        .and_then(|base| {
+            let header = base.checked_add(env.cpu.read_u32(base + 0x3c).ok()?)?;
+            env.cpu.read_u32(header.checked_add(24 + 48)?).ok()
+        });
+    match version {
+        Some(version) => Outcome::Return((version << 16) | (version >> 16)),
+        None => {
+            set_last_error(env, err::INVALID_PARAMETER);
+            Outcome::Return(0)
+        }
+    }
+}
+
 pub(super) fn register(reg: &mut Registry) {
     error_mode::register(reg);
     pointer::register(reg);
@@ -991,6 +1019,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ReadConsoleA", 5, read_console);
     stdcall(reg, K32, "SetConsoleCP", 1, set_console_cp);
     stdcall(reg, K32, "SetConsoleOutputCP", 1, set_console_cp);
+    stdcall(reg, K32, "GetProcessVersion", 1, get_process_version);
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
     });

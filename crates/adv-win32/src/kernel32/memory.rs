@@ -15,6 +15,7 @@ mod native;
 mod virtual_memory;
 pub(crate) use virtual_memory::native_read_memory;
 pub(crate) use virtual_memory::native_write_memory;
+pub(crate) use virtual_memory::page_prot;
 pub(crate) use virtual_memory::protect_memory;
 pub(crate) use virtual_memory::query as query_memory;
 pub(crate) use virtual_memory::{

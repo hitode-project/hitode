@@ -16,7 +16,7 @@ mod collation;
 mod preferred_ui;
 
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.
-pub(super) fn lcid(env: &Env<'_>) -> u32 {
+pub(crate) fn lcid(env: &Env<'_>) -> u32 {
     if env.ext.get::<Win32>().codec.acp == 936 {
         0x804
     } else {

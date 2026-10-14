@@ -1,5 +1,6 @@
-//! The executor enforces guest execute permission for every process. Report that
-//! existing immutable policy; never acknowledge a DEP toggle we cannot perform.
+//! Windows' default OptIn policy: an image with NX_COMPAT gets permanent DEP,
+//! and any other process runs readable pages. Never acknowledge a DEP toggle
+//! we cannot perform.
 use crate::util::set_last_error;
 use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, warn_unavailable, win32};
 use adv_cpu::backend::Prot;
@@ -7,8 +8,8 @@ use adv_machine::Env;
 
 #[win32(kernel32, name = "GetSystemDEPPolicy", level = state)]
 fn system(_env: &mut Env<'_>) -> i32 {
-    1
-} // AlwaysOn
+    2
+} // OptIn
 
 #[win32(kernel32, name = "GetProcessDEPPolicy", level = state)]
 fn process(
@@ -27,8 +28,10 @@ fn process(
         set_last_error(env, 998);
         return 0;
     }
-    // DEP enabled, ATL NX-thunk emulation disabled, permanent for this profile.
-    if flags.write(env.cpu, 3).is_err() || permanent.write(env.cpu, 1).is_err() {
+    // NX_COMPAT: DEP enabled, ATL NX-thunk emulation disabled, permanent.
+    let enabled = !adv_os::try_modules(env.ext).is_some_and(|m| m.dep_disabled());
+    let (value, fixed) = if enabled { (3, 1) } else { (0, 0) };
+    if flags.write(env.cpu, value).is_err() || permanent.write(env.cpu, fixed).is_err() {
         set_last_error(env, 998);
         return 0;
     }
@@ -45,7 +48,7 @@ fn set(env: &mut Env<'_>, flags: u32) -> i32 {
     warn_unavailable(
         env,
         "kernel32.dll!SetProcessDEPPolicy",
-        "guest execute-page enforcement is fixed (DEP AlwaysOn); dynamic DEP and ATL thunk emulation are unavailable",
+        "process DEP follows the image's NX_COMPAT flag; dynamic DEP and ATL thunk emulation are unavailable",
     );
     set_last_error(env, 5);
     0

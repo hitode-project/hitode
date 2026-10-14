@@ -211,7 +211,8 @@ pub fn build_with_private_entries(
     short(&mut bytes, 0x84, 0x14c);
     short(&mut bytes, 0x86, if data.is_empty() { 2 } else { 3 });
     short(&mut bytes, 0x94, 224);
-    short(&mut bytes, 0x96, 0x2103); // executable, x86, DLL, no base fixups
+    // Relocatable like a real system DLL; its entries need no fixups.
+    short(&mut bytes, 0x96, 0x2102);
     let optional = 0x98;
     short(&mut bytes, optional, 0x10b);
     word(&mut bytes, optional + 4, (text_end - text_rva) as u32);

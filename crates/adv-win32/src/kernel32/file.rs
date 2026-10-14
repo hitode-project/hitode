@@ -12,6 +12,7 @@ use crate::util::{INVALID_HANDLE_VALUE, cstr, err, out_u32, set_last_error, wstr
 use crate::{FileObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod attributes;
 mod change_notification;
+mod legacy;
 pub(crate) mod native;
 
 pub(crate) mod information;
@@ -1728,6 +1729,7 @@ pub(super) fn register(reg: &mut Registry) {
     });
     attributes::register(reg);
     change_notification::register(reg);
+    legacy::register(reg);
     information::register(reg);
     locking::register(reg);
     stdcall(reg, K32, "FindFirstFileA", 2, |e| {
