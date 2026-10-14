@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import ManageSaves from "./ManageSaves.svelte";
+  import { preview } from "../lib/bridge";
   import PhoneSettingsHeader from "./PhoneSettingsHeader.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
@@ -81,135 +82,143 @@
           ]}
         />
       </div>
-      <div class="row">
-        <span class="t">光盘</span>
-        <span class="val" style="font-size: 12px">更换光盘需重新启动游戏</span>
-      </div>
-      {#each setup.discs as disc, i (disc)}
+      {#if preview}
+        <div class="row">
+          <span class="t">光盘</span>
+          <span class="val" style="font-size: 12px">更换光盘需重新启动游戏</span>
+        </div>
+        {#each setup.discs as disc, i (disc)}
+          <div class="row sm">
+            <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
+            <span class="disc ellipsis">{disc}</span>
+            <button class="quiet" style="margin-right: -12px" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
+          </div>
+        {/each}
         <div class="row sm">
-          <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
-          <span class="disc ellipsis">{disc}</span>
-          <button class="quiet" style="margin-right: -12px" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
+          <button class="quiet" style="margin-left: -12px" onclick={() => form.addDisc()} disabled={form.discsFull}>添加光盘镜像…</button>
         </div>
-      {/each}
-      <div class="row sm">
-        <button class="quiet" style="margin-left: -12px" onclick={() => form.addDisc()} disabled={form.discsFull}>添加光盘镜像…</button>
-      </div>
+      {/if}
     </section>
 
-    <section class="sec" aria-labelledby="pg-view">
-      <h2 id="pg-view">画面</h2>
-      <div class="row" class:ov={form.overridden("scale")}>
-        {@render head("scale", "缩放")}
-        <SettingsSeg
-          variant="phone-sheet"
-          label="缩放"
-          value={form.value("scale")}
-          onpick={(v) => form.pick("scale", v)}
-          options={[
-            { value: "fit", label: "适应" },
-            { value: "int", label: "整数倍" },
-            { value: "stretch", label: "拉伸" },
-          ]}
-        />
-      </div>
-      <div class="row" class:ov={form.overridden("filter")}>
-        {@render head("filter", "过滤")}
-        <SettingsSeg
-          variant="phone-sheet"
-          label="过滤"
-          value={form.value("filter")}
-          onpick={(v) => form.pick("filter", v)}
-          options={[
-            { value: "smooth", label: "平滑" },
-            { value: "sharp", label: "锐利" },
-          ]}
-        />
-      </div>
-    </section>
-
-    <section class="sec" aria-labelledby="pg-font">
-      <h2 id="pg-font">字体</h2>
-      {#each fonts as f (f.key)}
-        {@const cur = form.value(f.key)}
-        <div class="row" class:ov={form.overridden(f.key)}>
-          {@render head(f.key, f.name, "ja")}
-          <span class="selw">
-            <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
-              <option value="auto" selected={cur === "auto"}>自动</option>
-              <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
-              <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
-              {#each form.extraFonts as name (name)}
-                <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
-              {/each}
-              <option value="import">导入字体文件…</option>
-            </select>
-            {@render chevron()}
-          </span>
+    {#if preview}
+      <section class="sec" aria-labelledby="pg-view">
+        <h2 id="pg-view">画面</h2>
+        <div class="row" class:ov={form.overridden("scale")}>
+          {@render head("scale", "缩放")}
+          <SettingsSeg
+            variant="phone-sheet"
+            label="缩放"
+            value={form.value("scale")}
+            onpick={(v) => form.pick("scale", v)}
+            options={[
+              { value: "fit", label: "适应" },
+              { value: "int", label: "整数倍" },
+              { value: "stretch", label: "拉伸" },
+            ]}
+          />
         </div>
-      {/each}
-      <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
-        <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
-          {#each fonts as f (f.key)}
-            <div>
-              <span lang="ja" style="font-size: 12px; color: var(--fg3)">{f.name}</span>
-              <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
-            </div>
-          {/each}
+        <div class="row" class:ov={form.overridden("filter")}>
+          {@render head("filter", "过滤")}
+          <SettingsSeg
+            variant="phone-sheet"
+            label="过滤"
+            value={form.value("filter")}
+            onpick={(v) => form.pick("filter", v)}
+            options={[
+              { value: "smooth", label: "平滑" },
+              { value: "sharp", label: "锐利" },
+            ]}
+          />
         </div>
-      </div>
-      <div class="row" class:ov={form.overridden("smooth")}>
-        {@render head("smooth", "字形平滑")}
-        <SettingsSeg
-          variant="phone-sheet"
-          label="字形平滑"
-          value={form.value("smooth")}
-          onpick={(v) => form.pick("smooth", v)}
-          options={[
-            { value: "game", label: "跟随游戏" },
-            { value: "on", label: "开" },
-            { value: "off", label: "关" },
-          ]}
-        />
-      </div>
-    </section>
+      </section>
 
-    <section class="sec" aria-labelledby="pg-input">
-      <h2 id="pg-input">输入</h2>
-      <div class="row" class:ov={form.overridden("ff")}>
-        {@render head("ff", "快进键")}
-        <SettingsSeg
-          variant="phone-sheet"
-          label="快进键"
-          value={form.value("ff")}
-          onpick={(v) => form.pick("ff", v)}
-          options={[
-            { value: "hold", label: "按住" },
-            { value: "toggle", label: "切换" },
-          ]}
-        />
-      </div>
-      <div class="row">
-        <span class="t">触屏按键布局</span>
-        <!-- The touch layout editor has no design yet. -->
-        <button class="quiet" style="margin-right: -12px" aria-label="编辑触屏按键布局">编辑…</button>
-      </div>
-    </section>
+      <section class="sec" aria-labelledby="pg-font">
+        <h2 id="pg-font">字体</h2>
+        {#each fonts as f (f.key)}
+          {@const cur = form.value(f.key)}
+          <div class="row" class:ov={form.overridden(f.key)}>
+            {@render head(f.key, f.name, "ja")}
+            <span class="selw">
+              <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
+                <option value="auto" selected={cur === "auto"}>自动</option>
+                <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
+                <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
+                {#each form.extraFonts as name (name)}
+                  <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
+                {/each}
+                <option value="import">导入字体文件…</option>
+              </select>
+              {@render chevron()}
+            </span>
+          </div>
+        {/each}
+        <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
+          <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
+            {#each fonts as f (f.key)}
+              <div>
+                <span lang="ja" style="font-size: 12px; color: var(--fg3)">{f.name}</span>
+                <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+        <div class="row" class:ov={form.overridden("smooth")}>
+          {@render head("smooth", "字形平滑")}
+          <SettingsSeg
+            variant="phone-sheet"
+            label="字形平滑"
+            value={form.value("smooth")}
+            onpick={(v) => form.pick("smooth", v)}
+            options={[
+              { value: "game", label: "跟随游戏" },
+              { value: "on", label: "开" },
+              { value: "off", label: "关" },
+            ]}
+          />
+        </div>
+      </section>
+
+      <section class="sec" aria-labelledby="pg-input">
+        <h2 id="pg-input">输入</h2>
+        <div class="row" class:ov={form.overridden("ff")}>
+          {@render head("ff", "快进键")}
+          <SettingsSeg
+            variant="phone-sheet"
+            label="快进键"
+            value={form.value("ff")}
+            onpick={(v) => form.pick("ff", v)}
+            options={[
+              { value: "hold", label: "按住" },
+              { value: "toggle", label: "切换" },
+            ]}
+          />
+        </div>
+        <div class="row">
+          <span class="t">触屏按键布局</span>
+          <!-- The touch layout editor has no design yet. -->
+          <button class="quiet" style="margin-right: -12px" aria-label="编辑触屏按键布局">编辑…</button>
+        </div>
+      </section>
+    {/if}
 
     <nav aria-label="更多" class="more">
-      <button class="link" onclick={() => (saves = true)}>
-        <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-        <span>存档…</span>
-      </button>
+      {#if preview}
+        <button class="link" onclick={() => (saves = true)}>
+          <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
+          <span>存档…</span>
+        </button>
+      {/if}
       <button class="link" onclick={() => revealFolder(game.path)}>
         <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"></path></svg>
         <span>打开所在文件夹</span>
       </button>
     </nav>
 
-    <div style="display: flex; justify-content: center; margin-top: -8px">
-      <button class="quiet" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
-    </div>
+    {#if preview}
+      <div style="display: flex; justify-content: center; margin-top: -8px">
+        <button class="quiet" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
+      </div>
+    {/if}
   </main>
 </div>
 

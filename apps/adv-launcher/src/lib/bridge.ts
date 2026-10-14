@@ -4,6 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 /** Whether the page runs inside the Tauri shell (false in a plain browser during `pnpm dev`). */
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/**
+ * Controls the host does not back yet show only in the browser preview, so the
+ * app never offers a setting that does nothing.
+ */
+export const preview = !inTauri;
+
 /** Calls a launcher command; outside Tauri it resolves to `fallback` so pages work in a browser. */
 export async function call<T>(command: string, args: Record<string, unknown>, fallback: T): Promise<T> {
   if (!inTauri) return fallback;

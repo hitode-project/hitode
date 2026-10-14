@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Icon from "../components/Icon.svelte";
-  import { call, onHostEvent } from "../lib/bridge";
+  import { call, onHostEvent, preview } from "../lib/bridge";
   import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, type Rect } from "../lib/overlay";
 
   /**
@@ -179,7 +180,7 @@
     </div>
   {/if}
 
-  {#if fps}
+  {#if preview && fps}
     <div class="fps mono">60 FPS</div>
   {/if}
 
@@ -196,57 +197,58 @@
           </div>
 
           <div class="middle">
-          <div class="rows">
-            <div class="prow">
-              <span>画面</span>
-              <div class="seg" role="group" aria-label="画面">
-                {#each scales as o (o.value)}
-                  <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => (scale = o.value)}>{o.label}</button>
-                {/each}
-              </div>
-            </div>
-            <div class="prow">
-              <span>过滤</span>
-              <div class="seg" role="group" aria-label="过滤">
-                {#each filters as o (o.value)}
-                  <button class:on={filter === o.value} aria-pressed={filter === o.value} onclick={() => (filter = o.value)}>{o.label}</button>
-                {/each}
-              </div>
-            </div>
-            <div class="prow">
-              <span>音量</span>
-              <div class="vol">
-                <button class="ibtn" class:on={muted} aria-label="静音" aria-pressed={muted} onclick={() => (muted = !muted)}>
-                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" />
-                    {#if muted}<path d="M10.5 6l3.5 4M14 6l-3.5 4" />{:else}<path d="M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.4 3.9a5.8 5.8 0 0 1 0 8.2" />{/if}
-                  </svg>
-                </button>
-                <div class="slider" class:muted>
-                  <div class="slider-in">
-                    <div class="rail"><div class="rfill" style="width: {volume}%"></div></div>
-                    <div class="thumb" style="left: {volume}%"></div>
-                  </div>
-                  <input type="range" min="0" max="100" step="1" bind:value={volume} oninput={() => (muted = false)} aria-label="音量" />
+          {#if preview}
+            <div class="rows">
+              <div class="prow">
+                <span>画面</span>
+                <div class="seg" role="group" aria-label="画面">
+                  {#each scales as o (o.value)}
+                    <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => (scale = o.value)}>{o.label}</button>
+                  {/each}
                 </div>
               </div>
+              <div class="prow">
+                <span>过滤</span>
+                <div class="seg" role="group" aria-label="过滤">
+                  {#each filters as o (o.value)}
+                    <button class:on={filter === o.value} aria-pressed={filter === o.value} onclick={() => (filter = o.value)}>{o.label}</button>
+                  {/each}
+                </div>
+              </div>
+              <div class="prow">
+                <span>音量</span>
+                <div class="vol">
+                  <button class="ibtn" class:on={muted} aria-label="静音" aria-pressed={muted} onclick={() => (muted = !muted)}>
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" />
+                      {#if muted}<path d="M10.5 6l3.5 4M14 6l-3.5 4" />{:else}<path d="M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.4 3.9a5.8 5.8 0 0 1 0 8.2" />{/if}
+                    </svg>
+                  </button>
+                  <div class="slider" class:muted>
+                    <div class="slider-in">
+                      <div class="rail"><div class="rfill" style="width: {volume}%"></div></div>
+                      <div class="thumb" style="left: {volume}%"></div>
+                    </div>
+                    <input type="range" min="0" max="100" step="1" bind:value={volume} oninput={() => (muted = false)} aria-label="音量" />
+                  </div>
+                </div>
+              </div>
+              <div class="prow">
+                <span>帧率显示</span>
+                <button class="sw" class:on={fps} role="switch" aria-checked={fps} aria-label="帧率显示" onclick={() => (fps = !fps)}></button>
+              </div>
             </div>
-            <div class="prow">
-              <span>帧率显示</span>
-              <button class="sw" class:on={fps} role="switch" aria-checked={fps} aria-label="帧率显示" onclick={() => (fps = !fps)}></button>
-            </div>
-          </div>
-          <div class="sep"></div>
+            <div class="sep"></div>
+          {/if}
           <div class="group">
             <button class="qrow" onclick={openTextBar}>
               <span>输入文字…</span>
               <span class="end"><Icon name="keyboard" /></span>
             </button>
             <button class="qrow" onclick={() => nav.go({ name: "report", gameId })}>报告问题…</button>
-            <button class="qrow">
-              <span>游戏文件夹</span>
-              <span class="end"><Icon name="chevron-right" /></span>
-            </button>
+            {#if canReveal() && game}
+              <button class="qrow" disabled={game.offline !== null} onclick={() => game && reveal(game.path)}>在访达中显示</button>
+            {/if}
           </div>
           </div>
           <div class="sep"></div>

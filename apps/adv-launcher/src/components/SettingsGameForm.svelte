@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
+  import { preview } from "../lib/bridge";
   import ManageSaves from "./ManageSaves.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
@@ -76,131 +77,137 @@
             ]}
           />
         </div>
-        <div class="row">
-          <span class="t">光盘</span>
-          <span class="val" style="font-size: 12px">更换光盘需重新启动游戏</span>
-        </div>
-        {#each setup.discs as disc, i (disc)}
+        {#if preview}
+          <div class="row">
+            <span class="t">光盘</span>
+            <span class="val" style="font-size: 12px">更换光盘需重新启动游戏</span>
+          </div>
+          {#each setup.discs as disc, i (disc)}
+            <div class="row sm">
+              <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
+              <span class="disc ellipsis">{disc}</span>
+              <button class="quiet" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
+            </div>
+          {/each}
           <div class="row sm">
-            <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
-            <span class="disc ellipsis">{disc}</span>
-            <button class="quiet" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
+            <button class="quiet" style="margin-left: -10px" onclick={() => form.addDisc()} disabled={form.discsFull}>
+              添加光盘镜像…
+            </button>
           </div>
-        {/each}
-        <div class="row sm">
-          <button class="quiet" style="margin-left: -10px" onclick={() => form.addDisc()} disabled={form.discsFull}>
-            添加光盘镜像…
-          </button>
-        </div>
+        {/if}
       </section>
 
-      <section class="sec" aria-labelledby="gs-view">
-        <h2 id="gs-view">画面</h2>
-        <div class="row" class:ov={form.overridden("scale")}>
-          {@render head("scale", "缩放")}
-          <SettingsSeg
-            variant="sheet"
-            label="缩放"
-            value={form.value("scale")}
-            onpick={(v) => form.pick("scale", v)}
-            options={[
-              { value: "fit", label: "适应" },
-              { value: "int", label: "整数倍" },
-              { value: "stretch", label: "拉伸" },
-            ]}
-          />
-        </div>
-        <div class="row" class:ov={form.overridden("filter")}>
-          {@render head("filter", "过滤")}
-          <SettingsSeg
-            variant="sheet"
-            label="过滤"
-            value={form.value("filter")}
-            onpick={(v) => form.pick("filter", v)}
-            options={[
-              { value: "smooth", label: "平滑" },
-              { value: "sharp", label: "锐利" },
-            ]}
-          />
-        </div>
-      </section>
-
-      <section class="sec" aria-labelledby="gs-font">
-        <h2 id="gs-font">字体</h2>
-        {#each fonts as f (f.key)}
-          {@const cur = form.value(f.key)}
-          <div class="row" class:ov={form.overridden(f.key)}>
-            {@render head(f.key, f.name, "ja")}
-            <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9.5 4.5L13 8l-3.5 3.5"></path></svg>
-            <span class="selw">
-              <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
-                <option value="auto" selected={cur === "auto"}>自动</option>
-                <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
-                <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
-                {#each form.extraFonts as name (name)}
-                  <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
-                {/each}
-                <option value="local">本机字体…</option>
-                <option value="import">导入字体文件…</option>
-              </select>
-              <Icon name="chevron-down" size={12} stroke={1.6} />
-            </span>
+      {#if preview}
+        <section class="sec" aria-labelledby="gs-view">
+          <h2 id="gs-view">画面</h2>
+          <div class="row" class:ov={form.overridden("scale")}>
+            {@render head("scale", "缩放")}
+            <SettingsSeg
+              variant="sheet"
+              label="缩放"
+              value={form.value("scale")}
+              onpick={(v) => form.pick("scale", v)}
+              options={[
+                { value: "fit", label: "适应" },
+                { value: "int", label: "整数倍" },
+                { value: "stretch", label: "拉伸" },
+              ]}
+            />
           </div>
-        {/each}
-        <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
-          <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
-            {#each fonts as f (f.key)}
-              <div class="pvr">
-                <span lang="ja" style="font-size: 12px; color: var(--fg3); white-space: nowrap">{f.name}</span>
-                <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
-              </div>
-            {/each}
+          <div class="row" class:ov={form.overridden("filter")}>
+            {@render head("filter", "过滤")}
+            <SettingsSeg
+              variant="sheet"
+              label="过滤"
+              value={form.value("filter")}
+              onpick={(v) => form.pick("filter", v)}
+              options={[
+                { value: "smooth", label: "平滑" },
+                { value: "sharp", label: "锐利" },
+              ]}
+            />
           </div>
-        </div>
-        <div class="row" class:ov={form.overridden("smooth")}>
-          {@render head("smooth", "字形平滑")}
-          <SettingsSeg
-            variant="sheet"
-            label="字形平滑"
-            value={form.value("smooth")}
-            onpick={(v) => form.pick("smooth", v)}
-            options={[
-              { value: "game", label: "跟随游戏" },
-              { value: "on", label: "开" },
-              { value: "off", label: "关" },
-            ]}
-          />
-        </div>
-      </section>
+        </section>
 
-      <section class="sec" aria-labelledby="gs-input">
-        <h2 id="gs-input">输入</h2>
-        <div class="row" class:ov={form.overridden("ff")}>
-          {@render head("ff", "快进键")}
-          <SettingsSeg
-            variant="sheet"
-            label="快进键"
-            value={form.value("ff")}
-            onpick={(v) => form.pick("ff", v)}
-            options={[
-              { value: "hold", label: "按住" },
-              { value: "toggle", label: "切换" },
-            ]}
-          />
-        </div>
-        <div class="row">
-          <span class="t">手柄</span>
-          <span class="val">默认映射</span>
-          <!-- The gamepad mapping editor has no design yet. -->
-          <button class="quiet" aria-label="编辑手柄映射">编辑…</button>
-        </div>
-      </section>
+        <section class="sec" aria-labelledby="gs-font">
+          <h2 id="gs-font">字体</h2>
+          {#each fonts as f (f.key)}
+            {@const cur = form.value(f.key)}
+            <div class="row" class:ov={form.overridden(f.key)}>
+              {@render head(f.key, f.name, "ja")}
+              <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9.5 4.5L13 8l-3.5 3.5"></path></svg>
+              <span class="selw">
+                <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
+                  <option value="auto" selected={cur === "auto"}>自动</option>
+                  <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
+                  <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
+                  {#each form.extraFonts as name (name)}
+                    <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
+                  {/each}
+                  <option value="local">本机字体…</option>
+                  <option value="import">导入字体文件…</option>
+                </select>
+                <Icon name="chevron-down" size={12} stroke={1.6} />
+              </span>
+            </div>
+          {/each}
+          <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
+            <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
+              {#each fonts as f (f.key)}
+                <div class="pvr">
+                  <span lang="ja" style="font-size: 12px; color: var(--fg3); white-space: nowrap">{f.name}</span>
+                  <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
+                </div>
+              {/each}
+            </div>
+          </div>
+          <div class="row" class:ov={form.overridden("smooth")}>
+            {@render head("smooth", "字形平滑")}
+            <SettingsSeg
+              variant="sheet"
+              label="字形平滑"
+              value={form.value("smooth")}
+              onpick={(v) => form.pick("smooth", v)}
+              options={[
+                { value: "game", label: "跟随游戏" },
+                { value: "on", label: "开" },
+                { value: "off", label: "关" },
+              ]}
+            />
+          </div>
+        </section>
+
+        <section class="sec" aria-labelledby="gs-input">
+          <h2 id="gs-input">输入</h2>
+          <div class="row" class:ov={form.overridden("ff")}>
+            {@render head("ff", "快进键")}
+            <SettingsSeg
+              variant="sheet"
+              label="快进键"
+              value={form.value("ff")}
+              onpick={(v) => form.pick("ff", v)}
+              options={[
+                { value: "hold", label: "按住" },
+                { value: "toggle", label: "切换" },
+              ]}
+            />
+          </div>
+          <div class="row">
+            <span class="t">手柄</span>
+            <span class="val">默认映射</span>
+            <!-- The gamepad mapping editor has no design yet. -->
+            <button class="quiet" aria-label="编辑手柄映射">编辑…</button>
+          </div>
+        </section>
+      {/if}
 
       <nav aria-label="更多" style="display: flex; gap: 4px; margin: -8px 0 0 -10px">
-        <button class="quiet" onclick={() => (saves = true)}>
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-          <span>存档…</span>
-        </button>
+        {#if preview}
+          <button class="quiet" onclick={() => (saves = true)}>
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
+            <span>存档…</span>
+          </button>
+        {/if}
         {#if canReveal()}
           <button class="quiet" title={game.path} disabled={game.offline !== null} onclick={() => reveal(game.path)}>
             <Icon name="folder" size={15} />
@@ -216,7 +223,9 @@
     </div>
 
     <div class="foot">
-      <button class="quiet" style="margin-left: -10px" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
+      {#if preview}
+        <button class="quiet" style="margin-left: -10px" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
+      {/if}
       <div style="flex: 1"></div>
       <button class="primary" onclick={() => nav.back()}>完成</button>
     </div>

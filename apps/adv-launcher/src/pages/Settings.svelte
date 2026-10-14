@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { preview } from "../lib/bridge";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
@@ -49,60 +50,64 @@
       </div>
     </section>
 
-    <section class="sec" aria-labelledby="g-play">
-      <h2 id="g-play">游戏中</h2>
-      <div class="row">
-        <span class="t">缩放</span>
-        <SettingsSeg
-          label="缩放"
-          value={prefs.scale}
-          onpick={(v) => set("scale", v)}
-          options={[
-            { value: "fit", label: "适应" },
-            { value: "int", label: "整数倍" },
-          ]}
-        />
-      </div>
-      <div class="row">
-        <span class="t">过滤</span>
-        <SettingsSeg
-          label="过滤"
-          value={prefs.filter}
-          onpick={(v) => set("filter", v)}
-          options={[
-            { value: "smooth", label: "平滑" },
-            { value: "sharp", label: "锐利" },
-          ]}
-        />
-      </div>
-      <div class="row">
-        <span class="t">快进键</span>
-        <SettingsSeg
-          label="快进键"
-          value={prefs.fastForward}
-          onpick={(v) => set("fastForward", v)}
-          options={[
-            { value: "hold", label: "按住" },
-            { value: "toggle", label: "切换" },
-          ]}
-        />
-      </div>
-      <div class="row">
-        <span class="t">切到后台时暂停</span>
-        <SettingsSwitch label="切到后台时暂停" checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
-      </div>
-      <div class="row">
-        <span class="t">显示帧率</span>
-        <SettingsSwitch label="显示帧率" checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
-      </div>
-    </section>
+    {#if preview}
+      <section class="sec" aria-labelledby="g-play">
+        <h2 id="g-play">游戏中</h2>
+        <div class="row">
+          <span class="t">缩放</span>
+          <SettingsSeg
+            label="缩放"
+            value={prefs.scale}
+            onpick={(v) => set("scale", v)}
+            options={[
+              { value: "fit", label: "适应" },
+              { value: "int", label: "整数倍" },
+            ]}
+          />
+        </div>
+        <div class="row">
+          <span class="t">过滤</span>
+          <SettingsSeg
+            label="过滤"
+            value={prefs.filter}
+            onpick={(v) => set("filter", v)}
+            options={[
+              { value: "smooth", label: "平滑" },
+              { value: "sharp", label: "锐利" },
+            ]}
+          />
+        </div>
+        <div class="row">
+          <span class="t">快进键</span>
+          <SettingsSeg
+            label="快进键"
+            value={prefs.fastForward}
+            onpick={(v) => set("fastForward", v)}
+            options={[
+              { value: "hold", label: "按住" },
+              { value: "toggle", label: "切换" },
+            ]}
+          />
+        </div>
+        <div class="row">
+          <span class="t">切到后台时暂停</span>
+          <SettingsSwitch label="切到后台时暂停" checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
+        </div>
+        <div class="row">
+          <span class="t">显示帧率</span>
+          <SettingsSwitch label="显示帧率" checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
+        </div>
+      </section>
+    {/if}
 
     <section class="sec" aria-labelledby="g-lib">
       <h2 id="g-lib">游戏库</h2>
-      <div class="row">
-        <span class="t">从 VNDB 获取资料</span>
-        <SettingsSwitch label="从 VNDB 获取资料" checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
-      </div>
+      {#if preview}
+        <div class="row">
+          <span class="t">从 VNDB 获取资料</span>
+          <SettingsSwitch label="从 VNDB 获取资料" checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
+        </div>
+      {/if}
       <div class="row">
         <span class="t">遮挡成人内容封面</span>
         <SettingsSwitch label="遮挡成人内容封面" checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
@@ -113,75 +118,79 @@
       </div>
     </section>
 
-    <section class="sec" aria-labelledby="g-roots">
-      <h2 id="g-roots">游戏库文件夹</h2>
-      {#each general.roots as f (f.id)}
+    {#if preview}
+      <section class="sec" aria-labelledby="g-roots">
+        <h2 id="g-roots">游戏库文件夹</h2>
+        {#each general.roots as f (f.id)}
+          <div class="row">
+            <span class="t two">
+              <span class="path">{f.path}</span>
+              <span class="meta">{general.rootMeta(f)}</span>
+            </span>
+            <button class="quiet" aria-label="移除 {f.path}" onclick={() => general.removeRoot(f.id)}>
+              移除
+            </button>
+          </div>
+        {/each}
         <div class="row">
-          <span class="t two">
-            <span class="path">{f.path}</span>
-            <span class="meta">{general.rootMeta(f)}</span>
-          </span>
-          <button class="quiet" aria-label="移除 {f.path}" onclick={() => general.removeRoot(f.id)}>
-            移除
+          <button class="quiet" style="margin-left: -12px" onclick={() => nav.go({ name: "scan" })}>添加文件夹…</button>
+        </div>
+      </section>
+
+      <section class="sec" aria-labelledby="g-store">
+        <h2 id="g-store">存储</h2>
+        <div class="store">
+          <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
+            <span class="total">{general.totalLabel}</span>
+            <span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>
+          </div>
+          <div class="usage" role="img" aria-label="存档 128 MB，缓存 {general.cacheLabel}">
+            <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>
+            <span style:width="{general.cachePct}%" class="cache"></span>
+          </div>
+          <div style="display: flex; gap: 18px; flex-wrap: wrap">
+            <span class="key"><i style:background="var(--accent)"></i>存档 128 MB</span>
+            <span class="key"><i class="cache"></i>缓存 {general.cacheLabel}</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="t">缓存</span>
+          <span class="val">{general.cacheLabel}</span>
+          <button class="quiet" onclick={() => general.clearCache()} disabled={general.cache !== "full"}>
+            {general.clearLabel}
           </button>
         </div>
-      {/each}
-      <div class="row">
-        <button class="quiet" style="margin-left: -12px" onclick={() => nav.go({ name: "scan" })}>添加文件夹…</button>
-      </div>
-    </section>
-
-    <section class="sec" aria-labelledby="g-store">
-      <h2 id="g-store">存储</h2>
-      <div class="store">
-        <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
-          <span class="total">{general.totalLabel}</span>
-          <span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>
-        </div>
-        <div class="usage" role="img" aria-label="存档 128 MB，缓存 {general.cacheLabel}">
-          <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>
-          <span style:width="{general.cachePct}%" class="cache"></span>
-        </div>
-        <div style="display: flex; gap: 18px; flex-wrap: wrap">
-          <span class="key"><i style:background="var(--accent)"></i>存档 128 MB</span>
-          <span class="key"><i class="cache"></i>缓存 {general.cacheLabel}</span>
-        </div>
-      </div>
-      <div class="row">
-        <span class="t">缓存</span>
-        <span class="val">{general.cacheLabel}</span>
-        <button class="quiet" onclick={() => general.clearCache()} disabled={general.cache !== "full"}>
-          {general.clearLabel}
-        </button>
-      </div>
-    </section>
+      </section>
+    {/if}
 
     <section class="sec" aria-labelledby="g-fb">
       <h2 id="g-fb">反馈与隐私</h2>
-      {#each general.reports as r (r.id)}
-        {@const gone = !!general.withdrawn[r.id]}
+      {#if preview}
+        {#each general.reports as r (r.id)}
+          {@const gone = !!general.withdrawn[r.id]}
+          <div class="row">
+            <span class="t two">
+              <span lang="ja" class="ellipsis">{r.title}</span>
+              <span class="meta">{r.date} · {r.kind}</span>
+            </span>
+            <button
+              class="quiet"
+              onclick={() => (general.withdrawn[r.id] = true)}
+              disabled={gone}
+              aria-label="撤回 {r.title} 的报告"
+            >
+              {gone ? "已撤回" : "撤回"}
+            </button>
+          </div>
+        {/each}
         <div class="row">
           <span class="t two">
-            <span lang="ja" class="ellipsis">{r.title}</span>
-            <span class="meta">{r.date} · {r.kind}</span>
+            <span>重置报告密钥</span>
+            <span class="meta">之后的报告无法与之前的关联</span>
           </span>
-          <button
-            class="quiet"
-            onclick={() => (general.withdrawn[r.id] = true)}
-            disabled={gone}
-            aria-label="撤回 {r.title} 的报告"
-          >
-            {gone ? "已撤回" : "撤回"}
-          </button>
+          <button class="quiet" onclick={() => (general.keyReset = true)} disabled={general.keyReset}>{general.keyReset ? "已重置" : "重置"}</button>
         </div>
-      {/each}
-      <div class="row">
-        <span class="t two">
-          <span>重置报告密钥</span>
-          <span class="meta">之后的报告无法与之前的关联</span>
-        </span>
-        <button class="quiet" onclick={() => (general.keyReset = true)} disabled={general.keyReset}>{general.keyReset ? "已重置" : "重置"}</button>
-      </div>
+      {/if}
       <div class="row" class:open={contentsOpen}>
         <span class="t">报告包含哪些内容</span>
         <button
