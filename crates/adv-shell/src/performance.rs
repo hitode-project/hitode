@@ -139,6 +139,8 @@ impl Performance {
     /// The first new frame establishes a boundary: its partial interval is excluded.
     pub fn reset(&mut self, serial: u64) {
         *self = Self {
+            #[cfg(target_os = "android")]
+            execution_scheduling: self.execution_scheduling.take(),
             measurement_start: Some(Instant::now()),
             measurement_start_frame: serial,
             observed_serial: serial,
