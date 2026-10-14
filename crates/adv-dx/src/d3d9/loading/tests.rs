@@ -234,7 +234,13 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
     }
     m.ext.insert(Images::default());
     let state = m.ext.get_mut::<State>();
-    state.gpu = Some(pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap());
+    state.gpu = Some(
+        pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .unwrap(),
+    );
     state.provider.insert = |ext, target| {
         let images = ext.get_mut::<Images>();
         images.next += 1;

@@ -18,7 +18,8 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         _ => GpuBackend::Automatic,
     };
     let mut gpu = pollster::block_on(Gpu::request_backend(
-        matches!(backend, GpuBackend::Automatic) && !cfg!(target_os = "macos"),
+        matches!(backend, GpuBackend::Automatic)
+            && !cfg!(any(target_os = "macos", target_os = "android")),
         backend,
     ))
     .unwrap();

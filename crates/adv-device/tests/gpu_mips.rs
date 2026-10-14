@@ -33,7 +33,11 @@ fn quad() -> [Vertex; 6] {
 
 #[test]
 fn shared_mip_views_clear_upload_copy_and_read_the_actual_subresource() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let chain = gpu.target_levels(8, 4, 4).unwrap();
     assert_eq!(chain.image.mip_levels(), 4);
     assert!(chain.mip_level(4).is_err());
@@ -111,7 +115,11 @@ fn shared_mip_views_clear_upload_copy_and_read_the_actual_subresource() {
 
 #[test]
 fn minification_and_clamped_first_level_sample_written_lower_mips() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let chain = gpu.target_levels(4, 4, 3).unwrap();
     for (level, color) in [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]]
         .into_iter()
@@ -175,14 +183,22 @@ fn minification_and_clamped_first_level_sample_written_lower_mips() {
 #[test]
 // spec: DEV-DEPTH-2
 fn replacing_a_public_target_image_revalidates_the_depth_attachment() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let original = gpu.target(4, 4, true).unwrap();
     let mut bad = original.clone();
     // Larger depth attachments are supported; a smaller one cannot cover the color target.
     bad.image = gpu.image(8, 8).unwrap();
     assert!(gpu.clear(&bad, Some([0.; 4]), Some(1.)).is_err());
     assert!(gpu.draw(&bad, &quad(), None, DrawState::new(8, 8)).is_err());
-    let other = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let other = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     bad.image = other.image(4, 4).unwrap();
     assert!(gpu.clear(&bad, Some([0.; 4]), Some(1.)).is_err());
     assert!(gpu.draw(&bad, &quad(), None, DrawState::new(4, 4)).is_err());

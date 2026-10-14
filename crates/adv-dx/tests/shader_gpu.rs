@@ -110,7 +110,10 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
         "gles" => (false, GpuBackend::Gl),
         "dx12" => (false, GpuBackend::Direct3D12),
         "metal" => (false, GpuBackend::Metal),
-        _ => (!cfg!(target_os = "macos"), GpuBackend::Automatic),
+        _ => (
+            !cfg!(any(target_os = "macos", target_os = "android")),
+            GpuBackend::Automatic,
+        ),
     };
     let mut gpu = pollster::block_on(Gpu::request_backend(fallback, backend))
         .expect("differential GPU adapter");

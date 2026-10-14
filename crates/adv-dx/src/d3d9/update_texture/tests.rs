@@ -39,7 +39,13 @@ impl Fixture {
         let state = m.ext.get_mut::<State>();
         state.com = com;
         state.tables.insert("IDirect3DTexture9", 0);
-        state.gpu = Some(pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap());
+        state.gpu = Some(
+            pollster::block_on(Gpu::request(!cfg!(any(
+                target_os = "macos",
+                target_os = "android"
+            ))))
+            .unwrap(),
+        );
         state.provider.insert = |ext, target| {
             let surfaces = ext.get_mut::<Surfaces>();
             surfaces.next += 1;

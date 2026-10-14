@@ -108,8 +108,11 @@ fn rejected_up_draw_records_the_exact_phase_without_changing_com_ownership() {
 
 #[test]
 fn depth_only_stencil_never_is_ignored_but_real_stencil_and_depth_tests_still_reject_pixels() {
-    let mut gpu =
-        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test drawing adapter");
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .expect("test drawing adapter");
     for (format, z_never, expected) in [
         (80, false, [0, 0, 255, 255]),
         (77, false, [0, 0, 255, 255]),
@@ -262,8 +265,11 @@ fn untransformed_vertices_cover_d3d9_pixel_centres() {
     // Identity transforms: a quad spanning screen x 0.25..4.25 covers the D3D9 centres
     // 1..=4. Host centres sit half a pixel further, so without the offset the GPU
     // would cover columns 0..=3 and point-sampled scenes would land on texel edges.
-    let mut gpu =
-        pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).expect("test drawing adapter");
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .expect("test drawing adapter");
     let mut machine = super::super::tests::machine();
     let color = gpu.target(16, 12, false).unwrap();
     gpu.clear_with_stencil(&color, Some([0., 0., 0., 1.]), None, None)

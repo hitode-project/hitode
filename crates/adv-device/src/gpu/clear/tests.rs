@@ -44,7 +44,11 @@ const FULL: Rect = Rect {
 
 #[test]
 fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_path() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     for alpha in [AlphaMode::Stored, AlphaMode::Opaque] {
         let target = gpu.target(4, 4, false).unwrap().with_alpha_mode(alpha);
         let before = gpu.stats();
@@ -99,7 +103,11 @@ fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_pa
 
 #[test]
 fn selected_partial_depth_and_stencil_preserve_other_components_and_outside_values() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let target = gpu
         .target(4, 4, false)
         .unwrap()
@@ -197,7 +205,11 @@ fn selected_partial_depth_and_stencil_preserve_other_components_and_outside_valu
 
 #[test]
 fn empty_and_invalid_regions_validate_before_submission_without_mutating_the_image() {
-    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let target = gpu.target(4, 4, false).unwrap();
     gpu.clear_region(&target, FULL, Some([1., 0., 0., 1.]), None, None)
         .unwrap();
@@ -242,7 +254,11 @@ fn empty_and_invalid_regions_validate_before_submission_without_mutating_the_ima
     ] {
         assert!(matches!(result, Err(Error::Invalid(_))));
     }
-    let foreign_gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let foreign_gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let foreign = foreign_gpu.target(4, 4, false).unwrap();
     assert!(matches!(
         gpu.clear_region(&foreign, empty, Some([0.; 4]), None, None),

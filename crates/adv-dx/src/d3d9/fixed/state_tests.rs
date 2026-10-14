@@ -263,8 +263,11 @@ mod state_tests {
         targets: BTreeMap<u32, Target>,
     }
     fn gpu(env: &mut Env<'_>) {
-        let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))
-            .expect("test state/reset fixture");
+        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .expect("test state/reset fixture");
         env.ext.insert(Surfaces::default());
         let state = env.ext.get_mut::<State>();
         state.gpu = Some(gpu);

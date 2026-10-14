@@ -170,7 +170,11 @@ fn successful_reset_applies_mode_and_rejected_reset_keeps_previous_mode() {
         released: Vec<u32>,
     }
     let mut m = super::super::tests::machine();
-    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     let mut env = Env {
         context: m.sys.current,
         cpu: &mut m.cpu,

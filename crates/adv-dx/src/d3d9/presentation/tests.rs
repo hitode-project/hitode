@@ -433,8 +433,11 @@ fn pixels(env: &mut Env<'_>, image: &Image) -> Vec<u8> {
 }
 
 fn install_surfaces(env: &mut Env<'_>) {
-    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos")))
-        .expect("software COPY GPU fixture");
+    let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .expect("software COPY GPU fixture");
     env.ext.insert(Surfaces::default());
     let state = env.ext.get_mut::<State>();
     state.gpu = Some(gpu);

@@ -1310,7 +1310,11 @@ mod tests {
     }
     #[test]
     fn sharp_bilinear_preserves_integer_pixels_and_blends_fractional_boundaries() {
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .unwrap();
         let source = gpu.image(2, 2).unwrap();
         let pixels: Vec<_> = [0, 255, 255, 0]
             .into_iter()
@@ -1386,7 +1390,11 @@ mod tests {
     #[test]
     fn video_load_pass_preserves_native_base_and_restores_it_without_a_window() {
         use adv_device::surface::{BlitRect, VideoFrame};
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .unwrap();
         let target = gpu.target(6, 2, false).unwrap();
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
         let base = gpu.present(&target.image, 1).unwrap();
@@ -1528,7 +1536,11 @@ mod tests {
     #[test]
     fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
         use crate::{Upscaler, upscaling::Upscaling};
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .unwrap();
         let (width, height) = (19, 13);
         let source = gpu.image(width, height).unwrap();
         let mut pixels = Vec::new();

@@ -1793,7 +1793,11 @@ mod cache_tests {
 
     #[test]
     fn full_pipeline_cache_evicts_fifo_and_submitted_commands_remain_valid() {
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+            target_os = "macos",
+            target_os = "android"
+        ))))
+        .unwrap();
         assert_eq!(gpu.pipeline_limit, 512);
         assert_eq!(gpu.pipeline_limit, MAX_PIPELINES);
         gpu.pipeline_limit = 2;
