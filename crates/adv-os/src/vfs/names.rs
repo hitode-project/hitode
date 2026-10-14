@@ -1,8 +1,6 @@
-//! Case-insensitive name index for host directories. Games probe for absent
-//! files in directories with thousands of entries, and a fresh scan per probe
-//! costs about a millisecond. An index is reused only while the directory's
-//! modification time is unchanged, and only once that time is old enough that
-//! a later change cannot share its timestamp.
+//! Case-insensitive host directory index with exact-spelling precedence.
+//! Entries are reused while the directory modification time is unchanged.
+//! Recently changed directories are not cached: another change may share their timestamp.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -15,8 +13,29 @@ const SETTLED: Duration = Duration::from_secs(2);
 
 struct Names {
     modified: SystemTime,
-    /// ASCII-lowercased name to the first host spelling `read_dir` returned.
-    names: HashMap<String, OsString>,
+    /// Preserve enumeration order and exact spelling on case-sensitive hosts.
+    names: HashMap<String, Vec<OsString>>,
+    ascii: bool,
+}
+
+fn choose(
+    dir: &Path,
+    name: &str,
+    spellings: Option<&Vec<OsString>>,
+    ascii: bool,
+) -> Option<PathBuf> {
+    // Preserve native short names on Windows and Unicode filesystem folding.
+    if (cfg!(windows) || !ascii || !name.is_ascii()) && dir.join(name).exists() {
+        return Some(dir.join(name));
+    }
+    let spellings = spellings?;
+    // Exact spelling wins if two live host entries differ only by case.
+    if let Some(exact) = spellings.iter().skip(1).find(|s| s.as_os_str() == name)
+        && dir.join(exact).exists()
+    {
+        return Some(dir.join(exact));
+    }
+    Some(dir.join(&spellings[0]))
 }
 
 thread_local! {
@@ -29,36 +48,56 @@ fn key(name: &str) -> String {
 
 /// Host path of the entry in `dir` whose name matches `name` ASCII case-insensitively.
 pub(super) fn find(dir: &Path, name: &str) -> Option<PathBuf> {
-    let modified = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let modified = match std::fs::metadata(dir) {
+        Ok(metadata) => metadata.modified().ok(),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        Err(_) => None,
+    };
     let key = key(name);
     if let Some(modified) = modified {
         let cached = INDEX.with_borrow(|index| {
             let names = index.get(dir).filter(|names| names.modified == modified)?;
-            Some(names.names.get(&key).map(|found| dir.join(found)))
+            Some(choose(dir, name, names.names.get(&key), names.ascii))
         });
         if let Some(found) = cached {
             return found;
         }
     }
-    let mut names = HashMap::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let name = entry.file_name();
-        names
-            .entry(self::key(&name.to_string_lossy()))
-            .or_insert(name);
-    }
-    let found = names.get(&key).map(|found| dir.join(found));
     let settled = modified.filter(|&modified| {
         SystemTime::now()
             .duration_since(modified)
             .is_ok_and(|age| age >= SETTLED)
     });
+    let mut names: HashMap<String, Vec<OsString>> = HashMap::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        names
+            .entry(self::key(&name.to_string_lossy()))
+            .or_default()
+            .push(name);
+    }
+    let ascii = names.keys().all(|name| name.is_ascii());
+    let found = choose(dir, name, names.get(&key), ascii);
     if let Some(modified) = settled {
         INDEX.with_borrow_mut(|index| {
             if index.len() >= MAX_DIRECTORIES && !index.contains_key(dir) {
                 index.clear();
             }
-            index.insert(dir.to_owned(), Names { modified, names });
+            index.insert(
+                dir.to_owned(),
+                Names {
+                    modified,
+                    names,
+                    ascii,
+                },
+            );
         });
     }
     found
@@ -100,6 +139,26 @@ mod tests {
         settle(&root);
         std::fs::remove_file(root.join("Data.PCK")).unwrap();
         assert_eq!(find(&root, "data.pck"), None);
+        std::fs::write(root.join("Case"), b"upper").unwrap();
+        std::fs::write(root.join("case"), b"lower").unwrap();
+        settle(&root);
+        // Exact spelling wins even if a folded directory index already exists.
+        find(&root, "absent");
+        assert_eq!(
+            std::fs::read(find(&root, "Case").unwrap()).unwrap(),
+            std::fs::read(root.join("Case")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(find(&root, "case").unwrap()).unwrap(),
+            std::fs::read(root.join("case")).unwrap()
+        );
+        std::os::unix::fs::symlink("absent", root.join("broken")).unwrap();
+        settle(&root);
+        assert!(!find(&root, "broken").unwrap().exists());
+        std::fs::write(root.join("É.TXT"), b"unicode").unwrap();
+        settle(&root);
+        find(&root, "absent");
+        assert_eq!(find(&root, "é.txt").is_some(), root.join("é.txt").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

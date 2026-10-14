@@ -93,12 +93,7 @@ pub struct Vfs {
 fn ci_find(base: &Path, comps: &[String]) -> Option<PathBuf> {
     let mut cur = base.to_path_buf();
     for c in comps {
-        let exact = cur.join(c);
-        cur = if exact.exists() {
-            exact
-        } else {
-            names::find(&cur, c)?
-        };
+        cur = names::find(&cur, c)?;
     }
     // With no components the base itself may not exist yet (an overlay nothing was written to).
     cur.exists().then_some(cur)

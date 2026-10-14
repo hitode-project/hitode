@@ -10,9 +10,11 @@ const ACCOUNTED: u32 = 1 << 23;
 pub(super) const HEADS: u32 = 0x110;
 pub(super) const RANGES: u32 = 0x310;
 const SLAB: u32 = 0x4000;
+const MAX_SLAB: u32 = 1024 * 1024;
 const LIMIT: usize = 128;
 const REGISTRY_GATE: u32 = 0xb10;
 const REGISTRY_ACTIVE: u32 = 0xb14;
+pub(super) const LAST_SLAB: u32 = 0xb18;
 const REGISTRY: u32 = 0xb20;
 const HEAPS: u32 = 16;
 
@@ -84,11 +86,22 @@ impl Heap {
             if count == LIMIT {
                 return None;
             }
-            if self.free_by_size.range((SLAB, 0)..).next().is_none() {
-                self.grow(cpu, vm, SLAB).ok()?;
+            // Grow only exhausted classes; short-lived classes keep their first
+            // small slab while live bursts need fewer registry slots.
+            let capacity = self
+                .slabs
+                .as_ref()?
+                .iter()
+                .rev()
+                .find(|slab| slab.class == class)
+                .map_or(SLAB, |slab| {
+                    ((slab.end - slab.base).next_power_of_two() * 2).min(MAX_SLAB)
+                });
+            if self.free_by_size.range((capacity, 0)..).next().is_none() {
+                self.grow(cpu, vm, capacity).ok()?;
             }
             let stride = (class + 1) * 8 + 8;
-            let length = SLAB / stride * stride;
+            let length = capacity / stride * stride;
             let base = self.take_free(length)?;
             let slab = Slab {
                 base,
@@ -126,6 +139,7 @@ impl Heap {
                     .ok()?;
             }
             cpu.write_u32(heap + 0x10c, count as u32 + 1).ok()?;
+            cpu.write_u32(heap + LAST_SLAB, count as u32).ok()?;
             addr = base + 8;
             publish(cpu, head, addr)?;
         }
@@ -180,6 +194,7 @@ impl Heaps {
             }
             cpu.write(heap + 0x100, &[0; 0xa10])?;
             cpu.write_u32(heap + 0x100, COOKIE)?;
+            cpu.write_u32(heap + LAST_SLAB, 0)?;
             cpu.write_u32(slot, heap)?;
             self.heaps.get_mut(&heap).expect("created heap").slabs = Some(Vec::new());
             return Ok(true);

@@ -514,3 +514,45 @@ fn accounted_private_blocks_keep_the_host_free_boundary() {
         assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
     }
 }
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn live_small_block_bursts_leave_room_for_other_guest_size_classes() {
+    for jit in [false, true] {
+        let mut m = machine(jit, true);
+        let heap = m.ext.get::<Heaps>().process_heap;
+        let mut last = 0;
+        for _ in 0..70_000 {
+            last = m
+                .ext
+                .get_mut::<Heaps>()
+                .alloc(&mut m.cpu, &mut m.sys.vm, heap, 32, false)
+                .unwrap();
+        }
+        assert!(m.cpu.read_u32(heap + 0x10c).unwrap() < 16);
+        let warm = m
+            .ext
+            .get_mut::<Heaps>()
+            .alloc(&mut m.cpu, &mut m.sys.vm, heap, 4, false)
+            .unwrap();
+        assert!(
+            m.ext
+                .get_mut::<Heaps>()
+                .free(&mut m.cpu, &mut m.sys.vm, heap, warm)
+        );
+        m.cpu.write_u32(heap + 0xb18, u32::MAX).unwrap();
+        let alloc = api(&mut m, "kernel32.dll", "HeapAlloc").unwrap();
+        let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+        m.cpu.write_u32(DATA, heap).unwrap();
+        let mut code = Asm::new(CODE);
+        for _ in 0..64 {
+            private_pair(&mut code, alloc, free, DATA, DATA + 4);
+        }
+        invoke(&mut code, free, &[heap, 0, last], DATA + 12);
+        run(&mut m, code);
+        assert_eq!(m.ext.get::<Calls>().allocate, 0);
+        assert_eq!(m.ext.get::<Calls>().free, 0);
+        assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 1);
+        assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
+    }
+}
