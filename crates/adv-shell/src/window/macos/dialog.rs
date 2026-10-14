@@ -42,6 +42,7 @@ fn kind(control: &DialogControl) -> Kind {
         "edit" => Kind::Edit,
         "combobox" => Kind::Combo,
         "msctls_trackbar32" => Kind::Track,
+        "msctls_statusbar32" => Kind::Label,
         _ => Kind::Unavailable,
     }
 }

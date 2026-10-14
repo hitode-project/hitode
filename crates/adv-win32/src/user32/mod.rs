@@ -30,6 +30,7 @@ mod resources;
 pub(crate) mod rich_edit;
 mod scroll;
 mod station;
+mod status_bar;
 pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
@@ -71,6 +72,7 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         combo: proc(controls::COMBO_PROC)?,
         trackbar: proc(controls::TRACKBAR_PROC)?,
         tab: proc(tab::PROC)?,
+        status_bar: proc(status_bar::PROC)?,
         rich_edit: proc(rich_edit::PROC)?,
     };
     let win32 = m.ext.get_mut::<Win32>();
