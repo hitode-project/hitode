@@ -20,7 +20,11 @@ impl FileSource for File {
 }
 fn padding<B: Backend>(cpu: B, virtual_size: u32, raw_size: u32, next: u32, entry: u32, size: u32) {
     let mut machine = Machine::new(cpu, Registry::default(), Clock::virtual_time()).unwrap();
-    let files = File(fixture::image(virtual_size, raw_size, Some(next), size));
+    let mut image = fixture::image(virtual_size, raw_size, Some(next), size);
+    // NX_COMPAT keeps DEP on, so section protections bound execution.
+    let nt = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+    image[nt + 24 + 71] |= 0x01; // DllCharacteristics 0x100
+    let files = File(image);
     let id = machine.load(&files, "fixture.exe").unwrap();
     let base = adv_os::modules(&machine.ext).get(id).base;
     assert_eq!(base, fixture::BASE);
