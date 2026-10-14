@@ -48,6 +48,7 @@ pub enum Integer {
     /// `div` or `idiv` (true) of EDX:EAX, with the helper that raises #DE.
     Divide(Src, bool, u8),
     Sahf,
+    TestBit(Src, u8),
 }
 
 /// The flags a shift by a count that is not zero writes.
@@ -79,6 +80,7 @@ impl Integer {
             // The helper reads every flag.
             Integer::Divide(..) => (F::NONE, F::NONE, true),
             Integer::Sahf => (F::NONE, F::ALL.minus(F::OF), false),
+            Integer::TestBit(src, _) => (F::NONE, F::CF, mem(src)),
         }
     }
 }
@@ -163,6 +165,9 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         }
         M::Div | M::Idiv => Integer::Divide(operand(0)?, mnemonic == M::Idiv, helper),
         M::Sahf => Integer::Sahf,
+        M::Bt if instruction.op1_kind() == OpKind::Immediate8 => {
+            Integer::TestBit(operand(0)?, instruction.immediate8() & 31)
+        }
         _ => return None,
     })
 }
@@ -182,6 +187,14 @@ impl Translator<'_> {
             Integer::Multiply(src, signed) => self.multiply(src, signed),
             Integer::Divide(src, signed, helper) => self.divide(src, signed, helper),
             Integer::Sahf => self.sahf(),
+            Integer::TestBit(src, bit) => {
+                let source = self.source(src);
+                self.convert(FlagSet::ALL.minus(FlagSet::CF));
+                self.insert_flags(Some((source, u32::from(bit))), None);
+                self.state.sense = Sense::Addition;
+                self.state.carry = Carry::Host;
+                self.state.derivable = None;
+            }
         }
     }
 

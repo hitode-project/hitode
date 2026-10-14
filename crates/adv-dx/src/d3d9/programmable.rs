@@ -9,6 +9,19 @@ use adv_device::gpu::{
 mod source;
 #[cfg(test)]
 mod tests;
+// Generational shader identities cover immutable declarations and sampler slots.
+// Only input registers and formats affect the assembled entry points.
+#[derive(PartialEq, Eq, Hash)]
+struct ProgramKey {
+    vertex: Option<Id>,
+    pixel: Option<Id>,
+    inputs: Vec<(u32, AttributeFormat)>,
+}
+#[derive(Default)]
+pub(super) struct ProgramCache {
+    entries: std::collections::HashMap<ProgramKey, Program>,
+    bytes: usize,
+}
 pub(super) fn register(registry: &mut Registry) {
     registry.register(set_clip_plane_ABI);
     registry.register(get_clip_plane_ABI);
@@ -171,6 +184,7 @@ fn inputs(env: &Env<'_>, pointer: u32, vs: &Shader) -> Result<Vec<Input>, u32> {
     Ok(result)
 }
 struct StageProgram {
+    id: Id,
     parsed: std::sync::Arc<Shader>,
     translation: std::sync::Arc<Translation>,
 }
@@ -178,6 +192,7 @@ fn stage(env: &Env<'_>, id: Option<Id>) -> Result<Option<StageProgram>, u32> {
     id.map(|id| {
         let s = shaders::bound(env, id).ok_or(INVALID)?;
         Ok(StageProgram {
+            id,
             parsed: s.parsed.clone(),
             translation: s.translation.as_ref().map_err(|_| UNAVAILABLE)?.clone(),
         })
@@ -511,18 +526,6 @@ fn prepare_checked(
             sampler: draw.state.sampler,
         });
     }
-    let source = source::build(
-        vs.as_ref().map(|s| s.parsed.as_ref()),
-        ps.as_ref().map(|s| s.parsed.as_ref()),
-        vt,
-        pt,
-        &input_spec,
-        &slots,
-    )?;
-    let program = Program {
-        source: source.into(),
-        textures: slots.iter().map(|s| s.0).collect(),
-    };
 
     let v = draw.state.viewport;
     let mut parameters = [[0; 4]; 40];
@@ -593,12 +596,45 @@ fn prepare_checked(
             0.,
         ];
     }
+    let vertex_constants = constants(&d.shaders.vertex_constants);
+    let key = ProgramKey {
+        vertex: vs.as_ref().map(|s| s.id),
+        pixel: ps.as_ref().map(|s| s.id),
+        inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
+    };
+    let cache = &mut env.ext.get_mut::<State>().programs;
+    let program = if let Some(program) = cache.entries.get(&key) {
+        program.clone()
+    } else {
+        let source = source::build(
+            vs.as_ref().map(|s| s.parsed.as_ref()),
+            ps.as_ref().map(|s| s.parsed.as_ref()),
+            vt,
+            pt,
+            &input_spec,
+            &slots,
+        )?;
+        let program = Program {
+            source: source.into(),
+            textures: slots.iter().map(|s| s.0).collect(),
+        };
+        const MAX_BYTES: usize = 8 * 1024 * 1024;
+        if program.source.len() <= MAX_BYTES {
+            if cache.entries.len() == 256 || cache.bytes + program.source.len() > MAX_BYTES {
+                cache.entries.clear();
+                cache.bytes = 0;
+            }
+            cache.bytes += program.source.len();
+            cache.entries.insert(key, program.clone());
+        }
+        program
+    };
     draw.programmable = Some(ProgrammableDraw {
         program,
         streams,
         indices: output_indices,
         vertex_count,
-        vertex_constants: constants(&d.shaders.vertex_constants),
+        vertex_constants,
         pixel_constants,
         textures: bindings,
         parameters,

@@ -58,6 +58,7 @@ pub(super) fn machine() -> Machine<JitCpu> {
         shader_caps: ShaderCaps::default(),
         shader_stats: ShaderStats::default(),
         shader_translations: shaders::TranslationCache::default(),
+        programs: programmable::ProgramCache::default(),
         shader_cache: None,
     });
     m

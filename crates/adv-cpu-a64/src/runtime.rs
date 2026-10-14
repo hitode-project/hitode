@@ -81,6 +81,9 @@ pub struct Runtime {
     /// The page class table: a byte per guest page, its permissions as
     /// `Memory::native_permissions` has them.
     pub classes: u64,
+    /// The ordinary-memory alias and raw permission table, biased to guest zero.
+    pub alias: u64,
+    pub alias_classes: u64,
     /// `interpret(runtime, helper, countdown) -> status`, called by
     /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
     /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
@@ -111,6 +114,8 @@ impl Runtime {
             resume: 0,
             access: 0,
             classes: 0,
+            alias: 0,
+            alias_classes: 0,
             interpret: 0,
             exit: 0,
             temps: [0; 2],
@@ -212,6 +217,8 @@ const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
+pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
+pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));
