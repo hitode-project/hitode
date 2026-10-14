@@ -416,10 +416,12 @@ fn equal_rectangles_clip_source_and_destination_together_without_shifting_pixels
 #[derive(Default)]
 struct Surfaces {
     next: u32,
+    serial: u64,
     targets: BTreeMap<u32, Target>,
     frames: Vec<NativeFrame>,
 }
 fn pixels(env: &mut Env<'_>, image: &Image) -> Vec<u8> {
+    super::super::tests::flush_recordings(env);
     let mut transfer = env
         .ext
         .get_mut::<State>()
@@ -458,12 +460,19 @@ fn install_surfaces(env: &mut Env<'_>) {
     };
     state.provider.present = |ext, surface, gpu| {
         let surfaces = ext.get_mut::<Surfaces>();
-        let serial = surfaces.frames.len() as u64 + 1;
+        let serial = surfaces.serial + 1;
         let frame = gpu.present(&surfaces.targets[&surface].image, serial)?;
         surfaces.frames.push(frame);
+        surfaces.serial = serial;
         Ok(serial)
     };
     state.provider.present_copy = state.provider.present;
+    state.provider.presentation_serial = |ext| Some(ext.get::<Surfaces>().serial);
+    state.provider.repeat = |ext, _| {
+        let s = ext.get_mut::<Surfaces>();
+        s.serial += 1;
+        Ok(s.serial)
+    };
 }
 
 #[test]
@@ -533,13 +542,19 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     assert_ne!(front, surface);
     assert_eq!(env.ext.get::<Surfaces>().targets.len(), 2);
     // Rendering after Present changes the original target but not its frame snapshot.
-    env.ext
-        .get_mut::<State>()
-        .gpu
-        .as_mut()
-        .unwrap()
-        .clear(&target, Some([0.0, 1.0, 0.0, 1.0]), None)
-        .unwrap();
+    assert!(matches!(
+        super::super::clear(
+            &mut env,
+            GuestPtr::new(pointer),
+            0,
+            GuestPtr::new(0),
+            1,
+            0xff00ff00,
+            1.0,
+            0
+        ),
+        Outcome::Return(0)
+    ));
     let green = [0u8, 255, 0, 255].repeat(16 * 12);
     assert_eq!(pixels(&mut env, &target.image), green);
     assert_eq!(pixels(&mut env, &snapshot), expected);

@@ -17,6 +17,9 @@ pub(super) struct Reader {
     start: u32,
 }
 impl Reader {
+    pub(super) fn key(&self) -> u64 {
+        super::super::recording::hash(&self.raw)
+    }
     pub(super) fn new(
         env: &Env<'_>,
         device: u32,

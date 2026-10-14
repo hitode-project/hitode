@@ -25,6 +25,10 @@ fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
 }
 fn machine(gpu: bool) -> (Machine<JitCpu>, u32) {
     let mut m = super::super::tests::machine();
+    if gpu {
+        m.sys.objects = Objects::default();
+        m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
+    }
     m.cpu.map(STACK, 4096, Prot::RW).unwrap();
     m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
     m.spawn("fixture", 0x400000, &[], 65536).unwrap();
@@ -113,6 +117,7 @@ fn image(m: &mut Machine<JitCpu>, texture: u32, level: usize) -> Image {
     e.ext.get::<Surfaces>().targets[&surface].image.clone()
 }
 fn pixels(m: &mut Machine<JitCpu>, image: &Image) -> Vec<u8> {
+    super::super::tests::flush_recordings(&mut env(m));
     let mut transfer = m
         .ext
         .get_mut::<State>()
@@ -359,6 +364,7 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     let target = image(&mut m, texture, 0);
     let storage = resources::resource(&env(&mut m), texture).unwrap().storage;
     m.cpu.write(storage, &[0x66; 64]).unwrap();
+    super::super::tests::force_recording_limit(&mut env(&mut m), device);
     let pause = m
         .ext
         .get::<State>()
@@ -380,6 +386,7 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     assert!(!resources::resource(&env(&mut m), texture).unwrap().levels[0].dirty);
     assert!(m.ext.get::<State>().pending.is_empty());
     let objects = m.sys.objects.object_count();
+    super::super::tests::force_recording_limit(&mut env(&mut m), device);
     let pause = m
         .ext
         .get::<State>()

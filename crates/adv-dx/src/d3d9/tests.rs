@@ -26,6 +26,8 @@ pub(super) fn machine() -> Machine<JitCpu> {
         replace: |_, _, _| unreachable!(),
         present: |_, _, _| unreachable!(),
         present_copy: |_, _, _| unreachable!(),
+        repeat: |_, _| unreachable!(),
+        presentation_serial: |_| Some(0),
         window: |_, _, _| Some((16, 12)),
         visible: |_, _, _| Some(false),
         fast_forward: |_| false,
@@ -60,6 +62,8 @@ pub(super) fn machine() -> Machine<JitCpu> {
         shader_translations: shaders::TranslationCache::default(),
         programs: programmable::ProgramCache::default(),
         shader_cache: None,
+        frames: FrameCounters::default(),
+        verify_frames: false,
     });
     m
 }
@@ -131,6 +135,8 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             fixed: fixed::Fixed::new(16, 12),
             shaders: shaders::Bindings::default(),
             recording: None,
+            frame: recording::Recording::default(),
+            gpu_lost: false,
         })),
     )
     .unwrap();
@@ -420,4 +426,34 @@ fn get_direct3d_output_fault_and_reference_limit_do_not_retain_or_partially_publ
     assert_eq!(get_direct3d(&mut env, GuestPtr::new(device), output), 0);
     assert_eq!(output.read(env.cpu).unwrap(), original);
     assert_eq!(com(&env).references(&env.sys.objects, owner), Some(1));
+}
+
+/// Backend pixel assertions bypass guest readback APIs, so explicitly commit
+/// recorded commands before asking Gpu for those pixels.
+pub(in crate::d3d9) fn flush_recordings(env: &mut Env<'_>) {
+    let ids: Vec<_> = env
+        .sys
+        .objects
+        .hosts_in::<adv_os::com::ComObject<Payload>>(com(env).namespace())
+        .filter_map(|(id, _)| {
+            matches!(
+                com(env).get_identity(&env.sys.objects, id),
+                Some(Payload::Device(_))
+            )
+            .then_some(id)
+        })
+        .collect();
+    for owner in ids {
+        let token = 1;
+        recording::flush(env, owner, token, recording::Reason::Readback).unwrap();
+        recording::unlock(env, owner, token);
+    }
+}
+/// Exercise the real Busy continuation through a recording capacity boundary.
+pub(in crate::d3d9) fn force_recording_limit(env: &mut Env<'_>, pointer: u32) {
+    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
+    else {
+        panic!()
+    };
+    d.frame.force_limit();
 }

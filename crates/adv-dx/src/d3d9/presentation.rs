@@ -8,6 +8,16 @@ pub(super) struct Copy {
     height: u32,
     transfer: Option<Transfer>,
 }
+impl Copy {
+    pub(super) fn key(self) -> u64 {
+        super::recording::hash((
+            self.width,
+            self.height,
+            self.transfer
+                .map(|t| (super::recording::rect(t.source), t.x, t.y)),
+        ))
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Transfer {
     source: Rect,

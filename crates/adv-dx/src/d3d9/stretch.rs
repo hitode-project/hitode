@@ -271,4 +271,4 @@ pub(super) fn copy(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

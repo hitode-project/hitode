@@ -51,22 +51,40 @@ fn child_gpu_reuses_host_context_and_survives_parent_teardown() {
     // consume an image from it. Each frontend keeps its own transfer budget.
     let mut parent_transfer = parent.readback(&parent_target.image, None).unwrap();
     let mut child_transfer = child.readback(&child_target.image, None).unwrap();
-    assert!(matches!(
-        parent.readback(&parent_target.image, None),
-        Err(Error::Busy)
-    ));
-    assert!(matches!(
-        child.readback(&child_target.image, None),
-        Err(Error::Busy)
-    ));
+    // Queue submission may deliver an older map callback on software Vulkan.
+    // Capacity is released at callback completion, not at Consumer::poll.
+    let parent_ready = match parent.readback(&parent_target.image, None) {
+        Err(Error::Busy) => None,
+        Ok(extra) => {
+            let pixels = parent_transfer
+                .poll()
+                .expect("capacity released only after completion")
+                .unwrap();
+            extra.cancel();
+            Some(pixels)
+        }
+        Err(error) => panic!("unexpected parent transfer failure: {error:?}"),
+    };
+    let child_ready = match child.readback(&child_target.image, None) {
+        Err(Error::Busy) => None,
+        Ok(extra) => {
+            let pixels = child_transfer
+                .poll()
+                .expect("capacity released only after completion")
+                .unwrap();
+            extra.cancel();
+            Some(pixels)
+        }
+        Err(error) => panic!("unexpected child transfer failure: {error:?}"),
+    };
     parent_transfer.take_completion_job().unwrap()();
     child_transfer.take_completion_job().unwrap()();
     assert_eq!(
-        parent_transfer.poll().unwrap().unwrap(),
+        parent_ready.unwrap_or_else(|| parent_transfer.poll().unwrap().unwrap()),
         [0, 0, 255, 255].repeat(2)
     );
     assert_eq!(
-        child_transfer.poll().unwrap().unwrap(),
+        child_ready.unwrap_or_else(|| child_transfer.poll().unwrap().unwrap()),
         [255, 0, 0, 255].repeat(2)
     );
     assert_eq!(
@@ -759,6 +777,7 @@ fn actual_software_adapter_clear_and_draw() {
     color_texture_blend_clip_depth_and_native_frame_readback(true);
 }
 
+// spec: GFX-REC-2
 #[test]
 fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     use adv_device::surface::{PixelFormat, Snapshot, SurfaceMemory, Surfaces, frame_mailbox};
@@ -829,6 +848,15 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     );
     let native_frame = consumer.current().native().unwrap().clone();
     assert_eq!(native_frame.serial, 100);
+    let before = gpu.stats();
+    assert_eq!(surfaces.repeat_native_frame(native).unwrap(), 101);
+    assert_eq!(surfaces.stats.presentations, 101);
+    assert!(!consumer.update(), "repeat publishes no mailbox frame");
+    assert_eq!(consumer.current().native().unwrap().serial, 100);
+    assert_eq!(surfaces.latest_native_frame().unwrap().serial, 100);
+    assert_eq!(gpu.stats(), before);
+    assert!(surfaces.repeat_native_frame(software).is_err());
+    assert_eq!(surfaces.stats.presentations, 101);
     assert!(
         consumer
             .current()
@@ -846,7 +874,7 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     );
     let mut snapshot = Snapshot::default();
     consumer.current().snapshot(&mut snapshot).unwrap();
-    assert_eq!(snapshot.frames, 101);
+    assert_eq!(snapshot.frames, 102);
     assert_eq!(
         pixel(&read(&mut gpu, &native_frame.image), 16, 8, 8),
         [0, 255, 0, 255]
@@ -855,6 +883,13 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     assert!(!surfaces.contains(native));
     assert!(surfaces.native_target(native).is_none());
     assert_eq!(surfaces.live_surfaces(), 1);
+    let mut child = Surfaces::new(16, 16, 0x1000, 0x10000, Snapshot::default()).unwrap();
+    assert_eq!(surfaces.output_serial(), Some(102));
+    assert!(surfaces.transfer_frame_mailbox_to(&mut child).unwrap());
+    assert_eq!(surfaces.output_serial(), None);
+    assert_eq!(child.output_serial(), Some(102));
+    assert!(child.transfer_frame_mailbox_to(&mut surfaces).unwrap());
+    assert_eq!(surfaces.output_serial(), Some(102));
     eprintln!("mailbox GPU stats: {:?}", gpu.stats());
 }
 

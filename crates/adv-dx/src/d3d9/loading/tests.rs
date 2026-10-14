@@ -263,6 +263,7 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
         .surface
         .unwrap();
     let image = m.ext.get::<Images>().targets[&surface].image.clone();
+    super::super::tests::flush_recordings(&mut env(&mut m));
     let mut transfer = m
         .ext
         .get_mut::<State>()

@@ -380,6 +380,8 @@ fn prepare_checked(
                 vertices: Vec::new(),
                 texcoords: None,
                 programmable: None,
+                recording_key: recording::draw_key(env, pointer),
+                program_key: 0,
             },
             streams,
             inputs,
@@ -602,6 +604,7 @@ fn prepare_checked(
         pixel: ps.as_ref().map(|s| s.id),
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
     };
+    draw.program_key = recording::hash(&key);
     let cache = &mut env.ext.get_mut::<State>().programs;
     let program = if let Some(program) = cache.entries.get(&key) {
         program.clone()

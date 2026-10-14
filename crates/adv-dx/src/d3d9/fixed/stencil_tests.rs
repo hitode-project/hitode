@@ -231,6 +231,7 @@ fn depth_only_stencil_never_is_ignored_but_real_stencil_and_depth_tests_still_re
         assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), aliases);
         assert_eq!(env.sys.objects.strong_count(owner), refs);
         assert!(env.ext.get::<State>().pending.is_empty());
+        super::super::tests::flush_recordings(&mut env);
         let mut transfer = env
             .ext
             .get_mut::<State>()
@@ -318,6 +319,7 @@ fn untransformed_vertices_cover_d3d9_pixel_centres() {
         draw_up(&mut env, this, 5, 2, GuestPtr::new(vertices), 16),
         Outcome::Return(0)
     ));
+    super::super::tests::flush_recordings(&mut env);
     let mut transfer = env
         .ext
         .get_mut::<State>()

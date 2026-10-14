@@ -64,6 +64,8 @@ impl Fixture {
                     replace: |_, _, _| panic!("DxDiag never replaces surfaces"),
                     present: |_, _, _| panic!("DxDiag never presents"),
                     present_copy: |_, _, _| panic!("DxDiag never presents"),
+                    repeat: |_, _| panic!("DxDiag never presents"),
+                    presentation_serial: |_| Some(0),
                     window: |_, _, _| None,
                     visible: |_, _, _| None,
                     fast_forward: |_| false,

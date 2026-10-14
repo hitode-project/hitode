@@ -87,6 +87,8 @@ pub(super) struct Draw {
     pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
     pub state: DrawState,
     pub programmable: Option<adv_device::gpu::ProgrammableDraw>,
+    pub recording_key: u64,
+    pub program_key: u64,
 }
 pub(super) struct Rejected {
     pub code: u32,
@@ -1041,6 +1043,7 @@ fn prepare_input_checked(
         .and_then(|v| v.iter().max().copied())
         .unwrap_or(length - 1);
     let mut input = input::Reader::new(env, pointer, layout, source, first, last)?;
+    let mut input_key = super::recording::hash(indices);
     let mut vertices = Vec::with_capacity(length as usize);
     let coordinate_count = layout.coordinate_count();
     let mut texcoords = if layout.extended_coordinates() {
@@ -1065,6 +1068,7 @@ fn prepare_input_checked(
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         input.read(env, index)?;
+        input_key = super::recording::hash((input_key, input.key()));
         let word = |stream: u16, at: u32| input.word(stream, at);
         let float = |stream, at| f32::from_le_bytes(word(stream, at));
         let at = layout.position;
@@ -1156,6 +1160,11 @@ fn prepare_input_checked(
         texcoords: texcoords.map(|values| (coordinate_count, values)),
         state,
         programmable: None,
+        recording_key: super::recording::hash((
+            super::recording::draw_key(env, pointer),
+            input_key,
+        )),
+        program_key: 0,
     })
 }
 pub(super) fn prepare_state(

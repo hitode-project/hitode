@@ -38,6 +38,14 @@ pub(super) fn leased(env: &Env<'_>, r: &Resource) -> bool {
 
 #[win32(d3d9, name = "IDirect3DSurface9::GetDC", level = implement)]
 fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome {
+    if let Some(r) = resources::resource(env, this.addr()) {
+        let owner = r.device;
+        if recording::has_work(env, owner) {
+            return recording::barrier(env, owner, recording::Reason::Dc, move |env| {
+                get(env, this, output)
+            });
+        }
+    }
     if adv_abi::guest::check_range(env.cpu, output.addr(), 4, Prot::WRITE).is_err() {
         return Outcome::Return(INVALID);
     }

@@ -64,6 +64,7 @@ fn write_vertex(m: &mut Machine<adv_cpu::JitCpu>, pointer: u32, offset: u32, byt
     okay(invoke(m, "IDirect3DVertexBuffer9::Unlock", &[pointer]));
 }
 fn pixels(m: &mut Machine<adv_cpu::JitCpu>, target: &Target) -> Vec<u8> {
+    super::super::super::tests::flush_recordings(&mut env(m));
     let mut transfer = m
         .ext
         .get_mut::<State>()

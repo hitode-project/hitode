@@ -24,7 +24,13 @@ pub(super) struct PendingTransfer {
     lock_output: Option<GuestPtr<D3DLOCKED_RECT>>,
 }
 pub(super) fn register(registry: &mut Registry) {
-    for api in [create_offscreen_ABI, transfer_ABI, lock_ABI, unlock_ABI] {
+    for api in [
+        create_offscreen_ABI,
+        transfer_ABI,
+        front_ABI,
+        lock_ABI,
+        unlock_ABI,
+    ] {
         registry.register(api);
     }
 }
@@ -158,6 +164,14 @@ pub(super) fn lock_internal(
     rect: GuestPtr<RECT>,
     flags: u32,
 ) -> Outcome {
+    if let Some(r) = resources::resource(env, this.addr()) {
+        let owner = r.device;
+        if recording::has_work(env, owner) {
+            return recording::barrier(env, owner, recording::Reason::Lock, move |env| {
+                lock_internal(env, this, output, rect, flags)
+            });
+        }
+    }
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
         return Outcome::Return(resources::texture_lock(
             env,
@@ -400,6 +414,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
 /// Surface upload retries reserve the existing lock. Failure leaves it usable
 /// for retry; cancellation of its guest continuation releases the reservation.
 pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled: bool) {
+    recording::cancel(env, operation);
     if let Operation::Upload {
         resource, level, ..
     } = operation
@@ -429,6 +444,13 @@ pub(super) fn transfer(
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
 ) -> Outcome {
+    if let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr())
+        && recording::has_work(env, owner)
+    {
+        return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
+            transfer(env, this, source, destination)
+        });
+    }
     let Some(owner) = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .filter(|_| device(env, this.addr()).is_some())
@@ -719,3 +741,33 @@ pub(super) fn pump(env: &mut Env<'_>) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+// Front-buffer capture remains unsupported and terminates through its existing
+// failure contract. Flush accepted work before that boundary, without inventing
+// successful capture or pixels for an API that has no implementation.
+#[win32(d3d9,name="IDirect3DDevice9::GetFrontBufferData",level=safe_fail)]
+fn front(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _chain: u32,
+    _destination: GuestPtr<()>,
+) -> Outcome {
+    let failed = |env: &mut Env<'_>| {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::GetFrontBufferData",
+            "front-buffer capture is unsupported",
+        );
+        Outcome::Fail("unimplemented: d3d9.dll!IDirect3DDevice9::GetFrontBufferData".into())
+    };
+    if let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) {
+        recording::barrier(
+            env,
+            recording::owner(env, owner),
+            recording::Reason::Readback,
+            failed,
+        )
+    } else {
+        failed(env)
+    }
+}

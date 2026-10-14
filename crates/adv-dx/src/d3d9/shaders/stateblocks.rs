@@ -63,7 +63,7 @@ pub(in crate::d3d9) struct Snapshot {
 }
 pub(in crate::d3d9) struct StateBlock {
     pointer: u32,
-    device: Id,
+    pub(in crate::d3d9) device: Id,
     snapshot: Arc<Snapshot>,
 }
 impl Snapshot {

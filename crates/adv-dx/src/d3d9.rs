@@ -26,6 +26,7 @@ mod pacing;
 mod presentation;
 mod programmable;
 mod readback;
+mod recording;
 mod residency;
 pub(crate) mod saving;
 mod stretch;
@@ -65,6 +66,10 @@ pub struct SurfaceProvider {
     pub present: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
     /// Snapshot a preserved COPY front without rotating its writable target.
     pub present_copy: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
+    /// Complete a guest Present without publishing or executing a GPU command.
+    pub repeat: fn(&mut Ext, u32) -> Result<u64, Error>,
+    /// Shared serial includes other devices, GDI, DirectDraw and video fronts.
+    pub presentation_serial: fn(&Ext) -> Option<u64>,
     pub window: fn(&Ext, &Objects, u32) -> Option<(u32, u32)>,
     pub visible: fn(&Ext, &Objects, u32) -> Option<bool>,
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
@@ -107,6 +112,8 @@ struct Device {
     fixed: fixed::Fixed,
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
+    frame: recording::Recording,
+    gpu_lost: bool,
 }
 pub struct State {
     com: Com,
@@ -128,6 +135,8 @@ pub struct State {
     shader_translations: shaders::TranslationCache,
     programs: programmable::ProgramCache,
     shader_cache: Option<std::path::PathBuf>,
+    frames: FrameCounters,
+    verify_frames: bool,
 }
 /// Shader model capability gates. SM2 passed its differential fixtures and the
 /// engine matrix and is reported by default; SM3 stays an explicit opt-in.
@@ -172,7 +181,9 @@ pub struct Diagnostics {
     pub pending_readbacks: usize,
     pub gpu: Option<adv_device::gpu::Stats>,
     pub shaders: ShaderStats,
+    pub frames: FrameCounters,
 }
+pub use recording::Counters as FrameCounters;
 pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
     let state = ext.get::<State>();
     Diagnostics {
@@ -181,6 +192,7 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
         pending_readbacks: state.transfers.len(),
         gpu: state.gpu.as_ref().map(|g| g.stats()),
         shaders: state.shader_stats,
+        frames: state.frames,
     }
 }
 // Keep ordinary hot commands inline. Only a parked command requires allocation.
@@ -194,6 +206,8 @@ enum Operation {
         stencil: Option<u32>,
     },
     Present {
+        owner: Id,
+        token: u64,
         surface: u32,
         deadline: Option<u64>,
         copy: Option<(Id, presentation::Copy)>,
@@ -215,6 +229,12 @@ enum Operation {
         resources: [Id; 2],
     },
     Draw(fixed::Draw),
+    Flush {
+        owner: Id,
+        token: u64,
+        reason: recording::Reason,
+    },
+    Consumed,
 }
 struct Pending {
     context: u32,
@@ -332,6 +352,8 @@ pub fn install<B: Backend>(
         shader_translations: shaders::TranslationCache::default(),
         programs: programmable::ProgramCache::default(),
         shader_cache: None,
+        frames: FrameCounters::default(),
+        verify_frames: std::env::var("ADV_VERIFY_FRAMES").as_deref() == Ok("1"),
     });
     Ok(())
 }
@@ -373,6 +395,7 @@ pub fn fork_host_state(parent: &Ext, child: &mut Ext) -> Result<(), String> {
     destination.copy = source.copy;
     destination.shader_caps = source.shader_caps;
     destination.shader_cache = source.shader_cache.clone();
+    destination.verify_frames = source.verify_frames;
     if let Some(gpu) = gpu {
         set_gpu(child, gpu)?;
     }
@@ -442,6 +465,7 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
             destroy(env, factory);
         }
     } else if let Payload::Resource(resource) = destroyed.value {
+        recording::forget(env, resource.device, resource.pointer);
         resources::destroy(env, resource);
     } else if let Payload::Buffer(buffer) = destroyed.value {
         buffers::destroy(env, buffer);
@@ -452,14 +476,18 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         free(env, pointer);
     }
 }
+fn release_parent(env: &Env<'_>, pointer: u32) -> Option<Id> {
+    let pointer = resources::container_pointer(env, pointer).unwrap_or(pointer);
+    resources::parent_on_last_public_release(env, pointer)
+        .or_else(|| buffers::parent_on_last_public_release(env, pointer))
+        .or_else(|| declaration::parent_on_last_public_release(env, pointer))
+        .or_else(|| shaders::parent_on_last_public_release(env, pointer))
+}
 fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     if let Some(parent) = resources::container_pointer(env, pointer) {
         return release(env, parent);
     }
-    let parent = resources::parent_on_last_public_release(env, pointer)
-        .or_else(|| buffers::parent_on_last_public_release(env, pointer))
-        .or_else(|| declaration::parent_on_last_public_release(env, pointer))
-        .or_else(|| shaders::parent_on_last_public_release(env, pointer));
+    let parent = release_parent(env, pointer);
     let Some(released) = com(env).release::<Payload>(&mut env.sys.objects, pointer) else {
         return 0;
     };
@@ -567,8 +595,28 @@ macro_rules! unknown {
             add_ref(env, this.addr()).unwrap_or(0)
         }
         #[win32(d3d9, name = $r, level = implement)]
-        fn $release(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-            release(env, this.addr())
+        fn $release(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+            let Some(id) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) else {
+                return Outcome::Return(0);
+            };
+            let owner = recording::owner(env, id);
+            // Commands own their data/images, so transient buffer, shader or
+            // state-block releases need no flush. Guard parent device teardown.
+            let refs = com(env).references(&env.sys.objects, owner);
+            let stateblock_last = matches!(
+                com(env).get_identity(&env.sys.objects, id),
+                Some(Payload::StateBlock(_))
+            ) && com(env).references(&env.sys.objects, id) == Some(1);
+            if owner != id
+                && refs != Some(0)
+                && !(refs == Some(1)
+                    && (stateblock_last || release_parent(env, this.addr()) == Some(owner)))
+            {
+                return Outcome::Return(release(env, this.addr()));
+            }
+            recording::barrier(env, owner, recording::Reason::Release, move |env| {
+                Outcome::Return(release(env, this.addr()))
+            })
         }
     };
 }
@@ -892,6 +940,8 @@ fn create_device(
         fixed,
         shaders: shaders::Bindings::default(),
         recording: None,
+        frame: recording::Recording::default(),
+        gpu_lost: false,
     };
     let Some((pointer, id)) = object(
         env,
@@ -983,6 +1033,9 @@ fn cooperative(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if device(env, this.addr()).unwrap().needs_reset {
         return DEVICE_NOT_RESET;
     }
+    if device(env, this.addr()).unwrap().gpu_lost {
+        return DEVICE_LOST;
+    }
     env.ext
         .get::<State>()
         .gpu
@@ -998,6 +1051,13 @@ fn reset(
     this: GuestPtr<()>,
     parameters: GuestPtr<D3DPRESENT_PARAMETERS>,
 ) -> Outcome {
+    if let Some(id) = com(env).identity::<Payload>(&env.sys.objects, this.addr())
+        && recording::has_work(env, id)
+    {
+        return recording::barrier(env, id, recording::Reason::Reset, move |env| {
+            reset(env, this, parameters)
+        });
+    }
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
@@ -1103,6 +1163,8 @@ fn reset(
         d.depth_stencil = new_depth;
         d.texture = None;
         d.needs_reset = false;
+        d.gpu_lost = false;
+        d.frame = recording::Recording::default();
         d.creation.reset();
         d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
         d.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
@@ -1146,7 +1208,7 @@ fn end_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     d.scene = false;
     0
 }
-fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
+fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
     let provider = env.ext.get::<State>().provider;
     let mut gpu = env
         .ext
@@ -1168,35 +1230,27 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
             surface,
             deadline,
             copy,
+            ..
         } => {
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {
-                (provider.present)(env.ext, *surface, &mut gpu)
+                // DISCARD permits preserving the writable target. Snapshotting
+                // keeps it consistent with the content identity after Present.
+                (provider.present_copy)(env.ext, *surface, &mut gpu)
             };
             result.map(|serial| Completion::Presented(serial, *deadline))
         }
         Operation::Upload {
-            resource,
-            level,
+            resource: _,
+            level: _,
             target,
             pixels,
             pitch,
             rectangle,
         } => gpu
             .upload(&target.image, *rectangle, *pitch, pixels)
-            .map(|()| {
-                if let Some(Payload::Resource(r)) =
-                    com(env).get_identity_mut(&mut env.sys.objects, *resource)
-                {
-                    if let Some(level) = level {
-                        r.levels[*level as usize].lock = None;
-                    } else {
-                        r.lock = None;
-                    }
-                }
-                Completion::Command
-            }),
+            .map(|()| Completion::Command),
         Operation::Draw(draw) => {
             let result = if let Some(program) = &draw.programmable {
                 gpu.draw_programmable(&draw.target, program, &draw.state)
@@ -1219,6 +1273,8 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
             ..
         } => stretch::copy(&mut gpu, source, *rectangle, destination, *region, *filter)
             .map(|()| Completion::Command),
+        Operation::Consumed => Ok(Completion::Command),
+        Operation::Flush { .. } => unreachable!("flush is executed by the recording owner"),
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);
     result
@@ -1245,6 +1301,35 @@ fn gpu_error(error: Error) -> Outcome {
     }
 }
 fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
+    recording::record(env, owner, operation)
+}
+fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
+    match operation {
+        Operation::Present { owner, .. } => {
+            let result = recording::present(env, operation);
+            if matches!(result, Err(Error::Device(_)))
+                && let Some(Payload::Device(d)) =
+                    com(env).get_identity_mut(&mut env.sys.objects, *owner)
+            {
+                d.gpu_lost = true;
+            }
+            result
+        }
+        Operation::Flush {
+            owner,
+            token,
+            reason,
+        } => {
+            let result = recording::flush(env, *owner, *token, *reason);
+            if !matches!(result, Err(Error::Busy)) {
+                recording::unlock(env, *owner, *token);
+            }
+            result
+        }
+        _ => execute_gpu(env, operation),
+    }
+}
+fn dispatch_now(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
     match execute(env, &operation) {
         Ok(value) => completed(env, value),
         Err(Error::Busy) => {
@@ -1508,13 +1593,8 @@ fn present(
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
-    dispatch(
-        env,
-        id,
-        Operation::Present {
-            surface,
-            deadline,
-            copy: copy.map(|copy| (id, copy)),
-        },
-    )
+    if device(env, this.addr()).unwrap().gpu_lost {
+        return Outcome::Return(DEVICE_LOST);
+    }
+    recording::present_operation(env, id, surface, deadline, copy.map(|copy| (id, copy)))
 }

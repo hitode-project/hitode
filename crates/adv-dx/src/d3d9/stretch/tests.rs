@@ -45,20 +45,23 @@ fn parameters() -> D3DPRESENT_PARAMETERS {
         ..D3DPRESENT_PARAMETERS::default()
     }
 }
-struct Fixture {
-    m: Machine<JitCpu>,
-    device: u32,
-    factory: u32,
-    back: u32,
-    wake: Arc<adv_sync::WakeEvent>,
+pub(in crate::d3d9) struct Fixture {
+    pub(in crate::d3d9) m: Machine<JitCpu>,
+    pub(in crate::d3d9) device: u32,
+    pub(in crate::d3d9) factory: u32,
+    pub(in crate::d3d9) back: u32,
+    pub(in crate::d3d9) wake: Arc<adv_sync::WakeEvent>,
     _service: adv_sync::background::Service,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(in crate::d3d9) fn new() -> Self {
+        Self::with_limits(adv_machine::ObjectLimits::default())
+    }
+    pub(in crate::d3d9) fn with_limits(limits: adv_machine::ObjectLimits) -> Self {
         let mut m = super::super::tests::machine();
         // The ownership-only base deliberately limits references to three.
         // This fixture exercises two live DEFAULT resources and a device wait.
-        m.sys.objects = Objects::default();
+        m.sys.objects = Objects::with_limits(limits);
         m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
         m.cpu.map(STACK, 4096, Prot::RW).unwrap();
         m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
@@ -124,7 +127,7 @@ impl Fixture {
         f.back = r.pointer;
         f
     }
-    fn packet<T: bytemuck::Pod>(&mut self, value: T) -> u32 {
+    pub(in crate::d3d9) fn packet<T: bytemuck::Pod>(&mut self, value: T) -> u32 {
         let mut e = env(&mut self.m);
         let address = alloc(&mut e, std::mem::size_of::<T>() as u32).unwrap();
         GuestPtr::new(address)
@@ -132,7 +135,7 @@ impl Fixture {
             .unwrap();
         address
     }
-    fn call(&mut self, name: &str, args: &[u32]) -> Outcome {
+    pub(in crate::d3d9) fn call(&mut self, name: &str, args: &[u32]) -> Outcome {
         let mut registry = Registry::default();
         super::super::register(&mut registry);
         self.m.cpu.set_reg(Reg::Esp, STACK);
@@ -145,7 +148,7 @@ impl Fixture {
         }
         (registry.get("d3d9.dll", name).unwrap().handler)(&mut env(&mut self.m))
     }
-    fn finish(&mut self, outcome: Outcome) -> u32 {
+    pub(in crate::d3d9) fn finish(&mut self, outcome: Outcome) -> u32 {
         let outcome = match outcome {
             Outcome::Block {
                 wait: Wait::Object { handle, .. },
@@ -168,16 +171,25 @@ impl Fixture {
             }
             outcome => outcome,
         };
+        if matches!(outcome, Outcome::Block { .. }) {
+            return self.finish(outcome);
+        }
         let Outcome::Return(result) = outcome else {
             panic!("expected command completion")
         };
         result
     }
-    fn okay(&mut self, name: &str, args: &[u32]) {
+    pub(in crate::d3d9) fn okay(&mut self, name: &str, args: &[u32]) {
         let outcome = self.call(name, args);
         assert_eq!(self.finish(outcome), 0, "{name}");
     }
-    fn surface(&mut self, width: u32, height: u32, format: u32, pool: u32) -> u32 {
+    pub(in crate::d3d9) fn surface(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+    ) -> u32 {
         let output = self.packet(0u32);
         self.okay(
             "IDirect3DDevice9::CreateOffscreenPlainSurface",
@@ -185,7 +197,7 @@ impl Fixture {
         );
         self.m.cpu.read_u32(output).unwrap()
     }
-    fn render_target(&mut self, width: u32, height: u32, format: u32) -> u32 {
+    pub(in crate::d3d9) fn render_target(&mut self, width: u32, height: u32, format: u32) -> u32 {
         let output = self.packet(0u32);
         self.okay(
             "IDirect3DDevice9::CreateRenderTarget",
@@ -193,7 +205,7 @@ impl Fixture {
         );
         self.m.cpu.read_u32(output).unwrap()
     }
-    fn lock(&mut self, surface: u32, rect: u32, flags: u32) -> D3DLOCKED_RECT {
+    pub(in crate::d3d9) fn lock(&mut self, surface: u32, rect: u32, flags: u32) -> D3DLOCKED_RECT {
         let output = self.packet(D3DLOCKED_RECT::default());
         self.okay(
             "IDirect3DSurface9::LockRect",
@@ -201,15 +213,23 @@ impl Fixture {
         );
         GuestPtr::new(output).read(&self.m.cpu).unwrap()
     }
-    fn image(&mut self, surface: u32) -> Image {
+    pub(in crate::d3d9) fn image(&mut self, surface: u32) -> Image {
         self.target(surface).image
     }
-    fn target(&mut self, surface: u32) -> Target {
+    pub(in crate::d3d9) fn target(&mut self, surface: u32) -> Target {
         let e = env(&mut self.m);
         let r = resources::resource(&e, surface).unwrap();
         (e.ext.get::<State>().provider.target)(e.ext, r.surface.unwrap()).unwrap()
     }
-    fn pixels(&mut self, image: &Image) -> Vec<u8> {
+    pub(in crate::d3d9) fn pixels(&mut self, image: &Image) -> Vec<u8> {
+        let mut e = env(&mut self.m);
+        let owner = com(&e)
+            .identity::<Payload>(&e.sys.objects, self.device)
+            .unwrap();
+        let outcome = recording::barrier(&mut e, owner, recording::Reason::Readback, |_| {
+            Outcome::Return(0)
+        });
+        assert_eq!(self.finish(outcome), 0);
         let mut transfer = self
             .m
             .ext
@@ -222,7 +242,7 @@ impl Fixture {
         transfer.take_completion_job().unwrap()();
         transfer.poll().unwrap().unwrap()
     }
-    fn submissions(&self) -> u64 {
+    pub(in crate::d3d9) fn submissions(&self) -> u64 {
         self.m
             .ext
             .get::<State>()
@@ -424,7 +444,7 @@ fn plain_surface_identity_reset_and_rejected_blits_do_not_submit_or_leak() {
 }
 
 #[test]
-fn pending_blit_retains_both_controlling_surfaces_until_success_or_cancel() {
+fn recorded_blit_retains_image_leases_until_success_or_cancel() {
     let mut f = Fixture::new();
     for cancel in [false, true] {
         let src = f.surface(4, 4, 21, 0);
@@ -449,6 +469,7 @@ fn pending_blit_retains_both_controlling_surfaces_until_success_or_cancel() {
                 &color,
             )
             .unwrap();
+        super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
         let pause =
             f.m.ext
                 .get::<State>()
@@ -467,8 +488,8 @@ fn pending_blit_retains_both_controlling_surfaces_until_success_or_cancel() {
         assert_eq!(release(&mut env(&mut f.m), dst), 0);
         assert_eq!(
             f.m.ext.get::<Surfaces>().targets.len(),
-            3,
-            "pending internal refs own both images"
+            1,
+            "recorded image leases outlive retired COM surfaces"
         );
         if cancel {
             super::super::cancel_pending(&mut f.m);

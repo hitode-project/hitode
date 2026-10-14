@@ -131,6 +131,7 @@ fn lock(machine: &mut Machine<JitCpu>, texture: u32, level: u32) -> D3DLOCKED_RE
     GuestPtr::new(output).read(&machine.cpu).unwrap()
 }
 fn readback(machine: &mut Machine<JitCpu>, surface: u32) -> Vec<u8> {
+    super::super::tests::flush_recordings(&mut env(machine));
     let image = machine.ext.get::<Surfaces>().targets[&surface]
         .image
         .clone();
@@ -333,6 +334,7 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
         .cpu
         .protect(storage & !4095, 4096, Prot::RW)
         .unwrap();
+    super::super::tests::force_recording_limit(&mut env(&mut machine), device);
     let pause = machine
         .ext
         .get::<State>()
@@ -379,6 +381,7 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
         "IDirect3DDevice9::EvictManagedResources",
         &[device],
     ));
+    super::super::tests::force_recording_limit(&mut env(&mut machine), device);
     let pause = machine
         .ext
         .get::<State>()

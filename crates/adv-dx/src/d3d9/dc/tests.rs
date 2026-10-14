@@ -432,6 +432,7 @@ fn dirty_marks_wait_for_release_dc_continuation_after_a_busy_upload() {
     let surface = f.m.cpu.read_u32(output).unwrap();
     let dc = f.acquire(surface);
     assert_eq!(f.gdi("SetPixel", &[dc, 0, 0, 0x00010203]), 0x00010203);
+    super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
             .get::<State>()
@@ -525,4 +526,28 @@ fn pending_get_dc_output_failure_and_cancel_return_scratch_and_internal_refs() {
         );
         assert_eq!(f.m.ext.get::<SurfaceStore>().live_surfaces(), 1);
     }
+}
+
+// spec: GFX-REC-1
+#[test]
+fn get_dc_reads_an_upload_accepted_by_the_recording_before_gpu_submission() {
+    let mut f = Fixture::new(true);
+    let surface = f.surface(0, 22);
+    let output = f.packet(adv_abi::types::D3DLOCKED_RECT::default());
+    assert_eq!(
+        f.d3d("IDirect3DSurface9::LockRect", &[surface, output, 0, 0]),
+        0
+    );
+    let locked: adv_abi::types::D3DLOCKED_RECT = GuestPtr::new(output).read(&f.m.cpu).unwrap();
+    f.m.cpu
+        .write(locked.pBits, &[0x33, 0x22, 0x11, 0xff].repeat(16))
+        .unwrap();
+    assert_eq!(f.d3d("IDirect3DSurface9::UnlockRect", &[surface]), 0);
+    let dc = f.acquire(surface);
+    assert_eq!(f.gdi("GetPixel", &[dc, 0, 0]), 0x00332211);
+    assert_eq!(
+        f.m.ext.get::<State>().frames.flushes[recording::Reason::Dc as usize],
+        1
+    );
+    assert_eq!(f.d3d("IDirect3DSurface9::ReleaseDC", &[surface, dc]), 0);
 }

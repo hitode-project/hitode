@@ -276,6 +276,8 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .publish_native_frame(id, frame)
                 .map_err(Error::Invalid)
         },
+        repeat: |ext, id| ext.get_mut::<Graphics<Snapshot>>().repeat_native_frame(id),
+        presentation_serial: |ext| ext.get::<Graphics<Snapshot>>().output_serial(),
         window: |ext, objects, hwnd| {
             let window = ext.get::<Win32>().user.windows.get(objects, &hwnd)?;
             let (width, height) = window.client_size();

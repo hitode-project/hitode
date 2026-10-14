@@ -1887,6 +1887,30 @@ impl<P: Presenter> Surfaces<P> {
         Ok(())
     }
 
+    /// A deferred store without the shared output can finish private frames.
+    /// Those frames are not a baseline for eliminating a foreground Present.
+    #[cfg(feature = "gpu")]
+    pub fn output_serial(&self) -> Option<u64> {
+        (!self.deferred_presentation || self.frame_mailbox.is_some())
+            .then_some(self.stats.presentations)
+    }
+
+    /// Advance guest presentation accounting while retaining the visible frame.
+    #[cfg(feature = "gpu")]
+    pub fn repeat_native_frame(&mut self, id: u32) -> Result<u64, crate::gpu::Error> {
+        if !self.native_surfaces.contains_key(&id) {
+            return Err(crate::gpu::Error::Invalid(
+                "unknown repeated surface".into(),
+            ));
+        }
+        let serial =
+            self.stats.presentations.checked_add(1).ok_or_else(|| {
+                crate::gpu::Error::Invalid("presentation serial exhausted".into())
+            })?;
+        self.stats.presentations = serial;
+        Ok(serial)
+    }
+
     /// A discard boundary transfers the old target into the immutable frame and
     /// rotates one available target. No texture copy or Queue submit is needed.
     /// The pool is bounded; retaining all frames returns Busy before publication.

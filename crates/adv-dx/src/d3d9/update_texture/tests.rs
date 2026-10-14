@@ -169,6 +169,7 @@ impl Fixture {
         e.ext.get::<Surfaces>().targets[&surface].image.clone()
     }
     fn pixels(&mut self, image: &Image) -> Vec<u8> {
+        super::super::tests::flush_recordings(&mut env(&mut self.m));
         let mut readback = self
             .m
             .ext
@@ -336,6 +337,7 @@ fn inaccessible_staging_and_late_shadow_failure_restore_marks_for_retry() {
         assert_eq!(f.dirty(source), [true; 3]);
         f.m.cpu.protect(page, 4096, Prot::RW).unwrap();
     }
+    super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
             .get::<State>()
@@ -382,6 +384,7 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
         .unwrap()
         .storage;
     let output = f.packet(D3DLOCKED_RECT::default());
+    super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
             .get::<State>()
@@ -428,6 +431,7 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
     assert_eq!(f.update(source, destination), 0);
     assert_eq!(f.pixels(&image), [9, 8, 7, 255].repeat(16));
     assert_eq!(f.invoke("IDirect3DTexture9::AddDirtyRect", &[source, 0]), 0);
+    super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
             .get::<State>()
@@ -442,9 +446,11 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
         &[f.device, source, destination],
     );
     assert!(matches!(outcome, Outcome::Block { .. }));
-    assert_eq!(f.invoke("IDirect3DTexture9::Release", &[source]), 0);
-    assert_eq!(f.invoke("IDirect3DTexture9::Release", &[destination]), 0);
-    assert_eq!(f.invoke("IDirect3DDevice9::Release", &[f.device]), 0);
+    // Drop public references internally while the Busy transfer owns them.
+    assert_eq!(super::super::release(&mut env(&mut f.m), source), 0);
+    assert_eq!(super::super::release(&mut env(&mut f.m), destination), 0);
+    let pointer = f.device;
+    assert_eq!(super::super::release(&mut env(&mut f.m), pointer), 0);
     assert!(
         f.m.ext
             .get::<Heaps>()
@@ -492,6 +498,7 @@ fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
         right: 3,
         bottom: 2,
     });
+    super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
             .get::<State>()
@@ -691,7 +698,8 @@ fn successive_sizes_formats_and_mip_chains_keep_original_shadow_and_gpu_pixels()
                 0
             );
         }
-        assert_eq!(f.invoke("IDirect3DTexture9::Release", &[source]), 0);
-        assert_eq!(f.invoke("IDirect3DTexture9::Release", &[destination]), 0);
+        // Drop public references internally while the Busy transfer owns them.
+        assert_eq!(super::super::release(&mut env(&mut f.m), source), 0);
+        assert_eq!(super::super::release(&mut env(&mut f.m), destination), 0);
     }
 }
