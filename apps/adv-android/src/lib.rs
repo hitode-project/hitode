@@ -575,7 +575,7 @@ pub extern "system" fn Java_org_hitode_player_GameActivity_nativeCopyFrame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-AND-6
+    // spec: AND-APP-6
     #[test]
     fn ui_notifications_ignore_telemetry_but_preserve_controls_and_errors() {
         let initial = json!({"status":"running", "menus":[], "dialogs":[],
@@ -627,7 +627,7 @@ mod tests {
     fn key(session: &Session, key: u32, pressed: bool) -> Result<(), String> {
         submit_command(session, protocol::Command::Key { key, pressed })
     }
-    // spec: HOST-AND-3
+    // spec: AND-APP-3
     #[test]
     fn input_requires_both_lifecycle_and_audio_focus_handshakes() {
         let (session, _receiver) = fixture(4);
@@ -637,7 +637,7 @@ mod tests {
         activate(&session);
         assert!(key(&session, 17, true).is_ok());
     }
-    // spec: HOST-AND-4
+    // spec: AND-APP-4
     #[test]
     fn ctrl_release_is_immediate_and_supersedes_a_queued_down() {
         let (session, receiver) = fixture(4);
@@ -650,7 +650,7 @@ mod tests {
         assert!(!packet_current(&session, &down));
         assert!(packet_current(&session, &receiver.recv().unwrap()));
     }
-    // spec: HOST-AND-3
+    // spec: AND-APP-3
     #[test]
     fn pause_resume_before_worker_observation_still_invalidates_old_inputs() {
         let (session, receiver) = fixture(4);
@@ -664,7 +664,7 @@ mod tests {
         key(&session, 17, true).unwrap();
         assert!(packet_current(&session, &receiver.recv().unwrap()));
     }
-    // spec: HOST-AND-4
+    // spec: AND-APP-4
     #[test]
     fn queue_saturation_cannot_leave_ctrl_physically_pressed() {
         let (session, receiver) = fixture(1);
@@ -675,7 +675,7 @@ mod tests {
         assert!(!packet_current(&session, &receiver.recv().unwrap()));
         assert!(session.release_input.load(Ordering::Acquire));
     }
-    // spec: HOST-AND-4
+    // spec: AND-APP-4
     #[test]
     fn discrete_tap_packets_keep_down_and_up_order_without_superseding_down() {
         let (session, receiver) = fixture(4);

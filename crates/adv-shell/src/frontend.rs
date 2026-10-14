@@ -665,7 +665,7 @@ pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-SES-2, HOST-AND-10
+    // spec: HOST-SES-2, AND-APP-10
     #[cfg(any(target_os = "macos", target_os = "android"))]
     #[test]
     fn tick_deadline_is_only_armed_for_a_visible_pending_refresh() {
@@ -680,7 +680,7 @@ mod tests {
             Some(overdue)
         );
     }
-    // spec: HOST-AND-10
+    // spec: AND-APP-10
     #[test]
     fn vsync_is_requested_only_for_pending_content_and_coalesces_wakes() {
         assert!(!request_vsync(None, false));

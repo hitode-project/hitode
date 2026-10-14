@@ -144,7 +144,7 @@ pub(crate) fn message(key: u32, scan: u32, down: bool, repeat: bool, alt: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-AND-11
+    // spec: AND-APP-11
     #[test]
     fn touch_uses_the_presented_rectangle_and_clamps_letterbox() {
         assert_eq!(
@@ -168,7 +168,7 @@ mod tests {
             320 | 240 << 16
         );
     }
-    // spec: HOST-AND-11
+    // spec: AND-APP-11
     #[test]
     fn second_finger_cancels_drag_and_clicks_right_once() {
         let mut touch = Touch::default();
@@ -188,7 +188,7 @@ mod tests {
             vec![(0x202, 0, 40)]
         );
     }
-    // spec: HOST-AND-11
+    // spec: AND-APP-11
     #[test]
     fn physical_keys_preserve_scan_codes_and_leave_back_to_the_host() {
         assert_eq!(key(4), None);

@@ -1415,7 +1415,7 @@ struct Sampling { source_uv: vec4<f32>, viewport: vec2<f32> }
 
 #[cfg(test)]
 mod tests {
-    // spec: HOST-AND-10
+    // spec: AND-APP-10
     #[test]
     fn detached_surface_never_accepts_render_work() {
         assert!(!super::can_schedule(false, (640, 480), false));

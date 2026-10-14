@@ -168,7 +168,7 @@ pub fn dialogs(set: &DialogSet) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-AND-4
+    // spec: AND-APP-4
     #[test]
     fn malformed_input_cannot_be_truncated_into_another_guest_command() {
         for text in [

@@ -41,7 +41,7 @@ impl Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-AND-3, HOST-AND-4
+    // spec: AND-APP-3, AND-APP-4
     #[test]
     fn pause_and_control_release_invalidate_queued_input() {
         let generation = Generation::default();
