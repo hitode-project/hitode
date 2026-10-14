@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent } from "../lib/bridge";
   import { pauser, runs } from "../lib/launch.svelte";
@@ -12,8 +12,9 @@
    * only elements attached with `region` or `modal` take input from it, every
    * other press reaches the game (see lib/overlay.ts).
    *
-   * The pause menu opens from the pause button (desktop), the edge grip and
-   * the back gesture (phone), and ⌘. in the macOS menu. Esc is never taken
+   * The pause menu opens from the pause button (desktop; in the title bar on
+   * macOS), the edge grip and the back gesture (phone), and ⌘. in the macOS
+   * menu. Esc is never taken
    * from the game: many games use it themselves, so it only closes this
    * overlay's own layers while they hold the keyboard.
    */
@@ -90,8 +91,15 @@
     return () => clearTimeout(timer);
   });
 
+  /** macOS: the window's title bar holds the pause button (see chrome.rs). */
+  const titleBar = $derived(gameView && !phone);
+
   onMount(() => {
     void call("set_pause_available", { available: true }, null).catch(() => {});
+    if (titleBar) {
+      const title = untrack(() => game?.title) ?? null;
+      void call("set_title_bar", { title }, null).catch(() => {});
+    }
     const stopPause = onHostEvent("pause", () => togglePause(false));
     const stopBack = nav.onBack(() => {
       togglePause(true);
@@ -99,6 +107,7 @@
     });
     return () => {
       void call("set_pause_available", { available: false }, null).catch(() => {});
+      if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
       stopBack();
     };
@@ -266,7 +275,7 @@
     </div>
   {:else if phone}
     <button class="grip fade" aria-label="暂停菜单" onclick={openMenu} {@attach region}><span></span></button>
-  {:else}
+  {:else if !titleBar}
     <button class="float fade" aria-label="暂停菜单" onclick={openMenu} {@attach region}>
       <Icon name="pause" />
     </button>

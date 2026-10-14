@@ -10,6 +10,8 @@ mod report;
 
 use serde::Serialize;
 #[cfg(target_os = "macos")]
+mod chrome;
+#[cfg(target_os = "macos")]
 mod game;
 #[cfg(target_os = "macos")]
 use game::{post_text, start_game, stop_game};
@@ -73,6 +75,7 @@ pub fn run() {
                 report::report_base,
                 report::save_report,
                 menu::set_pause_available,
+                chrome::set_title_bar,
                 library::library_pick_folder,
                 library::library_list,
                 library::library_inspect,
