@@ -503,6 +503,7 @@ pub(crate) struct Native {
     /// The permissions the page class table was made from, and the table
     /// when it is not that snapshot itself.
     snapshot: Option<Arc<Vec<u8>>>,
+    alias_snapshot: Option<Arc<Vec<u8>>>,
     /// `FastPermissions::version` of `snapshot`.
     version: u64,
     classes: Option<Box<[u8]>>,
@@ -583,6 +584,7 @@ impl Native {
             diagnostics: Diagnostics::default(),
             placed: Vec::new(),
             snapshot: None,
+            alias_snapshot: None,
             version: 0,
             classes: None,
             work: translate::Workspace::default(),
@@ -813,6 +815,13 @@ impl Native {
 
     /// Points the runtime at the page classes of the current permissions.
     fn classify(&mut self, memory: &mut Memory) {
+        // A helper may publish new page metadata. Pin the raw permissions for
+        // this native invocation, just like the window's permission snapshot.
+        self.runtime.alias =
+            (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64;
+        self.runtime.alias_classes =
+            (memory.perms.as_ptr() as usize).wrapping_sub((memory.base >> 12) as usize) as u64;
+        self.alias_snapshot = Some(memory.perms.clone());
         // Holding no reference while the table refreshes lets it update in
         // place instead of copying a byte for every page.
         let held = self.snapshot.take().map(|old| Arc::as_ptr(&old));

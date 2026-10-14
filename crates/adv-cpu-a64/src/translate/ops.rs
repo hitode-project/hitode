@@ -131,6 +131,21 @@ impl Translator<'_> {
                 self.forget(guest);
                 self.commit(index);
             }
+            Op::Leave => {
+                self.prepare(Operand::Guest(ESP));
+                self.prepare(Operand::Guest(5));
+                let addr = if self.checking {
+                    Addr::Window(host(5))
+                } else {
+                    Addr::Biased(host(5), 0)
+                };
+                self.load(addr, X6);
+                self.emit(add_imm(W, X16, host(5), 4, false));
+                self.emit(add_ext(X, host(ESP), WINDOW, X16, Uxtw, 0));
+                self.emit(add_ext(X, host(5), WINDOW, X6, Uxtw, 0));
+                self.forget(Operand::Guest(ESP));
+                self.forget(Operand::Guest(5));
+            }
             Op::Call(target) => {
                 self.mov_imm(X6, inst.next_pc);
                 self.push(X6);
@@ -455,10 +470,12 @@ impl Translator<'_> {
 
     /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,
     /// whose window form is `direct`: the window takes it if it stays in
-    /// one page whose class allows it, else the `access` stub does, and
-    /// loads `rt` or stores it. Uses x3 and x4.
+    /// one page whose class allows it. Ordinary pages blocked by the host
+    /// page intersection use the alias after a raw guest permission check.
+    /// The remaining cases use `access`. Uses x3 and x4.
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
         let slow = self.asm.label();
+        let alias = self.asm.label();
         let width = kind & 7;
         if width > 1 {
             // The last byte's address differs in bit 12 exactly when the
@@ -483,12 +500,29 @@ impl Translator<'_> {
         };
         self.asm.tbz(false, X4, bit(needed), slow);
         for &permission in excluded {
-            self.asm.tbz(true, X4, bit(permission), slow);
+            self.asm.tbz(true, X4, bit(permission), alias);
         }
         let (site, resume) = (self.asm.label(), self.asm.label());
         self.asm.bind(site);
         self.site();
         self.emit(direct);
+        self.asm.b(resume);
+        self.asm.bind(alias);
+        // The window class already granted the guest R/W bit, so this index
+        // is inside Memory's raw table even when its base is not zero.
+        self.emit_all(&[
+            ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
+            lsr_imm(W, X4, address, 12),
+            ldr_narrow(Narrow::Byte, X4, X3, X4),
+        ]);
+        self.asm.tbz(false, X4, bit(needed), slow);
+        for &permission in excluded {
+            self.asm.tbz(true, X4, bit(permission), slow);
+        }
+        self.emit(ldr(X, X3, RUNTIME, runtime::ALIAS));
+        self.site();
+        // Keep the access width and extension; only replace its base register.
+        self.emit((direct & !(31 << 5)) | (X3.number() << 5));
         self.asm.bind(resume);
         self.cold.push(Cold::Access {
             label: slow,

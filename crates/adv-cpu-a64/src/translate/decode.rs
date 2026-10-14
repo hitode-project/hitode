@@ -100,6 +100,7 @@ pub enum Op {
     Cdq,
     Push(Src),
     Pop(u8),
+    Leave,
     Jmp(u32),
     Call(u32),
     Jcc(Cc, u32),
@@ -353,6 +354,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
             (Src::Reg(dst), source) => Op::Carry(mnemonic == M::Sbb, dst, source),
             _ => return None,
         },
+        M::Leave if instruction.code() == iced_x86::Code::Leaved => Op::Leave,
         M::Push if count == 1 => Op::Push(operand(instruction, 0)?),
         M::Pop => match register(0)? {
             ESP => return None,
@@ -596,6 +598,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
             ESP => return None,
             register => Op::Pop(register),
         },
+        0xc9 => Op::Leave,
         0x68 => Op::Push(Src::Imm(b.u32()?)),
         0x6a => Op::Push(Src::Imm(b.i8()?)),
         0x69 | 0x6b => {
@@ -911,9 +914,12 @@ impl Op {
             Op::Step(..) => (F::NONE, F::ALL.minus(F::CF), false),
             Op::Neg(_) => (F::NONE, F::ALL, false),
             Op::Extend(_, source, _) => (F::NONE, F::NONE, matches!(source, Narrow8or16::Mem(..))),
-            Op::Push(_) | Op::Pop(_) | Op::Call(_) | Op::Ret(_) | Op::CallIndirect(_) => {
-                (F::NONE, F::NONE, true)
-            }
+            Op::Push(_)
+            | Op::Pop(_)
+            | Op::Leave
+            | Op::Call(_)
+            | Op::Ret(_)
+            | Op::CallIndirect(_) => (F::NONE, F::NONE, true),
             Op::JmpIndirect(target) => (F::NONE, F::NONE, mem(target)),
             Op::Jcc(Cc::Flags(cc), _) | Op::Setcc(cc, _) => (F::of(cc), F::NONE, false),
             Op::Jcc(Cc::Loop(Some(_)), _) => (F::ZF, F::NONE, false),

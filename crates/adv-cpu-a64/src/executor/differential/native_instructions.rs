@@ -135,14 +135,14 @@ fn bit_scans_biased_cl_shifts_and_comparisons_run_without_helpers_and_resume_at_
 // spec: A64-FLAG-4
 #[test]
 fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retry_after_mapping() {
-    for kind in 0..6 {
+    for kind in 0..9 {
         let width = match kind {
             0 | 1 => 2,
-            2 | 3 | 4 => 4,
+            2 | 3 | 4 | 6 | 7 => 4,
             _ => 8,
         };
         let address = DATA + DATA_LEN as u32 - width / 2;
-        let program = fixture(|a| {
+        let mut program = fixture(|a| {
             a.add(eax, ecx).unwrap();
             match kind {
                 0 => a.bsf(bp, word_ptr(address as i32)).unwrap(),
@@ -150,10 +150,14 @@ fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retr
                 2 => a.bsf(ebp, dword_ptr(address as i32)).unwrap(),
                 3 => a.bsr(esp, dword_ptr(address as i32)).unwrap(),
                 4 => compare_instruction(true, false, a, Some(address), 0),
-                _ => compare_instruction(true, true, a, Some(address), 0),
+                5 => compare_instruction(true, true, a, Some(address), 0),
+                6 => a.leave().unwrap(),
+                7 => a.bt(dword_ptr(address as i32), 31).unwrap(),
+                _ => a.movsd_2(xmm0, qword_ptr(address as i32)).unwrap(),
             }
             a.setz(al).unwrap();
         });
+        program.state.regs[5] = address;
         for flagm in [false, true] {
             for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
                 let config = (Features { flagm }, false, checks);
@@ -344,5 +348,85 @@ fn rewritten_bit_scan_and_comparison_forms_invalidate_the_old_native_unit() {
             assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
         }
         assert!(native.stats.invalidations >= 3);
+    }
+}
+
+// spec: A64-REG-5, A64-REG-6, A64-FLAG-2, A64-FLAG-4, A64-VER-1
+#[test]
+fn scalar_moves_word_extraction_bit_tests_and_leave_match_at_budget_cuts() {
+    let mut program = fixture(|a| {
+        a.add(eax, edx).unwrap();
+        a.movsd_2(xmm0, xmm1).unwrap();
+        a.movsd_2(qword_ptr(ebx), xmm0).unwrap();
+        a.movsd_2(xmm2, qword_ptr(ebx)).unwrap();
+        a.pextrw(ebp, xmm0, 15).unwrap();
+        a.pextrw(ecx, xmm2, 3).unwrap();
+        a.bt(dword_ptr(ebx), 63).unwrap();
+        a.setb(al).unwrap();
+        a.bt(ecx, 32).unwrap();
+        a.setb(dl).unwrap();
+        a.mov(ebp, ebx).unwrap();
+        a.leave().unwrap();
+        a.mov(dword_ptr(esp), eax).unwrap();
+    });
+    program.state.xmm[0] = [0x55; 16];
+    program.state.xmm[1] = [0x81; 16];
+    program.state.xmm[2] = [0xaa; 16];
+    let instructions = iced_x86::Decoder::new(32, &program.code, 0).iter().count() as u64 - 1;
+    for flagm in [false, true] {
+        for first in [false, true] {
+            for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
+                for budget in 1..=instructions + 1 {
+                    let config = (Features { flagm }, first, checks);
+                    let mut native = executor(&program, config, false);
+                    let mut oracle = executor(&program, config, true);
+                    assert_eq!(
+                        native.run(program.stop, budget).unwrap(),
+                        oracle.run(program.stop, budget).unwrap()
+                    );
+                    same(&native, &oracle);
+                    if !first && checks == Checks::Adaptive && budget > instructions {
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-MEM-1, A64-MEM-2, A64-MEM-4, A64-MEM-7, A64-MEM-8
+#[test]
+fn checked_ordinary_pages_avoid_helpers_and_follow_permission_changes() {
+    let program = fixture(|a| {
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(ebx), eax).unwrap();
+        a.movsx(ecx, byte_ptr(ebx)).unwrap();
+        a.movzx(edx, word_ptr(ebx)).unwrap();
+        a.mov(dword_ptr(ebx + 4), ecx).unwrap();
+        a.mov(esi, dword_ptr(ebx + 4)).unwrap();
+    });
+    for flagm in [false, true] {
+        let config = (Features { flagm }, false, Checks::All);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        // An inaccessible neighbour blocks the entire 16 KiB window page.
+        for cpu in [&mut native, &mut oracle] {
+            cpu.protect(DATA + 4096, DATA_LEN - 4096, 0).unwrap();
+        }
+        for permissions in [3, 1, 0, 3] {
+            for cpu in [&mut native, &mut oracle] {
+                cpu.protect(DATA, 4096, permissions).unwrap();
+                cpu.state = program.state.clone();
+            }
+            assert_eq!(
+                native.run(program.stop, 100).unwrap(),
+                oracle.run(program.stop, 100).unwrap()
+            );
+            same(&native, &oracle);
+            if permissions == 3 {
+                assert_eq!(native.native.as_ref().unwrap().diagnostics.accesses, 0);
+            }
+            native.native.as_mut().unwrap().diagnostics.accesses = 0;
+        }
     }
 }

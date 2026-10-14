@@ -362,6 +362,11 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
             cpu.regs[usize::from(ESP)] = regs[usize::from(ESP)].wrapping_add(4);
             cpu.regs[usize::from(dst)] = value;
         }
+        Op::Leave => {
+            let frame = load(regs[5], 4, memory)?;
+            cpu.regs[usize::from(ESP)] = regs[5].wrapping_add(4);
+            cpu.regs[5] = frame;
+        }
         Op::Jmp(to) => target = Some(to),
         Op::Call(to) => {
             push(next, cpu, memory)?;

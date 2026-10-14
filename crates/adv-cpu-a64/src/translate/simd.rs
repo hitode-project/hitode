@@ -58,8 +58,10 @@ pub enum Loc {
 pub enum Kind {
     /// `dst = src`, zero-extending a narrower value into a register.
     Move,
-    /// `movss` between registers: the low lane only.
-    MoveLow,
+    /// Scalar register moves: only the lane of `1 << log2` bytes changes.
+    MoveLow(u8),
+    /// A selected 16-bit lane, zero-extended into a GPR.
+    ExtractWord,
     /// A lane-wise operation on lanes of `1 << log2` bytes.
     Same(Same, u8),
     Logic(Logic),
@@ -186,8 +188,11 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         | M::Movntps
         | M::Movntpd
         | M::Movntdq => Kind::Move,
-        M::Movss if matches!((dst, src), (Loc::Xmm(_), Loc::Xmm(_))) => Kind::MoveLow,
-        M::Movss => Kind::Move,
+        M::Movss | M::Movsd if matches!((dst, src), (Loc::Xmm(_), Loc::Xmm(_))) => {
+            Kind::MoveLow(if mnemonic == M::Movsd { 3 } else { 2 })
+        }
+        M::Movss | M::Movsd => Kind::Move,
+        M::Pextrw => Kind::ExtractWord,
         M::Paddb => Kind::Same(Same::Add, 0),
         M::Paddw => Kind::Same(Same::Add, 1),
         M::Paddd => Kind::Same(Same::Add, 2),
@@ -287,6 +292,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (d, s) = (class(dst), class(src));
     let valid = match kind {
         Kind::Emms => true,
+        Kind::ExtractWord => d == 3 && matches!(s, 1 | 2),
         Kind::ToInt(_) => d == 1 && (s == 2 || src == Loc::Mem),
         Kind::Half(_) => d == 2 && src == Loc::Mem || dst == Loc::Mem && s == 2,
         Kind::Float(..) | Kind::Compare(..) | Kind::MinMax(..) => {
@@ -298,7 +304,10 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         },
         _ => matches!(d, 1 | 2) && (s == d || src == Loc::Mem || src == Loc::Imm),
     };
-    let three = matches!(kind, Kind::Shuffle(_) | Kind::Shufps | Kind::Compare(..));
+    let three = matches!(
+        kind,
+        Kind::Shuffle(_) | Kind::Shufps | Kind::Compare(..) | Kind::ExtractWord
+    );
     let imm_ok = match kind {
         Kind::ShiftImm(..) => instruction.op_count() == 2,
         _ if three => instruction.op_count() == 3 && instruction.op_kind(2) == OpKind::Immediate8,
@@ -318,7 +327,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     } else {
         match mnemonic {
             M::Movd => 4,
-            M::Movq => 8,
+            M::Movq | M::Movsd => 8,
             _ => 16,
         }
     };
@@ -414,6 +423,24 @@ impl Translator<'_> {
                 return;
             }
             Kind::Move => return self.simd_move(simd, address),
+            Kind::ExtractWord => {
+                let Loc::Gpr(index) = simd.dst else {
+                    unreachable!()
+                };
+                let s = self.register(simd.src);
+                let lane = u32::from(
+                    simd.imm
+                        & if matches!(simd.src, Loc::Xmm(_)) {
+                            7
+                        } else {
+                            3
+                        },
+                );
+                self.clobber(Operand::Guest(index));
+                self.emit(vumov(1, super::ops::result(index), s, lane));
+                self.commit(index);
+                return;
+            }
             Kind::Half(high) => return self.half(simd, high, address),
             Kind::Float(..) | Kind::Compare(..) | Kind::MinMax(..) | Kind::ToInt(_) => {
                 return self.floating(simd, address);
@@ -477,7 +504,7 @@ impl Translator<'_> {
         };
         let d = self.destination(simd.dst, true);
         match simd.kind {
-            Kind::MoveLow => self.emit(vins(2, d, 0, s, 0)),
+            Kind::MoveLow(log2) => self.emit(vins(u32::from(log2), d, 0, s, 0)),
             Kind::Same(op, log2) => self.emit(vsame(op, Arr::new(u32::from(log2), full), d, d, s)),
             Kind::Logic(op) => self.emit(vlogic(op, full, d, d, s)),
             Kind::AndNot => self.emit(vlogic(Logic::Bic, full, d, s, d)),
@@ -538,6 +565,7 @@ impl Translator<'_> {
                 self.emit(vmov(true, d, V0));
             }
             Kind::Move
+            | Kind::ExtractWord
             | Kind::ShiftImm(..)
             | Kind::ShiftBy(..)
             | Kind::Emms
@@ -898,7 +926,7 @@ mod tests {
         let by = plan(&decode(|a| a.psraw(xmm1, xmm2).unwrap()), 0).unwrap();
         assert_eq!(by.kind, Kind::ShiftBy(ShiftImm::Sshr, 1));
         let low = plan(&decode(|a| a.movss(xmm1, xmm2).unwrap()), 0).unwrap();
-        assert_eq!(low.kind, Kind::MoveLow);
+        assert_eq!(low.kind, Kind::MoveLow(2));
         assert!(plan(&decode(|a| a.movq2dq(xmm1, mm2).unwrap()), 0).is_none());
         let add = plan(&decode(|a| a.addss(xmm1, dword_ptr(esi)).unwrap()), 0).unwrap();
         assert_eq!((add.kind, add.width), (Kind::Float(Float::Fadd, true), 4));

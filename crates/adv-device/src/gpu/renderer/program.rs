@@ -9,7 +9,7 @@ struct Key {
 #[derive(Clone)]
 struct Pipeline {
     pipeline: wgpu::RenderPipeline,
-    constants: wgpu::BindGroupLayout,
+    constants: wgpu::BindGroup,
     textures: wgpu::BindGroupLayout,
 }
 #[derive(Default)]
@@ -68,7 +68,7 @@ impl Gpu {
             visibility,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
+                has_dynamic_offset: true,
                 min_binding_size: wgpu::BufferSize::new(size),
             },
             count: None,
@@ -201,6 +201,24 @@ impl Gpu {
             cache: self.programmable.disk.as_ref().map(|d| &d.cache),
         });
         self.check()?;
+        let uniform = self.programmable.uniforms.as_ref().unwrap();
+        let entry = |binding, offset, size| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: uniform,
+                offset,
+                size: wgpu::BufferSize::new(size),
+            }),
+        };
+        let constants = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("draw constants"),
+            layout: &constants,
+            entries: &[
+                entry(0, 0, CONSTANT_SIZE),
+                entry(1, CONSTANT_SIZE, CONSTANT_SIZE),
+                entry(2, CONSTANT_SIZE * 2, PARAMETER_SIZE),
+            ],
+        });
         let result = Pipeline {
             pipeline,
             constants,
@@ -338,15 +356,6 @@ impl Gpu {
             b.source = f(b.source);
             b.destination = f(b.destination);
         }
-        let pipeline = self.program_pipeline(Key {
-            program: draw.program.clone(),
-            streams: draw
-                .streams
-                .iter()
-                .map(|s| (s.stride, s.attributes.clone()))
-                .collect(),
-            raster,
-        })?;
         if self.programmable.uniforms.is_none() {
             self.programmable.uniforms =
                 Some(context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -356,6 +365,15 @@ impl Gpu {
                     mapped_at_creation: false,
                 }));
         }
+        let pipeline = self.program_pipeline(Key {
+            program: draw.program.clone(),
+            streams: draw
+                .streams
+                .iter()
+                .map(|s| (s.stride, s.attributes.clone()))
+                .collect(),
+            raster,
+        })?;
         let uniform = self.programmable.uniforms.as_ref().unwrap();
         let base = self.programmable.cursor * UNIFORM_STRIDE;
         self.programmable.cursor = (self.programmable.cursor + 1) % UNIFORM_SLOTS;
@@ -372,25 +390,6 @@ impl Gpu {
             base + CONSTANT_SIZE * 2,
             bytemuck::bytes_of(&draw.parameters),
         );
-        let entry = |binding, offset, size| wgpu::BindGroupEntry {
-            binding,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: uniform,
-                offset,
-                size: wgpu::BufferSize::new(size),
-            }),
-        };
-        let constants = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("draw constants"),
-                layout: &pipeline.constants,
-                entries: &[
-                    entry(0, base, CONSTANT_SIZE),
-                    entry(1, base + CONSTANT_SIZE, CONSTANT_SIZE),
-                    entry(2, base + CONSTANT_SIZE * 2, PARAMETER_SIZE),
-                ],
-            });
         let samplers: Vec<_> = draw
             .textures
             .iter()
@@ -499,7 +498,7 @@ impl Gpu {
                 ..Default::default()
             });
             pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, &constants, &[]);
+            pass.set_bind_group(0, &pipeline.constants, &[base as u32; 3]);
             pass.set_bind_group(1, &textures, &[]);
             let v = state.viewport;
             pass.set_viewport(
