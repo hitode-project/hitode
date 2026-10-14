@@ -153,6 +153,7 @@ pub(super) fn supported(class: &str, style: u32) -> bool {
         || class.eq_ignore_ascii_case("Edit")
         || (class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3)
         || class.eq_ignore_ascii_case("msctls_trackbar32")
+        || class.eq_ignore_ascii_case(super::super::status_bar::CLASS)
 }
 
 /// Cheap and allocation-free when no visible top-level dialog exists. Only the
@@ -200,7 +201,12 @@ pub fn presentation(win32: &Win32, objects: &Objects) -> Result<DialogSet, Strin
                 class: class.clone(),
                 style: child.style,
                 ex_style: child.ex_style,
-                text: child.text.clone(),
+                // A status bar shows all of its parts as one line.
+                text: child
+                    .control
+                    .status
+                    .as_ref()
+                    .map_or_else(|| child.text.clone(), |s| s.display(&child.text)),
                 rect: child.rect,
                 visible: child.visible(),
                 enabled: child.enabled(),

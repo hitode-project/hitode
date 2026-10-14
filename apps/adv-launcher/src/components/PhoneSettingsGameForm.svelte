@@ -122,12 +122,12 @@
       <div class="row" class:ov={form.overridden("filter")}>
         {@render head("filter", "超分辨率")}
         <UpscalingSelect value={form.overridden("filter") ? form.value("filter") : "inherit"}
-        inherit={form.global.filter}
-        onpick={(v) => v === "inherit" ? form.reset("filter") : form.pick("filter", v)} />
+          inherit={form.global.filter}
+          onpick={(v) => v === "inherit" ? form.reset("filter") : form.pick("filter", v)} />
       </div>
     </section>
 
-      {#if preview}
+    {#if preview}
       <section class="sec" aria-labelledby="pg-font">
         <h2 id="pg-font">字体</h2>
         {#each fonts as f (f.key)}
