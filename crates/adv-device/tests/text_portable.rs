@@ -201,6 +201,34 @@ fn enumeration_skips_faces_it_cannot_measure() {
     assert_eq!(entries[0].font.face, "ADV Resource Fixture");
 }
 
+#[test]
+// spec: DEV-FONT-5
+fn full_enumeration_reports_each_family_once() {
+    let mut text = Text::with_font_directories(&[]);
+    for bytes in [SINGLE, LEGACY, SINGLE, LEGACY] {
+        text.add_file_resource(bytes, true).unwrap();
+    }
+    for mode in [FontEnumeration::Families, FontEnumeration::Faces] {
+        let faces: Vec<_> = text
+            .enumerate(None, mode)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.font.face)
+            .collect();
+        assert_eq!(faces.len(), 2, "{faces:?}");
+    }
+    // A named family still reports every face that provides it.
+    assert_eq!(
+        text.enumerate(
+            Some("ADV Resource Fixture Medium"),
+            FontEnumeration::Families
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+}
+
 fn font(face: &str) -> FontRequest {
     FontRequest {
         default: None,

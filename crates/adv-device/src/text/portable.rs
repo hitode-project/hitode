@@ -256,7 +256,9 @@ impl Backend {
             return Err(TextError::Font("no OpenType fonts found".into()));
         }
         let mut output = Vec::new();
-        let mut seen = BTreeSet::new();
+        // A full enumeration reports each family once, preferring its regular
+        // style, as GDI does; extended enumeration does so per character set.
+        let mut seen = BTreeMap::new();
         let hidden: BTreeSet<_> = self
             .resources
             .values()
@@ -288,8 +290,15 @@ impl Backend {
             if output.len() >= 8192 {
                 return Err(TextError::Font("font enumeration budget exceeded".into()));
             }
-            let result = db
-                .with_face_data(info.id, |bytes, index| -> Result<_, TextError> {
+            let data = self
+                .store
+                .lock()
+                .map_err(|_| TextError::Font("font cache lock poisoned".into()))
+                .and_then(|mut store| source_bytes(&mut store, &info.source));
+            let result = data
+                .ok()
+                .map(|data| -> Result<_, TextError> {
+                    let (bytes, index) = (data.as_ref().as_ref(), info.index);
                     let font = FontRef::from_index(bytes, index).map_err(font_error)?;
                     // Report the legacy family GDI uses: the requested spelling
                     // when it names one, else the guest UI language, else English.
@@ -387,27 +396,40 @@ impl Backend {
             let Ok(Ok(result)) = result else {
                 continue;
             };
-            // EnumFonts (Faces) returns one representative per family when no
-            // family was supplied; Families retains each available style.
-            if mode == FontEnumeration::Faces
-                && face.is_none()
-                && !seen.insert(result.font.face.to_lowercase())
-            {
+            if named.is_none() && !listed(&result.font.face) {
                 continue;
             }
-            if let FontEnumeration::FamiliesEx(encoding) = mode {
-                for font in enumeration::repertoires(result, encoding) {
-                    if output.len() >= 8192 {
-                        return Err(TextError::Font("font enumeration budget exceeded".into()));
+            let fonts = match mode {
+                FontEnumeration::FamiliesEx(encoding) => enumeration::repertoires(result, encoding),
+                _ => vec![result],
+            };
+            for font in fonts {
+                if named.is_none() {
+                    let key = (font.font.face.to_lowercase(), font.font.encoding);
+                    let regular = font.design.as_ref().is_none_or(|design| design.regular);
+                    if let Some(&at) = seen.get(&key) {
+                        let current: &EnumeratedFont = &output[at];
+                        if regular && !current.design.as_ref().is_none_or(|d| d.regular) {
+                            output[at] = font;
+                        }
+                        continue;
                     }
-                    output.push(font);
+                    seen.insert(key, output.len());
                 }
-            } else {
-                output.push(result);
+                if output.len() >= 8192 {
+                    return Err(TextError::Font("font enumeration budget exceeded".into()));
+                }
+                output.push(font);
             }
         }
         Ok(output)
     }
+}
+
+/// Whether a full enumeration lists a family. A leading period marks a
+/// host-private family that host font menus also leave out.
+fn listed(family: &str) -> bool {
+    !family.is_empty() && !family.starts_with('.')
 }
 
 struct Face {
@@ -459,6 +481,38 @@ fn diagnostic(
         request.italic
     );
 }
+/// A face source's bytes. Files come through the store's bounded cache, so a
+/// collection's faces and repeated lookups read the file once.
+fn source_bytes(store: &mut FaceStore, source: &Source) -> Result<FontBytes, TextError> {
+    let path = match source {
+        Source::Binary(bytes) => return Ok(Arc::clone(bytes)),
+        Source::File(path) => path,
+    };
+    if let Some(bytes) = store.files.get(path) {
+        return Ok(Arc::clone(bytes));
+    }
+    let length = std::fs::metadata(path).map_err(font_error)?.len();
+    if length > MAX_SYSTEM_FONT_BYTES as u64 {
+        return Err(TextError::Font("system font exceeds data limit".into()));
+    }
+    let bytes: FontBytes = Arc::new(std::fs::read(path).map_err(font_error)?);
+    let length = bytes.as_ref().as_ref().len();
+    if length > MAX_SYSTEM_FONT_BYTES {
+        return Err(TextError::Font("system font exceeds data limit".into()));
+    }
+    // Keep a bounded number of shared collection files. Font owners
+    // independently retain data after this lookup cache is cleared.
+    if store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
+        store.faces.clear();
+        store.files.clear();
+        store.digests.clear();
+        store.file_bytes = 0;
+    }
+    store.file_bytes += length;
+    store.files.insert(path.clone(), Arc::clone(&bytes));
+    Ok(bytes)
+}
+
 fn load_face(
     db: &Database,
     store: &Mutex<FaceStore>,
@@ -475,35 +529,7 @@ fn load_face(
         .face(id)
         .ok_or_else(|| TextError::Font("font face no longer registered".into()))?
         .clone();
-    let data = match &info.source {
-        Source::Binary(bytes) => Arc::clone(bytes),
-        Source::File(path) => {
-            if let Some(bytes) = store.files.get(path) {
-                Arc::clone(bytes)
-            } else {
-                let length = std::fs::metadata(path).map_err(font_error)?.len();
-                if length > MAX_SYSTEM_FONT_BYTES as u64 {
-                    return Err(TextError::Font("system font exceeds data limit".into()));
-                }
-                let bytes: FontBytes = Arc::new(std::fs::read(path).map_err(font_error)?);
-                let length = bytes.as_ref().as_ref().len();
-                if length > MAX_SYSTEM_FONT_BYTES {
-                    return Err(TextError::Font("system font exceeds data limit".into()));
-                }
-                // Keep a bounded number of shared collection files. Font owners
-                // independently retain data after this lookup cache is cleared.
-                if store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
-                    store.faces.clear();
-                    store.files.clear();
-                    store.digests.clear();
-                    store.file_bytes = 0;
-                }
-                store.file_bytes += length;
-                store.files.insert(path.clone(), Arc::clone(&bytes));
-                bytes
-            }
-        }
-    };
+    let data = source_bytes(&mut store, &info.source)?;
     let source = match &info.source {
         Source::Binary(_) => profile
             .and_then(|profile| profile.paths.get(&id))
@@ -1957,6 +1983,14 @@ fn blend(pixels: &mut Pixels<'_>, x: i64, y: i64, color: [u8; 3], coverage: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    // spec: DEV-FONT-5
+    fn private_and_unnamed_families_are_not_listed() {
+        assert!(listed("PingFang SC"));
+        assert!(listed("宋体"));
+        assert!(!listed(".SF NS"));
+        assert!(!listed(""));
+    }
     fn font(face: &str) -> FontRequest {
         FontRequest {
             default: None,
