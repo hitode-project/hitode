@@ -1126,8 +1126,9 @@ mod tests {
         );
     }
 
+    // spec: WIN32-USER-16
     #[test]
-    fn mouse_coordinates_round_trip_for_negative_and_framed_window_origins() {
+    fn mouse_coordinates_round_trip_over_the_whole_displayed_client() {
         use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
         use adv_win32::user32::window::{
             Rect, WS_CAPTION, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, make_long,
@@ -1160,7 +1161,7 @@ mod tests {
             WS_POPUP | WS_VISIBLE,
             WS_CAPTION | WS_THICKFRAME | WS_VISIBLE,
         ] {
-            for (left, top) in [(-80, -60), (560, 240)] {
+            for (left, top) in [(-80, -60), (560, 240), (1500, 900)] {
                 let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
                 let window = user
                     .windows
@@ -1168,13 +1169,17 @@ mod tests {
                     .unwrap();
                 window.rect = Rect::new(left, top, 800, 600);
                 window.style = style;
+                let (width, height) = window.client_size();
                 user.queue(0).capture = 0;
                 let origin = user.client_origin(&runtime.machine.sys.objects, 0x10020);
                 for (x, y) in [(0, 0), (400, 300), (-12, -34)] {
                     let packed = make_long(x, y);
-                    // The guest desktop starts at (0, 0). A partially offscreen
-                    // window cannot move the physical cursor into negative space.
-                    let expected_screen = ((x + origin.0).max(0), (y + origin.1).max(0));
+                    // The host shows the whole client, so the pointer reaches it
+                    // past the (0, 0)-(1920, 1080) display, but not beyond both.
+                    let expected_screen = (
+                        (x + origin.0).clamp(origin.0.min(0), (origin.0 + width).max(1920) - 1),
+                        (y + origin.1).clamp(origin.1.min(0), (origin.1 + height).max(1080) - 1),
+                    );
                     let local = (expected_screen.0 - origin.0, expected_screen.1 - origin.1);
                     assert!(runtime.post_input(0x200, 0, packed));
                     let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
@@ -1228,7 +1233,7 @@ mod tests {
                     .get::<Win32>()
                     .user
                     .client_origin(&runtime.machine.sys.objects, 0x10028);
-                let screen = ((60 + origin.0).max(0), (80 + origin.1).max(0));
+                let screen = (60 + origin.0, 80 + origin.1);
                 assert!(runtime.post_input(0x200, 0, make_long(60, 80)));
                 let message = runtime
                     .machine

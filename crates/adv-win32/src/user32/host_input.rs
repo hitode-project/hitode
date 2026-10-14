@@ -56,8 +56,15 @@ fn post_at(
         // Frontend coordinates describe the displayed top-level client.
         // A captured child receives coordinates in its own client area.
         let (ox, oy) = user.client_origin(&env.sys.objects, top);
-        let (sx, sy) =
-            super::input::set_cursor_position(user, (x.saturating_add(ox), y.saturating_add(oy)));
+        let (cw, ch) = user
+            .windows
+            .get(&env.sys.objects, &top)
+            .map_or((0, 0), |window| window.client_size());
+        let (sx, sy) = super::input::set_host_cursor_position(
+            user,
+            (x.saturating_add(ox), y.saturating_add(oy)),
+            super::window::Rect::new(ox, oy, cw, ch),
+        );
         let thread = user.windows.get(&env.sys.objects, &top).unwrap().thread;
         let captured = user
             .queues

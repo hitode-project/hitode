@@ -57,6 +57,29 @@ pub(super) fn set_cursor_position(user: &mut User, position: (i32, i32)) -> (i32
     user.cursor_pos
 }
 
+/// A host pointer over `client`, the top-level client area the host displays
+/// whole. Where that window extends past the virtual display the pointer still
+/// reaches it, as on a second monitor; a guest ClipCursor still confines it.
+pub(super) fn set_host_cursor_position(
+    user: &mut User,
+    position: (i32, i32),
+    client: Rect,
+) -> (i32, i32) {
+    if user.cursor_clip.is_some() {
+        return set_cursor_position(user, position);
+    }
+    let screen = display_bounds(user);
+    let left = screen.left.min(client.left);
+    let top = screen.top.min(client.top);
+    let right = screen.right.max(client.right);
+    let bottom = screen.bottom.max(client.bottom);
+    user.cursor_pos = (
+        position.0.clamp(left, right - 1),
+        position.1.clamp(top, bottom - 1),
+    );
+    user.cursor_pos
+}
+
 /// Guest display policy: intersect a retained constraint with the resized
 /// desktop, or release it when disjoint. Never retain an off-desktop position.
 pub(super) fn reconcile_cursor_clip(user: &mut User) {
@@ -382,6 +405,27 @@ mod tests {
         assert_eq!(get_cursor_info(&mut env, GuestPtr::new(edge)), 0);
         assert_eq!(env.cpu.read_u32(edge + 4).unwrap(), 0x5a5a5a5a);
         assert_eq!(get_cursor_info(&mut env, GuestPtr::new(0)), 0);
+    }
+    // spec: WIN32-USER-16
+    #[test]
+    fn host_pointer_reaches_the_displayed_client_unless_the_guest_clips_it() {
+        let mut objects = adv_machine::Objects::default();
+        let mut user = User::new(&mut objects, (1920, 1080), None).unwrap();
+        // A 1920x1080 client whose window overhangs the display's bottom right.
+        let client = Rect::new(190, 192, 1920, 1080);
+        assert_eq!(
+            set_host_cursor_position(&mut user, (1458, 1172), client),
+            (1458, 1172)
+        );
+        assert_eq!(
+            set_host_cursor_position(&mut user, (3000, 3000), client),
+            (2109, 1271)
+        );
+        user.cursor_clip = Some(Rect::new(0, 0, 1920, 1080));
+        assert_eq!(
+            set_host_cursor_position(&mut user, (1458, 1172), client),
+            (1458, 1079)
+        );
     }
     #[test]
     fn host_inverse_then_guest_mapping_is_once_and_preserves_ctrl_wheel_and_extra_buttons() {
