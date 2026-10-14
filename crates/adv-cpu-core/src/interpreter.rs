@@ -407,6 +407,51 @@ fn execute_decoded(
             units: 1,
         };
     }
+    if let Action::CompareExchange8(address) = instruction.action {
+        let address = address.resolve_regs(&state.regs, state.fs_base);
+        let result = (|| {
+            for permission in [READ, WRITE] {
+                if !accessible(memory, address, 8, permission) {
+                    let address = fault_address(memory, address, permission);
+                    return Err(if permission == READ {
+                        Step::ReadFault { pc, address }
+                    } else {
+                        Step::WriteFault { pc, address }
+                    });
+                }
+            }
+            let bytes = memory
+                .read_data(address, 8)
+                .map_err(|_| Step::ReadFault { pc, address })?;
+            let old = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
+            let equal = old == u64::from(state.regs[0]) | (u64::from(state.regs[2]) << 32);
+            let value = if equal {
+                u64::from(state.regs[3]) | (u64::from(state.regs[1]) << 32)
+            } else {
+                old
+            };
+            // The failed comparison is still a write access. Commit all eight
+            // bytes before publishing registers or ZF, including COW failures.
+            memory
+                .write(address, &value.to_le_bytes())
+                .map_err(|_| Step::WriteFault { pc, address })?;
+            if !equal {
+                state.regs[0] = old as u32;
+                state.regs[2] = (old >> 32) as u32;
+            }
+            state.eflags = (state.eflags & !ZF) | if equal { ZF } else { 0 };
+            state.eip = instruction.next;
+            Ok(if debug {
+                Step::Trap { pc, vector: 1 }
+            } else {
+                Step::Executed
+            })
+        })();
+        return Execution {
+            units: u32::from(result.is_ok()),
+            step: result.unwrap_or_else(|step| step),
+        };
+    }
     let mut tx = Transaction {
         regs: state.regs,
         flags: state.eflags,
@@ -1181,6 +1226,7 @@ enum Action {
     Xchg(Operand, Operand),
     Xadd(Operand, Operand),
     CompareExchange(Operand, Operand),
+    CompareExchange8(Address),
     Multiply(Operand, Option<Operand>, Option<Operand>, bool),
     Divide(Operand, bool),
     Branch(Operand, ConditionCode),
@@ -1297,6 +1343,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
                     | M::Xchg
                     | M::Xadd
                     | M::Cmpxchg
+                    | M::Cmpxchg8b
                     | M::Bts
                     | M::Btr
                     | M::Btc
@@ -1396,6 +1443,9 @@ fn predecode(i: &Instruction) -> Option<Action> {
                 return None;
             }
             Action::Xchg(a, b)
+        }
+        M::Cmpxchg8b if i.op0_kind() == OpKind::Memory => {
+            Action::CompareExchange8(Address::decode(i, false)?)
         }
         M::Xadd | M::Cmpxchg => {
             let (dst, src) = pair()?;
@@ -1937,6 +1987,7 @@ impl Transaction {
                 self.store(memory, src, a)?;
                 self.store(memory, dst, value)?;
             }
+            Action::CompareExchange8(_) => unreachable!("handled before scalar transactions"),
             Action::CompareExchange(dst, src) => {
                 let value = self.read(memory, dst)?;
                 let source = self.read(memory, src)?;
@@ -2322,6 +2373,78 @@ fn condition_true(condition: ConditionCode, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: A64-ISA-5
+    #[test]
+    fn cmpxchg8b_commits_only_zf_and_checks_the_whole_write_even_on_mismatch() {
+        for locked in [false, true] {
+            for equal in [false, true] {
+                for writable in [false, true] {
+                    let mut memory = Memory::new(0x1000, 0x4000).unwrap();
+                    memory.protect(0x1000, 0x4000, READ | WRITE | EXEC).unwrap();
+                    let mut code = vec![0x0f, 0xc7, 0x0e]; // cmpxchg8b [esi]
+                    if locked {
+                        code.insert(0, 0xf0);
+                    }
+                    memory.write(0x1000, &code).unwrap();
+                    memory
+                        .write(0x2ffc, &0x1122334455667788u64.to_le_bytes())
+                        .unwrap();
+                    if !writable {
+                        memory.protect(0x3000, PAGE_SIZE, READ).unwrap();
+                    }
+                    let mut state = CpuState {
+                        eip: 0x1000,
+                        eflags: 0xad7,
+                        regs: [
+                            0x55667788,
+                            0xaabbccdd,
+                            if equal { 0x11223344 } else { 0 },
+                            0x98765432,
+                            0,
+                            0,
+                            0x2ffc,
+                            0,
+                        ],
+                        ..Default::default()
+                    };
+                    let before = state.clone();
+                    let result = Interpreter::new().run_chunk(&mut state, &mut memory, 1);
+                    let bytes = memory.read_data(0x2ffc, 8).unwrap();
+                    if !writable {
+                        assert_eq!(
+                            result.step,
+                            Step::WriteFault {
+                                pc: 0x1000,
+                                address: 0x3000
+                            }
+                        );
+                        assert_eq!(state.regs, before.regs);
+                        assert_eq!(state.eflags, before.eflags);
+                        assert_eq!(state.eip, before.eip);
+                        assert_eq!(bytes.as_ref(), 0x1122334455667788u64.to_le_bytes());
+                    } else {
+                        assert_eq!(result.step, Step::Executed);
+                        assert_eq!(
+                            state.eflags,
+                            (before.eflags & !ZF) | if equal { ZF } else { 0 }
+                        );
+                        assert_eq!(state.regs[0], 0x55667788);
+                        assert_eq!(state.regs[2], 0x11223344);
+                        assert_eq!(
+                            bytes.as_ref(),
+                            if equal {
+                                0xaabbccdd98765432u64
+                            } else {
+                                0x1122334455667788
+                            }
+                            .to_le_bytes()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn frame_retirement_counts_rep_once_and_keeps_fault_prefix() {

@@ -805,3 +805,43 @@ fn x87_single_precision_rounding_keeps_extended_exponents_and_exception_state() 
         }
     }
 }
+
+// spec: A64-ISA-5
+#[test]
+fn cmpxchg8b_matches_interpreter_flags_faults_and_native_commits() {
+    for offset in [0, 1, 4092] {
+        for equal in [false, true] {
+            for writable in [false, true] {
+                let mut program = fixture(|a| {
+                    a.lock().cmpxchg8b(qword_ptr(esi)).unwrap();
+                });
+                program.state.regs[6] = DATA + offset;
+                program.state.regs[0] = 0x55667788;
+                program.state.regs[2] = if equal { 0x11223344 } else { 0 };
+                program.state.regs[3] = 0x98765432;
+                program.state.regs[1] = 0xaabbccdd;
+                program.data[offset as usize..offset as usize + 8]
+                    .copy_from_slice(&0x1122334455667788u64.to_le_bytes());
+                for flagm in [false, true] {
+                    let config = (Features { flagm }, false, Checks::Adaptive);
+                    let mut native = executor(&program, config, false);
+                    let mut oracle = executor(&program, config, true);
+                    if !writable {
+                        let page = (DATA + offset + 7) & !4095;
+                        native.protect(page, 4096, adv_cpu_core::READ).unwrap();
+                        oracle.protect(page, 4096, adv_cpu_core::READ).unwrap();
+                    }
+                    assert_eq!(
+                        native.run(program.stop, 100).unwrap(),
+                        oracle.run(program.stop, 100).unwrap()
+                    );
+                    same(&native, &oracle);
+                    if writable && offset == 0 {
+                        assert_eq!(native.stats.interpreter_entries, 0);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    }
+                }
+            }
+        }
+    }
+}

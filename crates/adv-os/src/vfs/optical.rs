@@ -557,6 +557,9 @@ impl Vfs {
             .map(|(letter, media)| (*letter, &media.info))
     }
     fn optical_path(&self, guest: &str) -> Option<(Arc<OpticalMedia>, String)> {
+        if self.optical.is_empty() {
+            return None;
+        }
         let path = self.normalize(guest);
         let path = path.strip_prefix("\\\\?\\").unwrap_or(&path);
         let bytes = path.as_bytes();

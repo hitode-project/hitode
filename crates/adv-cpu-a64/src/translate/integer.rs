@@ -16,7 +16,7 @@ use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Part, ShiftKind, Src, memory};
+use super::decode::{Mem, Part, ShiftKind, Src, memory};
 use super::flags::FlagSet;
 use super::{
     Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
@@ -44,6 +44,7 @@ pub enum Integer {
     Xadd(Src, u8),
     /// `xchg dst, src`.
     Xchg(Src, u8),
+    CompareExchange8(Mem, u8),
     Bswap(u8),
     /// `mul` or `imul` (true) of EAX into EDX:EAX.
     Multiply(Src, bool),
@@ -91,6 +92,7 @@ impl Integer {
             }
             Integer::Xadd(dst, _) => (F::NONE, F::ALL, mem(dst)),
             Integer::Xchg(dst, _) => (F::NONE, F::NONE, mem(dst)),
+            Integer::CompareExchange8(..) => (F::NONE, F::ZF, true),
             Integer::Bswap(_) => (F::NONE, F::NONE, false),
             Integer::Multiply(src, _) => (F::NONE, F::CF.or(F::OF), mem(src)),
             // The helper reads every flag.
@@ -121,9 +123,13 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
     let mnemonic = instruction.mnemonic();
     // Locked exchanges are ordinary ones: guest threads take turns.
     if instruction.has_lock_prefix()
-        && !(matches!(mnemonic, M::Xadd | M::Xchg) && instruction.op_kind(0) == OpKind::Memory)
+        && !(matches!(mnemonic, M::Xadd | M::Xchg | M::Cmpxchg8b)
+            && instruction.op_kind(0) == OpKind::Memory)
     {
         return None;
+    }
+    if mnemonic == M::Cmpxchg8b && instruction.op0_kind() == OpKind::Memory {
+        return Some(Integer::CompareExchange8(memory(instruction)?, helper));
     }
     let dst = instruction.op0_register();
     if instruction.op0_kind() == OpKind::Register && (dst.is_gpr8() || dst.is_gpr16()) {
@@ -234,6 +240,7 @@ impl Translator<'_> {
             Integer::Through(left, dst, count) => self.through(left, dst, count),
             Integer::Xadd(dst, src) => self.xadd(dst, src),
             Integer::Xchg(dst, src) => self.xchg(dst, src),
+            Integer::CompareExchange8(mem, helper) => self.compare_exchange8(mem, helper),
             Integer::Bswap(index) => {
                 self.clobber(Operand::Guest(index));
                 self.emit(rev(W, host(index), host(index)));
@@ -250,6 +257,49 @@ impl Translator<'_> {
                 self.state.derivable = None;
             }
         }
+    }
+
+    fn compare_exchange8(&mut self, mem: Mem, helper: u8) {
+        if self.checking {
+            self.helper(helper);
+            return;
+        }
+        self.canonicalize();
+        let address = self.effective(mem);
+        self.emit(mov(W, X17, address));
+        let slow = self.asm.label();
+        self.emit(and_imm(W, X13, X17, 7));
+        self.asm.cbz(W, true, X13, slow);
+        self.site();
+        self.emit(ldr_reg(X, X6, super::WINDOW, X17, false));
+        self.emit_all(&[
+            orr(X, X13, host(EAX), host(EDX), Lsl, 32),
+            eor(X, X13, X13, X6, Lsl, 0),
+        ]);
+        let unequal = self.asm.label();
+        let done = self.asm.label();
+        self.asm.cbz(X, true, X13, unequal);
+        self.emit(orr(X, X15, host(3), host(ECX), Lsl, 32));
+        self.site();
+        self.emit(str_reg(X, X15, super::WINDOW, X17, false));
+        self.emit_all(&[mrs_nzcv(X14), orr_imm(X, X14, X14, 1 << 30), msr_nzcv(X14)]);
+        self.asm.b(done);
+        self.asm.bind(unequal);
+        self.site();
+        self.emit(str_reg(X, X6, super::WINDOW, X17, false));
+        self.emit_all(&[
+            mov(W, host(EAX), X6),
+            lsr_imm(X, X13, X6, 32),
+            mov(W, host(EDX), X13),
+            mrs_nzcv(X14),
+            and_imm(X, X14, X14, !(1u64 << 30)),
+            msr_nzcv(X14),
+        ]);
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
     }
 
     fn narrow_shift(&mut self, kind: ShiftKind, dst: u8, width: u8, count: u32) {
