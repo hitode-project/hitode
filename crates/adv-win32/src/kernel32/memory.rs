@@ -34,6 +34,7 @@ fn heap_create(env: &mut Env<'_>) -> Outcome {
     let flags = env.arg(0);
     let serialized = flags & 1 == 0; // HEAP_NO_SERIALIZE
     let executable = flags & 0x40000 != 0; // HEAP_CREATE_ENABLE_EXECUTE
+    let small = env.arg(2) == 0 && flags & !(1 | 0x40000) == 0;
     let heaps = env.ext.get_mut::<Heaps>();
     match heaps.create_with_policy(
         env.cpu,
@@ -42,7 +43,13 @@ fn heap_create(env: &mut Env<'_>) -> Outcome {
         executable,
         flags & 4 != 0,
     ) {
-        Ok(h) => Outcome::Return(h),
+        Ok(h) => {
+            if small && heaps.enable_small_heap(env.cpu, h).is_err() {
+                heaps.destroy(env.cpu, &mut env.sys.vm, h);
+                return Outcome::Return(0);
+            }
+            Outcome::Return(h)
+        }
         Err(_) => Outcome::Return(0),
     }
 }

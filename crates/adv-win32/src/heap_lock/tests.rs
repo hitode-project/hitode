@@ -210,3 +210,38 @@ fn heap_lock_waits_for_preempted_guest_operations_before_returning() {
         assert_eq!(machine.cpu.read_u32(heap + 0x104).unwrap(), 1);
     }
 }
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn private_heap_destruction_drains_lookup_pins_before_unregistering() {
+    for jit in [false, true] {
+        let mut machine = fixture_with(jit);
+        let root = machine.ext.get::<Heaps>().process_heap;
+        let heaps = machine.ext.get_mut::<Heaps>();
+        let heap = heaps.create(&mut machine.cpu, &mut machine.sys.vm).unwrap();
+        assert!(heaps.enable_small_heap(&mut machine.cpu, heap).unwrap());
+        machine.cpu.write_u32(root + 0xb14, 1).unwrap();
+        let Outcome::Block {
+            wait: Wait::Yield,
+            then,
+            ..
+        } = destroy(&mut env(&mut machine, 0), heap)
+        else {
+            panic!("lookup pin must keep heap mapped");
+        };
+        assert!(machine.cpu.accessible(heap, 4096, Prot::RW));
+        assert_eq!(machine.cpu.read_u32(root + 0xb24).unwrap(), heap);
+        assert_eq!(machine.cpu.read_u32(root + 0xb10).unwrap(), 1);
+        machine.cpu.write_u32(root + 0xb14, 0).unwrap();
+        returned(
+            then(
+                &mut env(&mut machine, 0),
+                Resume::Woke(WakeReason::Signaled),
+            ),
+            1,
+        );
+        assert!(!machine.cpu.accessible(heap, 4096, Prot::RW));
+        assert_eq!(machine.cpu.read_u32(root + 0xb24).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(root + 0xb10).unwrap(), 0);
+    }
+}

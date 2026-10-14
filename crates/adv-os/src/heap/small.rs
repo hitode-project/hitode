@@ -1,4 +1,4 @@
-//! Process-heap slabs share guest headers and generation-tagged free lists.
+//! Enabled heap slabs share guest headers and generation-tagged free lists.
 //! Host slab registration bounds every header read; corrupt metadata is invalid.
 //! Free links use body offset four, preserving retired COM interface vtable words.
 use super::*;
@@ -11,6 +11,10 @@ pub(super) const HEADS: u32 = 0x110;
 pub(super) const RANGES: u32 = 0x310;
 const SLAB: u32 = 0x4000;
 const LIMIT: usize = 128;
+const REGISTRY_GATE: u32 = 0xb10;
+const REGISTRY_ACTIVE: u32 = 0xb14;
+const REGISTRY: u32 = 0xb20;
+const HEAPS: u32 = 16;
 
 #[derive(Clone, Copy)]
 pub(super) struct Slab {
@@ -158,13 +162,76 @@ impl Heap {
     }
 }
 impl Heaps {
-    /// Initialize the shared small-block infrastructure before guest execution.
+    /// Initialize the process-owned registry before guest execution.
     pub fn enable_small(&mut self, cpu: &mut dyn Guest) -> Result<(), MemFault> {
-        let heap = self.process_heap;
-        let h = self.heaps.get_mut(&heap).expect("created process heap");
-        cpu.write(heap + 0x100, &[0; 0xa10])?;
-        cpu.write_u32(heap + 0x100, COOKIE)?;
-        h.slabs = Some(Vec::new());
+        cpu.write(self.process_heap + REGISTRY_GATE, &[0; 0x50])?;
+        self.enable_small_heap(cpu, self.process_heap)?;
+        Ok(())
+    }
+    /// Register an eligible heap only after its complete control page is initialized.
+    pub fn enable_small_heap(&mut self, cpu: &mut dyn Guest, heap: u32) -> Result<bool, MemFault> {
+        if !self.heaps.contains_key(&self.process_heap) {
+            return Ok(false);
+        }
+        for i in 0..HEAPS {
+            let slot = self.process_heap + REGISTRY + i * 4;
+            if cpu.read_u32(slot)? != 0 {
+                continue;
+            }
+            cpu.write(heap + 0x100, &[0; 0xa10])?;
+            cpu.write_u32(heap + 0x100, COOKIE)?;
+            cpu.write_u32(slot, heap)?;
+            self.heaps.get_mut(&heap).expect("created heap").slabs = Some(Vec::new());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    /// Protect lookups that have not yet reached the target heap's operation count.
+    pub fn gate_small_registry(&self, cpu: &mut dyn Guest, hold: bool) -> Result<(), MemFault> {
+        if self
+            .heaps
+            .get(&self.process_heap)
+            .is_some_and(|h| h.slabs.is_some())
+        {
+            let gate = self.process_heap + REGISTRY_GATE;
+            let n = cpu.read_u32(gate)?;
+            cpu.write_u32(
+                gate,
+                if hold {
+                    n.wrapping_add(1)
+                } else {
+                    n.wrapping_sub(1)
+                },
+            )?;
+        }
+        Ok(())
+    }
+    pub fn small_registry_active(&self, cpu: &dyn Guest) -> u32 {
+        if self
+            .heaps
+            .get(&self.process_heap)
+            .is_some_and(|h| h.slabs.is_some())
+        {
+            cpu.read_u32(self.process_heap + REGISTRY_ACTIVE)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+    pub(super) fn unregister_small(&self, cpu: &mut dyn Guest, heap: u32) -> Result<(), MemFault> {
+        if self
+            .heaps
+            .get(&self.process_heap)
+            .is_some_and(|h| h.slabs.is_some())
+        {
+            for i in 0..HEAPS {
+                let slot = self.process_heap + REGISTRY + i * 4;
+                if cpu.read_u32(slot)? == heap {
+                    cpu.write_u32(slot, 0)?;
+                    break;
+                }
+            }
+        }
         Ok(())
     }
     /// Prevent new guest operations before installing a persistent heap lock.
@@ -186,7 +253,9 @@ impl Heaps {
     }
     /// Global/Local allocations require host bookkeeping before recycling.
     pub fn account_small(&self, cpu: &mut dyn Guest, addr: u32) {
-        let heap = self.process_heap;
+        let Some(heap) = self.owner(cpu, addr) else {
+            return;
+        };
         if let Some(bits) = self
             .heaps
             .get(&heap)

@@ -1,6 +1,6 @@
 //! Guest heaps (HeapAlloc & co., also behind malloc, LocalAlloc, GlobalAlloc).
 //!
-//! Small process-heap blocks carry guest headers and shared free lists. Host reads
+//! Small enabled-heap blocks carry guest headers and shared free lists. Host reads
 //! validate headers against registered slabs; corruption is an invalid pointer, never
 //! a panic. Other allocations use host metadata and coalescing arena free ranges.
 //! Blocks are 8-byte aligned; large blocks own freshly zeroed VM regions.
@@ -221,6 +221,9 @@ impl Heaps {
     }
 
     pub fn destroy(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32) -> bool {
+        if self.unregister_small(cpu, handle).is_err() {
+            return false;
+        }
         let Some(h) = self.heaps.remove(&handle) else {
             return false;
         };

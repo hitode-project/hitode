@@ -330,3 +330,187 @@ fn heap_lock_routes_guest_calls_through_the_host_and_walk_reports_free_blocks() 
         );
     }
 }
+
+fn private_pair(code: &mut Asm, alloc: u32, free: u32, handle: u32, output: u32) {
+    code.push_imm(4)
+        .push_imm(0)
+        .mov_eax_mem(handle)
+        .push_eax()
+        .call(alloc)
+        .mov_mem_eax(output);
+    code.push_eax()
+        .push_imm(0)
+        .mov_eax_mem(handle)
+        .push_eax()
+        .call(free)
+        .mov_mem_eax(output + 4);
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn growable_private_heaps_avoid_host_calls_after_refill() {
+    for jit in [false, true] {
+        let mut m = machine(jit, true);
+        let create = api(&mut m, "kernel32.dll", "HeapCreate").unwrap();
+        let alloc = api(&mut m, "kernel32.dll", "HeapAlloc").unwrap();
+        let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+        let mut code = Asm::new(CODE);
+        for (i, options) in [0, 1, 0x40000, 0x40001].into_iter().enumerate() {
+            let data = DATA + i as u32 * 16;
+            invoke(&mut code, create, &[options, 0x1000, 0], data);
+            for _ in 0..64 {
+                private_pair(&mut code, alloc, free, data, data + 4);
+            }
+        }
+        run(&mut m, code);
+        assert_eq!(
+            m.ext.get::<Calls>().allocate,
+            4,
+            "only the first refill of each heap enters the host"
+        );
+        assert_eq!(m.ext.get::<Calls>().free, 0);
+        let root = m.ext.get::<Heaps>().process_heap;
+        assert_eq!(m.cpu.read_u32(root + 0xb14).unwrap(), 0);
+        for i in 0..4 {
+            let heap = m.cpu.read_u32(DATA + i * 16).unwrap();
+            let pointer = m.cpu.read_u32(DATA + i * 16 + 4).unwrap();
+            assert_ne!(heap, 0);
+            assert_ne!(pointer, 0);
+            assert_eq!(m.cpu.read_u32(DATA + i * 16 + 8).unwrap(), 1);
+            assert_eq!(m.cpu.accessible(pointer, 4, Prot::EXEC), i >= 2);
+            assert_eq!(m.cpu.read_u32(heap + 0x108).unwrap(), 0);
+            assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
+        }
+    }
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn fixed_and_exception_heaps_retain_host_calls() {
+    for jit in [false, true] {
+        let mut m = machine(jit, true);
+        let create = api(&mut m, "kernel32.dll", "HeapCreate").unwrap();
+        let alloc = api(&mut m, "kernel32.dll", "HeapAlloc").unwrap();
+        let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+        let mut code = Asm::new(CODE);
+        for (i, (options, maximum)) in [(0, 0x10000), (4, 0), (2, 0)].into_iter().enumerate() {
+            let data = DATA + i as u32 * 16;
+            invoke(&mut code, create, &[options, 0x1000, maximum], data);
+            for _ in 0..3 {
+                private_pair(&mut code, alloc, free, data, data + 4);
+            }
+        }
+        run(&mut m, code);
+        assert_eq!(m.ext.get::<Calls>().allocate, 9);
+        assert_eq!(m.ext.get::<Calls>().free, 9);
+        for i in 0..3 {
+            assert_ne!(m.cpu.read_u32(DATA + i * 16 + 4).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + i * 16 + 8).unwrap(), 1);
+        }
+    }
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn private_heap_registry_capacity_keeps_excess_heaps_usable() {
+    for jit in [false, true] {
+        let mut m = machine(jit, true);
+        let create = api(&mut m, "kernel32.dll", "HeapCreate").unwrap();
+        let alloc = api(&mut m, "kernel32.dll", "HeapAlloc").unwrap();
+        let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+        let mut code = Asm::new(CODE);
+        for i in 0..17 {
+            let data = DATA + i * 16;
+            invoke(&mut code, create, &[0, 0x1000, 0], data);
+            for _ in 0..3 {
+                private_pair(&mut code, alloc, free, data, data + 4);
+            }
+        }
+        run(&mut m, code);
+        assert_eq!(m.ext.get::<Calls>().allocate, 15 + 2 * 3);
+        assert_eq!(m.ext.get::<Calls>().free, 2 * 3);
+        let root = m.ext.get::<Heaps>().process_heap;
+        let registered: BTreeSet<_> = (0..16)
+            .map(|i| m.cpu.read_u32(root + 0xb20 + i * 4).unwrap())
+            .collect();
+        assert_eq!(registered.len(), 16);
+        assert!(registered.contains(&root));
+        for i in 0..17 {
+            let heap = m.cpu.read_u32(DATA + i * 16).unwrap();
+            assert_ne!(m.cpu.read_u32(DATA + i * 16 + 4).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + i * 16 + 8).unwrap(), 1);
+            assert_eq!(registered.contains(&heap), i < 15);
+        }
+    }
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn destroyed_private_heap_handles_fall_back_and_reuse_has_fresh_slabs() {
+    for jit in [false, true] {
+        for direct in [false, true] {
+            let mut m = machine(jit, direct);
+            let create = api(&mut m, "kernel32.dll", "HeapCreate").unwrap();
+            let destroy = api(&mut m, "kernel32.dll", "HeapDestroy").unwrap();
+            let alloc = api(&mut m, "kernel32.dll", "HeapAlloc").unwrap();
+            let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+            let mut code = Asm::new(CODE);
+            invoke(&mut code, create, &[0, 0x1000, 0], DATA);
+            private_pair(&mut code, alloc, free, DATA, DATA + 4);
+            code.mov_eax_mem(DATA)
+                .push_eax()
+                .call(destroy)
+                .mov_mem_eax(DATA + 12);
+            code.push_imm(4)
+                .push_imm(0)
+                .mov_eax_mem(DATA)
+                .push_eax()
+                .call(alloc)
+                .mov_mem_eax(DATA + 16);
+            invoke(&mut code, create, &[0, 0x1000, 0], DATA + 20);
+            private_pair(&mut code, alloc, free, DATA + 20, DATA + 24);
+            private_pair(&mut code, alloc, free, DATA + 20, DATA + 24);
+            run(&mut m, code);
+            let heap = m.cpu.read_u32(DATA).unwrap();
+            assert_eq!(m.cpu.read_u32(DATA + 12).unwrap(), 1);
+            assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), heap);
+            assert_ne!(m.cpu.read_u32(DATA + 24).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 1);
+            assert_eq!(m.ext.get::<Calls>().allocate, if direct { 3 } else { 4 });
+            assert_eq!(m.ext.get::<Calls>().free, if direct { 0 } else { 3 });
+            assert_eq!(m.cpu.read_u32(heap + 0x10c).unwrap(), 1);
+            assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
+            let root = m.ext.get::<Heaps>().process_heap;
+            assert_eq!(
+                (0..16)
+                    .filter(|i| m.cpu.read_u32(root + 0xb20 + i * 4).unwrap() == heap)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn accounted_private_blocks_keep_the_host_free_boundary() {
+    for jit in [false, true] {
+        let mut m = machine(jit, true);
+        let heaps = m.ext.get_mut::<Heaps>();
+        let heap = heaps.create(&mut m.cpu, &mut m.sys.vm).unwrap();
+        assert!(heaps.enable_small_heap(&mut m.cpu, heap).unwrap());
+        let pointer = heaps
+            .alloc(&mut m.cpu, &mut m.sys.vm, heap, 4, false)
+            .unwrap();
+        heaps.account_small(&mut m.cpu, pointer);
+        let free = api(&mut m, "kernel32.dll", "HeapFree").unwrap();
+        let mut code = Asm::new(CODE);
+        invoke(&mut code, free, &[heap, 0, pointer], DATA);
+        run(&mut m, code);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
+        assert_eq!(m.ext.get::<Calls>().free, 1);
+        assert_eq!(m.ext.get::<Heaps>().size(&m.cpu, heap, pointer), None);
+        assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
+    }
+}

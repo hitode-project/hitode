@@ -40,6 +40,18 @@ fn drained(
     body(env)
 }
 
+fn registry_drained(
+    env: &mut Env<'_>,
+    body: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    if env.ext.get::<Heaps>().small_registry_active(env.cpu) != 0 {
+        return Outcome::block(Wait::Yield, move |env, _| registry_drained(env, body));
+    }
+    let result = body(env);
+    let _ = env.ext.get::<Heaps>().gate_small_registry(env.cpu, false);
+    result
+}
+
 fn after_enter(
     env: &mut Env<'_>,
     result: Outcome,
@@ -201,12 +213,23 @@ pub(crate) fn destroy(env: &mut Env<'_>, heap: u32) -> Outcome {
     {
         return Outcome::Return(0);
     }
+    let retire = move |env: &mut Env<'_>| {
+        if env
+            .ext
+            .get::<Heaps>()
+            .gate_small_registry(env.cpu, true)
+            .is_err()
+        {
+            return Outcome::Return(0);
+        }
+        registry_drained(env, body)
+    };
     drained(env, heap, move |env| match sync.lock {
         Some(lock) if sync.serialized => {
             let result = enter_cs(env, lock);
-            after_enter(env, result, body)
+            after_enter(env, result, retire)
         }
-        _ => body(env),
+        _ => retire(env),
     })
 }
 
