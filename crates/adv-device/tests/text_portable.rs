@@ -654,7 +654,9 @@ fn explicit_directories_discover_fixture_faces_without_host_font_dependencies() 
     assert!(!Arc::ptr_eq(&before, &loaded));
     assert_eq!(before.data, loaded.data);
     text.remove_resource(id).unwrap();
-    assert_eq!(text.glyph(&request, query).unwrap().data, before.data);
+    let restored = text.glyph(&request, query).unwrap();
+    assert_eq!(restored.metrics, before.metrics);
+    assert_eq!(restored.data, before.data);
 }
 
 /// Tests may execute on another host than the compiler (notably Android).
@@ -779,7 +781,9 @@ fn strict_profile_owns_verified_bytes_across_file_changes_and_cache_invalidation
     assert_eq!(before.metrics.advance_x, 36);
     let (id, _) = text.add_resource(SINGLE).unwrap();
     text.remove_resource(id).unwrap();
-    assert_eq!(text.glyph(&request, query).unwrap().data, before.data);
+    let restored = text.glyph(&request, query).unwrap();
+    assert_eq!(restored.metrics, before.metrics);
+    assert_eq!(restored.data, before.data);
     let result = Text::with_font_profile(&path);
     assert!(
         matches!(result, Err(TextError::Font(message)) if message.contains("SHA-256 mismatch"))
@@ -1119,9 +1123,11 @@ fn explicit_host_substitution_updates_metrics_and_cached_glyphs() {
             .width,
         36
     );
-    assert_ne!(before.data, after.data);
+    assert!(!Arc::ptr_eq(&before, &after));
     text.set_overrides(Overrides::default());
-    assert_eq!(text.glyph(&request, query).unwrap().data, before.data);
+    let restored = text.glyph(&request, query).unwrap();
+    assert_eq!(restored.metrics, before.metrics);
+    assert_eq!(restored.data, before.data);
 }
 
 // spec: DEV-FONT-1
