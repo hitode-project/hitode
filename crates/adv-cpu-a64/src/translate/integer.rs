@@ -34,6 +34,8 @@ const X8: Reg = temp(1);
 pub enum Integer {
     /// A 32-bit register shifted or rotated by CL.
     ShiftCl(ShiftKind, u8),
+    NarrowShift(ShiftKind, u8, u8, u32),
+    NarrowNeg(u8, u8),
     /// BSF (false) or BSR of a word/dword source, retaining dst on zero.
     Scan(bool, u8, Src, u8),
     /// `rcl` (true) or `rcr` of a 32-bit register by 1 to 31.
@@ -67,6 +69,20 @@ impl Integer {
         let mem = |src: Src| matches!(src, Src::Mem(_));
         match self {
             // A count of zero keeps the flags it would write.
+            Integer::NarrowNeg(..) => (F::NONE, F::ALL, false),
+            Integer::NarrowShift(kind, _, width, count) => {
+                let mut writes = F::PF.or(F::ZF).or(F::SF);
+                if kind == ShiftKind::Sar || count <= u32::from(width) * 8 {
+                    writes = writes.or(F::CF);
+                }
+                if count == 1 {
+                    writes = writes.or(F::OF);
+                }
+                if count == 0 {
+                    writes = F::NONE;
+                }
+                (F::NONE, writes, false)
+            }
             Integer::ShiftCl(kind, _) => (written(kind), written(kind), false),
             Integer::Scan(_, _, src, _) => (F::NONE, F::ZF, mem(src)),
             Integer::Through(_, _, count) => {
@@ -108,6 +124,28 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         && !(matches!(mnemonic, M::Xadd | M::Xchg) && instruction.op_kind(0) == OpKind::Memory)
     {
         return None;
+    }
+    let dst = instruction.op0_register();
+    if instruction.op0_kind() == OpKind::Register && (dst.is_gpr8() || dst.is_gpr16()) {
+        let width = dst.size() as u8;
+        if mnemonic == M::Neg {
+            return Some(Integer::NarrowNeg(dst.number() as u8, width));
+        }
+        if matches!(mnemonic, M::Shl | M::Sal | M::Shr | M::Sar)
+            && instruction.op1_kind() == OpKind::Immediate8
+        {
+            let kind = match mnemonic {
+                M::Shr => ShiftKind::Shr,
+                M::Sar => ShiftKind::Sar,
+                _ => ShiftKind::Shl,
+            };
+            return Some(Integer::NarrowShift(
+                kind,
+                dst.number() as u8,
+                width,
+                u32::from(instruction.immediate8()) & 31,
+            ));
+        }
     }
     Some(match mnemonic {
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror
@@ -175,6 +213,22 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
 impl Translator<'_> {
     pub(super) fn integer(&mut self, op: Integer) {
         match op {
+            Integer::NarrowNeg(dst, width) => {
+                self.canonicalize();
+                self.narrow_read(Part::Reg(dst), width, Reg::ZR, X13);
+                self.emit(sub(W, X6, Reg::ZR, X13, Lsl, 0));
+                self.narrow_write(Part::Reg(dst), width, Reg::ZR, X6);
+                self.emit_all(&[
+                    mov(W, X10, X6),
+                    eor(W, X11, X13, X6, Lsl, 0),
+                    lsl_imm(W, X13, X13, 32 - 8 * u32::from(width)),
+                    subs(W, Reg::ZR, Reg::ZR, X13, Lsl, 0),
+                ]);
+                self.state = State::CANONICAL;
+            }
+            Integer::NarrowShift(kind, dst, width, count) => {
+                self.narrow_shift(kind, dst, width, count)
+            }
             Integer::ShiftCl(kind, dst) => self.shift_cl(kind, dst),
             Integer::Scan(reverse, dst, src, width) => self.scan(reverse, dst, src, width),
             Integer::Through(left, dst, count) => self.through(left, dst, count),
@@ -196,6 +250,59 @@ impl Translator<'_> {
                 self.state.derivable = None;
             }
         }
+    }
+
+    fn narrow_shift(&mut self, kind: ShiftKind, dst: u8, width: u8, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let bits = 8 * u32::from(width);
+        self.canonicalize();
+        self.emit(mrs_nzcv(X14));
+        self.narrow_read(Part::Reg(dst), width, Reg::ZR, X13);
+        let word = match kind {
+            ShiftKind::Shl => lsl_imm(W, X6, X13, count),
+            ShiftKind::Shr => lsr_imm(W, X6, X13, count),
+            ShiftKind::Sar => {
+                self.emit(sbfx(W, X6, X13, 0, bits));
+                asr_imm(W, X6, X6, count)
+            }
+            _ => unreachable!(),
+        };
+        self.emit(word);
+        self.emit(ubfx(W, X6, X6, 0, bits));
+        self.narrow_write(Part::Reg(dst), width, Reg::ZR, X6);
+        self.emit_all(&[
+            mov(W, X10, X6),
+            adds(W, Reg::ZR, Reg::ZR, X6, Lsl, 32 - bits),
+        ]);
+        if count > bits && kind != ShiftKind::Sar {
+            // Canonical C is the inverse of the guest CF.
+            self.emit_all(&[mvn(W, X15, X14), ubfx(W, X15, X15, 29, 1)]);
+        } else {
+            let bit = if kind == ShiftKind::Shl {
+                bits - count
+            } else {
+                count.min(bits) - 1
+            };
+            self.emit(ubfx(W, X15, X13, bit, 1));
+        }
+        if count != 1 {
+            self.emit(ubfx(W, X17, X14, 28, 1));
+        } else {
+            match kind {
+                ShiftKind::Shr => self.emit(ubfx(W, X17, X13, bits - 1, 1)),
+                ShiftKind::Shl => {
+                    self.emit_all(&[eor(W, X17, X13, X6, Lsl, 0), ubfx(W, X17, X17, bits - 1, 1)])
+                }
+                _ => self.emit(movz(W, X17, 0, 0)),
+            }
+        }
+        self.insert_flags(Some((X15, 0)), Some((X17, 0)));
+        self.state = State {
+            sense: Sense::Addition,
+            ..State::CANONICAL
+        };
     }
 
     /// A 32-bit source in a register: its own, or w6 loaded.

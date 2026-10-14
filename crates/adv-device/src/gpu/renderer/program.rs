@@ -379,17 +379,27 @@ impl Gpu {
         self.programmable.cursor = (self.programmable.cursor + 1) % UNIFORM_SLOTS;
         // Queue writes are ordered after the previous submission. Wraparound
         // never overwrites data still read by an earlier command on this queue.
-        submission.write_buffer(uniform, base, bytemuck::bytes_of(&draw.vertex_constants));
-        submission.write_buffer(
-            uniform,
-            base + CONSTANT_SIZE,
-            bytemuck::bytes_of(&draw.pixel_constants),
-        );
-        submission.write_buffer(
-            uniform,
-            base + CONSTANT_SIZE * 2,
-            bytemuck::bytes_of(&draw.parameters),
-        );
+        {
+            let mut upload = submission
+                .context
+                .queue
+                .write_buffer_with(
+                    uniform,
+                    base,
+                    wgpu::BufferSize::new(CONSTANT_SIZE * 2 + PARAMETER_SIZE).unwrap(),
+                )
+                .ok_or_else(|| invalid("programmable constant upload rejected"))?;
+            let split = CONSTANT_SIZE as usize;
+            upload
+                .slice(..split)
+                .copy_from_slice(bytemuck::bytes_of(&draw.vertex_constants));
+            upload
+                .slice(split..split * 2)
+                .copy_from_slice(bytemuck::bytes_of(&draw.pixel_constants));
+            upload
+                .slice(split * 2..)
+                .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
+        }
         let samplers: Vec<_> = draw
             .textures
             .iter()

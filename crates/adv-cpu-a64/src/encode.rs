@@ -1036,6 +1036,11 @@ pub const fn vwiden(rd: VReg, rn: VReg) -> u32 {
     0x0E61_7800 | rn.number() << 5 | rd.number()
 }
 
+/// `ext vd.16b, vn.16b, vm.16b, #bytes`.
+pub const fn vext(rd: VReg, rn: VReg, rm: VReg, bytes: u32) -> u32 {
+    0x6E00_0000 | rm.number() << 16 | bytes << 11 | rn.number() << 5 | rd.number()
+}
+
 /// `umaxv sd, vn.4s`.
 pub const fn umaxv(rd: VReg, rn: VReg) -> u32 {
     0x6EB0_A800 | rn.number() << 5 | rd.number()
@@ -1518,6 +1523,7 @@ mod tests {
             (umaxv(v(0), v(0)), "umaxv s0, v0.4s"),
             (vfromint(v(0), v(1)), "scvtf v0.4s, v1.4s"),
             (vwiden(v(0), v(1)), "fcvtl v0.2d, v1.2s"),
+            (vext(v(0), v(1), v(2), 3), "ext v0.16b, v1.16b, v2.16b, #3"),
             (vtoint(false, false, v(0), v(1)), "fcvtns v0.2s, v1.2s"),
             (vtoint(true, false, v(0), v(1)), "fcvtzs v0.2s, v1.2s"),
             (sfcmgt(v(0), v(1), v(2)), "fcmgt s0, s1, s2"),

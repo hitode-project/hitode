@@ -319,6 +319,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
             };
             Op::Extend(register(0)?, source, signed)
         }
+        M::Cwde => Op::Extend(0, Narrow8or16::Word(0), true),
         M::Cdq => Op::Cdq,
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
             let dst = register(0)?;

@@ -561,3 +561,247 @@ fn checked_ordinary_pages_avoid_helpers_and_follow_permission_changes() {
         }
     }
 }
+
+// spec: A64-FP-5 A64-MEM-5
+#[test]
+fn scalar_integer_conversions_preserve_flags_upper_lanes_and_fault_boundaries() {
+    for form in 0..6 {
+        for scenario in 0..14 {
+            let source = match scenario {
+                11 => Some(DATA + 1),
+                12 => Some(HOLE - 2),
+                _ => None,
+            };
+            let double = form % 2 == 1;
+            let mut program = fixture(|a| {
+                a.add(eax, ecx).unwrap();
+                macro_rules! convert {
+                    ($op:ident, $dst:expr, $src:expr, $ptr:ident) => {
+                        if let Some(at) = source {
+                            a.$op($dst, $ptr(at as i32))
+                        } else {
+                            a.$op($dst, $src)
+                        }
+                        .unwrap()
+                    };
+                }
+                match form {
+                    0 => convert!(cvtsi2ss, xmm0, ebp, dword_ptr),
+                    1 => convert!(cvtsi2sd, xmm0, esp, dword_ptr),
+                    2 => convert!(cvttss2si, ebp, xmm1, dword_ptr),
+                    3 => convert!(cvttsd2si, esp, xmm1, qword_ptr),
+                    4 => convert!(cvtss2si, ebp, xmm1, dword_ptr),
+                    _ => convert!(cvtsd2si, esp, xmm1, qword_ptr),
+                }
+                a.setz(dl).unwrap();
+            });
+            let integer: i32 = match scenario {
+                0 => -16_777_217,
+                1 => i32::MAX,
+                2 => i32::MIN,
+                _ => 17,
+            };
+            program.state.regs[4] = integer as u32;
+            program.state.regs[5] = integer as u32;
+            let value: f64 = match scenario {
+                0 | 11..=13 => -1.5,
+                1 => 0.0,
+                2 => -0.0,
+                3 => 2147483648.0,
+                4 => -2147483648.0,
+                5 => f64::NAN,
+                6 => f64::INFINITY,
+                7 => 0.5,
+                8 => -2147483649.0,
+                _ => 1.5,
+            };
+            let bits = if scenario == 9 {
+                1u64
+            } else if double {
+                value.to_bits()
+            } else {
+                (value as f32).to_bits() as u64
+            };
+            let width = if double { 8 } else { 4 };
+            program.state.xmm[0].fill(0xa5);
+            program.state.xmm[1].fill(0xff);
+            program.state.xmm[1][..width].copy_from_slice(&bits.to_le_bytes()[..width]);
+            if form < 2 {
+                program.data[1..5].copy_from_slice(&integer.to_le_bytes());
+            } else {
+                program.data[1..1 + width].copy_from_slice(&bits.to_le_bytes()[..width]);
+            }
+            program.state.mxcsr = match scenario {
+                7 => 0x0f80,
+                8 => 0x1f00,
+                10 => 0x3f80,
+                13 => 0x1fa0,
+                _ => 0x1f80,
+            };
+            for flagm in [false, true] {
+                let config = (Features { flagm }, false, Checks::Adaptive);
+                let budgets: &[u64] = if scenario == 0 { &[1, 2, 100] } else { &[100] };
+                for &budget in budgets {
+                    let mut native = executor(&program, config, false);
+                    let mut oracle = executor(&program, config, true);
+                    assert_eq!(
+                        native.run(program.stop, budget).unwrap(),
+                        oracle.run(program.stop, budget).unwrap(),
+                        "form={form}, scenario={scenario}"
+                    );
+                    same(&native, &oracle);
+                    if scenario == 0 && budget == 100 {
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(native.stats.interpreter_entries, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FLAG-2 A64-FLAG-5 A64-REG-6
+#[test]
+fn narrow_shifts_and_negation_keep_undefined_flags_and_register_halves() {
+    for width in [1, 2] {
+        for operation in 0..4 {
+            for count in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+                let mut program = fixture(|a| {
+                    a.add(eax, ecx).unwrap();
+                    macro_rules! op {
+                        ($op:ident, $($args:expr),*) => {
+                            if width == 1 { a.$op(ah, $($args),*) } else { a.$op(sp, $($args),*) }.unwrap()
+                        };
+                    }
+                    match operation {
+                        0 => op!(shl, count),
+                        1 => op!(shr, count),
+                        2 => op!(sar, count),
+                        _ => op!(neg,),
+                    }
+                    a.setb(dl).unwrap();
+                    a.seto(cl).unwrap();
+                });
+                for value in [0u32, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff] {
+                    program.state.regs[0] = 0x13570000 | value << 8;
+                    program.state.regs[1] = 0;
+                    program.state.regs[4] = 0xabc00000 | value;
+                    for flagm in [false, true] {
+                        let config = (Features { flagm }, false, Checks::Adaptive);
+                        let mut native = executor(&program, config, false);
+                        let mut oracle = executor(&program, config, true);
+                        assert_eq!(
+                            native.run(program.stop, 100).unwrap(),
+                            oracle.run(program.stop, 100).unwrap()
+                        );
+                        same(&native, &oracle);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FP-4 A64-MEM-5
+#[test]
+fn simd_lane_insertion_byte_shifts_and_control_stores_match_the_owner() {
+    for count in [0, 1, 7, 8, 15, 16, 17, 255] {
+        let mut program = fixture(|a| {
+            a.cwde().unwrap();
+            a.pinsrw(xmm0, esp, count).unwrap();
+            a.pinsrw(mm0, eax, count).unwrap();
+            a.psrldq(xmm0, count).unwrap();
+            a.pslldq(xmm1, count).unwrap();
+            a.movlpd(xmm2, qword_ptr(DATA as i32 + 1)).unwrap();
+            a.movhpd(qword_ptr(DATA as i32 + 16), xmm3).unwrap();
+            a.stmxcsr(dword_ptr(DATA as i32 + 28)).unwrap();
+        });
+        for (i, xmm) in program.state.xmm.iter_mut().enumerate() {
+            for (j, byte) in xmm.iter_mut().enumerate() {
+                *byte = (i * 16 + j) as u8;
+            }
+        }
+        program.data[..16].fill(0x73);
+        program.state.mxcsr = 0x5fa3;
+        for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
+            let config = (Features { flagm: false }, false, checks);
+            for budget in 1..=10 {
+                let mut native = executor(&program, config, false);
+                let mut oracle = executor(&program, config, true);
+                assert_eq!(
+                    native.run(program.stop, budget).unwrap(),
+                    oracle.run(program.stop, budget).unwrap()
+                );
+                same(&native, &oracle);
+                if budget == 10 && checks == Checks::Adaptive {
+                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FP-1 A64-FP-2 A64-FP-3
+#[test]
+fn x87_single_precision_rounding_keeps_extended_exponents_and_exception_state() {
+    let cases = [
+        (1.0, 2f64.powi(-24)),
+        (1.0 + 2f64.powi(-23), 2f64.powi(-24)),
+        (-1.0, -2f64.powi(-24)),
+        (2f64.powi(250), 2f64.powi(250)),
+        (2f64.powi(-250), 2f64.powi(-250)),
+        (1.0, 2f64.powi(-200)),
+        (1.0, 3.0),
+        (1.0 + 2f64.powi(-23), 1.0 + 2f64.powi(-22)),
+        (-0.0, 0.0),
+        (1.0 + 2f64.powi(-24), 1.0),
+        (2f64.powi(500), 1.0),
+    ];
+    for form in 0..7 {
+        for (case, (a, b)) in cases.into_iter().enumerate() {
+            let mut program = fixture(|code| {
+                code.add(eax, ecx).unwrap();
+                match form {
+                    0 => code.fadd_2(st0, st1),
+                    1 => code.fsub_2(st0, st1),
+                    2 => code.fmul_2(st0, st1),
+                    3 => code.fdiv_2(st0, st1),
+                    4 => code.fsubr_2(st0, st1),
+                    5 => code.faddp(st1, st0),
+                    _ => code.fmulp(st1, st0),
+                }
+                .unwrap();
+            });
+            program
+                .state
+                .x87
+                .push(adv_cpu_core::floating::fast::extended(b));
+            program
+                .state
+                .x87
+                .push(adv_cpu_core::floating::fast::extended(a));
+            program.state.x87.status |= 0x220;
+            for control in [0x007f, 0x027f, 0x037f, 0x047f, 0x007e] {
+                program.state.x87.set_control(control);
+                for flagm in [false, true] {
+                    let config = (Features { flagm }, false, Checks::Adaptive);
+                    let mut native = executor(&program, config, false);
+                    let mut oracle = executor(&program, config, true);
+                    assert_eq!(
+                        native.run(program.stop, 100).unwrap(),
+                        oracle.run(program.stop, 100).unwrap()
+                    );
+                    same(&native, &oracle);
+                    if control == 0x007f && case < 8 {
+                        assert_eq!(
+                            native.native.as_ref().unwrap().diagnostics.helpers,
+                            0,
+                            "form={form}, case={case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

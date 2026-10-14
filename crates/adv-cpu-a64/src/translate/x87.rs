@@ -11,9 +11,11 @@
 //! the guest flags in NZCV.
 //!
 //! Arithmetic needs exact doubles within `2^±fast::RANGE`, masked
-//! exceptions, round to nearest and precision 53 or 64; it rounds once in
+//! exceptions, round to nearest and precision 24, 53 or 64; it rounds once in
 //! binary64 and takes the error from TwoSum, a fused multiply-subtract or
-//! the division residual. Precision 64 admits only exact results.
+//! the division residual. Precision 64 admits only exact results. Precision 24
+//! requires single-exact operands and rounds the significand in integers,
+//! preserving the extended exponent range and the residual when rounding is unchanged.
 //!
 //! Copies keep the extended encoding. Stores and compares see a value as
 //! the double holding its top 53 significand bits with the lowest one ORed
@@ -404,11 +406,13 @@ impl Translator<'_> {
         if !matches!(source, Source::St(_)) {
             self.memory_operand(source, V1, Some(range), slow);
         }
-        // Masked exceptions, round to nearest, precision 53 or 64.
+        // Masked exceptions, round to nearest, excluding reserved precision.
         self.emit_all(&[and_imm(W, X16, X8, 0x3f), cmp_imm(W, X16, 0x3f, false)]);
         self.asm.b_cond(Cond::Ne, slow);
-        self.emit_all(&[ubfx(W, X16, X8, 9, 3), cmp_imm(W, X16, 1, false)]);
-        self.asm.b_cond(Cond::Ne, slow);
+        self.emit(ubfx(W, X16, X8, 10, 2));
+        self.asm.cbz(W, true, X16, slow);
+        self.emit_all(&[ubfx(W, X16, X8, 8, 2), cmp_imm(W, X16, 1, false)]);
+        self.asm.b_cond(Cond::Eq, slow);
         let target = self.slot(dest, X2);
         self.read_slot(target, X0, X1, slow);
         self.double(X0, X1, V0, Take::Exact(range), slow);
@@ -416,6 +420,16 @@ impl Translator<'_> {
             self.read(index, X0, X1, slow);
             self.double(X0, X1, V1, Take::Exact(range), slow);
         }
+        let wide = self.asm.label();
+        self.asm.tbz(true, X8, 9, wide);
+        self.emit_all(&[
+            fmov_from_v(X, X16, V0),
+            fmov_from_v(X, X17, V1),
+            orr(X, X16, X16, X17, Lsl, 0),
+            and_imm(X, X16, X16, fast::SINGLE_TAIL),
+        ]);
+        self.asm.cbz(X, true, X16, slow);
+        self.asm.bind(wide);
         let (a, b) = if reverse { (V1, V0) } else { (V0, V1) };
         // d2 the result; x16 the bits of the error, whose sign is that of
         // exact - rounded.
@@ -487,6 +501,27 @@ impl Translator<'_> {
         self.asm.bind(exact);
         self.clear_c1();
         self.asm.bind(flagged);
+        let rounded = self.asm.label();
+        self.asm.tbz(true, X8, 9, rounded);
+        // Round the significand, without binary32's exponent restriction.
+        self.emit_all(&[
+            fmov_from_v(X, X0, V2),
+            and_imm(X, X3, X0, fast::SINGLE_TAIL),
+        ]);
+        self.asm.cbz(X, false, X3, rounded);
+        self.mov_imm(X1, (1 << 28) - 1);
+        self.emit_all(&[
+            ubfx(X, X17, X0, 29, 1),
+            add(X, X1, X0, X1, Lsl, 0),
+            add(X, X1, X1, X17, Lsl, 0),
+            and_imm(X, X1, X1, !fast::SINGLE_TAIL),
+            cmp(X, X1, X0, Lsl, 0),
+            cset(W, X17, Cond::Hi),
+            orr_imm(W, X13, X13, u64::from(PE)),
+            bfi(W, X13, X17, 9, 1),
+            fmov_to_v(X, V2, X1),
+        ]);
+        self.asm.bind(rounded);
         self.extended(V2, X0, X1);
         self.commit_value(target, X0, X1);
         if pop {

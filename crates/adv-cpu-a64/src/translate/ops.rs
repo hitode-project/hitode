@@ -801,7 +801,7 @@ impl Translator<'_> {
     }
 
     /// Writes the low bytes of `value` to the narrow `part`.
-    fn narrow_write(&mut self, part: Part, width: u8, address: Reg, value: Reg) {
+    pub(super) fn narrow_write(&mut self, part: Part, width: u8, address: Reg, value: Reg) {
         match part {
             Part::Reg(number) => {
                 let (index, lsb) = part_register(number, width);
