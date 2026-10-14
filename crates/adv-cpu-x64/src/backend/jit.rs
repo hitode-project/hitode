@@ -185,6 +185,9 @@ impl Guest for View<'_> {
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.memory.file_page_copy_on_write(addr)
     }
+    fn private_copy_epoch(&self) -> Option<u64> {
+        Some(self.memory.private_copy_epoch())
+    }
     fn map_private_copy_pages(
         &mut self,
         addr: u32,
@@ -338,6 +341,9 @@ impl Guest for JitCpu {
     }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.executor().memory.file_page_copy_on_write(addr)
+    }
+    fn private_copy_epoch(&self) -> Option<u64> {
+        Some(self.executor().memory.private_copy_epoch())
     }
     fn map_private_copy_pages(
         &mut self,

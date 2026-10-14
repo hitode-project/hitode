@@ -6,7 +6,9 @@
 //! like the x86 Windows heap. Large blocks get their own zeroed VM region and
 //! release it on free, preserving fresh committed-page contents on each allocation.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_hash::FxHashMap;
 
 use adv_cpu::backend::{Guest, MemFault, Prot};
 use adv_machine::Vm;
@@ -40,9 +42,9 @@ pub struct Heap {
     free_by_addr: BTreeMap<u32, u32>,
     free_by_size: BTreeSet<(u32, u32)>,
     /// Block address -> (rounded size, requested size).
-    used: HashMap<u32, (u32, u32)>,
+    used: FxHashMap<u32, (u32, u32)>,
     /// Blocks with their own VM region.
-    large: HashMap<u32, u32>,
+    large: FxHashMap<u32, u32>,
     arenas: Vec<u32>,
 }
 
@@ -109,7 +111,7 @@ impl Heap {
 
 #[derive(Default)]
 pub struct Heaps {
-    heaps: HashMap<u32, Heap>,
+    heaps: FxHashMap<u32, Heap>,
     pub process_heap: u32,
 }
 

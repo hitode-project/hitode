@@ -145,6 +145,9 @@ pub struct Memory {
     /// Owned snapshots have no external alias. SHARED is only their first-store
     /// barrier, retired by the same transactional store preparation as COPY.
     private_copy_pages: BTreeMap<usize, bool>,
+    /// Advances whenever an owned snapshot page takes its first write or is
+    /// unmapped, so callers can tell that every unwritten page stayed so.
+    private_copy_epoch: u64,
     /// File pages whose bytes live in this window's committed pages.
     resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
     /// Real host pins owned by this window; repeated locks do not add a count.
@@ -478,6 +481,7 @@ impl Memory {
             reservation: None,
             shared_pages: BTreeMap::new(),
             private_copy_pages: BTreeMap::new(),
+            private_copy_epoch: 0,
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
             #[cfg(windows)]
@@ -525,6 +529,7 @@ impl Memory {
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
             private_copy_pages: BTreeMap::new(),
+            private_copy_epoch: 0,
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
             #[cfg(windows)]
@@ -747,7 +752,9 @@ impl Memory {
                 self.native_read_exceptions -= 1;
             }
             self.shared_pages.remove(&page);
-            self.private_copy_pages.remove(&page);
+            if self.private_copy_pages.remove(&page).is_some() {
+                self.private_copy_epoch += 1;
+            }
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
         self.fast.invalidate(pages.clone());
@@ -1183,6 +1190,7 @@ impl Memory {
                 scope.retain()
             }
         }
+        self.private_copy_epoch += changed.len() as u64;
         for &page in &changed {
             *self.private_copy_pages.get_mut(&page).unwrap() = false;
             Arc::make_mut(&mut self.perms)[page] &= !SHARED;
@@ -1274,6 +1282,9 @@ impl Memory {
         }
         self.fast.invalidate(page..page + 1);
         self.touch(self.base + (page * PAGE_SIZE) as u32, PAGE_SIZE);
+    }
+    pub fn private_copy_epoch(&self) -> u64 {
+        self.private_copy_epoch
     }
     pub fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         let page = addr.checked_sub(self.base)? as usize / PAGE_SIZE;

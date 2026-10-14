@@ -247,6 +247,11 @@ pub trait Guest {
     fn file_page_copy_on_write(&self, _addr: u32) -> Option<bool> {
         None
     }
+    /// A counter that advances whenever an unwritten private copy page is
+    /// written or unmapped. None means the backend cannot report it.
+    fn private_copy_epoch(&self) -> Option<u64> {
+        None
+    }
     /// Map an owned prepared snapshot with a per-page first-write barrier.
     /// Unlike file aliases these private pages may execute, and their source
     /// cannot be changed externally. Protection changes never reset the barrier.

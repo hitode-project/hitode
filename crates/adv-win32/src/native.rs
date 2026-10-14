@@ -31,7 +31,8 @@ fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, Load
 
 /// Entries found original while every page that decides the lookup was still
 /// an unwritten copy: the headers, the export data and the entry itself. A
-/// write to any of them makes the next call inspect the image again.
+/// write to any of them makes the next call inspect the image again. While the
+/// backend's copy epoch stays put, no unwritten page anywhere has changed.
 #[derive(Default)]
 struct Unmodified(HashMap<String, Original>);
 
@@ -40,6 +41,7 @@ struct Original {
     base: u32,
     entry: u32,
     pages: Vec<u32>,
+    epoch: Option<u64>,
 }
 
 fn unwritten(cpu: &dyn Guest, pages: &[u32]) -> bool {
@@ -71,6 +73,7 @@ pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, L
     if env.ext.try_get::<Win32>().is_none() || env.ext.try_get::<Modules>().is_none() {
         return Ok(None);
     }
+    let epoch = env.cpu.private_copy_epoch();
     if let Some(original) = env
         .ext
         .try_get::<Unmodified>()
@@ -80,9 +83,14 @@ pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, L
             .get::<Modules>()
             .try_get(original.module)
             .is_some_and(|image| image.base == original.base && image.executable_visible())
-        && unwritten(env.cpu, &original.pages)
+        && (epoch.is_some() && original.epoch == epoch || unwritten(env.cpu, &original.pages))
         && check_range(env.cpu, original.entry, THUNK_STRIDE, Prot::READ).is_ok()
     {
+        if original.epoch != epoch
+            && let Some(original) = env.ext.get_mut::<Unmodified>().0.get_mut(name)
+        {
+            original.epoch = epoch;
+        }
         return Ok(None);
     }
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
@@ -108,6 +116,7 @@ pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, L
                     base,
                     entry,
                     pages,
+                    epoch: env.cpu.private_copy_epoch(),
                 },
             );
         }

@@ -2,10 +2,29 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// TypeIds are already hashes; host calls look several up, so skip SipHash.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl Hasher for TypeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 ^= value;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Default)]
 pub struct Ext {
-    map: HashMap<TypeId, Box<dyn Any>>,
+    map: HashMap<TypeId, Box<dyn Any>, BuildHasherDefault<TypeIdHasher>>,
 }
 
 impl Ext {

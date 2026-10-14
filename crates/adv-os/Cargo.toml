@@ -14,6 +14,7 @@ adv-machine.workspace = true
 adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
+rustc-hash = "2.1"
 encoding_rs.workspace = true
 # Enable std only for the host I/O adapter; ISO's std feature also pulls in
 # unused clock, random-number and logging support for image authoring.
