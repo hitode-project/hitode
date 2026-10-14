@@ -134,6 +134,7 @@ mod mac {
         window.pump()
     }
 
+    // spec: HOST-VIEW-6
     pub fn run() {
         let mtm = MainThreadMarker::new().expect("main thread");
         let mut window = Window::new("adv macos window test", 320, 240, true).unwrap();
@@ -330,6 +331,19 @@ mod mac {
             assert!(events.iter().any(|event| event.0 == 0x202));
             assert_eq!(router.lock().unwrap().captured(0), None);
             container.set_game(None);
+            let library_frame = native.frame();
+            for (width, height) in [(1600, 900), (800, 600)] {
+                let embedded = GameView::new(width, height).unwrap();
+                container.set_game(Some(&embedded));
+                let size = embedded.bounds().size;
+                assert!(
+                    (size.width / size.height - f64::from(width) / f64::from(height)).abs() < 0.001
+                );
+                assert_eq!(embedded.bounds().size, container.bounds().size);
+                assert_eq!(overlay.bounds().size, container.bounds().size);
+                container.set_game(None);
+                assert_eq!(native.frame(), library_frame);
+            }
             native.setContentView(Some(&game));
             native.makeFirstResponder(Some(&game));
             dispatch(&mut window);

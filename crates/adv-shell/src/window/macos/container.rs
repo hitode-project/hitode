@@ -10,6 +10,8 @@ pub struct ContainerState {
     webview: Retained<NSView>,
     game: RefCell<Option<Retained<GameView>>>,
     monitor: RefCell<Option<Retained<AnyObject>>>,
+    window_frame: Cell<Option<NSRect>>,
+    canvas: Cell<Option<(u32, u32, bool)>>,
 }
 
 define_class!(
@@ -47,6 +49,8 @@ impl GameContainer {
             webview: webview.retain(),
             game: RefCell::new(None),
             monitor: RefCell::new(None),
+            window_frame: Cell::new(None),
+            canvas: Cell::new(None),
         });
         let view: Retained<Self> =
             unsafe { msg_send![super(this), initWithFrame: parent.bounds()] };
@@ -105,7 +109,15 @@ impl GameContainer {
         if let Some(old) = self.ivars().game.borrow_mut().take() {
             old.removeFromSuperview();
         }
+        let window = self.window().unwrap();
+        if let Some(frame) = self.ivars().window_frame.take()
+            && !window.styleMask().contains(NSWindowStyleMask::FullScreen)
+        {
+            window.setFrame_display(frame, true);
+        }
+        self.ivars().canvas.set(None);
         if let Some(game) = game {
+            self.ivars().window_frame.set(Some(window.frame()));
             game.setFrame(self.bounds());
             game.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewWidthSizable
@@ -117,7 +129,36 @@ impl GameContainer {
                 Some(&self.ivars().webview),
             );
             *self.ivars().game.borrow_mut() = Some(game.retain());
+            self.fit_canvas(game.canvas_size());
         }
+    }
+
+    pub(super) fn fit_canvas(&self, canvas: (u32, u32)) {
+        if canvas.0 == 0 || canvas.1 == 0 {
+            return;
+        }
+        let window = self.window().unwrap();
+        // The launcher changes title bar style after mounting the game.
+        let full_content = window
+            .styleMask()
+            .contains(NSWindowStyleMask::FullSizeContentView);
+        let key = (canvas.0, canvas.1, full_content);
+        if window.styleMask().contains(NSWindowStyleMask::FullScreen)
+            || self.ivars().canvas.get() == Some(key)
+        {
+            return;
+        }
+        self.ivars().canvas.set(Some(key));
+        let size = window
+            .contentRectForFrameRect(self.ivars().window_frame.get().unwrap())
+            .size;
+        let minimum = window.contentMinSize();
+        let (width, height) = (f64::from(canvas.0), f64::from(canvas.1));
+        let scale = (size.width / width)
+            .min(size.height / height)
+            .max(minimum.width / width)
+            .max(minimum.height / height);
+        window.setContentSize(NSSize::new(width * scale, height * scale));
     }
 }
 
