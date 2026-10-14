@@ -215,7 +215,9 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
     }
     exes.sort_by_key(|e| std::cmp::Reverse(e.size));
     let suggested = exes.iter().position(|e| {
-        e.arch == "x86" && !prefixed(&e.path, &["setup", "install", "unins", "config"])
+        e.arch == "x86"
+            && !prefixed(&e.path, &["setup", "install", "unins", "config"])
+            && !packaged(&folder.join(&e.path))
     });
     let name = folder.file_name().unwrap_or_default();
     let title = name.to_string_lossy().into();
@@ -319,6 +321,31 @@ fn offline(folder: &Path) -> Option<Offline> {
 fn prefixed(path: &str, prefixes: &[&str]) -> bool {
     let lower = path.to_ascii_lowercase();
     prefixes.iter().any(|p| lower.starts_with(p))
+}
+/// Installers, patchers and tool bundles: NSIS (`.ndata`), a payload appended
+/// after the sections that outweighs them, or a console program.
+fn packaged(path: &Path) -> bool {
+    let read = || -> Option<bool> {
+        let mut file = fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut head = vec![0; 4096];
+        let n = file.read(&mut head).ok()?;
+        head.truncate(n);
+        let u16_at = |at: usize| Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?));
+        let u32_at = |at: usize| Some(u32::from_le_bytes(head.get(at..at + 4)?.try_into().ok()?));
+        let pe = u32_at(60)? as usize;
+        let (sections, optional) = (u16_at(pe + 6)? as usize, u16_at(pe + 20)? as usize);
+        let console = u16_at(pe + 92)? == 3;
+        let mut end = 0u64;
+        let mut nsis = false;
+        for i in 0..sections {
+            let at = pe + 24 + optional + i * 40;
+            nsis |= head.get(at..at + 8)? == b".ndata\0\0";
+            end = end.max(u64::from(u32_at(at + 16)?) + u64::from(u32_at(at + 20)?));
+        }
+        Some(console || nsis || (sections > 0 && len - end.min(len) > len / 2))
+    };
+    read().unwrap_or(false)
 }
 fn machine(path: &Path) -> &'static str {
     let read = || {
@@ -459,6 +486,37 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let lib = Library::load(dir.join("app")).unwrap();
         (dir, lib)
+    }
+    // spec: HOST-LIB-2
+    #[test]
+    fn suggestion_skips_installers_bundles_and_console_programs() {
+        let dir =
+            std::env::temp_dir().join(format!("adv-launcher-packaged-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // One section at file offset 512 of `raw` bytes, subsystem `sub`.
+        let exe = |name: &str, section: &[u8; 8], raw: u32, size: usize, sub: u16| {
+            let mut bytes = vec![0; size];
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+            bytes[64..68].copy_from_slice(b"PE\0\0");
+            bytes[68..70].copy_from_slice(&0x14cu16.to_le_bytes());
+            bytes[70..72].copy_from_slice(&1u16.to_le_bytes());
+            bytes[84..86].copy_from_slice(&224u16.to_le_bytes());
+            bytes[156..158].copy_from_slice(&sub.to_le_bytes());
+            let at = 64 + 24 + 224;
+            bytes[at..at + 8].copy_from_slice(section);
+            bytes[at + 16..at + 20].copy_from_slice(&raw.to_le_bytes());
+            bytes[at + 20..at + 24].copy_from_slice(&512u32.to_le_bytes());
+            fs::write(dir.join(name), bytes).unwrap();
+        };
+        exe("game.exe", b".text\0\0\0", 3000, 3512, 2);
+        exe("patch.exe", b".ndata\0\0", 512, 1024 * 8, 2);
+        exe("tool.exe", b".text\0\0\0", 512, 1024 * 6, 2);
+        exe("console.exe", b".text\0\0\0", 4000, 4512, 3);
+        let found = inspect(&Vec::new(), &dir).unwrap();
+        let suggested = found.suggested.map(|i| found.exes[i].path.as_str());
+        assert_eq!(suggested, Some("game.exe"));
+        fs::remove_dir_all(dir).unwrap();
     }
     fn pe(dir: &Path, name: &str, machine: u16, size: usize) {
         let mut bytes = vec![0; size];
