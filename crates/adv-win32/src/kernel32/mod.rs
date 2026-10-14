@@ -37,6 +37,7 @@ pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
 pub(crate) use module::{native_add_ref_library, native_get_dll_handle, native_pc_to_file_header};
 mod nlsapi;
+pub(crate) use nlsapi::lcid;
 mod osversion;
 mod process;
 pub(crate) use environment::entries as environment_entries;

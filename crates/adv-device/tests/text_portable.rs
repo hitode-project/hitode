@@ -7,10 +7,14 @@ use adv_device::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, path::PathBuf, sync::Arc};
 
 const SINGLE: &[u8] = include_bytes!("fixtures/font-resource.ttf");
 const COLLECTION: &[u8] = include_bytes!("fixtures/font-resource.ttc");
+/// The single fixture renamed: typographic family "ADV Resource Fixture",
+/// legacy family "ADV Resource Fixture Medium" and "测试字体 Medium" in zh-CN,
+/// with a taller Windows cell so selection is observable.
+const LEGACY: &[u8] = include_bytes!("fixtures/font-resource-legacy.ttf");
 
 #[test]
 // spec: WIN32-GDI-10
@@ -116,6 +120,80 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
             .len(),
         1
     );
+}
+
+#[test]
+// spec: DEV-FONT-3
+fn legacy_family_names_select_and_enumerate_like_gdi() {
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(SINGLE, true).unwrap();
+    text.add_file_resource(LEGACY, true).unwrap();
+    for name in ["测试字体 Medium", "adv resource fixture medium"] {
+        let metrics = text.metrics(&font(name)).unwrap();
+        assert_eq!((metrics.height, metrics.ascent), (48, 40), "{name}");
+        let entries = text
+            .enumerate(Some(name), FontEnumeration::Families)
+            .unwrap();
+        assert_eq!(entries.len(), 1, "{name}");
+        let reported = if name.is_ascii() {
+            "ADV Resource Fixture Medium"
+        } else {
+            name
+        };
+        assert_eq!(entries[0].font.face, reported);
+    }
+    let all: BTreeSet<_> = text
+        .enumerate(None, FontEnumeration::Families)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.font.face)
+        .collect();
+    assert_eq!(
+        all,
+        BTreeSet::from([
+            "ADV Resource Fixture".to_owned(),
+            "ADV Resource Fixture Medium".to_owned()
+        ])
+    ); // A Chinese guest sees the Simplified Chinese name; the fixture without one stays English.
+    text.set_language("zh-Hans");
+    let all: BTreeSet<_> = text
+        .enumerate(None, FontEnumeration::Families)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.font.face)
+        .collect();
+    assert_eq!(
+        all,
+        BTreeSet::from([
+            "ADV Resource Fixture".to_owned(),
+            "测试字体 Medium".to_owned()
+        ])
+    );
+}
+
+#[test]
+// spec: DEV-FONT-3
+fn enumeration_skips_faces_it_cannot_measure() {
+    let table = |bytes: &[u8], tag: &[u8]| {
+        let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        (0..count)
+            .map(|i| 12 + i * 16)
+            .find(|&at| &bytes[at..at + 4] == tag)
+            .map(|at| u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize)
+            .unwrap()
+    };
+    // Zero typographic, Windows and horizontal-header extents leave no cell.
+    let mut broken = LEGACY.to_vec();
+    let (os2, hhea) = (table(&broken, b"OS/2"), table(&broken, b"hhea"));
+    broken[os2 + 68..os2 + 72].fill(0);
+    broken[os2 + 74..os2 + 78].fill(0);
+    broken[hhea + 4..hhea + 8].fill(0);
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(&broken, true).unwrap();
+    text.add_file_resource(SINGLE, true).unwrap();
+    let entries = text.enumerate(None, FontEnumeration::Families).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].font.face, "ADV Resource Fixture");
 }
 
 fn font(face: &str) -> FontRequest {

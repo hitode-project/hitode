@@ -733,6 +733,17 @@ impl Text {
         }
         Ok(&self.fonts[request])
     }
+    /// Name enumerated families in the guest UI language (a BCP 47 tag such
+    /// as "zh-Hans") when a font provides it, as GDI does. Native GDI already
+    /// follows the real UI language.
+    pub fn set_language(&mut self, tag: &'static str) {
+        #[cfg(not(windows))]
+        {
+            self.backend.language = Some(tag);
+        }
+        #[cfg(windows)]
+        let _ = tag;
+    }
     /// Use only these discovery directories on portable hosts. This provides a
     /// deterministic font environment for comparisons; guest resources still
     /// take precedence. Default construction discovers system fonts and the

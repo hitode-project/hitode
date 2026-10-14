@@ -42,6 +42,8 @@ pub(super) struct Backend {
     directories: Option<Vec<PathBuf>>,
     profile_path: Option<PathBuf>,
     resources: BTreeMap<FontResourceId, Resource>,
+    /// BCP 47 tag of the guest UI language, which names enumerated families.
+    pub(super) language: Option<&'static str>,
     next_resource: u64,
     resource_bytes: usize,
     store: Arc<Mutex<FaceStore>>,
@@ -191,7 +193,7 @@ impl Backend {
                 .filter(|face| {
                     resources.contains(&face.id)
                         && request.default.is_none()
-                        && family_matches(face, &request.face)
+                        && family_matches(&db, face, &request.face)
                 })
                 .collect();
             guests.sort_by_key(|face| {
@@ -222,10 +224,10 @@ impl Backend {
         let names = families(request);
         let mut candidates: Vec<_> = db.faces().collect();
         let weight = normalized_weight(request);
-        candidates.sort_by_key(|face| {
+        candidates.sort_by_cached_key(|face| {
             let rank = names
                 .iter()
-                .position(|name| family_matches(face, name))
+                .position(|name| family_matches(&db, face, name))
                 .unwrap_or(names.len() + usize::from(!face.monospaced && fixed(request)));
             (
                 rank,
@@ -264,25 +266,36 @@ impl Backend {
         for info in db
             .faces()
             .filter(|info| !hidden.contains(&info.id))
-            .filter(|info| face.is_none_or(|name| name.is_empty() || family_matches(info, name)))
+            .filter(|info| {
+                face.is_none_or(|name| name.is_empty() || family_matches(db, info, name))
+            })
         {
-            let name = info
-                .families
-                .first()
-                .map(|family| family.0.clone())
-                .unwrap_or_default();
-            // EnumFonts (Faces) returns one representative per family when no
-            // family was supplied; Families retains each available style.
-            if mode == FontEnumeration::Faces && face.is_none() && !seen.insert(name.to_lowercase())
-            {
-                continue;
-            }
             if output.len() >= 8192 {
                 return Err(TextError::Font("font enumeration budget exceeded".into()));
             }
             let result = db
-                .with_face_data(info.id, |bytes, index| {
+                .with_face_data(info.id, |bytes, index| -> Result<_, TextError> {
                     let font = FontRef::from_index(bytes, index).map_err(font_error)?;
+                    // Report the legacy family GDI uses: the requested spelling
+                    // when it names one, else the guest UI language, else English.
+                    let requested = face.filter(|name| !name.is_empty()).and_then(|name| {
+                        legacy_families(&font)
+                            .find(|family| family.to_lowercase() == name.to_lowercase())
+                    });
+                    let localized = self.language.and_then(|tag| {
+                        font.localized_strings(skrifa::string::StringId::FAMILY_NAME)
+                            .find(|name| name.language() == Some(tag))
+                            .map(|name| name.to_string())
+                    });
+                    let name = requested
+                        .or(localized)
+                        .or_else(|| {
+                            font.localized_strings(skrifa::string::StringId::FAMILY_NAME)
+                                .english_or_first()
+                                .map(|name| name.to_string())
+                        })
+                        .or_else(|| info.families.first().map(|family| family.0.clone()))
+                        .unwrap_or_default();
                     let request = enumeration_request(info, name);
                     let signature = matches!(mode, FontEnumeration::FamiliesEx(_)).then(|| {
                         font.os2()
@@ -349,7 +362,20 @@ impl Backend {
                         }),
                     })
                 })
-                .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()))??;
+                .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()));
+            // Windows leaves out fonts it cannot use; one bad file must not
+            // end enumeration of the rest.
+            let Ok(Ok(result)) = result else {
+                continue;
+            };
+            // EnumFonts (Faces) returns one representative per family when no
+            // family was supplied; Families retains each available style.
+            if mode == FontEnumeration::Faces
+                && face.is_none()
+                && !seen.insert(result.font.face.to_lowercase())
+            {
+                continue;
+            }
             if let FontEnumeration::FamiliesEx(encoding) = mode {
                 for font in enumeration::repertoires(result, encoding) {
                     if output.len() >= 8192 {
@@ -515,11 +541,31 @@ fn validate_font(request: &FontRequest) -> Result<(), TextError> {
     }
     Ok(())
 }
-fn family_matches(face: &FaceInfo, name: &str) -> bool {
+fn family_matches(db: &Database, face: &FaceInfo, name: &str) -> bool {
+    let name = name.to_lowercase();
     face.families
         .iter()
-        .any(|family| family.0.to_lowercase() == name.to_lowercase())
-        || face.post_script_name.eq_ignore_ascii_case(name)
+        .any(|family| family.0.to_lowercase() == name)
+        || face.post_script_name.to_lowercase() == name
+        // fontdb keeps only the typographic family when one exists; GDI names
+        // faces by their legacy family. Only faces whose typographic family
+        // prefixes the request are read again.
+        || (face
+            .families
+            .iter()
+            .any(|family| !family.0.is_empty() && name.starts_with(&family.0.to_lowercase()))
+            && db
+                .with_face_data(face.id, |data, index| {
+                    FontRef::from_index(data, index).is_ok_and(|font| {
+                        legacy_families(&font).any(|family| family.to_lowercase() == name)
+                    })
+                })
+                .unwrap_or(false))
+}
+/// The name ID 1 family in every language the font provides.
+fn legacy_families<'a>(font: &FontRef<'a>) -> impl Iterator<Item = String> + 'a {
+    font.localized_strings(skrifa::string::StringId::FAMILY_NAME)
+        .map(|name| name.to_string())
 }
 fn fixed(request: &FontRequest) -> bool {
     matches!(request.pitch, Pitch::Fixed)

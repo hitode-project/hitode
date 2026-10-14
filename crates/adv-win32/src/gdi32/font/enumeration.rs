@@ -229,7 +229,13 @@ fn start(
         set_last_error(env, 87);
         return Outcome::Return(0);
     }
-    let fonts = match env.ext.get::<Fonts>().text.enumerate(face.as_deref(), mode) {
+    let language = match crate::kernel32::lcid(env) {
+        0x804 => "zh-Hans",
+        _ => "ja-JP",
+    };
+    let text = &mut env.ext.get_mut::<Fonts>().text;
+    text.set_language(language);
+    let fonts = match text.enumerate(face.as_deref(), mode) {
         Ok(fonts) => fonts,
         Err(error) => {
             let api = match (mode, wide) {
