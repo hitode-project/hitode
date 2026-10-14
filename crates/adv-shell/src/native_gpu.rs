@@ -1361,7 +1361,7 @@ mod tests {
         );
     }
 
-    // spec: HOST-VIEW-6
+    // spec: HOST-VIEW-7
     #[test]
     fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
         use crate::{Upscaler, upscaling::Upscaling};

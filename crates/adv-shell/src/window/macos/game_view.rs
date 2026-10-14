@@ -224,6 +224,12 @@ impl GameView {
         input.width = width;
         input.height = height;
         input.hub.canvas.set((width, height));
+        drop(input);
+        if let Some(parent) = unsafe { self.superview() }
+            && let Some(container) = parent.downcast_ref::<GameContainer>()
+        {
+            container.fit_canvas((width, height));
+        }
     }
     pub(super) fn set_cursor_visible(&self, visible: bool) {
         let mut input = self.ivars().borrow_mut();
