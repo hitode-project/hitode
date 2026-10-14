@@ -57,9 +57,8 @@
 <div class="backdrop">
   <div class="dialog" role="dialog" aria-modal="true" aria-label="VNDB" tabindex="-1" onkeydown={(e) => { if (e.key === "Escape") { e.stopPropagation(); if (!saving) onclose(); } }}>
     <header><h2>{t("VNDB 资料")}</h2><button class="quiet" onclick={onclose} disabled={saving}>{t("关闭")}</button></header>
-    <p>{t("按名称搜索，或粘贴 VNDB 作品链接／编号。选择正确作品后再应用。")}</p>
     <form onsubmit={(e) => { e.preventDefault(); void search(); }}>
-      <input bind:this={searchInput} aria-label={t("名称或 VNDB 链接")} bind:value={query} maxlength="200" disabled={busy} />
+      <input bind:this={searchInput} aria-label={t("名称或 VNDB 链接")} placeholder={t("名称或 VNDB 链接")} bind:value={query} maxlength="200" disabled={busy} />
       <button class="primary" disabled={busy || !query.trim() || !inTauri}>{t("搜索")}</button>
     </form>
     {#if game.vndb}<p><a href="https://vndb.org/{game.vndb.id}" target="_blank" rel="noreferrer">VNDB · {game.vndb.id}</a> <button class="quiet" disabled={busy} onclick={() => { query = game.vndb!.id; void search(); }}>{t("刷新当前资料")}</button> <button class="quiet" disabled={busy} onclick={unlink}>{t("解除关联")}</button></p>{/if}
@@ -73,7 +72,7 @@
         </button>
       {/each}
     </div>
-    {#if searched && results.length === 0}<p>{t("没有找到作品。试试原名、罗马字或 VNDB 链接。")}</p>{/if}
+    {#if searched && results.length === 0}<p>{t("没有找到作品")}</p>{/if}
     {#if more}<button class="quiet" disabled={busy} onclick={() => search(true)}>{t("加载更多")}</button>{/if}
     {#if selected}
       <section>
@@ -82,11 +81,9 @@
         <p class="description">{selected.description ?? ""}</p>
         <label>{t("游戏库显示名称")}<input bind:value={title} disabled={busy} /></label>
         <button class="quiet" disabled={busy} onclick={() => title = selected!.alttitle || selected!.title}>{t("使用作品原名")}</button>
-        <p>{t("显示名称由你决定，自动搜索和刷新不会覆盖它。")}</p>
         <button class="primary" disabled={busy || !title.trim()} onclick={save}>{t("应用资料")}</button>
       </section>
     {/if}
-    <p class="credit"><a href="https://vndb.org" target="_blank" rel="noreferrer">VNDB</a> · {t("资料来源：VNDB；封面版权属于原权利人。")}</p>
   </div>
 </div>
 <style>
@@ -103,5 +100,4 @@
   img { width: 64px; height: 90px; object-fit: cover; }
   .blur { filter: blur(12px); }
   .description { white-space: pre-wrap; max-height: 160px; overflow: auto; }
-  .credit { font-size: 12px; color: var(--fg3); }
 </style>

@@ -11,7 +11,7 @@ export interface Novel {
   image: { thumbnail: string; sexual: number } | null; cover?: string | null;
 }
 export interface LibraryGame {
-  vndb: Novel | null; vndbChecked: boolean;
+  vndb: Novel | null;
   id: string; title: string; folder: string; exe: string; codepage: Codepage;
   addedAt: number; lastPlayed: number | null; playSeconds: number;
   favorite: boolean; nsfw: boolean; sessions: PlaySession[];

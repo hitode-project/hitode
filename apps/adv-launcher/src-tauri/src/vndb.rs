@@ -86,7 +86,7 @@ fn lookup(query: &str, page: u32) -> Result<Results, String> {
     }
     let id = identifier(query)?;
     let body = json!({"filters": if let Some(id) = &id { json!(["id", "=", id]) } else { json!(["search", "=", query]) },
-        "fields": FIELDS, "sort": if id.is_some() { "id" } else { "searchrank" }, "results": 20, "page": page });
+        "fields": FIELDS, "sort": if id.is_some() { "id" } else { "searchrank" }, "results": 10, "page": page });
     {
         let mut next = NEXT_REQUEST.lock().unwrap();
         if let Some(delay) = next.and_then(|at| at.checked_duration_since(Instant::now())) {
@@ -152,30 +152,6 @@ fn cache_cover(novel: &mut Novel) -> Result<(), String> {
     ));
     Ok(())
 }
-fn normalized(title: &str) -> String {
-    title
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-fn exact<'a>(query: &str, results: &'a Results) -> Option<&'a Novel> {
-    if results.more {
-        return None;
-    }
-    let name = normalized(query);
-    if name.is_empty() {
-        return None;
-    }
-    let mut matches = results.results.iter().filter(|vn| {
-        std::iter::once(&vn.title)
-            .chain(vn.alttitle.iter())
-            .chain(vn.aliases.iter())
-            .any(|title| normalized(title) == name)
-    });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
-}
 #[tauri::command]
 pub async fn vndb_search(query: String, page: u32) -> Result<Results, String> {
     tauri::async_runtime::spawn_blocking(move || lookup(&query, page))
@@ -206,33 +182,7 @@ pub async fn vndb_apply(
         app.state::<Mutex<Library>>()
             .lock()
             .unwrap()
-            .set_metadata(&id, Some(novel), Some(title), None)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-#[tauri::command]
-pub async fn vndb_auto(app: tauri::AppHandle, id: String) -> Result<LibraryGame, String> {
-    let game = app
-        .state::<Mutex<Library>>()
-        .lock()
-        .unwrap()
-        .metadata_target(&id)
-        .map_err(|e| e.to_string())?;
-    if game.vndb.is_some() || game.vndb_checked {
-        return Ok(game);
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let results = lookup(&game.title, 1)?;
-        let mut novel = exact(&game.title, &results).cloned();
-        if let Some(novel) = &mut novel {
-            cache_cover(novel)?;
-        }
-        app.state::<Mutex<Library>>()
-            .lock()
-            .unwrap()
-            .set_metadata(&id, novel, None, Some(&game.title))
+            .set_metadata(&id, Some(novel), Some(title))
             .map_err(|e| e.to_string())
     })
     .await
@@ -246,7 +196,7 @@ pub fn vndb_unlink(
     state
         .lock()
         .unwrap()
-        .set_metadata(&id, None, None, None)
+        .set_metadata(&id, None, None)
         .map_err(|e| e.to_string())
 }
 #[cfg(test)]
@@ -284,26 +234,5 @@ mod tests {
             assert!(identifier(q).is_err());
         }
         assert_eq!(identifier("a title").unwrap(), None);
-    }
-    // spec: HOST-VNDB-1
-    #[test]
-    fn automatic_matching_requires_unique_complete_exact_results() {
-        let vn = Novel {
-            title: "Example: Title".into(),
-            aliases: vec!["別名".into()],
-            ..Novel::default()
-        };
-        let mut results = Results {
-            results: vec![vn.clone()],
-            more: false,
-        };
-        assert!(exact("example title", &results).is_some());
-        assert!(exact("別名", &results).is_some());
-        assert!(exact("Example", &results).is_none());
-        results.more = true;
-        assert!(exact("example title", &results).is_none());
-        results.more = false;
-        results.results.push(vn);
-        assert!(exact("example title", &results).is_none());
     }
 }

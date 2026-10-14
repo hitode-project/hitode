@@ -29,7 +29,6 @@ export function toGame(g: LibraryGame, now: number): Game {
     id: g.id,
     title: g.title,
     vndb: g.vndb,
-    vndbChecked: g.vndbChecked,
     coverUrl: g.vndb?.cover ?? undefined,
     brand: g.vndb?.developers.map((d) => d.name).join(" / ") ?? "",
     year: Number(g.vndb?.released?.slice(0, 4)) || 0,

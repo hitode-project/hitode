@@ -6,7 +6,6 @@ export type Offline = "disk" | "missing";
 export interface Game {
   id: string;
   vndb?: Novel | null;
-  vndbChecked?: boolean;
   coverUrl?: string | undefined;
   title: string;
   brand: string;

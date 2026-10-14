@@ -5,5 +5,5 @@
   let { game }: { game: Game } = $props();
   let open = $state(false);
 </script>
-<button class="quiet" onclick={() => open = true}>VNDB · {game.vndb?.id ?? t(game.vndbChecked ? "待手动选择" : "未关联")}</button>
+<button class="quiet" onclick={() => open = true}>VNDB · {game.vndb?.id ?? t("未关联")}</button>
 {#if open}<Vndb {game} onclose={() => open = false} />{/if}

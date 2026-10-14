@@ -1,15 +1,11 @@
 <script lang="ts">
   import { t, locale } from "./lib/i18n.svelte";
-  import { scraper } from "./lib/vndb.svelte";
-  import { library } from "./lib/library.svelte";
-  import { untrack } from "svelte";
   import { call, onHostEvent } from "./lib/bridge";
   import Sidebar from "./components/Sidebar.svelte";
-  import VndbConsent from "./components/VndbConsent.svelte";
   import { device } from "./lib/device.svelte";
   import { nav } from "./lib/nav.svelte";
   import { setGameActive } from "./lib/overlay";
-  import { prefs, savePrefs } from "./lib/prefs.svelte";
+  import { prefs } from "./lib/prefs.svelte";
   import Game from "./pages/Game.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
@@ -28,18 +24,6 @@
   import PhoneSettings from "./phone/Settings.svelte";
   import PhoneStats from "./phone/Stats.svelte";
 
-  /** Ask before the first automatic lookup would send a game name. */
-  const askVndb = $derived(!prefs.vndbAsked && library.games.some((g) => !g.vndb && !g.vndbChecked));
-  function chooseVndb(automatic: boolean) {
-    prefs.fetchVndb = automatic;
-    prefs.vndbAsked = true;
-    savePrefs();
-  }
-  $effect(() => {
-    const enabled = prefs.vndbAsked && prefs.fetchVndb;
-    const ids = library.games.map((g) => `${g.id}:${g.title}:${g.vndbChecked}`).join();
-    if (enabled && ids) untrack(() => { void scraper.scan(); });
-  });
   let backupError = $state("");
   $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
 
@@ -76,7 +60,6 @@
   });
 </script>
 
-{#if askVndb && route.name !== "game"}<VndbConsent onchoose={chooseVndb} />{/if}
 {#if backupError}<div class="backup-error" role="alert">{backupError}<button onclick={() => backupError = ""}>{t("关闭")}</button></div>{/if}
 
 {#key locale()}

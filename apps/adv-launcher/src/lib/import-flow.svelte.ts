@@ -1,5 +1,5 @@
 import { t } from "./i18n.svelte";
-import { inTauri } from "./bridge";
+import { call, inTauri } from "./bridge";
 import {
   addToLibrary,
   defaultInstallTarget,
@@ -11,7 +11,7 @@ import {
   takeInstallSource,
   type Enc,
 } from "./fake-import";
-import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type ScanFound } from "./host";
+import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 
@@ -236,6 +236,10 @@ export class ImportPick {
   exe = $state(-1);
   enc = $state<Enc>("ja");
   title = $state("");
+  /** The VNDB work the user chose; none links nothing. */
+  vndb = $state<Novel | null>(null);
+  /** Why linking the chosen work failed after the game was added. */
+  linkError = $state("");
   adding = $state(false);
   /** Library id once added; the button then starts the game. */
   addedId = $state<string | null>(null);
@@ -283,6 +287,7 @@ export class ImportPick {
   #show(inspection: FolderInspection): void {
     this.inspection = inspection;
     this.title = inspection.title;
+    this.vndb = null;
     this.addedId = null;
     const usable = inspection.exes.findIndex((e) => e.arch !== "x64");
     const suggested = inspection.suggested;
@@ -312,6 +317,9 @@ export class ImportPick {
   setTitle(v: string): void {
     this.#edit(() => (this.title = v));
   }
+  setVndb(v: Novel | null): void {
+    this.#edit(() => (this.vndb = v));
+  }
 
   /** Adds to the library; once added, starts the game instead. A program already added opens its entry. */
   async add(): Promise<void> {
@@ -328,11 +336,21 @@ export class ImportPick {
     const exe = this.exes[this.exe];
     if (!this.canAdd || !inspection || !exe) return;
     this.adding = true;
+    this.linkError = "";
     try {
       const title = this.title.trim();
       if (inTauri) {
         const added = await libraryAdd(inspection.folder, exe.name, CODEPAGES[this.enc], title);
         if (added) this.addedId = library.put(added).id;
+        // The game stays added if its metadata cannot be fetched.
+        if (added && this.vndb) {
+          try {
+            const linked = await call<LibraryGame | null>("vndb_apply", { id: added.id, vn: this.vndb.id, title }, null);
+            if (linked) library.put(linked);
+          } catch (error) {
+            this.linkError = String(error);
+          }
+        }
       } else {
         this.addedId = addToLibrary(title, this.enc, inspection.folder);
       }

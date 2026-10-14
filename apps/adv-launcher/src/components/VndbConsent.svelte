@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
-  /** Called once with the user's choice; dismissing chooses manual lookup. */
+  /** Called once with the user's choice; dismissing chooses manual search. */
   let { onchoose }: { onchoose: (automatic: boolean) => void } = $props();
   let dialog = $state<HTMLElement>();
   $effect(() => dialog?.focus());
@@ -14,12 +14,12 @@
     tabindex="-1"
     onkeydown={(event) => { if (event.key === "Escape") onchoose(false); }}
   >
-    <h2 id="vndb-consent-title">{t("自动获取游戏信息？")}</h2>
-    <p>{t("Hitode 可以在你添加游戏时，把游戏名发送到 VNDB（vndb.org），自动获取封面、简介和开发商。只发送游戏名，不发送文件、路径或游玩记录。")}</p>
-    <p class="hint">{t("你可以随时在设置中更改，也可以为单个游戏手动查询。")}</p>
+    <h2 id="vndb-consent-title">{t("导入时自动搜索 VNDB？")}</h2>
+    <p>{t("导入游戏时，Hitode 可以把游戏名发送到 VNDB（vndb.org），搜索候选作品供你选择。只发送游戏名，不发送文件、路径或游玩记录。")}</p>
+    <p class="hint">{t("你可以随时在设置中更改。")}</p>
     <div class="actions">
-      <button type="button" class="quiet" onclick={() => onchoose(false)}>{t("仅手动查询")}</button>
-      <button type="button" class="primary" onclick={() => onchoose(true)}>{t("自动获取")}</button>
+      <button type="button" class="quiet" onclick={() => onchoose(false)}>{t("仅手动搜索")}</button>
+      <button type="button" class="primary" onclick={() => onchoose(true)}>{t("自动搜索")}</button>
     </div>
   </div>
 </div>

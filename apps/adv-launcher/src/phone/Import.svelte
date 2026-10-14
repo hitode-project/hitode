@@ -5,6 +5,7 @@
   import PhoneImportHeader from "../components/PhoneImportHeader.svelte";
   import PhoneImportOption from "../components/PhoneImportOption.svelte";
   import PhoneImportPage from "../components/PhoneImportPage.svelte";
+  import ImportVndb from "../components/ImportVndb.svelte";
   import { ImportPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
@@ -49,6 +50,7 @@
             <input type="text" lang="ja" aria-label={t("标题")} value={pick.title} oninput={(e) => pick.setTitle(e.currentTarget.value)} />
           </label>
         </fieldset>
+        <ImportVndb {pick} phone />
       {/if}
     {:else}
       <div class="status" class:err={pick.phase === "error"} role="status">
