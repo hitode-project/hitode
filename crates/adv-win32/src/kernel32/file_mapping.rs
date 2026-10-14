@@ -1,5 +1,5 @@
-//! Worker-owned data mappings. Views retain their section after handles close.
-//! Executable/image/reserved/device mappings and cross-host-process sharing are
+//! Worker-owned data and image mappings. Views retain their section after
+//! handles close. Reserved/device mappings and cross-host-process sharing are
 //! explicitly outside this implementation; no native OS named object is created.
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +13,7 @@ use adv_machine::{Env, Object, Outcome};
 use adv_os::vfs::{FileIdentity, FileSection, file_identity as identity};
 
 use super::K32;
+use super::memory::page_prot;
 use crate::{FileObj, Win32, stdcall, util::set_last_error};
 
 const PAGE: u64 = 4096;
@@ -23,6 +24,9 @@ const COPY: u32 = 1;
 const ALL: u32 = 0xf001f;
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
+const SEC_IMAGE: u32 = 0x0100_0000;
+
+mod image;
 
 #[derive(Default)]
 struct Mappings {
@@ -81,6 +85,8 @@ struct Section {
     len: u64,
     protection: u32,
     handles: Cell<u32>,
+    /// A SEC_IMAGE section's parsed file; views lay out private copies of it.
+    image: Option<Rc<adv_pe::Pe>>,
 }
 struct View {
     section: Rc<Section>,
@@ -300,11 +306,12 @@ pub(crate) fn create_section(
     maximum: u64,
     name: Option<Vec<u16>>,
 ) -> Outcome {
-    if protection & !(0x08000000 | 0xff) != 0 || protection & 0xff >= 0x10 {
+    let image = protection & SEC_IMAGE != 0;
+    if protection & !(0x08000000 | SEC_IMAGE | 0xff) != 0 || (!image && protection & 0xff >= 0x10) {
         return fail(env, 50);
     }
     let protection = protection & 0xff;
-    if !matches!(protection, 2 | 4 | 8) {
+    if !matches!(protection, 2 | 4 | 8) && !(image && matches!(protection, 0x20 | 0x40 | 0x80)) {
         return fail(env, 87);
     }
     let inherit = match super::handle::security_inherit(env, attributes) {
@@ -345,7 +352,17 @@ pub(crate) fn create_section(
     if !env.sys.objects.can_insert() {
         return fail(env, 8);
     }
-    let (len, backing) = if file == u32::MAX {
+    let mut layout = None;
+    let (len, backing) = if image {
+        // The file's SizeOfImage, not a maximum size, bounds an image section.
+        let pe = match image::parse(env, file) {
+            Ok(pe) => pe,
+            Err(e) => return fail(env, e),
+        };
+        let len = u64::from(pe.size_of_image);
+        layout = Some(Rc::new(pe));
+        (len, FileSection::anonymous())
+    } else if file == u32::MAX {
         if maximum == 0 {
             return fail(env, 87);
         }
@@ -376,6 +393,7 @@ pub(crate) fn create_section(
         len: len.div_ceil(PAGE) * PAGE,
         protection,
         handles: Cell::new(0),
+        image: layout,
     });
     if let Some(name) = name {
         state(env)
@@ -450,6 +468,9 @@ pub(crate) fn map_section(
     };
     let section = handle.section.clone();
     let rights = handle.access;
+    if section.image.is_some() {
+        return image::map(env, section, rights, access, offset, count, base);
+    }
     if access & 0x20 != 0 {
         return fail(env, 50);
     }
@@ -485,25 +506,15 @@ pub(crate) fn map_section(
     if base != 0 && u64::from(base) % GRANULE != 0 {
         return fail(env, 1132);
     }
-    let reserved = span.div_ceil(GRANULE) * GRANULE;
     let address = if base == 0 {
         match env.sys.vm.reserve_exact(span as u32) {
             Some(addr) => addr,
             None => return fail(env, 8),
         }
-    } else {
-        // Keep the entire last granule unavailable to a conflicting owner, but
-        // publish only the page-rounded view extent to VirtualQuery.
-        if env
-            .sys
-            .vm
-            .next_region(base)
-            .is_some_and(|next| u64::from(next) < u64::from(base) + reserved)
-            || !env.sys.vm.reserve_at(base, span as u32)
-        {
-            return fail(env, 487);
-        }
+    } else if reserve_view_at(env, base, span) {
         base
+    } else {
+        return fail(env, 487);
     };
     let mut pages = Vec::new();
     if pages.try_reserve_exact((span / PAGE) as usize).is_err() {
@@ -537,6 +548,17 @@ pub(crate) fn map_section(
         },
     );
     Outcome::Return(address)
+}
+
+/// Keep the entire last granule unavailable to a conflicting owner, but
+/// publish only the page-rounded view extent to VirtualQuery.
+fn reserve_view_at(env: &mut Env<'_>, base: u32, span: u64) -> bool {
+    let reserved = span.div_ceil(GRANULE) * GRANULE;
+    !env.sys
+        .vm
+        .next_region(base)
+        .is_some_and(|next| u64::from(next) < u64::from(base) + reserved)
+        && env.sys.vm.reserve_at(base, span as u32)
 }
 
 /// DIBs use DWORD offsets inside a private view of the same shared section.
@@ -780,10 +802,10 @@ pub(super) fn open_sync(
 
 fn page_protection(env: &Env<'_>, view: &View, base: u32, page: u32) -> u32 {
     let value = view.protections[((page - base) / 4096) as usize];
-    if value == 8 && env.cpu.file_page_copy_on_write(page) == Some(false) {
-        4
-    } else {
-        value
+    match (value, env.cpu.file_page_copy_on_write(page)) {
+        (8, Some(false)) => 4,
+        (0x80, Some(false)) => 0x40,
+        _ => value,
     }
 }
 
@@ -816,7 +838,11 @@ pub(super) fn query(env: &Env<'_>, addr: u32) -> Option<[u32; 7]> {
         (end - u64::from(begin)) as u32,
         0x1000,
         protection,
-        0x40000,
+        if view.section.image.is_some() {
+            0x100_0000
+        } else {
+            0x40000
+        },
     ])
 }
 
@@ -838,17 +864,20 @@ pub(super) fn protect(
     if u64::from(addr - base) + u64::from(len) > u64::from(view.len) {
         return Some(Err(487));
     }
-    if !matches!(value, 1 | 2 | 4 | 8) {
+    let image = view.section.image.is_some();
+    if !matches!(value, 1 | 2 | 4 | 8) && !(image && matches!(value, 0x10 | 0x20 | 0x40 | 0x80)) {
         return Some(Err(50));
     }
     if view.maximum == 2 && !matches!(value, 1 | 2) {
         return Some(Err(87));
     }
-    if value == 8 && !view.copy {
+    if matches!(value, 8 | 0x80) && !view.copy {
         return Some(Err(50));
     } // Changing a WRITE view into COPY needs a new view.
     let previous = page_protection(env, view, base, addr);
+    // Shared file pages never execute; image views hold private copies.
     let prot = match value {
+        _ if image => page_prot(env, value).unwrap_or_default(),
         1 => Prot::default(),
         2 => Prot::READ,
         _ => Prot::RW,

@@ -70,6 +70,10 @@ pub(crate) fn span(addr: u32, size: u32) -> Result<(u32, u32), Error> {
     let len = u32::try_from(end - u64::from(page)).map_err(|_| error(INVALID_ADDRESS))?;
     Ok((page, len))
 }
+/// Backend protection for a page protection value under the process DEP policy.
+pub(crate) fn page_prot(env: &Env<'_>, value: u32) -> Option<Prot> {
+    decode(env, value).ok()
+}
 /// Without DEP (an image lacking NX_COMPAT) readable pages also execute.
 fn decode(env: &Env<'_>, value: u32) -> Result<Prot, Error> {
     let prot = decode_value(value)?;
