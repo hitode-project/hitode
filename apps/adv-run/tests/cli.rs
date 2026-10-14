@@ -31,19 +31,21 @@ fn rejects_unsupported_codepages_before_loading_guest_files() {
             !output.status.success(),
             "invalid codepage {codepage} was accepted"
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--codepage must be 932 or 936"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--codepage must be auto, 932 or 936")
+        );
     }
 }
 
 #[test]
 fn accepts_documented_codepages() {
-    for codepage in ["932", "936"] {
+    for codepage in ["auto", "932", "936"] {
         let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
             .args(["--codepage", codepage, "--help"])
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("--codepage 932|936"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("--codepage auto|932|936"));
     }
 }
 
