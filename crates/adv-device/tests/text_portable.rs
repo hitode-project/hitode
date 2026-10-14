@@ -104,14 +104,19 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
         .unwrap()
         .is_empty()
     );
-    assert!(
-        text.enumerate(
+    // spec: DEV-FONT-4
+    // A missing family enumerates as the face that draws it, under its name.
+    let missing = text
+        .enumerate(
             Some("missing authored font"),
-            FontEnumeration::FamiliesEx(Encoding::Japanese)
+            FontEnumeration::FamiliesEx(Encoding::Japanese),
         )
-        .unwrap()
-        .is_empty()
-    );
+        .unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].font.face, "missing authored font");
+    assert_eq!(missing[0].font.encoding, Encoding::Japanese);
+    assert!(missing[0].substitute);
+    assert!(entries.iter().all(|entry| !entry.substitute));
     // Legacy discovery remains a single physical face, independent of its
     // repertoire declarations.
     assert_eq!(

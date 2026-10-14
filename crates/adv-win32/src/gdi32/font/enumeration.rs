@@ -235,17 +235,17 @@ fn start(
     };
     let text = &mut env.ext.get_mut::<Fonts>().text;
     text.set_language(language);
+    let api = match (mode, wide) {
+        (FontEnumeration::Families, false) => "gdi32.dll!EnumFontFamiliesA",
+        (FontEnumeration::Families, true) => "gdi32.dll!EnumFontFamiliesW",
+        (FontEnumeration::Faces, false) => "gdi32.dll!EnumFontsA",
+        (FontEnumeration::Faces, true) => "gdi32.dll!EnumFontsW",
+        (FontEnumeration::FamiliesEx(_), false) => "gdi32.dll!EnumFontFamiliesExA",
+        (FontEnumeration::FamiliesEx(_), true) => "gdi32.dll!EnumFontFamiliesExW",
+    };
     let fonts = match text.enumerate(face.as_deref(), mode) {
         Ok(fonts) => fonts,
         Err(error) => {
-            let api = match (mode, wide) {
-                (FontEnumeration::Families, false) => "gdi32.dll!EnumFontFamiliesA",
-                (FontEnumeration::Families, true) => "gdi32.dll!EnumFontFamiliesW",
-                (FontEnumeration::Faces, false) => "gdi32.dll!EnumFontsA",
-                (FontEnumeration::Faces, true) => "gdi32.dll!EnumFontsW",
-                (FontEnumeration::FamiliesEx(_), false) => "gdi32.dll!EnumFontFamiliesExA",
-                (FontEnumeration::FamiliesEx(_), true) => "gdi32.dll!EnumFontFamiliesExW",
-            };
             adv_abi::warn_unavailable(env, api, &error.to_string());
             set_last_error(
                 env,
@@ -260,6 +260,17 @@ fn start(
     };
     if fonts.is_empty() {
         return Outcome::Return(1);
+    }
+    if fonts[0].substitute {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            &format!(
+                "{:?} is not installed; enumerating its substitute {:?} under that name",
+                face.as_deref().unwrap_or_default(),
+                fonts[0].full_name
+            ),
+        );
     }
     let Some(scratch) = env
         .cpu

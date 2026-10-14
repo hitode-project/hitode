@@ -185,6 +185,7 @@ unsafe extern "system" fn collect(
         script,
         design,
         signature,
+        substitute: false,
     });
     1
 }

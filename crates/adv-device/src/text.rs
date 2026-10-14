@@ -162,6 +162,8 @@ pub struct EnumeratedFont {
     pub script: String,
     pub design: Option<FontDesign>,
     pub signature: Option<FontSignature>,
+    /// The requested family is not installed; this is the face that draws it.
+    pub substitute: bool,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FontSignature {

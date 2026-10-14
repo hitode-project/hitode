@@ -263,11 +263,26 @@ impl Backend {
             .filter(|resource| !resource.enumerable)
             .flat_map(|resource| resource.faces.iter().copied())
             .collect();
+        let named = face.filter(|name| !name.is_empty());
+        // A family the host lacks enumerates as the face that draws it, under
+        // the requested name, so a presence check agrees with drawing.
+        let substitute = named
+            .filter(|name| !db.faces().any(|info| family_matches(db, info, name)))
+            .and_then(|name| {
+                let mut request = enumeration_request(db.faces().next()?, name.to_owned());
+                (request.weight, request.italic) = (400, false);
+                (request.pitch, request.family) = (Pitch::Default, Family::Default);
+                if let FontEnumeration::FamiliesEx(encoding) = mode {
+                    request.encoding = encoding;
+                }
+                Some(self.font(&request).ok()?.primary.info.id)
+            });
         for info in db
             .faces()
             .filter(|info| !hidden.contains(&info.id))
-            .filter(|info| {
-                face.is_none_or(|name| name.is_empty() || family_matches(db, info, name))
+            .filter(|info| match substitute {
+                Some(id) => info.id == id,
+                None => named.is_none_or(|name| family_matches(db, info, name)),
             })
         {
             if output.len() >= 8192 {
@@ -278,7 +293,10 @@ impl Backend {
                     let font = FontRef::from_index(bytes, index).map_err(font_error)?;
                     // Report the legacy family GDI uses: the requested spelling
                     // when it names one, else the guest UI language, else English.
-                    let requested = face.filter(|name| !name.is_empty()).and_then(|name| {
+                    let requested = named.and_then(|name| {
+                        if substitute.is_some() {
+                            return Some(name.to_owned());
+                        }
                         legacy_families(&font)
                             .find(|family| family.to_lowercase() == name.to_lowercase())
                     });
@@ -360,6 +378,7 @@ impl Backend {
                             average_width: unscaled.average_width.unwrap_or(0.0).max(0.0).round()
                                 as u32,
                         }),
+                        substitute: substitute.is_some(),
                     })
                 })
                 .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()));
