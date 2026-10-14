@@ -306,6 +306,7 @@ fn allocate(env: &mut Env<'_>, bytes: &[u8], size: u32) -> Result<u32, Failure> 
     let pointer = heaps
         .alloc(env.cpu, &mut env.sys.vm, 0, size, false)
         .ok_or(Failure::Error(8))?;
+    heaps.account_small(env.cpu, pointer);
     let block = Block {
         allocation: pointer,
         handle: 0,

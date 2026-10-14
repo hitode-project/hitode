@@ -52,7 +52,7 @@ fn snapshot(env: &mut Env<'_>) -> Outcome {
     let pointer = env.arg(0);
     let owned = owns_bstr(env, pointer);
     let base = pointer.checked_sub(4);
-    let heap_size = base.and_then(|base| env.ext.get_mut::<Heaps>().size(0, base));
+    let heap_size = base.and_then(|base| env.ext.get_mut::<Heaps>().size(env.cpu, 0, base));
     let memory = if owned {
         let base = base.unwrap();
         let length = env.cpu.read_u32(base).unwrap();
@@ -508,7 +508,10 @@ fn foreign_and_already_retired_bstrs_keep_sys_free_string_failure_semantics() {
         );
         let pointer = machine.cpu.read_u32(POINTER).unwrap();
         assert_eq!(
-            machine.ext.get_mut::<Heaps>().size(0, pointer - 4),
+            machine
+                .ext
+                .get_mut::<Heaps>()
+                .size(&machine.cpu, 0, pointer - 4),
             if duplicate { None } else { Some(16) }
         );
         if !duplicate {
@@ -523,8 +526,8 @@ fn foreign_and_already_retired_bstrs_keep_sys_free_string_failure_semantics() {
     }
 }
 
-/// Inject only memory faults at the allocator's host write/read boundary, while
-/// retaining the actual CPU mappings and common heap allocation bookkeeping.
+/// Inject string source/payload faults without intercepting heap metadata access.
+/// Retain the actual CPU mappings and common heap allocation bookkeeping.
 struct AllocationFault<'a> {
     inner: &'a mut dyn Guest,
     reads: Cell<usize>,
@@ -532,6 +535,7 @@ struct AllocationFault<'a> {
     fail_read: Option<usize>,
     fail_write: Option<usize>,
     base: Option<u32>,
+    allocation: std::ops::Range<u32>,
 }
 impl Guest for AllocationFault<'_> {
     fn reg(&self, register: Reg) -> u32 {
@@ -541,6 +545,9 @@ impl Guest for AllocationFault<'_> {
         self.inner.set_reg(register, value);
     }
     fn read(&self, address: u32, bytes: &mut [u8]) -> Result<(), MemFault> {
+        if address != DATA + 0x1000 {
+            return self.inner.read(address, bytes);
+        }
         self.reads.set(self.reads.get() + 1);
         if self.fail_read == Some(self.reads.get()) {
             return Err(MemFault {
@@ -551,6 +558,9 @@ impl Guest for AllocationFault<'_> {
         self.inner.read(address, bytes)
     }
     fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), MemFault> {
+        if !self.allocation.contains(&address) {
+            return self.inner.write(address, bytes);
+        }
         self.base.get_or_insert(address);
         self.writes += 1;
         if self.fail_write == Some(self.writes) {
@@ -579,6 +589,12 @@ impl Guest for AllocationFault<'_> {
 fn allocation_faults_retire_partial_strings_before_publishing_shared_ownership() {
     for fault in 0..=4 {
         let mut machine = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+        let size = if fault == 0 { 9 } else { 4106 };
+        let heaps = machine.ext.get_mut::<Heaps>();
+        let reserved = heaps
+            .alloc(&mut machine.cpu, &mut machine.sys.vm, 0, size, false)
+            .unwrap();
+        assert!(heaps.free(&mut machine.cpu, &mut machine.sys.vm, 0, reserved));
         let base = {
             let mut cpu = AllocationFault {
                 inner: &mut machine.cpu,
@@ -587,6 +603,7 @@ fn allocation_faults_retire_partial_strings_before_publishing_shared_ownership()
                 fail_read: (fault == 0).then_some(1),
                 fail_write: (fault != 0).then_some(fault),
                 base: None,
+                allocation: reserved..reserved + size,
             };
             {
                 let mut env = Env {
@@ -606,7 +623,10 @@ fn allocation_faults_retire_partial_strings_before_publishing_shared_ownership()
             }
             cpu.base.unwrap()
         };
-        assert_eq!(machine.ext.get_mut::<Heaps>().size(0, base), None);
+        assert_eq!(
+            machine.ext.get_mut::<Heaps>().size(&machine.cpu, 0, base),
+            None
+        );
         let mut env = Env {
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
@@ -615,7 +635,13 @@ fn allocation_faults_retire_partial_strings_before_publishing_shared_ownership()
             thunk: 0,
         };
         assert!(!owns_bstr(&env, base + 4));
-        let pointer = alloc_bstr(&mut env, TEXT);
+        // Retry within the original allocation class.
+        let text = if fault == 0 {
+            TEXT.to_vec()
+        } else {
+            vec![0x3042; 2050]
+        };
+        let pointer = alloc_bstr(&mut env, &text);
         assert_eq!(pointer, base + 4, "failed allocation is reusable");
         assert!(owns_bstr(&env, pointer));
         assert!(free_bstr(&mut env, pointer));

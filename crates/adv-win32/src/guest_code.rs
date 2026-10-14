@@ -4,10 +4,13 @@
 //! listings are the source; tests compare each one against Windows behavior.
 
 use adv_abi::{GuestCode, Registry};
+mod heap;
 
 /// Attach after every handler is registered: re-registering a handler drops it.
 pub(crate) fn install(reg: &mut Registry) {
     for (module, name, guest) in [
+        ("ntdll.dll", "RtlAllocateHeap", &heap::ALLOCATE),
+        ("ntdll.dll", "RtlFreeHeap", &heap::FREE),
         ("user32.dll", "SetRectEmpty", &SET_RECT_EMPTY),
         ("user32.dll", "IsRectEmpty", &IS_RECT_EMPTY),
         ("user32.dll", "IntersectRect", &INTERSECT_RECT),

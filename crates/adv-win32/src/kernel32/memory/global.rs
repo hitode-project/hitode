@@ -49,7 +49,7 @@ fn with_handle_heap(
     {
         Some(heaps.process_heap)
     } else {
-        heaps.owner(handle)
+        heaps.owner(env.cpu, handle)
     };
     match heap {
         Some(heap) => crate::heap_lock::with_heap(env, heap, 0, body),
@@ -77,6 +77,7 @@ fn allocate_front(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
                     if pointer == 0 {
                         return Outcome::Return(error(env, 8, 0));
                     }
+                    env.ext.get::<Heaps>().account_small(env.cpu, pointer);
                     let block = Block {
                         handle: 0,
                         allocation: pointer,
@@ -140,6 +141,7 @@ pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
             None => return error(env, 8, 0),
         }
     };
+    heaps.account_small(env.cpu, pointer);
     let block = Block {
         handle: 0,
         allocation: pointer,
@@ -187,7 +189,7 @@ fn global_free(env: &mut Env<'_>, handle: Handle) -> Outcome {
                 let heap = env
                     .ext
                     .get::<Heaps>()
-                    .owner(pointer)
+                    .owner(env.cpu, pointer)
                     .unwrap_or(env.ext.get::<Heaps>().process_heap);
                 return Outcome::call(target, [heap, 0, pointer], move |env, result| {
                     if result.value() == 0 {
@@ -244,7 +246,7 @@ pub(crate) fn release(env: &mut Env<'_>, handle: u32, clipboard: bool) -> u32 {
             let block = globals.get(&env.sys.objects, actual).unwrap();
             return error(env, if block.clipboard { 5 } else { 6 }, handle);
         }
-        let heap = heaps.owner(handle);
+        let heap = heaps.owner(env.cpu, handle);
         if !clipboard && heap.is_some_and(|heap| heaps.free(env.cpu, &mut env.sys.vm, heap, handle))
         {
             0
@@ -276,7 +278,7 @@ fn lock(env: &mut Env<'_>, handle: u32) -> u32 {
             block.locks = n;
         }
         block.pointer
-    } else if heaps.owner(handle).is_some() {
+    } else if heaps.owner(env.cpu, handle).is_some() {
         handle
     } else {
         error(env, 6, 0)
@@ -309,7 +311,7 @@ fn unlock(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
         } else {
             1
         }
-    } else if heaps.owner(handle).is_some() {
+    } else if heaps.owner(env.cpu, handle).is_some() {
         if local { error(env, 158, 0) } else { 1 }
     } else {
         error(env, 6, 0)
@@ -330,12 +332,12 @@ fn size(env: &mut Env<'_>, handle: u32) -> u32 {
             return 0;
         }
         let result = heaps
-            .owner(block.allocation)
-            .and_then(|heap| heaps.size(heap, block.allocation))
+            .owner(env.cpu, block.allocation)
+            .and_then(|heap| heaps.size(env.cpu, heap, block.allocation))
             .and_then(|size| size.checked_sub(block.pointer.saturating_sub(block.allocation)));
         result.unwrap_or_else(|| error(env, 6, 0))
-    } else if let Some(heap) = heaps.owner(handle) {
-        heaps.size(heap, handle).unwrap_or(0)
+    } else if let Some(heap) = heaps.owner(env.cpu, handle) {
+        heaps.size(env.cpu, heap, handle).unwrap_or(0)
     } else {
         error(env, 6, 0)
     }
@@ -354,7 +356,7 @@ fn size_front(env: &mut Env<'_>, handle: u32) -> Outcome {
     let heap = env
         .ext
         .get::<Heaps>()
-        .owner(allocation)
+        .owner(env.cpu, allocation)
         .or_else(|| block.as_ref().map(|_| env.ext.get::<Heaps>().process_heap));
     if let Some(heap) = heap {
         match crate::native::overridden(env, "RtlSizeHeap") {
@@ -391,7 +393,7 @@ fn handle(env: &mut Env<'_>, pointer: u32) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
     globals
         .from_pointer(&env.sys.objects, pointer)
-        .or_else(|| heaps.owner(pointer).map(|_| pointer))
+        .or_else(|| heaps.owner(env.cpu, pointer).map(|_| pointer))
         .unwrap_or_else(|| error(env, 6, 0))
 }
 #[win32(kernel32,name="GlobalFlags",level=state)]
@@ -412,7 +414,7 @@ fn flags(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
         (if local { 0 } else { block.attributes })
             | u32::from(block.locks)
             | if block.pointer == 0 { 0x4000 } else { 0 }
-    } else if heaps.owner(handle).is_some() {
+    } else if heaps.owner(env.cpu, handle).is_some() {
         0
     } else {
         error(env, 6, 0x8000)
@@ -436,6 +438,7 @@ fn commit_native_resize(
     if allocation == 0 {
         return Outcome::Return(error(env, 8, 0));
     }
+    env.ext.get::<Heaps>().account_small(env.cpu, allocation);
     let bias = old.pointer.saturating_sub(old.allocation);
     let Some(pointer) = allocation.checked_add(bias) else {
         return Outcome::Fail("Global/Local native allocation view overflow".into());
@@ -506,7 +509,7 @@ fn resize_front(
         let heap = env
             .ext
             .get::<Heaps>()
-            .owner(old.allocation)
+            .owner(env.cpu, old.allocation)
             .unwrap_or(env.ext.get::<Heaps>().process_heap);
         if old.movable && requested == 0 {
             if old.allocation == 0 {
@@ -565,7 +568,7 @@ fn resize_front(
                 Ok(None) => {}
             }
         }
-    } else if let Some(heap) = env.ext.get::<Heaps>().owner(handle) {
+    } else if let Some(heap) = env.ext.get::<Heaps>().owner(env.cpu, handle) {
         match crate::native::overridden(env, "RtlReAllocateHeap") {
             Ok(Some(target)) => {
                 return Outcome::call(
@@ -604,7 +607,7 @@ pub(crate) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
             let block = globals.get(&env.sys.objects, actual).unwrap();
             return error(env, if block.clipboard { 5 } else { 6 }, 0);
         }
-        if let Some(heap) = heaps.owner(handle) {
+        if let Some(heap) = heaps.owner(env.cpu, handle) {
             return heaps
                 .realloc(
                     env.cpu,
@@ -671,6 +674,7 @@ pub(crate) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
         let Some(allocation) = allocation else {
             return error(env, 8, 0);
         };
+        heaps.account_small(env.cpu, allocation);
         globals.set_allocation(
             &mut env.sys.objects,
             handle,
@@ -701,6 +705,7 @@ pub(crate) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
     let Some(pointer) = heaps.alloc(env.cpu, &mut env.sys.vm, 0, size, flags & 0x40 != 0) else {
         return error(env, 8, 0);
     };
+    heaps.account_small(env.cpu, pointer);
     let new = Block {
         handle: pointer,
         allocation: pointer,
@@ -902,14 +907,24 @@ mod tests {
                 .from_allocation(&m.sys.objects, allocation),
             Some(handle)
         );
-        assert!(m.ext.get_mut::<Heaps>().size(heap, allocation).is_some());
+        assert!(
+            m.ext
+                .get_mut::<Heaps>()
+                .size(&m.cpu, heap, allocation)
+                .is_some()
+        );
         m.ext
             .get_mut::<Globals>()
             .get_mut(&mut m.sys.objects, handle)
             .unwrap()
             .clipboard = true;
         assert!(!super::super::free(&mut env(&mut m), heap, allocation));
-        assert!(m.ext.get_mut::<Heaps>().size(heap, allocation).is_some());
+        assert!(
+            m.ext
+                .get_mut::<Heaps>()
+                .size(&m.cpu, heap, allocation)
+                .is_some()
+        );
         m.ext
             .get_mut::<Globals>()
             .get_mut(&mut m.sys.objects, handle)
@@ -1058,12 +1073,12 @@ mod tests {
                         }
                     },
                     |m| {
-                        assert_eq!(m.ext.get::<Heaps>().owner(pointer), Some(heap));
+                        assert_eq!(m.ext.get::<Heaps>().owner(&m.cpu, pointer), Some(heap));
                     }
                 ),
                 0
             );
-            assert!(m.ext.get::<Heaps>().owner(pointer).is_none());
+            assert!(m.ext.get::<Heaps>().owner(&m.cpu, pointer).is_none());
         }
 
         let private = m
@@ -1082,11 +1097,14 @@ mod tests {
             private,
             |env| local_realloc(env, Handle(raw), 48, 2),
             |m| {
-                assert_eq!(m.ext.get_mut::<Heaps>().size(private, raw), Some(24));
+                assert_eq!(
+                    m.ext.get_mut::<Heaps>().size(&m.cpu, private, raw),
+                    Some(24)
+                );
                 assert_eq!(m.cpu.read_u32(raw).unwrap(), 0x24681357);
             },
         );
-        assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(private));
+        assert_eq!(m.ext.get::<Heaps>().owner(&m.cpu, resized), Some(private));
         assert_eq!(m.cpu.read_u32(resized).unwrap(), 0x24681357);
         assert_eq!(
             contended(
@@ -1094,11 +1112,11 @@ mod tests {
                 private,
                 |env| global_free(env, Handle(resized)),
                 |m| {
-                    assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(private));
+                    assert_eq!(m.ext.get::<Heaps>().owner(&m.cpu, resized), Some(private));
                 }
             ),
             0
         );
-        assert!(m.ext.get::<Heaps>().owner(resized).is_none());
+        assert!(m.ext.get::<Heaps>().owner(&m.cpu, resized).is_none());
     }
 }

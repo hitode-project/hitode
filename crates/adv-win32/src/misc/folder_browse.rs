@@ -100,7 +100,7 @@ fn pidl(env: &mut Env<'_>, path: &str) -> u32 {
     pointer
 }
 fn pidl_path(env: &mut Env<'_>, pointer: u32) -> Option<String> {
-    let size = env.ext.get_mut::<Heaps>().size(0, pointer)?;
+    let size = env.ext.get_mut::<Heaps>().size(env.cpu, 0, pointer)?;
     if !(10..=530).contains(&size) {
         return None;
     }
@@ -606,7 +606,12 @@ mod tests {
                 } else {
                     f.call("ole32.dll", "CoTaskMemFree", &[pointer]);
                 }
-                assert!(f.m.ext.get_mut::<Heaps>().size(0, pointer).is_none());
+                assert!(
+                    f.m.ext
+                        .get_mut::<Heaps>()
+                        .size(&f.m.cpu, 0, pointer)
+                        .is_none()
+                );
             }
         }
         f.m.cpu.write_u32(DATA, 1).unwrap();

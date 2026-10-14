@@ -253,7 +253,7 @@ fn queries<B: Backend>(cpu: B) {
             t.machine
                 .ext
                 .get::<adv_os::Heaps>()
-                .owner(fields[8])
+                .owner(&t.machine.cpu, fields[8])
                 .is_some()
         );
     }
@@ -277,7 +277,7 @@ fn queries<B: Backend>(cpu: B) {
         t.machine
             .ext
             .get::<adv_os::Heaps>()
-            .owner(t.value(retired + 32)),
+            .owner(&t.machine.cpu, t.value(retired + 32)),
         None
     );
     assert_eq!(t.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls, 0);

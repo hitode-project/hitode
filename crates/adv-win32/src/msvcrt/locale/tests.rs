@@ -90,7 +90,13 @@ fn initial_queries_c_save_restore_and_crt_module_owners_have_real_process_lifeti
     let pointer = call(&mut machine, entry, 0, None);
     assert_ne!(pointer, 0);
     assert_eq!(string(&machine, pointer), "C");
-    assert!(machine.ext.get::<Heaps>().owner(pointer).is_some());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, pointer)
+            .is_some()
+    );
     let saved = string(&machine, pointer);
     for category in 0..=5 {
         assert_eq!(call(&mut machine, entry, category, None), pointer);
@@ -121,10 +127,28 @@ fn initial_queries_c_save_restore_and_crt_module_owners_have_real_process_lifeti
     assert_eq!(string(&machine, queried), mixed);
     assert_eq!(machine.ext.get::<CrtState>().locales.len(), 2);
     super::super::detach_thread(&mut env(&mut machine, entry)).unwrap();
-    assert!(machine.ext.get::<Heaps>().owner(pointer).is_some());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, pointer)
+            .is_some()
+    );
     super::super::detach_process(&mut env(&mut machine, entry)).unwrap();
-    assert!(machine.ext.get::<Heaps>().owner(pointer).is_none());
-    assert!(machine.ext.get::<Heaps>().owner(second).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, pointer)
+            .is_none()
+    );
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, second)
+            .is_none()
+    );
     assert!(machine.ext.get::<CrtState>().locales.is_empty());
     super::super::detach_process(&mut env(&mut machine, entry)).unwrap();
 }
@@ -291,7 +315,13 @@ fn getter_arrays_follow_real_categories_codepage_module_owner_and_atomic_set_pub
     let pointer = handles(&mut machine, entry);
     assert_ne!(pointer, 0);
     let allocation = pointer - LCID_OFFSET;
-    assert!(machine.ext.get::<Heaps>().owner(allocation).is_some());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, allocation)
+            .is_some()
+    );
     assert_eq!(ids(&machine, pointer), [0; 6]);
     let errno = floating::errno_address(&mut env(&mut machine, entry));
     errno.write(&mut machine.cpu, 79).unwrap();
@@ -357,12 +387,18 @@ fn getter_arrays_follow_real_categories_codepage_module_owner_and_atomic_set_pub
         .protect(allocation & !4095, 4096, Prot::RW)
         .unwrap();
     super::super::detach_process(&mut env(&mut machine, entry)).unwrap();
-    assert!(machine.ext.get::<Heaps>().owner(allocation).is_none());
     assert!(
         machine
             .ext
             .get::<Heaps>()
-            .owner(other_pointer - LCID_OFFSET)
+            .owner(&machine.cpu, allocation)
+            .is_none()
+    );
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, other_pointer - LCID_OFFSET)
             .is_none()
     );
 }

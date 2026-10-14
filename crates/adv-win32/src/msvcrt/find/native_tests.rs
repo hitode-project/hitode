@@ -323,7 +323,11 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
     }));
     for pointer in &provider.allocations {
         assert!(
-            machine.ext.get::<adv_os::Heaps>().owner(*pointer).is_none(),
+            machine
+                .ext
+                .get::<adv_os::Heaps>()
+                .owner(&machine.cpu, *pointer)
+                .is_none(),
             "mode {mode}: scratch owner was not released"
         );
     }

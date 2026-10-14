@@ -975,7 +975,7 @@ kernel32.dll	892	HeapAlloc	forwarder	NTDLL.RtlAllocateHeap
 kernel32.dll	893	HeapCompact	code	
 kernel32.dll	894	HeapCreate	code	
 kernel32.dll	895	HeapDestroy	code	
-kernel32.dll	896	HeapFree	code	
+kernel32.dll	896	HeapFree	forwarder	NTDLL.RtlFreeHeap
 kernel32.dll	897	HeapLock	code	
 kernel32.dll	898	HeapQueryInformation	code	
 kernel32.dll	899	HeapReAlloc	forwarder	NTDLL.RtlReAllocateHeap

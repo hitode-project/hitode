@@ -59,7 +59,7 @@ fn table(env: &Env<'_>, pointer: GuestPtr<[u32; 3]>) -> Option<[u32; 3]> {
         && used <= capacity
         && used % 4 == 0
         && env.cpu.accessible(first, capacity, Prot::RW)
-        && env.ext.get::<Heaps>().owner(first).is_some())
+        && env.ext.get::<Heaps>().owner(env.cpu, first).is_some())
     .then_some(value)
 }
 
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(returned(initialize(&mut env, pointer)), 0);
         assert_eq!(returned(append(&mut env, pointer, GuestPtr::new(0))), 0);
         let original = pointer.read(env.cpu).unwrap();
-        assert!(env.ext.get::<Heaps>().owner(original[0]).is_some());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, original[0]).is_some());
         env.cpu.protect(0x510000, 4096, Prot::READ).unwrap();
         assert_eq!(
             returned(append(&mut env, pointer, GuestPtr::new(123))),
@@ -398,7 +398,7 @@ mod tests {
         pointer.write(env.cpu, original).unwrap();
         assert_eq!(returned(execute(&mut env, pointer)), 0);
         assert_eq!(pointer.read(env.cpu).unwrap(), [0; 3]);
-        assert!(env.ext.get::<Heaps>().owner(original[0]).is_none());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, original[0]).is_none());
         let lock = env.ext.get::<CrtState>().locks[&("ucrtbase.dll".to_owned(), 8)];
         assert!(matches!(
             env.sys.objects.get(lock),
@@ -484,8 +484,8 @@ mod tests {
         release_process_tables(&mut env).unwrap();
         release_process_tables(&mut env).unwrap();
         for (header, array, lock) in allocations {
-            assert!(env.ext.get::<Heaps>().owner(header).is_none());
-            assert!(env.ext.get::<Heaps>().owner(array).is_none());
+            assert!(env.ext.get::<Heaps>().owner(env.cpu, header).is_none());
+            assert!(env.ext.get::<Heaps>().owner(env.cpu, array).is_none());
             assert!(env.sys.objects.get(lock).is_none());
         }
     }

@@ -360,7 +360,13 @@ fn guest_matrix_stack_vtable_preserves_writable_tops_order_aliases_and_com_lifet
     );
     let heap = machine.ext.get::<Heaps>().process_heap;
     for address in [pointer, base, machine.cpu.read_u32(LAST_LEVEL).unwrap()] {
-        assert_eq!(machine.ext.get_mut::<Heaps>().size(heap, address), None);
+        assert_eq!(
+            machine
+                .ext
+                .get_mut::<Heaps>()
+                .size(&machine.cpu, heap, address),
+            None
+        );
     }
     assert_eq!(table, machine.cpu.read_u32(TABLE).unwrap());
     let diagnostics = machine.ext.get::<adv_abi::ApiDiagnostics>();

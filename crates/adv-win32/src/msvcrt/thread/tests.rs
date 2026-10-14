@@ -52,7 +52,7 @@ fn observed(env: &mut Env<'_>) -> Outcome {
         panic!("missing caller-owned thread handle")
     };
     assert_eq!(env.sys.context(*ctx).exit_code(), Some(code));
-    assert_eq!(env.ext.get::<adv_os::Heaps>().owner(cell), None);
+    assert_eq!(env.ext.get::<adv_os::Heaps>().owner(env.cpu, cell), None);
     assert!(
         env.ext
             .get::<super::super::CrtState>()

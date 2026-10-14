@@ -184,7 +184,7 @@ fn size(env: &mut Env<'_>, heap: u32, flags: u32, pointer: u32) -> Outcome {
         Outcome::Return(
             env.ext
                 .get_mut::<Heaps>()
-                .size(heap, pointer)
+                .size(env.cpu, heap, pointer)
                 .unwrap_or(u32::MAX),
         )
     })

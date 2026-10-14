@@ -102,8 +102,8 @@ fn a_w_share_one_iunknown_count_and_release_both_guest_aliases() {
         assert!(com.get::<Factory>(&machine.sys.objects, pointer).is_none());
         assert!(com.get::<Factory>(&machine.sys.objects, other).is_none());
         let heap = machine.ext.get_mut::<Heaps>();
-        assert_eq!(heap.size(heap.process_heap, pointer), None);
-        assert_eq!(heap.size(heap.process_heap, other), None);
+        assert_eq!(heap.size(&machine.cpu, heap.process_heap, pointer), None);
+        assert_eq!(heap.size(&machine.cpu, heap.process_heap, other), None);
     }
 }
 

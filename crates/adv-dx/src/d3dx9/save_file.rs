@@ -194,7 +194,7 @@ mod tests {
         drop(guard);
         reap(&mut env, false);
         assert!(super::super::buffer::contents(&env, pointer).is_none());
-        assert!(env.ext.get::<Heaps>().owner(data).is_none());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, data).is_none());
         assert!(env.ext.get::<Writes>().0.is_empty());
     }
 }

@@ -68,7 +68,13 @@ fn pctype_cached_profiles_follow_ctype_not_acp_and_have_readonly_module_lifetime
         let address = pointer(&mut machine, entry);
         assert_eq!(pointer(&mut machine, entry), address);
         assert!(!profiles.contains(&address));
-        assert!(machine.ext.get::<Heaps>().owner(address - 2).is_some());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address - 2)
+                .is_some()
+        );
         assert_eq!(hash(&bytes(&machine, address)), expected);
         assert_eq!(errno.read(&machine.cpu).unwrap(), 79);
         assert_eq!(
@@ -134,13 +140,31 @@ fn pctype_cached_profiles_follow_ctype_not_acp_and_have_readonly_module_lifetime
     let locale_buffer = machine.ext.get::<CrtState>().locales[MODULE].buffer;
     super::super::super::detach_thread(&mut env(&mut machine, entry)).unwrap();
     for &address in &profiles {
-        assert!(machine.ext.get::<Heaps>().owner(address - 2).is_some());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address - 2)
+                .is_some()
+        );
     }
     super::super::release_process_tables(&mut env(&mut machine, entry)).unwrap();
     for address in profiles.into_iter().chain([other_pointer]) {
-        assert!(machine.ext.get::<Heaps>().owner(address - 2).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address - 2)
+                .is_none()
+        );
     }
-    assert!(machine.ext.get::<Heaps>().owner(locale_buffer).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, locale_buffer)
+            .is_none()
+    );
     assert!(machine.ext.get::<CrtState>().locales.is_empty());
     super::super::release_process_tables(&mut env(&mut machine, entry)).unwrap();
 }
@@ -187,7 +211,13 @@ fn guest_table<B: Backend>(cpu: B) {
     machine.cpu.read(DATA + 512, &mut actual[2..]).unwrap();
     assert_eq!(hash(&actual), 0x48cabdc90fcb0865);
     let allocation = machine.cpu.read_u32(DATA).unwrap();
-    assert!(machine.ext.get::<Heaps>().owner(allocation).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, allocation)
+            .is_none()
+    );
 }
 #[test]
 fn pctype_actual_cdecl_getter_eof_bias_and512byte_copy_run_in_interpreter_and_jit() {

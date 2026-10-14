@@ -59,15 +59,21 @@ fn machine<B: Backend>(cpu: B) -> Machine<B> {
             .insert(("msvcr80.dll".into(), env.context + 1), other);
         super::super::detach_thread(env).unwrap();
         for address in owned {
-            assert_eq!(env.ext.get_mut::<Heaps>().size(heap, address), None);
+            assert_eq!(
+                env.ext.get_mut::<Heaps>().size(env.cpu, heap, address),
+                None
+            );
         }
-        assert_eq!(env.ext.get_mut::<Heaps>().size(heap, other), Some(TM_BYTES));
+        assert_eq!(
+            env.ext.get_mut::<Heaps>().size(env.cpu, heap, other),
+            Some(TM_BYTES)
+        );
         assert_eq!(env.ext.get::<CrtState>().tm_buffers.len(), 1);
         super::super::detach_thread(env).unwrap();
         super::super::detach_process(env).unwrap();
         super::super::detach_process(env).unwrap();
         assert!(env.ext.get::<CrtState>().tm_buffers.is_empty());
-        assert_eq!(env.ext.get_mut::<Heaps>().size(heap, other), None);
+        assert_eq!(env.ext.get_mut::<Heaps>().size(env.cpu, heap, other), None);
         Outcome::Return(0)
     });
     let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();

@@ -119,8 +119,8 @@ fn command<B: Backend>(machine: &mut Machine<B>, line: &str) {
         heaps,
         &wide,
     );
-    assert!(heaps.size(0, a).unwrap() >= ansi.len() as u32);
-    assert!(heaps.size(0, b).unwrap() >= wide.len() as u32);
+    assert!(heaps.size(&machine.cpu, 0, a).unwrap() >= ansi.len() as u32);
+    assert!(heaps.size(&machine.cpu, 0, b).unwrap() >= wide.len() as u32);
     machine.cpu.write(a, &ansi).unwrap();
     machine.cpu.write(b, &wide).unwrap();
 }

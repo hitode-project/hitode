@@ -376,7 +376,13 @@ fn large_global_local_and_heap_allocations_retire_without_stale_aliases() {
         let globals = machine.ext.get::<Globals>();
         assert_eq!(globals.from_pointer(&machine.sys.objects, plain), None);
         assert_eq!(globals.from_allocation(&machine.sys.objects, plain), None);
-        assert_eq!(machine.ext.get::<adv_os::Heaps>().owner(plain), None);
+        assert_eq!(
+            machine
+                .ext
+                .get::<adv_os::Heaps>()
+                .owner(&machine.cpu, plain),
+            None
+        );
         assert_eq!(machine.cpu.read_u32(DATA + 32).unwrap(), 0);
         assert!(!machine.cpu.accessible(plain, 1, Prot::READ));
     }

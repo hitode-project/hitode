@@ -334,9 +334,12 @@ fn installed_fronts_report_9_0_c_with_shared_variants_and_independent_container_
         assert!(!adv_os::com::owns_bstr(&env, bstr));
         let interfaces = [f.u32(provider), f.u32(root), f.u32(system)];
         let heaps = f.machine.ext.get_mut::<adv_os::Heaps>();
-        assert_eq!(heaps.size(0, bstr - 4), None);
+        assert_eq!(heaps.size(&f.machine.cpu, 0, bstr - 4), None);
         for pointer in interfaces {
-            assert_eq!(heaps.size(heaps.process_heap, pointer), None);
+            assert_eq!(
+                heaps.size(&f.machine.cpu, heaps.process_heap, pointer),
+                None
+            );
         }
         assert_eq!(f.machine.sys.objects.object_count(), before + 1);
     }

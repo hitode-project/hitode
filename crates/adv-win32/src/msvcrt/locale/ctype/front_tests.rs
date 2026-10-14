@@ -61,7 +61,7 @@ fn profile(env: &mut Env<'_>) -> Outcome {
 }
 fn readonly(env: &mut Env<'_>) -> Outcome {
     let pointer = env.arg(0);
-    assert!(env.ext.get::<Heaps>().owner(pointer - 2).is_some());
+    assert!(env.ext.get::<Heaps>().owner(env.cpu, pointer - 2).is_some());
     env.cpu
         .protect((pointer - 2) & !4095, 4096, Prot::READ)
         .unwrap();

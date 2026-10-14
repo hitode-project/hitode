@@ -1,6 +1,7 @@
 //! Heap, Local/Global, and Virtual memory functions.
 
 use adv_abi::Registry;
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
 use super::K32;
@@ -89,7 +90,7 @@ pub(crate) fn free(env: &mut Env<'_>, heap: u32, p: u32) -> bool {
     }
     let heaps = env.ext.get_mut::<Heaps>();
     let heap = if heap == 0 {
-        heaps.owner(p).unwrap_or(0)
+        heaps.owner(env.cpu, p).unwrap_or(0)
     } else {
         heap
     };
@@ -135,7 +136,7 @@ fn heap_free(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(1);
     }
     let owner = if h == 0 {
-        env.ext.get::<Heaps>().owner(p).unwrap_or(0)
+        env.ext.get::<Heaps>().owner(env.cpu, p).unwrap_or(0)
     } else {
         h
     };
@@ -182,6 +183,7 @@ pub(crate) fn reallocate(env: &mut Env<'_>, h: u32, flags: u32, p: u32, size: u3
     if r == 0 {
         set_last_error(env, err::NOT_ENOUGH_MEMORY);
     } else if let Some(mut block) = block {
+        heaps.account_small(env.cpu, r);
         let bias = block.pointer - block.allocation;
         let globals = env.ext.get_mut::<adv_os::global::Globals>();
         if block.movable || r == block.allocation {
@@ -208,8 +210,70 @@ fn heap_size(env: &mut Env<'_>) -> Outcome {
     let (h, flags, p) = (env.arg(0), env.arg(1), env.arg(2));
     crate::native::route(env, "RtlSizeHeap", [h, flags, p], move |env| {
         crate::heap_lock::with_heap(env, h, flags, move |env| {
-            Outcome::Return(env.ext.get_mut::<Heaps>().size(h, p).unwrap_or(u32::MAX))
+            Outcome::Return(
+                env.ext
+                    .get_mut::<Heaps>()
+                    .size(env.cpu, h, p)
+                    .unwrap_or(u32::MAX),
+            )
         })
+    })
+}
+
+fn heap_validate(env: &mut Env<'_>) -> Outcome {
+    let (heap, flags, pointer) = (env.arg(0), env.arg(1), env.arg(2));
+    if heap == 0 || flags & !1 != 0 {
+        return Outcome::Return(0);
+    }
+    crate::heap_lock::inspect(env, heap, flags, move |env| {
+        Outcome::Return(u32::from(
+            env.ext.get::<Heaps>().validate(env.cpu, heap, pointer),
+        ))
+    })
+}
+fn heap_walk(env: &mut Env<'_>) -> Outcome {
+    let (heap, entry) = (env.arg(0), env.arg(1));
+    if heap == 0 || env.ext.get::<Heaps>().normalize(heap).is_none() {
+        set_last_error(env, 6);
+        return Outcome::Return(0);
+    }
+    if !env.cpu.accessible(entry, 28, Prot::RW) {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let after = env.cpu.read_u32(entry).unwrap();
+    let after_flags = env.cpu.read_u16(entry + 10).unwrap();
+    crate::heap_lock::inspect(env, heap, 0, move |env| {
+        match env
+            .ext
+            .get::<Heaps>()
+            .walk(env.cpu, &env.sys.vm, heap, after, after_flags)
+        {
+            Ok(Some(mut row)) => {
+                let addr = u32::from_le_bytes(row[..4].try_into().unwrap());
+                if row[10] & 4 != 0
+                    && let Some(block) = global_allocation_block(env, addr).filter(|b| b.movable)
+                {
+                    row[10] |= 0x10;
+                    row[12..16].copy_from_slice(&block.handle.to_le_bytes());
+                }
+                match env.cpu.write(entry, &row) {
+                    Ok(()) => Outcome::Return(1),
+                    Err(_) => {
+                        set_last_error(env, 87);
+                        Outcome::Return(0)
+                    }
+                }
+            }
+            Ok(None) => {
+                set_last_error(env, 259);
+                Outcome::Return(0)
+            }
+            Err(()) => {
+                set_last_error(env, 87);
+                Outcome::Return(0)
+            }
+        }
     })
 }
 
@@ -225,7 +289,8 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "HeapReAlloc", 4, heap_realloc);
     stdcall(reg, K32, "HeapSize", 3, heap_size);
     stdcall(reg, K32, "HeapSetInformation", 4, |_| Outcome::Return(1));
-    stdcall(reg, K32, "HeapValidate", 3, |_| Outcome::Return(1));
+    stdcall(reg, K32, "HeapValidate", 3, heap_validate);
+    stdcall(reg, K32, "HeapWalk", 2, heap_walk);
     stdcall(reg, K32, "HeapCompact", 2, |_| Outcome::Return(0x10_0000));
     stdcall(reg, K32, "GetProcessHeap", 0, |e| {
         Outcome::Return(e.ext.get::<Heaps>().process_heap)

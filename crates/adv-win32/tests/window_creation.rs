@@ -342,7 +342,7 @@ fn creation<B: TestCpu>(cpu: B) {
             test.machine
                 .ext
                 .get::<adv_os::Heaps>()
-                .owner(test.value(capture + 100)),
+                .owner(&test.machine.cpu, test.value(capture + 100)),
             None
         );
         if atom {
@@ -367,7 +367,13 @@ fn creation<B: TestCpu>(cpu: B) {
                 assert_ne!(cs[9], input_title);
                 assert_ne!(cs[10], input_class);
                 for p in [cs[9], cs[10]] {
-                    assert_eq!(test.machine.ext.get::<adv_os::Heaps>().owner(p), None);
+                    assert_eq!(
+                        test.machine
+                            .ext
+                            .get::<adv_os::Heaps>()
+                            .owner(&test.machine.cpu, p),
+                        None
+                    );
                 }
             }
         }
@@ -497,7 +503,13 @@ fn rejection<B: TestCpu>(cpu: B) {
             test.value(capture + 36),
             test.value(capture + 40),
         ] {
-            assert_eq!(test.machine.ext.get::<adv_os::Heaps>().owner(pointer), None);
+            assert_eq!(
+                test.machine
+                    .ext
+                    .get::<adv_os::Heaps>()
+                    .owner(&test.machine.cpu, pointer),
+                None
+            );
         }
     }
     assert_eq!(

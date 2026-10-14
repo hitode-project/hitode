@@ -135,6 +135,7 @@ impl Win32 {
         let mut heaps = Heaps::default();
         let process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm)?;
         heaps.process_heap = process_heap;
+        heaps.enable_small(&mut m.cpu)?;
         m.cpu
             .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
         ntdll::install_peb_lock(m)?;

@@ -71,7 +71,10 @@ fn calloc_crt_zeroing_zero_requests_reuse_and_budget_use_real_process_heap_owner
             !live.contains(&address),
             "simultaneous blocks must be distinct"
         );
-        assert_eq!(machine.ext.get::<Heaps>().owner(address), Some(heap));
+        assert_eq!(
+            machine.ext.get::<Heaps>().owner(&machine.cpu, address),
+            Some(heap)
+        );
         assert_eq!(address & 7, 0); // x86 process-heap alignment.
         let mut bytes = vec![0x77; length];
         machine.cpu.read(address, &mut bytes).unwrap();
@@ -102,9 +105,18 @@ fn calloc_crt_zeroing_zero_requests_reuse_and_budget_use_real_process_heap_owner
     // Caller-owned blocks outlive the allocating thread's CRT errno storage.
     super::super::detach_thread(&mut env(&mut machine, entry)).unwrap();
     for address in live {
-        assert_eq!(machine.ext.get::<Heaps>().owner(address), Some(heap));
+        assert_eq!(
+            machine.ext.get::<Heaps>().owner(&machine.cpu, address),
+            Some(heap)
+        );
         free(&mut env(&mut machine, entry), GuestPtr::new(address));
-        assert!(machine.ext.get::<Heaps>().owner(address).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address)
+                .is_none()
+        );
     }
 }
 
@@ -189,8 +201,20 @@ fn guest_calloc<B: Backend>(cpu: B) {
     let zero_pointer = machine.cpu.read_u32(DATA + 16).unwrap();
     assert_ne!(pointer, 0);
     assert_ne!(zero_pointer, 0);
-    assert!(machine.ext.get::<Heaps>().owner(pointer).is_none());
-    assert!(machine.ext.get::<Heaps>().owner(zero_pointer).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, pointer)
+            .is_none()
+    );
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(&machine.cpu, zero_pointer)
+            .is_none()
+    );
     assert_eq!(machine.cpu.read_u32(DATA + 12).unwrap(), 79);
     assert_eq!(machine.cpu.read_u32(DATA + 20).unwrap(), 0);
     assert_eq!(machine.cpu.read_u32(DATA + 24).unwrap(), 12);
@@ -288,18 +312,27 @@ fn serialization<B: Backend>(cpu: B) {
         assert_ne!(pointer, 0);
         machine.cpu.write_u32(pointer, 0x13572468).unwrap();
         let resized = contended(&mut machine, module, "realloc", &[pointer, 64], |m| {
-            assert_eq!(m.ext.get_mut::<Heaps>().size(heap, pointer), Some(16));
+            assert_eq!(
+                m.ext.get_mut::<Heaps>().size(&m.cpu, heap, pointer),
+                Some(16)
+            );
             assert_eq!(m.cpu.read_u32(pointer).unwrap(), 0x13572468);
         });
         assert_ne!(resized, 0);
         assert_eq!(machine.cpu.read_u32(resized).unwrap(), 0x13572468);
         assert_eq!(
             contended(&mut machine, module, "free", &[resized], |m| {
-                assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(heap));
+                assert_eq!(m.ext.get::<Heaps>().owner(&m.cpu, resized), Some(heap));
             }),
             0
         );
-        assert!(machine.ext.get::<Heaps>().owner(resized).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, resized)
+                .is_none()
+        );
         let zeroed = contended(&mut machine, module, "calloc", &[4, 16], |_| {});
         let mut bytes = [0xff; 64];
         machine.cpu.read(zeroed, &mut bytes).unwrap();
@@ -331,14 +364,23 @@ fn serialization<B: Backend>(cpu: B) {
             ("??_U@YAPAXI@Z", "??_V@YAXPAX@Z"),
         ] {
             let pointer = contended(&mut machine, module, new, &[16], |_| {});
-            assert_eq!(machine.ext.get::<Heaps>().owner(pointer), Some(heap));
+            assert_eq!(
+                machine.ext.get::<Heaps>().owner(&machine.cpu, pointer),
+                Some(heap)
+            );
             assert_eq!(
                 contended(&mut machine, module, delete, &[pointer], |m| {
-                    assert_eq!(m.ext.get::<Heaps>().owner(pointer), Some(heap));
+                    assert_eq!(m.ext.get::<Heaps>().owner(&m.cpu, pointer), Some(heap));
                 }),
                 0
             );
-            assert!(machine.ext.get::<Heaps>().owner(pointer).is_none());
+            assert!(
+                machine
+                    .ext
+                    .get::<Heaps>()
+                    .owner(&machine.cpu, pointer)
+                    .is_none()
+            );
         }
     }
     for (name, args) in [("_malloc_crt", &[16][..]), ("_calloc_crt", &[4, 16][..])] {

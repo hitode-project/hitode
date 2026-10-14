@@ -367,7 +367,10 @@ fn callbacks<B: TestCpu>(cpu: B) {
         assert_eq!(gets.iter().map(|r| r[2]).collect::<Vec<_>>(), capacities);
         for row in sets.iter().chain(gets.iter()).filter(|r| r[3] != 0) {
             assert_eq!(
-                test.machine.ext.get::<adv_os::Heaps>().owner(row[3]),
+                test.machine
+                    .ext
+                    .get::<adv_os::Heaps>()
+                    .owner(&test.machine.cpu, row[3]),
                 None,
                 "temporary text storage must be reclaimed after reentrant dispatch"
             );
@@ -638,7 +641,13 @@ fn send_front<B: TestCpu>(cpu: B) {
     assert_eq!(sets_w[0][3], text);
     assert_ne!(sets_a[0][3], text);
     for row in sets_a {
-        assert_eq!(test.machine.ext.get::<adv_os::Heaps>().owner(row[3]), None);
+        assert_eq!(
+            test.machine
+                .ext
+                .get::<adv_os::Heaps>()
+                .owner(&test.machine.cpu, row[3]),
+            None
+        );
     }
     assert_eq!(
         test.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls,

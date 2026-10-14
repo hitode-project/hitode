@@ -382,7 +382,7 @@ fn sdk_legacy_slots_execute_through_both_guest_vtables_and_preserve_stack() {
                 assert_eq!(
                     {
                         let heap = m.ext.get_mut::<Heaps>();
-                        heap.size(heap.process_heap, table)
+                        heap.size(&m.cpu, heap.process_heap, table)
                     },
                     Some(slots * 4)
                 );

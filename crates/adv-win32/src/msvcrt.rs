@@ -1770,8 +1770,8 @@ mod tests {
             let resized = m.cpu.read_u32(data + 4).unwrap();
             assert_ne!(original, 0);
             assert_ne!(resized, 0);
-            assert!(m.ext.get::<Heaps>().owner(original).is_none());
-            assert!(m.ext.get::<Heaps>().owner(resized).is_none());
+            assert!(m.ext.get::<Heaps>().owner(&m.cpu, original).is_none());
+            assert!(m.ext.get::<Heaps>().owner(&m.cpu, resized).is_none());
             for (offset, expected) in [(8, 0), (12, 0x1234abcd), (16, 12), (20, 0), (24, 0)] {
                 assert_eq!(m.cpu.read_u32(data + offset).unwrap(), expected);
             }
@@ -1938,15 +1938,24 @@ mod tests {
                 }
                 assert_eq!(env.ext.get::<CrtState>().errno.len(), 1);
                 for &address in &cells[..2] {
-                    assert_eq!(env.ext.get_mut::<Heaps>().size(heap, address), None);
+                    assert_eq!(
+                        env.ext.get_mut::<Heaps>().size(env.cpu, heap, address),
+                        None
+                    );
                 }
-                assert_eq!(env.ext.get_mut::<Heaps>().size(heap, cells[2]), Some(4));
+                assert_eq!(
+                    env.ext.get_mut::<Heaps>().size(env.cpu, heap, cells[2]),
+                    Some(4)
+                );
                 // Repeated notification cleanup is idempotent.
                 detach_thread(env).unwrap();
                 detach_process(env).unwrap();
                 detach_process(env).unwrap();
                 assert!(env.ext.get::<CrtState>().errno.is_empty());
-                assert_eq!(env.ext.get_mut::<Heaps>().size(heap, cells[2]), None);
+                assert_eq!(
+                    env.ext.get_mut::<Heaps>().size(env.cpu, heap, cells[2]),
+                    None
+                );
                 Outcome::Return(0)
             });
             let mut machine = Machine::new(

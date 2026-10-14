@@ -231,7 +231,10 @@ fn actual_guest<B: Backend>(cpu: B) {
     );
     assert_eq!(machine.sys.objects.object_count(), before);
     let pointer = machine.cpu.read_u32(DATA + 0x380).unwrap();
-    assert_eq!(machine.ext.get::<Heaps>().owner(pointer), None);
+    assert_eq!(
+        machine.ext.get::<Heaps>().owner(&machine.cpu, pointer),
+        None
+    );
     assert_eq!(
         machine
             .ext
@@ -329,7 +332,10 @@ fn system_text_and_wide_allocations_use_local_memory_metadata() {
             false,
         )
         .unwrap();
-    assert_eq!(machine.ext.get::<Heaps>().owner(pointer), None);
+    assert_eq!(
+        machine.ext.get::<Heaps>().owner(&machine.cpu, pointer),
+        None
+    );
 }
 
 #[test]

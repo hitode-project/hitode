@@ -114,7 +114,7 @@ fn absent_provider<B: Backend>(cpu: B) {
         let pointer = t.call("GlobalLock", &[handle]);
         assert_ne!(pointer, 0);
         assert_eq!(handle == pointer, flags == 0x40);
-        let heap_owner = t.machine.ext.get::<Heaps>().owner(pointer);
+        let heap_owner = t.machine.ext.get::<Heaps>().owner(&t.machine.cpu, pointer);
         assert!(heap_owner.is_some());
         let before = t
             .machine
@@ -143,7 +143,10 @@ fn absent_provider<B: Backend>(cpu: B) {
                     (after.pointer, after.size, after.locks, after.clipboard),
                     (before.pointer, before.size, before.locks, before.clipboard)
                 );
-                assert_eq!(t.machine.ext.get::<Heaps>().owner(pointer), heap_owner);
+                assert_eq!(
+                    t.machine.ext.get::<Heaps>().owner(&t.machine.cpu, pointer),
+                    heap_owner
+                );
             }
         }
         assert_eq!(t.call("GlobalSize", &[handle]), 32);

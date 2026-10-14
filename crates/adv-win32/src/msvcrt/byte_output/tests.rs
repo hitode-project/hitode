@@ -29,7 +29,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 fn closed(env: &mut Env<'_>) -> Outcome {
     let stream = env.arg(0);
     assert!(!env.ext.get::<CrtState>().files.contains_key(&stream));
-    assert!(env.ext.get::<Heaps>().owner(stream).is_none());
+    assert!(env.ext.get::<Heaps>().owner(env.cpu, stream).is_none());
     Outcome::Return(1)
 }
 fn readonly(env: &mut Env<'_>) -> Outcome {

@@ -324,7 +324,10 @@ fn finish(machine: &mut Machine<JitCpu>, mut code: Asm) {
     assert!(machine.sys.objects.get(HANDLE).is_none());
     assert!(machine.sys.objects.all_hosts::<FileObj>().next().is_none());
     for &allocation in &machine.ext.get::<Provider>().allocations {
-        assert_eq!(machine.ext.get::<Heaps>().owner(allocation), None);
+        assert_eq!(
+            machine.ext.get::<Heaps>().owner(&machine.cpu, allocation),
+            None
+        );
     }
 }
 

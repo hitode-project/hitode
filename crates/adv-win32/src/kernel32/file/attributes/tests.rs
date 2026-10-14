@@ -438,7 +438,12 @@ fn attribute_hook(env: &mut Env<'_>) -> Outcome {
     let path = String::from_utf16(&units).unwrap();
     assert!(path.starts_with(r"\??\C:\Game\"));
     assert_eq!(output % 8, 0);
-    assert!(env.ext.get::<adv_os::Heaps>().owner(object).is_some());
+    assert!(
+        env.ext
+            .get::<adv_os::Heaps>()
+            .owner(env.cpu, object)
+            .is_some()
+    );
     let provider = env.ext.get_mut::<AttributeProvider>();
     provider.paths.push(path);
     provider.allocations.push(object);
@@ -603,7 +608,7 @@ fn a_w_attributes_use_only_live_attribute_hooks_and_release_native_scratch() {
                     machine
                         .ext
                         .get::<adv_os::Heaps>()
-                        .owner(*allocation)
+                        .owner(&machine.cpu, *allocation)
                         .is_none(),
                     "native scratch is released on success, NT failure and bad output"
                 );

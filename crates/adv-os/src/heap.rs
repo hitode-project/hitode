@@ -1,17 +1,19 @@
 //! Guest heaps (HeapAlloc & co., also behind malloc, LocalAlloc, GlobalAlloc).
 //!
-//! Metadata lives on the host: blocks never carry headers in guest memory, so guest
-//! overruns can't corrupt the allocator. Each heap owns arenas from the VM; free space is
-//! indexed by address (for coalescing) and by size (best fit). Blocks are 8-byte aligned
-//! like the x86 Windows heap. Large blocks get their own zeroed VM region and
-//! release it on free, preserving fresh committed-page contents on each allocation.
+//! Small process-heap blocks carry guest headers and shared free lists. Host reads
+//! validate headers against registered slabs; corruption is an invalid pointer, never
+//! a panic. Other allocations use host metadata and coalescing arena free ranges.
+//! Blocks are 8-byte aligned; large blocks own freshly zeroed VM regions.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::FxHashMap;
 
-use adv_cpu::backend::{Guest, MemFault, Prot};
+use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_machine::Vm;
+
+mod inspect;
+mod small;
 
 const ALIGN: u32 = 8;
 const ARENA: u32 = 0x10_0000;
@@ -46,6 +48,7 @@ pub struct Heap {
     /// Blocks with their own VM region.
     large: FxHashMap<u32, u32>,
     arenas: Vec<u32>,
+    slabs: Option<Vec<small::Slab>>,
 }
 
 /// Process-owned serialization identity; the personality initializes and waits
@@ -244,7 +247,14 @@ impl Heaps {
         size: u32,
         zero: bool,
     ) -> Option<u32> {
+        let handle = self.normalize(handle)?;
         let h = self.heap(handle)?;
+        if let Some(slabs) = &h.slabs
+            && (1..=512).contains(&size)
+            && (slabs.len() < 128 || cpu.read_u32(handle + 0x110 + ((size - 1) / 8) * 8).ok()? != 0)
+        {
+            return h.small_alloc(cpu, vm, handle, size, zero);
+        }
         let rsize = round(size)?;
         let mut freshly_mapped = false;
         let addr = if rsize >= LARGE {
@@ -270,9 +280,13 @@ impl Heaps {
     }
 
     pub fn free(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32, addr: u32) -> bool {
-        let Some(h) = self.heap(handle) else {
+        let Some(handle) = self.normalize(handle) else {
             return false;
         };
+        let h = self.heap(handle).unwrap();
+        if let Some(result) = h.small_free(cpu, handle, addr) {
+            return result;
+        }
         let Some((rsize, _)) = h.used.remove(&addr) else {
             return false;
         };
@@ -285,15 +299,20 @@ impl Heaps {
     }
 
     /// Requested size of a live block.
-    pub fn size(&mut self, handle: u32, addr: u32) -> Option<u32> {
-        self.heap(handle)?.used.get(&addr).map(|&(_, s)| s)
+    pub fn size(&self, cpu: &dyn Guest, handle: u32, addr: u32) -> Option<u32> {
+        let handle = self.normalize(handle)?;
+        let h = self.heaps.get(&handle)?;
+        if let Some(bits) = h.small_header(cpu, handle, addr) {
+            return (bits & (1 << 22) != 0).then_some(bits & 0xffff);
+        }
+        h.used.get(&addr).map(|&(_, s)| s)
     }
 
     /// Which heap a block belongs to (for LocalFree/GlobalFree style APIs without a handle).
-    pub fn owner(&self, addr: u32) -> Option<u32> {
+    pub fn owner(&self, cpu: &dyn Guest, addr: u32) -> Option<u32> {
         self.heaps
             .iter()
-            .find(|(_, h)| h.used.contains_key(&addr))
+            .find(|(heap, _)| self.size(cpu, **heap, addr).is_some())
             .map(|(&k, _)| k)
     }
 
@@ -308,7 +327,30 @@ impl Heaps {
         zero: bool,
         in_place_only: bool,
     ) -> Option<u32> {
+        let handle = self.normalize(handle)?;
         let h = self.heap(handle)?;
+        if let Some(bits) = h.small_header(cpu, handle, addr) {
+            if bits & (1 << 22) == 0 {
+                return None;
+            }
+            let old = bits & 0xffff;
+            let capacity = (((bits >> 16) & 63) + 1) * 8;
+            if size <= capacity {
+                if zero && size > old {
+                    zero_memory(cpu, addr + old, size - old).ok()?;
+                }
+                small::write_header(cpu, handle, addr, (bits & !0xffff) | size)?;
+                return Some(addr);
+            }
+            if in_place_only {
+                return None;
+            }
+            let new = self.move_block(cpu, vm, handle, addr, old, size, zero)?;
+            if bits & (1 << 23) != 0 {
+                self.account_small(cpu, new);
+            }
+            return Some(new);
+        }
         let &(rold, old) = h.used.get(&addr)?;
         let rnew = round(size)?;
         if rnew <= rold && !h.large.contains_key(&addr) {
@@ -341,6 +383,20 @@ impl Heaps {
         if in_place_only {
             return None;
         }
+        self.move_block(cpu, vm, handle, addr, old, size, zero)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn move_block(
+        &mut self,
+        cpu: &mut dyn Guest,
+        vm: &mut Vm,
+        handle: u32,
+        addr: u32,
+        old: u32,
+        size: u32,
+        zero: bool,
+    ) -> Option<u32> {
         let new = self.alloc(cpu, vm, handle, size, zero)?;
         let mut buf = [0; 4096];
         let mut offset = 0;
@@ -455,7 +511,7 @@ mod tests {
         guest.write(block, &vec![0xa5; size as usize]).unwrap();
         assert!(heaps.free(&mut guest, &mut vm, 0, block));
         let next = heaps.alloc(&mut guest, &mut vm, 0, size, false).unwrap();
-        assert_eq!(heaps.size(0, next), Some(size));
+        assert_eq!(heaps.size(&guest, 0, next), Some(size));
         assert!(
             guest
                 .bytes(next, size as usize)
@@ -486,8 +542,8 @@ mod tests {
                 .realloc(&mut guest, &mut vm, 0, old, new_size, zero, false)
                 .unwrap();
             assert_ne!(new, old);
-            assert_eq!(heaps.size(0, old), None);
-            assert_eq!(heaps.size(0, new), Some(new_size));
+            assert_eq!(heaps.size(&guest, 0, old), None);
+            assert_eq!(heaps.size(&guest, 0, new), Some(new_size));
             assert_eq!(guest.bytes(new, old_size as usize).unwrap(), pattern);
             assert!(
                 guest
@@ -519,10 +575,10 @@ mod tests {
                         .iter()
                         .all(|&b| b == 0)
                 );
-                assert_eq!(heaps.size(0, block), Some(requested));
+                assert_eq!(heaps.size(&guest, 0, block), Some(requested));
                 assert!(heaps.free(&mut guest, &mut vm, 0, block));
-                assert_eq!(heaps.owner(block), None);
-                assert_eq!(heaps.size(0, block), None);
+                assert_eq!(heaps.owner(&guest, block), None);
+                assert_eq!(heaps.size(&guest, 0, block), None);
                 assert_eq!(vm.region(block), None);
                 assert!(!guest.memory.contains_key(&block));
                 assert!(!heaps.free(&mut guest, &mut vm, 0, block));
@@ -549,7 +605,7 @@ mod tests {
         assert_eq!(vm.region(live), None);
         assert!(!guest.memory.contains_key(&live));
         assert_eq!(vm.region(foreign), Some(LARGE));
-        assert_eq!(heaps.owner(foreign), Some(other));
+        assert_eq!(heaps.owner(&guest, foreign), Some(other));
         assert!(heaps.destroy(&mut guest, &mut vm, other));
         assert_eq!(vm.region(foreign), None);
         assert!(guest.memory.is_empty());
@@ -657,8 +713,8 @@ mod tests {
             .realloc(&mut guest, &mut vm, 0, old, 21_000, true, false)
             .unwrap();
         assert_ne!(new, old);
-        assert_eq!(heaps.size(0, old), None);
-        assert_eq!(heaps.size(0, new), Some(21_000));
+        assert_eq!(heaps.size(&guest, 0, old), None);
+        assert_eq!(heaps.size(&guest, 0, new), Some(21_000));
         assert_eq!(guest.bytes(new, pattern.len()).unwrap(), pattern);
         assert!(
             guest
@@ -690,9 +746,9 @@ mod tests {
             );
             let failed_new = guest.last_map;
             assert_ne!(failed_new, old);
-            assert_eq!(heaps.size(0, old), Some(size));
+            assert_eq!(heaps.size(&guest, 0, old), Some(size));
             assert_eq!(guest.bytes(old, size as usize).unwrap(), pattern);
-            assert_eq!(heaps.owner(failed_new), None);
+            assert_eq!(heaps.owner(&guest, failed_new), None);
             assert_eq!(vm.region(failed_new), None);
             assert!(!guest.memory.contains_key(&failed_new));
             guest.fail_read_call = None;
@@ -724,7 +780,7 @@ mod tests {
             heaps.realloc(&mut guest, &mut vm, 0, old, 5000, true, false),
             None
         );
-        assert_eq!(heaps.size(0, old), Some(8));
+        assert_eq!(heaps.size(&guest, 0, old), Some(8));
         assert_eq!(guest.bytes(old, 6).unwrap(), [0xaa; 6]);
         guest.fail_write_call = None;
         assert_eq!(
@@ -743,15 +799,15 @@ mod tests {
             heaps.realloc(&mut guest, &mut vm, 0, old, u32::MAX, false, false),
             None
         );
-        assert_eq!(heaps.size(0, old), Some(16));
+        assert_eq!(heaps.size(&guest, 0, old), Some(16));
         // New VM mappings cannot fail a redundant clear; exercise reused arena bytes.
         let spare = heaps.alloc(&mut guest, &mut vm, 0, 5000, false).unwrap();
         assert!(heaps.free(&mut guest, &mut vm, 0, spare));
         guest.reset_counts();
         guest.fail_write_call = Some(1);
         assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), None);
-        assert_eq!(heaps.owner(spare), None);
-        assert_eq!(heaps.size(0, old), Some(16));
+        assert_eq!(heaps.owner(&guest, spare), None);
+        assert_eq!(heaps.size(&guest, 0, old), Some(16));
         guest.fail_write_call = None;
         assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, 5000, true), Some(spare));
         assert!(guest.bytes(spare, 5000).unwrap().iter().all(|&b| b == 0));

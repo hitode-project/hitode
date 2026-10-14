@@ -139,7 +139,7 @@ fn get_size(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> Out
     Outcome::Return(if valid(env, this.addr()) {
         env.ext
             .get_mut::<Heaps>()
-            .size(0, pointer.addr())
+            .size(env.cpu, 0, pointer.addr())
             .unwrap_or(u32::MAX)
     } else {
         u32::MAX
@@ -150,7 +150,12 @@ fn did_alloc(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> Ou
     Outcome::Return(if !valid(env, this.addr()) || pointer.is_null() {
         u32::MAX
     } else {
-        u32::from(env.ext.get_mut::<Heaps>().size(0, pointer.addr()).is_some())
+        u32::from(
+            env.ext
+                .get_mut::<Heaps>()
+                .size(env.cpu, 0, pointer.addr())
+                .is_some(),
+        )
     })
 }
 #[win32(ole32, name = "IMalloc::HeapMinimize", level = state)]
@@ -276,7 +281,7 @@ mod tests {
                 0
             );
             assert!(!m.ext.get::<TaskMemory>().allocations.contains(&grown));
-            assert_eq!(m.ext.get_mut::<Heaps>().size(0, grown), None);
+            assert_eq!(m.ext.get_mut::<Heaps>().size(&m.cpu, 0, grown), None);
         }
         let block = adv_os::com::task_alloc(&mut env(&mut m), 16);
         assert_eq!(

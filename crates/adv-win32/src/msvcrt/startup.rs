@@ -325,7 +325,13 @@ mod tests {
             .collect();
         assert_eq!(allocations.len(), 6);
         for &pointer in &allocations {
-            assert!(machine.ext.get::<Heaps>().owner(pointer).is_some());
+            assert!(
+                machine
+                    .ext
+                    .get::<Heaps>()
+                    .owner(&machine.cpu, pointer)
+                    .is_some()
+            );
         }
         let mut env = Env {
             context: machine.sys.current,
@@ -337,7 +343,7 @@ mod tests {
         super::super::detach_process(&mut env).unwrap();
         super::super::detach_process(&mut env).unwrap();
         for pointer in allocations {
-            assert!(env.ext.get::<Heaps>().owner(pointer).is_none());
+            assert!(env.ext.get::<Heaps>().owner(env.cpu, pointer).is_none());
         }
         assert!(env.ext.get::<CrtState>().globals.is_empty());
     }

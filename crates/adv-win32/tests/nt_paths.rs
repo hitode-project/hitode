@@ -130,7 +130,7 @@ fn converted_names_and_free<B: Backend>(cpu: B) {
         assert_eq!(length as usize, units.len() * 2);
         assert_eq!(maximum, length + 2);
         assert_eq!(
-            m.ext.get_mut::<Heaps>().size(heap, buffer),
+            m.ext.get_mut::<Heaps>().size(&m.cpu, heap, buffer),
             Some(u32::from(maximum))
         );
         let mut bytes = vec![0; maximum as usize];
@@ -185,7 +185,7 @@ fn converted_names_and_free<B: Backend>(cpu: B) {
     for (index, buffer) in buffers.into_iter().enumerate() {
         assert_eq!(descriptor(&m, DATA + index as u32 * 64), (0, 0, 0));
         assert_eq!(
-            m.ext.get_mut::<Heaps>().size(heap, buffer),
+            m.ext.get_mut::<Heaps>().size(&m.cpu, heap, buffer),
             None,
             "the ordinary RTL free owns this allocation"
         );

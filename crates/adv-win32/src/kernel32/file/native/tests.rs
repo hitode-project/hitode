@@ -179,6 +179,12 @@ fn live_hooks_keep_opaque_handles_and_close_on_read_failures() {
             _ => assert_eq!(provider.result, Some(Err(0xc0000008))),
         }
         let scratch = provider.scratch;
-        assert_eq!(machine.ext.get_mut::<Heaps>().size(0, scratch), None);
+        assert_eq!(
+            machine
+                .ext
+                .get_mut::<Heaps>()
+                .size(&machine.cpu, 0, scratch),
+            None
+        );
     }
 }

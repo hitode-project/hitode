@@ -45,7 +45,10 @@ fn machine<B: Backend>(cpu: B) -> (Machine<B>, [Handler; 2]) {
     assert_ne!(section, 0);
     assert!(machine.cpu.accessible(section, 24, Prot::RW));
     assert!(machine.sys.vm.region(section).is_some());
-    assert_eq!(machine.ext.get::<Heaps>().owner(section), None);
+    assert_eq!(
+        machine.ext.get::<Heaps>().owner(&machine.cpu, section),
+        None
+    );
     assert_eq!(state(&machine), (0, 0));
     machine
         .cpu

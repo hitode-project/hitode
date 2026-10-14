@@ -289,7 +289,7 @@ fn contract<B: Backend>(cpu: B) {
     assert_eq!(copied, m.cpu.read_u32(RESULTS + 36).unwrap());
     for pointer in [source_bstr, old_bstr, copied] {
         assert!(!owns_bstr(&env(&mut m), pointer));
-        assert_eq!(m.ext.get_mut::<Heaps>().size(0, pointer - 4), None);
+        assert_eq!(m.ext.get_mut::<Heaps>().size(&m.cpu, 0, pointer - 4), None);
     }
     assert_eq!(m.cpu.read_u32(ADDS).unwrap(), 1);
     assert_eq!(m.cpu.read_u32(RELEASES).unwrap(), 3);

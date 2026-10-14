@@ -439,16 +439,36 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
     assert_eq!(f.invoke("IDirect3DTexture9::Release", &[source]), 0);
     assert_eq!(f.invoke("IDirect3DTexture9::Release", &[destination]), 0);
     assert_eq!(f.invoke("IDirect3DDevice9::Release", &[f.device]), 0);
-    assert!(f.m.ext.get::<Heaps>().owner(source_storage).is_some());
-    assert!(f.m.ext.get::<Heaps>().owner(destination_storage).is_some());
+    assert!(
+        f.m.ext
+            .get::<Heaps>()
+            .owner(&f.m.cpu, source_storage)
+            .is_some()
+    );
+    assert!(
+        f.m.ext
+            .get::<Heaps>()
+            .owner(&f.m.cpu, destination_storage)
+            .is_some()
+    );
     super::super::cancel_pending(&mut f.m);
     drop(outcome);
     drop(pause);
     assert!(f.m.ext.get::<Transfers>().active.is_empty());
     assert!(f.m.ext.get::<State>().pending.is_empty());
     assert!(f.m.ext.get::<Surfaces>().targets.is_empty());
-    assert!(f.m.ext.get::<Heaps>().owner(source_storage).is_none());
-    assert!(f.m.ext.get::<Heaps>().owner(destination_storage).is_none());
+    assert!(
+        f.m.ext
+            .get::<Heaps>()
+            .owner(&f.m.cpu, source_storage)
+            .is_none()
+    );
+    assert!(
+        f.m.ext
+            .get::<Heaps>()
+            .owner(&f.m.cpu, destination_storage)
+            .is_none()
+    );
 }
 
 #[test]

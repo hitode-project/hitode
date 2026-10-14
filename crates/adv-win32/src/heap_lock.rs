@@ -1,7 +1,7 @@
 //! Heap frontends share the real recursive lock owned by each process heap.
 use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, Outcome};
+use adv_machine::{Env, Outcome, Wait};
 use adv_os::Heaps;
 
 use crate::kernel32::{enter_cs, initialize_cs, leave_cs, release_cs_wait};
@@ -21,8 +21,23 @@ fn section(env: &mut Env<'_>, heap: u32) -> Result<u32, String> {
     let lock = heap + LOCK_OFFSET;
     initialize_cs(env.cpu, lock)
         .map_err(|error| format!("cannot initialize heap lock: {error:?}"))?;
+    env.ext
+        .get::<Heaps>()
+        .gate_small(env.cpu, heap, true)
+        .map_err(|e| format!("cannot disable guest heap operations: {e:?}"))?;
     env.ext.get_mut::<Heaps>().set_lock(heap, lock);
     Ok(lock)
+}
+
+fn drained(
+    env: &mut Env<'_>,
+    heap: u32,
+    body: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    if env.ext.get::<Heaps>().small_active(env.cpu, heap) != 0 {
+        return Outcome::block(Wait::Yield, move |env, _| drained(env, heap, body));
+    }
+    body(env)
 }
 
 fn after_enter(
@@ -67,13 +82,38 @@ pub(crate) fn with_heap(
         // Only a persistent explicit lock can make an ordinary call contend.
         return body(env);
     };
-    let result = enter_cs(env, lock);
-    after_enter(env, result, move |env| {
-        let result = body(env);
-        match leave_cs(env, lock) {
-            Outcome::Return(_) => result,
-            failure => failure,
-        }
+    drained(env, heap, move |env| {
+        let result = enter_cs(env, lock);
+        after_enter(env, result, move |env| {
+            let result = body(env);
+            match leave_cs(env, lock) {
+                Outcome::Return(_) => result,
+                failure => failure,
+            }
+        })
+    })
+}
+
+pub(crate) fn inspect(
+    env: &mut Env<'_>,
+    heap: u32,
+    flags: u32,
+    body: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    if env
+        .ext
+        .get::<Heaps>()
+        .gate_small(env.cpu, heap, true)
+        .is_err()
+    {
+        return Outcome::Return(0);
+    }
+    drained(env, heap, move |env| {
+        with_heap(env, heap, flags, move |env| {
+            let result = body(env);
+            let _ = env.ext.get::<Heaps>().gate_small(env.cpu, heap, false);
+            result
+        })
     })
 }
 
@@ -93,8 +133,10 @@ pub(crate) fn lock(env: &mut Env<'_>, heap: u32) -> Outcome {
         Ok(lock) => lock,
         Err(_) => return Outcome::Return(0),
     };
-    let result = enter_cs(env, lock);
-    after_enter(env, result, |_| Outcome::Return(1))
+    drained(env, heap, move |env| {
+        let result = enter_cs(env, lock);
+        after_enter(env, result, |_| Outcome::Return(1))
+    })
 }
 
 pub(crate) fn unlock(env: &mut Env<'_>, heap: u32) -> Outcome {
@@ -140,18 +182,32 @@ pub(crate) fn destroy(env: &mut Env<'_>, heap: u32) -> Outcome {
             .ext
             .get_mut::<Heaps>()
             .destroy(env.cpu, &mut env.sys.vm, heap);
+        if destroyed && heap == env.ext.get::<Heaps>().process_heap {
+            let _ = env.cpu.write_u32(
+                adv_machine::layout::PEB_ADDR + adv_machine::layout::peb::PROCESS_HEAP,
+                0,
+            );
+        }
         if !destroyed && let Some(lock) = sync.lock.filter(|_| sync.serialized) {
             let _ = leave_cs(env, lock);
         }
         Outcome::Return(u32::from(destroyed))
     };
-    match sync.lock {
+    if env
+        .ext
+        .get::<Heaps>()
+        .gate_small(env.cpu, heap, true)
+        .is_err()
+    {
+        return Outcome::Return(0);
+    }
+    drained(env, heap, move |env| match sync.lock {
         Some(lock) if sync.serialized => {
             let result = enter_cs(env, lock);
             after_enter(env, result, body)
         }
         _ => body(env),
-    }
+    })
 }
 
 #[win32(kernel32, name = "HeapLock", level = implement)]

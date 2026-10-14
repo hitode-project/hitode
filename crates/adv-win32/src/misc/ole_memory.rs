@@ -39,7 +39,12 @@ fn task_free(env: &mut Env<'_>) -> Outcome {
 }
 pub(super) fn free_value(env: &mut Env<'_>, pointer: u32) -> Outcome {
     if pointer != 0 {
-        if env.ext.get_mut::<Heaps>().size(0, pointer).is_none() {
+        if env
+            .ext
+            .get_mut::<Heaps>()
+            .size(env.cpu, 0, pointer)
+            .is_none()
+        {
             return Outcome::Fail(format!(
                 "CoTaskMemFree: invalid task allocation {pointer:#x}"
             ));
@@ -60,7 +65,7 @@ pub(super) fn realloc_value(env: &mut Env<'_>, old: u32, size: u32) -> Outcome {
         }
         return Outcome::Return(pointer);
     }
-    if env.ext.get_mut::<Heaps>().size(0, old).is_none() {
+    if env.ext.get_mut::<Heaps>().size(env.cpu, 0, old).is_none() {
         return Outcome::Fail(format!(
             "CoTaskMemRealloc: invalid task allocation {old:#x}"
         ));

@@ -326,7 +326,10 @@ fn unsupported_heap_flag_bits_remain_unavailable_and_do_not_claim_oom() {
         assert_eq!(machine.cpu.read_u32(OBSERVED).unwrap(), 0);
         let allocated = returned(&machine, DATA);
         assert_eq!(
-            machine.ext.get_mut::<Heaps>().size(heap, allocated),
+            machine
+                .ext
+                .get_mut::<Heaps>()
+                .size(&machine.cpu, heap, allocated),
             Some(16)
         );
         let diagnostics = machine.ext.get::<ApiDiagnostics>();
@@ -458,7 +461,10 @@ fn contended_heap_oom_resumes_the_actual_api_epilogue_after_its_wait() {
                 check_observation(&machine, DATA + 0x100, 1);
                 let original = returned(&machine, DATA);
                 assert_eq!(
-                    machine.ext.get_mut::<Heaps>().size(heap, original),
+                    machine
+                        .ext
+                        .get_mut::<Heaps>()
+                        .size(&machine.cpu, heap, original),
                     Some(16)
                 );
                 let mut bytes = [0; 16];
@@ -565,7 +571,10 @@ fn heap_create_exception_policy_is_inherited_and_invalid_heaps_cannot_claim_oom(
                 assert_eq!(returned(&machine, DATA + offset), 0);
             }
             assert_eq!(
-                machine.ext.get_mut::<Heaps>().size(raising, original),
+                machine
+                    .ext
+                    .get_mut::<Heaps>()
+                    .size(&machine.cpu, raising, original),
                 Some(16)
             );
             let mut bytes = [0; 16];

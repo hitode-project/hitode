@@ -86,7 +86,13 @@ fn localeconv_matches_vc90_numeric_monetary_profiles_and_mixed_categories() {
         assert_ne!(call(&mut machine, setter, 0, Some(locale)), 0);
         let address = pointer(&mut machine, entry);
         assert_eq!(&data(&machine, address), golden, "{locale}");
-        assert!(machine.ext.get::<Heaps>().owner(address).is_some());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address)
+                .is_some()
+        );
     }
     // C numeric with English monetary must retain empty numeric grouping, but
     // publish the localized monetary separators, flags and sign independently.
@@ -213,11 +219,23 @@ fn localeconv_encoding_snapshots_cached_readonly_data_and_module_detach_have_one
     );
     super::super::super::detach_thread(&mut env(&mut machine, entry)).unwrap();
     for &address in &owned {
-        assert!(machine.ext.get::<Heaps>().owner(address).is_some());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address)
+                .is_some()
+        );
     }
     super::super::super::detach_process(&mut env(&mut machine, entry)).unwrap();
     for address in owned {
-        assert!(machine.ext.get::<Heaps>().owner(address).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, address)
+                .is_none()
+        );
     }
     assert!(machine.ext.get::<CrtState>().locales.is_empty());
     super::super::super::detach_process(&mut env(&mut machine, entry)).unwrap();

@@ -279,7 +279,7 @@ pub(crate) fn configure_codepage(
         if env
             .ext
             .get_mut::<Heaps>()
-            .size(0, pointer)
+            .size(env.cpu, 0, pointer)
             .is_none_or(|size| size < length)
         {
             return Err(adv_cpu::backend::MemFault {

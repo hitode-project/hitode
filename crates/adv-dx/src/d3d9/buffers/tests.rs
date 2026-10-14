@@ -133,7 +133,7 @@ fn zero_public_binding_resurrects_parent_once_and_unbinding_reclaims_storage() {
     assert!(com(&env).get_identity(&env.sys.objects, id).is_none());
     let heap = env.ext.get_mut::<Heaps>();
     let handle = heap.process_heap;
-    assert_eq!(heap.size(handle, storage), None);
+    assert_eq!(heap.size(env.cpu, handle, storage), None);
     assert_eq!(
         get_stream(&mut env, GuestPtr::new(device), 15, out, offset, stride),
         0

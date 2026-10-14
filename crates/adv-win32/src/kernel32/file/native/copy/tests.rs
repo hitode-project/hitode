@@ -375,7 +375,13 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
         }
     );
     for pointer in &provider.allocations {
-        assert!(machine.ext.get::<Heaps>().owner(*pointer).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Heaps>()
+                .owner(&machine.cpu, *pointer)
+                .is_none()
+        );
     }
     assert_eq!(
         std::fs::read(root.join("game/source.dat")).unwrap(),

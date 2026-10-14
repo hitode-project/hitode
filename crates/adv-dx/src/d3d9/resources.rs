@@ -1289,7 +1289,7 @@ mod tests {
                 .get_identity(&env.sys.objects, surface_id)
                 .is_some()
         );
-        assert!(env.ext.get::<Heaps>().owner(base).is_some());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, base).is_some());
         super::super::readback::cancel_pending(&mut env);
         assert!(
             com(&env)
@@ -1301,7 +1301,7 @@ mod tests {
                 .get_identity(&env.sys.objects, surface_id)
                 .is_none()
         );
-        assert!(env.ext.get::<Heaps>().owner(base).is_none());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, base).is_none());
         release(&mut env, source);
     }
 }

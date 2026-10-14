@@ -11,11 +11,15 @@ use adv_machine::{
 use std::{cell::Cell, rc::Rc};
 
 fn fixture() -> Machine<JitCpu> {
+    fixture_with(false)
+}
+
+fn fixture_with(jit: bool) -> Machine<JitCpu> {
     let mut registry = Registry::default();
     crate::register(&mut registry);
     assert!(registry.signature_conflicts().is_empty());
     let mut machine = Machine::new(
-        JitCpu::new(PARK_ADDR, false).unwrap(),
+        JitCpu::new(PARK_ADDR, jit).unwrap(),
         registry,
         Clock::virtual_time(),
     )
@@ -174,4 +178,35 @@ fn heap_owners_are_independent_and_no_serialize_bypasses_only_the_automatic_gate
     returned(unlock(&mut env(&mut machine, 0), unprotected), 1);
     returned(destroy(&mut env(&mut machine, 0), other), 1);
     returned(destroy(&mut env(&mut machine, 0), unprotected), 1);
+}
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn heap_lock_waits_for_preempted_guest_operations_before_returning() {
+    for jit in [false, true] {
+        let mut machine = fixture_with(jit);
+        let heap = machine.ext.get::<Heaps>().process_heap;
+        machine.cpu.write_u32(heap + 0x108, 1).unwrap();
+        let Outcome::Block {
+            wait: Wait::Yield,
+            then,
+            ..
+        } = lock(&mut env(&mut machine, 0), heap)
+        else {
+            panic!("must drain the earlier operation");
+        };
+        assert_eq!(machine.cpu.read_u32(heap + 0x104).unwrap(), 1);
+        assert_eq!(recursion(&machine, heap), 0);
+        machine.cpu.write_u32(heap + 0x108, 0).unwrap();
+        returned(
+            then(
+                &mut env(&mut machine, 0),
+                Resume::Woke(WakeReason::Signaled),
+            ),
+            1,
+        );
+        assert_eq!(recursion(&machine, heap), 1);
+        returned(unlock(&mut env(&mut machine, 0), heap), 1);
+        assert_eq!(machine.cpu.read_u32(heap + 0x104).unwrap(), 1);
+    }
 }

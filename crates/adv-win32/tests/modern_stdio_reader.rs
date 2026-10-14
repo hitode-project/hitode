@@ -227,7 +227,14 @@ fn reader<B: Backend>(cpu: B, label: &str) {
         assert_eq!(fixture.word(legacy_position), 1894);
         let file = fixture.word(output);
         assert_ne!(file, 0);
-        assert!(fixture.machine.ext.get::<Heaps>().owner(file).is_none());
+        assert!(
+            fixture
+                .machine
+                .ext
+                .get::<Heaps>()
+                .owner(&fixture.machine.cpu, file)
+                .is_none()
+        );
         let mut output_bytes = [0; 12];
         fixture
             .machine

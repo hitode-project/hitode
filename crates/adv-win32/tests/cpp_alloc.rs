@@ -25,9 +25,9 @@ fn observe_live(env: &mut Env<'_>) -> Outcome {
         assert_eq!(pointer % 8, 0);
         assert!(!pointers[..i].contains(&pointer));
         assert!(env.cpu.accessible(pointer, SIZES[i].max(1), Prot::RW));
-        assert_eq!(env.ext.get::<Heaps>().owner(pointer), Some(heap));
+        assert_eq!(env.ext.get::<Heaps>().owner(env.cpu, pointer), Some(heap));
         assert_eq!(
-            env.ext.get_mut::<Heaps>().size(heap, pointer),
+            env.ext.get_mut::<Heaps>().size(env.cpu, heap, pointer),
             Some(SIZES[i])
         );
     }
@@ -43,7 +43,7 @@ fn observe_live(env: &mut Env<'_>) -> Outcome {
 fn observe_freed(env: &mut Env<'_>) -> Outcome {
     for i in 0..4 {
         let pointer = env.cpu.read_u32(DATA + i * 4).unwrap();
-        assert!(env.ext.get::<Heaps>().owner(pointer).is_none());
+        assert!(env.ext.get::<Heaps>().owner(env.cpu, pointer).is_none());
     }
     assert_eq!(env.cpu.read_u32(DATA + 40).unwrap(), 79);
     assert_eq!(adv_win32::util::last_error(env), 73);
@@ -193,8 +193,17 @@ fn allocation_failure<B: Backend>(cpu: B, module: &str) {
         failure.message
     );
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0);
-    assert_eq!(machine.ext.get::<Heaps>().owner(existing), Some(heap));
-    assert_eq!(machine.ext.get_mut::<Heaps>().size(heap, existing), Some(8));
+    assert_eq!(
+        machine.ext.get::<Heaps>().owner(&machine.cpu, existing),
+        Some(heap)
+    );
+    assert_eq!(
+        machine
+            .ext
+            .get_mut::<Heaps>()
+            .size(&machine.cpu, heap, existing),
+        Some(8)
+    );
     let mut bytes = [0; 8];
     machine.cpu.read(existing, &mut bytes).unwrap();
     assert_eq!(bytes, contents);

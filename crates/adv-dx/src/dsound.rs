@@ -577,7 +577,10 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
             }
         }
     }
-    for pointer in destroyed.interfaces {
+    // Retire later allocations first so failed creation restores the free-list head.
+    let mut interfaces = destroyed.interfaces;
+    interfaces.sort_by_key(|pointer| *pointer == destroyed.value.pointer);
+    for pointer in interfaces {
         free(e, pointer);
     }
     0
@@ -2155,8 +2158,8 @@ mod tests {
         }
         assert_eq!(m.sys.objects.object_count(), before - 1);
         assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, b).is_none());
-        assert!(m.ext.get::<Heaps>().owner(b).is_none());
-        assert!(m.ext.get::<Heaps>().owner(notify).is_none());
+        assert!(m.ext.get::<Heaps>().owner(&m.cpu, b).is_none());
+        assert!(m.ext.get::<Heaps>().owner(&m.cpu, notify).is_none());
         assert_eq!(
             invoke(&mut m, "IDirectSoundNotify::AddRef", &[notify]),
             INVALID

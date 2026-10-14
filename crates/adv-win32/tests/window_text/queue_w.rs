@@ -166,7 +166,13 @@ fn guarded_dispatch<B: TestCpu>(cpu: B) {
     assert_eq!(test.read(copied_a, encoded.len()), encoded);
     for row in test.rows(test.value(a), wm::SETTEXT) {
         assert_ne!(row[3], text);
-        assert_eq!(test.machine.ext.get::<adv_os::Heaps>().owner(row[3]), None);
+        assert_eq!(
+            test.machine
+                .ext
+                .get::<adv_os::Heaps>()
+                .owner(&test.machine.cpu, row[3]),
+            None
+        );
     }
     assert_eq!(
         test.rows(test.value(w), wm::CHAR),

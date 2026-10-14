@@ -207,7 +207,7 @@ fn guest<B: Backend>(cpu: B, full: bool) {
             machine
                 .ext
                 .get::<adv_os::Heaps>()
-                .owner(*allocation)
+                .owner(&machine.cpu, *allocation)
                 .is_none()
         );
     }

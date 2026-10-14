@@ -305,7 +305,12 @@ fn gdi_dc_owns_mip_and_device_until_matching_release_and_blocks_public_unlock() 
     assert_eq!(f.gdi("SetPixel", &[dc, 0, 0, 0x00010203]), 0x00010203);
     assert_eq!(f.d3d("IDirect3DSurface9::ReleaseDC", &[sibling, dc]), 0);
     assert!(f.m.ext.get::<State>().dcs.is_empty());
-    assert!(f.m.ext.get::<Heaps>().owner(lease.scratch).is_none());
+    assert!(
+        f.m.ext
+            .get::<Heaps>()
+            .owner(&f.m.cpu, lease.scratch)
+            .is_none()
+    );
     assert!(
         f.m.ext
             .get::<State>()
@@ -491,7 +496,12 @@ fn pending_get_dc_output_failure_and_cancel_return_scratch_and_internal_refs() {
         assert_eq!(f.m.cpu.read_u32(page).unwrap(), 0x12345678);
         assert!(f.m.ext.get::<State>().dcs.is_empty());
         assert!(f.m.ext.get::<State>().transfers.is_empty());
-        assert!(f.m.ext.get::<Heaps>().owner(lease.scratch).is_none());
+        assert!(
+            f.m.ext
+                .get::<Heaps>()
+                .owner(&f.m.cpu, lease.scratch)
+                .is_none()
+        );
         assert_eq!(
             f.m.sys.objects.strong_count(lease.owner),
             Some(owner_count - 2)

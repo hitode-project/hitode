@@ -201,8 +201,8 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
         .unwrap()
         .pBits;
     let heap = m.ext.get::<Heaps>().process_heap;
-    assert_eq!(m.ext.get_mut::<Heaps>().size(heap, pointer), None);
-    assert_eq!(m.ext.get_mut::<Heaps>().size(heap, storage), None);
+    assert_eq!(m.ext.get_mut::<Heaps>().size(&m.cpu, heap, pointer), None);
+    assert_eq!(m.ext.get_mut::<Heaps>().size(&m.cpu, heap, storage), None);
     assert_eq!(m.sys.objects.object_count(), initial);
     assert!(m.ext.get::<Loading>().pending.is_empty());
     assert_eq!(m.cpu.read_u32(READ_ONLY).unwrap(), 0xcccccccc);

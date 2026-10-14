@@ -241,6 +241,7 @@ fn allocate_bytes(env: &mut Env<'_>, bytes: &[u8]) -> Option<Identity<Block>> {
         heaps.free(env.cpu, &mut env.sys.vm, 0, pointer);
         return None;
     }
+    heaps.account_small(env.cpu, pointer);
     let block = Block {
         allocation: pointer,
         handle: 0,
