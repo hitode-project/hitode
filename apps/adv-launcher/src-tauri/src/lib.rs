@@ -70,6 +70,7 @@ pub fn run() {
                 post_text,
                 start_game,
                 game::pause_game,
+                game::set_game_filter,
                 stop_game,
                 overlay::set_overlay_input,
                 report::report_base,

@@ -22,6 +22,8 @@ pub struct WindowPresenter {
     context: NativeContext,
     configuration: wgpu::SurfaceConfiguration,
     compositor: Compositor,
+    upscaler: crate::Upscaler,
+    upscaling: Option<crate::upscaling::Upscaling>,
     max_acquire_ns: Cell<u64>,
     max_configure_ns: u64,
 }
@@ -144,6 +146,8 @@ impl WindowPresenter {
             context,
             configuration,
             compositor,
+            upscaler: crate::Upscaler::Off,
+            upscaling: None,
             max_acquire_ns: Cell::new(0),
             max_configure_ns: 0,
         })
@@ -174,15 +178,51 @@ impl WindowPresenter {
     }
 
     fn draw_view(
-        &self,
+        &mut self,
         source: &wgpu::TextureView,
         size: (u32, u32),
         rectangle: [f32; 4],
         canvas: (u32, u32),
+        changed: bool,
         overlays: &[VideoOverlay],
         submission: &Submission<'_>,
     ) -> Result<DrawResult, String> {
         let (width, height) = size;
+        let enabled = self.upscaler != crate::Upscaler::Off
+            && rectangle[2] > canvas.0 as f32
+            && rectangle[3] > canvas.1 as f32;
+        let rebuild = enabled
+            && self
+                .upscaling
+                .as_ref()
+                .is_none_or(|u| u.choice != self.upscaler || u.size != canvas);
+        if rebuild {
+            self.upscaling = Some(crate::upscaling::Upscaling::new(
+                &self.context,
+                self.upscaler,
+                canvas,
+            )?);
+            self.compositor
+                .prepare_format(wgpu::TextureFormat::Rgba16Float);
+        } else if !enabled {
+            self.upscaling = None;
+        }
+        let refresh = changed || rebuild;
+        if let Some(upscaling) = &self.upscaling {
+            if refresh {
+                self.compositor.compose_frame(
+                    source,
+                    &upscaling.input,
+                    wgpu::TextureFormat::Rgba16Float,
+                    [0., 0., canvas.0 as f32, canvas.1 as f32],
+                    canvas,
+                    canvas,
+                    overlays,
+                    submission,
+                )?;
+                upscaling.run(&self.context, submission);
+            }
+        }
         if (width, height) != (self.configuration.width, self.configuration.height) {
             return Ok(DrawResult::Reconfigure);
         }
@@ -207,46 +247,31 @@ impl WindowPresenter {
             }
         };
         let view = output.texture.create_view(&Default::default());
-        self.compositor.compose_view(
-            source,
-            &view,
-            self.configuration.format,
-            rectangle,
-            submission,
-        )?;
-        for overlay in overlays {
-            if let Some((rect, _)) = overlay.layout.background {
-                self.compositor.compose_view_region(
-                    &overlay.border.as_ref().unwrap().view,
-                    &view,
-                    self.configuration.format,
-                    CompositionRegion::video(
-                        rect,
-                        [0., 0., 1., 1.],
-                        rectangle,
-                        canvas,
-                        (width, height),
-                    ),
-                    false,
-                    submission,
-                )?;
-            }
-            if let Some(video) = overlay.layout.video {
-                self.compositor.compose_view_region(
-                    &overlay.image.as_ref().unwrap().view,
-                    &view,
-                    self.configuration.format,
-                    CompositionRegion::video(
-                        video.destination,
-                        video.source_uv,
-                        rectangle,
-                        canvas,
-                        (width, height),
-                    ),
-                    false,
-                    submission,
-                )?;
-            }
+        if let Some(upscaling) = &self.upscaling {
+            self.compositor.compose_view_region_sampled(
+                upscaling.output(),
+                &view,
+                self.configuration.format,
+                CompositionRegion {
+                    rectangle,
+                    source_uv: [0., 0., 1., 1.],
+                    scissor: None,
+                },
+                true,
+                true,
+                submission,
+            )?;
+        } else {
+            self.compositor.compose_frame(
+                source,
+                &view,
+                self.configuration.format,
+                rectangle,
+                canvas,
+                size,
+                overlays,
+                submission,
+            )?;
         }
         submission.present(output);
         self.context
@@ -262,6 +287,7 @@ pub(crate) struct Compositor {
     layout: wgpu::BindGroupLayout,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     sampler: wgpu::Sampler,
+    linear_sampler: wgpu::Sampler,
 }
 
 impl Compositor {
@@ -305,14 +331,70 @@ impl Compositor {
             label: Some("adv native nearest composition"),
             ..Default::default()
         });
+        let linear_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let mut result = Self {
             context,
             layout,
             pipelines: HashMap::new(),
             sampler,
+            linear_sampler,
         };
         result.prepare_format(format);
         result
+    }
+
+    fn compose_frame(
+        &self,
+        source: &wgpu::TextureView,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        rectangle: [f32; 4],
+        canvas: (u32, u32),
+        size: (u32, u32),
+        overlays: &[VideoOverlay],
+        submission: &Submission<'_>,
+    ) -> Result<(), String> {
+        let (width, height) = size;
+        self.compose_view(source, view, format, rectangle, submission)?;
+        for overlay in overlays {
+            if let Some((rect, _)) = overlay.layout.background {
+                self.compose_view_region(
+                    &overlay.border.as_ref().unwrap().view,
+                    view,
+                    format,
+                    CompositionRegion::video(
+                        rect,
+                        [0., 0., 1., 1.],
+                        rectangle,
+                        canvas,
+                        (width, height),
+                    ),
+                    false,
+                    submission,
+                )?;
+            }
+            if let Some(video) = overlay.layout.video {
+                self.compose_view_region(
+                    &overlay.image.as_ref().unwrap().view,
+                    view,
+                    format,
+                    CompositionRegion::video(
+                        video.destination,
+                        video.source_uv,
+                        rectangle,
+                        canvas,
+                        (width, height),
+                    ),
+                    false,
+                    submission,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn prepare_format(&mut self, format: wgpu::TextureFormat) {
@@ -436,6 +518,26 @@ impl Compositor {
         clear: bool,
         submission: &Submission<'_>,
     ) -> Result<(), String> {
+        self.compose_view_region_sampled(
+            source,
+            destination,
+            format,
+            region,
+            clear,
+            false,
+            submission,
+        )
+    }
+    fn compose_view_region_sampled(
+        &self,
+        source: &wgpu::TextureView,
+        destination: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        region: CompositionRegion,
+        clear: bool,
+        linear: bool,
+        submission: &Submission<'_>,
+    ) -> Result<(), String> {
         let rectangle = region.rectangle;
         let pipeline = self
             .pipelines
@@ -483,7 +585,11 @@ impl Compositor {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(if linear {
+                            &self.linear_sampler
+                        } else {
+                            &self.sampler
+                        }),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -901,6 +1007,7 @@ impl Session {
             (width, height),
             rectangle,
             canvas,
+            changed,
             &self.overlays,
             &submission,
         )?;
@@ -936,6 +1043,7 @@ pub(crate) struct Completed {
 /// worker owns Surface acquisition, configuration and the original consumer.
 /// The HWND must outlive `shutdown` of the service and this coordinator.
 pub(crate) struct UiPresenter {
+    upscaler: crate::Upscaler,
     session: Option<Session>,
     observer: Observer<adv_device::surface::PendingFrame>,
     sender: background::Sender,
@@ -953,12 +1061,16 @@ impl UiPresenter {
         let observer = frames.observer();
         Self {
             session: Some(Session::new(presenter, frames)),
+            upscaler: crate::Upscaler::Off,
             observer,
             sender,
             wake,
             job: None,
             reconfigure: false,
         }
+    }
+    pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
+        self.upscaler = value;
     }
     pub(crate) fn has_update(&self) -> bool {
         self.observer.has_update() || self.reconfigure
@@ -1030,6 +1142,7 @@ impl UiPresenter {
             .transpose()
             .map_err(|error| error.to_string())?;
         let mut session = self.session.take().unwrap();
+        session.presenter.upscaler = self.upscaler;
         let (mut output, completion) = spsc::channel(1);
         let scheduled = Instant::now();
         let task = background::Task::new(move || {
@@ -1246,6 +1359,95 @@ mod tests {
             transfer.poll().unwrap().unwrap(),
             [0, 0, 255, 255].repeat(12)
         );
+    }
+
+    // spec: HOST-VIEW-6
+    #[test]
+    fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
+        use crate::{Upscaler, upscaling::Upscaling};
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let (width, height) = (19, 13);
+        let source = gpu.image(width, height).unwrap();
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[
+                    if x % 5 == 0 || y % 5 == 0 { 20 } else { 180 },
+                    (x * 11) as u8,
+                    (y * 17) as u8,
+                    255,
+                ]);
+            }
+        }
+        gpu.upload(
+            &source,
+            Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
+            width * 4,
+            &pixels,
+        )
+        .unwrap();
+        let context = gpu.context().clone();
+        let mut compositor = Compositor::new(context.clone(), wgpu::TextureFormat::Rgba16Float);
+        compositor.prepare_format(wgpu::TextureFormat::Bgra8Unorm);
+        let destination = gpu.image(width * 2, height * 2).unwrap();
+        let mut results = Vec::new();
+        for choice in [
+            Upscaler::Anime4k,
+            Upscaler::Cunny,
+            Upscaler::Artcnn,
+            Upscaler::K7,
+        ] {
+            let upscaling = Upscaling::new(&context, choice, (width, height)).unwrap();
+            {
+                let submission = context.submission().unwrap();
+                compositor
+                    .compose_frame(
+                        source.view(),
+                        &upscaling.input,
+                        wgpu::TextureFormat::Rgba16Float,
+                        [0., 0., width as f32, height as f32],
+                        (width, height),
+                        (width, height),
+                        &[],
+                        &submission,
+                    )
+                    .unwrap();
+                upscaling.run(&context, &submission);
+                compositor
+                    .compose_view(
+                        upscaling.output(),
+                        destination.view(),
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        [0., 0., (width * 2) as f32, (height * 2) as f32],
+                        &submission,
+                    )
+                    .unwrap();
+            }
+            let mut transfer = gpu.readback(&destination, None).unwrap();
+            transfer.take_completion_job().unwrap()();
+            let result = transfer.poll().unwrap().unwrap();
+            assert!(result.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(result.chunks_exact(4).any(|p| p[0] > 100));
+            assert!(result.chunks_exact(4).any(|p| p[0] < 80));
+            assert_ne!(
+                &result[..4],
+                &result[result.len() - 4..],
+                "{choice:?} lost the image extent"
+            );
+            assert!(
+                !results.contains(&result),
+                "{choice:?} must execute its own model"
+            );
+            results.push(result);
+        }
+        let mut transfer = gpu.readback(&source, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        assert_eq!(transfer.poll().unwrap().unwrap(), pixels);
     }
 
     #[cfg(windows)]

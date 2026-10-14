@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import UpscalingSelect from "../components/UpscalingSelect.svelte";
+  import { prefs } from "../lib/prefs.svelte";
+  import { filterOverride, gameFilter, setGameFilter } from "../lib/upscaling.svelte";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent, preview } from "../lib/bridge";
   import { pauser, runs } from "../lib/launch.svelte";
@@ -32,9 +35,15 @@
   let textInput = $state<HTMLInputElement | null>(null);
 
   type Scale = "int" | "fit" | "stretch";
-  type Filter = "sharp" | "smooth";
   let scale = $state<Scale>("fit");
-  let filter = $state<Filter>("smooth");
+  let filterError = $state("");
+  $effect(() => {
+    const filter = gameFilter(gameId);
+    if (!gameView) return;
+    void call("set_game_filter", { filter }, null)
+      .then(() => { filterError = ""; })
+      .catch((error) => { filterError = String(error); });
+  });
   let volume = $state(70);
   let muted = $state(false);
   let fps = $state(false);
@@ -51,10 +60,6 @@
     { value: "int", label: "整数倍" },
     { value: "fit", label: "适应" },
     { value: "stretch", label: "拉伸" },
-  ];
-  const filters: { value: Filter; label: string }[] = [
-    { value: "sharp", label: "锐利" },
-    { value: "smooth", label: "平滑" },
   ];
 
   // Diagnostic outline of the published regions: open the game screen with ?regions.
@@ -197,6 +202,13 @@
           </div>
 
           <div class="middle">
+            <div class="prow">
+              <span>超分辨率</span>
+              <UpscalingSelect value={filterOverride(gameId) ?? "inherit"} inherit={prefs.filter}
+                onpick={(value) => setGameFilter(gameId, value)} />
+            </div>
+            {#if filterError}<p role="alert">{filterError}</p>{/if}
+            <div class="sep"></div>
           {#if preview}
             <div class="rows">
               <div class="prow">
@@ -204,14 +216,6 @@
                 <div class="seg" role="group" aria-label="画面">
                   {#each scales as o (o.value)}
                     <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => (scale = o.value)}>{o.label}</button>
-                  {/each}
-                </div>
-              </div>
-              <div class="prow">
-                <span>过滤</span>
-                <div class="seg" role="group" aria-label="过滤">
-                  {#each filters as o (o.value)}
-                    <button class:on={filter === o.value} aria-pressed={filter === o.value} onclick={() => (filter = o.value)}>{o.label}</button>
                   {/each}
                 </div>
               </div>

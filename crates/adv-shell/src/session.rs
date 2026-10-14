@@ -188,6 +188,11 @@ impl Session {
     pub fn sleep(&self, sleeping: bool) {
         self.driver.view.hub().sleep(sleeping);
     }
+    pub fn set_upscaler(&self, value: crate::Upscaler) {
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.set_upscaler(value);
+        }
+    }
     /// Pause or resume the game, as the launcher's pause menu does. A close
     /// request resumes it so the guest can answer.
     pub fn set_paused(&self, paused: bool) {

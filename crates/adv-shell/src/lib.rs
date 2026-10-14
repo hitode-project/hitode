@@ -6,6 +6,10 @@ mod frontend;
 mod logging;
 #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 mod native_gpu;
+#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+mod upscaling;
+#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+pub use upscaling::Upscaler;
 pub mod overlay;
 mod performance;
 #[cfg(target_os = "macos")]

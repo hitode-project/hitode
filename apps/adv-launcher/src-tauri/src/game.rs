@@ -247,7 +247,8 @@ enum Finished {
 }
 
 #[tauri::command]
-pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String> {
+pub async fn start_game(window: WebviewWindow, id: String, filter: String) -> Result<(), String> {
+    let filter = upscaler(&filter)?;
     let (exe, data_dir, codepage) = window
         .state::<Mutex<Library>>()
         .lock()
@@ -338,6 +339,7 @@ pub async fn start_game(window: WebviewWindow, id: String) -> Result<(), String>
                                 .occlusionState()
                                 .contains(NSWindowOcclusionState::Visible),
                         );
+                        session.set_upscaler(filter);
                         host.session = Some(session);
                         // AppKit installs its own quit handler while the app
                         // finishes launching; replace it once a game starts.
@@ -426,6 +428,40 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
                 host.as_ref()
                     .and_then(|host| host.session.as_ref())
                     .map(|session| session.set_paused(paused))
+                    .ok_or_else(|| "no game is running".to_string())
+            });
+            let _ = reply.send(done);
+        })
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        result.recv().map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn upscaler(name: &str) -> Result<adv_shell::Upscaler, String> {
+    use adv_shell::Upscaler;
+    match name {
+        "off" => Ok(Upscaler::Off),
+        "anime4k" => Ok(Upscaler::Anime4k),
+        "cunny" => Ok(Upscaler::Cunny),
+        "artcnn" => Ok(Upscaler::Artcnn),
+        "k7" => Ok(Upscaler::K7),
+        _ => Err("unknown upscaling filter".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<(), String> {
+    let filter = upscaler(&filter)?;
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let done = HOST.with_borrow(|host| {
+                host.as_ref()
+                    .and_then(|host| host.session.as_ref())
+                    .map(|session| session.set_upscaler(filter))
                     .ok_or_else(|| "no game is running".to_string())
             });
             let _ = reply.send(done);

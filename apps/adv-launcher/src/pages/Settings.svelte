@@ -1,6 +1,7 @@
 <script lang="ts">
   import { preview } from "../lib/bridge";
   import SettingsAccent from "../components/SettingsAccent.svelte";
+  import UpscalingSelect from "../components/UpscalingSelect.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
   import { APP_VERSION, DATA_DIR, reportContents } from "../lib/fake-settings";
@@ -50,9 +51,9 @@
       </div>
     </section>
 
-    {#if preview}
-      <section class="sec" aria-labelledby="g-play">
-        <h2 id="g-play">游戏中</h2>
+    <section class="sec" aria-labelledby="g-play">
+      <h2 id="g-play">游戏中</h2>
+      {#if preview}
         <div class="row">
           <span class="t">缩放</span>
           <SettingsSeg
@@ -65,18 +66,12 @@
             ]}
           />
         </div>
-        <div class="row">
-          <span class="t">过滤</span>
-          <SettingsSeg
-            label="过滤"
-            value={prefs.filter}
-            onpick={(v) => set("filter", v)}
-            options={[
-              { value: "smooth", label: "平滑" },
-              { value: "sharp", label: "锐利" },
-            ]}
-          />
-        </div>
+      {/if}
+      <div class="row">
+        <span class="t">超分辨率</span>
+        <UpscalingSelect value={prefs.filter} onpick={(v) => { if (v !== "inherit") set("filter", v); }} />
+      </div>
+      {#if preview}
         <div class="row">
           <span class="t">快进键</span>
           <SettingsSeg
@@ -97,8 +92,8 @@
           <span class="t">显示帧率</span>
           <SettingsSwitch label="显示帧率" checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
         </div>
-      </section>
-    {/if}
+      {/if}
+    </section>
 
     <section class="sec" aria-labelledby="g-lib">
       <h2 id="g-lib">游戏库</h2>

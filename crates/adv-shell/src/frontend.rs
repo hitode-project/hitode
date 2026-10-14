@@ -167,6 +167,14 @@ impl Worker {
     }
 }
 impl Ui {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
+        if let Some(native) = &mut self.native {
+            native.set_upscaler(value);
+        }
+        self.repaint = true;
+        self.wake.signal();
+    }
     #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
     pub(crate) fn native(
         &mut self,

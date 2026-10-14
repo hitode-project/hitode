@@ -18,7 +18,8 @@ import {
 import { inTauri } from "./bridge";
 import { libraryInspect, type Codepage, type ExeCandidate } from "./host";
 import { library } from "./library.svelte";
-import { prefs, savePrefs, type Accent, type Prefs } from "./prefs.svelte";
+import { prefs, savePrefs, type Accent, type Filter, type Prefs } from "./prefs.svelte";
+import { filterOverride, gameFilter, setGameFilter } from "./upscaling.svelte";
 import type { Game } from "./types";
 
 // State shared by the desktop and phone settings screens.
@@ -162,24 +163,35 @@ export class GameForm {
   }
 
   value<K extends OverrideKey>(key: K): GameValues[K] {
+    if (key === "filter") return gameFilter(this.game.id) as GameValues[K];
     return this.setup.overrides[key] ?? this.global[key];
   }
 
   overridden(key: OverrideKey): boolean {
+    if (key === "filter") return filterOverride(this.game.id) !== undefined;
     return this.value(key) !== this.global[key];
   }
 
   pick<K extends OverrideKey>(key: K, v: GameValues[K]): void {
+    if (key === "filter") {
+      setGameFilter(this.game.id, v as Filter);
+      return;
+    }
     if (v === this.global[key]) delete this.setup.overrides[key];
     else this.setup.overrides[key] = v;
   }
 
   reset(key: OverrideKey): void {
+    if (key === "filter") {
+      setGameFilter(this.game.id, "inherit");
+      return;
+    }
     this.pick(key, this.global[key]);
   }
 
   resetAll(): void {
     this.setup.overrides = {};
+    setGameFilter(this.game.id, "inherit");
   }
 
   get discsFull(): boolean {

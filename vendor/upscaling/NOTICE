@@ -1,0 +1,20 @@
+Pinned upstream sources for the four built-in spatial upscalers
+
+Anime4K_Upscale_Denoise_L.hlsl, CuNNy-4x12-NVL.hlsl,
+k7_modernAnime_FHD_x2.hlsl and StubDefs.hlsli:
+https://github.com/Blinue/Magpie/tree/434e9f8d29865fcfe0fe85d70ba0df33f5a5b643/src/Effects
+Magpie's ports are distributed under GPL-3.0 (LICENSE-GPL).
+Anime4K also carries the upstream MIT notice (LICENSE-Anime4K).
+CuNNy's shader carries its GPL-3.0-or-later notice in the source.
+k7_modernAnime's port points to hooke007/mpv_PlayKit's shader of that name.
+
+ArtCNN_C4F16.glsl:
+https://github.com/Artoriuz/ArtCNN/blob/6304600fc27f388c1147740dda8704c85db9ca89/GLSL/ArtCNN_C4F16.glsl
+MIT license, copyright Joao Chrisostomo; full notice is in the source.
+This is the neutral ArtCNN model, not the separately trained Ani4Kv2 model.
+
+The WGSL files in crates/adv-shell/src/upscaling are generated adaptations.
+Regenerate with tools/upscaling/generate.py and Slang 2026.19.
+The adapter supplies texture bindings, dimensions, and compute entry points.
+Convolutions use FP32 arithmetic and preserve each intermediate storage format.
+ArtCNN processes BT.709 luma while retaining bilinearly sampled RGB chroma.

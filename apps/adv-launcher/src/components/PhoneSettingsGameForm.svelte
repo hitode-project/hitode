@@ -3,6 +3,7 @@
   import ManageSaves from "./ManageSaves.svelte";
   import { preview } from "../lib/bridge";
   import PhoneSettingsHeader from "./PhoneSettingsHeader.svelte";
+  import UpscalingSelect from "./UpscalingSelect.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
   import { prefs } from "../lib/prefs.svelte";
@@ -100,9 +101,9 @@
       {/if}
     </section>
 
-    {#if preview}
-      <section class="sec" aria-labelledby="pg-view">
-        <h2 id="pg-view">画面</h2>
+    <section class="sec" aria-labelledby="pg-view">
+      <h2 id="pg-view">画面</h2>
+      {#if preview}
         <div class="row" class:ov={form.overridden("scale")}>
           {@render head("scale", "缩放")}
           <SettingsSeg
@@ -117,21 +118,16 @@
             ]}
           />
         </div>
-        <div class="row" class:ov={form.overridden("filter")}>
-          {@render head("filter", "过滤")}
-          <SettingsSeg
-            variant="phone-sheet"
-            label="过滤"
-            value={form.value("filter")}
-            onpick={(v) => form.pick("filter", v)}
-            options={[
-              { value: "smooth", label: "平滑" },
-              { value: "sharp", label: "锐利" },
-            ]}
-          />
-        </div>
-      </section>
+      {/if}
+      <div class="row" class:ov={form.overridden("filter")}>
+        {@render head("filter", "超分辨率")}
+        <UpscalingSelect value={form.overridden("filter") ? form.value("filter") : "inherit"}
+        inherit={form.global.filter}
+        onpick={(v) => v === "inherit" ? form.reset("filter") : form.pick("filter", v)} />
+      </div>
+    </section>
 
+      {#if preview}
       <section class="sec" aria-labelledby="pg-font">
         <h2 id="pg-font">字体</h2>
         {#each fonts as f (f.key)}
