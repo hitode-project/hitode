@@ -1,9 +1,16 @@
 //! One live native-entry boundary for host frontends. The fast path is legal
 //! only while the guest-visible export still names its original implementation.
+use std::collections::HashMap;
+
 use crate::Win32;
+use adv_abi::guest::check_range;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_machine::layout::THUNK_STRIDE;
 use adv_machine::{Env, Outcome};
 use adv_os::{LoadError, Loader, ModuleId, ModuleKind, Modules};
-use adv_pe::ImportName;
+use adv_pe::{ExportTarget, ImportName};
+
+const PAGE: u32 = 4096;
 
 fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, LoadError> {
     if let Some((id, _)) = modules.iter().find(|(_, module)| {
@@ -22,17 +29,90 @@ fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, Load
     Ok(None)
 }
 
+/// Entries found original while every page that decides the lookup was still
+/// an unwritten copy: the headers, the export data and the entry itself. A
+/// write to any of them makes the next call inspect the image again.
+#[derive(Default)]
+struct Unmodified(HashMap<String, Original>);
+
+struct Original {
+    module: ModuleId,
+    base: u32,
+    entry: u32,
+    pages: Vec<u32>,
+}
+
+fn unwritten(cpu: &dyn Guest, pages: &[u32]) -> bool {
+    pages
+        .iter()
+        .all(|&page| cpu.file_page_copy_on_write(page) == Some(true))
+}
+
+/// Pages a synthetic image's export lookup and entry comparison read.
+fn deciding_pages(cpu: &dyn Guest, base: u32, entry: u32) -> Option<Vec<u32>> {
+    let header = cpu.read_u32(base + 0x3c).ok()?;
+    let directory = base.checked_add(cpu.read_u32(base.checked_add(header)? + 120).ok()?)?;
+    let size = cpu.read_u32(base.checked_add(header)? + 124).ok()?;
+    let span = |start: u32, len: u32| {
+        let end = start.checked_add(len.max(1) - 1)?;
+        Some((start / PAGE..=end / PAGE).map(|page| page * PAGE))
+    };
+    let mut pages: Vec<u32> = span(base, 1)?
+        .chain(span(directory, size)?)
+        .chain(span(entry, THUNK_STRIDE)?)
+        .collect();
+    pages.dedup();
+    Some(pages)
+}
+
 pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, LoadError> {
     // Standalone handler embedders may install no Windows personality. There
     // is then no guest system image whose entry could have been replaced.
     if env.ext.try_get::<Win32>().is_none() || env.ext.try_get::<Modules>().is_none() {
         return Ok(None);
     }
+    if let Some(original) = env
+        .ext
+        .try_get::<Unmodified>()
+        .and_then(|cache| cache.0.get(name))
+        && env
+            .ext
+            .get::<Modules>()
+            .try_get(original.module)
+            .is_some_and(|image| image.base == original.base && image.executable_visible())
+        && unwritten(env.cpu, &original.pages)
+        && check_range(env.cpu, original.entry, THUNK_STRIDE, Prot::READ).is_ok()
+    {
+        return Ok(None);
+    }
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
     let Some(module) = system_module(modules, name)? else {
         return Ok(None);
     };
-    Loader::new(env.cpu, env.sys, modules, &win32.vfs).guest_override(module, name)
+    let result = Loader::new(env.cpu, env.sys, modules, &win32.vfs).guest_override(module, name);
+    if let Ok(None) = result {
+        let image = modules.get(module);
+        let base = image.base;
+        let entry = match image.exports_by_name.get(name) {
+            Some(ExportTarget::Rva(rva)) => base.checked_add(*rva),
+            _ => None,
+        };
+        if let Some(entry) = entry
+            && let Some(pages) = deciding_pages(env.cpu, base, entry)
+            && unwritten(env.cpu, &pages)
+        {
+            env.ext.get_or_default::<Unmodified>().0.insert(
+                name.to_owned(),
+                Original {
+                    module,
+                    base,
+                    entry,
+                    pages,
+                },
+            );
+        }
+    }
+    result
 }
 
 pub(crate) fn entry(env: &mut Env<'_>, name: &str) -> Result<u32, u32> {

@@ -43,6 +43,18 @@ fn machine(jit: bool) -> Machine<JitCpu> {
 }
 
 fn rtl_hook(machine: &mut Machine<JitCpu>, native: usize, index: u32, name: &str) {
+    let (target, jump) = rtl_hook_body(machine, native, index, name);
+    machine.cpu.write(target, &jump).unwrap();
+}
+
+/// Writes a counting hook that resumes the original entry and returns the
+/// entry with the jump that installs it.
+fn rtl_hook_body(
+    machine: &mut Machine<JitCpu>,
+    native: usize,
+    index: u32,
+    name: &str,
+) -> (u32, Vec<u8>) {
     let target = Loader::new(
         &mut machine.cpu,
         &mut machine.sys,
@@ -70,7 +82,7 @@ fn rtl_hook(machine: &mut Machine<JitCpu>, native: usize, index: u32, name: &str
     machine.cpu.write(hook, &code).unwrap();
     let mut jump = vec![0xe9];
     jump.extend(hook.wrapping_sub(target + 5).to_le_bytes());
-    machine.cpu.write(target, &jump).unwrap();
+    (target, jump)
 }
 
 fn execute(machine: &mut Machine<JitCpu>, mut code: Asm) {
@@ -367,5 +379,52 @@ fn large_global_local_and_heap_allocations_retire_without_stale_aliases() {
         assert_eq!(machine.ext.get::<adv_os::Heaps>().owner(plain), None);
         assert_eq!(machine.cpu.read_u32(DATA + 32).unwrap(), 0);
         assert!(!machine.cpu.accessible(plain, 1, Prot::READ));
+    }
+}
+
+#[test]
+// spec: PERS-BRIDGE-2
+fn heap_hooks_installed_after_the_first_call_still_run() {
+    for jit in [false, true] {
+        let mut machine = machine(jit);
+        let native = machine.load(&Empty, "ntdll.dll").unwrap();
+        // The entry stays untouched until the guest patches it mid-run.
+        let (target, jump) = rtl_hook_body(&mut machine, native, 0, "RtlAllocateHeap");
+        let heap = machine
+            .resolve_import("kernel32.dll", "GetProcessHeap")
+            .unwrap();
+        let alloc = machine.resolve_import("kernel32.dll", "HeapAlloc").unwrap();
+        let protect = machine
+            .resolve_import("kernel32.dll", "VirtualProtect")
+            .unwrap();
+        let mut code = Asm::new(CODE);
+        let allocate = |code: &mut Asm, slot: u32| {
+            code.push_imm(16)
+                .push_imm(0)
+                .call(heap)
+                .push_eax()
+                .call(alloc);
+            code.mov_mem_eax(slot);
+        };
+        allocate(&mut code, DATA);
+        allocate(&mut code, DATA + 4);
+        code.push_imm(DATA + 8)
+            .push_imm(0x40)
+            .push_imm(5)
+            .push_imm(target)
+            .call(protect);
+        // mov dword [target], jump[0..4]; mov byte [target + 4], jump[4]
+        code.bytes.extend([0xc7, 0x05]);
+        code.bytes.extend(target.to_le_bytes());
+        code.bytes.extend(&jump[..4]);
+        code.bytes.extend([0xc6, 0x05]);
+        code.bytes.extend((target + 4).to_le_bytes());
+        code.bytes.push(jump[4]);
+        allocate(&mut code, DATA + 12);
+        execute(&mut machine, code);
+        for slot in [DATA, DATA + 4, DATA + 12] {
+            assert_ne!(machine.cpu.read_u32(slot).unwrap(), 0);
+        }
+        assert_eq!(machine.cpu.read_u32(DATA + 0x100).unwrap(), 1, "jit {jit}");
     }
 }
