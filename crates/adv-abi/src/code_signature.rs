@@ -7,7 +7,7 @@
 //! code/constant snapshots for the installer to revalidate before each call.
 //!
 //! Text schema v1 (one directive per line, `#` comments): `format 1`, `id NAME`,
-//! `source TEXT`, `license TEXT`, `profile KERNEL`, `candidate cdecl-stack32`,
+//! `source TEXT`, `license TEXT`, `profile KERNEL`, `candidate cdecl-stack32|frame-ebp32`,
 //! `entry ROLE`, `property NAME U32`, `function ROLE LENGTH SHA256 PROLOGUE_LEN`,
 //! `constant ROLE F32_BITS_HEX ABS32_OPERAND_OFFSET...`, `call ROLE OFFSET ROLE`.
 //! Integers are decimal or `0x` hexadecimal. Helper prologues use length zero.
@@ -63,6 +63,7 @@ pub struct Signature {
     pub license: String,
     pub profile: Profile,
     entry: String,
+    frame_ebp: bool,
     functions: BTreeMap<String, Function>,
 }
 
@@ -253,7 +254,12 @@ impl Signature {
                 .cloned()
                 .ok_or_else(|| Error::Invalid(format!("missing {key}")))
         };
-        if required("format")? != "1" || required("candidate")? != "cdecl-stack32" {
+        if required("format")? != "1"
+            || !matches!(
+                required("candidate")?.as_str(),
+                "cdecl-stack32" | "frame-ebp32"
+            )
+        {
             return Err(Error::Invalid("unsupported format/candidate".into()));
         }
         let entry = name(&required("entry")?)?;
@@ -346,6 +352,7 @@ impl Signature {
                 properties,
             },
             entry,
+            frame_ebp: required("candidate")? == "frame-ebp32",
             functions,
         })
     }
@@ -444,10 +451,22 @@ fn safe_prologue(bytes: &[u8], len: usize) -> bool {
     decoder.position() == len
 }
 
-/// Public x86/32-bit cdecl frame idiom, not a stored library instruction prefix:
-/// SUB ESP,imm; PUSH a preserved register; MOV that register,[ESP+displacement].
+/// Public x86/32-bit frame idioms, not stored library instruction prefixes.
+/// The descriptor selects a stack-argument or saved-frame-pointer prologue.
 /// Immediate/register/displacement values do not select a library version.
-fn candidate(bytes: &[u8], prologue_len: usize) -> bool {
+fn candidate(bytes: &[u8], prologue_len: usize, frame_ebp: bool) -> bool {
+    if frame_ebp {
+        // Public frame-pointer prologue: PUSH EBP; MOV EBP,ESP; SUB ESP,imm.
+        if bytes.len() < prologue_len || !bytes.starts_with(&[0x55, 0x8b, 0xec]) {
+            return false;
+        }
+        let mut decoder = Decoder::new(32, &bytes[3..prologue_len], DecoderOptions::NONE);
+        let sub = decoder.decode();
+        return sub.mnemonic() == Mnemonic::Sub
+            && sub.op0_register() == Register::ESP
+            && matches!(sub.op1_kind(), OpKind::Immediate32 | OpKind::Immediate8to32)
+            && safe_prologue(bytes, prologue_len);
+    }
     // 81/83 /5 register-direct ESP is the ISA encoding of SUB ESP, immediate.
     if bytes.len() < prologue_len
         || !matches!(bytes.first(), Some(0x81 | 0x83))
@@ -646,7 +665,7 @@ pub fn scan(
             continue;
         }
         for offset in 0..=bytes.len() - function.len {
-            if !candidate(&bytes[offset..], function.prologue_len) {
+            if !candidate(&bytes[offset..], function.prologue_len, signature.frame_ebp) {
                 continue;
             }
             candidates += 1;
@@ -777,6 +796,22 @@ mod tests {
             matches[0].functions[0].bytes[10..14],
             (CONSTANT + 4).to_le_bytes()
         );
+    }
+
+    // spec: DEV-AUDIO-4
+    #[test]
+    fn frame_pointer_candidate_still_requires_the_complete_closure() {
+        let mut fixture = Fixture::new();
+        fixture.main[..8].copy_from_slice(&[0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0x90, 0x90]);
+        fixture.memory[..fixture.main.len()].copy_from_slice(&fixture.main);
+        fixture.text = text(&fixture.main, 10, "call main 14 leaf\n")
+            .replace("candidate cdecl-stack32", "candidate frame-ebp32");
+        assert_eq!(fixture.scan().unwrap().len(), 1);
+        fixture.memory[0x81] = 0xee;
+        assert!(matches!(fixture.scan(), Err(Error::Verification { .. })));
+        fixture.memory[0x81] = 0xe8;
+        fixture.memory[5] ^= 1;
+        assert_eq!(fixture.scan(), Err(Error::NotFound));
     }
 
     #[test]

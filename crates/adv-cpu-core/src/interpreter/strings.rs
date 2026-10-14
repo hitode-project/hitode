@@ -1,8 +1,8 @@
 //! Restartable string execution with bounded, page-local copy/fill batches.
 use super::*;
 
-/// A batch cannot fault after validation, touch code, or observe an external
-/// alias. Limit it at both page and address-size boundaries; the scalar path
+/// A batch cannot fault after validation or touch code. PCM destinations keep
+/// byte-atomic writes. Limit it at page and address-size boundaries; the scalar path
 /// handles crossing elements and preserves their exact fault priority.
 fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -> u32 {
     if !matches!(op.kind, StringKind::Movs | StringKind::Stos) {
@@ -40,10 +40,21 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
     let destination = destination.wrapping_sub(back);
     let source = source.wrapping_sub(back);
     let len = (count * width) as usize;
-    let Some(dst) = memory.direct(destination, len, true) else {
-        return 0;
-    };
-    if op.kind == StringKind::Movs {
+    let dst = memory.direct(destination, len, true);
+    if dst.is_none() {
+        // A forward copy from ordinary RAM to PCM can validate once per page.
+        // It still publishes through Memory's byte-atomic audio stores.
+        if reverse
+            || op.kind != StringKind::Movs
+            || memory.direct(source, len, false).is_none()
+            || !memory.writable_audio(destination, len)
+        {
+            return 0;
+        }
+        memory
+            .copy(source, destination, len)
+            .expect("validated ordinary-to-PCM copy");
+    } else if op.kind == StringKind::Movs {
         let Some(src) = memory.direct(source, len, false) else {
             return 0;
         };
@@ -58,8 +69,9 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
         // SAFETY: direct() validated both complete ordinary ranges, and the
         // overlap/alias checks exclude physically overlapping storage. The
         // exclusive Memory borrow keeps mappings and permissions unchanged.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.unwrap(), len) };
     } else {
+        let dst = dst.unwrap();
         let value = state.regs[0];
         // SAFETY: the entire ordinary writable page range was validated above;
         // each unaligned element is inside it, and no shared/code page qualifies.
@@ -422,8 +434,47 @@ mod tests {
         }
     }
 
+    // spec: A64-MEM-3, A64-MEM-5
     #[test]
-    fn batches_reject_code_shared_and_physically_aliased_pages() {
+    fn pcm_batches_keep_budget_page_fault_and_atomic_publication() {
+        let mut m = Memory::reserve(0, 0x10000).unwrap();
+        m.map(0x2000, PAGE_SIZE, READ | WRITE).unwrap();
+        let audio = m.map_shared_audio(0x4000, PAGE_SIZE).unwrap();
+        m.write(0x2000, &[0x37; 32]).unwrap();
+        let op = StringOp {
+            kind: StringKind::Movs,
+            width: 4,
+            word: false,
+            fs: false,
+            repeat: true,
+            unequal: false,
+        };
+        let mut state = CpuState::default();
+        state.regs[1] = 8;
+        state.regs[6] = 0x2000;
+        state.regs[7] = 0x4ff0;
+        let first = execute::<true>(&mut state, &mut m, op, 2, 3, false);
+        assert_eq!(first.units, 3);
+        assert_eq!((state.regs[1], state.regs[7]), (5, 0x4ffc));
+        let last = execute::<true>(&mut state, &mut m, op, 2, 8, false);
+        assert!(matches!(
+            last.step,
+            Step::WriteFault {
+                address: 0x5000,
+                ..
+            }
+        ));
+        assert_eq!(
+            (state.regs[1], state.regs[6], state.regs[7]),
+            (4, 0x2010, 0x5000)
+        );
+        let mut bytes = [0; 16];
+        crate::backend::SharedReadView::copy_into(audio.as_ref(), 0xff0, &mut bytes);
+        assert_eq!(bytes, [0x37; 16]);
+    }
+
+    #[test]
+    fn batches_reject_code_and_file_aliases_but_publish_pcm_atomically() {
         let op = StringOp {
             kind: StringKind::Movs,
             width: 1,
@@ -453,6 +504,6 @@ mod tests {
         m.map(0x2000, PAGE_SIZE, READ | WRITE).unwrap();
         m.map_shared_audio(0x4000, PAGE_SIZE).unwrap();
         m.protect(0x4000, PAGE_SIZE, READ | WRITE).unwrap();
-        assert_eq!(batch(&mut state, &mut m, op, 16), 0);
+        assert_eq!(batch(&mut state, &mut m, op, 16), 16);
     }
 }

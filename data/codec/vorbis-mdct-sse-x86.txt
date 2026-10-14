@@ -1,0 +1,40 @@
+# Exact reviewed SSE/f32 library closure; fingerprints only, no executable bytes.
+# Source algorithm: Xiph libvorbis lib/mdct.c (BSD-3-Clause).
+# Exact upstream release/compiler version remains unknown.
+# Arguments: ECX lookup, EDX input, stack output; caller pops the stack argument.
+# https://github.com/xiph/vorbis/blob/master/lib/mdct.c
+# https://github.com/xiph/vorbis/blob/master/COPYING
+format 1
+id libvorbis-mdct-sse-f32-register32
+source verified libvorbis SSE f32 compiled variant; exact upstream release unknown
+license source algorithm BSD-3-Clause; metadata contains fingerprints only
+profile vorbis-mdct-backward-f32-register32
+candidate frame-ebp32
+entry main
+property lookup_bytes 20
+property n_offset 0
+property log2n_offset 4
+property trig_offset 8
+property bitrev_offset 12
+property scale_offset 16
+property min_n 64
+property max_n 8192
+# The reviewed SSE initializer rounds trig arguments to binary32.
+property table_pi_bits 0x40490fdb
+property table_angle_f32 1
+function main 0x357 57a003d6b6e9aea24a36d2c3ddc7a06bde7b18951e4e714929f9510449aa9423 6
+function bitreverse 0x1a7 680fe0456d9ee8ca06b0cc3bad49507f8cf8ef6703871771488a8dd0be247b5f 0
+function butterflies 0x50b b7832709ae4aeea5a81dd9eebc05f323a36d8db893cc380af9e541c1d1dead49 0
+function first 0x19a 30a018baba674874f0c277a9e541ea4df3969653c5e613883a34bc2a0529396a 0
+function butterfly16 0x249 0860c05e40d597e25ba526a8aaf7d938b429c3932bed4a36306cce13b0afb43c 0
+call main 0x180 butterflies
+call main 0x18d bitreverse
+constant main 80000000 0xc 0x19e
+constant bitreverse 3f000000 0x94 0xb0 0x153 0x15b
+call butterflies 0x24 first
+call butterflies 0x4db butterfly16
+call butterflies 0x4e3 butterfly16
+constant butterflies 3f6c835e 0x246 0x4ec
+constant butterflies 3ec3ef15 0x251 0x4f7
+constant butterflies 3f3504f3 0x33e 0x346 0x482 0x48a
+constant butterfly16 3f3504f3 0x40

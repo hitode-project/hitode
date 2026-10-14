@@ -18,14 +18,19 @@ use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_os::{ModuleId, ModuleKind};
 
 /// Reviewed signatures shipped with the runtime; fingerprints only, no code bytes.
-pub const BUNDLED_SIGNATURES: &str = include_str!("../../../data/codec/vorbis-mdct-x86.txt");
+pub const BUNDLED_SIGNATURES: &str = concat!(
+    include_str!("../../../data/codec/vorbis-mdct-x86.txt"),
+    "\n---\n",
+    include_str!("../../../data/codec/vorbis-mdct-sse-x86.txt"),
+);
 
 const MAX_BINDINGS: usize = 64;
 const MAX_CODE_BYTES: usize = 16 * 1024;
 const KERNEL: &str = "vorbis-mdct-backward-f32-cdecl32";
+const REGISTER_KERNEL: &str = "vorbis-mdct-backward-f32-register32";
 const BINDING_MODULE: &str = "adv-codec-kernel";
 // Reviewed library-build contract. The descriptor must state this explicitly;
-// double-PI or other builds require their own reviewed numerical profile.
+// SSE rounds each trig argument to f32; x87 retains its extended intermediate.
 const TABLE_PI_BITS: u32 = 0x4049_0fdb;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,19 +101,20 @@ struct StandardTables {
     bitrev: Vec<i32>,
 }
 impl StandardTables {
-    fn new(n: usize, pi_bits: u32) -> Self {
+    fn new(n: usize, sse: bool) -> Self {
+        let pi = f64::from(f32::from_bits(TABLE_PI_BITS));
+        let angle = |value: f64| if sse { f64::from(value as f32) } else { value };
         let mut trig = vec![0.0; n + n / 4];
-        let pi = f64::from(f32::from_bits(pi_bits));
         for i in 0..n / 4 {
-            let a = (pi / n as f64) * (4 * i) as f64;
+            let a = angle((pi / n as f64) * (4 * i) as f64);
             trig[2 * i] = a.cos() as f32;
             trig[2 * i + 1] = (-a.sin()) as f32;
-            let b = (pi / (2 * n) as f64) * (2 * i + 1) as f64;
+            let b = angle((pi / (2 * n) as f64) * (2 * i + 1) as f64);
             trig[n / 2 + 2 * i] = b.cos() as f32;
             trig[n / 2 + 2 * i + 1] = b.sin() as f32;
         }
         for i in 0..n / 8 {
-            let a = (pi / n as f64) * (4 * i + 2) as f64;
+            let a = angle((pi / n as f64) * (4 * i + 2) as f64);
             trig[n + 2 * i] = (a.cos() * 0.5) as f32;
             trig[n + 2 * i + 1] = (-a.sin() * 0.5) as f32;
         }
@@ -127,7 +133,7 @@ impl StandardTables {
 struct Provider {
     bindings: Vec<Binding>,
     cache: ImdctCache,
-    tables: [Option<StandardTables>; 8],
+    tables: [[Option<StandardTables>; 8]; 2],
     stats: Stats,
     squared_error: f64,
     squared_reference: f64,
@@ -137,7 +143,7 @@ impl Provider {
         Self {
             bindings: Vec::new(),
             cache: ImdctCache::default(),
-            tables: std::array::from_fn(|_| None),
+            tables: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             stats: Stats {
                 mode,
                 ..Stats::default()
@@ -157,8 +163,8 @@ pub fn stats<B: Backend>(machine: &Machine<B>) -> Option<Stats> {
 }
 
 /// Install only after guest images are mapped, before executing any guest code.
-/// The caller supplies an explicit external signature database. There is no
-/// embedded default database and Guest does not parse or patch anything.
+/// Signature records are separated by a `---` line. Guest mode does not parse
+/// signatures or patch anything.
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
     mode: Mode,
@@ -177,25 +183,36 @@ pub fn install<B: Backend>(
     if machine.ext.try_get::<Provider>().is_some() {
         return Err("codec kernel provider already installed".into());
     }
-    let signature = Signature::parse(signature_text).map_err(|e| e.to_string())?;
-    let properties = &signature.profile.properties;
-    let required = [
-        ("lookup_bytes", 20),
-        ("n_offset", 0),
-        ("log2n_offset", 4),
-        ("trig_offset", 8),
-        ("bitrev_offset", 12),
-        ("scale_offset", 16),
-        ("min_n", 64),
-        ("max_n", 8192),
-        ("table_pi_bits", TABLE_PI_BITS),
-    ];
-    if signature.profile.kernel != KERNEL
-        || required
+    let signatures = signature_text
+        .split("\n---\n")
+        .map(Signature::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for signature in &signatures {
+        let properties = &signature.profile.properties;
+        let required = [
+            ("lookup_bytes", 20),
+            ("n_offset", 0),
+            ("log2n_offset", 4),
+            ("trig_offset", 8),
+            ("bitrev_offset", 12),
+            ("scale_offset", 16),
+            ("min_n", 64),
+            ("max_n", 8192),
+            ("table_pi_bits", TABLE_PI_BITS),
+        ];
+        let table = match signature.profile.kernel.as_str() {
+            KERNEL => ("table_pi_bits", TABLE_PI_BITS),
+            REGISTER_KERNEL => ("table_angle_f32", 1),
+            _ => return Err("unsupported codec kernel ABI profile".into()),
+        };
+        if required
             .iter()
+            .chain(std::iter::once(&table))
             .any(|&(key, value)| properties.get(key) != Some(&value))
-    {
-        return Err("unsupported codec kernel ABI profile".into());
+        {
+            return Err("unsupported codec kernel ABI profile".into());
+        }
     }
     machine.cpu.quiesce_memory();
     machine
@@ -232,43 +249,44 @@ pub fn install<B: Backend>(
                 (len != 0).then_some(ExecutableRange { start, len })
             })
             .collect();
-        let found = match code_signature::scan(&signature, &ranges, &mut |address, len| {
-            let mut bytes = vec![0; len];
-            machine
-                .cpu
-                .read(address, &mut bytes)
-                .map_err(|e| e.to_string())?;
-            Ok(bytes)
-        }) {
-            Ok(found) => found,
-            Err(code_signature::Error::NotFound) => continue,
-            Err(error) => {
-                report.rejected += 1;
-                report.reason.get_or_insert_with(|| error.to_string());
-                continue;
+        for signature in &signatures {
+            let found = match code_signature::scan(signature, &ranges, &mut |address, len| {
+                let mut bytes = vec![0; len];
+                machine
+                    .cpu
+                    .read(address, &mut bytes)
+                    .map_err(|e| e.to_string())?;
+                Ok(bytes)
+            }) {
+                Ok(found) => found,
+                Err(code_signature::Error::NotFound) => continue,
+                Err(error) => {
+                    report.rejected += 1;
+                    report.reason.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
+            report.candidates += found.len() as u64;
+            for matched in found {
+                let code_bytes: usize = matched.functions.iter().map(|f| f.bytes.len()).sum();
+                let complete = matched.functions.iter().all(|f| {
+                    let Some(offset) = f.entry.checked_sub(base) else {
+                        return false;
+                    };
+                    offset
+                        .checked_add(f.bytes.len() as u32)
+                        .is_some_and(|end| end <= size)
+                });
+                if !(5..=32).contains(&matched.prologue_len)
+                    || code_bytes > MAX_CODE_BYTES
+                    || !complete
+                    || candidates.len() == MAX_BINDINGS
+                {
+                    report.rejected += 1;
+                    continue;
+                }
+                candidates.push((module, base, size, matched));
             }
-        };
-        report.candidates += found.len() as u64;
-        for matched in found {
-            let code_bytes: usize = matched.functions.iter().map(|f| f.bytes.len()).sum();
-            let complete = matched.functions.iter().all(|f| {
-                let Some(offset) = f.entry.checked_sub(base) else {
-                    return false;
-                };
-                offset
-                    .checked_add(f.bytes.len() as u32)
-                    .is_some_and(|end| end <= size)
-            });
-            if matched.profile.kernel != KERNEL
-                || !(5..=32).contains(&matched.prologue_len)
-                || code_bytes > MAX_CODE_BYTES
-                || !complete
-                || candidates.len() == MAX_BINDINGS
-            {
-                report.rejected += 1;
-                continue;
-            }
-            candidates.push((module, base, size, matched));
         }
     }
     machine.ext.insert(Provider::new(mode));
@@ -283,7 +301,13 @@ pub fn install<B: Backend>(
             .add_with_data(
                 BINDING_MODULE,
                 &name,
-                Conv::Cdecl { argc: 3 },
+                Conv::Cdecl {
+                    argc: if matched.profile.kernel == REGISTER_KERNEL {
+                        1
+                    } else {
+                        3
+                    },
+                },
                 call,
                 index as u64,
             );
@@ -426,11 +450,30 @@ fn ulp_match(actual: f32, expected: f32) -> bool {
         && actual.to_bits().abs_diff(expected.to_bits()) <= 2
 }
 
+fn arguments(e: &Env<'_>, index: usize) -> Result<[u32; 3], &'static str> {
+    if e.ext.get::<Provider>().bindings[index]
+        .matched
+        .profile
+        .kernel
+        == REGISTER_KERNEL
+    {
+        Ok([
+            e.cpu.reg(Reg::Ecx),
+            e.cpu.reg(Reg::Edx),
+            e.cpu.arg(0).map_err(|_| "unreadable arguments")?,
+        ])
+    } else {
+        let [Ok(lookup), Ok(source), Ok(output)] = [e.cpu.arg(0), e.cpu.arg(1), e.cpu.arg(2)]
+        else {
+            return Err("unreadable arguments");
+        };
+        Ok([lookup, source, output])
+    }
+}
+
 /// Read fresh table contents on every call. A heap pointer is never a content identity.
 fn input(e: &mut Env<'_>, index: usize) -> Result<(u32, Vec<f32>), &'static str> {
-    let lookup = e.cpu.arg(0).map_err(|_| "unreadable arguments")?;
-    let source = e.cpu.arg(1).map_err(|_| "unreadable arguments")?;
-    let output = e.cpu.arg(2).map_err(|_| "unreadable arguments")?;
+    let [lookup, source, output] = arguments(e, index)?;
     let lookup_span = span(lookup, 20).ok_or("lookup range wraps")?;
     if !e.cpu.accessible(lookup, 20, Prot::READ) {
         return Err("unreadable lookup");
@@ -524,18 +567,14 @@ fn input(e: &mut Env<'_>, index: usize) -> Result<(u32, Vec<f32>), &'static str>
         .read(bitrev, &mut bit_bytes)
         .map_err(|_| "unreadable lookup tables")?;
     let slot = n.ilog2() as usize - 6;
-    let pi_bits = e.ext.get::<Provider>().bindings[index]
+    let registers = e.ext.get::<Provider>().bindings[index]
         .matched
         .profile
-        .properties
-        .get("table_pi_bits")
-        .copied()
-        .ok_or("unsupported table numerical profile")?;
-    if pi_bits != TABLE_PI_BITS {
-        return Err("unsupported table numerical profile");
-    }
+        .kernel
+        == REGISTER_KERNEL;
     let provider = e.ext.get_mut::<Provider>();
-    let tables = provider.tables[slot].get_or_insert_with(|| StandardTables::new(n, pi_bits));
+    let tables = provider.tables[usize::from(registers)][slot]
+        .get_or_insert_with(|| StandardTables::new(n, registers));
     let trig_mismatch = trig_bytes
         .as_chunks::<4>()
         .0
@@ -664,13 +703,21 @@ fn call(e: &mut Env<'_>) -> Outcome {
         Ok(state) => state,
         Err(_) => return fallback(e, index, "unsupported architectural capture"),
     };
-    if architecture.eflags & (1 << 8) != 0
-        || architecture.x87.tag != 0xffff
-        || architecture.x87.status & 0x80 != 0
-        || architecture.x87.control & 0x3f != 0x3f
-        || architecture.x87.control & 0x0c00 != 0
-        || !matches!(architecture.x87.control & 0x0300, 0x0200 | 0x0300)
-    {
+    let registers = e.ext.get::<Provider>().bindings[index]
+        .matched
+        .profile
+        .kernel
+        == REGISTER_KERNEL;
+    let floating = if registers {
+        architecture.mxcsr & 0xffc0 == 0x1f80
+    } else {
+        architecture.x87.tag == 0xffff
+            && architecture.x87.status & 0x80 == 0
+            && architecture.x87.control & 0x3f == 0x3f
+            && architecture.x87.control & 0x0c00 == 0
+            && matches!(architecture.x87.control & 0x0300, 0x0200 | 0x0300)
+    };
+    if architecture.eflags & (1 << 8) != 0 || !floating {
         return fallback(e, index, "unsupported floating environment");
     }
     let (output, values) = match input(e, index) {
@@ -695,11 +742,15 @@ fn call(e: &mut Env<'_>) -> Outcome {
     if provider.stats.mode == Mode::Verify {
         provider.stats.verify_calls += 1;
         let target = provider.bindings[index].detour.original;
-        let args = [e.cpu.arg(0), e.cpu.arg(1), e.cpu.arg(2)];
-        let [Ok(lookup), Ok(source), Ok(output)] = args else {
+        let Ok([lookup, source, output]) = arguments(e, index) else {
             return fallback(e, index, "unreadable arguments");
         };
-        return Outcome::call(target, [lookup, source, output], move |e, resume| {
+        let args = if registers {
+            vec![output]
+        } else {
+            vec![lookup, source, output]
+        };
+        return Outcome::call(target, args, move |e, resume| {
             let mut bytes = vec![0; candidate.len() * 4];
             if e.cpu.read(output, &mut bytes).is_ok() {
                 compare(e.ext.get_mut::<Provider>(), &candidate, &bytes);
@@ -746,8 +797,20 @@ mod tests {
     /// An authored ABI fixture, not a codec fingerprint. It writes one sample,
     /// raises a masked x87 divide-by-zero, and returns a diagnostic EAX value.
     fn fixture(mode: Mode) -> Machine<JitCpu> {
+        fixture_abi(mode, false)
+    }
+
+    fn fixture_abi(mode: Mode, registers: bool) -> Machine<JitCpu> {
         let mut registry = Registry::default();
-        registry.add_with_data(BINDING_MODULE, "fixture", Conv::Cdecl { argc: 3 }, call, 0);
+        registry.add_with_data(
+            BINDING_MODULE,
+            "fixture",
+            Conv::Cdecl {
+                argc: if registers { 1 } else { 3 },
+            },
+            call,
+            0,
+        );
         registry.add("test", "done", Conv::Cdecl { argc: 0 }, |_| {
             Outcome::ExitProcess(0)
         });
@@ -778,6 +841,16 @@ mod tests {
         body.bytes.extend_from_slice(&RESULT.to_le_bytes());
         body.bytes.push(0x5b); // pop ebx
         body.add_esp(32).ret();
+        if registers {
+            // Authored register ABI: output = lookup.n + input[0] bits.
+            body.bytes.truncate(8);
+            body.bytes
+                .extend_from_slice(&[0x8b, 0x01, 0x03, 0x02, 0x89, 0x03]);
+            body.bytes.push(0xb8);
+            body.bytes.extend_from_slice(&RESULT.to_le_bytes());
+            body.bytes.push(0x5b);
+            body.add_esp(32).ret();
+        }
         m.cpu.write(ENTRY, &body.bytes).unwrap();
         let mut modules = Modules::default();
         let module = modules.add(Module {
@@ -806,7 +879,7 @@ mod tests {
             entry: ENTRY,
             prologue_len: 8,
             profile: Profile {
-                kernel: KERNEL.into(),
+                kernel: if registers { REGISTER_KERNEL } else { KERNEL }.into(),
                 properties: BTreeMap::from([("table_pi_bits".into(), TABLE_PI_BITS)]),
             },
             functions: vec![FunctionSnapshot {
@@ -838,7 +911,7 @@ mod tests {
             revoked: false,
         });
         m.ext.insert(provider);
-        let tables = StandardTables::new(64, TABLE_PI_BITS);
+        let tables = StandardTables::new(64, registers);
         let trig: Vec<_> = tables.trig.iter().flat_map(|f| f.to_le_bytes()).collect();
         let bitrev: Vec<_> = tables.bitrev.iter().flat_map(|i| i.to_le_bytes()).collect();
         m.cpu.write(TRIG, &trig).unwrap();
@@ -854,17 +927,58 @@ mod tests {
         }
         let done = m.resolve_import("test", "done").unwrap();
         let mut caller = Asm::new(CODE);
+        caller.push_imm(OUTPUT);
+        if registers {
+            caller.mov_ecx_imm(LOOKUP);
+            caller.bytes.push(0xba); // mov edx,INPUT
+            caller.bytes.extend_from_slice(&INPUT.to_le_bytes());
+        } else {
+            caller.push_imm(INPUT).push_imm(LOOKUP);
+        }
         caller
-            .push_imm(OUTPUT)
-            .push_imm(INPUT)
-            .push_imm(LOOKUP)
             .call(ENTRY)
-            .add_esp(12)
+            .add_esp(if registers { 4 } else { 12 })
             .mov_mem_eax(DATA)
             .call(done);
         m.cpu.write(CODE, &caller.bytes).unwrap();
         m.spawn("codec ABI fixture", CODE, &[], 0x10000).unwrap();
         m
+    }
+
+    // spec: DEV-AUDIO-4
+    #[test]
+    fn register_abi_preserves_verify_and_fallback_arguments() {
+        for (mode, bad_tables) in [
+            (Mode::Native, false),
+            (Mode::Verify, false),
+            (Mode::Native, true),
+        ] {
+            let mut m = fixture_abi(mode, true);
+            if bad_tables {
+                m.cpu.write_u32(BITREV, 29).unwrap();
+            }
+            assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(0)));
+            assert_eq!(
+                m.cpu.read_u32(DATA).unwrap(),
+                if mode == Mode::Native && !bad_tables {
+                    0
+                } else {
+                    RESULT
+                }
+            );
+            let stats = stats(&m).unwrap();
+            if mode == Mode::Verify {
+                assert_eq!(m.cpu.read_u32(OUTPUT).unwrap(), 64);
+                assert_eq!(stats.verify_calls, 1);
+                assert_eq!(stats.compared_floats, 64);
+            } else if bad_tables {
+                assert_eq!(m.cpu.read_u32(OUTPUT).unwrap(), 64);
+                assert_eq!(stats.fallback_calls, 1);
+            } else {
+                assert_eq!(f32::from_bits(m.cpu.read_u32(OUTPUT).unwrap()), 0.0);
+                assert_eq!(stats.native_calls, 1);
+            }
+        }
     }
 
     #[test]
@@ -940,13 +1054,16 @@ mod tests {
 
     #[test]
     fn reviewed_f32_pi_profile_has_the_initializers_table_values() {
-        let tables = StandardTables::new(256, TABLE_PI_BITS);
+        let tables = StandardTables::new(256, false);
         assert_eq!(tables.trig[0].to_bits(), 1.0f32.to_bits());
         assert_eq!(tables.trig[1].to_bits(), (-0.0f32).to_bits());
         // Independently observed standard initializer value. Using full f64 PI
         // gives 0x3e78cfcc and incorrectly rejects this verified f32 build.
         assert_eq!(tables.trig[54].to_bits(), 0x3e78_cfc9);
         assert_eq!(&tables.bitrev[..4], &[126, 0, 62, 64]);
+        let sse = StandardTables::new(256, true);
+        assert_eq!(sse.trig[44].to_bits(), 0x3ef1_5ae7);
+        assert_ne!(sse.trig[44].to_bits(), tables.trig[44].to_bits());
         assert!(!ulp_match(
             f32::from_bits(0x3e78_cfc9),
             f32::from_bits(0x3e78_cfcc)

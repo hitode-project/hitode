@@ -983,6 +983,19 @@ impl Memory {
             .is_ok_and(|range| self.overlays(&range))
     }
 
+    /// One writable PCM page, with no code or fallible file storage involved.
+    pub(crate) fn writable_audio(&self, address: u32, len: usize) -> bool {
+        let Ok(range) = self.range(address, len) else {
+            return false;
+        };
+        if range.is_empty() || range.start / PAGE_SIZE != (range.end - 1) / PAGE_SIZE {
+            return false;
+        }
+        let page = range.start / PAGE_SIZE;
+        self.perms[page] & (WRITE | EXEC) == WRITE
+            && matches!(self.shared_pages.get(&page), Some(SharedPage::Audio { .. }))
+    }
+
     /// Distinct guest views can overlap physically. REP must retain its element
     /// order (including propagation) instead of snapshotting such bytes.
     pub fn rep_alias_hazard(&self, source: u32, destination: u32, len: usize) -> bool {
