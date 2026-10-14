@@ -50,6 +50,9 @@ pub struct Ui {
     frame_times: std::collections::VecDeque<Instant>,
     #[cfg(target_os = "macos")]
     next: Instant,
+    /// Whether the last frame came from a paced `Present` (see `refresh_interval`).
+    #[cfg(target_os = "macos")]
+    paced: bool,
     #[cfg(target_os = "macos")]
     pub(crate) menu_changed: bool,
     #[cfg(target_os = "macos")]
@@ -100,6 +103,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frame_times: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             next: Instant::now(),
+            #[cfg(target_os = "macos")]
+            paced: false,
             #[cfg(target_os = "macos")]
             menu_changed: false,
             #[cfg(target_os = "macos")]
@@ -308,6 +313,7 @@ impl Ui {
             let completed = native.poll()?;
             if let Some(completed) = completed {
                 self.metric(Delivery::Native(completed.stats));
+                self.paced = completed.rendered.native;
                 self.repaint |= window.native_canvas(completed.rendered.canvas)?;
                 window.set_video_cursor_regions(completed.rendered.cursor_regions);
                 if matches!(
@@ -337,7 +343,7 @@ impl Ui {
                 && native.schedule(dimensions, self.repaint)?
             {
                 self.repaint = false;
-                self.next = window.next_refresh();
+                self.next = window.next_refresh(self.paced);
             }
         }
         self.deadline(window)

@@ -830,6 +830,8 @@ fn integer_drawable(client: (u32, u32), canvas: (u32, u32), viewport: [f32; 4]) 
 }
 pub(crate) struct Rendered {
     pub(crate) result: DrawResult,
+    /// The frame came from a paced `Present`, not from software surface writes.
+    pub(crate) native: bool,
     pub(crate) serial: u64,
     pub(crate) canvas: (u32, u32),
     pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
@@ -972,6 +974,7 @@ impl Session {
                 if self.candidate.width == 0 || self.candidate.height == 0 {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
+                        native: self.native.is_some(),
                         serial: self.serial,
                         canvas: (self.width, self.height),
                         cursor_regions: self.cursor_regions.clone(),
@@ -1036,6 +1039,7 @@ impl Session {
         {
             return Ok(Rendered {
                 result: DrawResult::Skipped,
+                native: self.native.is_some(),
                 serial: self.serial,
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
@@ -1068,6 +1072,7 @@ impl Session {
         self.stats.presented += u64::from(matches!(result, DrawResult::Presented));
         Ok(Rendered {
             result,
+            native: self.native.is_some(),
             serial: self.serial,
             canvas,
             cursor_regions: self.cursor_regions.clone(),

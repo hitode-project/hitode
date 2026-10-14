@@ -209,12 +209,12 @@ impl GameView {
         self.setHidden(true);
         self.hub().occluded.set(true);
     }
-    pub(crate) fn next_refresh(&self) -> std::time::Instant {
+    pub(crate) fn next_refresh(&self, paced: bool) -> std::time::Instant {
         let fps = self
             .window()
             .and_then(|window| window.screen())
             .map_or(60, |screen| screen.maximumFramesPerSecond());
-        std::time::Instant::now() + refresh_interval(fps)
+        std::time::Instant::now() + refresh_interval(fps, paced)
     }
     pub fn new(width: u32, height: u32) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
@@ -508,13 +508,15 @@ impl Input {
     }
 }
 
-/// The guest is told the display runs at 60 Hz, so presenting faster only
-/// repeats conversion and composition for frames a 60 Hz game never paces.
-/// Faster displays keep 10% slack so a 60 Hz guest whose frames arrive early
-/// is still shown at once instead of waiting a whole extra period.
-pub(crate) fn refresh_interval(display_fps: isize) -> Duration {
+/// A paced guest (`Present` boundaries) is told the display runs at 60 Hz, so
+/// presenting faster only repeats conversion and composition. Faster displays
+/// keep 10% slack so a 60 Hz guest whose frames arrive early is still shown at
+/// once. Software frames carry no frame boundary: a GDI engine blits a frame
+/// in strips, and a slower cap would hold each half-drawn frame on screen
+/// longer, so they keep the display rate.
+pub(crate) fn refresh_interval(display_fps: isize, paced: bool) -> Duration {
     let fps = display_fps.clamp(24, 240) as f64;
-    if fps > 60.0 {
+    if paced && fps > 60.0 {
         Duration::from_secs_f64(0.9 / 60.0)
     } else {
         Duration::from_secs_f64(1.0 / fps)
@@ -527,15 +529,28 @@ mod tests {
     // spec: HOST-SES-8
     #[test]
     fn presentation_never_exceeds_the_guest_refresh_rate() {
-        let fast = refresh_interval(180);
+        let fast = refresh_interval(180, true);
         assert!(
             fast > Duration::from_secs_f64(1.0 / 70.0)
                 && fast < Duration::from_secs_f64(1.0 / 60.0)
         );
-        assert_eq!(refresh_interval(120), fast);
-        assert_eq!(refresh_interval(60), Duration::from_secs_f64(1.0 / 60.0));
-        assert_eq!(refresh_interval(48), Duration::from_secs_f64(1.0 / 48.0));
-        assert_eq!(refresh_interval(0), Duration::from_secs_f64(1.0 / 24.0));
+        assert_eq!(refresh_interval(120, true), fast);
+        assert_eq!(
+            refresh_interval(60, true),
+            Duration::from_secs_f64(1.0 / 60.0)
+        );
+        assert_eq!(
+            refresh_interval(48, true),
+            Duration::from_secs_f64(1.0 / 48.0)
+        );
+        assert_eq!(
+            refresh_interval(0, true),
+            Duration::from_secs_f64(1.0 / 24.0)
+        );
+        assert_eq!(
+            refresh_interval(180, false),
+            Duration::from_secs_f64(1.0 / 180.0)
+        );
     }
     // spec: HOST-RUN-2
     #[test]
