@@ -19,7 +19,7 @@
   <div class="body">
     <div class="center">
       {#if game}
-        <div class="cv"><div class="art {game.cover}" class:blur={blurred}></div></div>
+        <div class="cv"><div class="art {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} class:blur={blurred}></div></div>
         <h1 lang="ja">{game.title}</h1>
 
         {#if flow.view === "prepare"}

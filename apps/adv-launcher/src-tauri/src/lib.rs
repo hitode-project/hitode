@@ -9,6 +9,8 @@ pub mod overlay;
 mod report;
 #[cfg(desktop)]
 mod settings;
+#[cfg(desktop)]
+mod vndb;
 
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -93,6 +95,10 @@ pub fn run() {
                 chrome::set_title_bar,
                 library::library_pick_folder,
                 library::library_list,
+                vndb::vndb_search,
+                vndb::vndb_apply,
+                vndb::vndb_auto,
+                vndb::vndb_unlink,
                 library::set_tracking,
                 library::library_inspect,
                 library::library_scan,
@@ -113,6 +119,10 @@ pub fn run() {
         menu::set_menu_language,
         library::library_pick_folder,
         library::library_list,
+        vndb::vndb_search,
+        vndb::vndb_apply,
+        vndb::vndb_auto,
+        vndb::vndb_unlink,
         library::set_tracking,
         library::library_inspect,
         library::library_scan,

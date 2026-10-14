@@ -28,8 +28,11 @@ export function toGame(g: LibraryGame, now: number): Game {
   return {
     id: g.id,
     title: g.title,
-    brand: "",
-    year: 0,
+    vndb: g.vndb,
+    vndbChecked: g.vndbChecked,
+    coverUrl: g.vndb?.cover ?? undefined,
+    brand: g.vndb?.developers.map((d) => d.name).join(" / ") ?? "",
+    year: Number(g.vndb?.released?.slice(0, 4)) || 0,
     cover: placeholderCover(g.id),
     engine: "",
     codepage: g.codepage,
@@ -98,7 +101,7 @@ class Library {
       if (filter === "recent" && g.lastPlayed === null) return false;
       if (filter === "favorite" && !g.favorite) return false;
       if (filter === "unstarted" && g.lastPlayed !== null) return false;
-      return !q || g.title.toLowerCase().includes(q) || g.brand.toLowerCase().includes(q);
+      return !q || g.title.toLowerCase().includes(q) || g.brand.toLowerCase().includes(q) || [g.vndb?.title, g.vndb?.alttitle, ...(g.vndb?.aliases ?? [])].some((name) => name?.toLowerCase().includes(q));
     });
     // Most recently played first, then never-started games in library order.
     return list.sort((a, b) => (b.lastPlayed ?? -1) - (a.lastPlayed ?? -1));

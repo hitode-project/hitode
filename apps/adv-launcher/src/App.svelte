@@ -1,5 +1,8 @@
 <script lang="ts">
   import { t, locale } from "./lib/i18n.svelte";
+  import { scraper } from "./lib/vndb.svelte";
+  import { library } from "./lib/library.svelte";
+  import { untrack } from "svelte";
   import { call, onHostEvent } from "./lib/bridge";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
@@ -24,6 +27,11 @@
   import PhoneSettings from "./phone/Settings.svelte";
   import PhoneStats from "./phone/Stats.svelte";
 
+  $effect(() => {
+    const enabled = prefs.fetchVndb;
+    const ids = library.games.map((g) => `${g.id}:${g.title}:${g.vndbChecked}`).join();
+    if (enabled && ids) untrack(() => { void scraper.scan(); });
+  });
   let backupError = $state("");
   $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
 

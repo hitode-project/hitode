@@ -1,4 +1,5 @@
 <script lang="ts">
+  import VndbLink from "../components/VndbLink.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import EmptyLibrary from "../components/EmptyLibrary.svelte";
@@ -163,7 +164,7 @@
     {#if current}
       {@const game = current}
       <aside class="detail" class:open={sheet} aria-label={t("游戏详情")}>
-        <div class="dbd {game.cover}" aria-hidden="true"></div>
+        <div class="dbd {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} aria-hidden="true"></div>
         <div class="dscrim" aria-hidden="true"></div>
         <div class="scroll detail-body">
           <button class="icon-btn d-close" onclick={closeSheet} aria-label={t("关闭详情")}>
@@ -238,6 +239,7 @@
             <dt>{t("上次游玩")}</dt><dd>{lastPlayedLabel(game.lastPlayed, library.now)}</dd>
             <dt>{t("累计时长")}</dt><dd>{playTimeLabel(game.playMinutes)}</dd>
             {#if game.engine}<dt>{t("引擎")}</dt><dd>{game.engine}</dd>{/if}
+            <dt>VNDB</dt><dd><VndbLink {game} /></dd>
             <dt>{t("编码")}</dt><dd>{codepageLabel(game.codepage)}</dd>
           </dl>
           {#if canReveal()}

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
+  import { scraper } from "../lib/vndb.svelte";
   import { preview } from "../lib/bridge";
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import SettingsAccent from "../components/SettingsAccent.svelte";
@@ -106,12 +107,15 @@
 
     <section class="sec" aria-labelledby="p-lib">
       <h2 id="p-lib">{t("游戏库")}</h2>
-      {#if preview}
         <div class="row">
           <span class="t">{t("从 VNDB 获取资料")}</span>
           <SettingsSwitch touch label={t("从 VNDB 获取资料")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
         </div>
-      {/if}
+        <p>{t("开启后自动搜索新游戏；唯一精确匹配才会关联。只发送游戏名称，不发送路径或文件。")}</p>
+        {#if scraper.busy}<p role="status">{t("正在搜索：{0}", scraper.current)}</p>{/if}
+        {#if scraper.error}<p role="alert">{scraper.error}</p><button class="quiet" disabled={scraper.busy || !prefs.fetchVndb} onclick={() => scraper.retry()}>{t("重试")}</button>{/if}
+
+
       <div class="row">
         <span class="t">{t("遮挡成人内容封面")}</span>
         <SettingsSwitch touch label={t("遮挡成人内容封面")} checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />

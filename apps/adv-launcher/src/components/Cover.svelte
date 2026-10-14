@@ -18,7 +18,7 @@
 </script>
 
 <div class="cv" class:gone={game.offline !== null} {style}>
-  <div class="art {game.cover}" class:blur={hidden}></div>
+  <div class="art {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} class:blur={hidden}></div>
   {@render children?.({ hidden })}
 </div>
 

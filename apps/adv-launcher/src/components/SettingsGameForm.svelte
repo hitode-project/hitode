@@ -41,7 +41,7 @@
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="sheet" role="region" aria-labelledby="gs-title" aria-describedby="gs-game">
     <div class="top">
-      <span class="th" aria-hidden="true"><span class="art {game.cover}"></span></span>
+      <span class="th" aria-hidden="true"><span class="art {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined}></span></span>
       <div style="flex: 1; min-width: 0">
         <h1 id="gs-title">{t("此游戏的设置")}</h1>
         <div id="gs-game" lang="ja" class="ellipsis" style="font-size: 13px; color: var(--fg2)">{game.title}</div>

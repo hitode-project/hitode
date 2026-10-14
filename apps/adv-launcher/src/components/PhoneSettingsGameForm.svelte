@@ -50,7 +50,7 @@
     <div>
       <h1 id="pg-title">{t("此游戏的设置")}</h1>
       <div class="game">
-        <span class="cv" aria-hidden="true"><span class="art {game.cover}" class:blur={hidden}></span></span>
+        <span class="cv" aria-hidden="true"><span class="art {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} class:blur={hidden}></span></span>
         <span lang="ja" class="ellipsis">{game.title}</span>
       </div>
     </div>

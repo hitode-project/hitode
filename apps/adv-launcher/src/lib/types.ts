@@ -1,10 +1,13 @@
-import type { RunSummary } from "./host";
+import type { RunSummary, Novel } from "./host";
 
 /** Why a library entry cannot be launched right now. */
 export type Offline = "disk" | "missing";
 
 export interface Game {
   id: string;
+  vndb?: Novel | null;
+  vndbChecked?: boolean;
+  coverUrl?: string | undefined;
   title: string;
   brand: string;
   year: number;

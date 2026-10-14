@@ -1,4 +1,5 @@
 <script lang="ts">
+  import VndbLink from "../components/VndbLink.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -169,7 +170,7 @@
 {#if current}
   {@const game = current}
   <div class="page" role="dialog" aria-label={t("游戏详情")}>
-    <div class="pbd {game.cover}" aria-hidden="true"></div>
+    <div class="pbd {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} aria-hidden="true"></div>
     <div class="pscrim" aria-hidden="true"></div>
     <div class="page-body">
       <div style="display: flex; margin-left: -12px">
@@ -192,6 +193,7 @@
           {/snippet}
         </Cover>
         <h2 lang="ja">{game.title}</h2>
+        <VndbLink {game} />
         {#if bylineLabel(game.brand, game.year)}<div class="byline" lang="ja">{bylineLabel(game.brand, game.year)}</div>{/if}
       </div>
 

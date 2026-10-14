@@ -1,5 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import Vndb from "./Vndb.svelte";
+  let metadata = $state(false);
   import EditTitle from "./EditTitle.svelte";
   let editing = $state(false);
   import Icon from "./Icon.svelte";
@@ -54,6 +56,8 @@
   function openSaves() { view = "saves"; }
 </script>
 
+{#if metadata}<Vndb {game} {onclose} />{/if}
+
 {#if editing}<EditTitle {game} {onclose} />{/if}
 
 <div class="pm">
@@ -68,7 +72,8 @@
             <span class="ic"><Icon name="folder" size={20} stroke={1.3} /></span>
             <span>{t("打开所在文件夹")}</span>
           </button>
-          <button class="si" role="menuitem" onclick={() => (editing = true)}>
+          <button class="si" role="menuitem" onclick={() => metadata = true}><span>VNDB</span><span>{t("搜索／关联资料…")}</span></button>
+    <button class="si" role="menuitem" onclick={() => (editing = true)}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M10.6 2.6l2.8 2.8-7.7 7.7-3.4.6.6-3.4z"></path></svg>
             <span>{t("编辑标题…")}</span>
           </button>

@@ -2,15 +2,16 @@
   // Blurred cover art behind the fullscreen launch and report screens.
   interface Props {
     cover: string;
+    coverUrl?: string | undefined;
     /** Extra dimmed, blurred layer under a dialog. */
     dim?: boolean;
   }
 
-  let { cover, dim = false }: Props = $props();
+  let { cover, coverUrl, dim = false }: Props = $props();
 </script>
 
 <div class="backdrop" aria-hidden="true">
-  <div class="bd {cover}"></div>
+  <div class="bd {cover}" style:background-size="cover" style:background-position="center" style:background-image={coverUrl ? `url("${coverUrl}")` : undefined}></div>
   <div class="scrim"></div>
   {#if dim}
     <div class="dim"></div>

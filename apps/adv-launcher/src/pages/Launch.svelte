@@ -13,11 +13,11 @@
 </script>
 
 <div class="launch">
-  <ReportBackdrop cover={game?.cover ?? "cv1"} />
+  <ReportBackdrop coverUrl={game?.coverUrl} cover={game?.cover ?? "cv1"} />
 
   <div class="body scroll">
     {#if game}
-      <div class="cv"><div class="art {game.cover}" class:blur={game.nsfw && prefs.blurAdult && !library.revealed[game.id]}></div></div>
+      <div class="cv"><div class="art {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} class:blur={game.nsfw && prefs.blurAdult && !library.revealed[game.id]}></div></div>
       <h1 lang="ja">{game.title}</h1>
 
       {#if flow.view === "prepare"}

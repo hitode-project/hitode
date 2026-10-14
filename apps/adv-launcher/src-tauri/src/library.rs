@@ -26,6 +26,10 @@ pub fn now() -> u64 {
 pub struct LibraryGame {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub vndb: Option<crate::vndb::Novel>,
+    #[serde(default)]
+    pub vndb_checked: bool,
     pub folder: PathBuf,
     pub exe: String,
     pub codepage: u32,
@@ -120,6 +124,42 @@ impl Library {
     pub(crate) fn game(&self, id: &str) -> io::Result<usize> {
         let index = self.games.iter().position(|g| g.id == id);
         index.ok_or_else(|| io::Error::other("game not found"))
+    }
+    pub(crate) fn metadata_target(&self, id: &str) -> io::Result<LibraryGame> {
+        let mut game = self.games[self.game(id)?].clone();
+        game.offline = offline(&game.folder);
+        Ok(game)
+    }
+    pub(crate) fn set_metadata(
+        &mut self,
+        id: &str,
+        novel: Option<crate::vndb::Novel>,
+        title: Option<String>,
+        expected: Option<&str>,
+    ) -> io::Result<LibraryGame> {
+        let index = self.game(id)?;
+        let game = &mut self.games[index];
+        if expected.is_some_and(|old| old != game.title || game.vndb.is_some() || game.vndb_checked)
+        {
+            return self.metadata_target(id);
+        }
+        let before = game.clone();
+        if let Some(next) = &novel
+            && game.vndb.as_ref().map(|old| &old.id) != Some(&next.id)
+            && next.image.as_ref().is_some_and(|image| image.sexual >= 1.0)
+        {
+            game.nsfw = true;
+        }
+        game.vndb = novel;
+        game.vndb_checked = true;
+        if let Some(title) = title {
+            game.title = title;
+        }
+        if let Err(error) = self.save() {
+            self.games[index] = before;
+            return Err(error);
+        }
+        self.metadata_target(id)
     }
     pub fn launch(&self, id: &str) -> io::Result<(PathBuf, PathBuf, u32)> {
         let game = &self.games[self.game(id)?];
@@ -467,6 +507,14 @@ pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<L
     let folder = reply(patch.folder.map(fs::canonicalize).transpose())?;
     let i = library.game(&id).map_err(|e| e.to_string())?;
     let game = &mut library.games[i];
+    if patch
+        .title
+        .as_ref()
+        .is_some_and(|title| title != &game.title)
+        && game.vndb.is_none()
+    {
+        game.vndb_checked = false;
+    }
     game.title = patch.title.unwrap_or_else(|| game.title.clone());
     game.codepage = patch.codepage.unwrap_or(game.codepage);
     game.favorite = patch.favorite.unwrap_or(game.favorite);
@@ -497,6 +545,54 @@ mod tests {
         let lib = Library::load(dir.join("app")).unwrap();
         (dir, lib)
     }
+    // spec: HOST-VNDB-1
+    #[test]
+    fn metadata_round_trip_preserves_display_names_and_game_state() {
+        let (dir, mut lib) = fixture("vndb");
+        let game = lib.add(&dir, "game.exe", 932, "My title").unwrap();
+        let vn = crate::vndb::Novel {
+            id: "v17".into(),
+            title: "Database title".into(),
+            image: Some(crate::vndb::Image {
+                thumbnail: String::new(),
+                sexual: 2.0,
+            }),
+            cover: Some("data:image/png;base64,AA==".into()),
+            ..Default::default()
+        };
+        lib.set_metadata(&game.id, Some(vn.clone()), None, Some("My title"))
+            .unwrap();
+        let mut loaded = Library::load(dir.join("app")).unwrap();
+        assert_eq!(loaded.games[0].title, "My title");
+        assert!(loaded.games[0].nsfw);
+        loaded.games[0].nsfw = false;
+        assert_eq!(loaded.games[0].vndb.as_ref().unwrap().cover, vn.cover);
+        loaded
+            .set_metadata(&game.id, Some(vn), Some("Custom name".into()), None)
+            .unwrap();
+        loaded
+            .set_metadata(&game.id, None, None, Some("My title"))
+            .unwrap();
+        assert_eq!(loaded.games[0].title, "Custom name");
+        assert!(!loaded.games[0].nsfw);
+        assert!(loaded.games[0].vndb.is_some());
+        loaded.set_metadata(&game.id, None, None, None).unwrap();
+        assert!(loaded.games[0].vndb.is_none() && loaded.games[0].vndb_checked);
+        loaded
+            .set_metadata(
+                &game.id,
+                Some(crate::vndb::Novel::default()),
+                None,
+                Some("Custom name"),
+            )
+            .unwrap();
+        assert!(loaded.games[0].vndb.is_none());
+        assert_eq!(loaded.games[0].title, "Custom name");
+        assert_eq!(loaded.games[0].folder, game.folder);
+        assert_eq!(loaded.games[0].exe, game.exe);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // spec: HOST-LIB-3, HOST-LIB-6
     #[test]
     fn disabling_tracking_keeps_last_run_but_not_play_statistics() {

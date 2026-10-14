@@ -5,7 +5,13 @@ import { call } from "./bridge";
 export type Codepage = 932 | 936;
 export interface PlaySession { ended: number; seconds: number }
 export interface LastRun { ended: number; summary: RunSummary | null; error: string | null }
+export interface Novel {
+  id: string; title: string; alttitle: string | null; aliases: string[]; released: string | null;
+  description: string | null; developers: { name: string }[];
+  image: { thumbnail: string; sexual: number } | null; cover?: string | null;
+}
 export interface LibraryGame {
+  vndb: Novel | null; vndbChecked: boolean;
   id: string; title: string; folder: string; exe: string; codepage: Codepage;
   addedAt: number; lastPlayed: number | null; playSeconds: number;
   favorite: boolean; nsfw: boolean; sessions: PlaySession[];
