@@ -810,6 +810,24 @@ pub(crate) struct Session {
     cursor_regions: Arc<[VideoCursorRegion]>,
     stats: crate::performance::NativePresentation,
 }
+/// `canvas` when `viewport` places it at an exact integer scale that the
+/// compositor's aspect fit reproduces: one axis filled, both margins whole.
+fn integer_drawable(client: (u32, u32), canvas: (u32, u32), viewport: [f32; 4]) -> (u32, u32) {
+    let [x, y, w, h] = viewport;
+    let scale = (client.0 as f32 / canvas.0 as f32).min(client.1 as f32 / canvas.1 as f32);
+    let exact = |offset: f32, size: f32, full: u32, game: u32| {
+        size == game as f32 * scale && offset * 2.0 + size == full as f32
+    };
+    if scale >= 1.0
+        && scale.fract() == 0.0
+        && exact(x, w, client.0, canvas.0)
+        && exact(y, h, client.1, canvas.1)
+    {
+        canvas
+    } else {
+        client
+    }
+}
 pub(crate) struct Rendered {
     pub(crate) result: DrawResult,
     pub(crate) serial: u64,
@@ -844,11 +862,44 @@ impl Session {
     }
 
     fn needs_configuration(&self, dimensions: (u32, u32)) -> bool {
-        dimensions
+        self.drawable(dimensions)
             != (
                 self.presenter.configuration.width,
                 self.presenter.configuration.height,
             )
+    }
+
+    /// The frame's rectangle in the client, in physical pixels.
+    fn viewport(&self, client: (u32, u32)) -> [f32; 4] {
+        if self.presenter.scaling == crate::Scaling::Fit {
+            crate::window::native_viewport(client.0, client.1, self.width, self.height)
+        } else {
+            self.presenter
+                .scaling
+                .rectangle(
+                    (f64::from(client.0), f64::from(client.1)),
+                    (self.width, self.height),
+                )
+                .map(|v| v as f32)
+        }
+    }
+
+    /// The drawable keeps the game resolution when the frame fills the client
+    /// at an exact integer scale, centered on whole pixels, with no upscaler or
+    /// video composed at display resolution. Core Animation then magnifies it
+    /// with nearest sampling (`GameView::new`), which equals sharp-bilinear at
+    /// integer scales, so no display-resolution pass runs.
+    fn drawable(&self, client: (u32, u32)) -> (u32, u32) {
+        let canvas = (self.width, self.height);
+        if !cfg!(target_os = "macos")
+            || self.presenter.upscaler != crate::Upscaler::Off
+            || !self.overlays.is_empty()
+            || canvas.0 == 0
+            || canvas.1 == 0
+        {
+            return client;
+        }
+        integer_drawable(client, canvas, self.viewport(client))
     }
 
     fn update_video(
@@ -990,13 +1041,11 @@ impl Session {
                 cursor_regions: self.cursor_regions.clone(),
             });
         }
-        let rectangle = if self.presenter.scaling == crate::Scaling::Fit {
-            crate::window::native_viewport(width, height, self.width, self.height)
+        let size = self.drawable((width, height));
+        let rectangle = if size == (width, height) {
+            self.viewport((width, height))
         } else {
-            self.presenter
-                .scaling
-                .rectangle((f64::from(width), f64::from(height)), canvas)
-                .map(|v| v as f32)
+            [0.0, 0.0, self.width as f32, self.height as f32]
         };
         let view = if let Some(frame) = &self.native {
             frame.image.view()
@@ -1009,7 +1058,7 @@ impl Session {
         };
         let result = self.presenter.draw_view(
             view,
-            (width, height),
+            size,
             rectangle,
             canvas,
             changed,
@@ -1142,9 +1191,12 @@ impl UiPresenter {
         }
         let session = self
             .session
-            .as_ref()
+            .as_mut()
             .expect("idle presenter owns its session");
+        session.presenter.upscaler = self.upscaler;
+        session.presenter.scaling = self.scaling;
         let configure = self.reconfigure || session.needs_configuration(dimensions);
+        let drawable = session.drawable(dimensions);
         // Pause is nonblocking. The worker receives its token and waits for the
         // last short Queue lease before configure waits for GPU idle.
         let pause = configure
@@ -1152,8 +1204,6 @@ impl UiPresenter {
             .transpose()
             .map_err(|error| error.to_string())?;
         let mut session = self.session.take().unwrap();
-        session.presenter.upscaler = self.upscaler;
-        session.presenter.scaling = self.scaling;
         let (mut output, completion) = spsc::channel(1);
         let scheduled = Instant::now();
         let task = background::Task::new(move || {
@@ -1167,7 +1217,7 @@ impl UiPresenter {
                     pause.wait_drained().map_err(|error| error.to_string())?;
                     session
                         .presenter
-                        .configure_exclusive(dimensions.0, dimensions.1)?;
+                        .configure_exclusive(drawable.0, drawable.1)?;
                     session.stats.configurations += 1;
                     drop(pause);
                 }
@@ -1242,6 +1292,30 @@ mod tests {
     use std::time::Duration;
 
     // spec: HOST-VIEW-1
+    // spec: HOST-VIEW-9
+    #[test]
+    fn integer_fits_keep_the_game_resolution_for_compositor_magnification() {
+        let fit = |client: (u32, u32), canvas: (u32, u32)| {
+            let viewport = crate::window::native_viewport(client.0, client.1, canvas.0, canvas.1);
+            integer_drawable(client, canvas, viewport)
+        };
+        let game = (1920, 1080);
+        assert_eq!(fit((3840, 2160), game), game);
+        assert_eq!(fit((3840, 2400), game), game);
+        assert_eq!(fit((1920, 1080), game), game);
+        // An odd margin cannot be centered on whole pixels.
+        assert_eq!(fit((3840, 2161), game), (3840, 2161));
+        assert_eq!(fit((3000, 2000), (1280, 720)), (3000, 2000));
+        assert_eq!(fit((960, 540), game), (960, 540));
+        // Integer mode leaving both margins is not what an aspect fit draws.
+        let integer = crate::Scaling::Integer
+            .rectangle((4000.0, 2400.0), (1280, 720))
+            .map(|v| v as f32);
+        assert_eq!(
+            integer_drawable((4000, 2400), (1280, 720), integer),
+            (4000, 2400)
+        );
+    }
     #[test]
     fn sharp_bilinear_preserves_integer_pixels_and_blends_fractional_boundaries() {
         let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();

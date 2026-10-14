@@ -237,7 +237,14 @@ impl GameView {
             msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(f64::from(width.max(1)), f64::from(height.max(1))))]
         };
         view.setWantsLayer(true);
-        view.setLayer(Some(&CAMetalLayer::new()));
+        let layer = CAMetalLayer::new();
+        // An integer-scaled frame keeps the game resolution and is magnified
+        // here (native_gpu `Session::drawable`); other drawables match the client.
+        unsafe {
+            layer.setContentsGravity(objc2_quartz_core::kCAGravityResizeAspect);
+            layer.setMagnificationFilter(objc2_quartz_core::kCAFilterNearest);
+        }
+        view.setLayer(Some(&layer));
         Ok(view)
     }
     pub(crate) fn hub(&self) -> Rc<Hub> {
