@@ -70,7 +70,17 @@ pub(crate) fn span(addr: u32, size: u32) -> Result<(u32, u32), Error> {
     let len = u32::try_from(end - u64::from(page)).map_err(|_| error(INVALID_ADDRESS))?;
     Ok((page, len))
 }
-fn decode(value: u32) -> Result<Prot, Error> {
+/// Without DEP (an image lacking NX_COMPAT) readable pages also execute.
+fn decode(env: &Env<'_>, value: u32) -> Result<Prot, Error> {
+    let prot = decode_value(value)?;
+    let dep_disabled = adv_os::try_modules(env.ext).is_some_and(|m| m.dep_disabled());
+    Ok(if dep_disabled && prot != Prot::default() {
+        prot | Prot::EXEC
+    } else {
+        prot
+    })
+}
+fn decode_value(value: u32) -> Result<Prot, Error> {
     Ok(match value {
         1 => Prot::default(),
         2 => Prot::READ,
@@ -151,7 +161,7 @@ pub(crate) fn allocate(
     ty: u32,
     protection: u32,
 ) -> Result<u32, Error> {
-    let prot = decode(protection)?;
+    let prot = decode(env, protection)?;
     if matches!(protection, 8 | 0x80) {
         return Err(error(err::INVALID_PARAMETER));
     }
@@ -238,7 +248,7 @@ pub(crate) fn allocate(
         // protection to all pages, matching VirtualAlloc on Windows.
         if env.cpu.protect(page, len, prot).is_err() {
             for (p, protection) in previous {
-                let _ = env.cpu.protect(p, PAGE, decode(protection).unwrap());
+                let _ = env.cpu.protect(p, PAGE, decode(env, protection).unwrap());
             }
             for (start, len) in mapped {
                 let _ = env.cpu.unmap(start, len);
@@ -455,7 +465,7 @@ pub(crate) fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
 }
 
 fn protect(env: &mut Env<'_>, addr: u32, size: u32, protection: u32) -> Result<u32, Error> {
-    let prot = decode(protection)?;
+    let prot = decode(env, protection)?;
     let (page, len) = span(addr, size)?;
     if !env.cpu.accessible(page, len, Prot::default()) {
         return Err(error(INVALID_ADDRESS));
@@ -760,7 +770,10 @@ fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8], debugger: bool) -
         if env.cpu.accessible(at, len, Prot::WRITE) {
             // Writable pages need no debugger protection override.
         } else if debugger && env.cpu.accessible(at, len, Prot::EXEC) {
-            temporary.push((page, decode(page_protection(env, page).unwrap()).unwrap()));
+            temporary.push((
+                page,
+                decode(env, page_protection(env, page).unwrap()).unwrap(),
+            ));
         } else {
             let code = if checked == 0 && env.cpu.accessible(at, len, Prot::default()) {
                 NOACCESS

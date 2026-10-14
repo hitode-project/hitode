@@ -113,9 +113,21 @@ pub struct Modules {
     ldr_used: u32,
     ldr_free: Vec<(u32, u32)>,
     system_layout: Rc<RefCell<BTreeMap<String, (u32, u32)>>>,
+    /// DEP as the first executable image decided it (NX_COMPAT).
+    dep: Option<bool>,
 }
 
 impl Modules {
+    /// The process image lacks NX_COMPAT. Under Windows' default OptIn policy
+    /// readable pages then also execute; guest-visible protections stay as set.
+    pub fn dep_disabled(&self) -> bool {
+        self.dep == Some(false)
+    }
+    /// The first executable image fixes the process policy.
+    pub fn decide_dep(&mut self, nx_compat: bool) {
+        self.dep.get_or_insert(nx_compat);
+    }
+
     /// A process family shares system-image addresses, never image bytes or
     /// module references. Install this before loading any child system image.
     pub fn inherit_system_image_layout(&mut self, source: &Self) -> Result<(), &'static str> {

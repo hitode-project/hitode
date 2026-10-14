@@ -802,6 +802,10 @@ impl<'a> Loader<'a> {
                 (start, length)
             })
             .collect();
+        if !pe.is_dll() {
+            // IMAGE_DLLCHARACTERISTICS_NX_COMPAT opts a 32-bit process into DEP.
+            self.modules.decide_dep(pe.dll_characteristics & 0x100 != 0);
+        }
         let bound = if self.defer_executable && !pe.is_dll() {
             self.pending_delay = pe.delay_imports_at(base).unwrap_or_default();
             self.pending_sections = sections.clone();
@@ -830,6 +834,21 @@ impl<'a> Loader<'a> {
         log::info!("loaded {key} at {base:#010x} (+{size:#x})");
         self.modules.get_mut(id).lifetime.mapped = true;
         self.modules.capture_image_protections(self.cpu, id);
+        if self.modules.dep_disabled() && pe.section_alignment >= PAGE {
+            // Captured protections keep the section flags the guest queries.
+            self.cpu.protect(
+                base,
+                align_up(pe.size_of_headers.max(1), PAGE),
+                Prot::READ | Prot::EXEC,
+            )?;
+            for s in &pe.sections {
+                let len = align_up(s.mem_size(), PAGE);
+                if len != 0 {
+                    let prot = prot_of(s.characteristics) | Prot::EXEC;
+                    self.cpu.protect(base + s.virtual_address, len, prot)?;
+                }
+            }
+        }
 
         self.modules.get_mut(id).lifetime.callbacks = tls_callbacks.clone();
         for cb in tls_callbacks {
