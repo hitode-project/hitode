@@ -1,6 +1,16 @@
 import { inTauri, onHostEvent } from "./bridge";
 import { fakeLibrary } from "./fake";
-import { libraryInspect, libraryList, libraryPickFolder, libraryRemove, libraryRestore, libraryUpdate, type LibraryGame } from "./host";
+import {
+  libraryInspect,
+  libraryList,
+  libraryPickFolder,
+  libraryRemove,
+  libraryRestore,
+  libraryUpdate,
+  type Codepage,
+  type GamePatch,
+  type LibraryGame,
+} from "./host";
 import { minutesByDay } from "./stats";
 import type { Game, LibraryFilter } from "./types";
 
@@ -181,7 +191,13 @@ class Library {
     if (game) await this.#update(game, { nsfw: !game.nsfw }, () => (game.nsfw = !game.nsfw));
   }
 
-  async #update(game: Game, patch: { favorite?: boolean; nsfw?: boolean }, fake: () => void): Promise<void> {
+  /** The program the game runs and its code page. */
+  async setRun(id: string, patch: { exe?: string; codepage?: Codepage }): Promise<void> {
+    const game = this.get(id);
+    if (game) await this.#update(game, patch, () => Object.assign(game, patch));
+  }
+
+  async #update(game: Game, patch: GamePatch, fake: () => void): Promise<void> {
     if (!inTauri) {
       fake();
       return;

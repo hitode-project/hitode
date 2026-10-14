@@ -52,9 +52,9 @@
         <div class="row">
           <span class="t">主程序</span>
           <span class="selw">
-            <select class="exe" aria-label="主程序" onchange={(e) => (setup.exe = e.currentTarget.value)}>
-              {#each setup.exes as exe (exe)}
-                <option value={exe} selected={exe === setup.exe}>{exe}</option>
+            <select class="exe" aria-label="主程序" onchange={(e) => form.setExe(e.currentTarget.value)}>
+              {#each form.exes as exe (exe)}
+                <option value={exe} selected={exe === form.exe}>{exe}</option>
               {/each}
             </select>
             <Icon name="chevron-down" size={12} stroke={1.6} />
@@ -69,7 +69,7 @@
             variant="sheet"
             label="编码"
             value={game.codepage === 936 ? "936" : "932"}
-            onpick={(v) => (game.codepage = Number(v))}
+            onpick={(v) => form.setCodepage(v === "936" ? 936 : 932)}
             options={[
               { value: "932", label: "日文" },
               { value: "936", label: "简体中文" },

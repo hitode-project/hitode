@@ -15,6 +15,8 @@ import {
   type LibraryRoot,
   type OverrideKey,
 } from "./fake-settings";
+import { inTauri } from "./bridge";
+import { libraryInspect, type Codepage, type ExeCandidate } from "./host";
 import { library } from "./library.svelte";
 import { prefs, savePrefs, type Accent, type Prefs } from "./prefs.svelte";
 import type { Game } from "./types";
@@ -78,8 +80,10 @@ type FontKey = "gothic" | "mincho";
  * Create it during component setup; edits are saved for the session as they happen.
  */
 export class GameForm {
-  readonly game: Game;
+  readonly #initial: Game;
   setup: GameSetup;
+  /** The folder's x86 programs in Tauri; read once when the form opens. */
+  #candidates = $state<ExeCandidate[]>([]);
   /** Local or imported fonts picked this session, offered in both font menus. */
   picked = $state<string[]>([]);
 
@@ -109,11 +113,52 @@ export class GameForm {
   ]);
   readonly smoothClass = $derived(this.value("smooth") === "on" ? "sm-on" : this.value("smooth") === "off" ? "sm-off" : "");
 
+  /** Main program choices; in Tauri the current one stays listed even if it is gone. */
+  readonly exes: string[];
+  readonly exe: string;
+
   constructor(game: Game) {
-    this.game = game;
+    this.#initial = game;
     this.setup = $state(loadGameSetup(game.id, game.codepage));
     this.encPreview = $derived(codepagePreview(this.game.title, this.setup.nativeCodepage, this.game.codepage));
+    this.exes = $derived.by(() => {
+      if (!inTauri) return this.setup.exes;
+      const paths = this.#candidates.map((e) => e.path);
+      const current = this.game.exe.toLowerCase();
+      return paths.some((p) => p.toLowerCase() === current) ? paths : [this.game.exe, ...paths];
+    });
+    this.exe = $derived(inTauri ? this.game.exe : this.setup.exe);
     $effect(() => saveGameSetup(this.game.id, $state.snapshot(this.setup)));
+    if (inTauri) void this.#inspect();
+  }
+
+  /** The library's current entry; host updates replace it. */
+  get game(): Game {
+    return library.get(this.#initial.id) ?? this.#initial;
+  }
+
+  async #inspect(): Promise<void> {
+    try {
+      const found = await libraryInspect(this.game.path);
+      this.#candidates = found?.exes.filter((e) => e.arch === "x86") ?? [];
+    } catch (error) {
+      console.error("library_inspect failed", error);
+    }
+  }
+
+  /** Runs another program of the folder, with the code page detected for it. */
+  setExe(exe: string): void {
+    if (!inTauri) {
+      this.setup.exe = exe;
+      return;
+    }
+    const codepage = this.#candidates.find((e) => e.path === exe)?.codepage;
+    void library.setRun(this.game.id, codepage ? { exe, codepage } : { exe });
+  }
+
+  setCodepage(codepage: Codepage): void {
+    if (inTauri) void library.setRun(this.game.id, { codepage });
+    else this.game.codepage = codepage;
   }
 
   value<K extends OverrideKey>(key: K): GameValues[K] {
