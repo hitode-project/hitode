@@ -195,6 +195,137 @@ fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retr
     }
 }
 
+// spec: A64-FP-5 A64-FLAG-6
+#[test]
+fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
+    for form in 0..13 {
+        for scenario in 0..14 {
+            for flagm in [false, true] {
+                let source = match scenario {
+                    10 => Some(DATA + 1),
+                    11 => Some(HOLE - 2),
+                    _ => None,
+                };
+                let mut program = fixture(|a| {
+                    a.add(eax, ecx).unwrap();
+                    macro_rules! op {
+                        ($name:ident, $ptr:ident) => {
+                            if let Some(address) = source {
+                                a.$name(xmm0, $ptr(address as i32))
+                            } else {
+                                a.$name(xmm0, if scenario == 12 { xmm0 } else { xmm1 })
+                            }
+                            .unwrap()
+                        };
+                    }
+                    match form {
+                        0 => op!(cvtdq2ps, xmmword_ptr),
+                        1 => op!(cvtdq2pd, qword_ptr),
+                        2 => op!(cvtps2pd, qword_ptr),
+                        3 => op!(cvtss2sd, dword_ptr),
+                        4 => op!(cvtsd2ss, qword_ptr),
+                        5 => op!(addsd, qword_ptr),
+                        6 => op!(subsd, qword_ptr),
+                        7 => op!(mulsd, qword_ptr),
+                        8 => op!(divsd, qword_ptr),
+                        9 => op!(comiss, dword_ptr),
+                        10 => op!(ucomiss, dword_ptr),
+                        11 => op!(comisd, qword_ptr),
+                        _ => op!(ucomisd, qword_ptr),
+                    }
+                    a.setz(al).unwrap();
+                    a.setb(cl).unwrap();
+                });
+                let double = matches!(form, 4..=8 | 11..=12);
+                let value = if form < 2 {
+                    match scenario {
+                        0 => 7,
+                        1 => i32::MIN as u64,
+                        2 => i32::MAX as u64,
+                        _ => 16_777_217,
+                    }
+                } else if double {
+                    match scenario {
+                        0 | 10..=13 => 2.5f64.to_bits(),
+                        1 => (-0.0f64).to_bits(),
+                        2 => 0x7ff8000000000001,
+                        3 | 7 => 0x7ff0000000000001,
+                        4 | 8 => 1,
+                        5 => f64::MAX.to_bits(),
+                        6 => f64::INFINITY.to_bits(),
+                        _ => (1.0f64 / 3.0).to_bits(),
+                    }
+                } else {
+                    match scenario {
+                        0 | 10..=13 => 2.5f32.to_bits() as u64,
+                        1 => (-0.0f32).to_bits() as u64,
+                        2 => 0x7fc00001,
+                        3 | 7 => 0x7f800001,
+                        4 | 8 => 1,
+                        5 => f32::MAX.to_bits() as u64,
+                        6 => f32::INFINITY.to_bits() as u64,
+                        _ => (1.0f32 / 3.0).to_bits() as u64,
+                    }
+                };
+                let width = if double { 8 } else { 4 };
+                program.state.xmm[0].fill(0xa5);
+                program.state.xmm[0][..width].copy_from_slice(
+                    &if double {
+                        1.25f64.to_bits()
+                    } else {
+                        1.25f32.to_bits() as u64
+                    }
+                    .to_le_bytes()[..width],
+                );
+                for lane in program.state.xmm[1].chunks_mut(width) {
+                    lane.copy_from_slice(&value.to_le_bytes()[..width]);
+                }
+                if scenario == 0 && form <= 3 {
+                    if form < 2 {
+                        program.state.xmm[1][4..8].copy_from_slice(&(-17i32).to_le_bytes());
+                    }
+                    program.state.xmm[1][8..12].copy_from_slice(&0x7f800001u32.to_le_bytes());
+                    program.state.xmm[1][12..16].copy_from_slice(&1u32.to_le_bytes());
+                }
+                program.data[1..17].copy_from_slice(&program.state.xmm[1]);
+                program.state.mxcsr = match scenario {
+                    7 => 0x1f00,
+                    8 => 0x1e80,
+                    9 => 0x3f80,
+                    13 => 0x1fa0,
+                    _ => 0x1f80,
+                };
+                let config = (Features { flagm }, false, Checks::Adaptive);
+                let budgets: &[u64] = if scenario == 0 {
+                    &[1, 2, 3, 100]
+                } else {
+                    &[100]
+                };
+                for &budget in budgets {
+                    let mut native = executor(&program, config, false);
+                    let mut oracle = executor(&program, config, true);
+                    let outcome = native.run(program.stop, budget).unwrap();
+                    assert_eq!(
+                        outcome,
+                        oracle.run(program.stop, budget).unwrap(),
+                        "form={form}, scenario={scenario}, budget={budget}"
+                    );
+                    same(&native, &oracle);
+                    if scenario == 0 && budget == 100 {
+                        assert_eq!(native.stats.interpreter_entries, 0, "form={form}");
+                        assert_eq!(
+                            native.native.as_ref().unwrap().diagnostics.helpers,
+                            0,
+                            "form={form}, helpers={:?}",
+                            native.interpreted_forms(2)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 // spec: A64-FP-5
 #[test]
 fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {

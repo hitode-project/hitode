@@ -893,7 +893,11 @@ impl Op {
             // interpreter.
             Op::Simd(simd) => (
                 F::NONE,
-                F::NONE,
+                if matches!(simd.kind, super::simd::Kind::FlagCompare(_)) {
+                    F::ALL
+                } else {
+                    F::NONE
+                },
                 simd.memory() || simd.mmx() || simd.floating(),
             ),
             // A REP compare of no elements keeps the flags.

@@ -1026,6 +1026,16 @@ pub const fn vtoint(truncate: bool, full: bool, rd: VReg, rn: VReg) -> u32 {
     base | (full as u32) << 30 | rn.number() << 5 | rd.number()
 }
 
+/// `scvtf vd.4s, vn.4s`.
+pub const fn vfromint(rd: VReg, rn: VReg) -> u32 {
+    0x4E21_D800 | rn.number() << 5 | rd.number()
+}
+
+/// `fcvtl vd.2d, vn.2s`.
+pub const fn vwiden(rd: VReg, rn: VReg) -> u32 {
+    0x0E61_7800 | rn.number() << 5 | rd.number()
+}
+
 /// `umaxv sd, vn.4s`.
 pub const fn umaxv(rd: VReg, rn: VReg) -> u32 {
     0x6EB0_A800 | rn.number() << 5 | rd.number()
@@ -1506,6 +1516,8 @@ mod tests {
             (fcvt_int(W, false, r(0), v(1)), "fcvtns w0, d1"),
             (msr_fpsr(Reg::ZR), "msr fpsr, xzr"),
             (umaxv(v(0), v(0)), "umaxv s0, v0.4s"),
+            (vfromint(v(0), v(1)), "scvtf v0.4s, v1.4s"),
+            (vwiden(v(0), v(1)), "fcvtl v0.2d, v1.2s"),
             (vtoint(false, false, v(0), v(1)), "fcvtns v0.2s, v1.2s"),
             (vtoint(true, false, v(0), v(1)), "fcvtzs v0.2s, v1.2s"),
             (sfcmgt(v(0), v(1), v(2)), "fcmgt s0, s1, s2"),
