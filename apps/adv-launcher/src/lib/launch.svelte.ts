@@ -195,7 +195,7 @@ export class LaunchFlow {
     }
     // Only builds with a native game view register start_game (macOS for now).
     if (!inTauri) {
-      this.#fail("unsupported", UNSUPPORTED_PLATFORM);
+      this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
       return;
     }
     runs.start(id).then(
@@ -207,7 +207,7 @@ export class LaunchFlow {
       (error: unknown) => {
         const message = String(error);
         // Builds without the command answer "Command start_game not found".
-        if (/start_game.*not found/i.test(message)) this.#fail("unsupported", UNSUPPORTED_PLATFORM);
+        if (/start_game.*not found/i.test(message)) this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
         else this.#fail("failed", message);
       },
     );

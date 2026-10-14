@@ -39,7 +39,7 @@ export const reportContents: { label: string; note: string }[] = [
   { label: "编码", note: "游戏使用的代码页" },
   { label: "失败信息", note: "无法启动或中途出错时" },
   { label: "性能", note: "选择性能问题时的帧时间" },
-  { label: "备注", note: "你填写的补充说明，30 天后删除" },
+  { label: "备注", note: "你填写的补充说明" },
 ];
 
 export const SAVES_GB = 0.128;

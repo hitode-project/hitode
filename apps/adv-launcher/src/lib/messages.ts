@@ -259,7 +259,7 @@ export const messages: Record<string, [string, string]> = {
   "性能问题": ["Performance issues", "性能の問題"],
   "补充说明（可选）": ["Additional details (optional)", "補足説明（任意）"],
   "30 天后删除": ["Delete after 30 days", "30 日後に削除"],
-  "将发送的内容": ["Report contents", "レポートの内容"],
+  "报告内容": ["Report contents", "レポートの内容"],
   "{0}：必需，无法移除": ["{0}: required, cannot remove", "{0}：必須のため削除できません"],
   "加回{0}": ["Include {0}", "{0} を含める"],
   "加回": ["Include", "含める"],
@@ -333,6 +333,6 @@ export const messages: Record<string, [string, string]> = {
   "游戏使用的代码页": ["Game code page", "ゲームのコードページ"],
   "无法启动或中途出错时": ["Startup or runtime failure", "起動または実行中のエラー"],
   "选择性能问题时的帧时间": ["Frame timing for performance issues", "性能問題のフレーム時間"],
-  "你填写的补充说明，30 天后删除": ["Your additional notes", "入力した補足説明"],
+  "你填写的补充说明": ["Your additional notes", "入力した補足説明"],
   "跟随全局（{0}）": ["Global default ({0})", "全体設定（{0}）"],
 };

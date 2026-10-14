@@ -55,6 +55,9 @@
       </div>
     </div>
 
+    {#if form.error}<p role="alert">{form.error}</p>{/if}
+    <p>{t("光盘与字体设置在下次启动时生效。")}</p>
+
     <section class="sec" aria-labelledby="pg-run">
       <h2 id="pg-run">{t("运行")}</h2>
       <div class="row">

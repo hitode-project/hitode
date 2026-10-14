@@ -122,11 +122,10 @@
 
         <div>
           <textarea class="note" rows="3" aria-label={t("补充说明（可选）")} placeholder={t("补充说明（可选）")} bind:value={form.note}></textarea>
-          <div class="ttl">{t("30 天后删除")}</div>
         </div>
 
         <div>
-          <p class="lbl">{t("将发送的内容")}</p>
+          <p class="lbl">{t("报告内容")}</p>
           <div class="list">
             {#each form.rows as r (r.id)}
               <div class="rw" class:off={r.removed}>
@@ -385,12 +384,6 @@
   .note:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-  }
-  .ttl {
-    margin-top: 6px;
-    text-align: right;
-    font-size: 11px;
-    color: var(--fg3);
   }
   .list {
     border-top: 1px solid var(--line);
