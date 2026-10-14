@@ -286,7 +286,6 @@ pub(crate) struct Compositor {
     context: NativeContext,
     layout: wgpu::BindGroupLayout,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
 }
 
@@ -317,7 +316,7 @@ impl Compositor {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -327,10 +326,6 @@ impl Compositor {
                     },
                 ],
             });
-        let sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("adv native nearest composition"),
-            ..Default::default()
-        });
         let linear_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -340,7 +335,6 @@ impl Compositor {
             context,
             layout,
             pipelines: HashMap::new(),
-            sampler,
             linear_sampler,
         };
         result.prepare_format(format);
@@ -550,8 +544,8 @@ impl Compositor {
             return Err("invalid native composition viewport".into());
         }
         let uv = self.context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("adv composition source UV"),
-            size: 16,
+            label: Some("adv composition sampling"),
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: true,
         });
@@ -560,12 +554,18 @@ impl Compositor {
                 .slice(..)
                 .get_mapped_range_mut()
                 .map_err(|error| error.to_string())?;
-            let mut packed = [0u8; 16];
-            for (out, value) in packed
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(region.source_uv)
+            let mut packed = [0u8; 32];
+            for (out, value) in
+                packed
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(region.source_uv.into_iter().chain([
+                        if linear { 0.0 } else { rectangle[2] },
+                        if linear { 0.0 } else { rectangle[3] },
+                        0.0,
+                        0.0,
+                    ]))
             {
                 out.copy_from_slice(&value.to_le_bytes());
             }
@@ -585,11 +585,7 @@ impl Compositor {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(if linear {
-                            &self.linear_sampler
-                        } else {
-                            &self.sampler
-                        }),
+                        resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -1192,17 +1188,28 @@ const SHADER: &str = r#"
 struct Fragment { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
-@group(0) @binding(2) var<uniform> source_uv: vec4<f32>;
+struct Sampling { source_uv: vec4<f32>, viewport: vec2<f32> }
+@group(0) @binding(2) var<uniform> sampling: Sampling;
 @vertex fn vertex_main(@builtin(vertex_index) index: u32) -> Fragment {
     let positions = array(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
     let position = positions[index];
     var output: Fragment;
     output.position = vec4(position,0.0,1.0);
-    output.uv = source_uv.xy + vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5) * source_uv.zw;
+    output.uv = sampling.source_uv.xy + vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5) * sampling.source_uv.zw;
     return output;
 }
 @fragment fn fragment_main(input: Fragment) -> @location(0) vec4<f32> {
-    var rgb = textureSample(image,image_sampler,input.uv).rgb;
+    // Sharp-bilinear remapping: rsn8887/TheMaister, public domain.
+    // https://github.com/libretro/glsl-shaders/blob/master/interpolation/shaders/sharp-bilinear-simple.glsl
+    // Emulate integer nearest prescaling followed by bilinear fitting, without
+    // an intermediate image. A zero viewport selects ordinary linear sampling.
+    let size = vec2<f32>(textureDimensions(image));
+    let scale = max(floor(sampling.viewport / (size * sampling.source_uv.zw)), vec2(1.0));
+    let texel = input.uv * size;
+    let offset = fract(texel) - 0.5;
+    let plateau = vec2(0.5) - 0.5 / scale;
+    let uv = (floor(texel) + 0.5 + (offset - clamp(offset, -plateau, plateau)) * scale) / size;
+    var rgb = textureSample(image,image_sampler,uv).rgb;
     // Legacy BGRA pixels already contain display-encoded values. Compensate an
     // sRGB attachment's encode; a second gamma transform would brighten them.
     if OUTPUT_SRGB {
@@ -1218,6 +1225,81 @@ mod tests {
     use adv_device::gpu::Gpu;
     use adv_device::surface::Rect;
     use std::time::Duration;
+
+    // spec: HOST-VIEW-1
+    #[test]
+    fn sharp_bilinear_preserves_integer_pixels_and_blends_fractional_boundaries() {
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+        let source = gpu.image(2, 2).unwrap();
+        let pixels: Vec<_> = [0, 255, 255, 0]
+            .into_iter()
+            .flat_map(|v| [v, v, v, 255])
+            .collect();
+        gpu.upload(
+            &source,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            8,
+            &pixels,
+        )
+        .unwrap();
+        let context = gpu.context().clone();
+        let compositor = Compositor::new(context.clone(), wgpu::TextureFormat::Bgra8Unorm);
+        let cases: &[(bool, &[u8])] = &[
+            (false, &[128]),
+            (false, &[0, 255]),
+            (false, &[0, 128, 255]),
+            (false, &[0, 0, 255, 255]),
+            (false, &[0, 0, 128, 255, 255]),
+            (false, &[0, 0, 0, 255, 255, 255]),
+            (true, &[0, 64, 191, 255]),
+        ];
+        for &(linear, ramp) in cases {
+            let n = ramp.len() as u32;
+            let output = gpu.image(n + 2, n + 2).unwrap();
+            compositor
+                .compose_view_region_sampled(
+                    source.view(),
+                    output.view(),
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    CompositionRegion {
+                        rectangle: [1., 1., n as f32, n as f32],
+                        source_uv: [0., 0., 1., 1.],
+                        scissor: None,
+                    },
+                    true,
+                    linear,
+                    &context.submission().unwrap(),
+                )
+                .unwrap();
+            let mut transfer = gpu.readback(&output, None).unwrap();
+            transfer.take_completion_job().unwrap()();
+            let bytes = transfer.poll().unwrap().unwrap();
+            for y in 0..n + 2 {
+                for x in 0..n + 2 {
+                    let expected = if x == 0 || y == 0 || x == n + 1 || y == n + 1 {
+                        0.0
+                    } else {
+                        let a = f32::from(ramp[(x - 1) as usize]) / 255.;
+                        let b = f32::from(ramp[(y - 1) as usize]) / 255.;
+                        255. * (a * (1. - b) + b * (1. - a))
+                    };
+                    let offset = ((y * (n + 2) + x) * 4) as usize;
+                    for &value in &bytes[offset..offset + 3] {
+                        assert!(
+                            (f32::from(value) - expected).abs() <= 1.5,
+                            "size={n}, linear={linear}, ({x},{y}): {value} != {expected}"
+                        );
+                    }
+                    assert_eq!(bytes[offset + 3], 255);
+                }
+            }
+        }
+    }
 
     // spec: HOST-VIEW-3
     #[test]
