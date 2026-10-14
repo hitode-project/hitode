@@ -209,3 +209,92 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
             .all(|pixel| pixel == [255, 0, 255, 255])
     );
 }
+
+#[test]
+// spec: GFX-BUFFER-2
+fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers() {
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let target = gpu.target(64, 1, false).unwrap();
+    gpu.clear(&target, Some([0.; 4]), None).unwrap();
+    let before = gpu.stats().submissions;
+    let mut draw = ProgrammableDraw {
+        program: Program {
+            source: "struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> }; @vertex fn vertex_main(@builtin(vertex_index) i:u32, @location(0) color:vec4<f32>)->V { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return V(vec4(p[i%3],0.,1.),color); } @fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return vec4(v.color.x,c.f[0].x,0.,1.); }".into(),
+            textures: vec![],
+        },
+        streams: vec![VertexStream { bytes: vec![], stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        indices: Some(vec![]), vertex_count: 6, vertex_constants: ConstantBlock::default(),
+        pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
+    };
+    let mut state = DrawState::new(64, 1);
+    for i in 0..64 {
+        let red = (i % 4) as f32 / 3.;
+        let vertices = [[red, 0., 0., 1.]; 3]
+            .into_iter()
+            .chain([[1. - red, 0., 0., 1.]; 3])
+            .collect::<Vec<_>>();
+        draw.streams[0].bytes = bytemuck::cast_slice(&vertices).to_vec();
+        draw.indices = Some((0..3).map(|n| n + (i % 2) * 3).collect());
+        draw.pixel_constants.floats[0][0] = i as f32 / 63.;
+        state.scissor = Some(Rect {
+            x: i,
+            y: 0,
+            w: 1,
+            h: 1,
+        });
+        gpu.draw_programmable(&target, &draw, &state).unwrap();
+    }
+    assert_eq!(gpu.stats().submissions - before, 2);
+    let pixels = read(&mut gpu, &target);
+    for (i, pixel) in pixels.chunks_exact(4).enumerate() {
+        let red = (i % 4) as f32 / 3.;
+        let expected = [
+            0.,
+            i as f32 / 63. * 255.,
+            if i % 2 == 0 { red } else { 1. - red } * 255.,
+            255.,
+        ];
+        assert!(
+            pixel
+                .iter()
+                .zip(expected)
+                .all(|(&v, e)| (v as f32 - e).abs() <= 1.),
+            "pixel {i}: {pixel:?}"
+        );
+    }
+    draw.streams[0]
+        .bytes
+        .resize((MAX_UPLOAD / 32 + 16) as usize, 0);
+    state.scissor = Some(Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    });
+    let before = gpu.stats().submissions;
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(gpu.stats().submissions, before + 1);
+    draw.streams[0].bytes.truncate(96);
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(gpu.stats().submissions, before + 1);
+    let frame = gpu.completed_frame(target.image.clone(), 1).unwrap();
+    assert_eq!(gpu.stats().submissions, before + 2);
+    drop(frame);
+    let other = gpu.target(64, 1, false).unwrap();
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    gpu.draw_programmable(&other, &draw, &state).unwrap();
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(&read(&mut gpu, &other)[..4], &[0, 255, 0, 255]);
+    let before = gpu.stats().submissions;
+    let mut child = gpu.fork().unwrap();
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    child.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(gpu.stats().submissions, before + 1);
+    child.clear(&target, Some([0., 1., 0., 1.]), None).unwrap();
+    assert_eq!(child.stats().submissions, 2);
+    assert!(
+        read(&mut gpu, &target)
+            .chunks_exact(4)
+            .all(|p| p == [0, 255, 0, 255])
+    );
+}

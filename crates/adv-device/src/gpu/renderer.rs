@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -67,6 +67,7 @@ pub struct NativeContext {
     id: u64,
     failure: Arc<OnceLock<String>>,
     gate: Arc<submission::Gate>,
+    pending: Arc<Mutex<program::Pending>>,
     // Keep the software-device turn alive until its last process/compositor
     // context is gone, including when the process that requested it exits.
     _software: Option<Arc<SoftwareTurn>>,
@@ -102,7 +103,15 @@ pub struct Submission<'a> {
     _lease: submission::Lease,
 }
 impl Submission<'_> {
+    fn flush(&self) {
+        self.context
+            .pending
+            .lock()
+            .unwrap()
+            .flush(&self.context.queue);
+    }
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.flush();
         self.context.queue.write_buffer(buffer, offset, data);
     }
     pub fn write_texture(
@@ -112,6 +121,7 @@ impl Submission<'_> {
         layout: wgpu::TexelCopyBufferLayout,
         size: wgpu::Extent3d,
     ) {
+        self.flush();
         self.context
             .queue
             .write_texture(texture, data, layout, size);
@@ -120,9 +130,11 @@ impl Submission<'_> {
         &self,
         commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
     ) -> wgpu::SubmissionIndex {
+        self.flush();
         self.context.queue.submit(commands)
     }
     pub fn present(&self, texture: wgpu::SurfaceTexture) {
+        self.flush();
         self.context.queue.present(texture);
     }
 }
@@ -477,6 +489,7 @@ impl Gpu {
             id: NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed),
             failure,
             gate: submission::Gate::new().map_err(|error| Error::Unavailable(error.to_string()))?,
+            pending: Arc::new(Mutex::new(program::Pending::default())),
             _software: software.clone(),
         };
         let error_scope = context
@@ -636,7 +649,9 @@ impl Gpu {
         &self.context
     }
     pub fn stats(&self) -> Stats {
-        self.stats
+        let mut stats = self.stats;
+        stats.submissions += self.programmable.submissions.load(Ordering::Relaxed);
+        stats
     }
 
     /// Bound explicit transfers to suit the host's staging-memory budget.
@@ -1496,6 +1511,7 @@ impl Gpu {
         }
         self.own(&image)?;
         let pin = FramePin::new(&image)?;
+        submission.flush();
         self.stats.native_frames += 1;
         Ok(NativeFrame {
             image,

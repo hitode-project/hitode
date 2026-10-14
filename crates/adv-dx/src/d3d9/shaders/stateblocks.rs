@@ -2,6 +2,7 @@
 //! redirects setters into an isolated snapshot, leaving current device state
 //! unchanged until Apply. Capture refreshes only the recorded subset. Apply
 //! borrows an immutable snapshot across device updates without copying maps.
+//! An unchanged captured subset retains its snapshot, including exact float bits.
 use super::*;
 use std::collections::BTreeSet;
 
@@ -106,6 +107,87 @@ impl Snapshot {
             texture: d.texture,
             mask,
         })
+    }
+    fn matches(&self, d: &super::super::Device) -> bool {
+        let m = &self.mask;
+        let a = &self.fixed;
+        let b = &d.fixed;
+        let constants = |a: &Constants, b: &Constants, m: &ConstantMask| {
+            m.floats
+                .iter()
+                .all(|&i| a.floats[i].map(f32::to_bits) == b.floats[i].map(f32::to_bits))
+                && m.integers.iter().all(|&i| a.integers[i] == b.integers[i])
+                && m.booleans.iter().all(|&i| a.booleans[i] == b.booleans[i])
+        };
+        (!m.vertex || self.shaders.vertex == d.shaders.vertex)
+            && (!m.pixel || self.shaders.pixel == d.shaders.pixel)
+            && (!m.fvf || a.fvf == b.fvf)
+            && (!m.declaration || self.buffers.declaration == d.buffers.declaration)
+            && (!m.indices || self.buffers.indices == d.buffers.indices)
+            && (!m.texture || self.texture == d.texture)
+            && m.streams.iter().all(|&i| {
+                let a = self.buffers.streams[i];
+                let b = d.buffers.streams[i];
+                (a.buffer, a.offset, a.stride) == (b.buffer, b.offset, b.stride)
+            })
+            && m.textures
+                .iter()
+                .all(|&i| self.shaders.textures[i] == d.shaders.textures[i])
+            && m.render.iter().all(|i| a.render.get(i) == b.render.get(i))
+            && m.stage.iter().all(|i| a.stage.get(i) == b.stage.get(i))
+            && m.stage_slots
+                .iter()
+                .all(|&(slot, i)| a.stage_slots[slot].get(&i) == b.stage_slots[slot].get(&i))
+            && m.sampler
+                .iter()
+                .all(|i| a.sampler.get(i) == b.sampler.get(i))
+            && m.sampler_slots
+                .iter()
+                .all(|&(slot, i)| a.sampler_slots[slot].get(&i) == b.sampler_slots[slot].get(&i))
+            && (!m.viewport
+                || (
+                    a.viewport.X,
+                    a.viewport.Y,
+                    a.viewport.Width,
+                    a.viewport.Height,
+                    a.viewport.MinZ.to_bits(),
+                    a.viewport.MaxZ.to_bits(),
+                ) == (
+                    b.viewport.X,
+                    b.viewport.Y,
+                    b.viewport.Width,
+                    b.viewport.Height,
+                    b.viewport.MinZ.to_bits(),
+                    b.viewport.MaxZ.to_bits(),
+                ))
+            && (!m.scissor
+                || (
+                    a.scissor.left,
+                    a.scissor.top,
+                    a.scissor.right,
+                    a.scissor.bottom,
+                ) == (
+                    b.scissor.left,
+                    b.scissor.top,
+                    b.scissor.right,
+                    b.scissor.bottom,
+                ))
+            && m.transforms
+                .iter()
+                .all(|&i| a.transforms[i].map(f32::to_bits) == b.transforms[i].map(f32::to_bits))
+            && m.clip_planes
+                .iter()
+                .all(|&i| a.clip_planes[i].map(f32::to_bits) == b.clip_planes[i].map(f32::to_bits))
+            && constants(
+                &self.shaders.vertex_constants,
+                &d.shaders.vertex_constants,
+                &m.vertex_constants,
+            )
+            && constants(
+                &self.shaders.pixel_constants,
+                &d.shaders.pixel_constants,
+                &m.pixel_constants,
+            )
     }
     pub(super) fn mark_constants(
         &mut self,
@@ -537,6 +619,9 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     if d.recording.is_some() {
         return INVALID;
+    }
+    if old.matches(d) {
+        return 0;
     }
     let snapshot = Snapshot::current(env, id, old.mask.clone()).unwrap();
     let changes = changes(&old.shaders, &old.buffers, old.texture, &snapshot);

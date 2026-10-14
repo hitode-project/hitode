@@ -741,3 +741,37 @@ fn translation_cache_bounds_large_bytecode_payloads() {
         "byte budget must evict before the entry limit"
     );
 }
+
+#[test]
+// spec: GFX-SHADER-4
+fn repeated_capture_preserves_signed_zero_nan_and_uncaptured_constants() {
+    let mut m = machine();
+    let mut env = env(&mut m);
+    let (device, _, _, _) = super::super::tests::setup(&mut env);
+    let this = GuestPtr::new(device);
+    let input = words(&mut env, &[0, 0x7fc0_0123, 0, 0]).cast();
+    let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+    assert_eq!(stateblocks::begin(&mut env, this), 0);
+    assert_eq!(set_vertex_f(&mut env, this, 7, input, 1), 0);
+    assert_eq!(stateblocks::end(&mut env, this, output), 0);
+    let block = GuestPtr::new(output.read(env.cpu).unwrap());
+    assert_eq!(set_vertex_f(&mut env, this, 7, input, 1), 0);
+    assert_eq!(stateblocks::capture(&mut env, block), 0);
+    assert_eq!(stateblocks::capture(&mut env, block), 0);
+    env.cpu.write_u32(input.addr(), 0x8000_0000).unwrap();
+    assert_eq!(set_vertex_f(&mut env, this, 7, input, 1), 0);
+    assert_eq!(stateblocks::capture(&mut env, block), 0);
+    env.cpu.write_u32(input.addr(), 1f32.to_bits()).unwrap();
+    assert_eq!(set_vertex_f(&mut env, this, 7, input, 1), 0);
+    assert_eq!(set_vertex_f(&mut env, this, 8, input, 1), 0);
+    assert_eq!(stateblocks::apply(&mut env, block), 0);
+    let c = &current_device(&env, device)
+        .unwrap()
+        .shaders
+        .vertex_constants;
+    assert_eq!(
+        c.floats[7].map(f32::to_bits),
+        [0x8000_0000, 0x7fc0_0123, 0, 0]
+    );
+    assert_eq!(c.floats[8][0], 1.);
+}

@@ -20,12 +20,36 @@ pub(super) struct Cache {
     cursor: u64,
     vertices: Vec<(wgpu::Buffer, u64)>,
     indices: Option<(wgpu::Buffer, u64)>,
+    pub(super) submissions: Arc<AtomicU64>,
     pub(super) disk: Option<super::pipeline_disk::DiskCache>,
 }
 const CONSTANT_SIZE: u64 = std::mem::size_of::<ConstantBlock>() as u64;
 const PARAMETER_SIZE: u64 = 640;
 const UNIFORM_STRIDE: u64 = (CONSTANT_SIZE * 2 + PARAMETER_SIZE).div_ceil(256) * 256;
 const UNIFORM_SLOTS: u64 = 32;
+
+// Queue writes precede submitted command buffers. Each pending draw owns a
+// different upload slot; external writes and consumers flush the batch first.
+#[derive(Default)]
+pub(super) struct Pending {
+    // Drop the pass before its encoder, including during producer teardown.
+    pass: Option<wgpu::RenderPass<'static>>,
+    attachments: Option<(wgpu::TextureView, Option<wgpu::TextureView>)>,
+    encoder: Option<wgpu::CommandEncoder>,
+    owner: Option<Arc<AtomicU64>>,
+    draws: u64,
+}
+impl Pending {
+    pub(super) fn flush(&mut self, queue: &wgpu::Queue) {
+        self.pass = None;
+        self.attachments = None;
+        if let Some(encoder) = self.encoder.take() {
+            queue.submit([encoder.finish()]);
+            self.owner.take().unwrap().fetch_add(1, Ordering::Relaxed);
+        }
+        self.draws = 0;
+    }
+}
 
 /// Validate before handing guest-derived source to the device. Failure remains
 /// a failed command, rather than poisoning the GPU's uncaptured-error channel.
@@ -375,10 +399,31 @@ impl Gpu {
             raster,
         })?;
         let uniform = self.programmable.uniforms.as_ref().unwrap();
-        let base = self.programmable.cursor * UNIFORM_STRIDE;
+        let slot = self.programmable.cursor;
+        let index_size = draw
+            .indices
+            .as_ref()
+            .map_or(0, |v| std::mem::size_of_val(v.as_slice()) as u64);
+        if index_size > MAX_UPLOAD {
+            return Err(invalid("index upload exceeds command limit"));
+        }
+        let immediate =
+            total > MAX_UPLOAD / UNIFORM_SLOTS || index_size > MAX_UPLOAD / UNIFORM_SLOTS;
+        let slots = if immediate { 1 } else { UNIFORM_SLOTS };
+        let upload_slot = if immediate { 0 } else { slot };
+        let mut pending = context.pending.lock().unwrap();
+        if slot == 0
+            || immediate
+            || pending
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !Arc::ptr_eq(owner, &self.programmable.submissions))
+        {
+            pending.flush(&context.queue);
+        }
+        let base = slot * UNIFORM_STRIDE;
         self.programmable.cursor = (self.programmable.cursor + 1) % UNIFORM_SLOTS;
-        // Queue writes are ordered after the previous submission. Wraparound
-        // never overwrites data still read by an earlier command on this queue.
+        // A slot is never overwritten until its pending commands are submitted.
         {
             let mut upload = submission
                 .context
@@ -431,9 +476,9 @@ impl Gpu {
                 .programmable
                 .vertices
                 .get(n)
-                .is_none_or(|(_, capacity)| *capacity < size)
+                .is_none_or(|(_, capacity)| *capacity < size * slots)
             {
-                let capacity = size.max(4).next_power_of_two().min(MAX_UPLOAD);
+                let capacity = (size.max(4) * slots).next_power_of_two().min(MAX_UPLOAD);
                 let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("raw vertex upload"),
                     size: capacity,
@@ -447,7 +492,10 @@ impl Gpu {
                 }
                 self.stats.vertex_buffer_allocations += 1;
             }
-            submission.write_buffer(&self.programmable.vertices[n].0, 0, &stream.bytes);
+            let (buffer, capacity) = &self.programmable.vertices[n];
+            context
+                .queue
+                .write_buffer(buffer, upload_slot * (capacity / slots), &stream.bytes);
         }
         if let Some(indices) = &draw.indices {
             let size = std::mem::size_of_val(indices.as_slice()) as u64;
@@ -458,9 +506,9 @@ impl Gpu {
                 .programmable
                 .indices
                 .as_ref()
-                .is_none_or(|(_, capacity)| *capacity < size)
+                .is_none_or(|(_, capacity)| *capacity < size * slots)
             {
-                let capacity = size.max(4).next_power_of_two().min(MAX_UPLOAD);
+                let capacity = (size.max(4) * slots).next_power_of_two().min(MAX_UPLOAD);
                 self.programmable.indices = Some((
                     context.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("index upload"),
@@ -471,16 +519,29 @@ impl Gpu {
                     capacity,
                 ));
             }
-            submission.write_buffer(
-                &self.programmable.indices.as_ref().unwrap().0,
-                0,
+            let (buffer, capacity) = self.programmable.indices.as_ref().unwrap();
+            context.queue.write_buffer(
+                buffer,
+                upload_slot * (capacity / slots),
                 bytemuck::cast_slice(indices),
             );
         }
         let attachment = self.attachment_color(target)?;
-        let mut encoder = context.device.create_command_encoder(&Default::default());
-        attachment.load(&mut encoder, &target.image);
+        pending.owner = Some(self.programmable.submissions.clone());
+        let depth_view = target.depth.as_ref().map(|d| d.view());
+        let padded = target.padded_attachments();
+        if padded
+            || pending.attachments.as_ref().is_none_or(|(color, depth)| {
+                color != &attachment.image.render_view || depth.as_ref() != depth_view
+            })
         {
+            pending.pass = None;
+        }
+        if pending.pass.is_none() {
+            let encoder = pending
+                .encoder
+                .get_or_insert_with(|| context.device.create_command_encoder(&Default::default()));
+            attachment.load(encoder, &target.image);
             let colors = [Some(wgpu::RenderPassColorAttachment {
                 view: &attachment.image.render_view,
                 depth_slice: None,
@@ -490,23 +551,30 @@ impl Gpu {
                     store: wgpu::StoreOp::Store,
                 },
             })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &colors,
-                depth_stencil_attachment: target.depth.as_ref().map(|d| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view: d.view(),
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: d.format().has_stencil().then_some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                    }
-                }),
-                ..Default::default()
-            });
+            let pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &colors,
+                    depth_stencil_attachment: target.depth.as_ref().map(|d| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view: d.view(),
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: d.format().has_stencil().then_some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                        }
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            pending.pass = Some(pass);
+            pending.attachments = Some((attachment.image.render_view.clone(), depth_view.cloned()));
+        }
+        {
+            let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &pipeline.constants, &[base as u32; 3]);
             pass.set_bind_group(1, &textures, &[]);
@@ -529,25 +597,34 @@ impl Gpu {
             if state.stencil.is_some() {
                 pass.set_stencil_reference(state.stencil_reference & 255);
             }
-            for (n, (b, _)) in self
+            for (n, (b, capacity)) in self
                 .programmable
                 .vertices
                 .iter()
                 .take(draw.streams.len())
                 .enumerate()
             {
-                pass.set_vertex_buffer(n as u32, b.slice(..));
+                pass.set_vertex_buffer(n as u32, b.slice(upload_slot * (capacity / slots)..));
             }
             if draw.indices.is_some() {
-                let i = &self.programmable.indices.as_ref().unwrap().0;
-                pass.set_index_buffer(i.slice(..), wgpu::IndexFormat::Uint32);
+                let (i, capacity) = self.programmable.indices.as_ref().unwrap();
+                pass.set_index_buffer(
+                    i.slice(upload_slot * (capacity / slots)..),
+                    wgpu::IndexFormat::Uint32,
+                );
                 pass.draw_indexed(0..count as u32, 0, 0..1);
             } else {
                 pass.draw(0..draw.vertex_count, 0..1);
             }
         }
-        attachment.store(&mut encoder, &target.image);
-        self.submit(encoder, &submission);
+        if padded {
+            pending.pass = None;
+            attachment.store(pending.encoder.as_mut().unwrap(), &target.image);
+        }
+        pending.draws += 1;
+        if pending.draws == UNIFORM_SLOTS || immediate {
+            pending.flush(&context.queue);
+        }
         self.stats.draws += 1;
         self.stats.vertices += count as u64;
         self.check()
