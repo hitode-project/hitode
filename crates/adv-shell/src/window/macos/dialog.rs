@@ -5,9 +5,11 @@ use super::*;
 use adv_runtime::{DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow};
 use objc2::sel;
 use objc2_app_kit::{
-    NSBezelStyle, NSBox, NSBoxType, NSButton, NSFont, NSPopUpButton, NSResponder,
-    NSSecureTextField, NSSlider, NSTextAlignment, NSTextField, NSView, NSWindowOrderingMode,
+    NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSFont, NSPopUpButton, NSResponder,
+    NSScrollView, NSSecureTextField, NSSlider, NSTableColumn, NSTableView, NSTextAlignment,
+    NSTextField, NSView, NSWindowOrderingMode,
 };
+use objc2_foundation::NSIndexSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -19,6 +21,7 @@ enum Kind {
     Frame,
     Edit,
     Combo,
+    List,
     Track,
     Unavailable,
 }
@@ -41,6 +44,7 @@ fn kind(control: &DialogControl) -> Kind {
         },
         "edit" => Kind::Edit,
         "combobox" => Kind::Combo,
+        "listbox" => Kind::List,
         "msctls_trackbar32" => Kind::Track,
         "msctls_statusbar32" => Kind::Label,
         _ => Kind::Unavailable,
@@ -63,6 +67,8 @@ pub(in crate::window) struct Output {
     syncing: Cell<bool>,
     bindings: RefCell<BTreeMap<usize, Binding>>,
     windows: RefCell<BTreeMap<usize, DialogTarget>>,
+    /// Items each list's table shows, by table.
+    lists: RefCell<BTreeMap<usize, Vec<String>>>,
 }
 impl Output {
     fn emit(&self, event: DialogEvent) {
@@ -157,6 +163,32 @@ impl Output {
             _ => {}
         }
     }
+    pub(super) fn list_len(&self, table: &NSTableView) -> usize {
+        let at = table as *const NSTableView as usize;
+        self.lists.borrow().get(&at).map_or(0, Vec::len)
+    }
+    pub(super) fn list_item(&self, table: &NSTableView, row: isize) -> Option<String> {
+        let at = table as *const NSTableView as usize;
+        let row = usize::try_from(row).ok()?;
+        self.lists.borrow().get(&at)?.get(row).cloned()
+    }
+    /// The user's selection; the guest's own selection arrives while syncing.
+    pub(super) fn list_selected(&self, object: &AnyObject) {
+        let at = object as *const AnyObject as usize;
+        let Some(binding) = self.bindings.borrow().get(&at).cloned() else {
+            return;
+        };
+        let Some(table) = object.downcast_ref::<NSTableView>() else {
+            return;
+        };
+        let index = table.selectedRow();
+        if binding.kind == Kind::List && index >= 0 {
+            self.emit(DialogEvent::Select {
+                target: binding.target,
+                index: index as i32,
+            });
+        }
+    }
     pub(super) fn text(&self, object: &AnyObject) {
         let at = object as *const AnyObject as usize;
         let Some(binding) = self.bindings.borrow().get(&at).cloned() else {
@@ -227,6 +259,21 @@ struct Control {
     source: DialogControl,
 }
 
+/// The table a list's scroll view shows.
+fn list_table(view: &NSView) -> Option<Retained<NSTableView>> {
+    view.downcast_ref::<NSScrollView>()?
+        .documentView()?
+        .downcast::<NSTableView>()
+        .ok()
+}
+
+/// Native objects whose callbacks name this control.
+fn binding_keys(view: &NSView) -> Vec<usize> {
+    let mut keys = vec![view as *const NSView as usize];
+    keys.extend(list_table(view).map(|table| Retained::as_ptr(&table) as usize));
+    keys
+}
+
 fn create(mtm: MainThreadMarker, target: &Target, control: &DialogControl) -> Retained<NSView> {
     let text = NSString::from_str(&control.text);
     let action = Some(sel!(dialogAction:));
@@ -293,6 +340,24 @@ fn create(mtm: MainThreadMarker, target: &Target, control: &DialogControl) -> Re
                 popup.setTarget(object);
                 popup.setAction(action);
                 Retained::into_super(Retained::into_super(Retained::into_super(popup)))
+            }
+            Kind::List => {
+                let table = NSTableView::new(mtm);
+                let column = NSTableColumn::initWithIdentifier(
+                    NSTableColumn::alloc(mtm),
+                    &NSString::from_str("item"),
+                );
+                table.addTableColumn(&column);
+                table.setHeaderView(None);
+                table.setAllowsMultipleSelection(false);
+                table.setAllowsEmptySelection(true);
+                table.setDataSource(Some(ProtocolObject::from_ref(target)));
+                table.setDelegate(Some(ProtocolObject::from_ref(target)));
+                let scroll = NSScrollView::new(mtm);
+                scroll.setHasVerticalScroller(true);
+                scroll.setBorderType(NSBorderType::BezelBorder);
+                scroll.setDocumentView(Some(&table));
+                Retained::into_super(scroll)
             }
             Kind::Track => {
                 let slider = NSSlider::sliderWithTarget_action(object, action, mtm);
@@ -398,10 +463,10 @@ impl HostDialog {
             .collect();
         for hwnd in stale {
             if let Some(control) = self.controls.remove(&hwnd) {
-                output
-                    .bindings
-                    .borrow_mut()
-                    .remove(&(Retained::as_ptr(&control.view) as usize));
+                for key in binding_keys(&control.view) {
+                    output.bindings.borrow_mut().remove(&key);
+                    output.lists.borrow_mut().remove(&key);
+                }
                 control.view.removeFromSuperview();
             }
         }
@@ -445,21 +510,24 @@ impl HostDialog {
                     },
                 }
             });
-            output.bindings.borrow_mut().insert(
-                Retained::as_ptr(&native.view) as usize,
-                Binding {
-                    target: control.target,
-                    kind: native.kind,
-                    check: control.check,
-                },
-            );
-            project(native, control, rect, source.font.as_ref());
+            for key in binding_keys(&native.view) {
+                output.bindings.borrow_mut().insert(
+                    key,
+                    Binding {
+                        target: control.target,
+                        kind: native.kind,
+                        check: control.check,
+                    },
+                );
+            }
+            project(output, native, control, rect, source.font.as_ref());
         }
     }
 }
 
 /// Shows the guest state of one control.
 fn project(
+    output: &Output,
     native: &mut Control,
     control: &DialogControl,
     rect: (i32, i32, i32, i32),
@@ -474,8 +542,38 @@ fn project(
         format!("Unavailable: {} · {}", control.class, control.text)
     };
     let font = font(control.font.as_ref().or(inherited));
-    // A popup is also a button, so it is matched first.
-    if let Some(popup) = view.downcast_ref::<NSPopUpButton>() {
+    if let Some(table) = list_table(view) {
+        if native.source.items != control.items {
+            output
+                .lists
+                .borrow_mut()
+                .insert(Retained::as_ptr(&table) as usize, control.items.clone());
+            table.reloadData();
+        }
+        let cell = table
+            .tableColumns()
+            .firstObject()
+            .map(|column| column.dataCell());
+        if let Some(cell) = cell {
+            // SAFETY: a cell-based column's data cell is an NSCell.
+            let _: () = unsafe { msg_send![&*cell, setFont: &*font] };
+        }
+        table.setRowHeight((font.ascender() - font.descender() + font.leading()).ceil() + 2.0);
+        table.sizeLastColumnToFit();
+        if native.source.selection != control.selection || native.source.items != control.items {
+            match usize::try_from(control.selection) {
+                Ok(row) => {
+                    table.selectRowIndexes_byExtendingSelection(
+                        &NSIndexSet::indexSetWithIndex(row),
+                        false,
+                    );
+                    table.scrollRowToVisible(row as isize);
+                }
+                Err(_) => table.selectRowIndexes_byExtendingSelection(&NSIndexSet::new(), false),
+            }
+        }
+        table.setEnabled(control.enabled);
+    } else if let Some(popup) = view.downcast_ref::<NSPopUpButton>() {
         if native.source.items != control.items {
             popup.removeAllItems();
             for item in &control.items {
@@ -722,7 +820,10 @@ impl Dialogs {
 fn retire(output: &Output, dialog: &HostDialog) {
     let mut bindings = output.bindings.borrow_mut();
     for control in dialog.controls.values() {
-        bindings.remove(&(Retained::as_ptr(&control.view) as usize));
+        for key in binding_keys(&control.view) {
+            bindings.remove(&key);
+            output.lists.borrow_mut().remove(&key);
+        }
     }
     if let Some(parent) = dialog.window.parentWindow() {
         parent.removeChildWindow(&dialog.window);

@@ -18,6 +18,7 @@ pub mod host_input;
 pub(crate) mod image;
 mod input;
 mod layered;
+mod list_box;
 pub mod menu;
 pub mod message;
 mod monitor;
@@ -74,6 +75,7 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         tab: proc(tab::PROC)?,
         status_bar: proc(status_bar::PROC)?,
         rich_edit: proc(rich_edit::PROC)?,
+        list_box: proc(list_box::PROC)?,
     };
     let win32 = m.ext.get_mut::<Win32>();
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);

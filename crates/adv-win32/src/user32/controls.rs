@@ -535,6 +535,7 @@ fn def_dlg_default(
 pub fn register(reg: &mut Registry) {
     super::tab::register(reg);
     super::status_bar::register(reg);
+    super::list_box::register(reg);
     reg.register(def_dlg_proc_w_ABI);
     stdcall(reg, USER32, DIALOG_PROC, 4, dialog_proc);
     stdcall(reg, USER32, MESSAGE_BOX_PROC, 4, message_box_proc);

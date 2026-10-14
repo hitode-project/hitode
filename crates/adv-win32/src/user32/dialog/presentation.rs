@@ -152,6 +152,7 @@ pub(super) fn supported(class: &str, style: u32) -> bool {
         || (class.eq_ignore_ascii_case("Static") && matches!(style & 0x1f, 0..=2 | 7..=9 | 11..=12))
         || class.eq_ignore_ascii_case("Edit")
         || (class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3)
+        || (class.eq_ignore_ascii_case("ListBox") && super::super::list_box::projectable(style))
         || class.eq_ignore_ascii_case("msctls_trackbar32")
         || class.eq_ignore_ascii_case(super::super::status_bar::CLASS)
 }
@@ -321,6 +322,33 @@ pub fn post_host_event(env: &mut Env<'_>, event: DialogEvent) -> bool {
     match event {
         DialogEvent::Click(_) if class.eq_ignore_ascii_case("Button") && style & 0xf != 7 => {
             super::super::message::post(env, target.hwnd, 0xf5, 0, 0)
+        }
+        DialogEvent::Select { index, .. }
+            if class.eq_ignore_ascii_case("ListBox")
+                && super::super::list_box::projectable(style) =>
+        {
+            let count = window.control.choices.as_ref().map_or(0, |c| c.items.len());
+            if index < 0 || index as usize >= count {
+                return false;
+            }
+            let window = env
+                .ext
+                .get::<Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &target.hwnd)
+                .unwrap();
+            window.control.choices.as_mut().unwrap().selected = Some(index as usize);
+            window.invalidate_client(true);
+            // LBN_SELCHANGE reaches the parent only with LBS_NOTIFY.
+            style & 1 == 0
+                || super::super::message::post(
+                    env,
+                    target.parent,
+                    wm::COMMAND,
+                    command | (1 << 16),
+                    target.hwnd,
+                )
         }
         DialogEvent::Select { index, .. }
             if class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3 =>

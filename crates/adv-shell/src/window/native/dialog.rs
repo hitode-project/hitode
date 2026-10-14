@@ -105,6 +105,11 @@ impl DialogData {
                 target: binding.target,
                 text: text(hwnd),
             })
+        } else if binding.class.eq_ignore_ascii_case("ListBox") && code == LBN_SELCHANGE {
+            Some(DialogEvent::Select {
+                target: binding.target,
+                index: unsafe { SendMessageW(hwnd, LB_GETCURSEL, 0, 0) } as i32,
+            })
         } else if binding.class.eq_ignore_ascii_case("ComboBox") && code == CBN_SELCHANGE {
             Some(DialogEvent::Select {
                 target: binding.target,
@@ -244,6 +249,9 @@ fn control_style(control: &DialogControl) -> u32 {
     } else if control.class.eq_ignore_ascii_case("ComboBox") {
         // The guest's item order and indices are authoritative across locales.
         style &= !(CBS_SORT as u32);
+    } else if control.class.eq_ignore_ascii_case("ListBox") {
+        // Guest order is authoritative; every user selection reaches the guest.
+        style = (style & !(LBS_SORT as u32)) | LBS_NOTIFY as u32;
     }
     style
 }
@@ -535,6 +543,18 @@ impl HostDialog {
                         }
                     }
                     SendMessageW(native.hwnd, CB_SETCURSEL, control.selection as usize, 0);
+                }
+                if control.class.eq_ignore_ascii_case("ListBox") && control.supported {
+                    let count = SendMessageW(native.hwnd, LB_GETCOUNT, 0, 0);
+                    if native.source.items != control.items || count != control.items.len() as isize
+                    {
+                        SendMessageW(native.hwnd, LB_RESETCONTENT, 0, 0);
+                        for item in &control.items {
+                            let item = wide(item);
+                            SendMessageW(native.hwnd, LB_ADDSTRING, 0, item.as_ptr() as isize);
+                        }
+                    }
+                    SendMessageW(native.hwnd, LB_SETCURSEL, control.selection as usize, 0);
                 }
                 ShowWindow(
                     native.hwnd,

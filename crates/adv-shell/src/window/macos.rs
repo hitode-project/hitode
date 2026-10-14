@@ -13,7 +13,8 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSBackingStoreType, NSControl, NSControlTextEditingDelegate,
     NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSTextFieldDelegate, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
+    NSMenuItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTextFieldDelegate, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
     NSWindowOcclusionState, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillPowerOffNotification, NSWorkspaceWillSleepNotification,
 };
@@ -343,6 +344,34 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for Target {}
 
     unsafe impl NSTextFieldDelegate for Target {}
+
+    unsafe impl NSTableViewDataSource for Target {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, table: &NSTableView) -> isize {
+            self.ivars().dialogs.list_len(table) as isize
+        }
+        #[unsafe(method_id(tableView:objectValueForTableColumn:row:))]
+        fn object_value(
+            &self,
+            table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<Retained<AnyObject>> {
+            self.ivars()
+                .dialogs
+                .list_item(table, row)
+                .map(|item| Retained::into_super(Retained::into_super(NSString::from_str(&item))))
+        }
+    }
+
+    unsafe impl NSTableViewDelegate for Target {
+        #[unsafe(method(tableViewSelectionDidChange:))]
+        fn table_selection_did_change(&self, notification: &NSNotification) {
+            if let Some(object) = notification.object() {
+                self.ivars().dialogs.list_selected(&object);
+            }
+        }
+    }
 
     impl Target {
         #[unsafe(method(hostWillPowerOff:))]

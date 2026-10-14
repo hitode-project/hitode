@@ -228,6 +228,8 @@ pub struct ChoiceState {
     pub items: Vec<String>,
     pub data: Vec<u32>,
     pub selected: Option<usize>,
+    /// The first visible item of a list box.
+    pub top: usize,
 }
 
 pub struct Window {
@@ -423,6 +425,7 @@ pub struct SysProcs {
     pub tab: u32,
     pub status_bar: u32,
     pub rich_edit: u32,
+    pub list_box: u32,
 }
 
 pub struct User {
@@ -597,7 +600,8 @@ impl User {
         self.add_class_raw("msctls_trackbar32", 0, procs.trackbar, 0, 0);
         self.add_class_raw("SysTabControl32", 0x400b, procs.tab, 4, 0);
         self.add_class_raw(super::status_bar::CLASS, 0x8, procs.status_bar, 0, 0);
-        for c in ["ListBox", "ScrollBar", "msctls_progress32", "SysListView32"] {
+        self.add_class_raw("ListBox", 0, procs.list_box, 0, 0);
+        for c in ["ScrollBar", "msctls_progress32", "SysListView32"] {
             self.add_class_raw(c, 0, procs.def_window, 0, 0);
         }
         self.add_class_raw("#32770", 0, procs.def_dlg, DLGWINDOWEXTRA, 0);
