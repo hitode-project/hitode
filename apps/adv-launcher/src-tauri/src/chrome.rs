@@ -5,6 +5,10 @@
 //! the game screen gets an opaque title bar with the game's title and the
 //! pause button, which then never covers the game. Full screen hides the bar
 //! until the pointer reaches the top of the screen.
+//!
+//! The window itself turns opaque too: a transparent window is blended with
+//! the desktop behind it, and WindowServer redid that for every game frame
+//! (about half a core for AQUA's title screen).
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -12,7 +16,7 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSButton, NSImage, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSWindow,
+    NSButton, NSColor, NSImage, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSWindow,
     NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, ns_string};
@@ -55,6 +59,13 @@ pub fn set_title_bar(window: WebviewWindow, title: Option<String>) -> Result<(),
     mask.set(NSWindowStyleMask::FullSizeContentView, !game);
     native.setStyleMask(mask);
     native.setTitlebarAppearsTransparent(!game);
+    native.setOpaque(game);
+    let background = if game {
+        NSColor::blackColor()
+    } else {
+        NSColor::clearColor()
+    };
+    native.setBackgroundColor(Some(&background));
     native.setTitleVisibility(if game {
         NSWindowTitleVisibility::Visible
     } else {
