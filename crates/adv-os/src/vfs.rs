@@ -2,6 +2,7 @@
 //!
 //! * Game files are writable in portable mode; isolated mode uses a data overlay.
 //!   Read-only replacements always use copy-on-write in the data overlay.
+//!   Deleting a read-only file records a persistent whiteout instead.
 //! * An optional read-only resource directory sits between guest writes and game files.
 //! * An optional install folder backs `C:\Program Files` and is written in place.
 //! * Every other `C:\` path (user profile, Windows dir, ...) maps into a writable host
@@ -23,6 +24,7 @@ mod optical;
 mod portable_saves;
 mod section;
 mod stream;
+mod whiteouts;
 mod wildcard;
 pub use optical::{OpticalDriveInfo, OpticalFile};
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
@@ -81,6 +83,7 @@ pub struct Vfs {
     user_name: String,
     resources: Option<PathBuf>,
     overlay: PathBuf,
+    whiteouts: whiteouts::Whiteouts,
     install: Option<PathBuf>,
     other: PathBuf,
     optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
@@ -141,6 +144,7 @@ impl Vfs {
             user_name: cfg.user_name.clone(),
             resources: cfg.resource_dir.clone(),
             overlay: cfg.data_dir.join("overlay"),
+            whiteouts: whiteouts::Whiteouts::load(cfg.data_dir.join("whiteouts")),
             install: cfg.install_dir.clone(),
             other: cfg.data_dir.join("c"),
             optical: BTreeMap::new(),
@@ -246,26 +250,62 @@ impl Vfs {
             return None;
         }
         match self.locate(guest)? {
-            Loc::Game(rel) => ci_find(&self.overlay, &rel)
-                .or_else(|| self.resources.as_ref().and_then(|p| ci_find(p, &rel)))
-                .or_else(|| ci_find(&self.game_host, &rel)),
+            Loc::Game(rel) => ci_find(&self.overlay, &rel).or_else(|| {
+                if self.whiteouts.contains(&rel) {
+                    return None;
+                }
+                self.resources
+                    .as_ref()
+                    .and_then(|p| ci_find(p, &rel))
+                    .or_else(|| ci_find(&self.game_host, &rel))
+            }),
             Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_find(&self.other, &rel),
         }
     }
 
+    /// A visible read-only file or directory under the game root.
+    fn underlay(&self, rel: &[String]) -> bool {
+        !self.whiteouts.contains(rel)
+            && (self
+                .resources
+                .as_ref()
+                .and_then(|p| ci_find(p, rel))
+                .is_some()
+                || (!self.write_game && ci_find(&self.game_host, rel).is_some()))
+    }
+
     /// Whether `guest` exists only in a read-only layer (a write must copy it first).
     pub fn is_base_only(&self, guest: &str) -> bool {
         matches!(self.locate(guest), Some(Loc::Game(rel)) if ci_find(&self.overlay, &rel).is_none()
-            && (self.resources.as_ref().and_then(|p| ci_find(p, &rel)).is_some() || (!self.write_game && ci_find(&self.game_host, &rel).is_some())))
+            && self.underlay(&rel))
     }
 
     /// Deleting/renaming a writable shadow must not expose a read-only layer.
-    /// Persistent whiteouts are not yet supported by this VFS.
+    /// Only `delete_file` records whiteouts; renames still refuse.
     pub fn has_read_only_underlay(&self, guest: &str) -> bool {
-        matches!(self.locate(guest), Some(Loc::Game(rel)) if
-            self.resources.as_ref().and_then(|p| ci_find(p, &rel)).is_some()
-            || (!self.write_game && ci_find(&self.game_host, &rel).is_some()))
+        matches!(self.locate(guest), Some(Loc::Game(rel)) if self.underlay(&rel))
+    }
+
+    /// Delete a file. A read-only game file stays on disk behind a persistent
+    /// whiteout, and any overlay copy is removed.
+    pub fn delete_file(&self, guest: &str) -> std::io::Result<()> {
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let host = self.lookup(guest).ok_or_else(missing)?;
+        let Some(Loc::Game(rel)) = self
+            .locate(guest)
+            .filter(|_| self.has_read_only_underlay(guest))
+        else {
+            return std::fs::remove_file(host);
+        };
+        self.whiteouts.set(&rel, true)?;
+        if let Some(shadow) = ci_find(&self.overlay, &rel)
+            && let Err(error) = std::fs::remove_file(shadow)
+        {
+            let _ = self.whiteouts.set(&rel, false);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Host path to create or write `guest` at; parent directories are created.
@@ -288,6 +328,8 @@ impl Vfs {
                 } else {
                     &self.overlay
                 };
+                // Writing a deleted name brings it back in the overlay.
+                let _ = self.whiteouts.set(&rel, false);
                 ci_path(base, &rel)
             }
             Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),
@@ -306,7 +348,10 @@ impl Vfs {
             return None;
         }
         let path = match self.locate(guest)? {
-            Loc::Game(rel) => ci_path(&self.overlay, &rel),
+            Loc::Game(rel) => {
+                let _ = self.whiteouts.set(&rel, false);
+                ci_path(&self.overlay, &rel)
+            }
             Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
         };
@@ -364,27 +409,43 @@ impl Vfs {
         if !self.is_dir(guest_dir) {
             return None;
         }
-        let dirs: Vec<PathBuf> = match self.locate(guest_dir)? {
+        // Read-only layers carry the directory's components so whiteouts can hide entries.
+        let dirs: Vec<(PathBuf, Option<Vec<String>>)> = match self.locate(guest_dir)? {
             Loc::Game(rel) => [
-                ci_find(&self.game_host, &rel),
-                self.resources.as_ref().and_then(|p| ci_find(p, &rel)),
-                ci_find(&self.overlay, &rel),
+                ci_find(&self.game_host, &rel).map(|p| (p, Some(rel.clone()))),
+                self.resources
+                    .as_ref()
+                    .and_then(|p| ci_find(p, &rel))
+                    .map(|p| (p, Some(rel.clone()))),
+                ci_find(&self.overlay, &rel).map(|p| (p, None)),
             ]
             .into_iter()
             .flatten()
-            .filter(|p| p.is_dir())
+            .filter(|(p, _)| p.is_dir())
             .collect(),
-            Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel).into_iter().collect(),
-            Loc::Other(rel) => ci_find(&self.other, &rel).into_iter().collect(),
+            Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel)
+                .map(|p| (p, None))
+                .into_iter()
+                .collect(),
+            Loc::Other(rel) => ci_find(&self.other, &rel)
+                .map(|p| (p, None))
+                .into_iter()
+                .collect(),
         };
         if dirs.is_empty() {
             return None;
         }
         let mut map = BTreeMap::new();
-        for d in dirs {
+        for (d, read_only) in dirs {
             for e in std::fs::read_dir(d).ok()?.flatten() {
                 let Ok(md) = e.metadata() else { continue };
                 let name = e.file_name().to_string_lossy().into_owned();
+                if read_only.as_ref().is_some_and(|rel| {
+                    self.whiteouts
+                        .contains(&[rel.as_slice(), &[name.clone()]].concat())
+                }) {
+                    continue;
+                }
                 map.insert(
                     name.to_ascii_lowercase(),
                     DirEntry {
@@ -550,6 +611,58 @@ mod tests {
             1
         );
         assert!(names.iter().any(|n| n == "Save"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    // spec: WIN32-OBJECT-8
+    fn deleting_a_read_only_file_persists_a_whiteout_until_the_name_is_written() {
+        let tmp = std::env::temp_dir().join(format!("adv-whiteout-vfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("game/Save")).unwrap();
+        std::fs::write(tmp.join("game/Save/Old.png"), "base").unwrap();
+        std::fs::write(tmp.join("game/Save/keep.png"), "keep").unwrap();
+        let names = |v: &Vfs| -> Vec<String> {
+            v.list(r"C:\Game\save")
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        let v = vfs(&tmp);
+        // An overlay copy and the read-only file both disappear.
+        std::fs::write(v.write_path(r"C:\Game\Save\old.png").unwrap(), "copy").unwrap();
+        v.delete_file(r"C:\Game\save\OLD.png").unwrap();
+        assert!(v.lookup(r"C:\Game\Save\old.png").is_none());
+        assert!(!v.has_read_only_underlay(r"C:\Game\Save\old.png"));
+        assert_eq!(names(&v), ["keep.png"]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("game/Save/Old.png")).unwrap(),
+            "base"
+        );
+        // The whiteout survives a restart; writing the name brings back the new file.
+        let v = vfs(&tmp);
+        assert!(v.lookup(r"C:\Game\Save\old.png").is_none());
+        std::fs::write(v.write_path(r"C:\Game\Save\old.png").unwrap(), "new").unwrap();
+        let v = vfs(&tmp);
+        assert_eq!(
+            std::fs::read_to_string(v.lookup(r"C:\Game\Save\old.png").unwrap()).unwrap(),
+            "new"
+        );
+        assert_eq!(names(&v).len(), 2);
+        // Files only the overlay holds are removed without a whiteout.
+        std::fs::write(v.write_path(r"C:\Game\Save\new.sav").unwrap(), "x").unwrap();
+        let index = std::fs::read_to_string(tmp.join("data/whiteouts")).unwrap();
+        v.delete_file(r"C:\Game\Save\new.sav").unwrap();
+        assert!(v.lookup(r"C:\Game\Save\new.sav").is_none());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("data/whiteouts")).unwrap(),
+            index
+        );
+        assert_eq!(
+            v.delete_file(r"C:\Game\Save\new.sav").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
