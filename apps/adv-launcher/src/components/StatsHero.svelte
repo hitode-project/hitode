@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { prefs } from "../lib/prefs.svelte";
   import { setPref } from "../lib/settings-form.svelte";
   import type { RangeStats } from "../lib/stats";
@@ -9,15 +10,15 @@
 
 <section class="hero">
   <span class="label">{data.heroLabel}</span>
-  <span class="total">{data.totalHours.toFixed(1)}<span class="unit">小时</span></span>
+  <span class="total">{data.totalHours.toFixed(1)}<span class="unit">{t("小时")}</span></span>
   <span class="delta">{data.delta}</span>
 </section>
 
 {#if !prefs.trackPlayTime}
   <div class="notice">
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
-    <span style="flex: 1">记录游玩时间已关闭，之后的游玩不会计入统计。</span>
-    <button class="link" onclick={() => setPref("trackPlayTime", true)}>开启</button>
+    <span style="flex: 1">{t("记录游玩时间已关闭，之后的游玩不会计入统计。")}</span>
+    <button class="link" onclick={() => setPref("trackPlayTime", true)}>{t("开启")}</button>
   </div>
 {/if}
 

@@ -7,6 +7,8 @@ mod library;
 mod menu;
 pub mod overlay;
 mod report;
+#[cfg(desktop)]
+mod settings;
 
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -14,12 +16,15 @@ mod chrome;
 #[cfg(target_os = "macos")]
 mod game;
 #[cfg(target_os = "macos")]
+mod saves;
+#[cfg(target_os = "macos")]
 use game::{post_text, start_game, stop_game};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostInfo {
     platform: &'static str,
+    version: &'static str,
     /// A native game view is attached under the webview.
     game_view: bool,
 }
@@ -28,6 +33,7 @@ struct HostInfo {
 fn host_info() -> HostInfo {
     HostInfo {
         platform: std::env::consts::OS,
+        version: env!("CARGO_PKG_VERSION"),
         game_view: cfg!(target_os = "macos"),
     }
 }
@@ -67,6 +73,13 @@ pub fn run() {
             .on_window_event(game::window_event)
             .invoke_handler(tauri::generate_handler![
                 host_info,
+                saves::save_info,
+                saves::save_policy,
+                saves::save_action,
+                settings::pick_game_file,
+                settings::font_families,
+                game::set_game_playback,
+                game::game_fps,
                 post_text,
                 start_game,
                 game::pause_game,
@@ -76,9 +89,11 @@ pub fn run() {
                 report::report_base,
                 report::save_report,
                 menu::set_pause_available,
+                menu::set_menu_language,
                 chrome::set_title_bar,
                 library::library_pick_folder,
                 library::library_list,
+                library::set_tracking,
                 library::library_inspect,
                 library::library_scan,
                 library::library_add,
@@ -95,8 +110,10 @@ pub fn run() {
         report::report_base,
         report::save_report,
         menu::set_pause_available,
+        menu::set_menu_language,
         library::library_pick_folder,
         library::library_list,
+        library::set_tracking,
         library::library_inspect,
         library::library_scan,
         library::library_add,

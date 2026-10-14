@@ -341,7 +341,7 @@ impl Projection {
     fn track_popup(&mut self, bar: &MenuBar, popup: &PopupPresentation) -> Result<(), String> {
         let (width, height) = self.hub.canvas.get();
         let client = self.view.client();
-        let viewport = Viewport::fit(client, width, height);
+        let viewport = self.view.viewport((width, height), self.hub.scaling.get());
         let x = viewport.x + f64::from(popup.x) * viewport.width / f64::from(width.max(1));
         let y = viewport.y + f64::from(popup.y) * viewport.height / f64::from(height.max(1));
         let native = self

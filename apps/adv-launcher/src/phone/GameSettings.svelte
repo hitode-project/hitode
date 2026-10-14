@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import PhoneSettingsGameForm from "../components/PhoneSettingsGameForm.svelte";
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import { library } from "../lib/library.svelte";
@@ -17,9 +18,9 @@
   <div class="screen">
     <PhoneSettingsHeader />
     <div class="missing">
-      <h1>找不到这个游戏</h1>
-      <p>它可能已从游戏库中移除。</p>
-      <button class="secondary" onclick={() => nav.home()}>返回游戏库</button>
+      <h1>{t("找不到这个游戏")}</h1>
+      <p>{t("它可能已从游戏库中移除。")}</p>
+      <button class="secondary" onclick={() => nav.home()}>{t("返回游戏库")}</button>
     </div>
   </div>
 {/if}

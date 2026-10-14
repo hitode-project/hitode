@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import type { Snippet } from "svelte";
 
   // The small centered result dialog of the report screen (已提交, 没有连上服务器, 已保存).
@@ -16,7 +17,7 @@
 
 <div class="dlg fade" role="dialog" aria-modal="true" aria-labelledby={id}>
   {#if onclose}
-    <button class="x" aria-label="关闭" onclick={onclose}>
+    <button class="x" aria-label={t("关闭")} onclick={onclose}>
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"></path></svg>
     </button>
   {/if}

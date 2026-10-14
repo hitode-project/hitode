@@ -29,6 +29,8 @@ pub enum Event {
     /// and suspended audio until it resumes.
     #[cfg(target_os = "macos")]
     Paused(bool),
+    #[cfg(target_os = "macos")]
+    Volume(u8),
     Repaint,
 }
 pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;

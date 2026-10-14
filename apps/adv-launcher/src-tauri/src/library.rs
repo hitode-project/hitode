@@ -57,6 +57,8 @@ type Offline = &'static str;
 #[derive(Serialize, Deserialize)]
 pub struct Library {
     version: u32,
+    #[serde(default = "tracking_default")]
+    track_play_time: bool,
     games: Vec<LibraryGame>,
     #[serde(skip)]
     path: PathBuf,
@@ -66,6 +68,7 @@ impl Library {
         let path = dir.join("library.json");
         let mut lib = Self {
             version: 1,
+            track_play_time: true,
             games: vec![],
             path,
         };
@@ -84,6 +87,7 @@ impl Library {
                             migrated = true;
                         }
                     }
+                    lib.track_play_time = saved.track_play_time;
                     lib.games = saved.games;
                     if migrated {
                         lib.save()?;
@@ -109,7 +113,11 @@ impl Library {
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&value)?).and_then(|()| fs::rename(tmp, &self.path))
     }
-    fn game(&self, id: &str) -> io::Result<usize> {
+    pub(crate) fn data_dir(&self, id: &str) -> io::Result<PathBuf> {
+        self.game(id)?;
+        Ok(self.path.parent().unwrap().join("games").join(id))
+    }
+    pub(crate) fn game(&self, id: &str) -> io::Result<usize> {
         let index = self.games.iter().position(|g| g.id == id);
         index.ok_or_else(|| io::Error::other("game not found"))
     }
@@ -122,11 +130,13 @@ impl Library {
         let ended = run.ended;
         let i = self.game(id)?;
         let game = &mut self.games[i];
-        game.sessions.push(PlaySession { ended, seconds });
+        if self.track_play_time {
+            game.sessions.push(PlaySession { ended, seconds });
+            game.play_seconds += u64::from(seconds);
+            add_daily(&mut game.daily, ended, seconds, &Local);
+        }
         game.last_played = Some(ended);
-        game.play_seconds += u64::from(seconds);
         game.last_run = Some(run);
-        add_daily(&mut game.daily, ended, seconds, &Local);
         self.prune(ended);
         self.save()
     }
@@ -487,6 +497,33 @@ mod tests {
         let lib = Library::load(dir.join("app")).unwrap();
         (dir, lib)
     }
+    // spec: HOST-LIB-3, HOST-LIB-6
+    #[test]
+    fn disabling_tracking_keeps_last_run_but_not_play_statistics() {
+        let (dir, mut lib) = fixture("tracking");
+        pe(&dir, "game.exe", 0x14c, 100);
+        let game = lib.add(&dir, "game.exe", 932, "Game").unwrap();
+        lib.track_play_time = false;
+        lib.save().unwrap();
+        let mut lib = Library::load(dir.join("app")).unwrap();
+        assert!(!lib.track_play_time);
+        let run = LastRun {
+            ended: now(),
+            summary: None,
+            error: None,
+        };
+        lib.finished(&game.id, 600, run.clone()).unwrap();
+        let game = &lib.games[0];
+        assert_eq!(game.play_seconds, 0);
+        assert!(game.sessions.is_empty() && game.daily.is_empty());
+        assert_eq!(game.last_run.as_ref(), Some(&run));
+        assert_eq!(game.last_played, Some(run.ended));
+        lib.track_play_time = true;
+        lib.finished(&lib.games[0].id.clone(), 60, run).unwrap();
+        assert_eq!(lib.games[0].play_seconds, 60);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // spec: HOST-LIB-2
     #[test]
     fn suggestion_skips_installers_bundles_and_console_programs() {
@@ -706,4 +743,15 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+fn tracking_default() -> bool {
+    true
+}
+
+#[tauri::command]
+pub fn set_tracking(state: Store<'_>, enabled: bool) -> Reply<()> {
+    let mut library = state.lock().unwrap();
+    library.track_play_time = enabled;
+    reply(library.save())
 }

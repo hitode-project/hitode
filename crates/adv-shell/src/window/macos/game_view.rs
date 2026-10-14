@@ -12,6 +12,8 @@ pub struct Input {
     regions: Arc<[adv_runtime::VideoCursorRegion]>,
     wheel: f64,
     modifiers: usize,
+    toggle_control: bool,
+    control_latched: bool,
 }
 
 define_class!(
@@ -37,6 +39,7 @@ define_class!(
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> bool {
             let mut input = self.ivars().borrow_mut();
+            input.control_latched = false;
             input.hub.push(Event::FocusLost);
             if input.cursor_hidden { NSCursor::unhide(); input.cursor_hidden = false; }
             true
@@ -75,6 +78,34 @@ define_class!(
 );
 
 impl GameView {
+    pub(super) fn viewport(&self, canvas: (u32, u32), scaling: crate::Scaling) -> Viewport {
+        let scale = self
+            .window()
+            .map_or(1.0, |window| window.backingScaleFactor());
+        Viewport::scaled(self.client(), canvas, scaling, scale)
+    }
+    pub(crate) fn clear_control_latch(&self) {
+        let mut input = self.ivars().borrow_mut();
+        if input.control_latched {
+            input.control_latched = false;
+            let (message, wparam, lparam) =
+                keys::message(keys::key(0x3b).unwrap(), false, false, false);
+            input.hub.push(Event::Input {
+                message,
+                wparam,
+                lparam,
+            });
+        }
+    }
+    pub(crate) fn set_fast_forward_toggle(&self, toggle: bool) {
+        let mut input = self.ivars().borrow_mut();
+        if input.toggle_control != toggle {
+            input.toggle_control = toggle;
+            input.control_latched = false;
+            input.hub.push(Event::FocusLost);
+        }
+    }
+
     /// Mouse lParams are client points, mapped like physical input.
     pub(crate) fn post_input(&self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
         let lparam = if (0x200..=0x20a).contains(&message) {
@@ -82,11 +113,7 @@ impl GameView {
                 f64::from(lparam as u16 as i16),
                 f64::from((lparam >> 16) as u16 as i16),
             );
-            let viewport = Viewport::fit(
-                self.client(),
-                self.hub().canvas.get().0,
-                self.hub().canvas.get().1,
-            );
+            let viewport = self.viewport(self.hub().canvas.get(), self.hub().scaling.get());
             let (x, y) =
                 viewport.position(x, y, self.hub().canvas.get().0, self.hub().canvas.get().1);
             u32::from(x as u16) | (u32::from(y as u16) << 16)
@@ -204,6 +231,8 @@ impl GameView {
             regions: Arc::from([]),
             wheel: 0.0,
             modifiers: 0,
+            toggle_control: false,
+            control_latched: false,
         }));
         let view: Retained<Self> = unsafe {
             msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(f64::from(width.max(1)), f64::from(height.max(1))))]
@@ -328,6 +357,19 @@ impl Input {
         if changed & bit == 0 {
             return;
         }
+        if self.toggle_control && matches!(bit, LEFT_CONTROL | RIGHT_CONTROL) {
+            if flags & bit != 0 {
+                self.control_latched = !self.control_latched;
+                let (message, wparam, lparam) =
+                    keys::message(keys::key(0x3b).unwrap(), self.control_latched, false, false);
+                self.hub.push(Event::Input {
+                    message,
+                    wparam,
+                    lparam,
+                });
+            }
+            return;
+        }
         let alt = |flags: usize| {
             flags & (LEFT_ALT | RIGHT_ALT) != 0 && flags & (LEFT_CONTROL | RIGHT_CONTROL) == 0
         };
@@ -364,7 +406,7 @@ impl Input {
             return;
         }
         let inside = x >= 0.0 && y >= 0.0 && x < cw && y < ch;
-        let viewport = Viewport::fit((cw, ch), self.width, self.height);
+        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
         let (gx, gy) = viewport.position(x, y, self.width, self.height);
         let on_canvas = gx >= 0 && gy >= 0 && gx < self.width as i32 && gy < self.height as i32;
         let pressed = NSEvent::pressedMouseButtons();
@@ -425,7 +467,7 @@ impl Input {
     }
 
     fn cursor_visible_at(&self, view: &GameView, point: (f64, f64)) -> bool {
-        let viewport = Viewport::fit(view.client(), self.width, self.height);
+        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
         let (x, y) = viewport.position(point.0, point.1, self.width, self.height);
         self.cursor_visible && !adv_runtime::VideoCursorRegion::hidden_at(&self.regions, x, y)
     }
@@ -456,6 +498,50 @@ impl Input {
             } else {
                 NSCursor::unhide();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // spec: HOST-RUN-2
+    #[test]
+    fn toggle_control_ignores_physical_releases_and_uses_one_guest_key() {
+        let hub = Rc::new(Hub::default());
+        let mut input = Input {
+            hub: hub.clone(),
+            width: 640,
+            height: 480,
+            cursor_visible: true,
+            cursor_hidden: false,
+            regions: Arc::from([]),
+            wheel: 0.0,
+            modifiers: 0,
+            toggle_control: true,
+            control_latched: false,
+        };
+        input.modifier(0x3b, LEFT_CONTROL, LEFT_CONTROL);
+        input.modifier(0x3b, 0, LEFT_CONTROL);
+        assert!(input.control_latched);
+        input.modifier(0x3e, RIGHT_CONTROL, RIGHT_CONTROL);
+        input.modifier(0x3e, 0, RIGHT_CONTROL);
+        assert!(!input.control_latched);
+        let events: Vec<_> = hub.events.borrow_mut().drain(..).collect();
+        assert_eq!(events.len(), 2);
+        for (event, down) in events.into_iter().zip([true, false]) {
+            let Event::Input {
+                message,
+                wparam,
+                lparam,
+            } = event
+            else {
+                panic!("expected Ctrl");
+            };
+            assert_eq!(
+                (message, wparam, lparam),
+                keys::message(keys::key(0x3b).unwrap(), down, false, false)
+            );
         }
     }
 }

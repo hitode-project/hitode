@@ -1,7 +1,8 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { untrack } from "svelte";
   import ManageSaves from "./ManageSaves.svelte";
-  import { preview } from "../lib/bridge";
+  import { device } from "../lib/device.svelte";
   import PhoneSettingsHeader from "./PhoneSettingsHeader.svelte";
   import UpscalingSelect from "./UpscalingSelect.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
@@ -33,9 +34,9 @@
 
 {#snippet head(key: OverrideKey, label: string, lang?: string)}
   <span class="t">
-    <i class="dot" aria-hidden="true"></i><span {lang} style="white-space: nowrap">{label}</span>{#if form.overridden(key)}<span class="sr">（已单独设置）</span>{/if}
+    <i class="dot" aria-hidden="true"></i><span {lang} style="white-space: nowrap">{label}</span>{#if form.overridden(key)}<span class="sr">{t("（已单独设置）")}</span>{/if}
   </span>
-  <button class="quiet rst" aria-label="{label} 恢复为全局设置" onclick={() => form.reset(key)}>恢复</button>
+  <button class="quiet rst" aria-label={t("{0} 恢复为全局设置", label)} onclick={() => form.reset(key)}>{t("恢复")}</button>
 {/snippet}
 
 {#snippet chevron()}
@@ -47,19 +48,22 @@
 
   <main class="scroll" aria-labelledby="pg-title">
     <div>
-      <h1 id="pg-title">此游戏的设置</h1>
+      <h1 id="pg-title">{t("此游戏的设置")}</h1>
       <div class="game">
         <span class="cv" aria-hidden="true"><span class="art {game.cover}" class:blur={hidden}></span></span>
         <span lang="ja" class="ellipsis">{game.title}</span>
       </div>
     </div>
 
+    {#if form.error}<p role="alert">{form.error}</p>{/if}
+    <p>{t("光盘与字体设置在下次启动时生效。")}</p>
+
     <section class="sec" aria-labelledby="pg-run">
-      <h2 id="pg-run">运行</h2>
+      <h2 id="pg-run">{t("运行")}</h2>
       <div class="row">
-        <span class="t">主程序</span>
+        <span class="t">{t("主程序")}</span>
         <span class="selw">
-          <select class="mono-sel" aria-label="主程序" onchange={(e) => form.setExe(e.currentTarget.value)}>
+          <select class="mono-sel" aria-label={t("主程序")} onchange={(e) => form.setExe(e.currentTarget.value)}>
             {#each form.exes as exe (exe)}
               <option value={exe} selected={exe === form.exe}>{exe}</option>
             {/each}
@@ -69,87 +73,85 @@
       </div>
       <div class="row" style="min-height: 68px">
         <span class="t" style="display: flex; flex-direction: column; gap: 3px">
-          <span>编码</span>
+          <span>{t("编码")}</span>
           <span class="enc ellipsis" lang={game.codepage === 932 ? "ja" : "zh-CN"}>{form.encPreview}</span>
         </span>
         <SettingsSeg
           variant="phone-sheet"
-          label="编码"
+          label={t("编码")}
           value={game.codepage === 936 ? "936" : "932"}
           onpick={(v) => form.setCodepage(v === "936" ? 936 : 932)}
           options={[
-            { value: "932", label: "日文" },
-            { value: "936", label: "简体中文" },
+            { value: "932", label: t("日文") },
+            { value: "936", label: t("简体中文") },
           ]}
         />
       </div>
-      {#if preview}
+      {#if device.gameView || device.simulated}
         <div class="row">
-          <span class="t">光盘</span>
-          <span class="val" style="font-size: 12px">更换光盘需重新启动游戏</span>
+          <span class="t">{t("光盘")}</span>
+          <span class="val" style="font-size: 12px">{t("更换光盘需重新启动游戏")}</span>
         </div>
         {#each setup.discs as disc, i (disc)}
           <div class="row sm">
             <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
             <span class="disc ellipsis">{disc}</span>
-            <button class="quiet" style="margin-right: -12px" aria-label="移除 {disc}" onclick={() => form.removeDisc(i)}>移除</button>
+            <button class="quiet" style="margin-right: -12px" aria-label={t("移除 {0}", disc)} onclick={() => form.removeDisc(i)}>{t("移除")}</button>
           </div>
         {/each}
         <div class="row sm">
-          <button class="quiet" style="margin-left: -12px" onclick={() => form.addDisc()} disabled={form.discsFull}>添加光盘镜像…</button>
+          <button class="quiet" style="margin-left: -12px" onclick={() => form.addDisc()} disabled={form.discsFull}>{t("添加光盘镜像…")}</button>
         </div>
       {/if}
     </section>
 
     <section class="sec" aria-labelledby="pg-view">
-      <h2 id="pg-view">画面</h2>
-      {#if preview}
+      <h2 id="pg-view">{t("画面")}</h2>
+      {#if device.gameView || device.simulated}
         <div class="row" class:ov={form.overridden("scale")}>
-          {@render head("scale", "缩放")}
+          {@render head("scale", t("缩放"))}
           <SettingsSeg
             variant="phone-sheet"
-            label="缩放"
+            label={t("缩放")}
             value={form.value("scale")}
             onpick={(v) => form.pick("scale", v)}
             options={[
-              { value: "fit", label: "适应" },
-              { value: "int", label: "整数倍" },
-              { value: "stretch", label: "拉伸" },
+              { value: "fit", label: t("适应") },
+              { value: "int", label: t("整数倍") },
+              { value: "stretch", label: t("拉伸") },
             ]}
           />
         </div>
       {/if}
       <div class="row" class:ov={form.overridden("filter")}>
-        {@render head("filter", "超分辨率")}
+        {@render head("filter", t("超分辨率"))}
         <UpscalingSelect value={form.overridden("filter") ? form.value("filter") : "inherit"}
           inherit={form.global.filter}
           onpick={(v) => v === "inherit" ? form.reset("filter") : form.pick("filter", v)} />
       </div>
     </section>
 
-    {#if preview}
+    {#if device.gameView || device.simulated}
       <section class="sec" aria-labelledby="pg-font">
-        <h2 id="pg-font">字体</h2>
+        <h2 id="pg-font">{t("字体")}</h2>
         {#each fonts as f (f.key)}
           {@const cur = form.value(f.key)}
           <div class="row" class:ov={form.overridden(f.key)}>
             {@render head(f.key, f.name, "ja")}
             <span class="selw">
-              <select aria-label="{f.name} 的替换字体" onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
-                <option value="auto" selected={cur === "auto"}>自动</option>
-                <option value="sans" selected={cur === "sans"}>Noto Sans JP</option>
-                <option value="serif" selected={cur === "serif"}>Noto Serif JP</option>
+              <select aria-label={t("{0} 的替换字体", f.name)} onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
+                <option value="auto" selected={cur === "auto"}>{t("自动")}</option>
                 {#each form.extraFonts as name (name)}
                   <option value="font:{name}" selected={cur === `font:${name}`}>{name}</option>
                 {/each}
-                <option value="import">导入字体文件…</option>
+                <option value="import">{t("导入字体文件…")}</option>
               </select>
               {@render chevron()}
             </span>
           </div>
         {/each}
         <div style="padding: 14px 0; border-bottom: 1px solid var(--line)">
-          <div class="pv {form.smoothClass}" role="group" aria-label="字体预览">
+          <div class="pv {form.smoothClass}" role="group" aria-label={t("字体预览")}>
             {#each fonts as f (f.key)}
               <div>
                 <span lang="ja" style="font-size: 12px; color: var(--fg3)">{f.name}</span>
@@ -159,60 +161,56 @@
           </div>
         </div>
         <div class="row" class:ov={form.overridden("smooth")}>
-          {@render head("smooth", "字形平滑")}
+          {@render head("smooth", t("字形平滑"))}
           <SettingsSeg
             variant="phone-sheet"
-            label="字形平滑"
+            label={t("字形平滑")}
             value={form.value("smooth")}
             onpick={(v) => form.pick("smooth", v)}
             options={[
-              { value: "game", label: "跟随游戏" },
-              { value: "on", label: "开" },
-              { value: "off", label: "关" },
+              { value: "game", label: t("跟随游戏") },
+              { value: "on", label: t("开") },
+              { value: "off", label: t("关") },
             ]}
           />
         </div>
       </section>
 
       <section class="sec" aria-labelledby="pg-input">
-        <h2 id="pg-input">输入</h2>
+        <h2 id="pg-input">{t("输入")}</h2>
         <div class="row" class:ov={form.overridden("ff")}>
-          {@render head("ff", "快进键")}
+          {@render head("ff", t("快进键"))}
           <SettingsSeg
             variant="phone-sheet"
-            label="快进键"
+            label={t("快进键")}
             value={form.value("ff")}
             onpick={(v) => form.pick("ff", v)}
             options={[
-              { value: "hold", label: "按住" },
-              { value: "toggle", label: "切换" },
+              { value: "hold", label: t("按住") },
+              { value: "toggle", label: t("切换") },
             ]}
           />
         </div>
-        <div class="row">
-          <span class="t">触屏按键布局</span>
-          <!-- The touch layout editor has no design yet. -->
-          <button class="quiet" style="margin-right: -12px" aria-label="编辑触屏按键布局">编辑…</button>
-        </div>
+
       </section>
     {/if}
 
-    <nav aria-label="更多" class="more">
-      {#if preview}
+    <nav aria-label={t("更多")} class="more">
+      {#if device.gameView || device.simulated}
         <button class="link" onclick={() => (saves = true)}>
           <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-          <span>存档…</span>
+          <span>{t("存档…")}</span>
         </button>
       {/if}
       <button class="link" onclick={() => revealFolder(game.path)}>
         <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"></path></svg>
-        <span>打开所在文件夹</span>
+        <span>{t("打开所在文件夹")}</span>
       </button>
     </nav>
 
-    {#if preview}
+    {#if device.gameView || device.simulated}
       <div style="display: flex; justify-content: center; margin-top: -8px">
-        <button class="quiet" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>全部恢复默认</button>
+        <button class="quiet" disabled={!form.anyOverridden} onclick={() => form.resetAll()}>{t("全部恢复默认")}</button>
       </div>
     {/if}
   </main>

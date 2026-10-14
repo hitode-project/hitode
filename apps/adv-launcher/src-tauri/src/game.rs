@@ -55,6 +55,8 @@ thread_local! {
 struct Host {
     container: Retained<GameContainer>,
     session: Option<Session>,
+    playback: Option<Playback>,
+    paused: bool,
     close_window: bool,
     // Pending game close, with an exit code only when the application should quit.
     exit: Option<Option<i32>>,
@@ -154,6 +156,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                             session.set_active(
                                 name == unsafe { NSApplicationDidBecomeActiveNotification },
                             );
+                            host.as_ref().unwrap().apply_pause();
                         }
                     });
                 },
@@ -205,6 +208,8 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
             *host = Some(Host {
                 container,
                 session: None,
+                playback: None,
+                paused: false,
                 close_window: false,
                 exit: None,
                 quit,
@@ -247,7 +252,12 @@ enum Finished {
 }
 
 #[tauri::command]
-pub async fn start_game(window: WebviewWindow, id: String, filter: String) -> Result<(), String> {
+pub async fn start_game(
+    window: WebviewWindow,
+    id: String,
+    filter: String,
+    playback: Playback,
+) -> Result<(), String> {
     let filter = upscaler(&filter)?;
     let (exe, data_dir, codepage) = window
         .state::<Mutex<Library>>()
@@ -261,12 +271,28 @@ pub async fn start_game(window: WebviewWindow, id: String, filter: String) -> Re
         .run_on_main_thread(move || {
             let started = HOST.with_borrow_mut(|host| {
                 let host = host.as_mut().unwrap();
+                if crate::saves::busy() {
+                    return Err("存档操作正在进行，请稍后启动".into());
+                }
                 if host.session.is_some() {
                     return Err("a game is already running".into());
                 }
+                let backup_data = data_dir.clone();
                 let mut options = Options::new(exe, data_dir);
                 options.codepage = Some(codepage);
                 options.audio = true;
+                if playback.discs.len() > 4 {
+                    return Err("at most four disc images can be mounted".into());
+                }
+                options.cdroms = playback
+                    .discs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| ((b'D' + i as u8) as char, p.clone()))
+                    .collect();
+                options.font_files = playback.font_files.clone();
+                options.font_families = playback.font_families.clone();
+                options.font_smoothing = playback.smoothing;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
@@ -286,6 +312,9 @@ pub async fn start_game(window: WebviewWindow, id: String, filter: String) -> Re
                             )
                         });
                         let elapsed = started_at.elapsed();
+                        if let Err(error) = crate::saves::automatic(&backup_data) {
+                            let _ = finished_window.emit("backup_failed", error.to_string());
+                        }
                         let summary = match &result {
                             Ok(finished) => finished.summary.clone(),
                             Err(error) => adv_shell::error_summary(error, elapsed),
@@ -340,7 +369,11 @@ pub async fn start_game(window: WebviewWindow, id: String, filter: String) -> Re
                                 .contains(NSWindowOcclusionState::Visible),
                         );
                         session.set_upscaler(filter);
+                        playback.apply(&session)?;
                         host.session = Some(session);
+                        host.playback = Some(playback);
+                        host.paused = false;
+                        host.apply_pause();
                         // AppKit installs its own quit handler while the app
                         // finishes launching; replace it once a game starts.
                         unsafe {
@@ -424,11 +457,14 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     window
         .run_on_main_thread(move || {
-            let done = HOST.with_borrow(|host| {
-                host.as_ref()
-                    .and_then(|host| host.session.as_ref())
-                    .map(|session| session.set_paused(paused))
-                    .ok_or_else(|| "no game is running".to_string())
+            let done = HOST.with_borrow_mut(|host| {
+                let host = host.as_mut().unwrap();
+                if host.session.is_none() {
+                    return Err("no game is running".to_string());
+                }
+                host.paused = paused;
+                host.apply_pause();
+                Ok(())
             });
             let _ = reply.send(done);
         })
@@ -515,4 +551,71 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
             }
         });
     }
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Playback {
+    scale: String,
+    volume: u8,
+    muted: bool,
+    toggle: bool,
+    pause_in_background: bool,
+    discs: Vec<std::path::PathBuf>,
+    font_files: Vec<std::path::PathBuf>,
+    font_families: std::collections::BTreeMap<String, String>,
+    smoothing: Option<bool>,
+}
+impl Playback {
+    fn apply(&self, session: &Session) -> Result<(), String> {
+        let scale = match self.scale.as_str() {
+            "fit" => adv_shell::Scaling::Fit,
+            "int" => adv_shell::Scaling::Integer,
+            "stretch" => adv_shell::Scaling::Stretch,
+            _ => return Err("unknown scaling mode".into()),
+        };
+        session.set_scaling(scale);
+        session.set_volume(if self.muted { 0 } else { self.volume });
+        session.set_fast_forward_toggle(self.toggle);
+        Ok(())
+    }
+}
+impl Host {
+    fn apply_pause(&self) {
+        if let Some(session) = &self.session {
+            let background =
+                !NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).isActive();
+            session.set_paused(
+                self.paused
+                    || (background
+                        && self
+                            .playback
+                            .as_ref()
+                            .is_some_and(|p| p.pause_in_background)),
+            );
+        }
+    }
+}
+#[tauri::command]
+pub fn set_game_playback(playback: Playback) -> Result<(), String> {
+    HOST.with_borrow_mut(|host| {
+        let host = host.as_mut().unwrap();
+        let session = host.session.as_ref().ok_or("no game is running")?;
+        playback.apply(session)?;
+        host.playback = Some(playback);
+        host.apply_pause();
+        Ok(())
+    })
+}
+#[tauri::command]
+pub fn game_fps() -> f64 {
+    HOST.with_borrow(|host| {
+        host.as_ref()
+            .and_then(|host| host.session.as_ref())
+            .map_or(0.0, Session::fps)
+    })
+}
+
+pub(crate) fn is_running() -> bool {
+    HOST.with_borrow(|host| host.as_ref().is_some_and(|host| host.session.is_some()))
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { LaunchFlow } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -23,39 +24,39 @@
 
         {#if flow.view === "prepare"}
           <div class="state fade">
-            <div class="msg">正在启动</div>
-            <div class="track" role="progressbar" aria-label="正在启动"><span class="fill"></span></div>
+            <div class="msg">{t("正在启动")}</div>
+            <div class="track" role="progressbar" aria-label={t("正在启动")}><span class="fill"></span></div>
           </div>
         {:else if flow.view === "failed"}
           <div class="state fade">
-            <div class="msg">游戏已停止</div>
+            <div class="msg">{t("游戏已停止")}</div>
             <div class="chip mono">{flow.reason}</div>
           </div>
         {:else}
           <div class="state fade">
-            <div class="msg">暂不支持</div>
+            <div class="msg">{t("暂不支持")}</div>
             <div class="chip mono">{flow.reason}</div>
           </div>
         {/if}
       {:else}
-        <div class="msg">找不到这个游戏</div>
+        <div class="msg">{t("找不到这个游戏")}</div>
       {/if}
     </div>
 
     {#if !game}
-      <div class="acts"><button class="btn primary" onclick={() => nav.home()}>返回</button></div>
+      <div class="acts"><button class="btn primary" onclick={() => nav.home()}>{t("返回")}</button></div>
     {:else if flow.view === "prepare"}
-      <div class="acts"><button class="btn quiet" onclick={() => flow.cancel()}>取消</button></div>
+      <div class="acts"><button class="btn quiet" onclick={() => flow.cancel()}>{t("取消")}</button></div>
     {:else if flow.view === "failed"}
       <div class="acts fade">
-        <button class="btn primary" onclick={() => flow.retry()}>再试一次</button>
-        <button class="btn quiet" onclick={() => flow.report()}>报告问题…</button>
-        <button class="btn quiet" onclick={() => nav.back()}>返回</button>
+        <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
+        <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
+        <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
       </div>
     {:else}
       <div class="acts fade">
-        <button class="btn primary" onclick={() => nav.back()}>返回</button>
-        <button class="btn quiet" onclick={() => flow.changeExe()}>更换主程序</button>
+        <button class="btn primary" onclick={() => nav.back()}>{t("返回")}</button>
+        <button class="btn quiet" onclick={() => flow.changeExe()}>{t("更换主程序")}</button>
       </div>
     {/if}
   </div>

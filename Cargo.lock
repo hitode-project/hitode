@@ -166,6 +166,7 @@ dependencies = [
  "adv-shell",
  "block2",
  "chrono",
+ "fontdb",
  "getrandom 0.3.4",
  "objc2",
  "objc2-app-kit",

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import Icon from "./Icon.svelte";
   import { nav } from "../lib/nav.svelte";
 </script>
@@ -9,13 +10,12 @@
     <div class="ghost-card" style="width: 76px"></div>
     <div class="ghost-card" style="transform: rotate(6deg) translateY(6px); opacity: .6"></div>
   </div>
-  <h2>添加游戏文件夹</h2>
+  <h2>{t("添加游戏文件夹")}</h2>
   <div class="actions">
     <button class="primary" onclick={() => nav.go({ name: "scan" })}>
       <Icon name="folder-plus" size={15} stroke={1.5} />
-      <span>添加文件夹…</span>
+      <span>{t("添加文件夹…")}</span>
     </button>
-    <button class="quiet">支持哪些游戏？</button>
   </div>
 </main>
 

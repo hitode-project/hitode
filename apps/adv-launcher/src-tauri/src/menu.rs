@@ -54,3 +54,17 @@ pub fn set_pause_available<R: Runtime>(app: AppHandle<R>, available: bool) -> Re
         None => Ok(()),
     }
 }
+
+#[tauri::command]
+pub fn set_menu_language<R: Runtime>(app: AppHandle<R>, language: String) -> Result<(), String> {
+    if let Some(item) = app.try_state::<PauseItem<R>>() {
+        item.0
+            .set_text(match language.as_str() {
+                "zh" => "暂停",
+                "ja" => "一時停止",
+                _ => "Pause",
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

@@ -1,6 +1,6 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import PhoneReportResult from "../components/PhoneReportResult.svelte";
-  import { inTauri } from "../lib/bridge";
   import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -54,37 +54,37 @@
 
 <div class="report" bind:this={root}>
   {#if game && form.loadError}
-    <PhoneReportResult id="pr-load" title="读不到游戏程序" onclose={() => nav.back()}>
+    <PhoneReportResult id="pr-load" title={t("读不到游戏程序")} onclose={() => nav.back()}>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
       {/snippet}
       <div class="path mono">{form.loadError}</div>
       {#snippet actions()}
-        <button class="primary big" onclick={() => nav.back()}>返回</button>
+        <button class="primary big" onclick={() => nav.back()}>{t("返回")}</button>
       {/snippet}
     </PhoneReportResult>
   {:else if game && !ctx}
     <!-- The host is identifying the main program. -->
   {:else if !game || !ctx}
-    <PhoneReportResult id="pr-none" title="找不到这个游戏" onclose={() => nav.home()}>
+    <PhoneReportResult id="pr-none" title={t("找不到这个游戏")} onclose={() => nav.home()}>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 7.2v4M8 4.9h.01"></path></svg>
       {/snippet}
       {#snippet actions()}
-        <button class="primary big" onclick={() => nav.home()}>返回</button>
+        <button class="primary big" onclick={() => nav.home()}>{t("返回")}</button>
       {/snippet}
     </PhoneReportResult>
   {:else if form.view === "form" || form.view === "sending"}
     <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="pr-title" aria-busy={sending}>
       <header class="head">
-        <button class="x" aria-label="关闭" onclick={close}>
+        <button class="x" aria-label={t("关闭")} onclick={close}>
           <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"></path></svg>
         </button>
       </header>
 
       <main class="body" class:busy={sending}>
         <div class="who">
-          <h1 id="pr-title">报告问题</h1>
+          <h1 id="pr-title">{t("报告问题")}</h1>
           <div class="game">
             <div class="th" aria-hidden="true">
               <div class="art {game.cover}" class:blur={game.nsfw && prefs.blurAdult && !library.revealed[game.id]}></div>
@@ -97,23 +97,23 @@
         </div>
 
         <div>
-          <p class="lbl" id="pr-sit">情况</p>
+          <p class="lbl" id="pr-sit">{t("情况")}</p>
           <div class="tiles" role="radiogroup" aria-labelledby="pr-sit">
             {#each SITUATIONS as [key, label] (key)}
               <label class="tile" class:on={form.situation === key}>
                 <input type="radio" name="psit" value={key} bind:group={form.situation} />
-                <span>{label}</span>
+                <span>{t(label)}</span>
               </label>
             {/each}
           </div>
           {#if form.isPerf}
-            <div class="chips fade" role="group" aria-label="性能问题">
+            <div class="chips fade" role="group" aria-label={t("性能问题")}>
               {#each PERF_ISSUES as key (key)}
                 <button class="chip" class:on={form.issues[key]} aria-pressed={form.issues[key] ?? false} onclick={() => form.toggleIssue(key)}>
                   {#if form.issues[key]}
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>
                   {/if}
-                  <span>{ISSUE_LABELS[key]}</span>
+                  <span>{t(ISSUE_LABELS[key])}</span>
                 </button>
               {/each}
             </div>
@@ -121,27 +121,26 @@
         </div>
 
         <div>
-          <textarea class="note" rows="3" aria-label="补充说明（可选）" placeholder="补充说明（可选）" bind:value={form.note}></textarea>
-          <div class="ttl">30 天后删除</div>
+          <textarea class="note" rows="3" aria-label={t("补充说明（可选）")} placeholder={t("补充说明（可选）")} bind:value={form.note}></textarea>
         </div>
 
         <div>
-          <p class="lbl">将发送的内容</p>
+          <p class="lbl">{t("报告内容")}</p>
           <div class="list">
             {#each form.rows as r (r.id)}
               <div class="rw" class:off={r.removed}>
                 <span class="k">{r.label}</span>
                 <span class="v" class:mono={!r.txt} class:txt={r.txt}>{r.value}</span>
                 {#if r.locked}
-                  <span class="lock" role="img" aria-label="{r.label}：必需，无法移除">
+                  <span class="lock" role="img" aria-label={t("{0}：必需，无法移除", r.label)}>
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"></rect><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"></path></svg>
                   </span>
                 {:else if r.optional}
                   {@const key = r.optional}
                   {#if r.removed}
-                    <button class="addback" aria-label="加回{r.label}" onclick={() => (form.off[key] = false)}>加回</button>
+                    <button class="addback" aria-label={t("加回{0}", r.label)} onclick={() => (form.off[key] = false)}>{t("加回")}</button>
                   {:else}
-                    <button class="act" aria-label="不发送{r.label}" onclick={() => (form.off[key] = true)}>
+                    <button class="act" aria-label={t("不发送{0}", r.label)} onclick={() => (form.off[key] = true)}>
                       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"></path></svg>
                     </button>
                   {/if}
@@ -149,59 +148,50 @@
               </div>
             {/each}
           </div>
-          <div class="privacy">不含文件路径、用户名、截图和存档</div>
+          <div class="privacy">{t("不含文件路径、用户名、截图和存档")}</div>
           <button class="rawbtn" class:open={form.rawOpen} aria-expanded={form.rawOpen} aria-controls="pr-raw" onclick={() => (form.rawOpen = !form.rawOpen)}>
-            <span>查看原始数据</span>
+            <span>{t("查看原始数据")}</span>
             <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"></path></svg>
           </button>
           {#if form.rawOpen}
-            <pre id="pr-raw" class="raw mono fade" aria-label="原始数据">{form.raw}</pre>
+            <pre id="pr-raw" class="raw mono fade" aria-label={t("原始数据")}>{form.raw}</pre>
           {/if}
         </div>
       </main>
 
       <footer class="foot">
-        <button class={inTauri ? "primary big" : "secondary big"} onclick={() => form.save()} disabled={sending}>保存为文件</button>
-        <!-- There is no report service yet: inside the app a report is saved as a file. -->
-        {#if !inTauri}
-          <button class="primary big" onclick={() => form.submit()} disabled={sending}>
-            {#if sending}
-              <span class="spin" aria-hidden="true"></span><span>正在提交</span>
-            {:else}
-              <span>匿名提交</span>
-            {/if}
-          </button>
-        {/if}
+        <button class="primary big" onclick={() => form.save()} disabled={sending}>{t("保存为文件")}</button>
+
       </footer>
     </div>
   {:else if form.view === "sent"}
-    <PhoneReportResult id="pr-sent" title="已提交" ok>
+    <PhoneReportResult id="pr-sent" title={t("已提交")} ok>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3L13 4.5"></path></svg>
       {/snippet}
-      <p class="sub">可在 设置 › 反馈与隐私 中撤回</p>
+      <p class="sub">{t("可在 设置 › 反馈与隐私 中撤回")}</p>
       {#snippet actions()}
-        <button class="primary big" data-autofocus onclick={() => nav.back()}>完成</button>
+        <button class="primary big" data-autofocus onclick={() => nav.back()}>{t("完成")}</button>
       {/snippet}
     </PhoneReportResult>
   {:else if form.view === "error"}
-    <PhoneReportResult id="pr-err" title="没有连上服务器" onclose={() => (form.view = "form")}>
+    <PhoneReportResult id="pr-err" title={t("没有连上服务器")} onclose={() => (form.view = "form")}>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5a8 8 0 0 1 11 0M4.6 8.8a5 5 0 0 1 6.8 0M7 11.2a1.6 1.6 0 0 1 2 0"></path><path d="M2.5 2.5l11 11"></path></svg>
       {/snippet}
       {#snippet actions()}
-        <button class="primary big" data-autofocus onclick={() => form.submit()}>重试</button>
-        <button class="secondary big" onclick={() => form.save()}>保存为文件</button>
+        <button class="primary big" data-autofocus onclick={() => form.submit()}>{t("重试")}</button>
+        <button class="secondary big" onclick={() => form.save()}>{t("保存为文件")}</button>
       {/snippet}
     </PhoneReportResult>
   {:else}
-    <PhoneReportResult id="pr-saved" title="已保存" ok tight>
+    <PhoneReportResult id="pr-saved" title={t("已保存")} ok tight>
       {#snippet badge()}
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7"></path><path d="M3 12.5h10"></path></svg>
       {/snippet}
       <div class="path mono">{form.savedPath}</div>
       {#snippet actions()}
-        <button class="primary big" data-autofocus onclick={() => nav.back()}>完成</button>
+        <button class="primary big" data-autofocus onclick={() => nav.back()}>{t("完成")}</button>
       {/snippet}
     </PhoneReportResult>
   {/if}
@@ -394,12 +384,6 @@
   .note:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-  }
-  .ttl {
-    margin-top: 6px;
-    text-align: right;
-    font-size: 11px;
-    color: var(--fg3);
   }
   .list {
     border-top: 1px solid var(--line);

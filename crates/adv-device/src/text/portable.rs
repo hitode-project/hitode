@@ -1707,7 +1707,7 @@ pub(super) fn paint(
     let run = font.run(paint.input)?;
     let metrics = font.metrics();
     let size = font.extent(paint.input)?;
-    let format = if request.quality == Quality::Monochrome {
+    let format = if font.request.quality == Quality::Monochrome {
         GlyphFormat::Monochrome
     } else {
         GlyphFormat::Gray8

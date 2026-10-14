@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import ImportFooter from "../components/ImportFooter.svelte";
   import ImportMini from "../components/ImportMini.svelte";
   import ImportSwitch from "../components/ImportSwitch.svelte";
@@ -13,13 +14,13 @@
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="col">
     <header>
-      <h1>添加文件夹</h1>
+      <h1>{t("添加文件夹")}</h1>
       <div class="mono" style="margin-top: 8px">{scan.root}</div>
     </header>
 
     <section class="opts">
       <div class="line wrap">
-        <span id="lbl-depth" style="flex: 1 1 200px; font-size: 14px">子文件夹层数</span>
+        <span id="lbl-depth" style="flex: 1 1 200px; font-size: 14px">{t("子文件夹层数")}</span>
         <div class="seg" role="group" aria-labelledby="lbl-depth">
           {#each SCAN_DEPTHS as n (n)}
             <button class:on={scan.depth === n} aria-pressed={scan.depth === n} aria-label={depthLabel(n)} onclick={() => scan.setDepth(n)}
@@ -29,24 +30,24 @@
         </div>
       </div>
       <div class="line">
-        <span style="flex: 1 1 auto; font-size: 14px">以后自动发现新游戏</span>
-        <ImportSwitch checked={scan.watch} label="以后自动发现新游戏" onchange={(v) => (scan.watch = v)} />
+        <span style="flex: 1 1 auto; font-size: 14px">{t("以后自动发现新游戏")}</span>
+        <ImportSwitch checked={scan.watch} label={t("以后自动发现新游戏")} onchange={(v) => (scan.watch = v)} />
       </div>
     </section>
 
     {#if scan.phase !== "ready"}
-      <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? "正在选择文件夹…" : "正在查找游戏…"}</div>
+      <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…")}</div>
     {:else}
         <section aria-labelledby="h-found" style="display: flex; flex-direction: column; gap: 10px">
       <div style="display: flex; align-items: baseline; gap: 12px; padding: 0 2px">
-        <h2 id="h-found" class="lbl">找到 {scan.list.length} 个</h2>
+        <h2 id="h-found" class="lbl">{t("找到")} {scan.list.length} {t("个")}</h2>
         <div style="flex: 1"></div>
         {#if scan.pickable.length > 0}
-          <button class="link" style="font-size: 13px" onclick={() => scan.toggleAll()}>{scan.allOn ? "全不选" : "全选"}</button>
+          <button class="link" style="font-size: 13px" onclick={() => scan.toggleAll()}>{scan.allOn ? t("全不选") : t("全选")}</button>
         {/if}
       </div>
       {#if scan.list.length === 0}
-        <div style="padding: 36px 0; text-align: center; font-size: 14px; color: var(--fg2)">这一层没有游戏</div>
+        <div style="padding: 36px 0; text-align: center; font-size: 14px; color: var(--fg2)">{t("这一层没有游戏")}</div>
       {/if}
       <div style="display: flex; flex-direction: column; gap: 2px">
         {#each scan.list as g (g.id)}
@@ -63,14 +64,10 @@
             </label>
             <span class="exe mono" style="color: var(--fg2); white-space: nowrap">{g.exe}</span>
             {#if !locked}
-              <ImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label="{g.name} 的编码" onpick={(v) => scan.setEnc(g, v)} />
+              <ImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label={t("{0} 的编码", g.name)} onpick={(v) => scan.setEnc(g, v)} />
             {/if}
             {#if g.setup}
-              {#if scan.installNote === g.id}
-                <span class="note" role="status">暂不支持安装</span>
-              {:else}
-                <button class="link" style="font-size: 13px" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
-              {/if}
+              <span class="note" role="status">{t("暂不支持安装")}</span>
             {/if}
             {#if locked && !g.setup}
               <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{scanNote(g)}</span>
@@ -84,7 +81,7 @@
 </main>
 
 <ImportFooter width={720}>
-  <button class="quiet" onclick={() => nav.back()}>取消</button>
+  <button class="quiet" onclick={() => nav.back()}>{t("取消")}</button>
   <button class="primary" onclick={() => scan.add()} disabled={scan.adding || (!scan.done && scan.chosen.length === 0)}>{scan.addLabel}</button>
 </ImportFooter>
 

@@ -191,6 +191,14 @@ class Library {
     if (game) await this.#update(game, { nsfw: !game.nsfw }, () => (game.nsfw = !game.nsfw));
   }
 
+  async rename(id: string, title: string): Promise<void> {
+    const game = this.get(id);
+    if (!game) throw new Error("game not found");
+    if (!inTauri) { game.title = title; return; }
+    const updated = await libraryUpdate(id, { title });
+    if (updated) this.put({ ...updated, offline: game.offline });
+  }
+
   /** The program the game runs and its code page. */
   async setRun(id: string, patch: { exe?: string; codepage?: Codepage }): Promise<void> {
     const game = this.get(id);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import type { StatsBucket, StatsScale } from "../lib/stats";
 
   // Column chart of play time with a readout of the selected (or hovered) column.
@@ -48,7 +49,7 @@
 <section class="chart" aria-label={title}>
   <div class="readout" aria-live="polite">
     <span class="rl">{shown?.label ?? ""}</span>
-    <span class="rv">{(shown?.hours ?? 0).toFixed(1)} 小时</span>
+    <span class="rv">{(shown?.hours ?? 0).toFixed(1)} {t("小时")}</span>
   </div>
   <div class="frame">
     <div class="plot" style:height="{height}px">
@@ -65,7 +66,7 @@
             class:hover={i === hover}
             tabindex={i === selected ? 0 : -1}
             aria-pressed={i === selected}
-            aria-label="{b.label} {b.hours.toFixed(1)} 小时"
+            aria-label={t("{0} {1} 小时", b.label, b.hours.toFixed(1))}
             onclick={() => onselect(i)}
             {onkeydown}
             onpointerenter={(e) => {

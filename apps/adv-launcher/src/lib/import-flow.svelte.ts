@@ -1,3 +1,4 @@
+import { t } from "./i18n.svelte";
 import { inTauri } from "./bridge";
 import {
   addToLibrary,
@@ -38,12 +39,12 @@ function sizeLabel(bytes: number): string {
 export const SCAN_DEPTHS = [1, 2, 3] as const;
 
 export function depthLabel(n: number): string {
-  return `${n} 层子文件夹`;
+  return t("{0} 层子文件夹", n);
 }
 
 export const SCAN_ENC_OPTIONS: { value: Enc; label: string }[] = [
-  { value: "ja", label: "日文" },
-  { value: "zh", label: "简中" },
+  { value: "ja", get label() { return t("日文"); } },
+  { value: "zh", get label() { return t("简中"); } },
 ];
 
 /** A scan result as the pages list it. */
@@ -80,7 +81,7 @@ export function scanLocked(g: ScanRow): boolean {
 }
 
 export function scanNote(g: ScanRow): string {
-  return g.inLib ? "已在库中" : "没找到程序";
+  return g.inLib ? t("已在库中") : t("没找到程序");
 }
 
 export class ScanPick {
@@ -104,7 +105,7 @@ export class ScanPick {
   readonly chosen = $derived(this.pickable.filter((g) => !this.off[g.id]));
   readonly allOn = $derived(this.chosen.length === this.pickable.length);
   readonly addLabel = $derived(
-    this.done ? "已添加" : this.adding ? "正在添加…" : this.chosen.length ? `添加 ${this.chosen.length} 个游戏` : "添加",
+    this.done ? t("已添加") : this.adding ? t("正在添加…") : this.chosen.length ? t("添加 {0} 个游戏", this.chosen.length) : t("添加"),
   );
 
   #began = false;
@@ -271,7 +272,7 @@ export class ImportPick {
       }
       this.phase = "reading";
       const inspection = inTauri ? await libraryInspect(folder) : fakeInspection();
-      if (!inspection) throw new Error("读不到这个文件夹");
+      if (!inspection) throw new Error(t("读不到这个文件夹"));
       this.#show(inspection);
     } catch (error) {
       this.error = String(error);

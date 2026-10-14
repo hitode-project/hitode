@@ -1,3 +1,4 @@
+import { t } from "./i18n.svelte";
 import { call } from "./bridge";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
@@ -50,19 +51,19 @@ const OS_NAMES: Record<string, string> = { windows: "Windows", macos: "macOS", l
 const NOT_RUN = "未运行过";
 
 function failureLabel(summary: RunSummary | null | undefined): string {
-  if (!summary) return NOT_RUN;
+  if (!summary) return t(NOT_RUN);
   const f = summary.failure;
-  if (!f) return "没有记录到失败";
-  if (f.kind === "api") return `未实现 · ${f.api ?? "未知接口"}`;
-  if (f.kind === "cpu") return `CPU 异常 · ${f.cpu_fault ?? "未知"}`;
-  return "运行时错误";
+  if (!f) return t("没有记录到失败");
+  if (f.kind === "api") return t("未实现 · {0}", f.api ?? t("未知接口"));
+  if (f.kind === "cpu") return t("CPU 异常 · {0}", f.cpu_fault ?? t("未知"));
+  return t("运行时错误");
 }
 
 function perfLabel(summary: RunSummary | null | undefined): string {
-  if (!summary) return NOT_RUN;
+  if (!summary) return t(NOT_RUN);
   const p = summary.perf;
-  if (!p) return "没有帧时间记录";
-  return `帧时间 p50 ${p.frame_ms_p50.toFixed(1)} ms · p95 ${p.frame_ms_p95.toFixed(1)} ms`;
+  if (!p) return t("没有帧时间记录");
+  return t("帧时间 p50 {0} ms · p95 {1} ms", p.frame_ms_p50.toFixed(1), p.frame_ms_p95.toFixed(1));
 }
 
 /**
@@ -152,16 +153,16 @@ export class ReportForm {
     const ctx = this.#ctx();
     if (!ctx) return [];
     const list: Omit<ReportRow, "removed">[] = [
-      { id: "exe", label: "程序指纹", value: ctx.exeLabel, locked: true },
-      { id: "ver", label: "版本", value: ctx.versionLabel, locked: true },
-      { id: "plat", label: "平台", value: ctx.platformLabel, locked: true },
-      { id: "cp", label: "编码", value: ctx.codepageLabel, locked: true },
+      { id: "exe", label: t("程序指纹"), value: ctx.exeLabel, locked: true },
+      { id: "ver", label: t("版本"), value: ctx.versionLabel, locked: true },
+      { id: "plat", label: t("平台"), value: ctx.platformLabel, locked: true },
+      { id: "cp", label: t("编码"), value: ctx.codepageLabel, locked: true },
     ];
     // A launch failure is the point of the report, so it cannot be left out.
     if (this.hasFail)
-      list.push({ id: "fail", label: "失败信息", value: ctx.failureLabel, locked: this.situation === "fail", optional: "failure" });
-    if (this.isPerf) list.push({ id: "perf", label: "性能", value: ctx.perfLabel, locked: false, optional: "perf" });
-    if (this.trimmed) list.push({ id: "note", label: "备注", value: this.trimmed, txt: true, locked: false, optional: "note" });
+      list.push({ id: "fail", label: t("失败信息"), value: ctx.failureLabel, locked: this.situation === "fail", optional: "failure" });
+    if (this.isPerf) list.push({ id: "perf", label: t("性能"), value: ctx.perfLabel, locked: false, optional: "perf" });
+    if (this.trimmed) list.push({ id: "note", label: t("备注"), value: this.trimmed, txt: true, locked: false, optional: "note" });
     return list.map((r) => ({ ...r, removed: !r.locked && r.optional !== undefined && this.off[r.optional] }));
   });
 

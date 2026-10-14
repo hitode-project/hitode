@@ -1,4 +1,4 @@
-/** Launcher-wide preferences; kept in localStorage until the Rust side stores settings. */
+/** Persisted launcher-wide preferences. */
 export type Theme = "system" | "light" | "dark";
 export type Accent = "blue" | "green" | "graphite";
 export type Language = "auto" | "zh" | "ja" | "en";
@@ -10,6 +10,8 @@ export type FastForward = "hold" | "toggle";
 
 export interface Prefs {
   theme: Theme;
+  volume: number;
+  muted: boolean;
   accent: Accent;
   /** Blur covers of games marked adult until revealed. */
   blurAdult: boolean;
@@ -27,6 +29,8 @@ export interface Prefs {
 const KEY = "adv-launcher.prefs";
 const defaults: Prefs = {
   theme: "system",
+  volume: 70,
+  muted: false,
   accent: "blue",
   blurAdult: true,
   language: "auto",

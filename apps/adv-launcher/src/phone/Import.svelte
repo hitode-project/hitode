@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import PhoneImportEncoding from "../components/PhoneImportEncoding.svelte";
   import PhoneImportFooter from "../components/PhoneImportFooter.svelte";
   import PhoneImportHeader from "../components/PhoneImportHeader.svelte";
@@ -11,30 +12,30 @@
 </script>
 
 <PhoneImportPage>
-  <PhoneImportHeader label="取消添加" onclose={() => nav.back()} />
+  <PhoneImportHeader label={t("取消添加")} onclose={() => nav.back()} />
 
   <main class="scroll body">
     {#if pick.phase === "ready" && pick.inspection}
       <div>
         <h1 lang="ja">{pick.title.trim() || pick.inspection.title}</h1>
         <div class="mono" style="margin-top: 6px">{pick.inspection.folder}</div>
-        {#if pick.inspection.inLibrary !== null}<div class="hint" style="margin-top: 6px">这个文件夹里已有游戏</div>{/if}
+        {#if pick.inspection.inLibrary !== null}<div class="hint" style="margin-top: 6px">{t("这个文件夹里已有游戏")}</div>{/if}
       </div>
 
       {#if pick.noExe}
         <div class="empty" role="status">
-          <div class="msg">没找到程序</div>
-          <div class="hint">这个文件夹里没有能运行的 32 位 Windows 程序</div>
-          <button class="quiet" style="margin-left: -12px" onclick={() => void pick.pick()}>重新选择文件夹…</button>
+          <div class="msg">{t("没找到程序")}</div>
+          <div class="hint">{t("这个文件夹里没有能运行的 32 位 Windows 程序")}</div>
+          <button class="quiet" style="margin-left: -12px" onclick={() => void pick.pick()}>{t("重新选择文件夹…")}</button>
         </div>
       {:else}
         <fieldset>
-          <legend class="lbl">主程序</legend>
+          <legend class="lbl">{t("主程序")}</legend>
           <div class="stack">
             {#each pick.exes as x, i (x.name)}
               <PhoneImportOption name="exe" checked={pick.exe === i} disabled={x.disabled} onpick={() => pick.pickExe(i)}>
                 <span class="mono" style="font-size: 14px; color: var(--fg)">{x.name}</span>
-                <span style="font-size: 12px; color: var(--fg3)">{x.disabled ? "64 位程序" : x.candidate.inLibrary !== null ? "已在库中" : x.size}</span>
+                <span style="font-size: 12px; color: var(--fg3)">{x.disabled ? t("64 位程序") : x.candidate.inLibrary !== null ? t("已在库中") : x.size}</span>
               </PhoneImportOption>
             {/each}
           </div>
@@ -43,24 +44,24 @@
         <PhoneImportEncoding choices={pick.encs} value={pick.enc} onpick={(v) => pick.pickEnc(v)} />
 
         <fieldset>
-          <legend class="lbl">标题</legend>
+          <legend class="lbl">{t("标题")}</legend>
           <label class="linkf">
-            <input type="text" lang="ja" aria-label="标题" value={pick.title} oninput={(e) => pick.setTitle(e.currentTarget.value)} />
+            <input type="text" lang="ja" aria-label={t("标题")} value={pick.title} oninput={(e) => pick.setTitle(e.currentTarget.value)} />
           </label>
         </fieldset>
       {/if}
     {:else}
       <div class="status" class:err={pick.phase === "error"} role="status">
-        {pick.phase === "error" ? pick.error : pick.phase === "picking" ? "正在选择文件夹…" : "正在读取文件夹…"}
+        {pick.phase === "error" ? pick.error : pick.phase === "picking" ? t("正在选择文件夹…") : t("正在读取文件夹…")}
       </div>
       {#if pick.phase === "error"}
-        <button class="quiet" style="align-self: center" onclick={() => void pick.pick()}>重新选择文件夹…</button>
+        <button class="quiet" style="align-self: center" onclick={() => void pick.pick()}>{t("重新选择文件夹…")}</button>
       {/if}
     {/if}
   </main>
 
   <PhoneImportFooter>
-    <button class="primary" disabled={!pick.addedId && !pick.canAdd} onclick={() => void pick.add()}>{pick.addedId ? "开始游戏" : pick.chosenInLibrary !== null ? "在游戏库中查看" : "添加到游戏库"}</button>
+    <button class="primary" disabled={!pick.addedId && !pick.canAdd} onclick={() => void pick.add()}>{pick.addedId ? t("开始游戏") : pick.chosenInLibrary !== null ? t("在游戏库中查看") : t("添加到游戏库")}</button>
   </PhoneImportFooter>
 </PhoneImportPage>
 

@@ -1,3 +1,4 @@
+import { t } from "./i18n.svelte";
 import type { Game } from "./types";
 
 // Play statistics as pure functions of the library. The host keeps seconds
@@ -7,9 +8,9 @@ import type { Game } from "./types";
 export type StatsRange = "week" | "month" | "year";
 
 export const STATS_RANGES: { value: StatsRange; label: string }[] = [
-  { value: "week", label: "周" },
-  { value: "month", label: "月" },
-  { value: "year", label: "年" },
+  { value: "week", get label() { return t("周"); } },
+  { value: "month", get label() { return t("月"); } },
+  { value: "year", get label() { return t("年"); } },
 ];
 
 /** One game's minutes per calendar day, oldest first; the last entry is today. */
@@ -106,13 +107,13 @@ function rank(entries: { game: Game; minutes: number }[]): StatsRankRow[] {
     return { game, title, hours, width: top > 0 ? Math.min(100, (hours / top) * 100) : 0 };
   };
   const rows = shown.map((e) => row(e.game, e.game.title, e.minutes));
-  if (rest.length) rows.push(row(null, `其他 ${rest.length} 部`, sum(rest.map((e) => e.minutes))));
+  if (rest.length) rows.push(row(null, t("其他 {0} 部", rest.length), sum(rest.map((e) => e.minutes))));
   return rows;
 }
 
 function compare(diffHours: number, period: string): string {
-  if (Math.abs(diffHours) < 0.05) return `与${period}持平`;
-  return `比${period}${diffHours > 0 ? "多" : "少"} ${Math.abs(diffHours).toFixed(1)} 小时`;
+  if (Math.abs(diffHours) < 0.05) return t("与{0}持平", period);
+  return t("比{0}{1} {2} 小时", period, diffHours > 0 ? t("多") : t("少"), Math.abs(diffHours).toFixed(1));
 }
 
 /** Everything the statistics screen shows for one range. */
@@ -128,12 +129,12 @@ export function rangeStats(logs: PlayLog[], range: StatsRange, today: Date): Ran
     const minutes = monthly(total, today, year, month, today);
     const sameDayLastYear = new Date(year - 1, month, today.getDate());
     const lastYear = sum(monthly(total, today, year - 1, month, sameDayLastYear));
-    const buckets = minutes.map((m, i) => ({ label: `${i + 1}月`, short: `${i + 1}月`, hours: m / 60 }));
+    const buckets = minutes.map((m, i) => ({ label: t("{0}月", i + 1), short: t("{0}月", i + 1), hours: m / 60 }));
     return {
-      heroLabel: "今年",
+      heroLabel: t("今年"),
       totalHours: sum(minutes) / 60,
-      delta: lastYear > 0 ? `去年同期 ${(lastYear / 60).toFixed(1)} 小时` : "去年同期没有游玩记录",
-      chartTitle: "每月游玩时长",
+      delta: lastYear > 0 ? t("去年同期 {0} 小时", (lastYear / 60).toFixed(1)) : t("去年同期没有游玩记录"),
+      chartTitle: t("每月游玩时长"),
       buckets,
       scale: niceScale(Math.max(0, ...buckets.map((b) => b.hours))),
       labelEvery: 1,
@@ -144,9 +145,9 @@ export function rangeStats(logs: PlayLog[], range: StatsRange, today: Date): Ran
   const count = range === "week" ? 7 : 30;
   const buckets = total.slice(-count).map((m, i, list) => {
     const d = dayBefore(today, list.length - 1 - i);
-    const weekday = `周${WEEKDAYS[d.getDay()] ?? ""}`;
+    const weekday = t("周{0}", t(WEEKDAYS[d.getDay()]!) ?? "");
     return {
-      label: `${d.getMonth() + 1}月${d.getDate()}日 ${weekday}`,
+      label: t("{0}月{1}日 {2}", d.getMonth() + 1, d.getDate(), weekday),
       short: range === "week" ? weekday : `${d.getMonth() + 1}/${d.getDate()}`,
       hours: m / 60,
     };
@@ -154,10 +155,10 @@ export function rangeStats(logs: PlayLog[], range: StatsRange, today: Date): Ran
   const current = sumWindow(total, 0, count) / 60;
   const previous = sumWindow(total, count, count) / 60;
   return {
-    heroLabel: `近 ${count} 天`,
+    heroLabel: t("近 {0} 天", count),
     totalHours: current,
-    delta: compare(current - previous, `前 ${count} 天`),
-    chartTitle: "每日游玩时长",
+    delta: compare(current - previous, t("前 {0} 天", count)),
+    chartTitle: t("每日游玩时长"),
     buckets,
     scale: niceScale(Math.max(0, ...buckets.map((b) => b.hours))),
     labelEvery: range === "week" ? 1 : 7,

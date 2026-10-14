@@ -1,11 +1,13 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
+  import { device } from "../lib/device.svelte";
   import { preview } from "../lib/bridge";
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
-  import { APP_VERSION, reportContents } from "../lib/fake-settings";
+  import { reportContents } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
   import { general, setPref as set } from "../lib/settings-form.svelte";
@@ -14,144 +16,144 @@
 </script>
 
 <div class="screen">
-  <PhoneSettingsHeader label="返回游戏库" />
+  <PhoneSettingsHeader label={t("返回游戏库")} />
 
   <main class="scroll">
-    <h1>设置</h1>
+    <h1>{t("设置")}</h1>
 
     <section class="sec" aria-labelledby="p-look">
-      <h2 id="p-look">外观</h2>
+      <h2 id="p-look">{t("外观")}</h2>
       <div class="row">
-        <span class="t">主题</span>
+        <span class="t">{t("主题")}</span>
         <SettingsSeg
           variant="phone"
-          label="主题"
+          label={t("主题")}
           value={prefs.theme}
           onpick={(v) => set("theme", v)}
           options={[
-            { value: "system", label: "自动" },
-            { value: "light", label: "浅色" },
-            { value: "dark", label: "深色" },
+            { value: "system", label: t("自动") },
+            { value: "light", label: t("浅色") },
+            { value: "dark", label: t("深色") },
           ]}
         />
       </div>
       <div class="row">
-        <span class="t">语言</span>
+        <span class="t">{t("语言")}</span>
         <SettingsSeg
           variant="phone"
-          label="语言"
+          label={t("语言")}
           value={prefs.language}
           onpick={(v) => set("language", v)}
           options={[
-            { value: "auto", label: "自动", lang: "zh-CN" },
-            { value: "zh", label: "中文", lang: "zh-CN" },
-            { value: "ja", label: "日本語", lang: "ja" },
+            { value: "auto", label: t("自动"), lang: "zh-CN" },
+            { value: "zh", label: t("中文"), lang: "zh-CN" },
+            { value: "ja", label: t("日本語"), lang: "ja" },
             { value: "en", label: "English", lang: "en" },
           ]}
         />
       </div>
       <div class="row">
-        <span class="t">强调色</span>
+        <span class="t">{t("强调色")}</span>
         <SettingsAccent touch />
       </div>
     </section>
 
     <section class="sec" aria-labelledby="p-play">
-      <h2 id="p-play">游戏中</h2>
-      {#if preview}
+      <h2 id="p-play">{t("游戏中")}</h2>
+      {#if device.gameView || preview}
         <div class="row">
-          <span class="t">缩放</span>
+          <span class="t">{t("缩放")}</span>
           <SettingsSeg
             variant="phone"
-            label="缩放"
+            label={t("缩放")}
             value={prefs.scale}
             onpick={(v) => set("scale", v)}
             options={[
-              { value: "fit", label: "适应" },
-              { value: "int", label: "整数倍" },
+              { value: "fit", label: t("适应") },
+              { value: "int", label: t("整数倍") },
             ]}
           />
         </div>
       {/if}
       <div class="row">
-        <span class="t">超分辨率</span>
+        <span class="t">{t("超分辨率")}</span>
         <UpscalingSelect value={prefs.filter} onpick={(v) => { if (v !== "inherit") set("filter", v); }} />
       </div>
-      {#if preview}
+      {#if device.gameView || preview}
         <div class="row">
-          <span class="t">快进键</span>
+          <span class="t">{t("快进键")}</span>
           <SettingsSeg
             variant="phone"
-            label="快进键"
+            label={t("快进键")}
             value={prefs.fastForward}
             onpick={(v) => set("fastForward", v)}
             options={[
-              { value: "hold", label: "按住" },
-              { value: "toggle", label: "切换" },
+              { value: "hold", label: t("按住") },
+              { value: "toggle", label: t("切换") },
             ]}
           />
         </div>
         <div class="row">
-          <span class="t">切到后台时暂停</span>
-          <SettingsSwitch touch label="切到后台时暂停" checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
+          <span class="t">{t("切到后台时暂停")}</span>
+          <SettingsSwitch touch label={t("切到后台时暂停")} checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
         </div>
         <div class="row">
-          <span class="t">显示帧率</span>
-          <SettingsSwitch touch label="显示帧率" checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
+          <span class="t">{t("显示帧率")}</span>
+          <SettingsSwitch touch label={t("显示帧率")} checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
         </div>
       {/if}
     </section>
 
     <section class="sec" aria-labelledby="p-lib">
-      <h2 id="p-lib">游戏库</h2>
+      <h2 id="p-lib">{t("游戏库")}</h2>
       {#if preview}
         <div class="row">
-          <span class="t">从 VNDB 获取资料</span>
-          <SettingsSwitch touch label="从 VNDB 获取资料" checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
+          <span class="t">{t("从 VNDB 获取资料")}</span>
+          <SettingsSwitch touch label={t("从 VNDB 获取资料")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
         </div>
       {/if}
       <div class="row">
-        <span class="t">遮挡成人内容封面</span>
-        <SettingsSwitch touch label="遮挡成人内容封面" checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
+        <span class="t">{t("遮挡成人内容封面")}</span>
+        <SettingsSwitch touch label={t("遮挡成人内容封面")} checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
       </div>
       <div class="row">
-        <span class="t">记录游玩时间</span>
-        <SettingsSwitch touch label="记录游玩时间" checked={prefs.trackPlayTime} onchange={(v) => set("trackPlayTime", v)} />
+        <span class="t">{t("记录游玩时间")}</span>
+        <SettingsSwitch touch label={t("记录游玩时间")} checked={prefs.trackPlayTime} onchange={(v) => set("trackPlayTime", v)} />
       </div>
     </section>
 
     {#if preview}
       <section class="sec" aria-labelledby="p-roots">
-        <h2 id="p-roots">游戏库文件夹</h2>
+        <h2 id="p-roots">{t("游戏库文件夹")}</h2>
         {#each general.roots as f (f.id)}
           <div class="row">
             <span class="t two">
               <span class="path">{f.path}</span>
               <span class="meta">{general.rootMeta(f)}</span>
             </span>
-            <button class="quiet" aria-label="移除 {f.path}" onclick={() => general.removeRoot(f.id)}>移除</button>
+            <button class="quiet" aria-label={t("移除 {0}", f.path)} onclick={() => general.removeRoot(f.id)}>{t("移除")}</button>
           </div>
         {/each}
         <div class="row">
-          <button class="quiet" style="margin-left: -12px" onclick={() => nav.go({ name: "scan" })}>添加文件夹…</button>
+          <button class="quiet" style="margin-left: -12px" onclick={() => nav.go({ name: "scan" })}>{t("添加文件夹…")}</button>
         </div>
       </section>
 
       <section class="sec" aria-labelledby="p-store">
-        <h2 id="p-store">存储</h2>
+        <h2 id="p-store">{t("存储")}</h2>
         <div class="store">
           <span class="total">{general.totalLabel}</span>
-          <div class="usage" role="img" aria-label="存档 128 MB，缓存 {general.cacheLabel}">
+          <div class="usage" role="img" aria-label={t("存档 128 MB，缓存 {0}", general.cacheLabel)}>
             <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>
             <span style:width="{general.cachePct}%" class="cache"></span>
           </div>
           <div style="display: flex; gap: 14px; flex-wrap: wrap">
-            <span class="key"><i style:background="var(--accent)"></i>存档 128 MB</span>
-            <span class="key"><i class="cache"></i>缓存 {general.cacheLabel}</span>
+            <span class="key"><i style:background="var(--accent)"></i>{t("存档 128 MB")}</span>
+            <span class="key"><i class="cache"></i>{t("缓存")} {general.cacheLabel}</span>
           </div>
         </div>
         <div class="row">
-          <span class="t">缓存</span>
+          <span class="t">{t("缓存")}</span>
           <span class="val">{general.cacheLabel}</span>
           <button class="quiet" onclick={() => general.clearCache()} disabled={general.cache !== "full"}>{general.clearLabel}</button>
         </div>
@@ -159,7 +161,7 @@
     {/if}
 
     <section class="sec" aria-labelledby="p-fb">
-      <h2 id="p-fb">反馈与隐私</h2>
+      <h2 id="p-fb">{t("反馈与隐私")}</h2>
       {#if preview}
         {#each general.reports as r (r.id)}
           {@const gone = !!general.withdrawn[r.id]}
@@ -168,31 +170,31 @@
               <span lang="ja" class="ellipsis">{r.title}</span>
               <span class="meta">{r.date} · {r.kind}</span>
             </span>
-            <button class="quiet" onclick={() => (general.withdrawn[r.id] = true)} disabled={gone} aria-label="撤回 {r.title} 的报告">
-              {gone ? "已撤回" : "撤回"}
+            <button class="quiet" onclick={() => (general.withdrawn[r.id] = true)} disabled={gone} aria-label={t("撤回 {0} 的报告", r.title)}>
+              {gone ? t("已撤回") : t("撤回")}
             </button>
           </div>
         {/each}
         <div class="row">
           <span class="t two">
-            <span>重置报告密钥</span>
-            <span class="meta">之后的报告无法与之前的关联</span>
+            <span>{t("重置报告密钥")}</span>
+            <span class="meta">{t("之后的报告无法与之前的关联")}</span>
           </span>
           <button class="quiet" onclick={() => (general.keyReset = true)} disabled={general.keyReset}>
-            {general.keyReset ? "已重置" : "重置"}
+            {general.keyReset ? t("已重置") : t("重置")}
           </button>
         </div>
       {/if}
       <div class="row" class:open={contentsOpen}>
-        <span class="t">报告包含哪些内容</span>
+        <span class="t">{t("报告包含哪些内容")}</span>
         <button
           class="quiet"
-          aria-label={contentsOpen ? "收起报告包含哪些内容" : "查看报告包含哪些内容"}
+          aria-label={contentsOpen ? t("收起报告包含哪些内容") : t("查看报告包含哪些内容")}
           aria-expanded={contentsOpen}
           aria-controls="p-fb-contents"
           onclick={() => (contentsOpen = !contentsOpen)}
         >
-          {contentsOpen ? "收起" : "查看"}
+          {contentsOpen ? t("收起") : t("查看")}
         </button>
       </div>
       {#if contentsOpen}
@@ -200,17 +202,17 @@
           <dl>
             {#each reportContents as c (c.label)}
               <div>
-                <dt>{c.label}</dt>
-                <dd>{c.note}</dd>
+                <dt>{t(c.label)}</dt>
+                <dd>{t(c.note)}</dd>
               </div>
             {/each}
           </dl>
-          <p>不含文件路径、用户名、截图和存档</p>
+          <p>{t("不含文件路径、用户名、截图和存档")}</p>
         </div>
       {/if}
     </section>
 
-    <footer>hitode {APP_VERSION} · GPL-3.0-or-later</footer>
+    <footer>hitode {device.version} · GPL-3.0-or-later</footer>
   </main>
 </div>
 

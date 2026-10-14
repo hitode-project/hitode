@@ -1,3 +1,4 @@
+import { t } from "./i18n.svelte";
 import { untrack } from "svelte";
 import { inTauri, onHostEvent } from "./bridge";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
@@ -189,12 +190,12 @@ export class LaunchFlow {
     this.reason = "";
     const game = library.get(id);
     if (game?.offline) {
-      this.#fail("unsupported", game.offline === "disk" ? "所在磁盘未连接" : "找不到文件夹");
+      this.#fail("unsupported", game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹"));
       return;
     }
     // Only builds with a native game view register start_game (macOS for now).
     if (!inTauri) {
-      this.#fail("unsupported", UNSUPPORTED_PLATFORM);
+      this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
       return;
     }
     runs.start(id).then(
@@ -206,7 +207,7 @@ export class LaunchFlow {
       (error: unknown) => {
         const message = String(error);
         // Builds without the command answer "Command start_game not found".
-        if (/start_game.*not found/i.test(message)) this.#fail("unsupported", UNSUPPORTED_PLATFORM);
+        if (/start_game.*not found/i.test(message)) this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
         else this.#fail("failed", message);
       },
     );
