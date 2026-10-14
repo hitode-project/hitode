@@ -168,6 +168,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-storage",
 ]
 
 [[package]]
@@ -5430,6 +5431,17 @@ dependencies = [
  "url",
  "windows 0.62.2",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-storage"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
 ]
 
 [[package]]

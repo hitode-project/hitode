@@ -1,4 +1,4 @@
-//! Desktop game library and executable discovery.
+//! Shared launcher game library and executable discovery.
 use chrono::{Duration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,6 +10,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 use tauri::{AppHandle, State};
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
 
 type Store<'a> = State<'a, Mutex<Library>>;
@@ -340,11 +341,33 @@ fn add_daily<T: TimeZone>(daily: &mut BTreeMap<String, u64>, ended: u64, seconds
 }
 
 #[tauri::command]
+#[cfg(desktop)]
 pub fn reveal_path(path: PathBuf) -> Reply<()> {
     if !path.exists() {
         return Err("path does not exist".into());
     }
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string())
+}
+
+#[cfg(any(mobile, test))]
+fn mobile_reveal_path() -> Reply<()> {
+    Err("revealing paths is not supported on mobile".into())
+}
+
+// spec: AND-APP-9
+#[test]
+fn mobile_reveal_is_unsupported() {
+    assert_eq!(
+        mobile_reveal_path(),
+        Err("revealing paths is not supported on mobile".into())
+    );
+}
+
+#[tauri::command]
+#[cfg(mobile)]
+pub fn reveal_path(path: PathBuf) -> Reply<()> {
+    let _ = path;
+    mobile_reveal_path()
 }
 
 fn offline(folder: &Path) -> Option<Offline> {
@@ -446,6 +469,7 @@ pub struct GamePatch {
 }
 
 #[tauri::command]
+#[cfg(desktop)]
 pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
     tauri::async_runtime::spawn_blocking(move || {
         let folder = app.dialog().file().blocking_pick_folder();
@@ -455,6 +479,31 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
+    use tauri_plugin_storage::StorageExt;
+    let storage = app.storage();
+    let folder = storage.pick_folder().await?;
+    let Some(uri) = folder.uri else {
+        return Ok(None);
+    };
+    if let Some(path) = folder.path {
+        return Ok(Some(path));
+    }
+    storage
+        .copy_folder(uri, None, None, None)
+        .await
+        .map(|copy| Some(copy.path))
+}
+
+#[tauri::command]
+#[cfg(target_os = "ios")]
+pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
+    let _ = app;
+    Err("folder selection is not supported on iOS".into())
 }
 #[tauri::command]
 pub fn library_list(state: Store<'_>) -> Reply<Vec<LibraryGame>> {

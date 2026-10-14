@@ -1,8 +1,10 @@
 //! Launcher file selection and native font discovery.
 use std::path::PathBuf;
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
+#[cfg(desktop)]
 pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
     let picker = app.dialog().file();
     let picker = match kind.as_str() {
@@ -22,6 +24,13 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+#[cfg(mobile)]
+pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
+    let _ = (app, kind);
+    Err("game file selection is not supported on mobile".into())
 }
 
 #[tauri::command]

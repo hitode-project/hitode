@@ -3,8 +3,8 @@ import { library } from "./library.svelte";
 import type { Game } from "./types";
 
 // Fake data and simulated host actions for adding games. Scanning and single
-// imports use them only in a plain browser (`pnpm dev`); the installer and the
-// phone storage access are not wired to the host yet and use them everywhere.
+// imports and Android storage use them only in a plain browser (`pnpm dev`).
+// The installer and iOS Files flow use simulated actions.
 
 /** Guest text encoding offered when adding a game. */
 export type Enc = "ja" | "zh";

@@ -54,7 +54,7 @@
       {/if}
     {:else}
       <div class="status" class:err={pick.phase === "error"} role="status">
-        {pick.phase === "error" ? pick.error : pick.phase === "picking" ? t("正在选择文件夹…") : t("正在读取文件夹…")}
+        {pick.phase === "error" ? pick.error : pick.copyStatus || (pick.phase === "picking" ? t("正在选择文件夹…") : t("正在读取文件夹…"))}
       </div>
       {#if pick.phase === "error"}
         <button class="quiet" style="align-self: center" onclick={() => void pick.pick()}>{t("重新选择文件夹…")}</button>

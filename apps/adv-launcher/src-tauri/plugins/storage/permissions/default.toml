@@ -1,0 +1,10 @@
+[default]
+description = "Allow the launcher to select and import game folders on Android."
+permissions = [
+  "allow-storage-status",
+  "allow-request-storage",
+  "allow-pick-folder",
+  "allow-folder-size",
+  "allow-copy-folder",
+  "allow-cancel-copy",
+]

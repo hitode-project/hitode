@@ -14,6 +14,7 @@ import {
 import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
+import { storageSize, type FolderPickOptions } from "./storage";
 
 // UI state of the three adding flows, shared by the desktop and phone pages.
 // Construct each class during component initialisation: they own effects.
@@ -26,8 +27,17 @@ export const encOfCodepage = (codepage: number): Enc => (codepage === 936 ? "zh"
 /** Where the flow is: the folder picker is open, the host is reading, or a result. */
 export type Phase = "picking" | "reading" | "ready" | "error";
 
-async function pickFolder(): Promise<string | null> {
-  return inTauri ? libraryPickFolder() : FAKE_SCAN_ROOT;
+async function pickFolder(options: FolderPickOptions): Promise<string | null> {
+  return inTauri ? libraryPickFolder(options) : FAKE_SCAN_ROOT;
+}
+
+function copyOptions(signal: AbortSignal, update: (status: string) => void): FolderPickOptions {
+  let total = 0;
+  return {
+    signal,
+    onSize: (bytes) => { total = bytes; update(storageSize(bytes)); },
+    onProgress: (progress) => update(`${storageSize(total)} · ${total ? Math.min(100, Math.floor(progress.bytes * 100 / total)) : 100}%`),
+  };
 }
 
 function sizeLabel(bytes: number): string {
@@ -87,6 +97,7 @@ export function scanNote(g: ScanRow): string {
 export class ScanPick {
   phase = $state<Phase>("picking");
   error = $state("");
+  copyStatus = $state("");
   root = $state("");
   rows = $state<ScanRow[]>([]);
   depth = $state(2);
@@ -110,8 +121,10 @@ export class ScanPick {
 
   #began = false;
   #scan = 0;
+  #picker = new AbortController();
 
   constructor() {
+    $effect(() => () => this.#picker.abort());
     // After the "已添加" confirmation, return to the library.
     $effect(() => {
       if (!this.done) return;
@@ -125,7 +138,9 @@ export class ScanPick {
     if (this.#began) return;
     this.#began = true;
     try {
-      const root = await pickFolder();
+      const root = await pickFolder(copyOptions(this.#picker.signal, (status) => (this.copyStatus = status)));
+      if (this.#picker.signal.aborted) return;
+      this.copyStatus = "";
       if (!root) {
         nav.back();
         return;
@@ -133,7 +148,7 @@ export class ScanPick {
       this.root = root;
       await this.#run();
     } catch (error) {
-      this.#fail(error);
+      if (!this.#picker.signal.aborted) this.#fail(error);
     }
   }
 
@@ -232,6 +247,8 @@ export interface ExeRow {
 export class ImportPick {
   phase = $state<Phase>("picking");
   error = $state("");
+  copyStatus = $state("");
+  #picker = new AbortController();
   inspection = $state<FolderInspection | null>(null);
   exe = $state(-1);
   enc = $state<Enc>("ja");
@@ -260,15 +277,22 @@ export class ImportPick {
   readonly canAdd = $derived(this.phase === "ready" && !this.noExe && this.exe >= 0 && this.title.trim() !== "" && !this.adding);
 
   constructor() {
+    $effect(() => () => this.#picker.abort());
     void this.pick();
   }
 
   /** Opens the folder picker; cancelling it the first time leaves the screen. */
   async pick(): Promise<void> {
+    this.#picker.abort();
+    this.#picker = new AbortController();
+    const controller = this.#picker;
+    this.copyStatus = "";
     const first = this.inspection === null;
     this.phase = "picking";
     try {
-      const folder = await pickFolder();
+      const folder = await pickFolder(copyOptions(controller.signal, (status) => (this.copyStatus = status)));
+      if (controller.signal.aborted) return;
+      this.copyStatus = "";
       if (!folder) {
         if (first) nav.back();
         else this.phase = "ready";
@@ -279,6 +303,7 @@ export class ImportPick {
       if (!inspection) throw new Error(t("读不到这个文件夹"));
       this.#show(inspection);
     } catch (error) {
+      if (controller.signal.aborted) return;
       this.error = String(error);
       this.phase = "error";
     }

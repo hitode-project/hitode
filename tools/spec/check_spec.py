@@ -35,7 +35,7 @@ BANNED = ("currently", "at present", "planned", "not yet", "TODO", "no longer",
 LOWERCASE = re.compile(r"\b(must|should|shall|SHALL)\b")
 # Controlled terms: what the glossary calls the thing instead.
 TERMS = {"client": "guest", "emulated program": "guest"}
-SCANNED = (".rs", ".py", ".md", ".ts", ".svelte", ".toml", ".ps1", ".c")
+SCANNED = (".rs", ".py", ".md", ".ts", ".svelte", ".toml", ".ps1", ".c", ".kt")
 
 PREFIX_LINE = re.compile(r"^ID prefix: ([A-Z][A-Z0-9]*)$")
 ENTRY = re.compile(r"^### (\S+) (\S.*)$")

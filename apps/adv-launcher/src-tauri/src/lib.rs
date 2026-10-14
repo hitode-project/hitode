@@ -1,15 +1,12 @@
 //! The player frontend: a Tauri window whose webview draws the game library
 //! and, while a game runs, a transparent in-game overlay above the native game
 //! view that adv-shell presents into (decision 25).
-#[cfg(desktop)]
 mod library;
 #[cfg(desktop)]
 mod menu;
 pub mod overlay;
 mod report;
-#[cfg(desktop)]
 mod settings;
-#[cfg(desktop)]
 mod vndb;
 
 use serde::Serialize;
@@ -51,23 +48,28 @@ fn post_text(text: String) -> Result<usize, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
-    #[cfg(desktop)]
-    let builder = builder
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            use tauri::Manager;
-            app.manage(std::sync::Mutex::new(library::Library::load(
-                app.path().app_data_dir()?,
-            )?));
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_storage::init());
+    let builder = builder.setup(|app| {
+        use tauri::Manager;
+        app.manage(std::sync::Mutex::new(library::Library::load(
+            app.path().app_data_dir()?,
+        )?));
+        #[cfg(desktop)]
+        {
             let menu = menu::build(app.handle())?;
             if cfg!(target_os = "macos") {
                 app.set_menu(menu)?;
             }
-            #[cfg(target_os = "macos")]
-            game::setup(app)?;
-            Ok(())
-        })
+        }
+        #[cfg(target_os = "macos")]
+        game::setup(app)?;
+        Ok(())
+    });
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()));
     #[cfg(target_os = "macos")]
     let builder =
@@ -136,7 +138,22 @@ pub fn run() {
         post_text,
         overlay::set_overlay_input,
         report::report_base,
-        report::save_report
+        report::save_report,
+        settings::pick_game_file,
+        settings::font_families,
+        library::library_pick_folder,
+        library::library_list,
+        vndb::vndb_search,
+        vndb::vndb_apply,
+        vndb::vndb_unlink,
+        library::set_tracking,
+        library::library_inspect,
+        library::library_scan,
+        library::library_add,
+        library::library_update,
+        library::library_remove,
+        library::library_restore,
+        library::reveal_path
     ]);
     let app = builder
         .build(tauri::generate_context!())

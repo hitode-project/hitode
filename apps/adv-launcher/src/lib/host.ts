@@ -1,6 +1,7 @@
 import { playback } from "./playback";
 import { gameFilter } from "./upscaling.svelte";
 import { call } from "./bridge";
+import { pickStorageFolder, takePreparedFolder, type FolderPickOptions } from "./storage";
 
 export type Codepage = 932 | 936;
 export interface PlaySession { ended: number; seconds: number }
@@ -51,7 +52,11 @@ export type GameFinished =
   | { gameId: string; exitCode: number; summary: RunSummary }
   | { gameId: string; error: string; summary: RunSummary };
 
-export function libraryPickFolder(): Promise<string | null> {
+export async function libraryPickFolder(options?: FolderPickOptions): Promise<string | null> {
+  const prepared = takePreparedFolder();
+  if (prepared) return prepared;
+  const folder = await pickStorageFolder(options);
+  if (folder !== undefined) return folder;
   return call("library_pick_folder", {}, null);
 }
 export function libraryList(): Promise<LibraryGame[]> {

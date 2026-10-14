@@ -8,16 +8,29 @@
   import PhoneImportPermission from "../components/PhoneImportPermission.svelte";
   import PhoneImportSwitch from "../components/PhoneImportSwitch.svelte";
   import { device } from "../lib/device.svelte";
-  import { hasStoragePermission } from "../lib/fake-import";
+  import { hasStoragePermission } from "../lib/storage";
   import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
   const ios = $derived(device.platform === "ios");
   // Storage access comes first: on iOS every folder is picked through Files, on
   // Android once the permission is granted the folder picker opens directly.
-  let asking = $state(device.platform === "ios" || !hasStoragePermission());
+  let asking = $state(true);
+  let checking = $state(true);
+  let permissionError = $state("");
 
   const scan = new ScanPick();
+  $effect(() => {
+    const platform = device.platform;
+    let active = true;
+    checking = true;
+    void hasStoragePermission().then((granted) => {
+      if (active) { asking = platform === "ios" || !granted; checking = false; }
+    }, (error) => {
+      if (active) { permissionError = String(error); checking = false; }
+    });
+    return () => { active = false; };
+  });
   // The folder picker opens once storage access is settled.
   $effect(() => {
     if (!asking) void scan.begin();
@@ -51,7 +64,7 @@
         </div>
 
         {#if scan.phase !== "ready"}
-          <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…")}</div>
+          <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.copyStatus || (scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…"))}</div>
         {:else}
                 <section aria-labelledby="p-h-found" style="display: flex; flex-direction: column; gap: 6px">
           <div style="display: flex; align-items: center; gap: 12px">
@@ -101,7 +114,9 @@
     {/if}
   </div>
 
-  {#if asking}
+  {#if permissionError}
+    <div class="status err" role="status">{permissionError}</div>
+  {:else if asking && !checking}
     <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} onimport={() => nav.replace({ name: "import" })} />
   {/if}
 </PhoneImportPage>
