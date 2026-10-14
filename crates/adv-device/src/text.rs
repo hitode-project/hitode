@@ -482,6 +482,7 @@ impl std::fmt::Display for TextError {
 
 #[derive(Default)]
 pub struct Text {
+    overrides: Overrides,
     #[cfg(windows)]
     fonts: BTreeMap<FontRequest, windows::Font>,
     #[cfg(not(windows))]
@@ -501,6 +502,30 @@ pub struct Text {
     resource_bytes: usize,
 }
 
+/// Explicit host font substitutions and text paint quality. Guest outline formats remain unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct Overrides {
+    pub families: BTreeMap<String, String>,
+    pub antialiased: Option<bool>,
+}
+impl Overrides {
+    fn apply(&self, request: &FontRequest) -> FontRequest {
+        let mut result = request.clone();
+        if let Some(face) = self.families.get(&request.face) {
+            result.face = face.clone();
+            result.default = None;
+        }
+        if let Some(smooth) = self.antialiased {
+            result.quality = if smooth {
+                Quality::Antialiased
+            } else {
+                Quality::Monochrome
+            };
+        }
+        result
+    }
+}
+
 /// A neutral, process-local font-data resource. Never a native or guest handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FontResourceId(u64);
@@ -510,6 +535,11 @@ pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// results are immutable and remain valid after the native owner is evicted.
 pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
+    pub fn set_overrides(&mut self, overrides: Overrides) {
+        self.invalidate_fonts();
+        self.overrides = overrides;
+    }
+
     /// Enumerate current backend fonts without exposing a native DC or font
     /// handle. Memory resources and hidden file resources are not enumerable.
     pub fn enumerate(
@@ -714,7 +744,7 @@ impl Text {
     #[cfg(windows)]
     fn font(&mut self, request: &FontRequest) -> Result<&windows::Font, TextError> {
         if !self.fonts.contains_key(request) {
-            let font = windows::Font::new(request)?;
+            let font = windows::Font::new(&self.overrides.apply(request))?;
             if self.fonts.len() >= FONT_CACHE_CAPACITY {
                 self.fonts.clear();
             }
@@ -725,7 +755,7 @@ impl Text {
     #[cfg(not(windows))]
     fn font(&mut self, request: &FontRequest) -> Result<&portable::Font, TextError> {
         if !self.fonts.contains_key(request) {
-            let font = self.backend.font(request)?;
+            let font = self.backend.font(&self.overrides.apply(request))?;
             if self.fonts.len() >= FONT_CACHE_CAPACITY {
                 self.fonts.clear();
             }

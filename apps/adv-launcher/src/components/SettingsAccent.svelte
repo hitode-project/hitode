@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { prefs } from "../lib/prefs.svelte";
   import { ACCENTS, setPref } from "../lib/settings-form.svelte";
 
@@ -6,7 +7,7 @@
   let { touch = false }: { touch?: boolean } = $props();
 </script>
 
-<div class="swatches" class:touch role="group" aria-label="强调色">
+<div class="swatches" class:touch role="group" aria-label={t("强调色")}>
   {#each ACCENTS as a (a.value)}
     <button
       class="swatch"

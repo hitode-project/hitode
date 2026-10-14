@@ -1,8 +1,11 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { onMount, untrack } from "svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
-  import { prefs } from "../lib/prefs.svelte";
+  import { prefs, savePrefs } from "../lib/prefs.svelte";
   import { filterOverride, gameFilter, setGameFilter } from "../lib/upscaling.svelte";
+  import { playback } from "../lib/playback";
+  import { loadGameSetup, saveGameSetup } from "../lib/fake-settings";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent, preview } from "../lib/bridge";
   import { pauser, runs } from "../lib/launch.svelte";
@@ -35,7 +38,7 @@
   let textInput = $state<HTMLInputElement | null>(null);
 
   type Scale = "int" | "fit" | "stretch";
-  let scale = $state<Scale>("fit");
+  let scale = $state<Scale>(untrack(() => playback(gameId).scale));
   let filterError = $state("");
   $effect(() => {
     const filter = gameFilter(gameId);
@@ -44,9 +47,26 @@
       .then(() => { filterError = ""; })
       .catch((error) => { filterError = String(error); });
   });
-  let volume = $state(70);
-  let muted = $state(false);
-  let fps = $state(false);
+  let volume = $derived(prefs.volume);
+  let muted = $derived(prefs.muted);
+  let fps = $derived(prefs.showFps);
+  let measuredFps = $state(0);
+  $effect(() => {
+    if (!gameView) return;
+    const value = { ...playback(gameId), scale };
+    void call("set_game_playback", { playback: value }, null).catch((e) => filterError = String(e));
+  });
+  $effect(() => {
+    if (!gameView || !fps) return;
+    const timer = setInterval(() => { void call<number>("game_fps", {}, 0).then((v) => measuredFps = v); }, 500);
+    return () => clearInterval(timer);
+  });
+  function pickScale(value: Scale) {
+    scale = value;
+    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
+    setup.overrides.scale = value;
+    saveGameSetup(gameId, setup);
+  }
 
   const started = Date.now();
   let now = $state(Date.now());
@@ -57,9 +77,9 @@
   const sessionMinutes = $derived(Math.max(0, Math.floor((now - started) / 60_000)));
 
   const scales: { value: Scale; label: string }[] = [
-    { value: "int", label: "整数倍" },
-    { value: "fit", label: "适应" },
-    { value: "stretch", label: "拉伸" },
+    { value: "int", label: t("整数倍") },
+    { value: "fit", label: t("适应") },
+    { value: "stretch", label: t("拉伸") },
   ];
 
   // Diagnostic outline of the published regions: open the game screen with ?regions.
@@ -179,14 +199,14 @@
     <!-- Stand-in for the native game view when none is attached (browser, Linux). -->
     <div class="scene f-{phone && scale === "int" ? "fit" : scale}" aria-hidden="true">
       <div class="say">
-        <div class="who" lang="ja">葵</div>
+        <div class="who" lang="ja">{t("葵")}</div>
         <div class="line" lang="ja">「夏休み、まだ半分も残ってるんだよ。……だから、もう少しだけ」</div>
       </div>
     </div>
   {/if}
 
-  {#if preview && fps}
-    <div class="fps mono">60 FPS</div>
+  {#if fps}
+    <div class="fps mono">{measuredFps.toFixed(0)} FPS</div>
   {/if}
 
   {#if view !== "closed"}
@@ -195,34 +215,34 @@
         <div class="panel" class:pop={!phone} class:slide={phone} role="dialog" aria-modal="true" aria-labelledby="pz-title">
           <div class="head">
             <div class="title">
-              <h2 id="pz-title" lang="ja">{game?.title ?? "游戏"}</h2>
-              <div class="sub">本次 {sessionMinutes} 分钟</div>
+              <h2 id="pz-title" lang="ja">{game?.title ?? t("游戏")}</h2>
+              <div class="sub">{t("本次")} {sessionMinutes} {t("分钟")}</div>
             </div>
-            <button class="primary" onclick={() => (view = "closed")}>继续</button>
+            <button class="primary" onclick={() => (view = "closed")}>{t("继续")}</button>
           </div>
 
           <div class="middle">
             <div class="prow">
-              <span>超分辨率</span>
+              <span>{t("超分辨率")}</span>
               <UpscalingSelect value={filterOverride(gameId) ?? "inherit"} inherit={prefs.filter}
                 onpick={(value) => setGameFilter(gameId, value)} />
             </div>
             {#if filterError}<p role="alert">{filterError}</p>{/if}
             <div class="sep"></div>
-          {#if preview}
+          {#if gameView || preview}
             <div class="rows">
               <div class="prow">
-                <span>画面</span>
-                <div class="seg" role="group" aria-label="画面">
+                <span>{t("画面")}</span>
+                <div class="seg" role="group" aria-label={t("画面")}>
                   {#each scales as o (o.value)}
-                    <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => (scale = o.value)}>{o.label}</button>
+                    <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => pickScale(o.value)}>{o.label}</button>
                   {/each}
                 </div>
               </div>
               <div class="prow">
-                <span>音量</span>
+                <span>{t("音量")}</span>
                 <div class="vol">
-                  <button class="ibtn" class:on={muted} aria-label="静音" aria-pressed={muted} onclick={() => (muted = !muted)}>
+                  <button class="ibtn" class:on={muted} aria-label={t("静音")} aria-pressed={muted} onclick={() => { prefs.muted = !muted; savePrefs(); }}>
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" />
                       {#if muted}<path d="M10.5 6l3.5 4M14 6l-3.5 4" />{:else}<path d="M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.4 3.9a5.8 5.8 0 0 1 0 8.2" />{/if}
@@ -233,56 +253,56 @@
                       <div class="rail"><div class="rfill" style="width: {volume}%"></div></div>
                       <div class="thumb" style="left: {volume}%"></div>
                     </div>
-                    <input type="range" min="0" max="100" step="1" bind:value={volume} oninput={() => (muted = false)} aria-label="音量" />
+                    <input type="range" min="0" max="100" step="1" value={volume} oninput={(e) => { prefs.volume = Number(e.currentTarget.value); prefs.muted = false; savePrefs(); }} aria-label={t("音量")} />
                   </div>
                 </div>
               </div>
               <div class="prow">
-                <span>帧率显示</span>
-                <button class="sw" class:on={fps} role="switch" aria-checked={fps} aria-label="帧率显示" onclick={() => (fps = !fps)}></button>
+                <span>{t("帧率显示")}</span>
+                <button class="sw" class:on={fps} role="switch" aria-checked={fps} aria-label={t("帧率显示")} onclick={() => { prefs.showFps = !fps; savePrefs(); }}></button>
               </div>
             </div>
             <div class="sep"></div>
           {/if}
           <div class="group">
             <button class="qrow" onclick={openTextBar}>
-              <span>输入文字…</span>
+              <span>{t("输入文字…")}</span>
               <span class="end"><Icon name="keyboard" /></span>
             </button>
-            <button class="qrow" onclick={() => nav.go({ name: "report", gameId })}>报告问题…</button>
+            <button class="qrow" onclick={() => nav.go({ name: "report", gameId })}>{t("报告问题…")}</button>
             {#if canReveal() && game}
-              <button class="qrow" disabled={game.offline !== null} onclick={() => game && reveal(game.path)}>在访达中显示</button>
+              <button class="qrow" disabled={game.offline !== null} onclick={() => game && reveal(game.path)}>{t("在访达中显示")}</button>
             {/if}
           </div>
           </div>
           <div class="sep"></div>
           <div class="group" style="padding-bottom: 10px">
-            <button class="qrow danger" onclick={() => (view = "confirm")}>退出游戏</button>
+            <button class="qrow danger" onclick={() => (view = "confirm")}>{t("退出游戏")}</button>
           </div>
         </div>
       {:else}
         <div class="panel confirm" class:pop={!phone} class:slide={phone} role="alertdialog" aria-modal="true" aria-labelledby="pz-quit" aria-describedby="pz-quit-d">
-          <h2 id="pz-quit">退出游戏？</h2>
-          <p id="pz-quit-d">未在游戏内保存的进度会丢失</p>
+          <h2 id="pz-quit">{t("退出游戏？")}</h2>
+          <p id="pz-quit-d">{t("未在游戏内保存的进度会丢失")}</p>
           {#if phone}
             <div style="flex: 1"></div>
             <div style="display: flex; flex-direction: column; gap: 8px">
-              <button class="danger-btn" onclick={quit}>{stopping ? "强制结束" : "退出"}</button>
-              <button class="secondary" onclick={() => (view = "menu")}>取消</button>
+              <button class="danger-btn" onclick={quit}>{stopping ? t("强制结束") : t("退出")}</button>
+              <button class="secondary" onclick={() => (view = "menu")}>{t("取消")}</button>
             </div>
           {:else}
             <div style="display: flex; gap: 8px; margin-top: 18px">
-              <button class="secondary" style="flex: 1" onclick={() => (view = "menu")}>取消</button>
-              <button class="danger-btn" style="flex: 1" onclick={quit}>{stopping ? "强制结束" : "退出"}</button>
+              <button class="secondary" style="flex: 1" onclick={() => (view = "menu")}>{t("取消")}</button>
+              <button class="danger-btn" style="flex: 1" onclick={quit}>{stopping ? t("强制结束") : t("退出")}</button>
             </div>
           {/if}
         </div>
       {/if}
     </div>
   {:else if phone}
-    <button class="grip fade" aria-label="暂停菜单" onclick={openMenu} {@attach region}><span></span></button>
+    <button class="grip fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}><span></span></button>
   {:else if !titleBar}
-    <button class="float fade" aria-label="暂停菜单" onclick={openMenu} {@attach region}>
+    <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
       <Icon name="pause" />
     </button>
   {/if}
@@ -292,7 +312,7 @@
   {/if}
 
   {#if textBar}
-    <div class="surface textbar fade" role="dialog" aria-label="输入文字" {@attach region}>
+    <div class="surface textbar fade" role="dialog" aria-label={t("输入文字")} {@attach region}>
       <span class="kbd"><Icon name="keyboard" /></span>
       <input
         bind:this={textInput}
@@ -300,12 +320,12 @@
         onkeydown={onTextKey}
         class="text"
         lang="ja"
-        aria-label="要发送的文字"
+        aria-label={t("要发送的文字")}
         autocomplete="off"
         spellcheck="false"
       />
-      <button class="quiet" style="height: 38px; box-sizing: border-box" onclick={() => (textBar = false)}>取消</button>
-      <button class="primary" style="height: 38px" disabled={!text} onclick={send}>发送</button>
+      <button class="quiet" style="height: 38px; box-sizing: border-box" onclick={() => (textBar = false)}>{t("取消")}</button>
+      <button class="primary" style="height: 38px" disabled={!text} onclick={send}>{t("发送")}</button>
     </div>
   {/if}
 

@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import { nav } from "../lib/nav.svelte";
 
   // The phone settings and statistics screens' top bar: a single back button.
-  let { label = "返回" }: { label?: string } = $props();
+  let { label = t("返回") }: { label?: string } = $props();
 </script>
 
 <header>

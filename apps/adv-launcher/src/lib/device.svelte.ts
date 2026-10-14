@@ -16,6 +16,7 @@ function guessPlatform(): string {
  */
 class Device {
   platform = $state(guessPlatform());
+  version = $state("browser preview");
   /** A native game view is attached under the webview. */
   gameView = $state(false);
   readonly simulated = new URLSearchParams(location.search).has("phone");
@@ -31,6 +32,7 @@ class Device {
     hostInfo().then(
       (info) => {
         this.platform = info.platform;
+        this.version = info.version;
         this.gameView = info.gameView;
       },
       // Outside Tauri the user agent guess stands.

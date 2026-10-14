@@ -23,6 +23,7 @@ pub struct WindowPresenter {
     configuration: wgpu::SurfaceConfiguration,
     compositor: Compositor,
     upscaler: crate::Upscaler,
+    scaling: crate::Scaling,
     upscaling: Option<crate::upscaling::Upscaling>,
     max_acquire_ns: Cell<u64>,
     max_configure_ns: u64,
@@ -147,6 +148,7 @@ impl WindowPresenter {
             configuration,
             compositor,
             upscaler: crate::Upscaler::Off,
+            scaling: crate::Scaling::Fit,
             upscaling: None,
             max_acquire_ns: Cell::new(0),
             max_configure_ns: 0,
@@ -988,7 +990,14 @@ impl Session {
                 cursor_regions: self.cursor_regions.clone(),
             });
         }
-        let rectangle = crate::window::native_viewport(width, height, self.width, self.height);
+        let rectangle = if self.presenter.scaling == crate::Scaling::Fit {
+            crate::window::native_viewport(width, height, self.width, self.height)
+        } else {
+            self.presenter
+                .scaling
+                .rectangle((f64::from(width), f64::from(height)), canvas)
+                .map(|v| v as f32)
+        };
         let view = if let Some(frame) = &self.native {
             frame.image.view()
         } else {
@@ -1040,6 +1049,7 @@ pub(crate) struct Completed {
 /// The HWND must outlive `shutdown` of the service and this coordinator.
 pub(crate) struct UiPresenter {
     upscaler: crate::Upscaler,
+    scaling: crate::Scaling,
     session: Option<Session>,
     observer: Observer<adv_device::surface::PendingFrame>,
     sender: background::Sender,
@@ -1058,12 +1068,16 @@ impl UiPresenter {
         Self {
             session: Some(Session::new(presenter, frames)),
             upscaler: crate::Upscaler::Off,
+            scaling: crate::Scaling::Fit,
             observer,
             sender,
             wake,
             job: None,
             reconfigure: false,
         }
+    }
+    pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
+        self.scaling = value;
     }
     pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
         self.upscaler = value;
@@ -1139,6 +1153,7 @@ impl UiPresenter {
             .map_err(|error| error.to_string())?;
         let mut session = self.session.take().unwrap();
         session.presenter.upscaler = self.upscaler;
+        session.presenter.scaling = self.scaling;
         let (mut output, completion) = spsc::channel(1);
         let scheduled = Instant::now();
         let task = background::Task::new(move || {

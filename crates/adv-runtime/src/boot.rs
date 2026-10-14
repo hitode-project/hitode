@@ -680,6 +680,29 @@ impl<B: Backend> Runtime<B> {
         accepted
     }
 
+    /// Apply host-selected fonts before guest execution begins.
+    pub fn configure_fonts(
+        &mut self,
+        overrides: adv_device::text::Overrides,
+        paths: &[std::path::PathBuf],
+    ) -> Result<(), String> {
+        use std::io::Read;
+        let mut remaining = adv_device::text::MAX_FONT_RESOURCE_BYTES;
+        let mut files = Vec::new();
+        for path in paths {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .map_err(|e| e.to_string())?
+                .take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            remaining = remaining
+                .checked_sub(bytes.len())
+                .ok_or("font resources exceed the byte limit")?;
+            files.push(bytes);
+        }
+        adv_win32::gdi32::font::configure(&mut self.machine, overrides, &files)
+    }
     /// Post text committed by a host input method to the keyboard focus (see
     /// [`adv_win32::user32::host_input::post_text`]); returns the characters posted.
     pub fn post_text(&mut self, text: &str) -> usize {

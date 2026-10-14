@@ -17,6 +17,7 @@ export async function call<T>(command: string, args: Record<string, unknown>, fa
 }
 
 export interface HostInfo {
+  version: string;
   /** "macos", "windows", "linux", "android", "ios". */
   platform: string;
   /** A native game view is attached under the webview. */

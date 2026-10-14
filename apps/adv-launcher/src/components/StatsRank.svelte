@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import Cover from "./Cover.svelte";
   import type { StatsRankRow } from "../lib/stats";
 
@@ -13,7 +14,7 @@
 </script>
 
 <section aria-labelledby="stats-rank">
-  <h2 id="stats-rank">按作品</h2>
+  <h2 id="stats-rank">{t("按作品")}</h2>
   {#if rows.length}
     <ol>
       {#each rows as r (r.game?.id ?? "other")}
@@ -26,7 +27,7 @@
           <span class="body">
             <span class="head">
               <span class="title" class:other={!r.game} lang={r.game ? "ja" : "zh-CN"}>{r.title}</span>
-              <span class="v">{r.hours.toFixed(1)} 小时</span>
+              <span class="v">{r.hours.toFixed(1)} {t("小时")}</span>
             </span>
             <span class="track" aria-hidden="true"><span class:other={!r.game} style:width="{r.width}%"></span></span>
           </span>
@@ -34,7 +35,7 @@
       {/each}
     </ol>
   {:else}
-    <p>这段时间没有游玩记录</p>
+    <p>{t("这段时间没有游玩记录")}</p>
   {/if}
 </section>
 

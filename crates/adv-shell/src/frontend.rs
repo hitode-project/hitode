@@ -47,6 +47,8 @@ pub struct Worker {
 }
 pub struct Ui {
     #[cfg(target_os = "macos")]
+    frame_times: std::collections::VecDeque<Instant>,
+    #[cfg(target_os = "macos")]
     next: Instant,
     #[cfg(target_os = "macos")]
     pub(crate) menu_changed: bool,
@@ -94,6 +96,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             metrics_dropped: metrics_dropped.clone(),
         },
         Ui {
+            #[cfg(target_os = "macos")]
+            frame_times: std::collections::VecDeque::new(),
             #[cfg(target_os = "macos")]
             next: Instant::now(),
             #[cfg(target_os = "macos")]
@@ -168,6 +172,22 @@ impl Worker {
 }
 impl Ui {
     #[cfg(target_os = "macos")]
+    pub(crate) fn fps(&self) -> f64 {
+        self.frame_times
+            .iter()
+            .filter(|at| at.elapsed() < Duration::from_secs(1))
+            .count() as f64
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
+        if let Some(native) = &mut self.native {
+            native.set_scaling(value);
+        }
+        self.repaint = true;
+        self.wake.signal();
+    }
+    #[cfg(target_os = "macos")]
     pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
         if let Some(native) = &mut self.native {
             native.set_upscaler(value);
@@ -226,6 +246,7 @@ impl Ui {
                 }
                 #[cfg(target_os = "macos")]
                 window::Event::AudioSuspended(_)
+                | window::Event::Volume(_)
                 | window::Event::Paused(_)
                 | window::Event::Text(..) => {}
                 #[cfg(target_os = "macos")]
@@ -293,6 +314,15 @@ impl Ui {
                     completed.rendered.result,
                     crate::native_gpu::DrawResult::Presented
                 ) {
+                    let now = Instant::now();
+                    while self
+                        .frame_times
+                        .front()
+                        .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(1))
+                    {
+                        self.frame_times.pop_front();
+                    }
+                    self.frame_times.push_back(now);
                     self.metric(Delivery::Present(
                         completed.rendered.serial,
                         completed.elapsed,

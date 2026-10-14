@@ -10,6 +10,8 @@ mod native_gpu;
 mod upscaling;
 #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
 pub use upscaling::Upscaler;
+mod scaling;
+pub use scaling::Scaling;
 pub mod overlay;
 mod performance;
 #[cfg(target_os = "macos")]
@@ -42,6 +44,9 @@ pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 
 pub struct Options {
+    pub font_families: std::collections::BTreeMap<String, String>,
+    pub font_files: Vec<PathBuf>,
+    pub font_smoothing: Option<bool>,
     row_workers: Option<usize>,
     row_batching: bool,
     exe: PathBuf,
@@ -131,6 +136,9 @@ impl Options {
     /// CLI defaults with a data directory supplied by the host.
     pub fn new(exe: PathBuf, data_dir: PathBuf) -> Self {
         Self {
+            font_families: std::collections::BTreeMap::new(),
+            font_files: Vec::new(),
+            font_smoothing: None,
             row_workers: None,
             row_batching: true,
             exe,
@@ -1290,6 +1298,13 @@ fn run_execution(
     if let Some(codepage) = options.codepage {
         runtime.set_codepage(codepage)?;
     }
+    runtime.configure_fonts(
+        adv_runtime::FontOverrides {
+            families: options.font_families.clone(),
+            antialiased: options.font_smoothing,
+        },
+        &options.font_files,
+    )?;
     for (drive, image) in &options.cdroms {
         runtime.mount_iso(*drive, image)?;
     }
@@ -1484,6 +1499,8 @@ fn run_execution(
                     window::Event::AudioSuspended(sleeping) => {
                         suspension.set(&mut runtime, &mut audio, Some(sleeping), None)
                     }
+                    #[cfg(target_os = "macos")]
+                    window::Event::Volume(percent) => audio.set_volume(percent),
                     #[cfg(target_os = "macos")]
                     window::Event::Paused(paused) => {
                         suspension.set(&mut runtime, &mut audio, None, Some(paused))

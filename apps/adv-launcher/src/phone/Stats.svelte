@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import StatsChart from "../components/StatsChart.svelte";
   import StatsHero from "../components/StatsHero.svelte";
@@ -14,12 +15,12 @@
 </script>
 
 <div class="screen">
-  <PhoneSettingsHeader label="返回游戏库" />
+  <PhoneSettingsHeader label={t("返回游戏库")} />
 
   <main class="scroll">
-    <h1>游玩统计</h1>
+    <h1>{t("游玩统计")}</h1>
 
-    <div class="seg" role="group" aria-label="时间范围">
+    <div class="seg" role="group" aria-label={t("时间范围")}>
       {#each STATS_RANGES as r (r.value)}
         <button
           class:on={range === r.value}

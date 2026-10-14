@@ -69,6 +69,19 @@ pub fn register(registry: &mut Registry) {
 pub fn install<B: adv_cpu::backend::Backend>(machine: &mut Machine<B>) {
     machine.ext.insert(Fonts::default());
 }
+pub fn configure<B: adv_cpu::backend::Backend>(
+    machine: &mut Machine<B>,
+    overrides: text::Overrides,
+    files: &[Vec<u8>],
+) -> Result<(), String> {
+    let text = &mut machine.ext.get_mut::<Fonts>().text;
+    for bytes in files {
+        text.add_file_resource(bytes, true)
+            .map_err(|e| e.to_string())?;
+    }
+    text.set_overrides(overrides);
+    Ok(())
+}
 pub fn cache_stats<B: adv_cpu::backend::Backend>(machine: &Machine<B>) -> text::CacheStats {
     machine.ext.get::<Fonts>().text.stats()
 }

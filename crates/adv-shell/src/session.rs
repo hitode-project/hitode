@@ -172,11 +172,15 @@ impl Session {
     }
     /// Application activation, delivered to the guest as WM_ACTIVATEAPP.
     pub fn set_active(&self, active: bool) {
+        if !active {
+            self.driver.view.clear_control_latch();
+        }
         self.driver.view.hub().activate(active);
     }
     /// The window showing the game lost key status. A guest dialog taking it
     /// keeps the guest's focus; another window removes it.
     pub fn resign_key(&self) {
+        self.driver.view.clear_control_latch();
         self.driver.view.hub().resign_key();
     }
     pub fn set_minimized(&self, minimized: bool) {
@@ -193,8 +197,22 @@ impl Session {
             ui.set_upscaler(value);
         }
     }
-    /// Pause or resume the game, as the launcher's pause menu does. A close
-    /// request resumes it so the guest can answer.
+    /// Set the presentation and input coordinate scaling together.
+    pub fn set_scaling(&self, value: crate::Scaling) {
+        self.driver.view.hub().scaling.set(value);
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.set_scaling(value);
+        }
+    }
+    pub fn set_fast_forward_toggle(&self, toggle: bool) {
+        self.driver.view.set_fast_forward_toggle(toggle);
+    }
+    pub fn fps(&self) -> f64 {
+        self.driver.ui.borrow().as_ref().map_or(0.0, |ui| ui.fps())
+    }
+    pub fn set_volume(&self, percent: u8) {
+        self.driver.view.hub().push(Event::Volume(percent.min(100)));
+    }
     pub fn set_paused(&self, paused: bool) {
         self.driver.view.hub().pause(paused);
     }

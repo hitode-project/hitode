@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import type { Filter } from "../lib/prefs.svelte";
   let { value, inherit, onpick }: {
     value: Filter | "inherit";
@@ -6,7 +7,7 @@
     onpick: (value: Filter | "inherit") => void;
   } = $props();
   const options: { value: Filter; label: string }[] = [
-    { value: "off", label: "关闭" },
+    { value: "off", label: t("关") },
     { value: "anime4k", label: "Anime4K" },
     { value: "cunny", label: "CuNNy" },
     { value: "artcnn", label: "ArtCNN" },
@@ -14,8 +15,8 @@
   ];
 </script>
 
-<select aria-label="超分辨率" {value} onchange={(event) => onpick(event.currentTarget.value as Filter | "inherit")}>
-  {#if inherit !== undefined}<option value="inherit">跟随全局（{options.find((o) => o.value === inherit)?.label}）</option>{/if}
+<select aria-label={t("超分辨率")} {value} onchange={(event) => onpick(event.currentTarget.value as Filter | "inherit")}>
+  {#if inherit !== undefined}<option value="inherit">{t("跟随全局（{0}）", options.find((o) => o.value === inherit)?.label)}</option>{/if}
   {#each options as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
 </select>
 

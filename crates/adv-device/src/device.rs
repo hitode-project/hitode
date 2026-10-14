@@ -2,7 +2,7 @@
 //! Dropping a silent stream also joins CPAL backends whose pause keeps a worker alive.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -37,6 +37,7 @@ pub struct Output {
     metrics: Arc<Metrics>,
     capture: Option<crate::capture::Capture>,
     mute: bool,
+    volume: Arc<AtomicU8>,
 }
 
 impl Output {
@@ -54,10 +55,14 @@ impl Output {
             retry_at: None,
             metrics: Arc::default(),
             capture,
+            volume: Arc::new(AtomicU8::new(100)),
             mute: std::env::var("ADV_AUDIO_MUTE_DEVICE")
                 .ok()
                 .is_some_and(|value| value == "1"),
         }
+    }
+    pub fn set_volume(&self, percent: u8) {
+        self.volume.store(percent.min(100), Ordering::Relaxed);
     }
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
@@ -199,6 +204,7 @@ impl Output {
             .map(|capture| capture.begin(rate, channels, self.mute))
             .transpose()?;
         let mute = self.mute;
+        let volume = self.volume.clone();
         self.metrics.hardware_muted.store(mute, Ordering::Relaxed);
         let started = Instant::now();
         // A fixed scratch buffer avoids allocating on the callback, even for large device buffers.
@@ -280,7 +286,7 @@ impl Output {
                         metrics
                             .non_silent_samples
                             .fetch_add(non_silent as u64, Ordering::Relaxed);
-                        convert_output(block, &scratch, mute);
+                        convert_output(block, &scratch, mute, volume.load(Ordering::Relaxed));
                     }
                 },
                 move |_| {
@@ -297,12 +303,14 @@ fn convert_output<T: cpal::SizedSample + cpal::FromSample<f32>>(
     out: &mut [T],
     samples: &[f32],
     muted: bool,
+    volume: u8,
 ) {
+    let gain = f32::from(volume) / 100.0;
     for (output, &sample) in out.iter_mut().zip(samples) {
         *output = if muted {
             T::EQUILIBRIUM
         } else {
-            T::from_sample(sample)
+            T::from_sample(sample * gain)
         };
     }
 }
@@ -359,7 +367,7 @@ mod tests {
     {
         let samples = [-1.0, -0.75, -0.25, 0.0, 0.25, 0.75, 1.0];
         let mut output = [T::EQUILIBRIUM; 7];
-        convert_output(&mut output, &samples, false);
+        convert_output(&mut output, &samples, false, 100);
         for (got, want) in output
             .iter()
             .map(|sample| f32::from_sample(*sample))
@@ -370,7 +378,7 @@ mod tests {
                 "format conversion {got} {want}"
             );
         }
-        convert_output(&mut output, &samples, true);
+        convert_output(&mut output, &samples, true, 100);
         assert!(
             output.iter().all(|sample| f32::from_sample(*sample) == 0.0),
             "mute submits true equilibrium for every sample type"
@@ -389,6 +397,19 @@ mod tests {
         conversion::<u64>(0.000001);
         conversion::<f32>(0.0);
         conversion::<f64>(0.0);
+    }
+
+    // spec: HOST-RUN-1
+    #[test]
+    fn host_volume_scales_device_samples_without_changing_source() {
+        let source = [-0.8, 0.4, 0.0];
+        let mut actual = [0.0_f32; 3];
+        convert_output(&mut actual, &source, false, 50);
+        assert_eq!(actual, [-0.4, 0.2, 0.0]);
+        convert_output(&mut actual, &source, false, 0);
+        assert_eq!(actual, [0.0; 3]);
+        convert_output(&mut actual, &source, false, 100);
+        assert_eq!(actual, source);
     }
 
     fn source() -> crate::AudioStream {

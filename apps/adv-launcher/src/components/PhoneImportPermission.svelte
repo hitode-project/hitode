@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import Icon from "./Icon.svelte";
   import { COPY_SIZE, pickFolderIos, requestStoragePermission } from "../lib/fake-import";
   import { nav } from "../lib/nav.svelte";
@@ -66,7 +67,7 @@
 <svelte:window {onkeydown} />
 
 <div class="layer">
-  <button class="scrim" onclick={oncancel} aria-label="关闭"></button>
+  <button class="scrim" onclick={oncancel} aria-label={t("关闭")}></button>
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="perm-t" tabindex="-1" bind:this={sheet}>
     <span class="grab" aria-hidden="true"></span>
 
@@ -75,15 +76,15 @@
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M11.5 19H4.5A1.5 1.5 0 0 1 3 17.5v-11A1.5 1.5 0 0 1 4.5 5h4.2l2 2h8.8A1.5 1.5 0 0 1 21 8.5V11"></path><path d="M18 13.2l3.5 1.3v2.7c0 2.2-1.5 3.8-3.5 4.6-2-.8-3.5-2.4-3.5-4.6v-2.7z"></path></svg>
         </div>
-        <h2 id="perm-t" class="ttl">允许访问游戏文件夹</h2>
-        <p class="line">游戏留在原处，启动器只读取，不会修改或上传。</p>
+        <h2 id="perm-t" class="ttl">{t("允许访问游戏文件夹")}</h2>
+        <p class="line">{t("游戏留在原处，启动器只读取，不会修改或上传。")}</p>
         <div class="acts">
           <button class="primary" onclick={grant}>
-            <span>去授权</span>
+            <span>{t("去授权")}</span>
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h6v6M12 4l-7.5 7.5"></path></svg>
           </button>
-          <button class="secondary" onclick={() => go("copy")}>改为复制到本机</button>
-          <button class="quiet" onclick={oncancel}>取消</button>
+          <button class="secondary" onclick={() => go("copy")}>{t("改为复制到本机")}</button>
+          <button class="quiet" onclick={oncancel}>{t("取消")}</button>
         </div>
       </div>
     {:else if !ios && step === "granted"}
@@ -91,13 +92,13 @@
         <div class="badge ok" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 12.5l3.6 3.6L17.5 8.5"></path></svg>
         </div>
-        <h2 id="perm-t" class="ttl">已授权</h2>
+        <h2 id="perm-t" class="ttl">{t("已授权")}</h2>
         <div class="acts" class:wait={!ready}>
           <button class="primary" disabled={!ready} onclick={onscan}>
             <Icon name="folder" size={17} stroke={1.5} />
-            <span>选择文件夹…</span>
+            <span>{t("选择文件夹…")}</span>
           </button>
-          <button class="quiet" onclick={oncancel} disabled={!ready}>取消</button>
+          <button class="quiet" onclick={oncancel} disabled={!ready}>{t("取消")}</button>
         </div>
       </div>
     {:else if !ios && step === "copy"}
@@ -105,14 +106,14 @@
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"></rect><path d="M12 7.5v7M9 11.5l3 3 3-3"></path></svg>
         </div>
-        <h2 id="perm-t" class="ttl">复制到本机</h2>
-        <p class="line">复制后可离线游玩，占用 {COPY_SIZE}</p>
+        <h2 id="perm-t" class="ttl">{t("复制到本机")}</h2>
+        <p class="line">{t("复制后可离线游玩，占用")} {COPY_SIZE}</p>
         <div class="acts">
           <button class="primary" onclick={onscan}>
             <Icon name="folder" size={17} stroke={1.5} />
-            <span>选择文件夹…</span>
+            <span>{t("选择文件夹…")}</span>
           </button>
-          <button class="quiet" onclick={() => go("ask")}>返回</button>
+          <button class="quiet" onclick={() => go("ask")}>{t("返回")}</button>
         </div>
       </div>
     {:else if ios && step === "icloud"}
@@ -123,12 +124,12 @@
         <h2 id="perm-t" class="ttl" lang="ja">{picked}</h2>
         <div class="warn" role="status">
           <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.6 12.5a3 3 0 0 1-.5-5.96 4 4 0 0 1 7.7-.9A3 3 0 0 1 11.4 12.5"></path><path d="M8 8v5.5M6.2 11.8L8 13.5l1.8-1.7"></path></svg>
-          <span>部分文件在 iCloud 中，需要先下载</span>
+          <span>{t("部分文件在 iCloud 中，需要先下载")}</span>
         </div>
         <div class="acts" style="margin-top: 22px">
-          <button class="primary" onclick={onimport}>下载并添加</button>
-          <button class="secondary" onclick={onimport}>复制到本机</button>
-          <button class="quiet" onclick={oncancel}>取消</button>
+          <button class="primary" onclick={onimport}>{t("下载并添加")}</button>
+          <button class="secondary" onclick={onimport}>{t("复制到本机")}</button>
+          <button class="quiet" onclick={oncancel}>{t("取消")}</button>
         </div>
       </div>
     {:else}
@@ -136,11 +137,11 @@
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.2l2 2h8.8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"></path></svg>
         </div>
-        <h2 id="perm-t" class="ttl">选择游戏文件夹</h2>
-        <p class="line">在“文件”里选中整个游戏文件夹。</p>
+        <h2 id="perm-t" class="ttl">{t("选择游戏文件夹")}</h2>
+        <p class="line">{t("在“文件”里选中整个游戏文件夹。")}</p>
         <div class="acts">
-          <button class="primary" onclick={pickIos}>打开“文件”</button>
-          <button class="quiet" onclick={oncancel}>取消</button>
+          <button class="primary" onclick={pickIos}>{t("打开“文件”")}</button>
+          <button class="quiet" onclick={oncancel}>{t("取消")}</button>
         </div>
       </div>
     {/if}

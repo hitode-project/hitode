@@ -43,6 +43,12 @@ impl AudioOutput {
             output.suspend();
         }
     }
+    #[cfg(target_os = "macos")]
+    pub fn set_volume(&self, percent: u8) {
+        if let Some(output) = &self.output {
+            output.set_volume(percent);
+        }
+    }
     pub fn update(&mut self) {
         #[cfg(target_os = "macos")]
         if self.suspended {

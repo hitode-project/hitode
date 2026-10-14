@@ -49,6 +49,32 @@ pub(super) struct Viewport {
     height: f64,
 }
 impl Viewport {
+    fn scaled(
+        client: (f64, f64),
+        canvas: (u32, u32),
+        scaling: crate::Scaling,
+        backing: f64,
+    ) -> Self {
+        let pixels = ((client.0 * backing).round(), (client.1 * backing).round());
+        let rect = if scaling == crate::Scaling::Fit || canvas.0 == 0 || canvas.1 == 0 {
+            Self::fit(pixels, canvas.0, canvas.1)
+        } else {
+            let [x, y, width, height] = scaling.rectangle(pixels, canvas);
+            Self {
+                x,
+                y,
+                width,
+                height,
+            }
+        };
+        Self {
+            x: rect.x / backing,
+            y: rect.y / backing,
+            width: rect.width / backing,
+            height: rect.height / backing,
+        }
+    }
+
     fn fit(client: (f64, f64), width: u32, height: u32) -> Self {
         let (cw, ch) = (client.0.max(0.0), client.1.max(0.0));
         if cw == 0.0 || ch == 0.0 || width == 0 || height == 0 {
@@ -105,6 +131,7 @@ pub(crate) fn native_viewport(
 /// dispatch on the main thread, so no borrow is held across `sendEvent`.
 #[derive(Default)]
 pub(crate) struct Hub {
+    pub(crate) scaling: Cell<crate::Scaling>,
     main: Cell<usize>,
     wake: RefCell<Option<WakeEvent>>,
     main_enabled: Cell<bool>,
@@ -675,6 +702,28 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: HOST-RUN-1
+    #[test]
+    fn retina_scaling_maps_the_presented_rectangle() {
+        let integer = Viewport::scaled((600.0, 500.0), (800, 600), crate::Scaling::Integer, 2.0);
+        assert_eq!(
+            (integer.x, integer.y, integer.width, integer.height),
+            (100.0, 100.0, 400.0, 300.0)
+        );
+        assert_eq!(integer.position(100.0, 100.0, 800, 600), (0, 0));
+        assert_eq!(integer.position(499.5, 399.5, 800, 600), (799, 599));
+        let stretch = Viewport::scaled((600.0, 500.0), (800, 600), crate::Scaling::Stretch, 2.0);
+        assert_eq!(stretch.position(300.0, 250.0, 800, 600), (400, 300));
+        assert_eq!(
+            (stretch.x, stretch.y, stretch.width, stretch.height),
+            (0.0, 0.0, 600.0, 500.0)
+        );
+        assert_eq!(
+            crate::Scaling::Integer.rectangle((400.0, 300.0), (800, 600)),
+            [0.0, 0.0, 400.0, 300.0]
+        );
+    }
 
     // spec: HOST-VIEW-1
     #[test]

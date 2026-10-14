@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import StatsChart from "../components/StatsChart.svelte";
   import StatsHero from "../components/StatsHero.svelte";
@@ -16,9 +17,9 @@
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="page">
     <div class="head">
-      <h1>游玩统计</h1>
+      <h1>{t("游玩统计")}</h1>
       <SettingsSeg
-        label="时间范围"
+        label={t("时间范围")}
         value={range}
         onpick={(v) => {
           range = v;

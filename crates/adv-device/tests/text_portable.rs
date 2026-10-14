@@ -1094,3 +1094,87 @@ fn installed_chinese_dbcs_glyphs_ignore_upper_word_when_available() {
         );
     }
 }
+
+// spec: DEV-FONT-1
+#[test]
+fn explicit_host_substitution_updates_metrics_and_cached_glyphs() {
+    let (mut text, request) = loaded();
+    text.add_file_resource(COLLECTION, false).unwrap();
+    let query = glyph(Character::Unicode(66), GlyphFormat::Gray8);
+    let before = text.glyph(&request, query).unwrap();
+    assert_eq!(before.metrics.advance_x, 20);
+    text.set_overrides(Overrides {
+        families: [(request.face.clone(), "ADV Collection Two".into())].into(),
+        antialiased: Some(false),
+    });
+    assert_eq!(
+        text.resolved_character(&request, 66).unwrap().family,
+        "ADV Collection Two"
+    );
+    let after = text.glyph(&request, query).unwrap();
+    assert_eq!(after.metrics.advance_x, 36);
+    assert_eq!(
+        text.extent(&request, TextInput::Unicode(&[66]))
+            .unwrap()
+            .width,
+        36
+    );
+    assert_ne!(before.data, after.data);
+    text.set_overrides(Overrides::default());
+    assert_eq!(text.glyph(&request, query).unwrap().data, before.data);
+}
+
+// spec: DEV-FONT-1
+#[test]
+fn host_smoothing_changes_paint_without_changing_outline_requests() {
+    let (mut text, mut request) = loaded();
+    request.quality = Quality::Monochrome;
+    let mut images = Vec::new();
+    for smooth in [false, true] {
+        text.set_overrides(Overrides {
+            antialiased: Some(smooth),
+            ..Overrides::default()
+        });
+        let mut bytes = vec![0; 64 * 48 * 4];
+        text.paint(
+            &request,
+            Paint {
+                input: TextInput::Unicode(&[65]),
+                origin: Point { x: 4, y: 40 },
+                horizontal: Horizontal::Left,
+                vertical: Vertical::Baseline,
+                foreground: [255; 3],
+                background: [0; 3],
+                opaque_background: false,
+                clip: None,
+                fill: None,
+            },
+            Pixels {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 48,
+                },
+                pitch: 256,
+                format: PixelFormat::Bgra32,
+                bytes: &mut bytes,
+            },
+        )
+        .unwrap();
+        let partial = bytes
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 0 && pixel[0] < 255);
+        assert_eq!(partial, smooth);
+        images.push(
+            text.glyph(
+                &request,
+                glyph(Character::Unicode(65), GlyphFormat::Monochrome),
+            )
+            .unwrap()
+            .data
+            .clone(),
+        );
+    }
+    assert_eq!(images[0], images[1]);
+}

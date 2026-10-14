@@ -1,3 +1,4 @@
+import { t } from "./i18n.svelte";
 import {
   CACHE_GB,
   GAME_DEFAULTS,
@@ -7,15 +8,13 @@ import {
   fakeReports,
   fakeRoots,
   loadGameSetup,
-  pickDiscImage,
-  pickFont,
   saveGameSetup,
   type GameSetup,
   type GameValues,
   type LibraryRoot,
   type OverrideKey,
 } from "./fake-settings";
-import { inTauri } from "./bridge";
+import { call, inTauri } from "./bridge";
 import { libraryInspect, type Codepage, type ExeCandidate } from "./host";
 import { library } from "./library.svelte";
 import { prefs, savePrefs, type Accent, type Filter, type Prefs } from "./prefs.svelte";
@@ -30,9 +29,9 @@ export function setPref<K extends keyof Prefs>(key: K, value: Prefs[K]): void {
 }
 
 export const ACCENTS: { value: Accent; label: string; color: string }[] = [
-  { value: "blue", label: "蓝", color: "#3767D6" },
-  { value: "green", label: "绿", color: "#2D7556" },
-  { value: "graphite", label: "石墨", color: "#3F3F44" },
+  { value: "blue", get label() { return t("蓝"); }, color: "#3767D6" },
+  { value: "green", get label() { return t("绿"); }, color: "#2D7556" },
+  { value: "graphite", get label() { return t("石墨"); }, color: "#3F3F44" },
 ];
 
 const gb = (v: number) => `${v.toFixed(1)} GB`;
@@ -48,17 +47,17 @@ class GeneralSettings {
   readonly totalGb = $derived(SAVES_GB + this.cacheGb);
   readonly totalLabel = $derived(gb(this.totalGb));
   readonly cacheLabel = $derived(this.cache === "cleared" ? "0 MB" : gb(CACHE_GB));
-  readonly clearLabel = $derived(this.cache === "cleared" ? "已清除" : this.cache === "clearing" ? "正在清除…" : "清除");
+  readonly clearLabel = $derived(this.cache === "cleared" ? t("已清除") : this.cache === "clearing" ? t("正在清除…") : t("清除"));
   /** Widths of the saves and cache segments of the usage bar, in percent. */
   readonly savesPct = $derived(Math.max(2, (SAVES_GB / this.totalGb) * 100));
   readonly cachePct = $derived((this.cacheGb / this.totalGb) * 100);
   readonly reports = $derived(
-    fakeReports.map((r) => ({ ...r, title: library.get(r.gameId)?.title ?? "已移除的游戏" })),
+    fakeReports.map((r) => ({ ...r, title: library.get(r.gameId)?.title ?? t("已移除的游戏") })),
   );
 
   rootMeta(root: LibraryRoot): string {
     const count = library.games.filter((g) => g.path.startsWith(root.path + "/")).length;
-    return root.depth === null ? `磁盘未连接 · ${count} 个游戏` : `自动发现 · ${root.depth} 层 · ${count} 个游戏`;
+    return root.depth === null ? t("磁盘未连接 · {0} 个游戏", count) : t("自动发现 · {0} 层 · {1} 个游戏", root.depth, count);
   }
 
   removeRoot(id: string): void {
@@ -78,7 +77,7 @@ type FontKey = "gothic" | "mincho";
 
 /**
  * One game's settings form: run setup and per-game overrides of global values.
- * Create it during component setup; edits are saved for the session as they happen.
+ * Create it during component setup; edits are persisted as they happen.
  */
 export class GameForm {
   readonly #initial: Game;
@@ -87,6 +86,7 @@ export class GameForm {
   #candidates = $state<ExeCandidate[]>([]);
   /** Local or imported fonts picked this session, offered in both font menus. */
   picked = $state<string[]>([]);
+  error = $state("");
 
   static readonly LETTERS = ["D:", "E:", "F:", "G:"];
   static readonly FONTS: { key: FontKey; name: string }[] = [
@@ -130,7 +130,10 @@ export class GameForm {
     });
     this.exe = $derived(inTauri ? this.game.exe : this.setup.exe);
     $effect(() => saveGameSetup(this.game.id, $state.snapshot(this.setup)));
-    if (inTauri) void this.#inspect();
+    if (inTauri) {
+      void this.#inspect();
+      void call<string[]>("font_families", { path: null }, []).then((names) => this.picked = names).catch((e) => this.error = String(e));
+    }
   }
 
   /** The library's current entry; host updates replace it. */
@@ -198,8 +201,12 @@ export class GameForm {
     return this.setup.discs.length >= GameForm.LETTERS.length;
   }
 
-  addDisc(): void {
-    if (!this.discsFull) this.setup.discs.push(pickDiscImage(this.setup.exe, this.setup.discs));
+  async addDisc(): Promise<void> {
+    if (this.discsFull) return;
+    try {
+      const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+      if (path) this.setup.discs.push(path);
+    } catch (e) { this.error = String(e); }
   }
 
   removeDisc(index: number): void {
@@ -215,10 +222,16 @@ export class GameForm {
     }
     // Keep showing the current choice while the host dialog is open.
     select.value = this.value(key);
-    const family = await pickFont(next);
-    if (!family) return;
-    if (!this.picked.includes(family)) this.picked.push(family);
-    this.pick(key, `font:${family}`);
+    try {
+      const path = await call<string | null>("pick_game_file", { kind: "font" }, null);
+      if (!path) return;
+      const names = await call<string[]>("font_families", { path }, []);
+      const family = names[0];
+      if (!family) throw new Error(t("字体文件没有可用的字形面"));
+      if (!this.setup.fontFiles.includes(path)) this.setup.fontFiles.push(path);
+      this.picked = [...new Set([...this.picked, ...names])];
+      this.pick(key, `font:${family}`);
+    } catch (e) { this.error = String(e); }
   }
 
   /** CSS font stack previewing a font choice. */

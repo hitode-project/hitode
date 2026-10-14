@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import Icon from "../components/Icon.svelte";
   import PhoneImportFooter from "../components/PhoneImportFooter.svelte";
   import PhoneImportHeader from "../components/PhoneImportHeader.svelte";
@@ -25,17 +26,17 @@
 
 <PhoneImportPage>
   <div class="base" inert={asking}>
-    <PhoneImportHeader label="取消" onclose={() => nav.back()} />
+    <PhoneImportHeader label={t("取消")} onclose={() => nav.back()} />
 
     <main class="scroll body">
       <div>
-        <h1>添加文件夹</h1>
+        <h1>{t("添加文件夹")}</h1>
         {#if !asking}<div class="mono" style="margin-top: 6px">{scan.root}</div>{/if}
       </div>
 
       {#if !asking}
         <div style="display: flex; flex-direction: column; gap: 10px">
-          <div class="lbl" id="p-lbl-depth">子文件夹层数</div>
+          <div class="lbl" id="p-lbl-depth">{t("子文件夹层数")}</div>
           <div class="seg" role="group" aria-labelledby="p-lbl-depth">
             {#each SCAN_DEPTHS as n (n)}
               <button class:on={scan.depth === n} aria-pressed={scan.depth === n} aria-label={depthLabel(n)} onclick={() => scan.setDepth(n)}
@@ -44,23 +45,23 @@
             {/each}
           </div>
           <div class="watch">
-            <span style="flex: 1; font-size: 15px">以后自动发现新游戏</span>
-            <PhoneImportSwitch checked={scan.watch} label="以后自动发现新游戏" onchange={(v) => (scan.watch = v)} />
+            <span style="flex: 1; font-size: 15px">{t("以后自动发现新游戏")}</span>
+            <PhoneImportSwitch checked={scan.watch} label={t("以后自动发现新游戏")} onchange={(v) => (scan.watch = v)} />
           </div>
         </div>
 
         {#if scan.phase !== "ready"}
-          <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? "正在选择文件夹…" : "正在查找游戏…"}</div>
+          <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…")}</div>
         {:else}
                 <section aria-labelledby="p-h-found" style="display: flex; flex-direction: column; gap: 6px">
           <div style="display: flex; align-items: center; gap: 12px">
-            <h2 id="p-h-found" class="lbl" style="margin: 0; flex: 1">找到 {scan.list.length} 个</h2>
+            <h2 id="p-h-found" class="lbl" style="margin: 0; flex: 1">{t("找到")} {scan.list.length} {t("个")}</h2>
             {#if scan.pickable.length > 0}
-              <button class="link" onclick={() => scan.toggleAll()}>{scan.allOn ? "全不选" : "全选"}</button>
+              <button class="link" onclick={() => scan.toggleAll()}>{scan.allOn ? t("全不选") : t("全选")}</button>
             {/if}
           </div>
           {#if scan.list.length === 0}
-            <div style="padding: 32px 0; text-align: center; font-size: 14px; color: var(--fg2)">这一层没有游戏</div>
+            <div style="padding: 32px 0; text-align: center; font-size: 14px; color: var(--fg2)">{t("这一层没有游戏")}</div>
           {/if}
           {#each scan.list as g (g.id)}
             {@const locked = scanLocked(g)}
@@ -77,14 +78,10 @@
               <div class="sub">
                 <span class="mono ell" style="flex: 1; min-width: 0; color: var(--fg2)">{g.exe}</span>
                 {#if !locked}
-                  <PhoneImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label="{g.name} 的编码" onpick={(v) => scan.setEnc(g, v)} />
+                  <PhoneImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label={t("{0} 的编码", g.name)} onpick={(v) => scan.setEnc(g, v)} />
                 {/if}
                 {#if g.setup}
-                  {#if scan.installNote === g.id}
-                    <span class="note" role="status">暂不支持安装</span>
-                  {:else}
-                    <button class="link" aria-label="安装 {g.name}" onclick={() => scan.install(g)}>安装…</button>
-                  {/if}
+              <span class="note" role="status">{t("暂不支持安装")}</span>
                 {/if}
                 {#if locked && !g.setup}
                   <span style="font-size: 12px; color: var(--fg3); white-space: nowrap">{scanNote(g)}</span>

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t, locale } from "./lib/i18n.svelte";
+  import { call, onHostEvent } from "./lib/bridge";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
   import { nav } from "./lib/nav.svelte";
@@ -7,7 +9,6 @@
   import Game from "./pages/Game.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
-  import Install from "./pages/Install.svelte";
   import Launch from "./pages/Launch.svelte";
   import Library from "./pages/Library.svelte";
   import Report from "./pages/Report.svelte";
@@ -16,13 +17,15 @@
   import Stats from "./pages/Stats.svelte";
   import PhoneGameSettings from "./phone/GameSettings.svelte";
   import PhoneImport from "./phone/Import.svelte";
-  import PhoneInstall from "./phone/Install.svelte";
   import PhoneLaunch from "./phone/Launch.svelte";
   import PhoneLibrary from "./phone/Library.svelte";
   import PhoneReport from "./phone/Report.svelte";
   import PhoneScan from "./phone/Scan.svelte";
   import PhoneSettings from "./phone/Settings.svelte";
   import PhoneStats from "./phone/Stats.svelte";
+
+  let backupError = $state("");
+  $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
 
   let systemDark = $state(matchMedia("(prefers-color-scheme: dark)").matches);
   $effect(() => {
@@ -38,6 +41,7 @@
 
   $effect(() => {
     const root = document.documentElement;
+    root.lang = locale() === "zh" ? "zh-CN" : locale();
     root.dataset.theme = prefs.theme === "system" ? (systemDark ? "dark" : "light") : prefs.theme;
     root.dataset.accent = prefs.accent;
     root.dataset.screen = route.name;
@@ -46,9 +50,19 @@
     if (device.simulated) root.dataset.simulated = "";
   });
 
+  $effect(() => {
+    void call("set_menu_language", { language: locale() }, null).catch(console.error);
+  });
+
   $effect(() => setGameActive(route.name === "game"));
+  $effect(() => {
+    void call("set_tracking", { enabled: prefs.trackPlayTime }, null).catch(console.error);
+  });
 </script>
 
+{#if backupError}<div class="backup-error" role="alert">{backupError}<button onclick={() => backupError = ""}>{t("关闭")}</button></div>{/if}
+
+{#key locale()}
 {#if route.name === "game"}
   <Game gameId={route.gameId} gameView={device.gameView} phone={device.phone} />
 {:else if device.phone}
@@ -63,7 +77,7 @@
     {:else if route.name === "scan"}
       <PhoneScan />
     {:else if route.name === "install"}
-      <PhoneInstall />
+      <PhoneLibrary filter="all" />
     {:else if route.name === "settings"}
       <PhoneSettings />
     {:else if route.name === "game-settings"}
@@ -93,7 +107,7 @@
       {:else if route.name === "scan"}
         <Scan />
       {:else if route.name === "install"}
-        <Install />
+        <Library filter="all" />
       {:else if route.name === "settings"}
         <Settings />
       {:else if route.name === "game-settings"}
@@ -103,7 +117,10 @@
   </div>
 {/if}
 
+{/key}
+
 <style>
+  .backup-error { position: fixed; z-index: 100; top: 40px; left: 20px; right: 20px; padding: 16px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); }
   .shell {
     position: relative;
     height: 100%;

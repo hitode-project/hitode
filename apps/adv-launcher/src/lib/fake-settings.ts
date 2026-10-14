@@ -1,7 +1,7 @@
+import { call } from "./bridge";
 import type { FastForward, Filter } from "./prefs.svelte";
 
-// Fake data for the settings screens until the Rust side stores settings,
-// library folders, storage and reports. Host actions are simulated here.
+// Persisted per-game settings and browser-only library maintenance fixtures.
 
 export const APP_VERSION = "0.1.0";
 export const DATA_DIR = "~/Library/Application Support/org.hitode.launcher";
@@ -71,6 +71,7 @@ export interface GameSetup {
   exes: string[];
   exe: string;
   discs: string[];
+  fontFiles: string[];
   overrides: Partial<GameValues>;
 }
 
@@ -89,34 +90,25 @@ const exes: Record<string, string[]> = {
   g12: ["Momiji.exe", "Setup.exe"],
 };
 
-// Kept for the session so leaving and reopening a game's settings keeps edits.
-const setups = new Map<string, GameSetup>([
-  ["g1", { nativeCodepage: 932, exes: exes.g1 ?? [], exe: "Natsukage.exe", discs: ["NATSUKAGE_DISC1.iso"], overrides: { scale: "int", mincho: "serif" } }],
-]);
+// Persisted separately from the library, keyed by its stable game id.
+const SETUP_KEY = "adv-launcher.game-settings";
+function savedSetups(): [string, GameSetup][] {
+  try { return Object.entries(JSON.parse(localStorage.getItem(SETUP_KEY) ?? "{}")); }
+  catch { return []; }
+}
+const setups = new Map<string, GameSetup>(savedSetups());
 
 /** The game's run setup; `codepage` is its current code page, taken as native on first load. */
 export function loadGameSetup(gameId: string, codepage: number): GameSetup {
   const saved = setups.get(gameId);
   if (saved) return structuredClone(saved);
   const list = exes[gameId] ?? ["Game.exe"];
-  return { nativeCodepage: codepage, exes: list, exe: list[0] ?? "Game.exe", discs: [], overrides: {} };
+  return { nativeCodepage: codepage, exes: list, exe: list[0] ?? "Game.exe", discs: [], fontFiles: [], overrides: {} };
 }
 
 export function saveGameSetup(gameId: string, setup: GameSetup): void {
   setups.set(gameId, structuredClone(setup));
-}
-
-/** Host file dialog for a disc image: pretends the next disc of the set was picked. */
-export function pickDiscImage(exe: string, mounted: string[]): string {
-  const base = exe.replace(/\.exe$/i, "").toUpperCase();
-  let n = 1;
-  while (mounted.includes(`${base}_DISC${n}.iso`)) n++;
-  return `${base}_DISC${n}.iso`;
-}
-
-/** Host font picker or font file dialog; resolves to the chosen family, null if cancelled. */
-export function pickFont(kind: "local" | "import"): Promise<string | null> {
-  return new Promise((resolve) => setTimeout(() => resolve(kind === "local" ? "ヒラギノ明朝 ProN" : "源暎アンチック"), 250));
+  localStorage.setItem(SETUP_KEY, JSON.stringify(Object.fromEntries(setups)));
 }
 
 /** Host action: drop cached thumbnails and shader caches. */
@@ -170,6 +162,5 @@ export function codepagePreview(text: string, from: number, to: number): string 
 
 /** Host action: reveal the game's folder in Finder or Explorer. */
 export function revealFolder(path: string): Promise<void> {
-  void path;
-  return Promise.resolve();
+  return call("reveal_path", { path }, undefined);
 }

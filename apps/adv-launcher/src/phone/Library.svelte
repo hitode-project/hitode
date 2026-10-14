@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
@@ -10,10 +11,10 @@
   let { filter }: { filter: LibraryFilter } = $props();
 
   const chips: { filter: LibraryFilter; label: string }[] = [
-    { filter: "all", label: "全部" },
-    { filter: "recent", label: "最近" },
-    { filter: "favorite", label: "收藏" },
-    { filter: "unstarted", label: "未开始" },
+    { filter: "all", label: t("全部") },
+    { filter: "recent", label: t("最近") },
+    { filter: "favorite", label: t("收藏") },
+    { filter: "unstarted", label: t("未开始") },
   ];
 
   let searching = $state(false);
@@ -41,7 +42,7 @@
   }
 
   function offlineLabel(game: Game): string {
-    return game.offline === "disk" ? "未连接" : "找不到";
+    return game.offline === "disk" ? t("未连接") : t("找不到");
   }
 
   function trend(game: Game) {
@@ -76,8 +77,8 @@
 
 {#if library.games.length === 0}
   <header class="top">
-    <h1>游戏库</h1>
-    <button class="icon-btn" aria-label="设置" onclick={() => nav.go({ name: "settings" })}>
+    <h1>{t("游戏库")}</h1>
+    <button class="icon-btn" aria-label={t("设置")} onclick={() => nav.go({ name: "settings" })}>
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
   </header>
@@ -87,28 +88,27 @@
       <div class="ghost-card" style="width: 76px"></div>
       <div class="ghost-card" style="transform: rotate(6deg) translateY(6px); opacity: .6"></div>
     </div>
-    <h2>添加游戏文件夹</h2>
+    <h2>{t("添加游戏文件夹")}</h2>
     <div class="empty-actions">
       <button class="primary" onclick={() => nav.go({ name: "scan" })}>
         <Icon name="folder-plus" size={18} stroke={1.5} />
-        <span>添加文件夹…</span>
+        <span>{t("添加文件夹…")}</span>
       </button>
-      <button class="quiet">支持哪些游戏？</button>
     </div>
   </main>
 {:else}
   <header class="top">
-    <h1>游戏库</h1>
-    <button class="icon-btn" aria-label="搜索" aria-pressed={searching} onclick={toggleSearch}>
+    <h1>{t("游戏库")}</h1>
+    <button class="icon-btn" aria-label={t("搜索")} aria-pressed={searching} onclick={toggleSearch}>
       <Icon name="search" size={20} stroke={1.5} />
     </button>
-    <button class="icon-btn" aria-label="游玩统计" onclick={() => nav.go({ name: "stats" })}>
+    <button class="icon-btn" aria-label={t("游玩统计")} onclick={() => nav.go({ name: "stats" })}>
       <Icon name="chart" size={20} stroke={1.5} />
     </button>
-    <button class="icon-btn" aria-label="添加游戏" onclick={() => nav.go({ name: "scan" })}>
+    <button class="icon-btn" aria-label={t("添加游戏")} onclick={() => nav.go({ name: "scan" })}>
       <Icon name="plus" size={20} stroke={1.5} />
     </button>
-    <button class="icon-btn" aria-label="设置" onclick={() => nav.go({ name: "settings" })}>
+    <button class="icon-btn" aria-label={t("设置")} onclick={() => nav.go({ name: "settings" })}>
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
   </header>
@@ -116,11 +116,11 @@
   {#if searching}
     <label class="field search">
       <Icon name="search" size={16} stroke={1.5} />
-      <span class="sr">搜索</span>
-      <input type="search" placeholder="搜索标题或品牌" bind:this={searchInput} bind:value={query} />
+      <span class="sr">{t("搜索")}</span>
+      <input type="search" placeholder={t("搜索标题或品牌")} bind:this={searchInput} bind:value={query} />
     </label>
   {:else}
-    <div class="chips" role="group" aria-label="分类">
+    <div class="chips" role="group" aria-label={t("分类")}>
       {#each chips as c (c.filter)}
         <button
           class="chip"
@@ -136,7 +136,7 @@
 
   <main class="grid-wrap">
     {#if items.length === 0}
-      <div class="none">没有匹配的游戏</div>
+      <div class="none">{t("没有匹配的游戏")}</div>
     {/if}
     <div class="grid">
       {#each items as game (game.id)}
@@ -145,12 +145,12 @@
           class:gone={game.offline !== null}
           onclick={() => (openId = game.id)}
           aria-label={game.offline
-            ? `${game.title}，${game.offline === "disk" ? "磁盘未连接" : "找不到文件夹"}`
+            ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
             : game.title}
         >
           <Cover {game} style="border-radius: 5px">
             {#snippet children({ hidden })}
-              {#if hidden}<span class="veil">已遮挡</span>{/if}
+              {#if hidden}<span class="veil">{t("已遮挡")}</span>{/if}
               {#if game.offline}
                 <span class="badge" aria-hidden="true">
                   <Icon name="unlink" size={10} stroke={1.6} />
@@ -168,12 +168,12 @@
 
 {#if current}
   {@const game = current}
-  <div class="page" role="dialog" aria-label="游戏详情">
+  <div class="page" role="dialog" aria-label={t("游戏详情")}>
     <div class="pbd {game.cover}" aria-hidden="true"></div>
     <div class="pscrim" aria-hidden="true"></div>
     <div class="page-body">
       <div style="display: flex; margin-left: -12px">
-        <button class="icon-btn" onclick={() => (openId = null)} aria-label="返回游戏库">
+        <button class="icon-btn" onclick={() => (openId = null)} aria-label={t("返回游戏库")}>
           <Icon name="chevron-left" size={22} stroke={1.6} />
         </button>
       </div>
@@ -181,11 +181,11 @@
         <Cover {game} style="width: 160px; border-radius: 8px; box-shadow: 0 20px 44px rgba(0,0,0,.28), 0 0 0 1px var(--line)">
           {#snippet children({ hidden })}
             {#if hidden}
-              <button class="reveal" onclick={() => (library.revealed[game.id] = true)} aria-label="显示封面">
-                <Icon name="eye" size={14} stroke={1.5} /><span>显示</span>
+              <button class="reveal" onclick={() => (library.revealed[game.id] = true)} aria-label={t("显示封面")}>
+                <Icon name="eye" size={14} stroke={1.5} /><span>{t("显示")}</span>
               </button>
             {:else if game.nsfw && library.revealed[game.id]}
-              <button class="rehide" onclick={() => (library.revealed[game.id] = false)} aria-label="重新遮挡封面">
+              <button class="rehide" onclick={() => (library.revealed[game.id] = false)} aria-label={t("重新遮挡封面")}>
                 <Icon name="eye-off" stroke={1.5} />
               </button>
             {/if}
@@ -199,7 +199,7 @@
         <div class="notice phone-notice" role="status">
           <Icon name={game.offline === "disk" ? "disk" : "folder-question"} />
           <div style="min-width: 0">
-            <div style="font-weight: 500">{game.offline === "disk" ? "所在磁盘未连接" : "找不到文件夹"}</div>
+            <div style="font-weight: 500">{game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹")}</div>
             <div class="mono" style="margin-top: 2px">{game.path}</div>
           </div>
         </div>
@@ -209,7 +209,7 @@
         {#if game.offline === "missing"}
           <button class="primary" onclick={() => void library.relocate(game.id)}>
             <Icon name="folder" size={16} stroke={1.5} />
-            <span>重新定位…</span>
+            <span>{t("重新定位…")}</span>
           </button>
         {:else}
           <button
@@ -218,25 +218,25 @@
             onclick={() => game.offline === null && nav.go({ name: "launch", gameId: game.id })}
           >
             <Icon name="play" size={15} />
-            <span>{game.lastPlayed === null ? "开始游戏" : "继续游戏"}</span>
+            <span>{game.lastPlayed === null ? t("开始游戏") : t("继续游戏")}</span>
           </button>
         {/if}
-        <button class="ghost" aria-label="更多操作" aria-haspopup="dialog" onclick={() => (more = true)}>
+        <button class="ghost" aria-label={t("更多操作")} aria-haspopup="dialog" onclick={() => (more = true)}>
           <Icon name="more" size={18} />
         </button>
       </div>
       {#if game.offline === "missing"}
-        <button class="quiet remove" onclick={() => remove(game)}>从游戏库移除</button>
+        <button class="quiet remove" onclick={() => remove(game)}>{t("从游戏库移除")}</button>
       {/if}
 
       <dl class="meta">
-        <dt>上次游玩</dt><dd>{lastPlayedLabel(game.lastPlayed, library.now)}</dd>
-        <dt>累计时长</dt><dd>{playTimeLabel(game.playMinutes)}</dd>
+        <dt>{t("上次游玩")}</dt><dd>{lastPlayedLabel(game.lastPlayed, library.now)}</dd>
+        <dt>{t("累计时长")}</dt><dd>{playTimeLabel(game.playMinutes)}</dd>
       </dl>
       {#if game.lastPlayed !== null}
         <div style="margin-top: 22px">
-          <div class="trend-head"><span>近 30 天</span><span>{game.sessions30} 次</span></div>
-          <div class="trend" role="img" aria-label="近 30 天每日游玩时长">
+          <div class="trend-head"><span>{t("近 30 天")}</span><span>{game.sessions30} {t("次")}</span></div>
+          <div class="trend" role="img" aria-label={t("近 30 天每日游玩时长")}>
             {#each trend(game) as day, i (i)}
               <span class="tb" class:on={day.on} style="height: {day.h}px"></span>
             {/each}
@@ -253,8 +253,8 @@
 
 {#if undoToast}
   <div class="toast" role="status">
-    <span style="flex: 1">已从游戏库移除</span>
-    <button onclick={() => { void library.undoRemove(); undoToast = false; }}>撤销</button>
+    <span style="flex: 1">{t("已从游戏库移除")}</span>
+    <button onclick={() => { void library.undoRemove(); undoToast = false; }}>{t("撤销")}</button>
   </div>
 {/if}
 

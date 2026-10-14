@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../lib/i18n.svelte";
   import PhoneImportOption from "./PhoneImportOption.svelte";
   import type { Enc, EncChoice } from "../lib/fake-import";
 
@@ -14,7 +15,7 @@
 </script>
 
 <fieldset>
-  <legend class="lbl">编码</legend>
+  <legend class="lbl">{t("编码")}</legend>
   <div class="grid">
     {#each choices as e (e.k)}
       <PhoneImportOption

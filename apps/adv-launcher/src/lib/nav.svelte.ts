@@ -15,7 +15,7 @@ export type Route =
 
 const HOME: Route = { name: "library", filter: "all" };
 const FILTERS = ["all", "recent", "favorite", "unstarted"];
-const PLAIN = ["stats", "import", "scan", "install", "settings"];
+const PLAIN = ["stats", "import", "scan", "settings"];
 const PER_GAME = ["game-settings", "report", "launch", "game"];
 
 /** The screen a location hash names: `#/settings`, `#/library/recent`, `#/launch/g1`. */

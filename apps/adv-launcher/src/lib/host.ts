@@ -1,3 +1,4 @@
+import { playback } from "./playback";
 import { gameFilter } from "./upscaling.svelte";
 import { call } from "./bridge";
 
@@ -69,7 +70,7 @@ export function libraryRestore(game: LibraryGame, index: number): Promise<void> 
   return call("library_restore", { game, index }, undefined);
 }
 export function startGame(id: string): Promise<void> {
-  return call("start_game", { id, filter: gameFilter(id) }, undefined);
+  return call("start_game", { id, filter: gameFilter(id), playback: playback(id) }, undefined);
 }
 /** Pause or resume the running game, e.g. while the pause menu or report page is open. */
 export function pauseGame(paused: boolean): Promise<void> {
