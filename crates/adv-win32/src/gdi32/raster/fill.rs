@@ -232,7 +232,7 @@ fn paint_rectangles(
         }
         result.and_then(|()| {
             if window {
-                store.present(target, &memory)
+                store.present(target, &memory, memory.damage())
             } else {
                 Ok(())
             }
@@ -378,7 +378,16 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
             )
             .and_then(|()| {
                 if window {
-                    store.present(target, &memory)
+                    store.present(
+                        target,
+                        &memory,
+                        Rect {
+                            x: ux,
+                            y: uy,
+                            w: 1,
+                            h: 1,
+                        },
+                    )
                 } else {
                     Ok(())
                 }
@@ -601,7 +610,7 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
             )
             .and_then(|()| {
                 if window {
-                    store.present(target, &memory)
+                    store.present(target, &memory, memory.damage())
                 } else {
                     Ok(())
                 }

@@ -153,6 +153,7 @@ pub fn install_graphics<B: Backend>(
         height,
         bgra: vec![0; width as usize * height as usize * 4],
         frames: 0,
+        ..Default::default()
     };
     machine.ext.insert(SurfaceStore::new(
         width, height, arena, arena_len, snapshot,

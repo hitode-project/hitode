@@ -15,6 +15,15 @@ pub trait SurfaceMemory {
     fn writable(&self, addr: u32, len: usize) -> Result<(), String>;
     /// Checked byte copy with memmove semantics when the ranges overlap.
     fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String>;
+    /// SRCCOPY row comparison; clipping adapters compare only writable spans.
+    fn copy_changed(&mut self, src: u32, dst: u32, len: usize) -> Result<bool, String> {
+        self.writable(dst, len)?;
+        if self.read(src, len)?.as_ref() == self.read(dst, len)?.as_ref() {
+            return Ok(false);
+        }
+        self.copy(src, dst, len)?;
+        Ok(true)
+    }
     fn u32(&self, addr: u32) -> Result<u32, String> {
         Ok(u32::from_le_bytes(
             self.read(addr, 4)?.as_ref().try_into().unwrap(),
@@ -47,6 +56,8 @@ pub struct Snapshot {
     pub height: u32,
     pub bgra: Vec<u8>,
     pub frames: u64,
+    /// Regions converted during the latest snapshot, for incremental upload.
+    pub damage: Damage,
 }
 
 /// One process-local pixel/target store. Snapshot is neutral device data, so
@@ -110,6 +121,11 @@ impl Presenter for Snapshot {
 #[derive(Default, Debug)]
 pub struct GraphicsStats {
     pub presentations: u64,
+    pub copied_bytes: u64,
+    pub software_started: Option<std::time::Instant>,
+    pub converted_bytes: u64,
+    pub published_frames: u64,
+    pub empty_damage: u64,
     pub host_captures: u64,
     pub coalesced_frames: u64,
     pub converted_pixels: u64,
@@ -129,6 +145,9 @@ pub struct PendingFrame {
     palette: Option<Arc<[[u8; 4]; 256]>>,
     serial: u64,
     pixels: Arc<Vec<u8>>,
+    damage: Damage,
+    bottom_up: bool,
+    history: DamageHistory,
     video: Arc<[(u64, VideoLayer)]>,
     #[cfg(feature = "gpu")]
     native: Option<crate::gpu::NativeFrame>,
@@ -143,6 +162,9 @@ impl Default for PendingFrame {
             palette: None,
             serial: 0,
             pixels: Arc::new(Vec::new()),
+            damage: Damage::default(),
+            bottom_up: false,
+            history: DamageHistory::default(),
             video: Arc::from([]),
             #[cfg(feature = "gpu")]
             native: None,
@@ -150,7 +172,25 @@ impl Default for PendingFrame {
     }
 }
 impl PendingFrame {
-    fn store(&mut self, surface: &Surface, pixels: &[u8], serial: u64) {
+    fn store(
+        &mut self,
+        surface: &Surface,
+        memory: &dyn SurfaceMemory,
+        serial: u64,
+        history: &DamageHistory,
+        damage: Rect,
+    ) -> Result<u64, String> {
+        let full = surface.rect();
+        let reset = self.width != surface.width
+            || self.height != surface.height
+            || self.pitch != surface.pitch
+            || self.format != surface.format
+            || Arc::get_mut(&mut self.pixels).is_none();
+        let regions = if reset {
+            Damage::from_rect(full)
+        } else {
+            damage_since(history, self.serial, serial, full)
+        };
         #[cfg(feature = "gpu")]
         {
             self.native = None;
@@ -160,27 +200,41 @@ impl PendingFrame {
         self.pitch = surface.pitch;
         self.format = surface.format;
         self.palette.clone_from(&surface.palette);
-        self.serial = serial;
+        self.bottom_up = surface.bottom_up;
+        self.serial = 0; // A failed write invalidates this private slot's baseline.
+        self.history = history.clone();
+        self.damage = Damage::from_rect(damage);
         if Arc::get_mut(&mut self.pixels).is_none() {
-            // A retained frame still owns this base. Do not copy its obsolete
-            // pixels merely to overwrite them with the next completed frame.
-            self.pixels = Arc::new(Vec::with_capacity(pixels.len()));
+            self.pixels = Arc::new(Vec::new());
         }
         let output = Arc::get_mut(&mut self.pixels).unwrap();
-        output.resize(pixels.len(), 0);
-        if surface.bottom_up {
-            let pitch = surface.pitch as usize;
-            for y in 0..surface.height as usize {
-                output[y * pitch..(y + 1) * pitch].copy_from_slice(
-                    &pixels[(surface.height as usize - 1 - y) * pitch
-                        ..(surface.height as usize - y) * pitch],
-                );
+        output.resize((surface.pitch * surface.height) as usize, 0);
+        let mut copied = 0;
+        for r in regions.iter().copied() {
+            let start = surface.format.byte_offset(r.x) as usize;
+            let n = surface.span(r.x, r.w) as usize;
+            for y in r.y..r.y + r.h {
+                let src = memory.read(surface.row(0, y) + start as u32, n)?;
+                let dst = y as usize * surface.pitch as usize + start;
+                output[dst..dst + n].copy_from_slice(src.as_ref());
+                copied += n as u64;
             }
-        } else {
-            output.copy_from_slice(pixels);
         }
+        if verify_software() {
+            for y in 0..surface.height {
+                let n = surface.format.row_bytes(surface.width) as usize;
+                let src = memory.read(surface.row(0, y), n)?;
+                let at = y as usize * surface.pitch as usize;
+                if output[at..at + n] != *src {
+                    return Err("incremental software slot differs from full storage".into());
+                }
+            }
+        }
+        self.serial = serial;
+        Ok(copied)
     }
-    /// Conversion is performed only by the display consumer, or an explicit capture.
+    /// Convert only changes since this consumer's last snapshot. History gaps
+    /// force a full conversion; each consumer independently owns its baseline.
     pub fn snapshot(&self, out: &mut Snapshot) -> Result<(), String> {
         #[cfg(feature = "gpu")]
         if self.native.is_some() {
@@ -189,30 +243,72 @@ impl PendingFrame {
         if self.width == 0 {
             return Ok(());
         }
+        let full = Rect {
+            x: 0,
+            y: 0,
+            w: self.width,
+            h: self.height,
+        };
+        let damage = if out.width != self.width
+            || out.height != self.height
+            || out.bgra.len() != self.width as usize * self.height as usize * 4
+            || !self.video.is_empty()
+        {
+            Damage::from_rect(full)
+        } else {
+            damage_since(&self.history, out.frames, self.serial, full)
+        };
         out.width = self.width;
         out.height = self.height;
-        out.frames = self.serial;
         out.bgra
             .resize(self.width as usize * self.height as usize * 4, 0);
-        for y in 0..self.height as usize {
-            let src = &self.pixels[y * self.pitch as usize..];
-            let dst = &mut out.bgra[y * self.width as usize * 4..(y + 1) * self.width as usize * 4];
-            if self.format == PixelFormat::Bgra32 {
-                dst.copy_from_slice(&src[..dst.len()]);
-            } else {
-                for (x, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    let index = [self.format.index(src, x as u32)];
-                    let raw = if self.format.packed() {
-                        &index[..]
-                    } else {
-                        &src[x * self.format.bytes() as usize..]
-                    };
-                    pixel.copy_from_slice(&decode_pixel(self.format, self.palette.as_deref(), raw));
+        self.convert(out, &damage);
+        self.compose_video(out)?;
+        out.frames = self.serial;
+        out.damage = damage;
+        if verify_software() {
+            let mut reference = Snapshot {
+                width: self.width,
+                height: self.height,
+                bgra: vec![0; out.bgra.len()],
+                ..Default::default()
+            };
+            self.convert(&mut reference, &[full]);
+            self.compose_video(&mut reference)?;
+            if reference.bgra != out.bgra {
+                return Err("incremental software snapshot differs from full conversion".into());
+            }
+        }
+        Ok(())
+    }
+    fn convert(&self, out: &mut Snapshot, damage: &[Rect]) {
+        for r in damage {
+            for y in r.y..r.y + r.h {
+                let src = &self.pixels[y as usize * self.pitch as usize..];
+                let start = (y as usize * self.width as usize + r.x as usize) * 4;
+                let dst = &mut out.bgra[start..start + r.w as usize * 4];
+                if self.format == PixelFormat::Bgra32 {
+                    dst.copy_from_slice(&src[r.x as usize * 4..(r.x + r.w) as usize * 4]);
+                } else {
+                    for (i, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let x = r.x + i as u32;
+                        let raw = if self.format.packed() {
+                            &[self.format.index(src, x)][..]
+                        } else {
+                            &src[self.format.byte_offset(x) as usize..]
+                        };
+                        pixel.copy_from_slice(&decode_pixel(
+                            self.format,
+                            self.palette.as_deref(),
+                            raw,
+                        ));
+                    }
                 }
             }
         }
-        self.compose_video(out)?;
-        Ok(())
+    }
+    pub fn damage(&self) -> &[Rect] {
+        &self.damage
     }
     pub fn extent(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -288,13 +384,134 @@ pub fn frame_mailbox() -> (FrameProducer, FrameConsumer) {
     adv_sync::mailbox::channel(std::array::from_fn(|_| PendingFrame::default()))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 
 pub struct Rect {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
+}
+impl Rect {
+    pub fn empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+    pub fn union(self, other: Self) -> Self {
+        if self.empty() {
+            return other;
+        }
+        if other.empty() {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self {
+            x,
+            y,
+            w: (self.x + self.w).max(other.x + other.w) - x,
+            h: (self.y + self.h).max(other.y + other.h) - y,
+        }
+    }
+    pub fn clipped(self, bounds: Self) -> Self {
+        let x = self.x.max(bounds.x);
+        let y = self.y.max(bounds.y);
+        Self {
+            x,
+            y,
+            w: self
+                .x
+                .saturating_add(self.w)
+                .min(bounds.x + bounds.w)
+                .saturating_sub(x),
+            h: self
+                .y
+                .saturating_add(self.h)
+                .min(bounds.y + bounds.h)
+                .saturating_sub(y),
+        }
+    }
+}
+/// Bounded software damage, stored without per-publication allocation.
+#[derive(Clone, Debug, Default)]
+pub struct Damage {
+    rects: [Rect; 4],
+    len: usize,
+}
+impl Damage {
+    fn from_rect(rect: Rect) -> Self {
+        Self {
+            rects: [rect, Rect::default(), Rect::default(), Rect::default()],
+            len: usize::from(!rect.empty()),
+        }
+    }
+}
+impl std::ops::Deref for Damage {
+    type Target = [Rect];
+    fn deref(&self) -> &[Rect] {
+        &self.rects[..self.len]
+    }
+}
+#[derive(Clone, Default)]
+struct DamageHistory {
+    entries: [(u64, Rect); 16],
+    first: usize,
+    len: usize,
+}
+impl DamageHistory {
+    fn clear(&mut self) {
+        self.first = 0;
+        self.len = 0;
+    }
+    fn push(&mut self, entry: (u64, Rect)) {
+        self.entries[(self.first + self.len) % 16] = entry;
+        if self.len < 16 {
+            self.len += 1;
+        } else {
+            self.first = (self.first + 1) % 16;
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = &(u64, Rect)> {
+        (0..self.len).map(|i| &self.entries[(self.first + i) % 16])
+    }
+}
+fn verify_software() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
+}
+fn damage_since(history: &DamageHistory, since: u64, serial: u64, full: Rect) -> Damage {
+    if since == serial && since != 0 {
+        return Damage::default();
+    }
+    if since == 0 || since > serial || history.iter().next().is_none_or(|(n, _)| since < n - 1) {
+        return Damage::from_rect(full);
+    }
+    let mut result = Damage::default();
+    for &(_, r) in history.iter().filter(|(n, _)| *n > since) {
+        let mut r = r;
+        let mut i = 0;
+        while i < result.len() {
+            let old = result[i];
+            if r.x <= old.x + old.w
+                && old.x <= r.x + r.w
+                && r.y <= old.y + old.h
+                && old.y <= r.y + r.h
+            {
+                r = r.union(result.rects[i]);
+                result.rects.copy_within(i + 1..result.len, i);
+                result.len -= 1;
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        if result.len == 4 {
+            result = Damage::from_rect(result.iter().copied().fold(r, Rect::union));
+        } else {
+            result.rects[result.len] = r;
+            result.len += 1;
+        }
+    }
+    result
 }
 #[derive(Clone)]
 pub struct Surface {
@@ -909,6 +1126,8 @@ pub struct Surfaces<P: Presenter> {
     /// Next id; surfaces and device contexts share the numbering.
     next: u32,
     surfaces: BTreeMap<u32, Surface>,
+    damage_history: DamageHistory,
+    software_source: Option<u32>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
     primary: Option<u32>,
@@ -917,7 +1136,7 @@ pub struct Surfaces<P: Presenter> {
     retained_frame: Option<PendingFrame>,
     video_layers: Arc<[(u64, VideoLayer)]>,
     captured_serial: u64,
-    conversion: Vec<u8>,
+    conversion: Snapshot,
     blit_row: Vec<u8>,
     blit_sample: Vec<u8>,
     blit_source: Vec<u8>,
@@ -952,6 +1171,8 @@ impl<P: Presenter> Surfaces<P> {
             arena: Arena::new(arena, len)?,
             next: 16,
             surfaces: BTreeMap::new(),
+            damage_history: DamageHistory::default(),
+            software_source: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
             primary: None,
@@ -960,7 +1181,7 @@ impl<P: Presenter> Surfaces<P> {
             retained_frame: None,
             video_layers: Arc::from([]),
             captured_serial: 0,
-            conversion: Vec::new(),
+            conversion: Snapshot::default(),
             blit_row: Vec::new(),
             blit_sample: Vec::new(),
             blit_source: Vec::new(),
@@ -1138,12 +1359,21 @@ impl<P: Presenter> Surfaces<P> {
         }
         let frame = self.retained_frame.as_mut().unwrap();
         frame.serial = serial;
+        frame.history.clear(); // Video composition and removal always rebuild the base.
+        frame.damage = Damage::from_rect(Rect {
+            x: 0,
+            y: 0,
+            w: frame.width,
+            h: frame.height,
+        });
         frame.video = self.video_layers.clone();
+        self.software_source = None;
         #[cfg(feature = "gpu")]
         if let Some(native) = &mut frame.native {
             native.serial = serial;
         }
         self.stats.presentations = serial;
+        self.software_source = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|slot| *slot = frame.clone());
             self.stats.coalesced_frames += u64::from(overwritten);
@@ -1299,13 +1529,14 @@ impl<P: Presenter> Surfaces<P> {
             self.stats.host_captures += 1;
             return Ok(true);
         }
-        let mut snapshot = Snapshot {
-            bgra: std::mem::take(&mut self.conversion),
-            ..Default::default()
-        };
+        let mut snapshot = std::mem::take(&mut self.conversion);
         frame.snapshot(&mut snapshot)?;
         if frame.format != PixelFormat::Bgra32 {
-            self.stats.converted_pixels += u64::from(frame.width) * u64::from(frame.height);
+            self.stats.converted_pixels += snapshot
+                .damage
+                .iter()
+                .map(|r| u64::from(r.w) * u64::from(r.h))
+                .sum::<u64>();
         }
         let result = self.presenter.present(FrameView {
             width: snapshot.width,
@@ -1314,7 +1545,12 @@ impl<P: Presenter> Surfaces<P> {
             bgra: &snapshot.bgra,
             serial: frame.serial,
         });
-        self.conversion = snapshot.bgra;
+        self.stats.converted_bytes += snapshot
+            .damage
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+            .sum::<u64>();
+        self.conversion = snapshot;
         result?;
         self.captured_serial = frame.serial;
         self.stats.host_captures += 1;
@@ -1345,6 +1581,9 @@ impl<P: Presenter> Surfaces<P> {
         // A process-local pending frame may carry a smaller sequence. Clear it
         // before adopting the shared output so delayed captures cannot regress.
         destination.pending_frame = None;
+        destination.software_source = None;
+        destination.damage_history.clear();
+        self.software_source = None;
         destination.captured_serial = serial;
         destination.frame_mailbox = endpoint;
         destination.deferred_presentation = self.deferred_presentation;
@@ -1474,20 +1713,49 @@ impl<P: Presenter> Surfaces<P> {
         Ok(id)
     }
     /// Hand surface `id` to the frame mailbox, the pending frame or the presenter.
-    pub fn present(&mut self, id: u32, m: &dyn SurfaceMemory) -> Result<(), String> {
+    pub fn present(&mut self, id: u32, m: &dyn SurfaceMemory, damage: Rect) -> Result<(), String> {
         #[cfg(feature = "gpu")]
         if self.native_surfaces.contains_key(&id) {
             return Err("native surface requires GPU presentation".into());
         }
         let s = &self.surfaces[&id];
+        let damage = damage.clipped(s.rect());
+        if damage.empty() {
+            self.stats.empty_damage += 1;
+            return Ok(());
+        }
+        let latest = self.retained_frame.as_ref();
+        let reset = self.software_source != Some(id)
+            || latest.is_none_or(|f| {
+                f.extent() != (s.width, s.height)
+                    || f.pitch != s.pitch
+                    || f.format != s.format
+                    || f.bottom_up != s.bottom_up
+                    || f.palette != s.palette
+                    || !f.video.is_empty()
+            })
+            || !self.video_layers.is_empty();
+        let damage = if reset { s.rect() } else { damage };
+        if reset {
+            self.damage_history.clear();
+        }
         self.stats.presentations += 1;
-        let pixels = m.read(s.pixels, (s.pitch * s.height) as usize)?;
+        self.stats
+            .software_started
+            .get_or_insert_with(std::time::Instant::now);
+        self.software_source = Some(id);
+        self.damage_history.push((self.stats.presentations, damage));
+        // Retire our latest reference before recycling the writer's private slot.
+        self.retained_frame = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
-            let overwritten = mailbox.publish(|frame| {
-                frame.store(s, pixels.as_ref(), self.stats.presentations);
+            let overwritten = mailbox.try_publish(|frame| {
+                self.stats.copied_bytes +=
+                    frame.store(s, m, self.stats.presentations, &self.damage_history, damage)?;
                 frame.video = self.video_layers.clone();
                 self.retained_frame = Some(frame.clone());
-            });
+                Ok::<(), String>(())
+            })?;
+            self.stats.published_frames += 1;
             self.stats.coalesced_frames += u64::from(overwritten);
             if !overwritten {
                 wake.signal();
@@ -1506,10 +1774,12 @@ impl<P: Presenter> Surfaces<P> {
             // Retiring this reference before writing keeps the pending slot's
             // raw buffer reusable when no consumer still owns the previous base.
             self.retained_frame = None;
-            frame.store(s, pixels.as_ref(), self.stats.presentations);
+            self.stats.copied_bytes +=
+                frame.store(s, m, self.stats.presentations, &self.damage_history, damage)?;
             frame.video = self.video_layers.clone();
             self.retained_frame = Some(frame.clone());
         }
+        self.stats.published_frames += 1;
         if !self.deferred_presentation {
             self.capture_latest()?;
         }
@@ -1716,6 +1986,7 @@ impl<P: Presenter> Surfaces<P> {
             self.stats.host_captures += 1;
         }
         self.stats.presentations = serial;
+        self.software_source = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|slot| {
                 slot.store_native(frame);
@@ -1967,7 +2238,7 @@ impl<P: Presenter> Surfaces<P> {
         dst: u32,
         dr: Rect,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<(), String> {
+    ) -> Result<Rect, String> {
         self.blit(
             src,
             sr,
@@ -1993,7 +2264,7 @@ impl<P: Presenter> Surfaces<P> {
         dr: BlitRect,
         options: BlitOptions,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<(), String> {
+    ) -> Result<Rect, String> {
         #[cfg(feature = "gpu")]
         if self.native_surfaces.contains_key(&src) || self.native_surfaces.contains_key(&dst) {
             return Err("native blit requires GPU copy or explicit asynchronous readback".into());
@@ -2016,7 +2287,7 @@ impl<P: Presenter> Surfaces<P> {
         dr: BlitRect,
         options: BlitOptions,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<(), String> {
+    ) -> Result<Rect, String> {
         if source.width == 0 || source.height == 0 {
             return Err("empty external surface".into());
         }
@@ -2063,7 +2334,7 @@ impl<P: Presenter> Surfaces<P> {
                 .ok_or("destination overflow")?
                 .min(i64::from(d.height));
         if right <= left || bottom <= top || sr.w == 0 || sr.h == 0 {
-            return Ok(());
+            return Ok(Rect::default());
         }
         // Validate every source/destination row before the first write. DIB
         // padding is not part of a pixel and need not be readable or writable.
@@ -2087,7 +2358,7 @@ impl<P: Presenter> Surfaces<P> {
         dr: BlitRect,
         options: BlitOptions,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<(), String> {
+    ) -> Result<Rect, String> {
         let d = self
             .surfaces
             .get(&dst)
@@ -2112,7 +2383,7 @@ impl<P: Presenter> Surfaces<P> {
         let left = dr.x.max(0);
         let top = dr.y.max(0);
         if sr.w == 0 || sr.h == 0 || dr.w == 0 || dr.h == 0 || right <= left || bottom <= top {
-            return Ok(());
+            return Ok(Rect::default());
         }
         let clipped = Rect {
             x: left as u32,
@@ -2148,12 +2419,16 @@ impl<P: Presenter> Surfaces<P> {
             .then(|| {
                 std::array::from_fn(|index| d.encode_pixel(s.decode_pixel(&[index as u8]))[0])
             });
+        let mut damage = clipped;
+        let mut copied_rows = clipped.h;
         if unscaled
             && !options.mirror_x
             && !options.mirror_y
             && same_encoding
             && (!aliases || same_layout)
         {
+            damage = Rect::default();
+            copied_rows = 0;
             // Logical row order is independent of top-down/bottom-up storage.
             for row in 0..clipped.h {
                 let y = if same_layout && clipped.y > sr.y + oy {
@@ -2161,11 +2436,17 @@ impl<P: Presenter> Surfaces<P> {
                 } else {
                     row
                 };
-                m.copy(
-                    s.row(sr.x + ox, sr.y + oy + y),
-                    d.row(clipped.x, clipped.y + y),
-                    clipped.w as usize * sb,
-                )?;
+                let src = s.row(sr.x + ox, sr.y + oy + y);
+                let dst = d.row(clipped.x, clipped.y + y);
+                let n = clipped.w as usize * sb;
+                if m.copy_changed(src, dst, n)? {
+                    damage = damage.union(Rect {
+                        y: clipped.y + y,
+                        h: 1,
+                        ..clipped
+                    });
+                    copied_rows += 1;
+                }
             }
         } else if unscaled && !options.mirror_x && !aliases {
             // Every sampling mode reduces to one source texel at equal size.
@@ -2311,10 +2592,12 @@ impl<P: Presenter> Surfaces<P> {
                 m.write(d.row(clipped.x, clipped.y + y), output)?;
             }
         }
-        self.surfaces.get_mut(&dst).unwrap().version += 1;
+        if !damage.empty() {
+            self.surfaces.get_mut(&dst).unwrap().version += 1;
+        }
         self.stats.bytes_blitted +=
-            u64::from(clipped.w) * u64::from(clipped.h) * u64::from(d.format.bytes());
-        Ok(())
+            u64::from(clipped.w) * u64::from(copied_rows) * u64::from(d.format.bytes());
+        Ok(damage)
     }
 }
 

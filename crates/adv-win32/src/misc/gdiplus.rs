@@ -375,6 +375,7 @@ fn draw(env: &mut Env<'_>, handle: u32, operation: Op<'_>) -> Outcome {
         let clip = crate::gdi32::raster::clip::snapshot(env, dc);
         let bpp = s.format.bytes() as usize;
         let mut changed = false;
+        let mut damage = adv_device::surface::Rect::default();
         for y in 0..s.height {
             let row_y = if s.bottom_up { s.height - 1 - y } else { y };
             for (left, right) in clip.spans(y as i32, s.width) {
@@ -395,6 +396,12 @@ fn draw(env: &mut Env<'_>, handle: u32, operation: Op<'_>) -> Outcome {
                         return Outcome::Return(2);
                     }
                     changed = true;
+                    damage = damage.union(adv_device::surface::Rect {
+                        x: left,
+                        y,
+                        w: right - left,
+                        h: 1,
+                    });
                 }
             }
         }
@@ -410,7 +417,7 @@ fn draw(env: &mut Env<'_>, handle: u32, operation: Op<'_>) -> Outcome {
             let store = env.ext.get_mut::<SurfaceStore>();
             store.get_mut(target).unwrap().version += 1;
             if window {
-                if let Err(error) = store.present(target, &(provider.memory)(env.cpu)) {
+                if let Err(error) = store.present(target, &(provider.memory)(env.cpu), damage) {
                     return Outcome::Fail(error);
                 }
                 let presented = store.stats.presentations;

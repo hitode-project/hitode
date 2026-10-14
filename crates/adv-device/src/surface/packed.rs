@@ -179,7 +179,7 @@ impl<P: Presenter> Surfaces<P> {
         dr: BlitRect,
         options: BlitOptions,
         memory: &mut dyn SurfaceMemory,
-    ) -> Result<(), String> {
+    ) -> Result<Rect, String> {
         let left = dr.x.max(0);
         let top = dr.y.max(0);
         let right = (dr.x + i64::from(dr.w)).min(i64::from(destination.width));
@@ -204,6 +204,38 @@ impl<P: Presenter> Surfaces<P> {
             if destination.format.packed() {
                 memory.read(address, len)?;
             }
+        }
+        if source.format == destination.format
+            && source.palette == destination.palette
+            && sr.w == dr.w
+            && sr.h == dr.h
+            && !options.mirror_x
+            && !options.mirror_y
+        {
+            let mut damage = Rect::default();
+            for y in top..bottom {
+                let sy = oy + (y - top) as u32;
+                let at = sy as usize * stride + ox as usize * sb;
+                let input = &self.blit_source[at..at + width as usize * sb];
+                if destination
+                    .read_pixels(memory, left as u32, y as u32, width)?
+                    .as_ref()
+                    != input
+                {
+                    destination.write_pixels(memory, left as u32, y as u32, input)?;
+                    damage = damage.union(Rect {
+                        x: left as u32,
+                        y: y as u32,
+                        w: width,
+                        h: 1,
+                    });
+                    self.stats.bytes_blitted += u64::from(destination.span(left as u32, width));
+                }
+            }
+            if !damage.empty() {
+                self.surfaces.get_mut(&dst).unwrap().version += 1;
+            }
+            return Ok(damage);
         }
         let colour = matches!(options.sampling, Sampling::AndColour | Sampling::OrColour);
         let sample_bytes = if colour { 4 } else { sb };
@@ -255,6 +287,11 @@ impl<P: Presenter> Surfaces<P> {
         self.surfaces.get_mut(&dst).unwrap().version += 1;
         self.stats.bytes_blitted +=
             u64::from(destination.format.row_bytes(width)) * (bottom - top) as u64;
-        Ok(())
+        Ok(Rect {
+            x: left as u32,
+            y: top as u32,
+            w: width,
+            h: (bottom - top) as u32,
+        })
     }
 }

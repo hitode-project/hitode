@@ -6,7 +6,7 @@ use adv_abi::{
     win32,
 };
 use adv_cpu::backend::Prot;
-use adv_device::surface::{Surface, SurfaceMemory, SurfaceStore};
+use adv_device::surface::{Rect, Surface, SurfaceMemory, SurfaceStore};
 use adv_os::gdi::{DcClip, GdiObj};
 use std::borrow::Cow;
 
@@ -381,6 +381,7 @@ pub(crate) struct ClippedMemory<'a> {
     memory: &'a mut dyn SurfaceMemory,
     surface: Surface,
     clip: &'a DcClip,
+    damage: Rect,
 }
 impl<'a> ClippedMemory<'a> {
     pub(crate) fn new(
@@ -392,6 +393,44 @@ impl<'a> ClippedMemory<'a> {
             memory,
             surface,
             clip,
+            damage: Rect::default(),
+        }
+    }
+    pub(crate) fn damage(&self) -> Rect {
+        self.damage
+    }
+    fn record(&mut self, addr: u32, len: usize) {
+        let s = &self.surface;
+        let base = u64::from(s.pixels);
+        let first = u64::from(addr).max(base);
+        let last =
+            (u64::from(addr) + len as u64).min(base + u64::from(s.pitch) * u64::from(s.height));
+        if first >= last {
+            return;
+        }
+        for row in (first - base) / u64::from(s.pitch)..(last - base).div_ceil(u64::from(s.pitch)) {
+            let rowbase = base + row * u64::from(s.pitch);
+            let x = ((first.max(rowbase) - rowbase) * 8 / u64::from(s.format.bits())) as u32;
+            let right = (((last.min(rowbase + u64::from(s.pitch)) - rowbase) * 8)
+                .div_ceil(u64::from(s.format.bits())) as u32)
+                .min(s.width);
+            let y = if s.bottom_up {
+                s.height - 1 - row as u32
+            } else {
+                row as u32
+            };
+            for (left, end) in self.clip.spans(y as i32, s.width) {
+                let left = left.max(x);
+                let end = end.min(right);
+                if left < end {
+                    self.damage = self.damage.union(Rect {
+                        x: left,
+                        y,
+                        w: end - left,
+                        h: 1,
+                    });
+                }
+            }
         }
     }
     fn visit(
@@ -453,6 +492,7 @@ impl SurfaceMemory for ClippedMemory<'_> {
         })
     }
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        self.record(addr, data.len());
         if self.surface.format.packed() && !self.clip.is_default() {
             let mut merged = self.memory.read(addr, data.len())?.into_owned();
             let bits = self.surface.format.bits();
@@ -491,12 +531,95 @@ impl SurfaceMemory for ClippedMemory<'_> {
             self.memory.write(addr + o as u32, &data[o..o + n])
         })
     }
+    fn copy_changed(&mut self, src: u32, dst: u32, len: usize) -> Result<bool, String> {
+        self.writable(dst, len)?;
+        if self.clip.is_default() {
+            let changed = self.memory.copy_changed(src, dst, len)?;
+            if changed {
+                self.record(dst, len);
+            }
+            return Ok(changed);
+        }
+        let bytes = self.memory.read(src, len)?.into_owned();
+        let mut changed = false;
+        Self::visit(&self.surface, self.clip, dst, len, |o, n| {
+            changed |= self.memory.read(dst + o as u32, n)?.as_ref() != &bytes[o..o + n];
+            Ok(())
+        })?;
+        if changed {
+            self.write(dst, &bytes)?;
+        }
+        Ok(changed)
+    }
     fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
         if self.clip.is_default() {
+            self.record(dst, len);
             return self.memory.copy(src, dst, len);
         }
         // Snapshot the row before splitting it, so overlapping aliases are memmove.
         let bytes = self.memory.read(src, len)?.into_owned();
         self.write(dst, &bytes)
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+    struct Memory([u8; 32]);
+    impl SurfaceMemory for Memory {
+        fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+            Ok(Cow::Borrowed(&self.0[addr as usize..addr as usize + len]))
+        }
+        fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
+            self.0[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn writable(&self, _: u32, _: usize) -> Result<(), String> {
+            Ok(())
+        }
+        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+            self.0
+                .copy_within(src as usize..src as usize + len, dst as usize);
+            Ok(())
+        }
+    }
+    // spec: DEV-FRAME-3
+    #[test]
+    fn differences_outside_the_clip_do_not_damage_visible_rows() {
+        let surface = Surface {
+            pixels: 16,
+            width: 2,
+            height: 2,
+            pitch: 8,
+            bottom_up: false,
+            locked: None,
+            version: 0,
+            format: adv_device::surface::PixelFormat::Bgra32,
+            palette: None,
+        };
+        let mut clip = DcClip::default();
+        assert!(clip.exclude([1, 0, 2, 2]));
+        let mut raw = Memory([0; 32]);
+        raw.0[4..8].fill(7);
+        let mut memory = ClippedMemory::new(&mut raw, surface.clone(), &clip);
+        assert!(!memory.copy_changed(0, 16, 8).unwrap());
+        assert!(memory.damage().empty());
+        drop(memory);
+        raw.0[..4].fill(9);
+        let mut memory = ClippedMemory::new(&mut raw, surface, &clip);
+        assert!(memory.copy_changed(0, 16, 8).unwrap());
+        assert_eq!(
+            memory.damage(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1
+            }
+        );
+        assert_eq!(
+            memory.read(16, 8).unwrap().as_ref(),
+            &[9, 9, 9, 9, 0, 0, 0, 0]
+        );
     }
 }

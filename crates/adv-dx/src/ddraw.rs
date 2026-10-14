@@ -925,8 +925,8 @@ impl DirectDraw {
                     s.version += 1;
                 }
                 surfaces.stats.unlocks += 1;
-                if surfaces.primary_id() == Some(sid) {
-                    surfaces.present(sid, m)?;
+                if !readonly && surfaces.primary_id() == Some(sid) {
+                    surfaces.present(sid, m, locked)?;
                 }
                 0
             }
@@ -989,7 +989,7 @@ impl DirectDraw {
                 let front = surfaces[dst].pixels;
                 surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
                 surfaces.get_mut(src).unwrap().pixels = front;
-                surfaces.present(dst, m)?;
+                surfaces.present(dst, m, surfaces[dst].rect())?;
                 0
             }
             api::SURFACE_DC => {
@@ -1019,7 +1019,7 @@ impl DirectDraw {
                 }
                 dcs.remove(objects, a[1]);
                 if surfaces.primary_id() == Some(sid) {
-                    surfaces.present(sid, m)?;
+                    surfaces.present(sid, m, surfaces[sid].rect())?;
                 }
                 0
             }
@@ -1050,9 +1050,9 @@ impl DirectDraw {
                 if d.locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                surfaces.copy(src, sr, dst, dr, m)?;
+                let damage = surfaces.copy(src, sr, dst, dr, m)?;
                 if surfaces.primary_id() == Some(dst) {
-                    surfaces.present(dst, m)?;
+                    surfaces.present(dst, m, damage)?;
                 }
                 0
             }
@@ -1072,8 +1072,9 @@ impl DirectDraw {
                         return Ok(BUSY);
                     }
                     surfaces.fill_raw(dst, dr, m.u32(a[5] + 80)?, m)?;
+                    let damage = dr;
                     if surfaces.primary_id() == Some(dst) {
-                        surfaces.present(dst, m)?;
+                        surfaces.present(dst, m, damage)?;
                     }
                     return Ok(0);
                 }
@@ -1145,9 +1146,9 @@ impl DirectDraw {
                 {
                     return Ok(0);
                 }
-                surfaces.blit(src, sr, dst, dr, BlitOptions::default(), m)?;
+                let damage = surfaces.blit(src, sr, dst, dr, BlitOptions::default(), m)?;
                 if surfaces.primary_id() == Some(dst) {
-                    surfaces.present(dst, m)?;
+                    surfaces.present(dst, m, damage)?;
                 }
                 0
             }

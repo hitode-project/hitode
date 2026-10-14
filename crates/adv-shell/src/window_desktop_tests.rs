@@ -44,6 +44,7 @@ fn pattern(serial: u64) -> Snapshot {
         height: 256,
         bgra: vec![0; 384 * 256 * 4],
         frames: serial,
+        ..Default::default()
     };
     for y in 0..256usize {
         for x in 0..384usize {

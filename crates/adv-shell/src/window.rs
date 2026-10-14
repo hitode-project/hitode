@@ -1154,6 +1154,7 @@ mod native {
                 height: 6,
                 bgra: [32, 64, 192, 255].repeat(8 * 6),
                 frames: 1,
+                ..Default::default()
             };
             let mut retained = RetainedFrame::default();
             retained.update(&frame).unwrap();
@@ -1188,6 +1189,7 @@ mod native {
                 height: 6,
                 bgra: [32, 64, 192, 255].repeat(8 * 6),
                 frames: 1,
+                ..Default::default()
             };
             let mut retained = RetainedFrame::default();
             retained.update(&frame).unwrap();
@@ -1200,6 +1202,7 @@ mod native {
                 height: 6,
                 bgra: Vec::new(),
                 frames: 2,
+                ..Default::default()
             };
             assert!(retained.update(&invalid).is_err());
             let short = Snapshot {
@@ -1207,6 +1210,7 @@ mod native {
                 height: 6,
                 bgra: vec![0; 8],
                 frames: 2,
+                ..Default::default()
             };
             assert!(retained.update(&short).is_err());
             retained.draw(target.dc, &rect).unwrap();
@@ -1246,6 +1250,7 @@ mod native {
                 height: 600,
                 bgra: vec![255; 800 * 600 * 4],
                 frames: 1,
+                ..Default::default()
             };
             window.present(&frame).unwrap();
             assert_eq!(
@@ -1333,6 +1338,7 @@ mod native {
                 height: 6,
                 bgra: Vec::new(),
                 frames: 1,
+                ..Default::default()
             };
             for y in 0..6u8 {
                 for x in 0..8u8 {

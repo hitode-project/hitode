@@ -801,7 +801,6 @@ pub(crate) struct Session {
     native: Option<NativeFrame>,
     software: Option<(wgpu::Texture, wgpu::TextureView)>,
     snapshot: Snapshot,
-    candidate: Snapshot,
     serial: u64,
     width: u32,
     height: u32,
@@ -844,7 +843,6 @@ impl Session {
             native: None,
             software: None,
             snapshot: Snapshot::default(),
-            candidate: Snapshot::default(),
             serial: 0,
             width: 0,
             height: 0,
@@ -967,11 +965,12 @@ impl Session {
                 changed = true;
             } else {
                 self.cursor_regions = Arc::from(self.frames.current().video_cursor_regions()?);
-                self.candidate.width = 0;
-                self.candidate.height = 0;
-                self.candidate.bgra.clear();
-                self.frames.current().snapshot(&mut self.candidate)?;
-                if self.candidate.width == 0 || self.candidate.height == 0 {
+                if self.native.is_some() {
+                    self.snapshot.frames = 0;
+                }
+                let old_extent = (self.snapshot.width, self.snapshot.height);
+                self.frames.current().snapshot(&mut self.snapshot)?;
+                if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
                         native: self.native.is_some(),
@@ -980,17 +979,12 @@ impl Session {
                         cursor_regions: self.cursor_regions.clone(),
                     });
                 }
-                changed = self.native.is_some()
-                    || self.snapshot.width != self.candidate.width
-                    || self.snapshot.height != self.candidate.height
-                    || self.snapshot.bgra != self.candidate.bgra;
-                self.width = self.candidate.width;
-                self.height = self.candidate.height;
-                self.serial = self.candidate.frames;
+                changed = !self.snapshot.damage.is_empty();
+                self.width = self.snapshot.width;
+                self.height = self.snapshot.height;
+                self.serial = self.snapshot.frames;
                 if changed {
-                    if self.software.is_none()
-                        || (self.snapshot.width, self.snapshot.height) != (self.width, self.height)
-                    {
+                    if self.software.is_none() || old_extent != (self.width, self.height) {
                         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("adv final software frame"),
                             size: wgpu::Extent3d {
@@ -1009,22 +1003,15 @@ impl Session {
                         let view = texture.create_view(&Default::default());
                         self.software = Some((texture, view));
                     }
-                    submission.write_texture(
-                        self.software.as_ref().unwrap().0.as_image_copy(),
-                        &self.candidate.bgra,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(self.width * 4),
-                            rows_per_image: Some(self.height),
-                        },
-                        wgpu::Extent3d {
-                            width: self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1,
-                        },
+                    let bytes = crate::software_frame::upload(
+                        &submission,
+                        &self.software.as_ref().unwrap().0,
+                        &self.snapshot,
                     );
-                    self.stats.uploads += 1;
-                    std::mem::swap(&mut self.snapshot, &mut self.candidate);
+                    self.stats.uploads += self.snapshot.damage.len() as u64;
+                    self.stats.uploaded_bytes += bytes;
+                    self.stats.converted_bytes += bytes;
+                    self.stats.software_started.get_or_insert_with(Instant::now);
                 }
                 self.native = None;
                 self.overlays.clear();
@@ -1786,7 +1773,9 @@ mod tests {
                     &mut memory,
                 )
                 .unwrap();
-            surfaces.present(software, &memory).unwrap();
+            surfaces
+                .present(software, &memory, surfaces[software].rect())
+                .unwrap();
         }
         assert!(window.native_canvas((8, 6)).unwrap());
         assert!(

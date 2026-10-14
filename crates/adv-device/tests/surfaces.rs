@@ -111,7 +111,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     memory.write(store[base].pixels, &pixels).unwrap();
     let (producer, mut consumer) = frame_mailbox();
     store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
-    store.present(base, &memory).unwrap();
+    store.present(base, &memory, store[base].rect()).unwrap();
     // Later writes are not a presentation and cannot replace the retained base.
     memory.write(store[base].pixels, &[0; 80]).unwrap();
     let layer = video_layer();
@@ -261,11 +261,19 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
         .write(child[child_surface].pixels, &[5, 6, 7, 8])
         .unwrap();
     for _ in 0..3 {
-        parent.present(parent_surface, &parent_memory).unwrap();
+        parent
+            .present(
+                parent_surface,
+                &parent_memory,
+                parent[parent_surface].rect(),
+            )
+            .unwrap();
     }
     assert!(parent.transfer_frame_mailbox_to(&mut child).unwrap());
     assert!(!parent.transfer_frame_mailbox_to(&mut store()).unwrap());
-    child.present(child_surface, &child_memory).unwrap();
+    child
+        .present(child_surface, &child_memory, child[child_surface].rect())
+        .unwrap();
     assert!(consumer.update());
     let mut snapshot = Snapshot::default();
     consumer.current().snapshot(&mut snapshot).unwrap();
@@ -274,10 +282,22 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
         (4, &[5, 6, 7, 8][..])
     );
     // Background output stays local and cannot overwrite the foreground child.
-    parent.present(parent_surface, &parent_memory).unwrap();
+    parent
+        .present(
+            parent_surface,
+            &parent_memory,
+            parent[parent_surface].rect(),
+        )
+        .unwrap();
     assert!(!consumer.update());
     assert!(child.transfer_frame_mailbox_to(&mut parent).unwrap());
-    parent.present(parent_surface, &parent_memory).unwrap();
+    parent
+        .present(
+            parent_surface,
+            &parent_memory,
+            parent[parent_surface].rect(),
+        )
+        .unwrap();
     assert!(consumer.update());
     consumer.current().snapshot(&mut snapshot).unwrap();
     assert_eq!(
@@ -312,10 +332,18 @@ fn headless_foreground_handoff_keeps_deferred_capture_and_frame_sequence() {
         .create(1, 1, false, PixelFormat::Bgra32, &mut child_memory)
         .unwrap();
     for _ in 0..3 {
-        parent.present(parent_surface, &parent_memory).unwrap();
+        parent
+            .present(
+                parent_surface,
+                &parent_memory,
+                parent[parent_surface].rect(),
+            )
+            .unwrap();
     }
     assert!(!parent.transfer_frame_mailbox_to(&mut child).unwrap());
-    child.present(child_surface, &child_memory).unwrap();
+    child
+        .present(child_surface, &child_memory, child[child_surface].rect())
+        .unwrap();
     assert_eq!(child.presenter.frames, 0);
     assert!(child.capture_latest().unwrap());
     assert_eq!(child.presenter.frames, 4);
@@ -717,8 +745,8 @@ fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels
             if path == 2 {
                 s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
             }
-            s.present(id, &m).unwrap();
-            s.present(id, &m).unwrap();
+            s.present(id, &m, s[id].rect()).unwrap();
+            s.present(id, &m, s[id].rect()).unwrap();
             let mut expected = [0, 0, 255, 0].repeat(3);
             expected.extend_from_slice(&if format == PixelFormat::Bgra32 {
                 [31, 0, 0, 0].repeat(3)
@@ -786,7 +814,7 @@ fn indexed_non_gray_rows_convert_to_bgra_with_stride_and_orientation() {
             for y in 0..2 {
                 assert_eq!(m.read(s[src].row(3, y), 1).unwrap().as_ref(), &[0xcc]);
             }
-            s.present(src, &m).unwrap();
+            s.present(src, &m, s[src].rect()).unwrap();
             assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
         }
     }
@@ -852,7 +880,7 @@ fn indexed_blits_remap_different_palettes_and_preserve_same_palette_indices() {
         m.read(s[different].row(0, 1), 4).unwrap().as_ref(),
         &[22, 21, 20, 0xa7]
     );
-    s.present(different, &m).unwrap();
+    s.present(different, &m, s[different].rect()).unwrap();
     assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
     let same = s
         .create(3, 2, false, PixelFormat::Indexed8, &mut m)
@@ -886,7 +914,7 @@ fn completed_indexed_frames_keep_their_palette_after_live_update_and_delete() {
         if path == 2 {
             s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
         }
-        s.present(id, &m).unwrap();
+        s.present(id, &m, s[id].rect()).unwrap();
         s.set_palette(id, 1, &[[99, 88, 77, 0]; 6]).unwrap();
         assert!(!std::sync::Arc::ptr_eq(
             &old_table,
@@ -921,7 +949,7 @@ fn indexed_primary_resize_keeps_the_palette_and_overlapping_indices() {
     s.configure_window(3, 2, &mut m).unwrap();
     assert_eq!(s.palette_entries(primary, 1, 6).unwrap(), &INDEXED_COLORS);
     assert!(logical_pixels(&s, primary, &m).iter().all(|p| p == &[1]));
-    s.present(primary, &m).unwrap();
+    s.present(primary, &m, s[primary].rect()).unwrap();
     assert_eq!(s.presenter.bgra, INDEXED_COLORS[0].repeat(6));
 }
 
@@ -1089,7 +1117,9 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
             memory.read(surfaces[indexed].pixels, 8).unwrap().as_ref(),
             [0x87, 0x65, 0x43, 0x21, 0, 0xcc, 0xdd, 0xee]
         );
-        surfaces.present(indexed, &memory).unwrap();
+        surfaces
+            .present(indexed, &memory, surfaces[indexed].rect())
+            .unwrap();
         assert_eq!(
             surfaces
                 .presenter
@@ -1100,4 +1130,262 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
             [8, 7, 6, 5, 4, 3, 2, 1, 0]
         );
     }
+}
+
+// spec: DEV-FRAME-3
+#[test]
+fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
+    for owned in [false, true] {
+        let mut s = store();
+        let mut m = Memory::new(owned);
+        let src = s.create(5, 4, false, PixelFormat::Bgra32, &mut m).unwrap();
+        let dst = s.primary(&mut m).unwrap();
+        let (tx, mut rx) = frame_mailbox();
+        let wake = adv_sync::WakeEvent::new().unwrap();
+        s.set_frame_mailbox(tx, wake.clone());
+        s.present(dst, &m, s[dst].rect()).unwrap();
+        assert!(rx.update());
+        assert!(wake.wait(Some(std::time::Duration::ZERO)).unwrap());
+        let mut out = Snapshot::default();
+        rx.current().snapshot(&mut out).unwrap();
+        let serial = s.stats.presentations;
+        let bytes = s.stats.copied_bytes;
+        let blitted = s.stats.bytes_blitted;
+        let damage = s
+            .copy(src, s[src].rect(), dst, s[dst].rect(), &mut m)
+            .unwrap();
+        assert!(damage.empty());
+        s.present(dst, &m, damage).unwrap();
+        assert!(!rx.update());
+        assert!(!wake.wait(Some(std::time::Duration::ZERO)).unwrap());
+        assert_eq!(s.stats.presentations, serial);
+        assert_eq!(s.stats.copied_bytes, bytes);
+        assert_eq!(s.stats.bytes_blitted, blitted);
+        assert_eq!(s.stats.empty_damage, 1);
+        m.write(s[src].row(0, 2), &[7; 20]).unwrap();
+        let damage = s
+            .copy(src, s[src].rect(), dst, s[dst].rect(), &mut m)
+            .unwrap();
+        assert_eq!(
+            damage,
+            Rect {
+                x: 0,
+                y: 2,
+                w: 5,
+                h: 1
+            }
+        );
+        assert_eq!(s.stats.bytes_blitted - blitted, 20);
+        s.present(dst, &m, damage).unwrap();
+        assert!(rx.update());
+        assert_eq!(rx.current().damage(), &[damage]);
+        rx.current().snapshot(&mut out).unwrap();
+        assert_eq!(&*out.damage, &[damage]);
+        assert_eq!(&out.bgra[40..60], &[7; 20]);
+        assert_eq!(&out.bgra[..40], &[0; 40]);
+        assert_eq!(&out.bgra[60..], &[0; 20]);
+    }
+}
+
+// spec: DEV-FRAME-4, DEV-FRAME-5, DEV-FRAME-7
+#[test]
+fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
+    let mut s = store();
+    let mut m = Memory::new(true);
+    let id = s.primary(&mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    let mut out = Snapshot::default();
+    let mut expected = vec![0; 80];
+    for n in 0..12 {
+        let y = n % 4;
+        let x = n % 5;
+        let r = Rect { x, y, w: 1, h: 1 };
+        let value = [n as u8 + 1; 4];
+        m.write(s[id].row(x, y), &value).unwrap();
+        expected[((y * 5 + x) * 4) as usize..((y * 5 + x) * 4 + 4) as usize]
+            .copy_from_slice(&value);
+        let before = s.stats.copied_bytes;
+        s.present(id, &m, r).unwrap();
+        assert!(rx.update());
+        rx.current().snapshot(&mut out).unwrap();
+        assert_eq!(out.bgra, expected);
+        if n >= 3 {
+            assert!(s.stats.copied_bytes - before < 80);
+        }
+        // A fresh capture verifies the full slot, not only the consumer's patch.
+        let mut full = Snapshot::default();
+        rx.current().snapshot(&mut full).unwrap();
+        assert_eq!(full.bgra, expected);
+    }
+    let mut lagging = Snapshot {
+        width: out.width,
+        height: out.height,
+        frames: out.frames,
+        bgra: out.bgra.clone(),
+        ..Default::default()
+    };
+    for n in 0..3 {
+        let r = Rect {
+            x: n * 2,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+        let value = [40 + n as u8; 4];
+        m.write(s[id].row(r.x, r.y), &value).unwrap();
+        expected[(r.x * 4) as usize..(r.x * 4 + 4) as usize].copy_from_slice(&value);
+        s.present(id, &m, r).unwrap();
+    }
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(out.damage.len(), 3);
+    assert_eq!(out.bgra, expected);
+    // Keep one slot and two consumer baselines idle beyond the history window.
+    for n in 0..20 {
+        let r = Rect {
+            x: 0,
+            y: 3,
+            w: 1,
+            h: 1,
+        };
+        let value = [80 + n; 4];
+        m.write(s[id].row(0, 3), &value).unwrap();
+        expected[60..64].copy_from_slice(&value);
+        s.present(id, &m, r).unwrap();
+    }
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(&*out.damage, &[s[id].rect()]);
+    rx.current().snapshot(&mut lagging).unwrap();
+    assert_eq!(lagging.bgra, expected);
+    assert_eq!(out.bgra, expected);
+    // The previously parked reader slot now re-enters writer rotation.
+    let mut full_copies = 0;
+    for n in 0..2 {
+        let r = Rect {
+            x: 4,
+            y: 3,
+            w: 1,
+            h: 1,
+        };
+        m.write(s[id].row(4, 3), &[120 + n; 4]).unwrap();
+        expected[76..80].fill(120 + n);
+        let before = s.stats.copied_bytes;
+        s.present(id, &m, r).unwrap();
+        full_copies += usize::from(s.stats.copied_bytes - before == 80);
+        assert!(rx.update());
+        let mut full = Snapshot::default();
+        rx.current().snapshot(&mut full).unwrap();
+        assert_eq!(full.bgra, expected);
+    }
+    assert!(full_copies >= 1);
+}
+
+// spec: DEV-FRAME-4, DEV-FRAME-5, DEV-FRAME-6
+#[test]
+fn bottom_up_palette_changes_and_packed_edges_match_full_conversion() {
+    for format in [
+        PixelFormat::Indexed8,
+        PixelFormat::Indexed4,
+        PixelFormat::Indexed1,
+    ] {
+        let mut s = store();
+        let mut m = Memory::new(false);
+        let id = s.create(5, 4, true, format, &mut m).unwrap();
+        s.set_palette(id, 1, &[[7, 8, 9, 0]]).unwrap();
+        let (tx, mut rx) = frame_mailbox();
+        s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+        s.present(id, &m, s[id].rect()).unwrap();
+        assert!(rx.update());
+        let mut out = Snapshot::default();
+        rx.current().snapshot(&mut out).unwrap();
+        let r = Rect {
+            x: 3,
+            y: 1,
+            w: 1,
+            h: 1,
+        };
+        s.fill_raw(id, r, 1, &mut m).unwrap();
+        s.present(id, &m, r).unwrap();
+        assert!(rx.update());
+        rx.current().snapshot(&mut out).unwrap();
+        assert_eq!(&*out.damage, &[r]);
+        assert_eq!(&out.bgra[32..36], &[7, 8, 9, 0]);
+        let mut full = Snapshot::default();
+        rx.current().snapshot(&mut full).unwrap();
+        assert_eq!(out.bgra, full.bgra);
+        s.set_palette(id, 1, &[[30, 31, 32, 0]]).unwrap();
+        s.present(id, &m, s[id].rect()).unwrap();
+        assert!(rx.update());
+        rx.current().snapshot(&mut out).unwrap();
+        assert_eq!(&*out.damage, &[s[id].rect()]);
+        assert_eq!(&out.bgra[32..36], &[30, 31, 32, 0]);
+    }
+}
+
+// spec: DEV-FRAME-4, DEV-FRAME-6
+#[test]
+fn surface_switches_and_resize_round_trips_invalidate_damage_history() {
+    let mut s = store();
+    let mut m = Memory::new(false);
+    let a = s.create(5, 4, false, PixelFormat::Bgra32, &mut m).unwrap();
+    let b = s.create(6, 4, true, PixelFormat::Bgr24, &mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    s.present(a, &m, s[a].rect()).unwrap();
+    assert!(rx.update());
+    let mut out = Snapshot::default();
+    rx.current().snapshot(&mut out).unwrap();
+    s.fill_raw(b, s[b].rect(), 0xabcdef, &mut m).unwrap();
+    s.present(b, &m, s[b].rect()).unwrap();
+    s.fill_raw(a, s[a].rect(), 0x12345678, &mut m).unwrap();
+    s.present(
+        a,
+        &m,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+    )
+    .unwrap();
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(&*out.damage, &[s[a].rect()]);
+    assert_eq!(out.bgra, [0x78, 0x56, 0x34, 0x12].repeat(20));
+}
+
+// spec: DEV-FRAME-5
+#[test]
+fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
+    let mut s = store();
+    let mut m = Memory::new(false);
+    let id = s.primary(&mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    s.present(id, &m, s[id].rect()).unwrap();
+    assert!(rx.update());
+    let mut out = Snapshot::default();
+    rx.current().snapshot(&mut out).unwrap();
+    for (x, y) in [(0, 0), (2, 0), (4, 0), (0, 2), (2, 2)] {
+        let r = Rect { x, y, w: 1, h: 1 };
+        m.write(s[id].row(x, y), &[7; 4]).unwrap();
+        s.present(id, &m, r).unwrap();
+    }
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(
+        &*out.damage,
+        &[Rect {
+            x: 0,
+            y: 0,
+            w: 5,
+            h: 3
+        }]
+    );
+    let mut full = Snapshot::default();
+    rx.current().snapshot(&mut full).unwrap();
+    assert_eq!(out.bgra, full.bgra);
 }

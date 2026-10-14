@@ -75,6 +75,7 @@ impl Fixture {
                     height: 4,
                     bgra: vec![0; 64],
                     frames: 0,
+                    ..Default::default()
                 },
             )
             .unwrap(),

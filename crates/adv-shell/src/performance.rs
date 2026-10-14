@@ -17,6 +17,9 @@ const SAMPLE_CAPACITY: usize = 4096;
 pub(crate) struct NativePresentation {
     pub consumed: u64,
     pub uploads: u64,
+    pub uploaded_bytes: u64,
+    pub converted_bytes: u64,
+    pub software_started: Option<Instant>,
     pub presented: u64,
     pub configurations: u64,
     pub max_queue_ns: u64,
@@ -30,7 +33,9 @@ impl NativePresentation {
             concat!(
                 "{{\"cumulative\": true, \"consumed_frames\": {}, \"software_uploads\": {}, ",
                 "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
-                "\"max_job_ns\": {}, \"max_acquire_ns\": {}, \"max_configure_ns\": {}}}"
+                "\"max_job_ns\": {}, \"max_acquire_ns\": {}, \"max_configure_ns\": {}, ",
+                "\"software_uploaded_bytes\": {}, \"software_converted_bytes\": {}, ",
+                "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}}}"
             ),
             self.consumed,
             self.uploads,
@@ -39,7 +44,17 @@ impl NativePresentation {
             self.max_queue_ns,
             self.max_job_ns,
             self.max_acquire_ns,
-            self.max_configure_ns
+            self.max_configure_ns,
+            self.uploaded_bytes,
+            self.converted_bytes,
+            self.uploaded_bytes as f64
+                / self
+                    .software_started
+                    .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9)),
+            self.converted_bytes as f64
+                / self
+                    .software_started
+                    .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9))
         )
     }
 }
@@ -280,6 +295,22 @@ impl Performance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-DAMAGE-2
+    #[test]
+    fn software_work_counters_report_bytes_and_real_time_rates() {
+        let stats = NativePresentation {
+            uploaded_bytes: 20,
+            converted_bytes: 40,
+            software_started: Some(Instant::now() - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let json = stats.json();
+        assert!(json.contains("\"software_uploaded_bytes\": 20"));
+        assert!(json.contains("\"software_converted_bytes\": 40"));
+        assert!(json.contains("\"software_upload_bytes_per_second\":"));
+        assert!(json.contains("\"software_conversion_bytes_per_second\":"));
+        assert!(!json.contains("NaN") && !json.contains("inf"));
+    }
     #[test]
     fn delayed_ui_delivery_cannot_reenter_a_reset_measurement_window() {
         let mut stats = Performance::default();

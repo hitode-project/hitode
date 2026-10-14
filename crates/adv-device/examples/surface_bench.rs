@@ -87,7 +87,9 @@ fn main() {
             p.copy_from_slice(&[255, 0, 255, 0]);
         }
         let (ms, allocations) = measure(
-            || surfaces.copy(src, rect, dst, rect, &mut memory).unwrap(),
+            || {
+                surfaces.copy(src, rect, dst, rect, &mut memory).unwrap();
+            },
             frames,
         );
         assert_eq!(
@@ -102,7 +104,9 @@ fn main() {
             h: h / 2,
         };
         let (ms, allocations) = measure(
-            || surfaces.copy(src, rect, dst, scaled, &mut memory).unwrap(),
+            || {
+                surfaces.copy(src, rect, dst, scaled, &mut memory).unwrap();
+            },
             frames,
         );
         assert_eq!(
@@ -110,7 +114,14 @@ fn main() {
             &[0x1f, 0xf8]
         );
         println!("scale_bgra_to_565,{w}x{h},{ms:.4},{allocations}");
-        let (ms, allocations) = measure(|| surfaces.present(dst, &memory).unwrap(), frames);
+        let (ms, allocations) = measure(
+            || {
+                surfaces
+                    .present(dst, &memory, surfaces[dst].rect())
+                    .unwrap()
+            },
+            frames,
+        );
         assert!(
             surfaces
                 .presenter
@@ -121,7 +132,14 @@ fn main() {
         println!("present_565,{w}x{h},{ms:.4},{allocations}");
         surfaces.set_deferred_presentation(true).unwrap();
         let before = surfaces.stats.converted_pixels;
-        let (ms, allocations) = measure(|| surfaces.present(dst, &memory).unwrap(), frames);
+        let (ms, allocations) = measure(
+            || {
+                surfaces
+                    .present(dst, &memory, surfaces[dst].rect())
+                    .unwrap()
+            },
+            frames,
+        );
         assert_eq!(surfaces.stats.converted_pixels, before);
         assert!(surfaces.capture_latest().unwrap());
         assert!(!surfaces.capture_latest().unwrap());

@@ -313,7 +313,7 @@ impl Raster {
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.copy(src, sr, dst, dr, &mut m)?;
             if dcs.is_window_dc(objects, destination_dc) {
-                surfaces.present(dst, &m)?;
+                surfaces.present(dst, &m, m.damage())?;
             }
             1
         })
@@ -415,7 +415,7 @@ impl Raster {
             &mut m,
         )?;
         if dcs.is_window_dc(objects, destination_dc) {
-            surfaces.present(dst, &m)?;
+            surfaces.present(dst, &m, m.damage())?;
         }
         Ok(transfer.scan_lines)
     }
@@ -514,7 +514,7 @@ impl Raster {
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.blit(src, sr, dst, dr, options, &mut m)?;
             if dcs.is_window_dc(objects, destination_dc) {
-                surfaces.present(dst, &m)?;
+                surfaces.present(dst, &m, m.damage())?;
             }
             1
         })

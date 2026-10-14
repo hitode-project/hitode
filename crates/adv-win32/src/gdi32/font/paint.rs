@@ -401,7 +401,7 @@ fn paint(
         let before = store.stats.presentations;
         let result = result.and_then(|changed| {
             if changed && window {
-                store.present(target, &memory)?;
+                store.present(target, &memory, memory.damage())?;
             }
             Ok(())
         });

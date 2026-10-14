@@ -784,7 +784,9 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
             .is_err()
     );
     assert!(
-        surfaces.present(native, &memory).is_err(),
+        surfaces
+            .present(native, &memory, surfaces[native].rect())
+            .is_err(),
         "never treat native pixels as guest address zero"
     );
     for serial in 1..=100_u32 {
@@ -807,7 +809,9 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
             .is_err(),
         "CPU snapshot is explicit"
     );
-    surfaces.present(software, &memory).unwrap();
+    surfaces
+        .present(software, &memory, surfaces[software].rect())
+        .unwrap();
     assert!(consumer.update());
     assert!(
         consumer.current().native().is_none(),

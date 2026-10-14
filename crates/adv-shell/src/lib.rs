@@ -16,6 +16,8 @@ pub mod overlay;
 mod performance;
 #[cfg(target_os = "macos")]
 mod session;
+#[cfg(any(target_os = "macos", feature = "gpu"))]
+mod software_frame;
 pub mod window;
 #[cfg(target_os = "macos")]
 pub use session::Session;

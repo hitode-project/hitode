@@ -73,6 +73,20 @@ impl<T> Producer<T> {
         old & DIRTY != 0
     }
 }
+impl<T> Producer<T> {
+    /// Failed preparation leaves the private slot unpublished and does not wake
+    /// the reader. The caller must invalidate any partially updated baseline.
+    pub fn try_publish<E>(
+        &mut self,
+        fill: impl FnOnce(&mut T) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        fill(unsafe { &mut *self.shared.slots[self.slot].get() })?;
+        self.latest = Some(self.slot);
+        let old = self.shared.middle.swap(self.slot | DIRTY, Ordering::AcqRel);
+        self.slot = old & !DIRTY;
+        Ok(old & DIRTY != 0)
+    }
+}
 impl<T: Sync> Producer<T> {
     /// Diagnostic access to the last published value. The consumer never writes;
     /// the immutable borrow prevents this producer from recycling any slot.
@@ -104,6 +118,31 @@ impl<T> Consumer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: DEV-FRAME-4
+    #[test]
+    fn failed_slot_preparation_keeps_the_last_complete_publication() {
+        let (mut tx, mut rx) = channel([0u32; 3]);
+        tx.publish(|slot| *slot = 1);
+        assert!(rx.update());
+        let result = tx.try_publish(|slot| {
+            *slot = 2;
+            Err(())
+        });
+        assert_eq!(result, Err(()));
+        assert!(!rx.has_update());
+        assert_eq!(*rx.current(), 1);
+        assert_eq!(tx.latest(), Some(&1));
+        assert_eq!(
+            tx.try_publish(|slot| {
+                *slot = 3;
+                Ok::<(), ()>(())
+            }),
+            Ok(false)
+        );
+        assert!(rx.update());
+        assert_eq!(*rx.current(), 3);
+    }
+
     #[test]
     fn concurrent_frames_are_complete_monotonic_and_latest_survives() {
         let (mut tx, mut rx) = channel([[0u64; 257]; 3]);
