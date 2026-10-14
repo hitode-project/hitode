@@ -17,19 +17,19 @@ pub enum Event {
         wparam: u32,
         lparam: u32,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     Text(String, std::sync::mpsc::SyncSender<usize>),
     Close,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     ForceClose,
     FocusLost,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     AudioSuspended(bool),
     /// The launcher paused the game: no guest execution, frozen guest time
     /// and suspended audio until it resumes.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     Paused(bool),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     Volume(u8),
     Repaint,
 }
@@ -1530,5 +1530,33 @@ mod tests {
                 .unwrap(),
             WaitOutcome::Deadline
         );
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) mod android;
+#[cfg(target_os = "android")]
+pub(crate) use android::native_viewport;
+#[cfg(target_os = "android")]
+pub use android::{GameView, TouchAction};
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod android_epoch;
+#[cfg(all(test, not(target_os = "android")))]
+#[path = "window/android/input.rs"]
+mod android_input_tests;
+
+#[cfg(any(target_os = "macos", target_os = "android"))]
+/// A paced guest (`Present` boundaries) is told the display runs at 60 Hz, so
+/// presenting faster only repeats conversion and composition. Faster displays
+/// keep 10% slack so a 60 Hz guest whose frames arrive early is still shown at
+/// once. Software frames carry no frame boundary: a GDI engine blits a frame
+/// in strips, and a slower cap would hold each half-drawn frame on screen
+/// longer, so they keep the display rate.
+pub(crate) fn refresh_interval(display_fps: isize, paced: bool) -> Duration {
+    let fps = display_fps.clamp(24, 240) as f64;
+    if paced && fps > 60.0 {
+        Duration::from_secs_f64(0.9 / 60.0)
+    } else {
+        Duration::from_secs_f64(1.0 / fps)
     }
 }

@@ -2,24 +2,36 @@
 mod audio;
 mod control;
 mod frontend;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "android"))]
 mod logging;
-#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "android",
+    all(windows, feature = "gpu")
+))]
 mod native_gpu;
-#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "android",
+    all(windows, feature = "gpu")
+))]
 mod upscaling;
-#[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "android",
+    all(windows, feature = "gpu")
+))]
 pub use upscaling::Upscaler;
 mod scaling;
 pub use scaling::Scaling;
 pub mod overlay;
 mod performance;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 mod session;
-#[cfg(any(target_os = "macos", feature = "gpu"))]
+#[cfg(any(target_os = "macos", target_os = "android", feature = "gpu"))]
 mod software_frame;
 pub mod window;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub use session::Session;
 
 /// How a game run ended.
@@ -312,7 +324,7 @@ impl Options {
             }
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
-        #[cfg(not(any(feature = "gpu", target_os = "macos")))]
+        #[cfg(not(any(feature = "gpu", target_os = "macos", target_os = "android")))]
         if options.headless_gpu || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
             return Err("D3D9 shader capability switches require the gpu feature".into());
         }
@@ -687,7 +699,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
     );
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
         let versions = |counts: [u64; 7]| {
@@ -715,7 +727,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             shader_versions
         )
     };
-    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos", target_os = "android")))]
     let gpu_diagnostics = "null";
     let mut codec = adv_runtime::vorbis::stats(&runtime.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),
@@ -958,7 +970,7 @@ fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Resu
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     if runtime.has_native_frame() {
         return capture_native_after_stop(runtime, wake);
     }
@@ -1029,7 +1041,7 @@ fn acknowledge_scene_gate(
     control::acknowledge(result);
 }
 
-#[cfg(any(feature = "gpu", target_os = "macos"))]
+#[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
 fn capture_native_after_stop(
     runtime: &mut Runtime,
     wake: &window::WakeEvent,
@@ -1097,13 +1109,17 @@ fn run(options: Options) -> Result<u8, String> {
     if options.frame_budget && !options.headless {
         return Err("--frame-budget requires headless execution".into());
     }
-    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos", target_os = "android")))]
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
     #[cfg(target_os = "macos")]
     if !options.headless {
         return session::run_cli(options);
+    }
+    #[cfg(target_os = "android")]
+    if !options.headless {
+        return Err("Android games require a host GameView and Session".into());
     }
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
@@ -1119,7 +1135,7 @@ fn run(options: Options) -> Result<u8, String> {
         service.shutdown();
         return result.map(|finished| finished.exit_code);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
         // The shared worker cannot preempt an active compiler task. Interactive
         // compilation uses measured work slices so presentation can run between
@@ -1184,7 +1200,7 @@ fn run(options: Options) -> Result<u8, String> {
         window.finish_termination();
         result?.map(|finished| finished.exit_code)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     unreachable!()
 }
 
@@ -1245,13 +1261,13 @@ fn native_cache_is_default_and_has_one_diagnostic_bypass() {
 
 /// Host reasons the game is not playing. System sleep only silences the
 /// output; a launcher pause also stops guest execution and guest time.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 #[derive(Default)]
 struct Suspension {
     sleeping: bool,
     paused: bool,
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 impl Suspension {
     fn set(
         &mut self,
@@ -1385,9 +1401,9 @@ fn run_execution(
     }
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     runtime.set_d3d9_shader_caps(options.d3d9_sm3);
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
     runtime.machine.sys.stats.services_enabled =
         options.host_profile.is_some() || options.schedule_profile.is_some();
@@ -1425,11 +1441,14 @@ fn run_execution(
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
     }
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
-    if cfg!(windows) || (cfg!(target_os = "macos") && window.is_some()) || options.headless_gpu {
-        #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
+    if cfg!(windows)
+        || (cfg!(any(target_os = "macos", target_os = "android")) && window.is_some())
+        || options.headless_gpu
+    {
+        #[cfg(any(windows, target_os = "macos", target_os = "android"))]
         let supplied_gpu = window.as_mut().and_then(|worker| worker.gpu.take());
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
         let supplied_gpu = None;
         let gpu = match supplied_gpu {
             Some(gpu) => gpu,
@@ -1448,7 +1467,7 @@ fn run_execution(
         runtime.set_gpu_background(gpu_background, wake.clone());
     }
     let mut audio = audio::AudioOutput::new(options.audio, options.headless, &runtime);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     let mut suspension = Suspension::default();
     let mut control = options
         .control_stdin
@@ -1460,6 +1479,10 @@ fn run_execution(
     let mut idle_waits = 0u64;
     let mut wait_time = Duration::ZERO;
     let mut performance = performance::Performance::default();
+    #[cfg(target_os = "android")]
+    {
+        performance.execution_scheduling = Some(configure_execution_thread());
+    }
     let mut scene_gate = control::SceneGate::default();
     let mut inputs = 0u64;
     let mut injected = false;
@@ -1475,7 +1498,11 @@ fn run_execution(
             return Err("UI stopped while the guest was running".into());
         }
         if let Some(w) = window.as_mut() {
-            for event in w.pump(&mut performance) {
+            #[cfg(target_os = "android")]
+            let events = std::iter::from_fn(|| w.next_input(&mut performance));
+            #[cfg(not(target_os = "android"))]
+            let events = w.pump(&mut performance);
+            for event in events {
                 match event {
                     window::Event::Input {
                         message,
@@ -1484,30 +1511,30 @@ fn run_execution(
                     } => {
                         inputs += u64::from(runtime.post_input(message, wparam, lparam));
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "android"))]
                     window::Event::Text(text, reply) => {
                         let posted = runtime.post_text(&text);
                         inputs += posted as u64;
                         let _ = reply.send(posted);
                     }
                     window::Event::Close => {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "android"))]
                         suspension.set(&mut runtime, &mut audio, None, Some(false));
                         runtime.post_input(0x10, 0, 0);
-                        #[cfg(not(target_os = "macos"))]
+                        #[cfg(not(any(target_os = "macos", target_os = "android")))]
                         close_at.get_or_insert_with(Instant::now);
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "android"))]
                     window::Event::AudioSuspended(sleeping) => {
                         suspension.set(&mut runtime, &mut audio, Some(sleeping), None)
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "android"))]
                     window::Event::Volume(percent) => audio.set_volume(percent),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "android"))]
                     window::Event::Paused(paused) => {
                         suspension.set(&mut runtime, &mut audio, None, Some(paused))
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "android"))]
                     window::Event::ForceClose => unreachable!("force close is consumed by the UI"),
                     window::Event::Repaint => {}
                     window::Event::FocusLost => inputs += runtime.release_input() as u64,
@@ -1878,7 +1905,7 @@ fn run_execution(
             stop_reason = "host_window_closed";
             break;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "android"))]
         if suspension.paused {
             // Input stays queued; only a resume, close or diagnostic command wakes this.
             if !control.as_ref().is_some_and(control::Control::has_pending) {
@@ -2073,7 +2100,7 @@ fn run_execution(
             }
         }
     }
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     runtime.cancel_pending_graphics();
     runtime.machine.sys.trace.flush();
     if options.profile {
@@ -2120,15 +2147,15 @@ fn run_execution(
             }
         }
     }
-    #[cfg(any(feature = "gpu", target_os = "macos"))]
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     let native_frame = runtime.has_native_frame();
-    #[cfg(not(any(feature = "gpu", target_os = "macos")))]
+    #[cfg(not(any(feature = "gpu", target_os = "macos", target_os = "android")))]
     let native_frame = false;
     if let Err(error) = runtime.machine.cpu.persist() {
         eprintln!("warning: {error}");
     }
     if native_frame {
-        #[cfg(any(feature = "gpu", target_os = "macos"))]
+        #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
         if options.screenshot.is_some() || options.report.is_some() {
             capture_native_after_stop(&mut runtime, &wake)?;
         }
@@ -2213,7 +2240,7 @@ fn run_execution(
 
 /// Run the desktop/headless command-line shell with the process arguments.
 pub fn run_cli() -> std::process::ExitCode {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "android"))]
     logging::init();
     if std::env::var("ADV_HOST_FEATURES_REPORT").is_ok_and(|value| value == "1") {
         eprintln!(
@@ -2233,3 +2260,26 @@ pub fn run_cli() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod deadline_tests;
+
+#[cfg(target_os = "android")]
+fn configure_execution_thread() -> String {
+    let (result, error, nice, query_error) = unsafe {
+        let tid = libc::gettid();
+        let result = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -2);
+        let error = if result == 0 { 0 } else { *libc::__errno() };
+        *libc::__errno() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t);
+        (result, error, nice, *libc::__errno())
+    };
+    format!(
+        "{{\"requested_nice\": -2, \"actual_nice\": {}, \"applied\": {}, \"set_errno\": {}, \"query_errno\": {}}}",
+        if query_error == 0 {
+            nice.to_string()
+        } else {
+            "null".into()
+        },
+        result == 0 && query_error == 0 && nice == -2,
+        error,
+        query_error
+    )
+}

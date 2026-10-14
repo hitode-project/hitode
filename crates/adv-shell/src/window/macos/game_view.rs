@@ -1,5 +1,6 @@
 //! Native game input and Metal presentation surface.
 use super::*;
+use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
 use objc2_quartz_core::CAMetalLayer;
 
@@ -208,6 +209,9 @@ impl GameView {
     pub(crate) fn hide(&self) {
         self.setHidden(true);
         self.hub().occluded.set(true);
+    }
+    pub(crate) fn refresh_ready(&self) -> bool {
+        true
     }
     pub(crate) fn next_refresh(&self, paced: bool) -> std::time::Instant {
         let fps = self
@@ -505,21 +509,6 @@ impl Input {
                 NSCursor::unhide();
             }
         }
-    }
-}
-
-/// A paced guest (`Present` boundaries) is told the display runs at 60 Hz, so
-/// presenting faster only repeats conversion and composition. Faster displays
-/// keep 10% slack so a 60 Hz guest whose frames arrive early is still shown at
-/// once. Software frames carry no frame boundary: a GDI engine blits a frame
-/// in strips, and a slower cap would hold each half-drawn frame on screen
-/// longer, so they keep the display rate.
-pub(crate) fn refresh_interval(display_fps: isize, paced: bool) -> Duration {
-    let fps = display_fps.clamp(24, 240) as f64;
-    if paced && fps > 60.0 {
-        Duration::from_secs_f64(0.9 / 60.0)
-    } else {
-        Duration::from_secs_f64(1.0 / fps)
     }
 }
 

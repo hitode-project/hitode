@@ -95,6 +95,8 @@ impl Samples {
 
 #[derive(Default)]
 pub struct Performance {
+    #[cfg(target_os = "android")]
+    pub(crate) execution_scheduling: Option<String>,
     measurement_start: Option<Instant>,
     measurement_start_frame: u64,
     steps: u64,
@@ -164,7 +166,11 @@ impl Performance {
     pub fn set_ui_metrics_dropped(&mut self, total: u64) {
         self.ui_metrics_dropped_total = total;
     }
-    #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "android",
+        all(windows, feature = "gpu")
+    ))]
     pub(crate) fn native(&mut self, stats: NativePresentation) {
         self.native = Some(stats);
     }
@@ -240,9 +246,16 @@ impl Performance {
         }
     }
     pub fn json(&self) -> String {
+        #[cfg(target_os = "android")]
+        let platform = format!(
+            "\"execution_scheduling\": {}, ",
+            self.execution_scheduling.as_deref().unwrap_or("null")
+        );
+        #[cfg(not(target_os = "android"))]
+        let platform = "";
         format!(
             concat!(
-                "{{\n    \"measurement_start_frame\": {}, \"measurement_elapsed_seconds\": {},\n",
+                "{{{}\n    \"measurement_start_frame\": {}, \"measurement_elapsed_seconds\": {},\n",
                 "    \"runtime_steps\": {}, \"runtime_soft_yields\": {}, \"runtime_step_seconds\": {:.6}, \"runtime_step_max_seconds\": {:.6},\n",
                 "    \"cold_step_seconds_before_first_observation\": {:.6}, \"event_pump_seconds\": {:.6}, \"event_pump_max_seconds\": {:.6},\n",
                 "    \"ui_metrics_dropped_total\": {},\n",
@@ -256,6 +269,7 @@ impl Performance {
                 "    \"host_repaints\": {}, \"host_repaint_seconds\": {:.6},\n",
                 "    \"wait_requested_seconds\": {:.6}, \"wait_deadline_wakes\": {}, \"wait_input_wakes\": {}, \"wait_deadline_overshoot\": {}\n  }}"
             ),
+            platform,
             self.measurement_start_frame,
             self.measurement_start.map_or_else(
                 || "null".into(),

@@ -1,63 +1,88 @@
-//! A game session driven by the host's main AppKit run loop.
+//! A game session driven by the host main loop.
 use crate::{
     Finished, Options, frontend,
-    window::{Event, GameView, Projection, Window},
+    window::{Event, GameView},
 };
 use adv_runtime::{DialogEvent, DialogSet, MenuBar, MenuEvent, MenuItem};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
+#[cfg(target_os = "macos")]
 use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::NSApplication;
+#[cfg(target_os = "macos")]
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFFileDescriptor, CFFileDescriptorContext, CFOptionFlags, CFRetained,
     CFRunLoop, CFRunLoopSource, CFRunLoopTimer, CFRunLoopTimerContext,
     kCFFileDescriptorReadCallBack, kCFRunLoopCommonModes,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
-use std::{
-    cell::RefCell,
-    ffi::c_void,
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, time::Duration};
 
 pub struct Session {
     driver: Rc<Driver>,
+    #[cfg(target_os = "macos")]
     descriptor: CFRetained<CFFileDescriptor>,
+    #[cfg(target_os = "macos")]
     source: CFRetained<CFRunLoopSource>,
+    #[cfg(target_os = "macos")]
     timer: CFRetained<CFRunLoopTimer>,
 }
 struct Driver {
+    #[cfg(target_os = "android")]
+    main_loop: RefCell<Option<android::MainLoop>>,
+    #[cfg(target_os = "macos")]
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
-    view: Retained<GameView>,
+    view: View,
     ui: RefCell<Option<frontend::Ui>>,
     done: RefCell<spsc::Consumer<Result<Finished, String>>>,
     pending: RefCell<Option<Result<Finished, String>>>,
     execution: RefCell<Option<std::thread::JoinHandle<()>>>,
     service: RefCell<adv_sync::background::Service>,
     on_finished: RefCell<Option<Box<dyn FnOnce(Result<Finished, String>)>>>,
+    #[cfg(target_os = "macos")]
     timer: RefCell<Option<CFRetained<CFRunLoopTimer>>>,
     wake: WakeEvent,
     /// Guest menus and dialogs; borrowed across a nested popup loop.
+    #[cfg(target_os = "macos")]
     projection: RefCell<Option<Rc<RefCell<Projection>>>>,
+    #[cfg(target_os = "macos")]
     cli: RefCell<Option<Rc<RefCell<Window>>>>,
 }
+#[cfg(target_os = "macos")]
+use crate::window::{Projection, Window};
+#[cfg(target_os = "macos")]
+type View = Retained<GameView>;
+#[cfg(target_os = "android")]
+type View = Rc<GameView>;
+#[cfg(target_os = "android")]
+mod android;
+
 impl Session {
-    /// Starts a game in `view`. Guest menus join the application's main menu
-    /// after its first item and guest dialogs open over the view's window.
+    /// Starts a game in the host view, on the main thread.
+    /// Android requires the initial SurfaceHolder window to be attached.
     pub fn new(
-        view: Retained<GameView>,
+        view: View,
         options: Options,
         on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
         let projection = Rc::new(RefCell::new(Projection::embedded(view.clone())?));
-        Self::start(view, options, on_finished, projection)
+        Self::start(
+            view,
+            options,
+            on_finished,
+            #[cfg(target_os = "macos")]
+            projection,
+        )
     }
     fn start(
-        view: Retained<GameView>,
+        view: View,
         options: Options,
         on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
-        projection: Rc<RefCell<Projection>>,
+        #[cfg(target_os = "macos")] projection: Rc<RefCell<Projection>>,
     ) -> Result<Self, String> {
         let wake = WakeEvent::new().map_err(|e| e.to_string())?;
         let keys = Arc::new(KeyState::default());
@@ -76,12 +101,15 @@ impl Session {
             .sender_with_capacity_wake(1, 1, ui.wake())
             .map_err(|e| e.to_string())?;
         ui.native(presenter, sender);
+        #[cfg(target_os = "macos")]
         ui.install_sinks(&mut projection.borrow_mut());
         worker.gpu = Some(gpu);
         let service = background.start().map_err(|e| e.to_string())?;
         let completion_wake = ui.wake();
         view.watch(completion_wake.clone());
         let (mut tx, rx) = spsc::channel(1);
+        #[cfg(target_os = "android")]
+        let view_keys = keys.clone();
         let execution = std::thread::Builder::new()
             .name("adv-execution".into())
             .spawn(move || {
@@ -94,6 +122,9 @@ impl Session {
             })
             .map_err(|e| e.to_string())?;
         let driver = Rc::new(Driver {
+            #[cfg(target_os = "android")]
+            main_loop: RefCell::new(None),
+            #[cfg(target_os = "macos")]
             activity: NSProcessInfo::processInfo().beginActivityWithOptions_reason(
                 NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
                 &NSString::from_str("Guest execution and audio playback"),
@@ -106,61 +137,86 @@ impl Session {
             execution: RefCell::new(Some(execution)),
             service: RefCell::new(service),
             on_finished: RefCell::new(Some(on_finished)),
+            #[cfg(target_os = "macos")]
             timer: RefCell::new(None),
+            #[cfg(target_os = "macos")]
             projection: RefCell::new(Some(projection)),
+            #[cfg(target_os = "macos")]
             cli: RefCell::new(None),
         });
-        let info = Rc::as_ptr(&driver) as *mut c_void;
-        let context = CFFileDescriptorContext {
-            version: 0,
-            info,
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        // The Session retains Driver and invalidates both sources before dropping it.
-        let descriptor = unsafe {
-            CFFileDescriptor::new(
-                None,
-                driver.wake.as_raw_fd(),
-                false,
-                Some(wake_callback),
-                &context,
-            )
+        #[cfg(target_os = "android")]
+        {
+            *driver.main_loop.borrow_mut() = Some(android::MainLoop::new(&driver)?);
+            let weak = Rc::downgrade(&driver);
+            driver.view.bind(
+                view_keys,
+                Box::new(move |window| {
+                    if let Some(driver) = weak.upgrade() {
+                        if let Some(ui) = driver.ui.borrow_mut().as_mut() {
+                            unsafe {
+                                ui.replace_window(window)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+            Ok(Self { driver })
         }
-        .ok_or("CFFileDescriptorCreate failed")?;
-        let source = CFFileDescriptor::new_run_loop_source(None, Some(&descriptor), 0)
-            .ok_or("CFFileDescriptorCreateRunLoopSource failed")?;
-        let mut context = CFRunLoopTimerContext {
-            version: 0,
-            info,
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        let timer = unsafe {
-            CFRunLoopTimer::new(
-                None,
-                f64::MAX,
-                f64::MAX,
-                0,
-                0,
-                Some(timer_callback),
-                &mut context,
-            )
+        #[cfg(target_os = "macos")]
+        {
+            let info = Rc::as_ptr(&driver) as *mut c_void;
+            let context = CFFileDescriptorContext {
+                version: 0,
+                info,
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            // The Session retains Driver and invalidates both sources before dropping it.
+            let descriptor = unsafe {
+                CFFileDescriptor::new(
+                    None,
+                    driver.wake.as_raw_fd(),
+                    false,
+                    Some(wake_callback),
+                    &context,
+                )
+            }
+            .ok_or("CFFileDescriptorCreate failed")?;
+            let source = CFFileDescriptor::new_run_loop_source(None, Some(&descriptor), 0)
+                .ok_or("CFFileDescriptorCreateRunLoopSource failed")?;
+            let mut context = CFRunLoopTimerContext {
+                version: 0,
+                info,
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            let timer = unsafe {
+                CFRunLoopTimer::new(
+                    None,
+                    f64::MAX,
+                    f64::MAX,
+                    0,
+                    0,
+                    Some(timer_callback),
+                    &mut context,
+                )
+            }
+            .ok_or("CFRunLoopTimerCreate failed")?;
+            *driver.timer.borrow_mut() = Some(timer.clone());
+            let run_loop = CFRunLoop::main().ok_or("no main run loop")?;
+            run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+            run_loop.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+            descriptor.enable_call_backs(kCFFileDescriptorReadCallBack);
+            Ok(Self {
+                driver,
+                descriptor,
+                source,
+                timer,
+            })
         }
-        .ok_or("CFRunLoopTimerCreate failed")?;
-        *driver.timer.borrow_mut() = Some(timer.clone());
-        let run_loop = CFRunLoop::main().ok_or("no main run loop")?;
-        run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
-        run_loop.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
-        descriptor.enable_call_backs(kCFFileDescriptorReadCallBack);
-        Ok(Self {
-            driver,
-            descriptor,
-            source,
-            timer,
-        })
     }
     /// Post confirmed IME text through the input channel and return the guest's count.
     pub fn post_text(&self, text: &str) -> usize {
@@ -179,16 +235,20 @@ impl Session {
     }
     /// The window showing the game lost key status. A guest dialog taking it
     /// keeps the guest's focus; another window removes it.
+    #[cfg(target_os = "macos")]
     pub fn resign_key(&self) {
         self.driver.view.clear_control_latch();
         self.driver.view.hub().resign_key();
     }
+    #[cfg(target_os = "macos")]
     pub fn set_minimized(&self, minimized: bool) {
         self.driver.view.hub().minimized(minimized);
     }
+    #[cfg(target_os = "macos")]
     pub fn set_occluded(&self, occluded: bool) {
         self.driver.view.hub().set_occluded(occluded);
     }
+    #[cfg(target_os = "macos")]
     pub fn sleep(&self, sleeping: bool) {
         self.driver.view.hub().sleep(sleeping);
     }
@@ -214,6 +274,10 @@ impl Session {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
     }
     pub fn set_paused(&self, paused: bool) {
+        #[cfg(target_os = "android")]
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.pause_input(paused);
+        }
         self.driver.view.hub().pause(paused);
     }
     pub fn request_close(&self) {
@@ -222,6 +286,7 @@ impl Session {
     pub fn force_close(&self) {
         self.driver.view.hub().force_close();
     }
+    #[cfg(target_os = "macos")]
     pub fn power_off(&self) {
         self.driver.view.hub().power_off();
     }
@@ -264,10 +329,12 @@ impl Session {
 }
 impl Driver {
     fn tick(&self) -> Result<Option<Instant>, String> {
+        #[cfg(target_os = "macos")]
         let projection = self.projection.borrow().clone();
         if self.finish_pending() {
             return Ok(None);
         }
+        #[cfg(target_os = "macos")]
         if let Some(projection) = &projection
             && let Ok(mut projection) = projection.try_borrow_mut()
         {
@@ -287,6 +354,7 @@ impl Driver {
         }
         // A native popup runs a nested AppKit loop. Its input sinks remain
         // usable while projection is borrowed by the outer invocation.
+        #[cfg(target_os = "macos")]
         if let Some(projection) = &projection
             && let Ok(mut projection) = projection.try_borrow_mut()
         {
@@ -326,6 +394,7 @@ impl Driver {
         }
     }
     fn finish_pending(&self) -> bool {
+        #[cfg(target_os = "macos")]
         if self
             .projection
             .borrow()
@@ -348,6 +417,7 @@ impl Driver {
     fn finish(&self, mut result: Result<Finished, String>) {
         drop(self.ui.borrow_mut().take());
         // Retires guest menus and dialogs unless a nested loop still holds them.
+        #[cfg(target_os = "macos")]
         drop(self.projection.borrow_mut().take());
         if let Some(execution) = self.execution.borrow_mut().take() {
             if execution.join().is_err() {
@@ -368,6 +438,18 @@ impl Driver {
                 None
             }
         };
+        #[cfg(target_os = "android")]
+        {
+            let result = self
+                .main_loop
+                .borrow()
+                .as_ref()
+                .map(|main_loop| main_loop.arm(next));
+            if let Some(Err(error)) = result {
+                self.finish(Err(error));
+            }
+        }
+        #[cfg(target_os = "macos")]
         if let Some(timer) = self.timer.borrow().as_ref() {
             if timer.is_valid() {
                 let date = next.map_or(f64::MAX, |next| {
@@ -381,6 +463,7 @@ impl Driver {
 }
 // A completion callback may drop its Session. Keep Driver alive until this
 // invocation returns, including when AppKit is dispatching a nested menu loop.
+#[cfg(target_os = "macos")]
 unsafe fn callback_driver(info: *mut c_void) -> Rc<Driver> {
     let pointer = info as *const Driver;
     unsafe {
@@ -388,6 +471,7 @@ unsafe fn callback_driver(info: *mut c_void) -> Rc<Driver> {
         Rc::from_raw(pointer)
     }
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C-unwind" fn wake_callback(
     fd: *mut CFFileDescriptor,
     _: CFOptionFlags,
@@ -402,14 +486,23 @@ unsafe extern "C-unwind" fn wake_callback(
         Err(error) => driver.finish(Err(error.to_string())),
     }
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C-unwind" fn timer_callback(_: *mut CFRunLoopTimer, info: *mut c_void) {
     unsafe { callback_driver(info) }.drive();
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.timer.invalidate();
-        self.descriptor.invalidate();
-        self.source.invalidate();
+        #[cfg(target_os = "android")]
+        {
+            self.driver.view.unbind();
+            self.driver.main_loop.borrow_mut().take();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.timer.invalidate();
+            self.descriptor.invalidate();
+            self.source.invalidate();
+        }
     }
 }
 impl Drop for Driver {
@@ -420,12 +513,14 @@ impl Drop for Driver {
             let _ = execution.join();
         }
         self.service.get_mut().shutdown();
+        #[cfg(target_os = "macos")]
         unsafe {
             NSProcessInfo::processInfo().endActivity(&self.activity);
         }
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
     let window = Rc::new(RefCell::new(Window::new(
         &format!(

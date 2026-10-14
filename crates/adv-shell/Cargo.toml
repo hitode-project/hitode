@@ -22,7 +22,7 @@ png = "0.17"
 wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl"] }
 pollster = { version = "0.4", optional = true }
 
-[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+[target.'cfg(not(any(windows, target_os = "macos", target_os = "android")))'.dependencies]
 adv-device = { path = "../adv-device", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -52,3 +52,12 @@ harness = false
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+adv-device = { path = "../adv-device", features = ["device", "gpu"] }
+adv-runtime = { path = "../adv-runtime", features = ["gpu"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "vulkan"] }
+pollster = "0.4"
+ndk-sys = "0.6"
+libc = "0.2"
+log = "0.4"

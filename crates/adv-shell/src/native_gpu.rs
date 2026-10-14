@@ -17,8 +17,32 @@ pub(crate) enum DrawResult {
     Reconfigure,
 }
 
+#[cfg(target_os = "android")]
+struct AndroidWindow(std::ptr::NonNull<ndk_sys::ANativeWindow>);
+// ANativeWindow references are thread-safe; jobs own a reference until their surface drops.
+#[cfg(target_os = "android")]
+unsafe impl Send for AndroidWindow {}
+#[cfg(target_os = "android")]
+impl AndroidWindow {
+    unsafe fn acquire(window: std::ptr::NonNull<ndk_sys::ANativeWindow>) -> Self {
+        unsafe {
+            ndk_sys::ANativeWindow_acquire(window.as_ptr());
+        }
+        Self(window)
+    }
+}
+#[cfg(target_os = "android")]
+impl Drop for AndroidWindow {
+    fn drop(&mut self) {
+        unsafe {
+            ndk_sys::ANativeWindow_release(self.0.as_ptr());
+        }
+    }
+}
 pub struct WindowPresenter {
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
+    #[cfg(target_os = "android")]
+    android_window: Option<AndroidWindow>,
     context: NativeContext,
     configuration: wgpu::SurfaceConfiguration,
     compositor: Compositor,
@@ -79,6 +103,44 @@ impl WindowPresenter {
         .map_err(|error| error.to_string())
     }
 
+    #[cfg(target_os = "android")]
+    unsafe fn surface(
+        window: *mut std::ffi::c_void,
+        instance: &wgpu::Instance,
+    ) -> Result<wgpu::Surface<'static>, String> {
+        let window = std::ptr::NonNull::new(window).ok_or("null Android window")?;
+        unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(wgpu::rwh::AndroidDisplayHandle::new().into()),
+                raw_window_handle: wgpu::rwh::AndroidNdkWindowHandle::new(window).into(),
+            })
+        }
+        .map_err(|error| error.to_string())
+    }
+    /// The coordinator has returned every old surface job before replacement.
+    #[cfg(target_os = "android")]
+    unsafe fn replace_window(
+        &mut self,
+        window: Option<std::ptr::NonNull<ndk_sys::ANativeWindow>>,
+    ) -> Result<(), String> {
+        self.surface.take();
+        self.android_window.take();
+        if let Some(window) = window {
+            let owner = unsafe { AndroidWindow::acquire(window) };
+            let surface = unsafe { Self::surface(window.as_ptr().cast(), &self.context.instance) }?;
+            let mut replacement = Self::with_surface(
+                surface,
+                self.context.clone(),
+                self.configuration.width,
+                self.configuration.height,
+            )?;
+            replacement.android_window = Some(owner);
+            replacement.upscaler = self.upscaler;
+            replacement.scaling = self.scaling;
+            *self = replacement;
+        }
+        Ok(())
+    }
     pub(crate) async unsafe fn request(
         hwnd: *mut std::ffi::c_void,
         width: u32,
@@ -89,6 +151,11 @@ impl WindowPresenter {
         #[cfg(target_os = "macos")]
         let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL,
+            ..descriptor
+        };
+        #[cfg(target_os = "android")]
+        let descriptor = wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
             ..descriptor
         };
         let instance = wgpu::Instance::new(descriptor);
@@ -104,6 +171,14 @@ impl WindowPresenter {
                     .map_err(|error| error.to_string())?,
             };
         let presenter = Self::with_surface(surface, gpu.context().clone(), width, height)?;
+        #[cfg(target_os = "android")]
+        let presenter = {
+            let mut presenter = presenter;
+            presenter.android_window = Some(unsafe {
+                AndroidWindow::acquire(std::ptr::NonNull::new(hwnd.cast()).unwrap())
+            });
+            presenter
+        };
         Ok((gpu, presenter))
     }
 
@@ -137,13 +212,17 @@ impl WindowPresenter {
             wgpu::PresentMode::Mailbox
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
+        } else if cfg!(target_os = "android") {
+            wgpu::PresentMode::Fifo
         } else {
             return Err("native surface has no nonblocking presentation mode".into());
         };
         configuration.desired_maximum_frame_latency = 2;
         let compositor = Compositor::new(context.clone(), configuration.format);
         Ok(Self {
-            surface,
+            surface: Some(surface),
+            #[cfg(target_os = "android")]
+            android_window: None,
             context,
             configuration,
             compositor,
@@ -170,6 +249,8 @@ impl WindowPresenter {
             .push_error_scope(wgpu::ErrorFilter::Validation);
         let started = Instant::now();
         self.surface
+            .as_ref()
+            .ok_or("Android surface is absent")?
             .configure(&self.context.device, &self.configuration);
         let error = pollster::block_on(errors.pop());
         self.max_configure_ns = self.max_configure_ns.max(nanoseconds(started.elapsed()));
@@ -229,7 +310,10 @@ impl WindowPresenter {
             return Ok(DrawResult::Reconfigure);
         }
         let started = Instant::now();
-        let output = self.surface.get_current_texture();
+        let Some(surface) = &self.surface else {
+            return Ok(DrawResult::Skipped);
+        };
+        let output = surface.get_current_texture();
         self.max_acquire_ns.set(
             self.max_acquire_ns
                 .get()
@@ -1097,6 +1181,8 @@ pub(crate) struct UiPresenter {
     wake: WakeEvent,
     job: Option<Job>,
     reconfigure: bool,
+    #[cfg(target_os = "android")]
+    surface_live: Arc<std::sync::atomic::AtomicBool>,
 }
 impl UiPresenter {
     pub(crate) fn new(
@@ -1115,7 +1201,37 @@ impl UiPresenter {
             wake,
             job: None,
             reconfigure: false,
+            #[cfg(target_os = "android")]
+            surface_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) unsafe fn replace_window(
+        &mut self,
+        window: Option<std::ptr::NonNull<ndk_sys::ANativeWindow>>,
+    ) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        self.surface_live.store(false, Ordering::Release);
+        // Pending tasks return their consumer without rendering. A task already
+        // using the old surface finishes while the host still owns its window.
+        let mut failure = None;
+        while self.job.is_some() {
+            if let Err(error) = self.poll() {
+                failure = Some(error);
+                break;
+            }
+            if self.job.is_some() {
+                self.wake.wait(None).map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(session) = self.session.as_mut() {
+            unsafe {
+                session.presenter.replace_window(window)?;
+            }
+        }
+        self.reconfigure = window.is_some();
+        self.surface_live.store(window.is_some(), Ordering::Release);
+        failure.map_or(Ok(()), Err)
     }
     pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
         self.scaling = value;
@@ -1178,7 +1294,13 @@ impl UiPresenter {
         dimensions: (u32, u32),
         repaint: bool,
     ) -> Result<bool, String> {
-        if self.job.is_some() || dimensions.0 == 0 || dimensions.1 == 0 {
+        if !can_schedule(
+            self.job.is_some(),
+            dimensions,
+            self.session
+                .as_ref()
+                .is_none_or(|s| s.presenter.surface.is_some()),
+        ) {
             return Ok(false);
         }
         let session = self
@@ -1198,6 +1320,8 @@ impl UiPresenter {
         let mut session = self.session.take().unwrap();
         let (mut output, completion) = spsc::channel(1);
         let scheduled = Instant::now();
+        #[cfg(target_os = "android")]
+        let surface_live = self.surface_live.clone();
         let task = background::Task::new(move || {
             let started = Instant::now();
             session.stats.max_queue_ns = session
@@ -1205,6 +1329,16 @@ impl UiPresenter {
                 .max_queue_ns
                 .max(nanoseconds(started.saturating_duration_since(scheduled)));
             let result = (|| {
+                #[cfg(target_os = "android")]
+                if !surface_live.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(Rendered {
+                        result: DrawResult::Skipped,
+                        native: session.native.is_some(),
+                        serial: session.serial,
+                        canvas: (session.width, session.height),
+                        cursor_regions: session.cursor_regions.clone(),
+                    });
+                }
                 if let Some(pause) = pause {
                     pause.wait_drained().map_err(|error| error.to_string())?;
                     session
@@ -1237,6 +1371,9 @@ impl UiPresenter {
     }
 }
 
+fn can_schedule(in_flight: bool, dimensions: (u32, u32), surface_live: bool) -> bool {
+    !in_flight && dimensions.0 != 0 && dimensions.1 != 0 && surface_live
+}
 fn nanoseconds(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
@@ -1278,6 +1415,13 @@ struct Sampling { source_uv: vec4<f32>, viewport: vec2<f32> }
 
 #[cfg(test)]
 mod tests {
+    // spec: HOST-AND-10
+    #[test]
+    fn detached_surface_never_accepts_render_work() {
+        assert!(!super::can_schedule(false, (640, 480), false));
+        assert!(super::can_schedule(false, (640, 480), true));
+        assert!(!super::can_schedule(true, (640, 480), true));
+    }
     use super::*;
     use adv_device::gpu::Gpu;
     use adv_device::surface::Rect;
@@ -1841,7 +1985,7 @@ mod tests {
         assert!(
             gpu.context()
                 .adapter
-                .is_surface_supported(&presenter.surface)
+                .is_surface_supported(presenter.surface.as_ref().unwrap())
         );
         gpu.context().device.destroy();
         let _ = gpu.poll();
