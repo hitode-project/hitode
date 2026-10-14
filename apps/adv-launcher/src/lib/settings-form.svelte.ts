@@ -25,6 +25,8 @@ import type { Game } from "./types";
 
 export function setPref<K extends keyof Prefs>(key: K, value: Prefs[K]): void {
   prefs[key] = value;
+  // Changing the switch answers the first-lookup question too.
+  if (key === "fetchVndb") prefs.vndbAsked = true;
   savePrefs();
 }
 

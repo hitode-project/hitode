@@ -101,8 +101,8 @@
     <section class="sec" aria-labelledby="g-lib">
       <h2 id="g-lib">{t("游戏库")}</h2>
         <div class="row">
-          <span class="t">{t("从 VNDB 获取资料")}</span>
-          <SettingsSwitch label={t("从 VNDB 获取资料")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
+          <span class="t">{t("自动从 VNDB 获取资料")}</span>
+          <SettingsSwitch label={t("自动从 VNDB 获取资料")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
         </div>
         <p>{t("开启后自动搜索新游戏；唯一精确匹配才会关联。只发送游戏名称，不发送路径或文件。")}</p>
         {#if scraper.busy}<p role="status">{t("正在搜索：{0}", scraper.current)}</p>{/if}

@@ -23,6 +23,8 @@ export interface Prefs {
   showFps: boolean;
   /** Fetch titles and covers from VNDB. */
   fetchVndb: boolean;
+  /** Whether the user has chosen automatic or manual VNDB lookup. */
+  vndbAsked: boolean;
   trackPlayTime: boolean;
 }
 
@@ -39,7 +41,8 @@ const defaults: Prefs = {
   fastForward: "hold",
   pauseInBackground: true,
   showFps: false,
-  fetchVndb: true,
+  fetchVndb: false,
+  vndbAsked: false,
   trackPlayTime: true,
 };
 

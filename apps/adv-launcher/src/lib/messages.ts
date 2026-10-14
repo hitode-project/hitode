@@ -1,6 +1,11 @@
 // Interface translations keyed by the Chinese source text.
 export const messages: Record<string, [string, string]> = {
   "关闭": ["Close", "閉じる"],
+  "自动获取游戏信息？": ["Fetch game details automatically?", "ゲーム情報を自動で取得しますか？"],
+  "Hitode 可以在你添加游戏时，把游戏名发送到 VNDB（vndb.org），自动获取封面、简介和开发商。只发送游戏名，不发送文件、路径或游玩记录。": ["When you add a game, Hitode can send its name to VNDB (vndb.org) to fetch the cover, description and developer. Only the name is sent, never files, paths or play history.", "ゲームを追加したとき、Hitode はゲーム名を VNDB（vndb.org）に送信して、カバー・紹介・開発元を取得できます。送信するのはゲーム名だけで、ファイル・パス・プレイ履歴は送信しません。"],
+  "你可以随时在设置中更改，也可以为单个游戏手动查询。": ["You can change this in Settings at any time, or look up a single game by hand.", "設定でいつでも変更できます。個別のゲームを手動で検索することもできます。"],
+  "仅手动查询": ["Manual lookup only", "手動検索のみ"],
+  "自动获取": ["Fetch automatically", "自動で取得"],
   "编辑标题": ["Edit title", "タイトルを編集"],
   "标题": ["Title", "タイトル"],
   "取消": ["Cancel", "キャンセル"],
@@ -295,7 +300,7 @@ export const messages: Record<string, [string, string]> = {
   "游戏中": ["In game", "ゲーム中"],
   "切到后台时暂停": ["Pause in background", "バックグラウンドで一時停止"],
   "显示帧率": ["Show frame rate", "フレームレートを表示"],
-  "从 VNDB 获取资料": ["Fetch metadata from VNDB", "VNDB から情報を取得"],
+  "自动从 VNDB 获取资料": ["Fetch metadata from VNDB automatically", "VNDB から情報を自動で取得"],
   "遮挡成人内容封面": ["Blur adult covers", "成人向けカバーをぼかす"],
   "记录游玩时间": ["Track playtime", "プレイ時間を記録"],
   "游戏库文件夹": ["Library folders", "ライブラリフォルダー"],

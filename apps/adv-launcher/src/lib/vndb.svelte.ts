@@ -9,11 +9,11 @@ class Scraper {
   current = $state("");
   #attempted = new Set<string>();
   async scan() {
-    if (!inTauri || !prefs.fetchVndb || this.busy) return;
+    if (!inTauri || !prefs.vndbAsked || !prefs.fetchVndb || this.busy) return;
     this.busy = true;
     this.error = "";
     try {
-      while (prefs.fetchVndb) {
+      while (prefs.vndbAsked && prefs.fetchVndb) {
         const game = library.games.find((g) => !g.vndb && !g.vndbChecked && !this.#attempted.has(`${g.id}:${g.title}`));
         if (!game) break;
         this.#attempted.add(`${game.id}:${game.title}`);
