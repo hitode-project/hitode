@@ -1,6 +1,7 @@
 //! State blocks retain precisely the object slots they capture. Recording
 //! redirects setters into an isolated snapshot, leaving current device state
-//! unchanged until Apply. Capture refreshes only the recorded subset.
+//! unchanged until Apply. Capture refreshes only the recorded subset. Apply
+//! borrows an immutable snapshot across device updates without copying maps.
 use super::*;
 use std::collections::BTreeSet;
 
@@ -52,7 +53,6 @@ struct Mask {
     transforms: BTreeSet<usize>,
     clip_planes: BTreeSet<usize>,
 }
-#[derive(Clone)]
 pub(in crate::d3d9) struct Snapshot {
     pub(in crate::d3d9) fixed: fixed::Fixed,
     pub(in crate::d3d9) shaders: Bindings,
@@ -63,7 +63,7 @@ pub(in crate::d3d9) struct Snapshot {
 pub(in crate::d3d9) struct StateBlock {
     pointer: u32,
     device: Id,
-    snapshot: Snapshot,
+    snapshot: Arc<Snapshot>,
 }
 impl Snapshot {
     fn current(env: &Env<'_>, id: Id, mask: Mask) -> Option<Self> {
@@ -71,7 +71,36 @@ impl Snapshot {
             return None;
         };
         Some(Self {
-            fixed: d.fixed.clone(),
+            fixed: fixed::Fixed {
+                fvf: d.fixed.fvf,
+                render: mask
+                    .render
+                    .iter()
+                    .map(|&i| (i, d.fixed.render[&i]))
+                    .collect(),
+                stage: mask.stage.iter().map(|&i| (i, d.fixed.stage[&i])).collect(),
+                stage_slots: std::array::from_fn(|slot| {
+                    mask.stage_slots
+                        .range((slot, i32::MIN)..=(slot, i32::MAX))
+                        .map(|&(_, i)| (i, d.fixed.stage_slots[slot][&i]))
+                        .collect()
+                }),
+                sampler: mask
+                    .sampler
+                    .iter()
+                    .map(|&i| (i, d.fixed.sampler[&i]))
+                    .collect(),
+                sampler_slots: std::array::from_fn(|slot| {
+                    mask.sampler_slots
+                        .range((slot, i32::MIN)..=(slot, i32::MAX))
+                        .map(|&(_, i)| (i, d.fixed.sampler_slots[slot][&i]))
+                        .collect()
+                }),
+                viewport: d.fixed.viewport,
+                scissor: d.fixed.scissor,
+                transforms: d.fixed.transforms,
+                clip_planes: d.fixed.clip_planes,
+            },
             shaders: d.shaders.clone(),
             buffers: d.buffers.clone(),
             texture: d.texture,
@@ -205,32 +234,37 @@ fn retain_snapshot(env: &mut Env<'_>, snapshot: &Snapshot) -> bool {
     }
     true
 }
-fn changes(old: &Snapshot, new: &Snapshot) -> Vec<(Option<Id>, Option<Id>)> {
+fn changes(
+    shaders: &Bindings,
+    buffers: &buffers::Bindings,
+    texture: Option<Id>,
+    new: &Snapshot,
+) -> Vec<(Option<Id>, Option<Id>)> {
     let mut pairs = Vec::new();
     for (captured, old, new) in [
-        (new.mask.vertex, old.shaders.vertex, new.shaders.vertex),
-        (new.mask.pixel, old.shaders.pixel, new.shaders.pixel),
+        (new.mask.vertex, shaders.vertex, new.shaders.vertex),
+        (new.mask.pixel, shaders.pixel, new.shaders.pixel),
         (
             new.mask.declaration,
-            old.buffers.declaration,
+            buffers.declaration,
             new.buffers.declaration,
         ),
-        (new.mask.indices, old.buffers.indices, new.buffers.indices),
-        (new.mask.texture, old.texture, new.texture),
+        (new.mask.indices, buffers.indices, new.buffers.indices),
+        (new.mask.texture, texture, new.texture),
     ] {
         if captured && old != new {
             pairs.push((old, new));
         }
     }
     for &i in &new.mask.streams {
-        let old = old.buffers.streams[i].buffer;
+        let old = buffers.streams[i].buffer;
         let new = new.buffers.streams[i].buffer;
         if old != new {
             pairs.push((old, new));
         }
     }
     for &i in &new.mask.textures {
-        let old = old.shaders.textures[i];
+        let old = shaders.textures[i];
         let new = new.shaders.textures[i];
         if old != new {
             pairs.push((old, new));
@@ -264,7 +298,9 @@ pub(in crate::d3d9) fn release_snapshot(env: &mut Env<'_>, snapshot: Snapshot) {
     }
 }
 pub(in crate::d3d9) fn destroy(env: &mut Env<'_>, block: StateBlock) {
-    release_snapshot(env, block.snapshot);
+    for id in block.snapshot.identities() {
+        release_binding(env, Some(id));
+    }
     if let Some(released) = com(env).release_identity(&mut env.sys.objects, block.device)
         && let Some(dead) = released.destroyed
     {
@@ -394,7 +430,7 @@ fn make(env: &mut Env<'_>, device: Id, snapshot: Snapshot, output: GuestPtr<u32>
         Payload::StateBlock(Box::new(StateBlock {
             pointer: 0,
             device,
-            snapshot,
+            snapshot: Arc::new(snapshot),
         })),
     ) else {
         for id in retained {
@@ -495,16 +531,15 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     let id = b.device;
-    let mask = b.snapshot.mask.clone();
-    let old = b.snapshot.clone();
+    let old = Arc::clone(&b.snapshot);
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
     };
     if d.recording.is_some() {
         return INVALID;
     }
-    let snapshot = Snapshot::current(env, id, mask).unwrap();
-    let changes = changes(&old, &snapshot);
+    let snapshot = Snapshot::current(env, id, old.mask.clone()).unwrap();
+    let changes = changes(&old.shaders, &old.buffers, old.texture, &snapshot);
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
@@ -513,7 +548,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     else {
         return INVALID;
     };
-    b.snapshot = snapshot;
+    b.snapshot = Arc::new(snapshot);
     release_changes(env, &changes);
     0
 }
@@ -534,7 +569,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     let id = b.device;
-    let snapshot = b.snapshot.clone();
+    let snapshot = Arc::clone(&b.snapshot);
     let mask = &snapshot.mask;
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
@@ -542,8 +577,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    let old = Snapshot::current(env, id, mask.clone()).unwrap();
-    let changes = changes(&old, &snapshot);
+    let changes = changes(&d.shaders, &d.buffers, d.texture, &snapshot);
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
