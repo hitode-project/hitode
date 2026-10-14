@@ -213,9 +213,8 @@ impl GameView {
         let fps = self
             .window()
             .and_then(|window| window.screen())
-            .map_or(60, |screen| screen.maximumFramesPerSecond())
-            .clamp(24, 240);
-        std::time::Instant::now() + Duration::from_secs_f64(1.0 / fps as f64)
+            .map_or(60, |screen| screen.maximumFramesPerSecond());
+        std::time::Instant::now() + refresh_interval(fps)
     }
     pub fn new(width: u32, height: u32) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
@@ -502,9 +501,35 @@ impl Input {
     }
 }
 
+/// The guest is told the display runs at 60 Hz, so presenting faster only
+/// repeats conversion and composition for frames a 60 Hz game never paces.
+/// Faster displays keep 10% slack so a 60 Hz guest whose frames arrive early
+/// is still shown at once instead of waiting a whole extra period.
+pub(crate) fn refresh_interval(display_fps: isize) -> Duration {
+    let fps = display_fps.clamp(24, 240) as f64;
+    if fps > 60.0 {
+        Duration::from_secs_f64(0.9 / 60.0)
+    } else {
+        Duration::from_secs_f64(1.0 / fps)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: HOST-SES-8
+    #[test]
+    fn presentation_never_exceeds_the_guest_refresh_rate() {
+        let fast = refresh_interval(180);
+        assert!(
+            fast > Duration::from_secs_f64(1.0 / 70.0)
+                && fast < Duration::from_secs_f64(1.0 / 60.0)
+        );
+        assert_eq!(refresh_interval(120), fast);
+        assert_eq!(refresh_interval(60), Duration::from_secs_f64(1.0 / 60.0));
+        assert_eq!(refresh_interval(48), Duration::from_secs_f64(1.0 / 48.0));
+        assert_eq!(refresh_interval(0), Duration::from_secs_f64(1.0 / 24.0));
+    }
     // spec: HOST-RUN-2
     #[test]
     fn toggle_control_ignores_physical_releases_and_uses_one_guest_key() {
