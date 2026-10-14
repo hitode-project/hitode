@@ -617,17 +617,14 @@ fn prepare_checked(
             &input_spec,
             &slots,
         )?;
-        let program = Program {
-            source: source.into(),
-            textures: slots.iter().map(|s| s.0).collect(),
-        };
+        let program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
         const MAX_BYTES: usize = 8 * 1024 * 1024;
-        if program.source.len() <= MAX_BYTES {
-            if cache.entries.len() == 256 || cache.bytes + program.source.len() > MAX_BYTES {
+        if program.source().len() <= MAX_BYTES {
+            if cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {
                 cache.entries.clear();
                 cache.bytes = 0;
             }
-            cache.bytes += program.source.len();
+            cache.bytes += program.source().len();
             cache.entries.insert(key, program.clone());
         }
         program

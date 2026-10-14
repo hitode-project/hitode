@@ -69,7 +69,7 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
     let before = gpu.stats();
     gpu.clear_with_stencil(&small, Some([1., 0., 0., 0.5]), Some(0.25), Some(7))
         .unwrap();
-    assert_eq!(gpu.stats().submissions, before.submissions + 1);
+    assert_eq!(gpu.stats().submissions, before.submissions);
     assert_eq!(gpu.stats().readbacks, before.readbacks);
     assert!(
         read(&mut gpu, &small)
@@ -185,7 +185,7 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
         .with_depth(Some(gpu.depth(8, 6, DepthFormat::Unorm16).unwrap()))
         .unwrap();
     let draw = ProgrammableDraw {
-        program: Program { source: "@vertex fn vertex_main(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,1.),vec2(-1.,-3.),vec2(3.,1.)); return vec4(p[i],0.5,1.); } @fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4(1.,0.,1.,1.); }".into(), textures: vec![] },
+        program: Program::new("@vertex fn vertex_main(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,1.),vec2(-1.,-3.),vec2(3.,1.)); return vec4(p[i],0.5,1.); } @fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4(1.,0.,1.,1.); }".into(), vec![]),
         streams: vec![], indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default(), pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
     };
     let mut state = DrawState::new(4, 4);
@@ -234,10 +234,7 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     gpu.clear(&target, Some([0.; 4]), None).unwrap();
     let before = gpu.stats().submissions;
     let mut draw = ProgrammableDraw {
-        program: Program {
-            source: "struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> }; @vertex fn vertex_main(@builtin(vertex_index) i:u32, @location(0) color:vec4<f32>)->V { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return V(vec4(p[i%3],0.,1.),color); } @fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return vec4(v.color.x,c.f[0].x,0.,1.); }".into(),
-            textures: vec![],
-        },
+        program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> }; @vertex fn vertex_main(@builtin(vertex_index) i:u32, @location(0) color:vec4<f32>)->V { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return V(vec4(p[i%3],0.,1.),color); } @fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return vec4(v.color.x,c.f[0].x,0.,1.); }".into(), vec![]),
         streams: vec![VertexStream { bytes: vec![], stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
         indices: Some(vec![]), vertex_count: 6, vertex_constants: ConstantBlock::default(),
         pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
@@ -261,6 +258,10 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
         gpu.draw_programmable(&target, &draw, &state).unwrap();
     }
     assert_eq!(gpu.stats().submissions - before, 2);
+    assert_eq!(gpu.stats().buffer_writes, 6);
+    assert_eq!(gpu.stats().last_flush_buffer_writes, 3);
+    assert_eq!(gpu.stats().bind_group_creations, 2);
+    assert_eq!(gpu.stats().pipeline_cache_hits, 63);
     let pixels = read(&mut gpu, &target);
     for (i, pixel) in pixels.chunks_exact(4).enumerate() {
         let red = (i % 4) as f32 / 3.;

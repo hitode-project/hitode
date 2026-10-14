@@ -717,7 +717,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             diagnostics.shaders.malformed,
             diagnostics.shaders.untranslated
         );
-        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations));
+        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits));
         format!(
             "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"shader_versions\":{}}}",
             diagnostics.live_interfaces,

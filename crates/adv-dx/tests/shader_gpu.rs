@@ -55,10 +55,7 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
     let source = full_source(&shader, input);
     let target = gpu.target(16, 12, false).unwrap();
     let draw = ProgrammableDraw {
-        program: Program {
-            source: Arc::from(source),
-            textures: Vec::new(),
-        },
+        program: Program::new(Arc::from(source), Vec::new()),
         streams: Vec::new(),
         indices: None,
         vertex_count: 3,

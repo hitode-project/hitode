@@ -145,6 +145,7 @@ pub struct Image {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     render_view: wgpu::TextureView,
+    view_life: Arc<()>,
     mip: u32,
     levels: u32,
     width: u32,
@@ -186,6 +187,7 @@ impl Image {
         let mut image = self.clone();
         image.render_view = view.clone();
         image.view = view;
+        image.view_life = Arc::new(());
         image.mip = mip;
         image.levels = 1;
         image.width = (self.width >> level).max(1);
@@ -534,7 +536,7 @@ impl Gpu {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
+                            has_dynamic_offset: true,
                             min_binding_size: wgpu::BufferSize::new(32),
                         },
                         count: None,
@@ -550,7 +552,7 @@ impl Gpu {
             });
         let uniform = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("adv draw parameters"),
-            size: 32,
+            size: program::UNIFORM_STRIDE * program::UNIFORM_SLOTS,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -615,7 +617,7 @@ impl Gpu {
         });
         let uniform = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("adv child draw parameters"),
-            size: 32,
+            size: program::UNIFORM_STRIDE * program::UNIFORM_SLOTS,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -650,7 +652,10 @@ impl Gpu {
     }
     pub fn stats(&self) -> Stats {
         let mut stats = self.stats;
-        stats.submissions += self.programmable.submissions.load(Ordering::Relaxed);
+        let batch = &self.programmable.batch_stats;
+        stats.submissions += batch.submissions.load(Ordering::Relaxed);
+        stats.buffer_writes = batch.buffer_writes.load(Ordering::Relaxed);
+        stats.last_flush_buffer_writes = batch.last_flush_buffer_writes.load(Ordering::Relaxed);
         stats
     }
 
@@ -737,6 +742,7 @@ impl Gpu {
             texture,
             view,
             render_view,
+            view_life: Arc::new(()),
             mip: 0,
             levels,
             width,
@@ -952,6 +958,7 @@ impl Gpu {
 
     fn pipeline(&mut self, key: PipelineKey) -> Result<wgpu::RenderPipeline, Error> {
         if let Some(pipeline) = self.pipelines.get(&key) {
+            self.stats.pipeline_cache_hits += 1;
             return Ok(pipeline.clone());
         }
         let pipeline = self.context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1038,7 +1045,7 @@ impl Gpu {
         mut state: DrawState,
     ) -> Result<(), Error> {
         let context = self.context.clone();
-        let submission = context.submission()?;
+        let _submission = context.submission()?;
         self.own_target(target)?;
         target.image.writable()?;
         if let Some(image) = image {
@@ -1099,16 +1106,6 @@ impl Gpu {
         if size > MAX_UPLOAD {
             return Err(invalid("vertex upload exceeds command limit"));
         }
-        if size > self.upload_capacity {
-            self.upload_capacity = size.next_power_of_two().min(MAX_UPLOAD);
-            self.upload = self.context.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("adv vertex upload"),
-                size: self.upload_capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.stats.vertex_buffer_allocations += 1;
-        }
         let key = PipelineKey {
             topology: state.topology,
             cull: state.cull,
@@ -1131,15 +1128,10 @@ impl Gpu {
             })
             .transpose()?;
         let image_levels = image.map_or(1, Image::mip_levels);
-        let sampler = self.sampler(Sampler {
-            first_level: state.sampler.first_level.min(image_levels - 1),
-            ..state.sampler
-        });
         let sampler_parameters = super::sampler_parameters(Sampler {
             first_level: state.sampler.first_level.min(image_levels - 1),
             ..state.sampler
         });
-        submission.write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
         let parameters = [
             texture_op(state.texture_op),
             texture_op(state.alpha_texture_op)
@@ -1155,70 +1147,27 @@ impl Gpu {
             sampler_parameters[2],
             sampler_parameters[3],
         ];
-        submission.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&parameters));
-        let binding = self
-            .context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("adv draw image"),
-                layout: &self.bindings,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &image.unwrap_or(&self.white).view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.uniform.as_entire_binding(),
-                    },
-                ],
-            });
-        let attachment = self.attachment_color(target)?;
-        let mut encoder = self
-            .context
-            .device
-            .create_command_encoder(&Default::default());
-        attachment.load(&mut encoder, &target.image);
+        let white = image.is_none().then(|| self.white.clone());
+        let texture = image.or(white.as_ref()).unwrap();
+        let sampler = Sampler {
+            first_level: state.sampler.first_level.min(image_levels - 1),
+            ..state.sampler
+        };
+        let binding = self.texture_binding(&self.bindings.clone(), &[(texture, sampler)], true);
+        let mut pending = context.pending.lock().unwrap();
+        let immediate = self.prepare_batch(&mut pending, size, 0);
+        let attachment = self.begin_batch_pass(&mut pending, target)?;
+        let offset = pending
+            .vertices
+            .append(&self.upload, bytemuck::cast_slice(vertices), 4);
+        let base = pending.constants(&self.uniform, &[bytemuck::cast_slice(&parameters)]);
         {
-            let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &attachment.image.render_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &colors,
-                depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view: attachment.view(),
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: attachment.format().has_stencil().then_some(
-                            wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        ),
-                    }
-                }),
-                ..Default::default()
-            });
+            let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline);
             if state.stencil.is_some() {
                 pass.set_stencil_reference(state.stencil_reference & 255);
             }
-            pass.set_bind_group(0, &binding, &[]);
+            pass.set_bind_group(0, &binding, &[base]);
             let viewport = state.viewport;
             pass.set_viewport(
                 viewport.x,
@@ -1235,7 +1184,7 @@ impl Gpu {
                 h: target.image.height,
             });
             pass.set_scissor_rect(r.x, r.y, r.w, r.h);
-            pass.set_vertex_buffer(0, self.upload.slice(0..size));
+            pass.set_vertex_buffer(0, self.upload.slice(offset..offset + size));
             match inclusive {
                 None => pass.draw(0..vertices.len() as u32, 0..1),
                 Some(line::Inclusive::Strip { terminal }) => {
@@ -1262,8 +1211,7 @@ impl Gpu {
                 }
             }
         }
-        attachment.store(&mut encoder, &target.image);
-        self.submit(encoder, &submission);
+        self.finish_batch(&mut pending, target, &attachment, immediate);
         self.stats.draws += 1;
         self.stats.vertices += vertices.len() as u64;
         self.check()

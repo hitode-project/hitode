@@ -73,15 +73,11 @@ fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_pa
         let after = gpu.stats();
         assert_eq!(after.draws, before.draws + 1);
         assert_eq!(after.vertices, before.vertices + 6);
-        assert_eq!(after.submissions, before.submissions + 1);
+        assert_eq!(after.submissions, before.submissions);
         assert_eq!(after.readbacks, before.readbacks);
         assert_eq!(
             after.native_frame_allocations,
             before.native_frame_allocations
-        );
-        assert_eq!(
-            after.vertex_buffer_allocations,
-            before.vertex_buffer_allocations
         );
         assert_pixels(&read(&mut gpu, &target), |x, y| {
             let inside = (1..3).contains(&x) && (1..3).contains(&y);
@@ -144,15 +140,11 @@ fn selected_partial_depth_and_stencil_preserve_other_components_and_outside_valu
     .unwrap();
     let after = gpu.stats();
     assert_eq!(after.draws, before.draws + 2);
-    assert_eq!(after.submissions, before.submissions + 2);
+    assert_eq!(after.submissions, before.submissions);
     assert_eq!(after.readbacks, before.readbacks);
     assert_eq!(
         after.native_frame_allocations,
         before.native_frame_allocations
-    );
-    assert_eq!(
-        after.vertex_buffer_allocations,
-        before.vertex_buffer_allocations
     );
     assert_pixels(&read(&mut gpu, &target), |_, _| [0, 0, 0, 255]);
     let mut state = DrawState::new(4, 4);

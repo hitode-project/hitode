@@ -227,6 +227,10 @@ pub struct Stats {
     pub native_frames: u64,
     pub native_frame_allocations: u64,
     pub vertex_buffer_allocations: u64,
+    pub buffer_writes: u64,
+    pub last_flush_buffer_writes: u64,
+    pub bind_group_creations: u64,
+    pub pipeline_cache_hits: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

@@ -148,10 +148,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             &[(false, 0)],
         )
         .unwrap();
-        let program = Program {
-            source: source.into(),
-            textures: vec![false],
-        };
+        let program = Program::new(source.into(), vec![false]);
         validate_program(&program).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
         let state = DrawState::new(8, 8);
         let mut parameters = [[0; 4]; 40];

@@ -959,6 +959,7 @@ fn repeated_drawing_reuses_upload_buffer_and_preserves_queue_order() {
             timeout: Some(Duration::from_secs(10)),
         })
         .unwrap();
+    let allocations = gpu.stats().vertex_buffer_allocations;
     let start = Instant::now();
     for i in 0..256 {
         let color = if i % 2 == 0 {
@@ -970,7 +971,7 @@ fn repeated_drawing_reuses_upload_buffer_and_preserves_queue_order() {
             .unwrap();
     }
     let encoding = start.elapsed();
-    assert_eq!(gpu.stats().vertex_buffer_allocations, 1);
+    assert_eq!(gpu.stats().vertex_buffer_allocations, allocations);
     assert_eq!(gpu.stats().draws, 257);
     assert_eq!(
         pixel(&read(&mut gpu, &target.image), 64, 32, 32),

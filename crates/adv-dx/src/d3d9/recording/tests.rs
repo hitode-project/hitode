@@ -566,10 +566,10 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
     let mut state = d.state;
     state.texture_op = TextureOp::Texture;
     d.programmable = Some(ProgrammableDraw {
-        program: Program {
-            source: Arc::from("authored immutable program identity"),
-            textures: vec![false],
-        },
+        program: Program::new(
+            Arc::from("authored immutable program identity"),
+            vec![false],
+        ),
         streams: vec![VertexStream {
             bytes: vec![0; 96],
             stride: 16,

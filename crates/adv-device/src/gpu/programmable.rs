@@ -124,8 +124,9 @@ impl Default for ConstantBlock {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Program {
+    pub(super) id: u64,
     /// Complete validated WGSL with vertex_main and fragment_main entry points.
-    pub source: Arc<str>,
+    pub(super) source: Arc<str>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
     pub textures: Vec<bool>,
 }
@@ -145,4 +146,18 @@ pub struct ProgrammableDraw {
     pub textures: Vec<ProgramTexture>,
     /// Viewport, fixed texture/alpha operations and alpha test, then reserved.
     pub parameters: [[u32; 4]; 40],
+}
+
+impl Program {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn new(source: Arc<str>, textures: Vec<bool>) -> Self {
+        static NEXT_PROGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            source,
+            textures,
+        }
+    }
 }
