@@ -235,6 +235,7 @@ pub trait Guest {
     fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<SharedRegion, MemFault> {
         Err(MemFault { addr, len })
     }
+    /// Map zeroed execution-owner words; failure MUST leave mappings unchanged.
     fn map_shared_counters(
         &mut self,
         addr: u32,

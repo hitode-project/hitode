@@ -301,10 +301,11 @@ fn env_leaf_declines_restore_transport_and_count_each_call_once() {
             .write_host_csv(&light.cpu, &light.sys.thunks, &mut csv)
             .unwrap();
         let csv = String::from_utf8(csv).unwrap();
-        assert!(csv.ends_with(&format!(
-            ",{},{}\n",
-            light.sys.stats.leaf_calls, light.sys.stats.leaf_abandons
-        )));
+        let fields: Vec<_> = csv.lines().last().unwrap().split(',').collect();
+        assert_eq!(fields[5], u64::from(!abandon).to_string());
+        assert_eq!(fields[6], u64::from(abandon).to_string());
+        assert_eq!(fields[7], "0");
+        assert_eq!(fields[8], u64::from(abandon).to_string());
         let budget = light.sys.stats.frame_budget.as_mut().unwrap();
         budget.mark_frame(1);
         budget.finish(light.sys.stats.total, None);
