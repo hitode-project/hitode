@@ -72,12 +72,36 @@ fn identifier(value: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 fn client() -> Result<Client, String> {
-    Client::builder()
+    let builder = Client::builder()
         .timeout(Duration::from_secs(25))
         .user_agent(concat!("Hitode/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(target_os = "android")]
+    let builder = builder.tls_certs_only(system_certificates()?);
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Android's platform verifier needs JNI setup and a Gradle component. Trust
+/// the system store directly instead, as Android apps do by default.
+#[cfg(target_os = "android")]
+fn system_certificates() -> Result<Vec<reqwest::Certificate>, String> {
+    for dir in [
+        "/apex/com.android.conscrypt/cacerts",
+        "/system/etc/security/cacerts",
+    ] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let certificates: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|pem| reqwest::Certificate::from_pem(&pem).ok())
+            .collect();
+        if !certificates.is_empty() {
+            return Ok(certificates);
+        }
+    }
+    Err("No system certificates are available".into())
 }
 fn lookup(query: &str, page: u32) -> Result<Results, String> {
     let query = query.trim();
