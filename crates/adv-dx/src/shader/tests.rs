@@ -54,6 +54,117 @@ fn validate(s: &Shader) {
         panic!("{e}\n{text}");
     }
 }
+
+#[test]
+// spec: GFX-REC-7
+fn usage_includes_matrix_rows_int_bool_and_excludes_all_local_definitions() {
+    let mut body = instruction(Opcode::Def, &[dst(2, 4), 0, 0, 0, 0]);
+    body.extend(instruction(Opcode::Defi, &[dst(7, 2), 1, 0, 1, 0]));
+    body.extend(instruction(Opcode::Defb, &[dst(14, 2), 1]));
+    body.extend(instruction(
+        Opcode::M4x4,
+        &[dst(4, 0), src(2, 0), src(2, 3)],
+    ));
+    for n in [1, 2] {
+        body.extend(instruction(Opcode::Rep, &[src(7, n)]));
+        body.extend(instruction(Opcode::If, &[src(14, n)]));
+        body.extend(instruction(Opcode::EndIf, &[]));
+        body.extend(instruction(Opcode::EndRep, &[]));
+    }
+    let usage = shader(Stage::Vertex, 2, 0, &body)
+        .translate()
+        .unwrap()
+        .constants;
+    assert!(!usage.relative);
+    assert_eq!(
+        usage
+            .ranges()
+            .flat_map(|r| r.start / 16..r.end / 16)
+            .collect::<Vec<_>>(),
+        [0, 3, 5, 6, 257, 273]
+    );
+    for (op, rows) in [
+        (Opcode::M4x3, 3),
+        (Opcode::M3x4, 4),
+        (Opcode::M3x3, 3),
+        (Opcode::M3x2, 2),
+    ] {
+        let s = shader(
+            Stage::Vertex,
+            2,
+            0,
+            &instruction(op, &[dst(4, 0), src(2, 63), src(2, 127)]),
+        );
+        let used = s.translate().unwrap().constants;
+        assert_eq!(
+            used.ranges()
+                .flat_map(|r| r.start / 16..r.end / 16)
+                .collect::<Vec<_>>(),
+            std::iter::once(63)
+                .chain(127..127 + rows)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+// spec: GFX-REC-7
+fn relative_usage_covers_all_floats_but_keeps_local_definitions_private() {
+    let body = [
+        Opcode::Def as u32,
+        dst(2, 5),
+        0,
+        0,
+        0,
+        0,
+        Opcode::Mov as u32,
+        dst(4, 0),
+        src(2, 3) | 0x2000,
+    ];
+    let s = shader(Stage::Vertex, 1, 1, &body);
+    let usage = s.translate().unwrap().constants;
+    assert!(usage.relative);
+    let registers = usage
+        .ranges()
+        .flat_map(|r| r.start / 16..r.end / 16)
+        .collect::<Vec<_>>();
+    assert_eq!(registers, (0..256).filter(|n| *n != 5).collect::<Vec<_>>());
+}
+
+#[test]
+// spec: GFX-REC-7
+fn legacy_bump_usage_covers_only_the_implicit_stage_parameters() {
+    for op in [Opcode::Texbem, Opcode::Texbeml] {
+        let s = shader(Stage::Pixel, 1, 1, &[op as u32, dst(3, 1), src(3, 0)]);
+        let usage = s.translate().unwrap().constants;
+        let expected = if op == Opcode::Texbem {
+            vec![289]
+        } else {
+            vec![289, 297]
+        };
+        assert_eq!(
+            usage
+                .ranges()
+                .flat_map(|r| r.start / 16..r.end / 16)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    let s = shader(
+        Stage::Pixel,
+        1,
+        4,
+        &[Opcode::Bem as u32, dst(0, 1), src(0, 0), src(0, 2)],
+    );
+    assert_eq!(
+        s.translate()
+            .unwrap()
+            .constants
+            .ranges()
+            .collect::<Vec<_>>(),
+        [289 * 16..290 * 16]
+    );
+}
 #[test]
 // spec: GFX-SHADER-1, GFX-BUFFER-3
 fn versions_comments_end_and_immediates() {

@@ -230,6 +230,7 @@ pub(super) fn translate(shader: &Shader) -> Result<Translation, Error> {
     }
     out.push_str("return result;\n}\n");
     let translation = Translation {
+        constants: constant_usage(shader),
         source: out,
         samplers: samplers
             .into_iter()
@@ -240,6 +241,55 @@ pub(super) fn translate(shader: &Shader) -> Result<Translation, Error> {
     };
     translation.validate(shader.stage)?;
     Ok(translation)
+}
+fn constant_usage(shader: &Shader) -> adv_device::constants::ConstantUsage {
+    let mut used = adv_device::constants::ConstantUsage::default();
+    for ins in &shader.instructions {
+        for (operand, s) in ins.sources.iter().chain(ins.predicate.iter()).enumerate() {
+            let base = match s.register.kind {
+                RegisterKind::Float => 0,
+                RegisterKind::Int => 256,
+                RegisterKind::Bool => 272,
+                _ => continue,
+            };
+            if s.relative.is_some() && base == 0 {
+                used.relative = true;
+                used.registers[..4].fill(u64::MAX);
+            } else {
+                let rows = if operand == 1 {
+                    match ins.opcode {
+                        Opcode::M4x4 | Opcode::M3x4 => 4,
+                        Opcode::M4x3 | Opcode::M3x3 => 3,
+                        Opcode::M3x2 => 2,
+                        _ => 1,
+                    }
+                } else {
+                    1
+                };
+                for row in 0..rows {
+                    used.set(base + usize::from(s.register.index) + row);
+                }
+            }
+        }
+        if matches!(ins.opcode, Opcode::Texbem | Opcode::Texbeml | Opcode::Bem) {
+            let n = usize::from(ins.destination.as_ref().unwrap().register.index);
+            used.set(288 + n);
+            if ins.opcode == Opcode::Texbeml {
+                used.set(296 + n);
+            }
+        }
+    }
+    for ins in &shader.instructions {
+        let base = match ins.opcode {
+            Opcode::Def => 0,
+            Opcode::Defi => 256,
+            Opcode::Defb => 272,
+            _ => continue,
+        };
+        let n = base + usize::from(ins.destination.as_ref().unwrap().register.index);
+        used.registers[n / 64] &= !(1 << (n % 64));
+    }
+    used
 }
 fn component_name(i: usize) -> char {
     "xyzw".chars().nth(i).unwrap_or('x')

@@ -9,7 +9,7 @@ pub(super) struct Copy {
     transfer: Option<Transfer>,
 }
 impl Copy {
-    pub(super) fn key(self) -> u64 {
+    pub(super) fn key(self) -> u128 {
         super::recording::hash((
             self.width,
             self.height,

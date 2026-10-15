@@ -1,5 +1,5 @@
 use super::*;
-fn sequence(slot: u64, key: u64, r: Rect) -> Sequence {
+fn sequence(slot: u128, key: u128, r: Rect) -> Sequence {
     Sequence {
         entries: vec![
             (
@@ -24,7 +24,7 @@ fn sequence(slot: u64, key: u64, r: Rect) -> Sequence {
         independent: true,
     }
 }
-fn step(h: &mut History, slot: u64, key: u64, r: Rect) -> (Rect, Rect) {
+fn step(h: &mut History, slot: u128, key: u128, r: Rect) -> (Rect, Rect) {
     h.next = sequence(slot, key, r);
     h.advance(false)
 }

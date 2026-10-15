@@ -28,6 +28,164 @@ fn recorded_bounds(f: &mut Fixture) -> Rect {
     let d = device(&e, pointer).unwrap();
     damage::bounds(&e, d, d.frame.commands.last().unwrap())
 }
+
+#[test]
+// spec: GFX-REC-2, GFX-REC-4, GFX-REC-7
+fn sparse_draw_keys_damage_and_pixels_match_complete_constants() {
+    check_sparse_constants(false);
+    check_sparse_constants(true);
+}
+
+fn check_sparse_constants(verify: bool) {
+    let mut f = fixture();
+    f.m.ext.get_mut::<State>().verify_frames = verify;
+    let output = f.packet(0u32);
+    let vs = f.packet([
+        0xfffe0200u32,
+        0x0200001f,
+        0x80000000,
+        0x900f0000,
+        0x03000002,
+        0xc00f0000,
+        0x90e40000,
+        0xa0e40003,
+        0xffff,
+    ]);
+    f.okay(
+        "IDirect3DDevice9::CreateVertexShader",
+        &[f.device, vs, output],
+    );
+    let vs = f.m.cpu.read_u32(output).unwrap();
+    let ps = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, 0xa0e40007, 0xffff]);
+    f.okay(
+        "IDirect3DDevice9::CreatePixelShader",
+        &[f.device, ps, output],
+    );
+    let ps = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, vs]);
+    f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, ps]);
+    f.okay("IDirect3DDevice9::SetFVF", &[f.device, 2]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[f.device, 22, 1]);
+    let vertices = f.packet([[-0.75f32, 0.5, 0.], [-0.5, 0.5, 0.], [-0.75, 0., 0.]]);
+    let mut keys = Vec::new();
+    let mut draw_keys = Vec::new();
+    let mut frame_pixels = Vec::new();
+    let mut frame_bounds = Vec::new();
+    for frame_index in 0..3 {
+        {
+            let owner = id(&mut f);
+            let e = env(&mut f);
+            // Mutate unused registers in every bank, including nonfinite float bits.
+            let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner)
+            else {
+                unreachable!()
+            };
+            d.shaders
+                .vertex_constants
+                .floats
+                .fill([f32::from_bits(0x7fc00000 | frame_index as u32); 4]);
+            d.shaders
+                .pixel_constants
+                .floats
+                .fill([f32::from_bits(0x7f800000 | ((frame_index as u32 & 1) << 31)); 4]);
+            d.shaders.vertex_constants.integers.fill([frame_index; 4]);
+            d.shaders.pixel_constants.integers.fill([frame_index; 4]);
+            d.shaders.vertex_constants.booleans.fill(frame_index);
+            d.shaders.pixel_constants.booleans.fill(frame_index);
+            d.shaders.vertex_constants.floats[3] =
+                [if frame_index == 2 { 0.25 } else { 0. }, 0., 0., 0.];
+            d.shaders.pixel_constants.floats[7] = if frame_index == 2 {
+                [0., 1., 0., 1.]
+            } else {
+                [1., 0., 0., 1.]
+            };
+        }
+        let pointer = f.device;
+        draw_keys.push(draw_key(&env(&mut f), pointer));
+        clear(&mut f, 0xff000000);
+        f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[f.device, 4, 1, vertices, 12],
+        );
+        f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+        keys.push(command_keys(&mut env(&mut f), pointer));
+        frame_bounds.push(recorded_bounds(&mut f));
+        let (mut full, state) = {
+            let e = env(&mut f);
+            let device = device(&e, pointer).unwrap();
+            let Operation::Draw(d) = device.frame.commands.last().unwrap() else {
+                unreachable!()
+            };
+            let p = d.programmable.as_ref().unwrap();
+            assert_eq!(
+                p.constant_ranges().map(|(_, b)| b.len()).sum::<usize>(),
+                672
+            );
+            assert_eq!(p.vertex_constants.floats[255], [0.; 4]);
+            assert_eq!(p.pixel_constants.floats[255], [0.; 4]);
+            let mut full = p.clone();
+            full.vertex_constants.floats = device.shaders.vertex_constants.floats;
+            full.vertex_constants.integers = device.shaders.vertex_constants.integers;
+            full.vertex_constants.booleans = device
+                .shaders
+                .vertex_constants
+                .booleans
+                .map(|b| [b, 0, 0, 0]);
+            full.pixel_constants.floats = device.shaders.pixel_constants.floats;
+            full.pixel_constants.integers = device.shaders.pixel_constants.integers;
+            full.pixel_constants.booleans = device
+                .shaders
+                .pixel_constants
+                .booleans
+                .map(|b| [b, 0, 0, 0]);
+            let full_bounds = damage::bounds(
+                &e,
+                device,
+                &Operation::Draw(fixed::Draw {
+                    target: d.target.clone(),
+                    image: d.image.clone(),
+                    vertices: vec![],
+                    texcoords: None,
+                    state: d.state,
+                    programmable: Some(full.clone()),
+                    recording_key: d.recording_key,
+                    program_key: d.program_key,
+                }),
+            );
+            assert_eq!(full_bounds, *frame_bounds.last().unwrap());
+            (full, d.state)
+        };
+        full.program.constants = [adv_device::constants::ConstantUsage::ALL; 2];
+        let mut gpu = f.m.ext.get_mut::<State>().gpu.take().unwrap();
+        let target = gpu
+            .target(16, 12, false)
+            .unwrap()
+            .with_alpha_mode(AlphaMode::Opaque);
+        gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+        gpu.draw_programmable(&target, &full, &state).unwrap();
+        f.m.ext.get_mut::<State>().gpu = Some(gpu);
+        present(&mut f);
+        frame_pixels.push(latest(&mut f));
+        assert_eq!(*frame_pixels.last().unwrap(), pixels(&mut f, &target.image));
+    }
+    assert_eq!(draw_keys[0], draw_keys[1]);
+    assert_ne!(draw_keys[1], draw_keys[2]);
+    assert_eq!(keys[0], keys[1]);
+    assert_ne!(keys[1], keys[2]);
+    assert_eq!(frame_bounds[0], frame_bounds[1]);
+    assert_ne!(frame_bounds[1], frame_bounds[2]);
+    assert_eq!(frame_pixels[0], frame_pixels[1]);
+    assert_ne!(frame_pixels[1], frame_pixels[2]);
+    let counts = f.m.ext.get::<State>().frames;
+    assert_eq!(counts.eliminated_frames, u64::from(!verify));
+    assert_eq!(counts.clipped_executions, u64::from(!verify));
+    assert_eq!(counts.verification_mismatches, 0);
+    println!(
+        "authored two-register draw: verify={verify}; constant hashing payload 18560 -> 64 bytes/draw; uniform writes 10368 -> 672 bytes/draw; eliminated frames={}; clipped executions={}; mismatches=0",
+        counts.eliminated_frames, counts.clipped_executions
+    );
+}
 // spec: GFX-REC-4
 #[test]
 fn bounds_cover_pretransformed_fixed_pipeline_and_conservative_fallbacks() {

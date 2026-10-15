@@ -8,6 +8,25 @@ pub(super) struct Ring {
     waiting: Arc<AtomicBool>,
     completions: VecDeque<(u64, Arc<AtomicBool>)>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    // spec: GFX-METAL-1, GFX-REC-7
+    fn sparse_constants_still_reserve_a_complete_window_before_wrapping() {
+        let gpu = pollster::block_on(Gpu::request_backend(false, GpuBackend::Metal)).unwrap();
+        let state = State::new(&gpu.context).unwrap();
+        let mut ring = Ring::new(&state.device).unwrap();
+        ring.head = CAPACITY - 256;
+        ring.tail = ring.head;
+        let start = ring.plan(program::UNIFORM_STRIDE).unwrap();
+        assert_eq!(start, CAPACITY);
+        let base = start % CAPACITY;
+        assert_eq!(base % 256, 0);
+        assert!(base + 2 * std::mem::size_of::<ConstantBlock>() as u64 + 640 <= CAPACITY);
+    }
+}
 impl Ring {
     pub(super) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, Error> {
         Ok(Self {
@@ -62,7 +81,7 @@ impl Ring {
             );
         }
     }
-    pub(super) fn equal(&self, offset: u64, blocks: &[&[u8]]) -> bool {
+    pub(super) fn equal(&self, offset: u64, block: &[u8]) -> bool {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 self.buffer
@@ -70,10 +89,10 @@ impl Ring {
                     .as_ptr()
                     .cast::<u8>()
                     .add(offset as usize),
-                blocks.iter().map(|b| b.len()).sum(),
+                block.len(),
             )
         };
-        bytes.iter().eq(blocks.iter().flat_map(|b| b.iter()))
+        bytes == block
     }
     pub(super) fn submitted(
         &mut self,

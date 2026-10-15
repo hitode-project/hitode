@@ -173,10 +173,10 @@ impl Damage {
 }
 #[derive(Default)]
 struct Sequence {
-    entries: Vec<(u64, Rect)>,
+    entries: Vec<(u128, Rect)>,
     full: Rect,
-    shape: u64,
-    slot: u64,
+    shape: u128,
+    slot: u128,
     independent: bool,
 }
 #[derive(Default)]
@@ -184,7 +184,7 @@ struct History {
     previous: Sequence,
     next: Sequence,
     changes: std::collections::VecDeque<Damage>,
-    slots: HashMap<u64, u64>,
+    slots: HashMap<u128, u64>,
     serial: u64,
     seen: u64,
 }
@@ -250,13 +250,13 @@ pub(super) struct Analysis {
     histories: HashMap<Content, History>,
     reads: HashSet<Content>,
     unsafe_order: bool,
-    pub clips: HashMap<u64, Rect>,
-    pub changed: HashMap<u64, Rect>,
+    pub clips: HashMap<u128, Rect>,
+    pub changed: HashMap<u128, Rect>,
     pub planned: bool,
     epoch: u64,
 }
 impl Analysis {
-    pub fn record(&mut self, p: &key::Prepared, command: u64, contents: &HashMap<Content, u64>) {
+    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &HashMap<Content, u128>) {
         let Some(image) = image(&p.operation) else {
             return;
         };
@@ -312,7 +312,7 @@ impl Analysis {
         }
         self.planned = true;
     }
-    pub fn rotatable(&self, slot: u64) -> bool {
+    pub fn rotatable(&self, slot: u128) -> bool {
         !self.unsafe_order
             && self.histories.iter().any(|(k, h)| {
                 k.2 == 0

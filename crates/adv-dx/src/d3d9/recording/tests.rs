@@ -556,11 +556,61 @@ fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {
         assert_ne!(key::raster(c), baseline);
     }
 }
-fn fingerprint(f: &mut Fixture, d: fixed::Draw) -> u64 {
+fn fingerprint(f: &mut Fixture, d: fixed::Draw) -> u128 {
     let owner = id(f);
     let e = env(f);
     let p = key::prepare(&e, owner, Operation::Draw(d)).unwrap();
     hash((p.key, p.reads, p.writes))
+}
+
+#[test]
+// spec: GFX-REC-7
+fn content_keys_keep_all_xxh3_bits_and_ignore_unused_constant_banks() {
+    use std::hash::Hash;
+    let input = b"recording content needs 128 bits";
+    let mut expected = xxhash_rust::xxh3::Xxh3::new();
+    input.hash(&mut expected);
+    assert_eq!(hash(input), expected.digest128());
+    assert_ne!(hash(input) >> 64, 0);
+    let mut f = fixture();
+    let make = |f: &mut Fixture| {
+        let mut d = programmable_draw(f);
+        let p = d.programmable.as_mut().unwrap();
+        p.program.constants = [adv_device::constants::ConstantUsage::default(); 2];
+        for usage in &mut p.program.constants {
+            for n in [3, 258, 277, 288, 296] {
+                usage.set(n);
+            }
+        }
+        d
+    };
+    let d = make(&mut f);
+    let original = fingerprint(&mut f, d);
+    for stage in 0..2 {
+        for bank in 0..5 {
+            for used in [false, true] {
+                let mut d = make(&mut f);
+                let p = d.programmable.as_mut().unwrap();
+                let c = if stage == 0 {
+                    &mut p.vertex_constants
+                } else {
+                    &mut p.pixel_constants
+                };
+                match bank {
+                    0 => c.floats[if used { 3 } else { 255 }][0] = -0.,
+                    1 => c.integers[if used { 2 } else { 15 }][0] = 1,
+                    2 => c.booleans[if used { 5 } else { 15 }][0] = 1,
+                    3 => c.bump_matrix[if used { 0 } else { 7 }][0] = -0.,
+                    _ => c.bump_luminance[if used { 0 } else { 7 }][0] = -0.,
+                }
+                assert_eq!(
+                    fingerprint(&mut f, d) != original,
+                    used,
+                    "stage {stage}, bank {bank}"
+                );
+            }
+        }
+    }
 }
 fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
     let mut d = draw(f);
@@ -844,7 +894,11 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
             4 => d.shaders.pixel_constants.integers[0][0] = 1,
             _ => d.shaders.pixel_constants.booleans[0] = 2,
         };
-        assert_ne!(draw_key(&env(&mut f), pointer), baseline);
+        assert_eq!(
+            draw_key(&env(&mut f), pointer) != baseline,
+            n < 3,
+            "unbound shaders cannot observe constant registers"
+        );
         if let Some(Payload::Device(d)) =
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {

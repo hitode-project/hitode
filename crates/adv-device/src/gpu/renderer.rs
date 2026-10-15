@@ -1215,7 +1215,11 @@ impl Gpu {
         let offset = pending
             .vertices
             .append(&self.upload, bytemuck::cast_slice(vertices), 4);
-        let base = pending.constants(&self.uniform, &[bytemuck::cast_slice(&parameters)]);
+        let base = pending.constants(
+            &context.device,
+            &self.uniform,
+            std::iter::once((0, bytemuck::cast_slice(&parameters))),
+        );
         {
             let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline);

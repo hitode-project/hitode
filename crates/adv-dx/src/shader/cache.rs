@@ -44,12 +44,25 @@ fn decode(bytes: &[u8], key: &str, stage: Stage) -> Option<Translation> {
     if expected != digest(payload.as_bytes()) {
         return None;
     }
-    let mut parts = payload.splitn(3, '\n');
+    let mut parts = payload.splitn(4, '\n');
     let flags = parts.next()?.parse::<u8>().ok()?;
     if flags > 3 {
         return None;
     }
     let samplers_text = parts.next()?;
+    let usage = parts
+        .next()?
+        .split(',')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let constants = adv_device::constants::ConstantUsage {
+        registers: usage.get(..5)?.try_into().ok()?,
+        relative: *usage.get(5)? != 0,
+    };
+    if usage.len() != 6 || usage[5] > 1 || constants.registers[4] >> 48 != 0 {
+        return None;
+    }
     let source = parts.next()?.to_string();
     let mut samplers = Vec::new();
     if !samplers_text.is_empty() {
@@ -71,6 +84,7 @@ fn decode(bytes: &[u8], key: &str, stage: Stage) -> Option<Translation> {
         }
     }
     let translation = Translation {
+        constants,
         source,
         samplers,
         writes_depth: flags & 1 != 0,
@@ -98,7 +112,15 @@ fn save(directory: &Path, path: &Path, key: &str, tr: &Translation) -> std::io::
         })
         .collect::<Vec<_>>()
         .join(",");
-    let payload = format!("{flags}\n{samplers}\n{}", tr.source);
+    let usage = tr
+        .constants
+        .registers
+        .into_iter()
+        .chain([u64::from(tr.constants.relative)])
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = format!("{flags}\n{samplers}\n{usage}\n{}", tr.source);
     let bytes = format!(
         "{TRANSLATOR_ABI}\n{key}\n{}\n{payload}",
         digest(payload.as_bytes())
@@ -163,7 +185,7 @@ mod tests {
     // spec: GFX-CACHE-2
     fn corrupted_and_version_cache_regenerates() {
         let shader = Shader::parse(&[
-            0xfffe0200, 0x0200001f, 0x80000000, 0x900f0000, 0x02000001, 0xc00f0000, 0x90e40000,
+            0xfffe0200, 0x0200001f, 0x80000000, 0x900f0000, 0x02000001, 0xc00f0000, 0xa0e40003,
             0xffff,
         ])
         .unwrap();
@@ -180,6 +202,15 @@ mod tests {
         assert!(path.is_file());
         let cached = shader.translate_cached(&dir).unwrap();
         assert_eq!(original.source, cached.source);
+        assert_eq!(original.constants, cached.constants);
+        assert_eq!(cached.constants.registers[0], 1 << 3);
+        let payload = format!("0\n\n0,0,0,0,{},0\n{}", u64::MAX, original.source);
+        let malformed = format!(
+            "{TRANSLATOR_ABI}\n{}\n{}\n{payload}",
+            key(&shader),
+            digest(payload.as_bytes())
+        );
+        assert!(decode(malformed.as_bytes(), &key(&shader), shader.stage).is_none());
         std::fs::write(&path, "corrupt").unwrap();
         assert_eq!(
             original.source,
