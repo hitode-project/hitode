@@ -108,6 +108,10 @@ impl Registry {
         self.fns
             .iter()
             .map(|((module, name), entry)| (module.as_str(), name.as_str(), entry.host))
+            .chain(self.aliases.iter().filter_map(|((module, name), _)| {
+                self.get(module, name)
+                    .map(|host| (module.as_str(), name.as_str(), host))
+            }))
     }
     /// Register one implementation for both light calls and ordinary traps.
     pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
