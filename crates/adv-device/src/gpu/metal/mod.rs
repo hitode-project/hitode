@@ -124,6 +124,15 @@ impl State {
                 && depth.as_ref() == target.depth.as_ref().map(Depth::view)
         })
     }
+    pub(super) fn detach_depth(&mut self, depth: &Depth) {
+        if self
+            .attachments
+            .as_ref()
+            .is_some_and(|(_, view)| view.as_ref() == Some(depth.view()))
+        {
+            self.attachments = None;
+        }
+    }
     pub(super) fn flush(&mut self) {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
@@ -292,7 +301,12 @@ impl State {
                 if let Some(encoder) = self.encoder.take() {
                     encoder.endEncoding();
                 }
-                let clear = clear.unwrap_or_default();
+                let mut clear = clear.unwrap_or_default();
+                if let Some((depth, stencil)) =
+                    target.depth.as_ref().and_then(Depth::take_whole_clear)
+                {
+                    (clear.depth, clear.stencil) = (depth, stencil);
+                }
                 clear.count(&self.owner, target.depth.is_some(), true);
                 let descriptor = MTLRenderPassDescriptor::new();
                 let color = descriptor.colorAttachments().objectAtIndexedSubscript(0);
