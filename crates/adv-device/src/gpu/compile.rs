@@ -81,6 +81,7 @@ impl<T: Send + Sync + 'static> Compile<T> {
         if let Some(result) = self.ready() {
             return result;
         }
+        let _demand = Demand::enter();
         let start = Instant::now();
         let result = self.resolve();
         self.0.counters.0.0.fetch_add(1, Ordering::Relaxed);
@@ -176,4 +177,35 @@ mod tests {
         assert_eq!(*job.wait(), Ok(7));
         thread.join().unwrap();
     }
+}
+
+static DEMAND: Mutex<usize> = Mutex::new(0);
+static DEMAND_DONE: std::sync::Condvar = std::sync::Condvar::new();
+struct Demand;
+impl Demand {
+    fn enter() -> Self {
+        *DEMAND.lock().unwrap() += 1;
+        Self
+    }
+}
+impl Drop for Demand {
+    fn drop(&mut self) {
+        *DEMAND.lock().unwrap() -= 1;
+        DEMAND_DONE.notify_all();
+    }
+}
+/// A bounded archive uses one queue slot. Demand can steal any individual job;
+/// speculative work yields to foreground compilation at each pipeline boundary.
+pub fn prebuild<T: Send + Sync + 'static>(bytes: usize, jobs: Vec<Compile<T>>) -> Compile<()> {
+    Compile::spawn(bytes, CompileCounters::default(), move || {
+        for job in jobs {
+            let mut active = DEMAND.lock().unwrap();
+            while *active != 0 {
+                active = DEMAND_DONE.wait(active).unwrap();
+            }
+            drop(active);
+            job.resolve();
+        }
+        Ok(())
+    })
 }

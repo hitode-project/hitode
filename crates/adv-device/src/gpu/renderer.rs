@@ -12,6 +12,7 @@ mod metal;
 mod pipeline_disk;
 mod program;
 mod recipes;
+mod warmup;
 pub use program::validate_program;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
