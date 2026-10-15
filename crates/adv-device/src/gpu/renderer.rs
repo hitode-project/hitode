@@ -487,7 +487,9 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("adv neutral graphics"),
                 required_limits: limits,
-                required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
+                // SHADER_F16 serves the half-precision upscalers.
+                required_features: adapter.features()
+                    & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::SHADER_F16),
                 ..Default::default()
             })
             .await

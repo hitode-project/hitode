@@ -24,6 +24,32 @@ fn slots_for(size: (u32, u32), regions: &[Option<Rect>]) -> Vec<u8> {
     bytes
 }
 
+/// Rewrites a half-precision pass for devices without `SHADER_F16`, keeping
+/// its f16-rounded weights.
+fn widen(source: &str) -> String {
+    let source = source.replacen("enable f16;", "", 1);
+    let mut out = String::with_capacity(source.len());
+    // Words include dots, so `1.5e-05h` ends in the word `05h`.
+    for (index, word) in source
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .enumerate()
+    {
+        // Replacements keep lengths, so `out.len()` indexes the next separator.
+        if index > 0 {
+            out.push(source.as_bytes()[out.len()] as char);
+        }
+        if word == "f16" {
+            out.push_str("f32");
+        } else if word.starts_with(|c: char| c.is_ascii_digit()) && word.ends_with('h') {
+            out.push_str(&word[..word.len() - 1]);
+            out.push('f');
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Upscaler {
     #[default]
@@ -123,10 +149,15 @@ impl Upscaling {
         });
         let mut pipelines = Vec::new();
         let mut bindings = Vec::new();
+        let half = device.features().contains(wgpu::Features::SHADER_F16);
         for (index, pass) in model.passes.iter().enumerate() {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("adv upstream upscaling model"),
-                source: wgpu::ShaderSource::Wgsl(pass.source.into()),
+                source: wgpu::ShaderSource::Wgsl(if half {
+                    pass.source.into()
+                } else {
+                    widen(pass.source).into()
+                }),
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("adv upscaling pass"),
@@ -335,6 +366,40 @@ mod tests {
             .chunks_exact(row as usize)
             .map(|line| line[..texture.width() as usize * 8].to_vec())
             .collect()
+    }
+
+    // spec: HOST-VIEW-7
+    #[test]
+    fn half_precision_passes_widen_to_valid_single_precision() {
+        use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+        assert_eq!(
+            widen("enable f16;\nlet a : vec2<f16> = vec2<f16>(1.5e-05h, 2.0h) * x1h;"),
+            "\nlet a : vec2<f32> = vec2<f32>(1.5e-05f, 2.0f) * x1h;"
+        );
+        let mut half = 0;
+        for choice in [
+            Upscaler::Anime4k,
+            Upscaler::Cunny,
+            Upscaler::Artcnn,
+            Upscaler::K7,
+        ] {
+            for pass in models::model(choice).passes {
+                half += usize::from(pass.source.contains("enable f16;"));
+                for (source, capabilities) in [
+                    (pass.source.to_owned(), Capabilities::all()),
+                    (
+                        widen(pass.source),
+                        Capabilities::all() - Capabilities::SHADER_FLOAT16,
+                    ),
+                ] {
+                    let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+                    Validator::new(ValidationFlags::all(), capabilities)
+                        .validate(&module)
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(half, 4 + 6 + 8, "the three Magpie models declare FP16");
     }
 
     // spec: HOST-VIEW-10
