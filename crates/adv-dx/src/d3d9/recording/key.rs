@@ -131,6 +131,7 @@ pub(super) struct Prepared {
     pub reads: Vec<Content>,
     pub writes: Vec<(Content, bool)>,
     pub bytes: usize,
+    pub bounds: adv_device::surface::Rect,
 }
 pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
@@ -335,7 +336,9 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
         }
         _ => return Err(INVALID),
     }
+    let bounds = super::damage::bounds(env, d, &operation);
     Ok(Prepared {
+        bounds,
         operation,
         key: h.finish(),
         reads,

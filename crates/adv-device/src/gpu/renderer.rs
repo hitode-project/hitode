@@ -400,6 +400,7 @@ pub struct Gpu {
     pipeline_limit: usize,
     programmable: program::Cache,
     attachment_scratch: Option<Image>,
+    pub(super) clip: Option<Rect>,
     samplers: HashMap<Sampler, wgpu::Sampler>,
     white: Image,
     upload: wgpu::Buffer,
@@ -586,6 +587,7 @@ impl Gpu {
             pipeline_limit: MAX_PIPELINES,
             programmable: program::Cache::default(),
             attachment_scratch: None,
+            clip: None,
             samplers: HashMap::new(),
             white,
             upload,
@@ -631,6 +633,7 @@ impl Gpu {
             pipeline_limit: self.pipeline_limit,
             programmable: program::Cache::default(),
             attachment_scratch: None,
+            clip: None,
             samplers: HashMap::new(),
             white: self.white.clone(),
             upload,
@@ -649,6 +652,26 @@ impl Gpu {
 
     pub fn context(&self) -> &NativeContext {
         &self.context
+    }
+    /// Restrict writes during a recorded flush; None restores ordinary execution.
+    pub fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
+    }
+    fn clipped_state(&self, mut state: DrawState, image: &Image) -> DrawState {
+        if let Some(clip) = self.clip {
+            state.scissor = Some(
+                state
+                    .scissor
+                    .unwrap_or(Rect {
+                        x: 0,
+                        y: 0,
+                        w: image.width(),
+                        h: image.height(),
+                    })
+                    .clipped(clip),
+            );
+        }
+        state
     }
     pub fn stats(&self) -> Stats {
         let mut stats = self.stats;
@@ -872,7 +895,7 @@ impl Gpu {
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), Error> {
-        if target.padded_attachments() {
+        if self.clip.is_some() || target.padded_attachments() {
             // A load-op clear would erase the larger depth image outside the
             // logical color view. The bounded draw path clears only that view.
             return self.clear_region(
@@ -1055,6 +1078,7 @@ impl Gpu {
             }
         }
         validate(target, vertices, &state)?;
+        state = self.clipped_state(state, &target.image);
         let inclusive = line::prepare(vertices, image, &state)?;
         // Metal chooses the lower pixel at exact aliased-line ties. Move up
         // 1/128 pixel to match D3D9 REF's upper-edge choice, below the supported
@@ -1105,6 +1129,9 @@ impl Gpu {
         let size = std::mem::size_of_val(vertices) as u64;
         if size > MAX_UPLOAD {
             return Err(invalid("vertex upload exceeds command limit"));
+        }
+        if state.scissor.is_some_and(Rect::empty) {
+            return Ok(());
         }
         let key = PipelineKey {
             topology: state.topology,
@@ -1335,10 +1362,10 @@ impl Gpu {
     fn copy_under(
         &mut self,
         source: &Image,
-        rectangle: Rect,
+        mut rectangle: Rect,
         destination: &Image,
-        x: u32,
-        y: u32,
+        mut x: u32,
+        mut y: u32,
         submission: &Submission<'_>,
     ) -> Result<(), Error> {
         self.own(source)?;
@@ -1356,6 +1383,24 @@ impl Gpu {
         )?;
         if source.id == destination.id {
             return Err(invalid("image cannot copy onto itself"));
+        }
+        if let Some(clip) = self.clip {
+            let region = Rect {
+                x,
+                y,
+                w: rectangle.w,
+                h: rectangle.h,
+            }
+            .clipped(clip);
+            if region.empty() {
+                return Ok(());
+            }
+            rectangle.x += region.x - x;
+            rectangle.y += region.y - y;
+            rectangle.w = region.w;
+            rectangle.h = region.h;
+            x = region.x;
+            y = region.y;
         }
         let mut encoder = self
             .context

@@ -6,7 +6,7 @@ impl Gpu {
     pub fn clear_region(
         &mut self,
         target: &Target,
-        rectangle: Rect,
+        mut rectangle: Rect,
         color: Option<[f64; 4]>,
         depth: Option<f32>,
         stencil: Option<u32>,
@@ -36,12 +36,16 @@ impl Gpu {
         {
             return Err(invalid("clear rectangle is outside the target"));
         }
+        if let Some(clip) = self.clip {
+            rectangle = rectangle.clipped(clip);
+        }
         // Even an empty command must validate ownership, arguments and the
         // selected attachment. A valid no-op neither writes nor acquires a fence.
         if rectangle.w == 0 || rectangle.h == 0 {
             return Ok(());
         }
-        if !target.padded_attachments()
+        if self.clip.is_none()
+            && !target.padded_attachments()
             && rectangle
                 == (Rect {
                     x: 0,

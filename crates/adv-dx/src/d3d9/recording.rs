@@ -5,6 +5,7 @@
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
 use std::collections::HashMap;
+mod damage;
 mod key;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
@@ -48,10 +49,18 @@ pub struct Counters {
     pub flushes: [u64; 8],
     pub eliminated_frames: u64,
     pub verification_mismatches: u64,
+    pub full_executions: u64,
+    pub clipped_executions: u64,
+    pub clipped_area_sum: f64,
 }
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    damage: damage::Analysis,
+    verify_region: Option<adv_device::surface::Rect>,
+    verify_image: Option<adv_device::gpu::Image>,
+    baseline: Option<adv_device::gpu::Image>,
+    pub(super) rotate: bool,
     held_uploads: Vec<(Id, Option<u32>)>,
     head: usize,
     bytes: usize,
@@ -82,6 +91,7 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         let f = &mut d.frame;
         let before = f.contents.len();
         f.contents.retain(|k, _| k.3 != pointer);
+        f.damage.forget(pointer);
         if f.contents.len() != before {
             f.partial = true;
             f.last = None;
@@ -113,7 +123,36 @@ pub(super) fn has_work(env: &mut Env<'_>, owner: Id) -> bool {
     matches!(
         com(env).get_identity(&env.sys.objects, owner),
         Some(Payload::Device(_))
-    ) && (!frame(env, owner).commands.is_empty() || frame(env, owner).active.is_some())
+    ) && (!frame(env, owner).commands.is_empty()
+        || frame(env, owner).active.is_some()
+        || restore_operation(env, owner).is_some())
+}
+// A frame may stop rebuilding the whole DISCARD target after a rotating frame.
+// Seed such a frame (or an early read) from the last logical backbuffer first.
+fn restore_operation(env: &Env<'_>, owner: Id) -> Option<Operation> {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
+        return None;
+    };
+    let source = d.frame.baseline.as_ref()?;
+    env.ext.get::<State>().gpu.as_ref()?.check().ok()?;
+    let destination = (env.ext.get::<State>().provider.target)(env.ext, d.surface)?;
+    if source.shares_storage(&destination.image) {
+        return None;
+    }
+    let rectangle = adv_device::surface::Rect {
+        x: 0,
+        y: 0,
+        w: source.width(),
+        h: source.height(),
+    };
+    Some(Operation::Copy {
+        source: source.clone(),
+        rectangle,
+        destination,
+        region: rectangle,
+        filter: adv_device::gpu::Filter::Nearest,
+        resources: [d.back_buffer?; 2],
+    })
 }
 fn follow(
     env: &mut Env<'_>,
@@ -150,6 +189,14 @@ pub(super) fn barrier(
         return then(env);
     }
     if frame(env, owner).commands.is_empty() && frame(env, owner).active.is_none() {
+        if let Some(operation) = restore_operation(env, owner) {
+            let image = damage::image(&operation).unwrap().clone();
+            let result = dispatch_now(env, owner, operation);
+            return follow(env, result, move |env| {
+                frame(env, owner).baseline = Some(image);
+                then(env)
+            });
+        }
         return then(env);
     }
     let token = token(env, owner);
@@ -236,6 +283,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
             .map(|k| (*k, f.contents.get(k).copied().unwrap_or(0)))
             .collect::<Vec<_>>(),
     ));
+    f.damage.record(&p, command, &f.contents);
     for (k, overwrite) in p.writes {
         let old = f.contents.get(&k).copied().unwrap_or(0);
         f.base.entry(k).or_insert(old);
@@ -270,6 +318,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             f.commands.pop();
+            f.damage.invalidate();
             f.bytes -= bytes;
             f.key = key;
             for (k, old, had_base) in contents {
@@ -295,6 +344,9 @@ fn enter(env: &mut Env<'_>, owner: Id, token: u64, reason: Reason) -> Result<(),
         Some(_) => Ok(()),
         None => {
             frame(env, owner).active = Some(token);
+            if !matches!(reason, Reason::Present) {
+                frame(env, owner).damage.invalidate();
+            }
             env.ext.get_mut::<State>().frames.flushes[reason as usize] += 1;
             Ok(())
         }
@@ -307,13 +359,50 @@ pub(super) fn flush(
     reason: Reason,
 ) -> Result<Completion, Error> {
     enter(env, owner, token, reason)?;
+    if !frame(env, owner).rotate
+        && let Some(operation) = restore_operation(env, owner)
+    {
+        execute_gpu(env, &operation)?;
+        frame(env, owner).baseline = Some(damage::image(&operation).unwrap().clone());
+    }
     loop {
         let f = frame(env, owner);
         if f.head == f.commands.len() {
+            let surface = match com(env).get_identity(&env.sys.objects, owner) {
+                Some(Payload::Device(d)) => d.surface,
+                _ => unreachable!(),
+            };
+            frame(env, owner).baseline =
+                (env.ext.get::<State>().provider.target)(env.ext, surface).map(|t| t.image);
             return Ok(Completion::Command);
         }
         let operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
-        match execute_gpu(env, &operation) {
+        let clip = if env.ext.get::<State>().verify_frames {
+            None
+        } else {
+            damage::image(&operation).and_then(|i| {
+                frame(env, owner)
+                    .damage
+                    .clips
+                    .get(&hash(i.view()))
+                    .copied()
+                    .filter(|r| r.w < i.width() || r.h < i.height())
+            })
+        };
+        env.ext
+            .get_mut::<State>()
+            .gpu
+            .as_mut()
+            .unwrap()
+            .set_clip(clip);
+        let result = execute_gpu(env, &operation);
+        env.ext
+            .get_mut::<State>()
+            .gpu
+            .as_mut()
+            .unwrap()
+            .set_clip(None);
+        match result {
             Err(Error::Busy) => {
                 let f = frame(env, owner);
                 f.commands[f.head] = operation;
@@ -324,6 +413,7 @@ pub(super) fn flush(
                     com(env).get_identity_mut(&mut env.sys.objects, owner)
                 {
                     d.gpu_lost = true;
+                    d.frame.damage.invalidate();
                     d.frame.commands.clear();
                     d.frame.head = 0;
                 }
@@ -389,6 +479,9 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
                 f.active = None;
                 f.partial = true;
                 f.last = None;
+                f.damage.invalidate();
+                f.rotate = false;
+                f.verify_image = None;
                 f.verdict = None;
                 f.presented = None;
                 if let Some(ticket) = f.readback.take() {
@@ -459,6 +552,39 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         finish(env, *owner, *token, presentation, Some(serial));
         return Ok(Completion::Presented(serial, *deadline));
     }
+    if !frame(env, *owner).damage.planned {
+        let provider = env.ext.get::<State>().provider;
+        let image = (provider.target)(env.ext, *surface).unwrap().image;
+        let f = frame(env, *owner);
+        let force = f.partial || f.last != Some(presentation);
+        f.damage.plan(force);
+        f.rotate = !force && f.damage.rotatable(hash(image.view()));
+        if verify && copy.is_none() {
+            f.verify_image = Some(image.clone());
+        }
+        let full = adv_device::surface::Rect {
+            x: 0,
+            y: 0,
+            w: image.width(),
+            h: image.height(),
+        };
+        let slot = hash(image.view());
+        f.verify_region = Some(if force || copy.is_some() {
+            full
+        } else {
+            f.damage.changed.get(&slot).copied().unwrap_or_default()
+        });
+        let clip = f.damage.clips.get(&slot).copied().unwrap_or(full);
+        let fraction =
+            f64::from(clip.w) * f64::from(clip.h) / (f64::from(full.w) * f64::from(full.h));
+        let counters = &mut env.ext.get_mut::<State>().frames;
+        if verify || clip == full {
+            counters.full_executions += 1;
+        } else {
+            counters.clipped_executions += 1;
+        }
+        counters.clipped_area_sum += fraction;
+    }
     flush(env, *owner, *token, Reason::Present)?;
     if matches!(com(env).get_identity(&env.sys.objects,*owner),Some(Payload::Device(d)) if d.gpu_lost)
     {
@@ -484,6 +610,10 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
 fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u64, serial: Option<u64>) {
     unlock(env, owner, token);
     let f = frame(env, owner);
+    f.damage.finish();
+    f.rotate = false;
+    f.verify_image = None;
+    f.verify_region = None;
     f.last = Some(presentation);
     f.last_serial = serial;
     f.base.clear();
@@ -514,9 +644,13 @@ fn verify_pixels(
         } else {
             surface
         };
-        let image = (provider.target)(env.ext, surface)
-            .ok_or_else(|| Error::Invalid("verification image missing".into()))?
-            .image;
+        let image = if let Some(image) = frame(env, owner).verify_image.clone() {
+            image
+        } else {
+            (provider.target)(env.ext, surface)
+                .ok_or_else(|| Error::Invalid("verification image missing".into()))?
+                .image
+        };
         let mut ticket = env
             .ext
             .get_mut::<State>()
@@ -547,15 +681,33 @@ fn verify_pixels(
         return Err(Error::Busy);
     };
     let pixels = (ticket.width, ticket.height, pixels?);
-    let mismatch = repeat
-        && f.previous
-            .as_ref()
-            .is_some_and(|previous| previous != &pixels);
+    let region = if repeat {
+        adv_device::surface::Rect::default()
+    } else {
+        f.verify_region.unwrap()
+    };
+    let mismatch = f.previous.as_ref().is_some_and(|previous| {
+        previous.0 == pixels.0
+            && previous.1 == pixels.1
+            && pixels
+                .2
+                .chunks_exact(4)
+                .zip(previous.2.chunks_exact(4))
+                .enumerate()
+                .any(|(n, (a, b))| {
+                    let (x, y) = (n as u32 % pixels.0, n as u32 / pixels.0);
+                    (x < region.x
+                        || x >= region.x + region.w
+                        || y < region.y
+                        || y >= region.y + region.h)
+                        && a != b
+                })
+    });
     f.previous = Some(pixels);
     f.readback = None;
     if mismatch {
         env.ext.get_mut::<State>().frames.verification_mismatches += 1;
-        log::warn!("D3D9 repeated frame pixel verification mismatch");
+        log::warn!("D3D9 frame pixel verification mismatch outside damage");
     }
     Ok(())
 }

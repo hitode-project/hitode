@@ -1239,9 +1239,13 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {
-                // DISCARD permits preserving the writable target. Snapshotting
-                // keeps it consistent with the content identity after Present.
-                (provider.present_copy)(env.ext, *surface, &mut gpu)
+                let rotate = matches!(operation, Operation::Present { owner, .. } if
+                    matches!(com(env).get_identity(&env.sys.objects, *owner), Some(Payload::Device(d)) if d.frame.rotate));
+                if rotate {
+                    (provider.present)(env.ext, *surface, &mut gpu)
+                } else {
+                    (provider.present_copy)(env.ext, *surface, &mut gpu)
+                }
             };
             result.map(|serial| Completion::Presented(serial, *deadline))
         }

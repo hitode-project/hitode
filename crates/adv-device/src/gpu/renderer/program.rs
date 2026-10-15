@@ -558,6 +558,8 @@ impl Gpu {
             _ => 3,
         };
         validate(target, &vec![dummy; probe], state)?;
+        let clipped = self.clipped_state(*state, &target.image);
+        let state = &clipped;
         if count == 0
             || count > 0x300000
             || match state.topology {
@@ -671,6 +673,9 @@ impl Gpu {
             .map_or(0, |v| std::mem::size_of_val(v.as_slice()) as u64);
         if index_size > MAX_UPLOAD {
             return Err(invalid("index upload exceeds command limit"));
+        }
+        if state.scissor.is_some_and(Rect::empty) {
+            return Ok(());
         }
         let mut pending = context.pending.lock().unwrap();
         let immediate = self.prepare_batch(&mut pending, total, index_size);

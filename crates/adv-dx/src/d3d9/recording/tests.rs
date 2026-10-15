@@ -52,6 +52,7 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
         p.latest = Some(frame);
         Ok(serial)
     };
+    state.provider.present = state.provider.present_copy;
     state.provider.repeat = |ext, _| {
         let p = ext.get_mut::<Presents>();
         p.serial += 1;
@@ -1165,3 +1166,6 @@ fn releasing_the_last_child_device_owner_flushes_before_indirect_device_teardown
         );
     }
 }
+
+#[path = "damage_tests.rs"]
+mod damage_tests;
