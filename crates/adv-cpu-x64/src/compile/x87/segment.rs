@@ -83,8 +83,16 @@ pub(in crate::compile) fn segments(
     };
     let floating = |i: &Instruction| {
         linear(i)
-            && crate::floating::fast::classify(i)
-                .is_some_and(|fast| !matches!(fast, Fast::StoreControl | Fast::StoreStatus))
+            && crate::floating::fast::classify(i).is_some_and(|fast| {
+                !matches!(
+                    fast,
+                    Fast::StoreControl
+                        | Fast::StoreStatus
+                        | Fast::Round
+                        | Fast::Scale
+                        | Fast::Examine
+                )
+            })
     };
     let integer =
         |i: &Instruction| linear(i) && i.flow_control() == FlowControl::Next && lane_integer(i);
@@ -515,7 +523,12 @@ impl Emitter<'_> {
                     // FLDCW leaves C1, FIP/FDP/FOP and TOP/tag unchanged.
                     continue;
                 }
-                Fast::Wait | Fast::StoreControl | Fast::StoreStatus => unreachable!(),
+                Fast::Wait
+                | Fast::StoreControl
+                | Fast::StoreStatus
+                | Fast::Round
+                | Fast::Scale
+                | Fast::Examine => unreachable!(),
             }
             prefix.metadata = Some((i.ip32(), self.x87[&i.ip32()].1));
         }

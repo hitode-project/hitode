@@ -119,6 +119,8 @@ pub enum Op {
     Narrow(Option<Alu>, u8, Part, Part),
     /// `inc` (true) or `dec` of a 32-bit memory operand, which keep CF.
     StepMemory(bool, Mem),
+    /// `inc` or `dec` of a byte or word, preserving CF.
+    NarrowStep(bool, u8, Part),
     /// `cld` (false) or `std`.
     Direction(bool),
     /// An MMX or SSE instruction.
@@ -264,6 +266,15 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
             (Part::Imm(_), _) | (Part::Mem(_), Part::Mem(_)) => None,
             (dst, src) => Some(Op::Narrow(alu, width, dst, src)),
         };
+    }
+    if matches!(mnemonic, M::Inc | M::Dec)
+        && let Some(width) = narrow_width(instruction)
+    {
+        return Some(Op::NarrowStep(
+            mnemonic == M::Inc,
+            width,
+            part(instruction, 0, width)?,
+        ));
     }
     Some(match mnemonic {
         M::Nop => Op::Nop,
@@ -946,6 +957,9 @@ impl Op {
                 (F::NONE, writes, site)
             }
             Op::StepMemory(..) => (F::NONE, F::ALL.minus(F::CF), true),
+            Op::NarrowStep(_, _, dst) => {
+                (F::NONE, F::ALL.minus(F::CF), matches!(dst, Part::Mem(_)))
+            }
             // The interpreter reads and writes canonical flags.
             Op::Helper(_) => (F::ALL, F::NONE, true),
         };
@@ -1114,7 +1128,10 @@ pub(super) mod tests {
                 assert_eq!(Some(actual), expected, "{bytes:02x?} at {pc:#x}");
             }
             // Narrow and memory `inc`/`dec` forms are iced's alone.
-            let quick_form = !matches!(expected, Some((Op::Narrow(..) | Op::StepMemory(..), _)));
+            let quick_form = !matches!(
+                expected,
+                Some((Op::Narrow(..) | Op::StepMemory(..) | Op::NarrowStep(..), _))
+            );
             if expected.is_some() && quick_form && round % 8 != 0 {
                 planned += 1;
                 covered += u32::from(actual.is_some());

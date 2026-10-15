@@ -131,6 +131,12 @@ impl Translator<'_> {
         let mut metadata = true;
         match x.fast {
             Fast::Wait => metadata = false,
+            Fast::Round => self.x87_round(slow),
+            Fast::Scale => self.x87_scale(slow),
+            Fast::Examine => {
+                self.x87_examine();
+                metadata = false;
+            }
             Fast::Load(source) => self.x87_load(source, slow),
             Fast::Constant(one) => {
                 let target = self.push_target(slow);
@@ -248,6 +254,97 @@ impl Translator<'_> {
         // The stack may have changed under the MMX registers.
         self.vector = super::simd::Vector::default();
         self.vector.cpu = true;
+    }
+
+    fn x87_round(&mut self, slow: Label) {
+        self.emit(and_imm(W, X16, X8, 0x3f));
+        self.emit(cmp_imm(W, X16, 0x3f, false));
+        self.asm.b_cond(Cond::Ne, slow);
+        self.read(0, X0, X1, slow);
+        self.double(X0, X1, V0, Take::Exact(RANGE as u32), slow);
+        self.emit(ubfx(W, X2, X8, 10, 2));
+        let rounded = self.asm.label();
+        for (rc, op) in [Unary::Frintn, Unary::Frintm, Unary::Frintp, Unary::Frintz]
+            .into_iter()
+            .enumerate()
+        {
+            let next = self.asm.label();
+            self.emit(cmp_imm(W, X2, rc as u32, false));
+            self.asm.b_cond(Cond::Ne, next);
+            self.emit(unary(op, V1, V0));
+            self.asm.b(rounded);
+            self.asm.bind(next);
+        }
+        self.asm.bind(rounded);
+        self.grew(V1, V0);
+        self.extended(V1, X0, X1);
+        self.commit_value(X15, X0, X1);
+        self.emit_all(&[orr(W, X13, X13, X3, Lsl, 5), bfi(W, X13, X7, 9, 1)]);
+    }
+
+    fn x87_scale(&mut self, slow: Label) {
+        self.read(0, X0, X1, slow);
+        self.ordinary(X0, X1, slow);
+        self.read(1, X2, X3, slow);
+        self.double(X2, X3, V0, Take::Exact(14), slow);
+        self.emit(fcvt_int(W, true, X2, V0));
+        let commit = self.asm.label();
+        self.asm.cbz(X, false, X0, commit);
+        self.emit_all(&[
+            and_imm(W, X16, X1, 0x7fff),
+            add(W, X16, X16, X2, Lsl, 0),
+            sub_imm(W, X17, X16, 1, false),
+            movz(W, X2, 0x7ffd, 0),
+            cmp(W, X17, X2, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Hi, slow);
+        self.emit(bfi(W, X1, X16, 0, 15));
+        self.asm.bind(commit);
+        self.commit_value(X15, X0, X1);
+        self.clear_c1();
+    }
+
+    fn x87_examine(&mut self) {
+        let [empty, zero_exp, normal, infinite, nan, denormal, zero, done] =
+            std::array::from_fn(|_| self.asm.label());
+        self.slot_base(X15, X17);
+        self.emit_all(&[
+            ldr(X, X0, X17, 0),
+            ldrh(X1, X17, 8),
+            movz(W, X16, (C0 | C1 | C2 | C3) as u16, 0),
+            bic(W, X13, X13, X16, Lsl, 0),
+            ubfx(W, X16, X1, 15, 1),
+            bfi(W, X13, X16, 9, 1),
+            lsl_imm(W, X16, X15, 1),
+            shiftv(W, Shift::Lsr, X16, X14, X16),
+            and_imm(W, X16, X16, 3),
+            cmp_imm(W, X16, 3, false),
+        ]);
+        self.asm.b_cond(Cond::Eq, empty);
+        self.emit(and_imm(W, X1, X1, 0x7fff));
+        self.asm.cbz(W, false, X1, zero_exp);
+        self.asm.tbz(false, X0, 63, done);
+        self.emit_all(&[movz(W, X16, 0x7fff, 0), cmp(W, X1, X16, Lsl, 0)]);
+        self.asm.b_cond(Cond::Ne, normal);
+        self.emit(eor_imm(X, X16, X0, 1 << 63));
+        self.asm.cbz(X, false, X16, infinite);
+        self.asm.b(nan);
+        self.asm.bind(zero_exp);
+        self.asm.cbz(X, false, X0, zero);
+        self.asm.b(denormal);
+        for (label, flags) in [
+            (empty, C3 | C0),
+            (zero, C3),
+            (denormal, C3 | C2),
+            (normal, C2),
+            (infinite, C2 | C0),
+            (nan, C0),
+        ] {
+            self.asm.bind(label);
+            self.emit_all(&[movz(W, X16, flags as u16, 0), orr(W, X13, X13, X16, Lsl, 0)]);
+            self.asm.b(done);
+        }
+        self.asm.bind(done);
     }
 
     fn x87_load(&mut self, source: Source, slow: Label) {
