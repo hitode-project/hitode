@@ -115,14 +115,33 @@ impl Gpu {
         let Some(directory) = directory else {
             return;
         };
-        let key = recipes::partition(&self.context.adapter.get_info());
-        let store = recipes::Store::open(directory, key.clone());
-        if self
+        let native = self
             .context
             .device
             .features()
             .contains(wgpu::Features::PIPELINE_CACHE)
-        {
+            .then(|| {
+                // SAFETY: no externally supplied bytes enter this empty cache.
+                unsafe {
+                    self.context
+                        .device
+                        .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                            label: Some("driver identity"),
+                            data: None,
+                            fallback: true,
+                        })
+                }
+            });
+        let header = native.as_ref().and_then(|cache| cache.get_data());
+        // wgpu 30's first 48 header bytes contain backend, adapter and raw
+        // driver validation identity, but exclude variable payload length.
+        // AdapterInfo alone may report "?" without VK_KHR_driver_properties.
+        let key = recipes::partition(
+            &self.context.adapter.get_info(),
+            header.as_ref().and_then(|bytes| bytes.get(..48)),
+        );
+        let store = recipes::Store::open(directory, key.clone());
+        if let Some(native) = native {
             let path = directory.join(format!("{key}.bin"));
             let data = load_blob(&path);
             // SAFETY: only get_data() results are written with our envelope, checked
@@ -130,14 +149,18 @@ impl Gpu {
             // like the application's other compiled caches; it is never a guest
             // path. wgpu additionally checks its backend/adapter/driver header and
             // discards obsolete data because fallback is enabled.
-            let cache = unsafe {
-                self.context
-                    .device
-                    .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                        label: Some("programmable driver cache"),
-                        data: data.as_deref(),
-                        fallback: true,
-                    })
+            let cache = if data.is_none() {
+                native
+            } else {
+                unsafe {
+                    self.context
+                        .device
+                        .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                            label: Some("programmable driver cache"),
+                            data: data.as_deref(),
+                            fallback: true,
+                        })
+                }
             };
             self.programmable.disk = Some(DiskCache {
                 cache,
@@ -228,7 +251,12 @@ mod boundary_tests {
         // wgpu 30's driver validation key occupies bytes 32..48, before any
         // native payload. A mismatched key must never reach the Vulkan driver.
         assert!(data.len() >= 64);
+        let identity = recipes::partition(&gpu.context.adapter.get_info(), Some(&data[..48]));
         data[32] ^= 1;
+        assert_ne!(
+            identity,
+            recipes::partition(&gpu.context.adapter.get_info(), Some(&data[..48]))
+        );
         let path = disk.path.clone();
         save_blob(&path, &data).unwrap();
         gpu.set_pipeline_cache_directory(Some(&dir));

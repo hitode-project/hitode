@@ -58,7 +58,7 @@ pub(super) struct Store {
 }
 /// Include the backend, complete driver version and target format. The portable
 /// recipes remain useful on backends without native binary archive support.
-pub(super) fn partition(info: &wgpu::AdapterInfo) -> String {
+pub(super) fn partition(info: &wgpu::AdapterInfo, driver_header: Option<&[u8]>) -> String {
     let identity = format!(
         "wgpu-30/{:?}/{}/{}/{}/{}/{:?}/{}",
         info.backend,
@@ -69,7 +69,10 @@ pub(super) fn partition(info: &wgpu::AdapterInfo) -> String {
         FORMAT,
         std::env::consts::ARCH
     );
-    format!("{:x}", Sha256::digest(identity.as_bytes()))
+    let mut hash = Sha256::new();
+    hash.update(identity.as_bytes());
+    hash.update(driver_header.unwrap_or_default());
+    format!("{:x}", hash.finalize())
 }
 impl Store {
     pub fn open(directory: &Path, identity: String) -> Self {
@@ -118,6 +121,7 @@ impl Store {
     pub fn persisted(&self) -> u64 {
         self.journal.lock().unwrap().persisted
     }
+    #[cfg(test)]
     pub fn len(&self) -> u64 {
         self.journal.lock().unwrap().archive.entries.len() as u64
     }
