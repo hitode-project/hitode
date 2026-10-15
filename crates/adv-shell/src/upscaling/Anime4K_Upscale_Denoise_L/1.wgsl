@@ -2,6 +2,7 @@
 struct SLANG_ParameterGroup_Params_std140_0
 {
     @align(16) dimensions_0 : vec4<u32>,
+    @align(16) origin_0 : vec4<u32>,
 };
 
 @binding(0) @group(0) var<uniform> Params_0 : SLANG_ParameterGroup_Params_std140_0;
@@ -150,6 +151,6 @@ fn Pass1_0( blockStart_0 : vec2<u32>,  threadId_0 : vec3<u32>)
 @workgroup_size(64, 1, 1)
 fn main(@builtin(workgroup_id) group_0 : vec3<u32>, @builtin(local_invocation_id) tid_0 : vec3<u32>)
 {
-    Pass1_0(group_0.xy * vec2<u32>(u32(16)), tid_0);
+    Pass1_0(group_0.xy * vec2<u32>(u32(16)) + Params_0.origin_0.xy, tid_0);
     return;
 }

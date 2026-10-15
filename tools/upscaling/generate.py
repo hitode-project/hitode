@@ -35,7 +35,7 @@ def generate(compiler):
             ins = re.search('//!IN ([^\\n]+)', body)[1].replace(' ', '').split(',')
             outs = re.search('//!OUT ([^\\n]+)', body)[1].replace(' ', '').split(',')
             block = int(re.search('//!BLOCK_SIZE (\\d+)', body)[1])
-            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n' + common + '\n' + shared + '\n'
+            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n' + common + '\n' + shared + '\n'
             binding = 1
             for name in ins:
                 pre += f'[[vk::binding({binding},0)]] Texture2D<float4> {name};\n'
@@ -48,7 +48,9 @@ def generate(compiler):
                 binding += 1
             for name in outs:
                 body = re.sub('\\b' + name + '\\[([^\\]]+)\\]\\s*=\\s*([^;]+);', lambda m: name + '.Store(' + m[1] + ', ' + m[2] + ');', body)
-            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block}, tid); }}\n'
+            # origin.xy is the damaged region's corner in input pixels, origin.zw in output pixels.
+            origin = 'origin.zw' if 'OUTPUT' in outs else 'origin.xy'
+            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block} + {origin}, tid); }}\n'
             p = outdir / f'{n}.slang'
             p.write_text(src)
             r = subprocess.run([str(compiler), str(p), '-entry', 'main', '-stage', 'compute', '-target', 'wgsl', '-o', str(outdir / f'{n}.wgsl')], capture_output=True, text=True)
@@ -70,7 +72,7 @@ def generate(compiler):
         outs = [save[1] if save else 'OUTPUT']
         if last:
             ins.append('INPUT')
-        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n'
+        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n'
         for (b, name) in enumerate(ins, 1):
             pre += f'[[vk::binding({b},0)]] Texture2D<float4> {name};\n'
         b = len(ins) + 1
@@ -88,10 +90,11 @@ def generate(compiler):
         if 'LUMA' in ins:
             pre = pre.replace('return LUMA.SampleLevel(sam, uv, 0);', 'return float4(dot(LUMA.SampleLevel(sam, uv, 0).rgb, float3(0.2126, 0.7152, 0.0722)), 0, 0, 1);')
         size = 'dimensions.zw' if last else 'dimensions.xy'
-        main = f'\n[numthreads(8,8,1)] void main(uint3 id : SV_DispatchThreadID) {{ if(any(id.xy >= {size})) return; float2 pos = (float2(id.xy) + 0.5) / float2({size}); float4 v=hook(pos);'
+        origin = 'origin.zw' if last else 'origin.xy'
+        main = f'\n[numthreads(8,8,1)] void main(uint3 group : SV_DispatchThreadID) {{ uint2 id = group.xy + {origin}; if(any(id >= {size})) return; float2 pos = (float2(id) + 0.5) / float2({size}); float4 v=hook(pos);'
         if last:
             main += 'float3 rgb=INPUT.SampleLevel(sam,pos,0).rgb; v=float4(rgb + (v.x - dot(rgb,float3(0.2126,0.7152,0.0722))),1);'
-        main += f'{outs[0]}.Store(id.xy,v); }}'
+        main += f'{outs[0]}.Store(id,v); }}'
         p = outdir / f'{n}.slang'
         p.write_text(pre + body + main)
         r = subprocess.run([str(compiler), str(p), '-entry', 'main', '-stage', 'compute', '-target', 'wgsl', '-o', str(outdir / f'{n}.wgsl')], capture_output=True, text=True)
