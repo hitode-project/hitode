@@ -182,6 +182,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
                 state.draw.configure_clipper(clipper, geometry.origin);
             }
         }
+        state.draw.context = env.context;
         let before = store.stats.presentations;
         let result = state.draw.call(
             id,

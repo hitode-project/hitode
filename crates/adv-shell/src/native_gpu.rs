@@ -1932,6 +1932,9 @@ mod tests {
             surfaces
                 .present(software, &memory, surfaces[software].rect())
                 .unwrap();
+            surfaces
+                .flush(&memory, adv_device::surface::FlushReason::Immediate)
+                .unwrap();
         }
         assert!(window.native_canvas((8, 6)).unwrap());
         assert!(

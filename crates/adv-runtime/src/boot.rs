@@ -527,7 +527,7 @@ impl<B: Backend> Runtime<B> {
         self.machine
             .ext
             .get_mut::<Graphics<Snapshot>>()
-            .capture_latest()
+            .capture_latest(&crate::graphics::guest_memory(&mut self.machine.cpu))
     }
     #[cfg(feature = "gpu")]
     pub fn has_native_frame(&self) -> bool {

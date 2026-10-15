@@ -169,6 +169,7 @@ const BUSY: u32 = 0x887601ae;
 const NOT_LOCKED: u32 = 0x88760248;
 
 pub struct DirectDraw {
+    pub(super) context: u32,
     com: Option<CommonCom>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
     surface_objects: BTreeMap<u32, ComIdentity<ComState>>,
@@ -190,6 +191,7 @@ pub struct DirectDraw {
 impl DirectDraw {
     pub fn new(entries: BTreeMap<u32, u32>) -> Self {
         Self {
+            context: 0,
             com: None,
             surface_objects: BTreeMap::new(),
             dd_vtable: None,
@@ -747,6 +749,7 @@ impl DirectDraw {
                 if surfaces.primary_id().is_some() {
                     return Ok(BUSY);
                 }
+                surfaces.flush(m, surface::FlushReason::Immediate)?;
                 surfaces.width = a[1];
                 surfaces.height = a[2];
                 surfaces.display_format = if a[3] == 16 {
@@ -882,6 +885,7 @@ impl DirectDraw {
                 0
             }
             api::LOCK => {
+                surfaces.flush(m, surface::FlushReason::Immediate)?;
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
@@ -926,7 +930,7 @@ impl DirectDraw {
                 }
                 surfaces.stats.unlocks += 1;
                 if !readonly && surfaces.primary_id() == Some(sid) {
-                    surfaces.present(sid, m, locked)?;
+                    surfaces.present_from(self.context, sid, m, locked)?;
                 }
                 0
             }
@@ -986,10 +990,11 @@ impl DirectDraw {
                 if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
+                surfaces.flush(m, surface::FlushReason::Immediate)?;
                 let front = surfaces[dst].pixels;
                 surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
                 surfaces.get_mut(src).unwrap().pixels = front;
-                surfaces.present(dst, m, surfaces[dst].rect())?;
+                surfaces.present_from(self.context, dst, m, surfaces[dst].rect())?;
                 0
             }
             api::SURFACE_DC => {
@@ -1019,7 +1024,7 @@ impl DirectDraw {
                 }
                 dcs.remove(objects, a[1]);
                 if surfaces.primary_id() == Some(sid) {
-                    surfaces.present(sid, m, surfaces[sid].rect())?;
+                    surfaces.present_from(self.context, sid, m, surfaces[sid].rect())?;
                 }
                 0
             }
@@ -1052,7 +1057,7 @@ impl DirectDraw {
                 }
                 let damage = surfaces.copy(src, sr, dst, dr, m)?;
                 if surfaces.primary_id() == Some(dst) {
-                    surfaces.present(dst, m, damage)?;
+                    surfaces.present_from(self.context, dst, m, damage)?;
                 }
                 0
             }
@@ -1074,7 +1079,7 @@ impl DirectDraw {
                     surfaces.fill_raw(dst, dr, m.u32(a[5] + 80)?, m)?;
                     let damage = dr;
                     if surfaces.primary_id() == Some(dst) {
-                        surfaces.present(dst, m, damage)?;
+                        surfaces.present_from(self.context, dst, m, damage)?;
                     }
                     return Ok(0);
                 }
@@ -1148,7 +1153,7 @@ impl DirectDraw {
                 }
                 let damage = surfaces.blit(src, sr, dst, dr, BlitOptions::default(), m)?;
                 if surfaces.primary_id() == Some(dst) {
-                    surfaces.present(dst, m, damage)?;
+                    surfaces.present_from(self.context, dst, m, damage)?;
                 }
                 0
             }

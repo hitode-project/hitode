@@ -26,6 +26,12 @@ fn get_bits(
     info: GuestPtr<()>,
     usage: u32,
 ) -> Outcome {
+    if let Some(out) = crate::gdi32::raster::front::flush_software(
+        env,
+        adv_device::surface::FlushReason::Immediate,
+    ) {
+        return out;
+    }
     if !matches!(get(env, dc.0), Some(GdiObj::Dc { .. })) {
         return fail(env, 6);
     }

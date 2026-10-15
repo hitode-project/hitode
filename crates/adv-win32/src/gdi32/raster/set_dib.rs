@@ -92,7 +92,7 @@ impl Raster {
             &mut memory,
         )?;
         if dcs.is_window_dc(objects, dc) {
-            surfaces.present(dst, &memory, memory.damage())?;
+            surfaces.present_from(self.context, dst, &memory, memory.damage())?;
         }
         Ok(result)
     }

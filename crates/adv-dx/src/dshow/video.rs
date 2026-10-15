@@ -25,7 +25,12 @@ pub struct VideoWindowGeometry {
 #[derive(Clone, Copy)]
 pub struct VideoProvider {
     pub window: fn(&Ext, &Objects, u32) -> Option<VideoWindowGeometry>,
-    pub update: fn(&mut Ext, u64, Option<VideoLayer>) -> Result<u64, String>,
+    pub update: fn(
+        &mut Ext,
+        &mut dyn adv_cpu::backend::Guest,
+        u64,
+        Option<VideoLayer>,
+    ) -> Result<u64, String>,
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
 }
 
@@ -195,7 +200,7 @@ fn update(env: &mut Env<'_>, graph: u32) -> Result<u64, u32> {
             Err(E_NOINTERFACE)
         };
     };
-    let serial = (provider.update)(env.ext, key(graph), layer).map_err(|error| {
+    let serial = (provider.update)(env.ext, env.cpu, key(graph), layer).map_err(|error| {
         adv_abi::warn_unavailable(env, "DirectShowVideoRenderer", &error);
         0x8000_4005u32
     })?;
@@ -271,7 +276,7 @@ pub(crate) fn detach(env: &mut Env<'_>, graph: u32) {
         g.video_geometry = None;
     }
     if let Some(provider) = env.ext.try_get::<VideoProvider>().copied()
-        && let Err(error) = (provider.update)(env.ext, key(graph), None)
+        && let Err(error) = (provider.update)(env.ext, env.cpu, key(graph), None)
     {
         adv_abi::warn_unavailable(env, "DirectShowVideoRenderer", &error);
     }

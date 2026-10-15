@@ -20,7 +20,7 @@ pub mod api {
     pub use adv_win32::gdi32::raster::api::*;
 }
 /// One byte-access adapter, borrowed on the stack by both personality fronts.
-fn guest_memory<'a>(cpu: &'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a> {
+pub(crate) fn guest_memory<'a>(cpu: &'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a> {
     MemoryView::new(
         cpu,
         MemoryOperations {
@@ -162,7 +162,10 @@ pub fn install_graphics<B: Backend>(
     adv_dx::dshow::set_video_provider(
         &mut machine.ext,
         adv_dx::dshow::VideoProvider {
-            update: |ext, key, layer| ext.get_mut::<SurfaceStore>().set_video_layer(key, layer),
+            update: |ext, cpu, key, layer| {
+                ext.get_mut::<SurfaceStore>()
+                    .set_video_layer(key, layer, &guest_memory(cpu))
+            },
             window: video_window_geometry,
             completed: frame_completed,
         },

@@ -141,8 +141,8 @@ fn main() {
             frames,
         );
         assert_eq!(surfaces.stats.converted_pixels, before);
-        assert!(surfaces.capture_latest().unwrap());
-        assert!(!surfaces.capture_latest().unwrap());
+        assert!(surfaces.capture_latest(&memory).unwrap());
+        assert!(!surfaces.capture_latest(&memory).unwrap());
         assert!(
             surfaces
                 .presenter

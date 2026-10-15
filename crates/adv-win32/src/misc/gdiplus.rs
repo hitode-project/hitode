@@ -417,7 +417,9 @@ fn draw(env: &mut Env<'_>, handle: u32, operation: Op<'_>) -> Outcome {
             let store = env.ext.get_mut::<SurfaceStore>();
             store.get_mut(target).unwrap().version += 1;
             if window {
-                if let Err(error) = store.present(target, &(provider.memory)(env.cpu), damage) {
+                if let Err(error) =
+                    store.present_from(env.context, target, &(provider.memory)(env.cpu), damage)
+                {
                     return Outcome::Fail(error);
                 }
                 let presented = store.stats.presentations;

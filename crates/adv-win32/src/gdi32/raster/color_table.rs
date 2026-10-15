@@ -65,11 +65,13 @@ fn set(
     for color in &mut entries[..count] {
         color[3] = 0;
     }
-    match env
-        .ext
-        .get_mut::<SurfaceStore>()
-        .set_palette(bitmap, start, &entries[..count])
-    {
+    let provider = super::front::provider(env.ext).unwrap();
+    match env.ext.get_mut::<SurfaceStore>().set_palette(
+        bitmap,
+        start,
+        &entries[..count],
+        &(provider.memory)(env.cpu),
+    ) {
         Ok(changed) => Outcome::Return(changed as u32),
         Err(_) => Outcome::Return(0),
     }

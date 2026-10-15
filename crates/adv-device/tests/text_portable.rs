@@ -1076,7 +1076,7 @@ fn indexed_surface_text_preserves_coverage_and_reuses_scratch_and_glyphs() {
         .create(64, 48, true, PixelFormat::Indexed8, &mut memory)
         .unwrap();
     let palette: [[u8; 4]; 256] = std::array::from_fn(|i| [i as u8, i as u8, i as u8, 0]);
-    store.set_palette(id, 0, &palette).unwrap();
+    store.set_palette(id, 0, &palette, &memory).unwrap();
     let paint = Paint {
         input: TextInput::Encoded(b"AB"),
         origin: Point { x: 0, y: 0 },

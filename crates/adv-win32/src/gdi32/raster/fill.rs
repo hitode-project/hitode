@@ -232,7 +232,7 @@ fn paint_rectangles(
         }
         result.and_then(|()| {
             if window {
-                store.present(target, &memory, memory.damage())
+                store.present_from(env.context, target, &memory, memory.damage())
             } else {
                 Ok(())
             }
@@ -378,7 +378,8 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
             )
             .and_then(|()| {
                 if window {
-                    store.present(
+                    store.present_from(
+                        env.context,
                         target,
                         &memory,
                         Rect {
@@ -418,6 +419,11 @@ fn set_pixel_v(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Out
 
 #[win32(gdi32, name = "GetPixel", level = implement)]
 fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
+    if let Some(out) =
+        super::front::flush_software(env, adv_device::surface::FlushReason::Immediate)
+    {
+        return out;
+    }
     if super::front::unavailable_pixels(env, dc.0, "gdi32.dll!GetPixel") {
         return Outcome::Return(CLR_INVALID);
     }
@@ -610,7 +616,7 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
             )
             .and_then(|()| {
                 if window {
-                    store.present(target, &memory, memory.damage())
+                    store.present_from(env.context, target, &memory, memory.damage())
                 } else {
                     Ok(())
                 }

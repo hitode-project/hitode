@@ -337,7 +337,7 @@ fn indexed_text_preserves_gray_antialiasing_clip_and_unchanged_duplicate_indices
             .unwrap();
         let mut palette: [[u8; 4]; 256] = std::array::from_fn(|i| [i as u8, i as u8, i as u8, 0]);
         palette[50] = palette[49];
-        store.set_palette(indexed, 0, &palette).unwrap();
+        store.set_palette(indexed, 0, &palette, &memory).unwrap();
         let indices = store.get(indexed).unwrap().clone();
         let direct = store.get(bgra).unwrap().clone();
         memory.0
@@ -429,7 +429,7 @@ fn packed_text_quantizes_into_actual_bits_and_keeps_clipped_edges_and_padding() 
                     [v, v, v, 0]
                 })
                 .collect();
-            store.set_palette(id, 0, &palette).unwrap();
+            store.set_palette(id, 0, &palette, &memory).unwrap();
             let surface = store.get(id).unwrap().clone();
             for y in 0..25 {
                 let at = surface.row(0, y) as usize;
@@ -529,7 +529,7 @@ fn monochrome_text_matches_native_duplicate_palettes_colours_quality_and_partial
                         let id = store
                             .create(41, 25, bottom_up, PixelFormat::Indexed1, &mut memory)
                             .unwrap();
-                        store.set_palette(id, 0, &palette).unwrap();
+                        store.set_palette(id, 0, &palette, &memory).unwrap();
                         let surface = store.get(id).unwrap().clone();
                         let length = (surface.pitch * surface.height) as usize;
                         memory.0[surface.pixels as usize..surface.pixels as usize + length]

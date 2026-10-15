@@ -4,7 +4,7 @@ use super::*;
 use crate::{Win32, util::set_last_error};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
-use adv_device::surface::{MemoryView, SurfaceStore};
+use adv_device::surface::{FlushReason, MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 use adv_os::gdi::WINDOW_DC;
 
@@ -50,6 +50,7 @@ struct WindowDcLease {
     paint_before: Option<Option<Vec<[i32; 4]>>>,
 }
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
+    machine.sys.context_wait = Some(|env| flush_software(env, FlushReason::Wait));
     let gdi = machine.ext.get::<Win32>().gdi.clone();
     machine.ext.insert(State {
         raster: Raster::default(),
@@ -66,6 +67,22 @@ pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
 }
 pub(crate) fn provider(ext: &Ext) -> Option<DrawingProvider> {
     ext.try_get::<State>().and_then(|state| state.provider)
+}
+pub(crate) fn flush_software(env: &mut Env<'_>, reason: FlushReason) -> Option<Outcome> {
+    let provider = provider(env.ext)?;
+    let store = env.ext.try_get_mut::<SurfaceStore>()?;
+    let memory = (provider.memory)(env.cpu);
+    let result = if matches!(reason, FlushReason::Wait | FlushReason::Message) {
+        store.flush_context(env.context, &memory, reason)
+    } else {
+        store.flush(&memory, reason)
+    };
+    let serial = store.stats.presentations;
+    match result {
+        Ok(true) => (provider.completed)(env, serial),
+        Ok(false) => None,
+        Err(error) => Some(Outcome::Fail(error)),
+    }
 }
 /// Independent display metadata must never silently draw into another window's
 /// primary. Memory/surface DCs and the legacy primary identity retain their path.
@@ -177,6 +194,7 @@ fn raster_call_named(
     let (result, presented, error, changed) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         state.raster.last_error = 0;
+        state.raster.context = env.context;
         let before = store.stats.presentations;
         let result = call(
             &mut state.raster,
@@ -954,8 +972,8 @@ fn set_stretch_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
     })
 }
 #[win32(gdi32, name = "GdiFlush", level = state)]
-fn flush(_env: &mut Env<'_>) -> i32 {
-    1
+fn flush(env: &mut Env<'_>) -> Outcome {
+    flush_software(env, FlushReason::Immediate).unwrap_or(Outcome::Return(1))
 }
 
 #[cfg(test)]

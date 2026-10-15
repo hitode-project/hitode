@@ -422,7 +422,7 @@ fn render_file_movie_keeps_connected_renderers_and_appends_video_and_audio_strea
         &mut m.ext,
         VideoProvider {
             window: |_, _, _| None,
-            update: |_, _, _| Ok(1),
+            update: |_, _, _, _| Ok(1),
             completed: |_, _| None,
         },
     );
@@ -469,7 +469,7 @@ fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_w
         &mut m.ext,
         VideoProvider {
             window: |_, _, _| None,
-            update: |_, _, _| Ok(1),
+            update: |_, _, _, _| Ok(1),
             completed: |_, _| None,
         },
     );

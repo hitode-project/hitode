@@ -33,6 +33,7 @@ pub mod api {
 #[derive(Default)]
 pub struct Raster {
     last_error: u32,
+    context: u32,
 }
 
 impl Raster {
@@ -128,7 +129,7 @@ impl Raster {
             let palette = dib.palette;
             let bitmap = surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
             if let Some(palette) = palette {
-                surfaces.set_palette(bitmap, 0, palette.as_ref())?;
+                surfaces.set_palette(bitmap, 0, palette.as_ref(), m)?;
             }
             let surface = surfaces.get(bitmap).unwrap();
             let bits = surface.pixels;
@@ -250,6 +251,7 @@ impl Raster {
                 return Ok(self.fail(87));
             }
             let src = if dcs.is_window_dc(objects, source_dc) {
+                surfaces.flush(m, adv_device::surface::FlushReason::Immediate)?;
                 surfaces.primary(m)?
             } else {
                 let Some(src) = dcs.get(objects, source_dc) else {
@@ -313,7 +315,7 @@ impl Raster {
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.copy(src, sr, dst, dr, &mut m)?;
             if dcs.is_window_dc(objects, destination_dc) {
-                surfaces.present(dst, &m, m.damage())?;
+                surfaces.present_from(self.context, dst, &m, m.damage())?;
             }
             1
         })
@@ -415,7 +417,7 @@ impl Raster {
             &mut m,
         )?;
         if dcs.is_window_dc(objects, destination_dc) {
-            surfaces.present(dst, &m, m.damage())?;
+            surfaces.present_from(self.context, dst, &m, m.damage())?;
         }
         Ok(transfer.scan_lines)
     }
@@ -443,6 +445,7 @@ impl Raster {
                 return Ok(self.fail(87));
             }
             let src = if dcs.is_window_dc(objects, source_dc) {
+                surfaces.flush(m, adv_device::surface::FlushReason::Immediate)?;
                 surfaces.primary(m)?
             } else {
                 dcs.get(objects, source_dc).unwrap_or(0)
@@ -514,7 +517,7 @@ impl Raster {
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.blit(src, sr, dst, dr, options, &mut m)?;
             if dcs.is_window_dc(objects, destination_dc) {
-                surfaces.present(dst, &m, m.damage())?;
+                surfaces.present_from(self.context, dst, &m, m.damage())?;
             }
             1
         })

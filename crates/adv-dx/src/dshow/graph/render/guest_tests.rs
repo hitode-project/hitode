@@ -568,7 +568,7 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
                     visible: ext.get::<Presentation>().owner_visible,
                 })
             },
-            update: |ext, _, layer| {
+            update: |ext, _, _, layer| {
                 let presentation = ext.get_mut::<Presentation>();
                 presentation.updates.push(layer);
                 Ok(presentation.updates.len() as u64)

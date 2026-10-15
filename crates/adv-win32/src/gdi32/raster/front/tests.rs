@@ -45,6 +45,158 @@ pub(super) fn invoke<B: Backend>(
         _ => panic!("GDI resource request must return a Win32 value"),
     }
 }
+
+// spec: DEV-FRAME-8, PROC-MACH-7
+#[test]
+fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
+    use adv_device::surface::frame_mailbox;
+    let mut registry = Registry::default();
+    crate::register(&mut registry);
+    crate::compat::register(&mut registry);
+    let mut m = Machine::new(
+        JitCpu::new(layout::PARK_ADDR, false).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    let mut registry = Registry::default();
+    crate::register(&mut registry);
+    crate::compat::register(&mut registry);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/scratch/codex/frame-boundary-tests");
+    let mut config = crate::Win32Config::new(&root, "authored.exe", &root);
+    config.screen = (2, 2);
+    Win32::install(&mut m, config).unwrap();
+    m.spawn("writer", layout::PARK_ADDR, &[], 65536).unwrap();
+    let data = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+    m.cpu.set_reg(adv_cpu::backend::Reg::Esp, data);
+    let arena = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+    m.ext
+        .insert(SurfaceStore::new(2, 2, arena, 4096, Snapshot::default()).unwrap());
+    set_provider(
+        &mut m.ext,
+        DrawingProvider {
+            memory,
+            completed: |env, serial| {
+                env.sys.frame = serial as u32;
+                env.sys.complete_frame();
+                None
+            },
+        },
+    );
+    let (tx, mut rx) = frame_mailbox();
+    m.ext
+        .get_mut::<SurfaceStore>()
+        .set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    let dc = invoke(&mut m, data, get_dc_ABI, &[0]);
+    let primary = m.ext.get::<SurfaceStore>().primary_id().unwrap();
+    let queue = |m: &mut Machine<JitCpu>| {
+        let store = m.ext.get_mut::<SurfaceStore>();
+        store
+            .fill_raw(
+                primary,
+                store[primary].rect(),
+                0x123456,
+                &mut memory(&mut m.cpu),
+            )
+            .unwrap();
+        store
+            .present_from(0, primary, &memory(&mut m.cpu), store[primary].rect())
+            .unwrap();
+    };
+    for (name, args) in [
+        ("PeekMessageA", vec![data + 128, 0, 0, 0, 0]),
+        ("PeekMessageW", vec![data + 128, 0, 0, 0, 0]),
+        ("GetMessageA", vec![data + 128, 0, 0, 0]),
+        ("GetMessageW", vec![data + 128, 0, 0, 0]),
+        ("MsgWaitForMultipleObjects", vec![0, 0, 0, 0, 0]),
+        ("GetPixel", vec![dc, 0, 0]),
+        ("BitBlt", vec![dc, 0, 0, 1, 1, dc, 0, 0, 0xcc0020]),
+    ] {
+        queue(&mut m);
+        assert!(!rx.update());
+        for (i, arg) in args.iter().enumerate() {
+            m.cpu.write_u32(data + 4 + i as u32 * 4, *arg).unwrap();
+        }
+        let module = if matches!(name, "GetPixel" | "BitBlt") {
+            "gdi32.dll"
+        } else {
+            "user32.dll"
+        };
+        let handler = registry.get(module, name).unwrap().handler;
+        let entry = m.resolve_import(module, name).unwrap();
+        let thunk = (entry - layout::THUNK_BASE) / layout::THUNK_STRIDE;
+        handler(&mut Env {
+            context: 0,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        });
+        assert!(rx.update(), "{name} must flush the pending frame");
+    }
+
+    let before = m.ext.get::<SurfaceStore>().stats.presentations;
+    m.ext
+        .get_mut::<SurfaceStore>()
+        .present_from(
+            0,
+            primary,
+            &memory(&mut m.cpu),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+        )
+        .unwrap();
+    let hook = m.sys.context_wait.unwrap();
+    assert!(
+        hook(&mut Env {
+            context: 1,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0
+        })
+        .is_none()
+    );
+    assert!(!rx.update());
+    assert!(
+        hook(&mut Env {
+            context: 0,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0
+        })
+        .is_none()
+    );
+    assert!(rx.update());
+    assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, before + 1);
+    assert_eq!(
+        m.ext.get::<SurfaceStore>().stats.software_flushes,
+        [1, 5, 0, 2]
+    );
+    assert_eq!(m.sys.completed_frames, 8);
+    queue(&mut m);
+    assert!(!rx.update());
+    m.cpu.write_u32(data + 4, 0).unwrap();
+    (registry.get("kernel32.dll", "ExitProcess").unwrap().handler)(&mut Env {
+        context: 0,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    });
+    assert!(rx.update());
+    assert_eq!(
+        m.ext.get::<SurfaceStore>().stats.software_flushes,
+        [1, 5, 0, 3]
+    );
+    assert_eq!(m.sys.completed_frames, 9);
+}
 #[test]
 fn dib_growth_uses_shared_vm_and_releases_pixels_with_standard_gdi_lifetime() {
     let mut registry = Registry::default();

@@ -5,6 +5,27 @@ use std::time::{Duration, Instant};
 use adv_device::gpu::*;
 use adv_device::surface::Rect;
 
+struct Memory(Vec<u8>);
+impl adv_device::surface::SurfaceMemory for Memory {
+    fn read(&self, addr: u32, len: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        Ok(std::borrow::Cow::Borrowed(
+            &self.0[addr as usize..addr as usize + len],
+        ))
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        self.0[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+    fn writable(&self, _addr: u32, _len: usize) -> Result<(), String> {
+        Ok(())
+    }
+    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+        self.0
+            .copy_within(src as usize..src as usize + len, dst as usize);
+        Ok(())
+    }
+}
+
 fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
     let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
     let mut readback = gpu.readback(image, Some(wake.clone())).unwrap();
@@ -249,7 +270,12 @@ fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture(
         visible: true,
         hide_cursor: true,
     };
-    assert_eq!(surfaces.set_video_layer(5, Some(layer.clone())).unwrap(), 2);
+    assert_eq!(
+        surfaces
+            .set_video_layer(5, Some(layer.clone()), &Memory(Vec::new()))
+            .unwrap(),
+        2
+    );
     let composition = surfaces.latest_frame().unwrap().clone();
     assert!(composition.native().is_some());
     assert_eq!(gpu.stats().readbacks, 0);
@@ -259,7 +285,9 @@ fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture(
     let complete = transfer.take_completion_job().unwrap();
     let mut newer = layer;
     newer.frame.bgra = Arc::from([0, 255, 0, 255]);
-    surfaces.set_video_layer(5, Some(newer)).unwrap();
+    surfaces
+        .set_video_layer(5, Some(newer), &Memory(Vec::new()))
+        .unwrap();
     complete();
     let pixels = transfer.poll().unwrap().unwrap();
     assert!(
@@ -272,7 +300,12 @@ fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture(
         surfaces.presenter.bgra,
         [0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255]
     );
-    assert_eq!(surfaces.set_video_layer(5, None).unwrap(), 4);
+    assert_eq!(
+        surfaces
+            .set_video_layer(5, None, &Memory(Vec::new()))
+            .unwrap(),
+        4
+    );
     let restored = surfaces.latest_native_frame().unwrap().clone();
     let pixels = read(&mut gpu, &restored.image);
     assert!(surfaces.capture_native_pixels(4, 3, 1, &pixels).unwrap());
@@ -780,26 +813,7 @@ fn actual_software_adapter_clear_and_draw() {
 // spec: GFX-REC-2
 #[test]
 fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
-    use adv_device::surface::{PixelFormat, Snapshot, SurfaceMemory, Surfaces, frame_mailbox};
-    use std::borrow::Cow;
-    struct Memory(Vec<u8>);
-    impl SurfaceMemory for Memory {
-        fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-            Ok(Cow::Borrowed(&self.0[addr as usize..addr as usize + len]))
-        }
-        fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-            self.0[addr as usize..addr as usize + data.len()].copy_from_slice(data);
-            Ok(())
-        }
-        fn writable(&self, _addr: u32, _len: usize) -> Result<(), String> {
-            Ok(())
-        }
-        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-            self.0
-                .copy_within(src as usize..src as usize + len, dst as usize);
-            Ok(())
-        }
-    }
+    use adv_device::surface::{PixelFormat, Snapshot, Surfaces, frame_mailbox};
     let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
     let mut surfaces = Surfaces::new(16, 16, 0x1000, 0x10000, Snapshot::default()).unwrap();
     let mut memory = Memory(vec![0; 0x11000]);
@@ -867,6 +881,9 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     surfaces
         .present(software, &memory, surfaces[software].rect())
         .unwrap();
+    surfaces
+        .flush(&memory, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert!(consumer.update());
     assert!(
         consumer.current().native().is_none(),
@@ -885,10 +902,18 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
     assert_eq!(surfaces.live_surfaces(), 1);
     let mut child = Surfaces::new(16, 16, 0x1000, 0x10000, Snapshot::default()).unwrap();
     assert_eq!(surfaces.output_serial(), Some(102));
-    assert!(surfaces.transfer_frame_mailbox_to(&mut child).unwrap());
+    assert!(
+        surfaces
+            .transfer_frame_mailbox_to(&mut child, &memory)
+            .unwrap()
+    );
     assert_eq!(surfaces.output_serial(), None);
     assert_eq!(child.output_serial(), Some(102));
-    assert!(child.transfer_frame_mailbox_to(&mut surfaces).unwrap());
+    assert!(
+        child
+            .transfer_frame_mailbox_to(&mut surfaces, &memory)
+            .unwrap()
+    );
     assert_eq!(surfaces.output_serial(), Some(102));
     eprintln!("mailbox GPU stats: {:?}", gpu.stats());
 }

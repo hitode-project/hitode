@@ -1323,6 +1323,11 @@ fn peek_message_front(
     wide: bool,
 ) -> Outcome {
     let f = Filter { hwnd, min, max };
+    if let Some(out) =
+        crate::gdi32::raster::front::flush_software(env, adv_device::surface::FlushReason::Message)
+    {
+        return out;
+    }
     let remove = flags & PM_REMOVE != 0;
     if flags >> 16 == 0 || flags & (sent::QS_SEND << 16) != 0 {
         sent::drain(env, move |env| peek_message(env, out, f, remove, wide))
@@ -1494,6 +1499,11 @@ fn get_message_w(
 }
 
 fn get_message(env: &mut Env<'_>, out: u32, f: Filter, wide: bool) -> Outcome {
+    if let Some(out) =
+        crate::gdi32::raster::front::flush_software(env, adv_device::surface::FlushReason::Message)
+    {
+        return out;
+    }
     sent::drain(env, move |env| get_message_inner(env, out, f, wide))
 }
 

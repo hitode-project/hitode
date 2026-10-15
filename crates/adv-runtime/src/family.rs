@@ -183,7 +183,10 @@ impl<B: Backend> Runtime<B> {
         self.machine
             .ext
             .get_mut::<Graphics<Snapshot>>()
-            .transfer_frame_mailbox_to(next.ext.get_mut::<Graphics<Snapshot>>())?;
+            .transfer_frame_mailbox_to(
+                next.ext.get_mut::<Graphics<Snapshot>>(),
+                &crate::graphics::guest_memory(&mut self.machine.cpu),
+            )?;
         self.family.foreground = pid;
         self.select_process(pid);
         Ok(())

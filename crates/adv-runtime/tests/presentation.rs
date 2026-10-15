@@ -5,6 +5,28 @@ use adv_cpu::backend::Guest;
 use adv_runtime::api;
 use pipeline::*;
 
+fn capture(f: &mut Fixture) -> Result<bool, String> {
+    use adv_device::surface::{MemoryOperations, MemoryView};
+    use std::borrow::Cow;
+    let memory = MemoryView::new(
+        &mut f.machine.cpu,
+        MemoryOperations {
+            read: |cpu: &cpu::Cpu, address, length| {
+                let mut bytes = vec![0; length];
+                cpu.read(address, &mut bytes).map_err(|e| e.to_string())?;
+                Ok(Cow::Owned(bytes))
+            },
+            write: |cpu, address, data| cpu.write(address, data).map_err(|e| e.to_string()),
+            writable: |_, _, _| Ok(()),
+            copy: |cpu, src, dst, len| cpu.copy_memory(src, dst, len).map_err(|e| e.to_string()),
+        },
+    );
+    f.machine
+        .ext
+        .get_mut::<adv_runtime::Graphics>()
+        .capture_latest(&memory)
+}
+
 #[test]
 // spec: DEV-FRAME-1
 fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces() {
@@ -42,10 +64,10 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
         f.machine.cpu.write(front, &[0xff; 32]).unwrap();
         assert_eq!(invoke(&mut f, api::RELEASE, &[source]), 0);
         assert_eq!(invoke(&mut f, api::RELEASE, &[primary]), 0);
-        assert!(f.graphics_mut().capture_latest().unwrap());
+        assert!(capture(&mut f).unwrap());
         assert_eq!(f.graphics().presenter.bgra, latest);
         assert_eq!(f.graphics().presenter.frames, 3);
-        assert!(!f.graphics_mut().capture_latest().unwrap());
+        assert!(!capture(&mut f).unwrap());
         assert_eq!(f.graphics().stats.host_captures, 1);
         if mailbox {
             assert!(consumer.update());
@@ -113,7 +135,7 @@ fn selected_bitmaps_cannot_be_deleted_and_handles_can_be_released() {
 }
 
 #[test]
-// spec: DEV-FRAME-2
+// spec: DEV-FRAME-2, DEV-FRAME-3
 fn directdraw_locking_enforces_busy_and_unlock_states() {
     let mut f = fixture(true, 64, 32, false);
     f.run().unwrap();
@@ -132,7 +154,7 @@ fn directdraw_locking_enforces_busy_and_unlock_states() {
     assert_eq!(f.graphics().presenter.frames, 1);
     assert_eq!(invoke(&mut f, api::UNLOCK, &[surface, 0]), 0);
     assert_eq!(invoke(&mut f, api::BLT, &[primary, 0, surface, 0, 0, 0]), 0);
-    assert_eq!(f.graphics().presenter.frames, 2);
+    assert_eq!(f.graphics().presenter.frames, 1);
     assert_eq!(invoke(&mut f, api::RELEASE, &[surface]), 0);
     assert_eq!(
         invoke(&mut f, api::LOCK, &[surface, 0, LOCK_DESC, 0, 0]),
@@ -287,7 +309,7 @@ fn legacy_directdraw_16_bit_backbuffer_flips_to_bgra() {
         if deferred {
             assert_eq!(f.graphics().presenter.frames, 0);
             assert_eq!(f.graphics().stats.converted_pixels, 0);
-            assert!(f.graphics_mut().capture_latest().unwrap());
+            assert!(capture(&mut f).unwrap());
             assert_eq!(f.graphics().stats.converted_pixels, 8);
         }
         assert_eq!(f.graphics().presenter.frames, 1);

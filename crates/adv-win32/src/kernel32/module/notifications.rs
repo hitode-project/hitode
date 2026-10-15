@@ -412,6 +412,12 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
 }
 
 pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
+    if let Some(out) = crate::gdi32::raster::front::flush_software(
+        env,
+        adv_device::surface::FlushReason::Immediate,
+    ) {
+        return out;
+    }
     super::super::process::apc::retire(env, env.context);
     if env.sys.process_identity.completion.exit_status().is_some() {
         return Outcome::ExitProcess(code);

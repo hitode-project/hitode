@@ -1,6 +1,6 @@
 use adv_device::surface::{
-    BlitOptions, BlitRect, PixelFormat, Rect, Sampling, Snapshot, SurfaceMemory, Surfaces,
-    VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
+    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Snapshot, SurfaceMemory,
+    Surfaces, VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ struct Memory {
     owned_reads: bool,
     denied: Option<(u32, usize)>,
 }
+
 impl Memory {
     fn new(owned_reads: bool) -> Self {
         Self {
@@ -112,10 +113,18 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     let (producer, mut consumer) = frame_mailbox();
     store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
     store.present(base, &memory, store[base].rect()).unwrap();
+    store
+        .flush(&memory, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     // Later writes are not a presentation and cannot replace the retained base.
     memory.write(store[base].pixels, &[0; 80]).unwrap();
     let layer = video_layer();
-    assert_eq!(store.set_video_layer(7, Some(layer.clone())).unwrap(), 2);
+    assert_eq!(
+        store
+            .set_video_layer(7, Some(layer.clone()), &memory)
+            .unwrap(),
+        2
+    );
     assert!(consumer.update());
     assert!(consumer.current().hide_cursor());
     let mut cursor = consumer.current().video_cursor_regions().unwrap();
@@ -154,17 +163,17 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     assert_eq!(patch.bgra[..16], composed.bgra[20..36]);
     let mut hidden = layer.clone();
     hidden.visible = false;
-    store.set_video_layer(7, Some(hidden)).unwrap();
+    store.set_video_layer(7, Some(hidden), &memory).unwrap();
     assert!(consumer.update());
     assert!(!consumer.current().hide_cursor());
     consumer.current().snapshot(&mut composed).unwrap();
     assert_eq!(composed.bgra, pixels);
-    store.set_video_layer(7, Some(layer)).unwrap();
-    assert_eq!(store.set_video_layer(7, None).unwrap(), 5);
+    store.set_video_layer(7, Some(layer), &memory).unwrap();
+    assert_eq!(store.set_video_layer(7, None, &memory).unwrap(), 5);
     assert!(consumer.update());
     consumer.current().snapshot(&mut composed).unwrap();
     assert_eq!(composed.bgra, pixels);
-    assert_eq!(store.set_video_layer(7, None).unwrap(), 5);
+    assert_eq!(store.set_video_layer(7, None, &memory).unwrap(), 5);
 
     // USER's 960x544 client and a 1280x720 backbuffer describe the same whole
     // canvas. Scale the video, border and clip together, rather than covering 75%.
@@ -196,7 +205,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     assert_eq!(&patch.bgra[639 * 4..640 * 4], &[22, 0, 0, 255]);
     assert_eq!(&patch.bgra[640 * 4..641 * 4], &[33, 0, 0, 255]);
     assert_eq!(&patch.bgra[patch.bgra.len() - 4..], &[33, 0, 0, 255]);
-    store.set_video_layer(7, Some(scaled)).unwrap();
+    store.set_video_layer(7, Some(scaled), &memory).unwrap();
     assert!(consumer.update());
     consumer.current().snapshot(&mut composed).unwrap();
     for row in composed.bgra.chunks_exact(20) {
@@ -207,7 +216,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
             ]
         );
     }
-    store.set_video_layer(7, None).unwrap();
+    store.set_video_layer(7, None, &memory).unwrap();
     assert!(consumer.update());
     consumer.current().snapshot(&mut composed).unwrap();
     assert_eq!(composed.bgra, pixels);
@@ -216,13 +225,14 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
 #[test]
 // spec: MEDIA-VIDEO-4
 fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
+    let memory = Memory::new(false);
     let mut store = store();
     let (producer, mut consumer) = frame_mailbox();
     store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
     for color in 1..=100u8 {
         let mut layer = video_layer();
         layer.frame.bgra = Arc::from([color, 0, 0, 255, color, 0, 0, 255]);
-        store.set_video_layer(3, Some(layer)).unwrap();
+        store.set_video_layer(3, Some(layer), &memory).unwrap();
     }
     assert!(consumer.update());
     assert!(!consumer.update());
@@ -231,11 +241,11 @@ fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     assert_eq!(shown.frames, 100);
     assert_eq!(&shown.bgra[..4], &[0; 4]);
     assert_eq!(&shown.bgra[20..24], &[100, 0, 0, 255]);
-    assert!(store.capture_latest().unwrap());
+    assert!(store.capture_latest(&memory).unwrap());
     assert_eq!(store.presenter.bgra, shown.bgra);
     assert_eq!(store.stats.coalesced_frames, 99);
-    store.set_video_layer(3, None).unwrap();
-    store.capture_latest().unwrap();
+    store.set_video_layer(3, None, &memory).unwrap();
+    store.capture_latest(&memory).unwrap();
     assert!(store.presenter.bgra.iter().all(|byte| *byte == 0));
 }
 
@@ -268,11 +278,25 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
                 parent[parent_surface].rect(),
             )
             .unwrap();
+        parent
+            .flush(&parent_memory, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
     }
-    assert!(parent.transfer_frame_mailbox_to(&mut child).unwrap());
-    assert!(!parent.transfer_frame_mailbox_to(&mut store()).unwrap());
+    assert!(
+        parent
+            .transfer_frame_mailbox_to(&mut child, &parent_memory)
+            .unwrap()
+    );
+    assert!(
+        !parent
+            .transfer_frame_mailbox_to(&mut store(), &parent_memory)
+            .unwrap()
+    );
     child
         .present(child_surface, &child_memory, child[child_surface].rect())
+        .unwrap();
+    child
+        .flush(&child_memory, adv_device::surface::FlushReason::Immediate)
         .unwrap();
     assert!(consumer.update());
     let mut snapshot = Snapshot::default();
@@ -289,14 +313,24 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
             parent[parent_surface].rect(),
         )
         .unwrap();
+    parent
+        .flush(&parent_memory, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert!(!consumer.update());
-    assert!(child.transfer_frame_mailbox_to(&mut parent).unwrap());
+    assert!(
+        child
+            .transfer_frame_mailbox_to(&mut parent, &child_memory)
+            .unwrap()
+    );
     parent
         .present(
             parent_surface,
             &parent_memory,
             parent[parent_surface].rect(),
         )
+        .unwrap();
+    parent
+        .flush(&parent_memory, adv_device::surface::FlushReason::Immediate)
         .unwrap();
     assert!(consumer.update());
     consumer.current().snapshot(&mut snapshot).unwrap();
@@ -308,14 +342,23 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
 
 #[test]
 fn mailbox_handoff_rejects_an_owned_destination_without_losing_the_source() {
+    let parent_memory = Memory::new(false);
     let mut parent = store();
     let mut child = store();
     let (parent_producer, _) = frame_mailbox();
     let (child_producer, _) = frame_mailbox();
     parent.set_frame_mailbox(parent_producer, adv_sync::WakeEvent::new().unwrap());
     child.set_frame_mailbox(child_producer, adv_sync::WakeEvent::new().unwrap());
-    assert!(parent.transfer_frame_mailbox_to(&mut child).is_err());
-    assert!(parent.transfer_frame_mailbox_to(&mut store()).unwrap());
+    assert!(
+        parent
+            .transfer_frame_mailbox_to(&mut child, &parent_memory)
+            .is_err()
+    );
+    assert!(
+        parent
+            .transfer_frame_mailbox_to(&mut store(), &parent_memory)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -339,13 +382,23 @@ fn headless_foreground_handoff_keeps_deferred_capture_and_frame_sequence() {
                 parent[parent_surface].rect(),
             )
             .unwrap();
+        parent
+            .flush(&parent_memory, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
     }
-    assert!(!parent.transfer_frame_mailbox_to(&mut child).unwrap());
+    assert!(
+        !parent
+            .transfer_frame_mailbox_to(&mut child, &parent_memory)
+            .unwrap()
+    );
     child
         .present(child_surface, &child_memory, child[child_surface].rect())
         .unwrap();
+    child
+        .flush(&child_memory, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert_eq!(child.presenter.frames, 0);
-    assert!(child.capture_latest().unwrap());
+    assert!(child.capture_latest(&child_memory).unwrap());
     assert_eq!(child.presenter.frames, 4);
 }
 
@@ -746,7 +799,11 @@ fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels
                 s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
             }
             s.present(id, &m, s[id].rect()).unwrap();
+            s.flush(&m, adv_device::surface::FlushReason::Immediate)
+                .unwrap();
             s.present(id, &m, s[id].rect()).unwrap();
+            s.flush(&m, adv_device::surface::FlushReason::Immediate)
+                .unwrap();
             let mut expected = [0, 0, 255, 0].repeat(3);
             expected.extend_from_slice(&if format == PixelFormat::Bgra32 {
                 [31, 0, 0, 0].repeat(3)
@@ -758,8 +815,8 @@ fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels
                 assert_eq!(s.stats.coalesced_frames, 1);
                 s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
                 s.delete(id);
-                assert!(s.capture_latest().unwrap());
-                assert!(!s.capture_latest().unwrap());
+                assert!(s.capture_latest(&m).unwrap());
+                assert!(!s.capture_latest(&m).unwrap());
             }
             assert_eq!(s.presenter.bgra, expected);
             assert_eq!(s.presenter.frames, 2);
@@ -786,7 +843,7 @@ const INDEXED_COLORS: [[u8; 4]; 6] = [
 
 fn indexed_pattern(s: &mut Surfaces<Snapshot>, m: &mut Memory, bottom_up: bool) -> u32 {
     let id = s.create(3, 2, bottom_up, PixelFormat::Indexed8, m).unwrap();
-    s.set_palette(id, 1, &INDEXED_COLORS).unwrap();
+    s.set_palette(id, 1, &INDEXED_COLORS, m).unwrap();
     m.write(s[id].row(0, 0), &[1, 2, 3, 0xcc]).unwrap();
     m.write(s[id].row(0, 1), &[4, 5, 6, 0xcc]).unwrap();
     id
@@ -815,6 +872,8 @@ fn indexed_non_gray_rows_convert_to_bgra_with_stride_and_orientation() {
                 assert_eq!(m.read(s[src].row(3, y), 1).unwrap().as_ref(), &[0xcc]);
             }
             s.present(src, &m, s[src].rect()).unwrap();
+            s.flush(&m, adv_device::surface::FlushReason::Immediate)
+                .unwrap();
             assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
         }
     }
@@ -829,7 +888,7 @@ fn indexed_palette_bounds_default_and_nearest_rgb_are_explicit() {
         .unwrap();
     assert_eq!(s[id].decode_pixel(&[255]), [0; 4]);
     assert_eq!(s.palette_entries(id, 0, u32::MAX).unwrap(), &[[0; 4]; 256]);
-    assert_eq!(s.set_palette(id, 254, &INDEXED_COLORS).unwrap(), 2);
+    assert_eq!(s.set_palette(id, 254, &INDEXED_COLORS, &m).unwrap(), 2);
     assert_eq!(
         s.palette_entries(id, 254, 10).unwrap(),
         &INDEXED_COLORS[..2]
@@ -839,18 +898,18 @@ fn indexed_palette_bounds_default_and_nearest_rgb_are_explicit() {
         &INDEXED_COLORS[1..2]
     );
     let version = s[id].version;
-    assert_eq!(s.set_palette(id, u32::MAX, &INDEXED_COLORS).unwrap(), 0);
+    assert_eq!(s.set_palette(id, u32::MAX, &INDEXED_COLORS, &m).unwrap(), 0);
     assert_eq!(s[id].version, version);
     assert!(s.palette_entries(id, 256, 1).unwrap().is_empty());
-    s.set_palette(id, 12, &[[30, 60, 90, 0], [30, 60, 90, 255]])
+    s.set_palette(id, 12, &[[30, 60, 90, 0], [30, 60, 90, 255]], &m)
         .unwrap();
     // A nearest color may differ from every palette entry; alpha and ties
     // cannot change its RGB index. No implicit grayscale interpretation exists.
     assert_eq!(s[id].encode_pixel([31, 59, 90, 128]), [12, 0, 0, 0]);
     let direct = s.create(3, 2, false, PixelFormat::Bgra32, &mut m).unwrap();
-    assert!(s.set_palette(direct, 0, &INDEXED_COLORS).is_err());
+    assert!(s.set_palette(direct, 0, &INDEXED_COLORS, &m).is_err());
     assert!(s.palette_entries(direct, 0, 1).is_none());
-    assert!(s.set_palette(u32::MAX, 0, &INDEXED_COLORS).is_err());
+    assert!(s.set_palette(u32::MAX, 0, &INDEXED_COLORS, &m).is_err());
     assert!(s.palette_entries(u32::MAX, 0, 1).is_none());
 }
 
@@ -859,14 +918,14 @@ fn indexed_blits_remap_different_palettes_and_preserve_same_palette_indices() {
     let mut m = Memory::new(false);
     let mut s = store();
     let src = indexed_pattern(&mut s, &mut m, true);
-    s.set_palette(src, 200, &INDEXED_COLORS[..1]).unwrap();
+    s.set_palette(src, 200, &INDEXED_COLORS[..1], &m).unwrap();
     m.write(s[src].row(0, 0), &[200, 2, 3]).unwrap();
     let different = s
         .create(3, 2, false, PixelFormat::Indexed8, &mut m)
         .unwrap();
     let mut reversed = INDEXED_COLORS;
     reversed.reverse();
-    s.set_palette(different, 20, &reversed).unwrap();
+    s.set_palette(different, 20, &reversed, &m).unwrap();
     for y in 0..2 {
         m.write(s[different].row(3, y), &[0xa7]).unwrap();
     }
@@ -881,12 +940,14 @@ fn indexed_blits_remap_different_palettes_and_preserve_same_palette_indices() {
         &[22, 21, 20, 0xa7]
     );
     s.present(different, &m, s[different].rect()).unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
     let same = s
         .create(3, 2, false, PixelFormat::Indexed8, &mut m)
         .unwrap();
     let table = s[src].palette.clone().unwrap();
-    s.set_palette(same, 0, table.as_ref()).unwrap();
+    s.set_palette(same, 0, table.as_ref(), &m).unwrap();
     s.copy(src, s[src].rect(), same, s[same].rect(), &mut m)
         .unwrap();
     // Duplicate colors still retain their actual raw index for identical tables.
@@ -915,7 +976,9 @@ fn completed_indexed_frames_keep_their_palette_after_live_update_and_delete() {
             s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
         }
         s.present(id, &m, s[id].rect()).unwrap();
-        s.set_palette(id, 1, &[[99, 88, 77, 0]; 6]).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
+        s.set_palette(id, 1, &[[99, 88, 77, 0]; 6], &m).unwrap();
         assert!(!std::sync::Arc::ptr_eq(
             &old_table,
             s[id].palette.as_ref().unwrap()
@@ -924,8 +987,8 @@ fn completed_indexed_frames_keep_their_palette_after_live_update_and_delete() {
         s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
         s.delete(id);
         if path != 0 {
-            assert!(s.capture_latest().unwrap());
-            assert!(!s.capture_latest().unwrap());
+            assert!(s.capture_latest(&m).unwrap());
+            assert!(!s.capture_latest(&m).unwrap());
         }
         assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
         if path == 2 {
@@ -944,12 +1007,14 @@ fn indexed_primary_resize_keeps_the_palette_and_overlapping_indices() {
     let mut s = store();
     s.display_format = PixelFormat::Indexed8;
     let primary = s.primary(&mut m).unwrap();
-    s.set_palette(primary, 1, &INDEXED_COLORS).unwrap();
+    s.set_palette(primary, 1, &INDEXED_COLORS, &m).unwrap();
     s.fill_raw(primary, s[primary].rect(), 1, &mut m).unwrap();
     s.configure_window(3, 2, &mut m).unwrap();
     assert_eq!(s.palette_entries(primary, 1, 6).unwrap(), &INDEXED_COLORS);
     assert!(logical_pixels(&s, primary, &m).iter().all(|p| p == &[1]));
     s.present(primary, &m, s[primary].rect()).unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert_eq!(s.presenter.bgra, INDEXED_COLORS[0].repeat(6));
 }
 
@@ -1056,7 +1121,7 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
             .create(9, 1, false, PixelFormat::Indexed4, &mut memory)
             .unwrap();
         let colors: Vec<_> = (0..16).map(|i| [i, 0, 0, 0]).collect();
-        surfaces.set_palette(indexed, 0, &colors).unwrap();
+        surfaces.set_palette(indexed, 0, &colors, &memory).unwrap();
         memory
             .write(
                 surfaces[indexed].pixels,
@@ -1120,6 +1185,9 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
         surfaces
             .present(indexed, &memory, surfaces[indexed].rect())
             .unwrap();
+        surfaces
+            .flush(&memory, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert_eq!(
             surfaces
                 .presenter
@@ -1144,6 +1212,8 @@ fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
         let wake = adv_sync::WakeEvent::new().unwrap();
         s.set_frame_mailbox(tx, wake.clone());
         s.present(dst, &m, s[dst].rect()).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         assert!(wake.wait(Some(std::time::Duration::ZERO)).unwrap());
         let mut out = Snapshot::default();
@@ -1156,6 +1226,8 @@ fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
             .unwrap();
         assert!(damage.empty());
         s.present(dst, &m, damage).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(!rx.update());
         assert!(!wake.wait(Some(std::time::Duration::ZERO)).unwrap());
         assert_eq!(s.stats.presentations, serial);
@@ -1177,6 +1249,8 @@ fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
         );
         assert_eq!(s.stats.bytes_blitted - blitted, 20);
         s.present(dst, &m, damage).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         assert_eq!(rx.current().damage(), &[damage]);
         rx.current().snapshot(&mut out).unwrap();
@@ -1207,6 +1281,8 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
             .copy_from_slice(&value);
         let before = s.stats.copied_bytes;
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut out).unwrap();
         assert_eq!(out.bgra, expected);
@@ -1236,6 +1312,8 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
         m.write(s[id].row(r.x, r.y), &value).unwrap();
         expected[(r.x * 4) as usize..(r.x * 4 + 4) as usize].copy_from_slice(&value);
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
     }
     assert!(rx.update());
     rx.current().snapshot(&mut out).unwrap();
@@ -1253,6 +1331,8 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
         m.write(s[id].row(0, 3), &value).unwrap();
         expected[60..64].copy_from_slice(&value);
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
     }
     assert!(rx.update());
     rx.current().snapshot(&mut out).unwrap();
@@ -1273,6 +1353,8 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
         expected[76..80].fill(120 + n);
         let before = s.stats.copied_bytes;
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         full_copies += usize::from(s.stats.copied_bytes - before == 80);
         assert!(rx.update());
         let mut full = Snapshot::default();
@@ -1293,10 +1375,12 @@ fn bottom_up_palette_changes_and_packed_edges_match_full_conversion() {
         let mut s = store();
         let mut m = Memory::new(false);
         let id = s.create(5, 4, true, format, &mut m).unwrap();
-        s.set_palette(id, 1, &[[7, 8, 9, 0]]).unwrap();
+        s.set_palette(id, 1, &[[7, 8, 9, 0]], &m).unwrap();
         let (tx, mut rx) = frame_mailbox();
         s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
         s.present(id, &m, s[id].rect()).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         let mut out = Snapshot::default();
         rx.current().snapshot(&mut out).unwrap();
@@ -1308,6 +1392,8 @@ fn bottom_up_palette_changes_and_packed_edges_match_full_conversion() {
         };
         s.fill_raw(id, r, 1, &mut m).unwrap();
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut out).unwrap();
         assert_eq!(&*out.damage, &[r]);
@@ -1315,8 +1401,10 @@ fn bottom_up_palette_changes_and_packed_edges_match_full_conversion() {
         let mut full = Snapshot::default();
         rx.current().snapshot(&mut full).unwrap();
         assert_eq!(out.bgra, full.bgra);
-        s.set_palette(id, 1, &[[30, 31, 32, 0]]).unwrap();
+        s.set_palette(id, 1, &[[30, 31, 32, 0]], &m).unwrap();
         s.present(id, &m, s[id].rect()).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut out).unwrap();
         assert_eq!(&*out.damage, &[s[id].rect()]);
@@ -1334,11 +1422,15 @@ fn surface_switches_and_resize_round_trips_invalidate_damage_history() {
     let (tx, mut rx) = frame_mailbox();
     s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
     s.present(a, &m, s[a].rect()).unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert!(rx.update());
     let mut out = Snapshot::default();
     rx.current().snapshot(&mut out).unwrap();
     s.fill_raw(b, s[b].rect(), 0xabcdef, &mut m).unwrap();
     s.present(b, &m, s[b].rect()).unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     s.fill_raw(a, s[a].rect(), 0x12345678, &mut m).unwrap();
     s.present(
         a,
@@ -1351,6 +1443,8 @@ fn surface_switches_and_resize_round_trips_invalidate_damage_history() {
         },
     )
     .unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert!(rx.update());
     rx.current().snapshot(&mut out).unwrap();
     assert_eq!(&*out.damage, &[s[a].rect()]);
@@ -1366,6 +1460,8 @@ fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
     let (tx, mut rx) = frame_mailbox();
     s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
     s.present(id, &m, s[id].rect()).unwrap();
+    s.flush(&m, adv_device::surface::FlushReason::Immediate)
+        .unwrap();
     assert!(rx.update());
     let mut out = Snapshot::default();
     rx.current().snapshot(&mut out).unwrap();
@@ -1373,6 +1469,8 @@ fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
         let r = Rect { x, y, w: 1, h: 1 };
         m.write(s[id].row(x, y), &[7; 4]).unwrap();
         s.present(id, &m, r).unwrap();
+        s.flush(&m, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
     }
     assert!(rx.update());
     rx.current().snapshot(&mut out).unwrap();
@@ -1388,4 +1486,117 @@ fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
     let mut full = Snapshot::default();
     rx.current().snapshot(&mut full).unwrap();
     assert_eq!(out.bgra, full.bgra);
+}
+
+// spec: DEV-FRAME-8
+#[test]
+fn strip_frame_is_published_once_with_all_damage_at_the_writer_boundary() {
+    let mut s = store();
+    let mut m = Memory::new(false);
+    let id = s.primary(&mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    s.set_frame_mailbox(tx, wake.clone());
+    s.present_from(7, id, &m, s[id].rect()).unwrap();
+    s.flush_context(7, &m, FlushReason::Wait).unwrap();
+    assert!(rx.update());
+    assert!(wake.wait(Some(std::time::Duration::ZERO)).unwrap());
+    let mut out = Snapshot::default();
+    rx.current().snapshot(&mut out).unwrap();
+    let copied = s.stats.copied_bytes;
+    for y in 0..3 {
+        let strip = Rect {
+            x: 0,
+            y,
+            w: 5,
+            h: 1,
+        };
+        s.fill_raw(id, strip, 0x01020304 + y, &mut m).unwrap();
+        s.present_from(7, id, &m, strip).unwrap();
+        assert!(!rx.update());
+        assert!(!wake.wait(Some(std::time::Duration::ZERO)).unwrap());
+    }
+    assert_eq!(s.stats.presentations, 1);
+    assert_eq!(s.stats.copied_bytes, copied);
+    assert!(!s.flush_context(8, &m, FlushReason::Wait).unwrap());
+    assert!(!s.flush_context(8, &m, FlushReason::Message).unwrap());
+    assert!(s.flush_context(7, &m, FlushReason::Message).unwrap());
+    assert!(rx.update());
+    assert_eq!(s.stats.presentations, 2);
+    let damage = Rect {
+        x: 0,
+        y: 0,
+        w: 5,
+        h: 3,
+    };
+    assert_eq!(rx.current().damage(), &[damage]);
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(&*out.damage, &[damage]);
+    for y in 0..3usize {
+        assert_eq!(
+            &out.bgra[y * 20..y * 20 + 20],
+            &(0x01020304u32 + y as u32).to_le_bytes().repeat(5)
+        );
+    }
+    assert_eq!(&out.bgra[60..], &[0; 20]);
+    assert_eq!(s.stats.software_flushes, [1, 1, 0, 0]);
+}
+
+// spec: DEV-FRAME-8
+#[test]
+fn overdue_frame_flushes_on_present_or_another_context_wait() {
+    let mut s = store();
+    let mut m = Memory::new(false);
+    let id = s.primary(&mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    for via_present in [false, true] {
+        s.present_from(7, id, &m, s[id].rect()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(55));
+        if via_present {
+            // Unchanged strips must still enforce the pending frame's age.
+            s.present_from(8, id, &m, Rect::default()).unwrap();
+        } else {
+            assert!(s.flush_context(8, &m, FlushReason::Wait).unwrap());
+        }
+        assert!(rx.update());
+    }
+    assert_eq!(s.stats.software_flushes, [0, 0, 2, 0]);
+    assert_eq!(s.stats.presentations, 2);
+}
+
+// spec: DEV-FRAME-8
+#[test]
+fn capture_resize_palette_and_video_flush_pending_pixels_before_the_change() {
+    let mut s = store();
+    let mut m = Memory::new(false);
+    s.display_format = PixelFormat::Indexed8;
+    let id = s.primary(&mut m).unwrap();
+    s.set_palette(id, 1, &[[7, 8, 9, 0]], &m).unwrap();
+    s.fill_raw(id, s[id].rect(), 1, &mut m).unwrap();
+    let (tx, mut rx) = frame_mailbox();
+    s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    s.present_from(7, id, &m, s[id].rect()).unwrap();
+    s.set_palette(id, 1, &[[30, 31, 32, 0]], &m).unwrap();
+    assert!(rx.update());
+    let mut out = Snapshot::default();
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(out.bgra, [7, 8, 9, 0].repeat(20));
+    s.present_from(7, id, &m, s[id].rect()).unwrap();
+    s.configure_window(6, 3, &mut m).unwrap();
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!((out.width, out.height), (5, 4));
+    assert_eq!(out.bgra, [30, 31, 32, 0].repeat(20));
+    s.present_from(7, id, &m, s[id].rect()).unwrap();
+    assert!(s.capture_latest(&m).unwrap());
+    assert_eq!((s.presenter.width, s.presenter.height), (6, 3));
+    assert!(rx.update());
+    s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
+    s.present_from(7, id, &m, s[id].rect()).unwrap();
+    s.set_video_layer(1, Some(video_layer()), &m).unwrap();
+    assert!(rx.update());
+    rx.current().snapshot(&mut out).unwrap();
+    assert_eq!(&out.bgra[48..72], &[0; 24]);
+    assert_eq!(s.stats.software_flushes, [0, 0, 0, 4]);
 }

@@ -9,6 +9,85 @@ use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x0040_0000;
 
+// spec: PROC-MACH-7
+#[test]
+fn personality_wait_hook_observes_initial_and_resumed_contexts_before_parking() {
+    #[derive(Default)]
+    struct Boundaries(Vec<u32>);
+    let mut registry = Registry::default();
+    registry.add("test", "wait_twice", Conv::Stdcall { argc: 1 }, |env| {
+        let handle = env.arg(0);
+        Outcome::block(
+            Wait::Object {
+                handle,
+                deadline: None,
+            },
+            move |_, _| {
+                Outcome::block_then_return(
+                    Wait::Object {
+                        handle,
+                        deadline: None,
+                    },
+                    0,
+                )
+            },
+        )
+    });
+    let mut m = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    m.ext.insert(Boundaries::default());
+    m.sys.context_wait = Some(|env| {
+        env.ext.get_mut::<Boundaries>().0.push(env.context);
+        assert_eq!(env.sys.current, env.context);
+        assert_ne!(env.cpu.reg(adv_cpu::backend::Reg::Esp), 0);
+        None
+    });
+    let event = m.sys.objects.insert(Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
+    m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    let entry = m.resolve_import("test", "wait_twice").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(event).call(entry).ret();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.spawn("first", CODE, &[], 65536).unwrap();
+    m.spawn("second", CODE, &[], 65536).unwrap();
+    assert!(matches!(
+        m.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert_eq!(m.ext.get::<Boundaries>().0, [0, 1]);
+    m.sys.set_event(event);
+    assert!(matches!(
+        m.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert_eq!(m.ext.get::<Boundaries>().0, [0, 1, 0]);
+    assert_eq!(m.sys.context(0).state_name(), "Blocked");
+    assert_eq!(m.sys.context(1).state_name(), "Blocked");
+    m.sys.set_event(event);
+    assert!(matches!(
+        m.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert_eq!(m.sys.context(0).state_name(), "Done");
+    assert_eq!(m.ext.get::<Boundaries>().0, [0, 1, 0]);
+    m.sys.context_wait = Some(|_| Some(Outcome::ExitProcess(42)));
+    m.sys.set_event(event);
+    assert!(matches!(m.run(), RunResult::Exited(42)));
+}
+
 fn blocked_waiters(manual: bool, count: usize) -> (Machine<UnicornCpu>, u32) {
     let mut registry = Registry::default();
     registry.add("test", "wait", Conv::Stdcall { argc: 1 }, |env| {

@@ -113,6 +113,8 @@ pub struct Sys {
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// Personality infrastructure that must exist before the initial context.
     pub process_prepare: Option<fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>>,
+    /// Personality work before a context parks on an Outcome::Block.
+    pub context_wait: Option<fn(&mut Env<'_>) -> Option<Outcome>>,
     /// Personality-supplied interpretation of precise CPU stops.
     pub exception_handler: Option<exception::ExceptionHandler>,
     /// First backend fault, retained across guest SEH execution and later slices.
@@ -1101,12 +1103,25 @@ fn apply(
             wait,
             then,
             allow_time_skip,
-        } => Err(Parked::Block {
-            wait,
-            then,
-            origin,
-            allow_time_skip,
-        }),
+        } => {
+            if let Some(hook) = sys.context_wait
+                && let Some(out) = hook(&mut Env {
+                    context: sys.current,
+                    cpu,
+                    sys,
+                    ext,
+                    thunk: origin.thunk,
+                })
+            {
+                return apply(cpu, sys, ext, out, origin, defer_work);
+            }
+            Err(Parked::Block {
+                wait,
+                then,
+                origin,
+                allow_time_skip,
+            })
+        }
         Outcome::Defer { .. } => unreachable!("deferred outcomes were resolved above"),
         Outcome::HostRequest { then } => Err(Parked::HostRequest { then, origin }),
         Outcome::ExitThread(c) => {
@@ -1681,6 +1696,7 @@ impl<B: Backend> Machine<B> {
             thread_exception_entry: None,
             process_return: None,
             process_prepare: None,
+            context_wait: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,

@@ -42,6 +42,11 @@ fn wait_objects(
     timeout: u32,
     mask: u32,
 ) -> Outcome {
+    if let Some(out) =
+        crate::gdi32::raster::front::flush_software(e, adv_device::surface::FlushReason::Message)
+    {
+        return out;
+    }
     if count > 63 {
         set_last_error(e, 87);
         return Outcome::Return(u32::MAX);

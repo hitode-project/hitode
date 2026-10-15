@@ -59,6 +59,12 @@ pub(crate) fn terminate_process_owner(
     complete: impl FnOnce(&mut Env<'_>, Result<u32, processes::Error>) -> Outcome + 'static,
 ) -> Outcome {
     if pid == env.sys.pid {
+        if let Some(out) = crate::gdi32::raster::front::flush_software(
+            env,
+            adv_device::surface::FlushReason::Immediate,
+        ) {
+            return out;
+        }
         apc::retire_all(env);
         return Outcome::ExitProcess(code);
     }
@@ -78,6 +84,12 @@ pub(crate) fn terminate_process_owner(
                     err::ACCESS_DENIED,
                     "process has begun termination",
                 ));
+            }
+            if let Some(Outcome::Fail(message)) = crate::gdi32::raster::front::flush_software(
+                target,
+                adv_device::surface::FlushReason::Immediate,
+            ) {
+                return Err(processes::Error::new(31, message));
             }
             target.sys.terminate_process_stopped(code);
             apc::retire_all(target);

@@ -136,6 +136,9 @@ mod tests {
         surfaces.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
         let mut frame = Snapshot::default();
         surfaces.present(id, &memory, surfaces[id].rect()).unwrap();
+        surfaces
+            .flush(&memory, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut frame).unwrap();
         assert_eq!(upload(&context.submission().unwrap(), &texture, &frame), 80);
@@ -147,6 +150,9 @@ mod tests {
         };
         memory.write(surfaces[id].row(0, 2), &[7; 20]).unwrap();
         surfaces.present(id, &memory, r).unwrap();
+        surfaces
+            .flush(&memory, adv_device::surface::FlushReason::Immediate)
+            .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut frame).unwrap();
         assert_eq!(upload(&context.submission().unwrap(), &texture, &frame), 20);
@@ -162,6 +168,9 @@ mod tests {
                 .write(surfaces[id].row(x, 0), &[30 + x as u8; 4])
                 .unwrap();
             surfaces.present(id, &memory, r).unwrap();
+            surfaces
+                .flush(&memory, adv_device::surface::FlushReason::Immediate)
+                .unwrap();
         }
         assert!(rx.update());
         rx.current().snapshot(&mut frame).unwrap();

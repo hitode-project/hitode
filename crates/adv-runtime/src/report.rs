@@ -163,8 +163,8 @@ impl<B: Backend> Runtime<B> {
             .software_started
             .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9));
         report.push_str(&format!(
-            "\nSoftware frames: published {}; empty damage {}; mailbox copied {} bytes ({:.3} B/s); converted {} bytes ({:.3} B/s)",
-            g.published_frames, g.empty_damage, g.copied_bytes, g.copied_bytes as f64 / seconds,
+            "\nSoftware frames: published {}; flushes [wait, message, timeout, immediate] {:?}; empty damage {}; mailbox copied {} bytes ({:.3} B/s); converted {} bytes ({:.3} B/s)",
+            g.published_frames, g.software_flushes, g.empty_damage, g.copied_bytes, g.copied_bytes as f64 / seconds,
             g.converted_bytes, g.converted_bytes as f64 / seconds));
         for process in self.process_statuses() {
             report.push_str(&format!(

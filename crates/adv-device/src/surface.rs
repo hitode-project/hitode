@@ -125,6 +125,8 @@ pub struct GraphicsStats {
     pub software_started: Option<std::time::Instant>,
     pub converted_bytes: u64,
     pub published_frames: u64,
+    /// Software flushes: writer wait, message retrieval, timeout, immediate visibility.
+    pub software_flushes: [u64; 4],
     pub empty_damage: u64,
     pub host_captures: u64,
     pub coalesced_frames: u64,
@@ -178,7 +180,7 @@ impl PendingFrame {
         memory: &dyn SurfaceMemory,
         serial: u64,
         history: &DamageHistory,
-        damage: Rect,
+        damage: &Damage,
     ) -> Result<u64, String> {
         let full = surface.rect();
         let reset = self.width != surface.width
@@ -203,7 +205,7 @@ impl PendingFrame {
         self.bottom_up = surface.bottom_up;
         self.serial = 0; // A failed write invalidates this private slot's baseline.
         self.history = history.clone();
-        self.damage = Damage::from_rect(damage);
+        self.damage = *damage;
         if Arc::get_mut(&mut self.pixels).is_none() {
             self.pixels = Arc::new(Vec::new());
         }
@@ -432,7 +434,7 @@ impl Rect {
     }
 }
 /// Bounded software damage, stored without per-publication allocation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Damage {
     rects: [Rect; 4],
     len: usize,
@@ -444,6 +446,30 @@ impl Damage {
             len: usize::from(!rect.empty()),
         }
     }
+    fn add(&mut self, mut r: Rect) {
+        let mut i = 0;
+        while i < self.len {
+            let old = self.rects[i];
+            if r.x <= old.x + old.w
+                && old.x <= r.x + r.w
+                && r.y <= old.y + old.h
+                && old.y <= r.y + r.h
+            {
+                r = r.union(old);
+                self.rects.copy_within(i + 1..self.len, i);
+                self.len -= 1;
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        if self.len == 4 {
+            *self = Self::from_rect(self.iter().copied().fold(r, Rect::union));
+        } else {
+            self.rects[self.len] = r;
+            self.len += 1;
+        }
+    }
 }
 impl std::ops::Deref for Damage {
     type Target = [Rect];
@@ -453,7 +479,7 @@ impl std::ops::Deref for Damage {
 }
 #[derive(Clone, Default)]
 struct DamageHistory {
-    entries: [(u64, Rect); 16],
+    entries: [(u64, Damage); 16],
     first: usize,
     len: usize,
 }
@@ -462,7 +488,7 @@ impl DamageHistory {
         self.first = 0;
         self.len = 0;
     }
-    fn push(&mut self, entry: (u64, Rect)) {
+    fn push(&mut self, entry: (u64, Damage)) {
         self.entries[(self.first + self.len) % 16] = entry;
         if self.len < 16 {
             self.len += 1;
@@ -470,7 +496,7 @@ impl DamageHistory {
             self.first = (self.first + 1) % 16;
         }
     }
-    fn iter(&self) -> impl Iterator<Item = &(u64, Rect)> {
+    fn iter(&self) -> impl Iterator<Item = &(u64, Damage)> {
         (0..self.len).map(|i| &self.entries[(self.first + i) % 16])
     }
 }
@@ -486,29 +512,9 @@ fn damage_since(history: &DamageHistory, since: u64, serial: u64, full: Rect) ->
         return Damage::from_rect(full);
     }
     let mut result = Damage::default();
-    for &(_, r) in history.iter().filter(|(n, _)| *n > since) {
-        let mut r = r;
-        let mut i = 0;
-        while i < result.len() {
-            let old = result[i];
-            if r.x <= old.x + old.w
-                && old.x <= r.x + r.w
-                && r.y <= old.y + old.h
-                && old.y <= r.y + r.h
-            {
-                r = r.union(result.rects[i]);
-                result.rects.copy_within(i + 1..result.len, i);
-                result.len -= 1;
-                i = 0;
-            } else {
-                i += 1;
-            }
-        }
-        if result.len == 4 {
-            result = Damage::from_rect(result.iter().copied().fold(r, Rect::union));
-        } else {
-            result.rects[result.len] = r;
-            result.len += 1;
+    for (_, damage) in history.iter().filter(|(n, _)| *n > since) {
+        for &r in damage.iter() {
+            result.add(r);
         }
     }
     result
@@ -1128,6 +1134,7 @@ pub struct Surfaces<P: Presenter> {
     surfaces: BTreeMap<u32, Surface>,
     damage_history: DamageHistory,
     software_source: Option<u32>,
+    software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
     primary: Option<u32>,
@@ -1142,6 +1149,21 @@ pub struct Surfaces<P: Presenter> {
     blit_source: Vec<u8>,
     text_patch: Vec<u8>,
     frame_mailbox: Option<(FrameProducer, adv_sync::WakeEvent)>,
+}
+
+struct SoftwareFrame {
+    source: u32,
+    writer: u32,
+    started: std::time::Instant,
+    damage: Damage,
+}
+
+#[derive(Clone, Copy)]
+pub enum FlushReason {
+    Wait,
+    Message,
+    Timeout,
+    Immediate,
 }
 
 #[cfg(feature = "gpu")]
@@ -1173,6 +1195,7 @@ impl<P: Presenter> Surfaces<P> {
             surfaces: BTreeMap::new(),
             damage_history: DamageHistory::default(),
             software_source: None,
+            software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
             primary: None,
@@ -1250,7 +1273,9 @@ impl<P: Presenter> Surfaces<P> {
         id: u32,
         start: u32,
         entries: &[[u8; 4]],
+        m: &dyn SurfaceMemory,
     ) -> Result<usize, String> {
+        self.flush(m, FlushReason::Immediate)?;
         let surface = self
             .surfaces
             .get_mut(&id)
@@ -1317,7 +1342,7 @@ impl<P: Presenter> Surfaces<P> {
 
     pub fn set_deferred_presentation(&mut self, enabled: bool) -> Result<(), String> {
         if !enabled {
-            self.capture_latest()?;
+            self.capture_complete()?;
         }
         self.deferred_presentation = enabled;
         Ok(())
@@ -1325,12 +1350,18 @@ impl<P: Presenter> Surfaces<P> {
 
     /// Publish a movie sample or a layout/visibility change independently of a
     /// game Present. The retained base remains immutable beneath every layer.
-    pub fn set_video_layer(&mut self, key: u64, layer: Option<VideoLayer>) -> Result<u64, String> {
+    pub fn set_video_layer(
+        &mut self,
+        key: u64,
+        layer: Option<VideoLayer>,
+        m: &dyn SurfaceMemory,
+    ) -> Result<u64, String> {
         if let Some(layer) = &layer {
             layer.validate()?;
         } else if !self.video_layers.iter().any(|(id, _)| *id == key) {
             return Ok(self.stats.presentations);
         }
+        self.flush(m, FlushReason::Immediate)?;
         let serial = self
             .stats
             .presentations
@@ -1390,7 +1421,7 @@ impl<P: Presenter> Surfaces<P> {
             }
             self.pending_frame = Some(frame.clone());
             if !self.deferred_presentation {
-                self.capture_latest()?;
+                self.capture_complete()?;
             }
         }
         Ok(serial)
@@ -1512,7 +1543,11 @@ impl<P: Presenter> Surfaces<P> {
     /// Materialize the newest complete frame once, including after the guest stops
     /// producing frames. Raw pixels are owned, so later guest writes or surface
     /// release cannot turn this into a partially drawn frame.
-    pub fn capture_latest(&mut self) -> Result<bool, String> {
+    pub fn capture_latest(&mut self, m: &dyn SurfaceMemory) -> Result<bool, String> {
+        self.flush(m, FlushReason::Immediate)?;
+        self.capture_complete()
+    }
+    fn capture_complete(&mut self) -> Result<bool, String> {
         let Some(frame) = self
             .frame_mailbox
             .as_ref()
@@ -1567,10 +1602,15 @@ impl<P: Presenter> Surfaces<P> {
     /// receiving process continues the sequence observed by the same consumer.
     /// Without a mailbox, carry the capture policy and sequence instead.
     /// Both stores must be between execution leases during this handoff.
-    pub fn transfer_frame_mailbox_to(&mut self, destination: &mut Self) -> Result<bool, String> {
+    pub fn transfer_frame_mailbox_to(
+        &mut self,
+        destination: &mut Self,
+        m: &dyn SurfaceMemory,
+    ) -> Result<bool, String> {
         if destination.frame_mailbox.is_some() {
             return Err("destination already owns a frame mailbox".into());
         }
+        self.flush(m, FlushReason::Immediate)?;
         let endpoint = self.frame_mailbox.take();
         let transferred = endpoint.is_some();
         let serial = self
@@ -1599,6 +1639,9 @@ impl<P: Presenter> Surfaces<P> {
         m: &mut dyn SurfaceMemory,
     ) -> Result<(), String> {
         size(width, height)?;
+        if (self.width, self.height) != (width, height) {
+            self.flush(m, FlushReason::Immediate)?;
+        }
         self.width = width;
         self.height = height;
         let Some(primary) = self.primary else {
@@ -1714,16 +1757,85 @@ impl<P: Presenter> Surfaces<P> {
     }
     /// Hand surface `id` to the frame mailbox, the pending frame or the presenter.
     pub fn present(&mut self, id: u32, m: &dyn SurfaceMemory, damage: Rect) -> Result<(), String> {
+        self.present_from(0, id, m, damage)
+    }
+    pub fn present_from(
+        &mut self,
+        context: u32,
+        id: u32,
+        m: &dyn SurfaceMemory,
+        damage: Rect,
+    ) -> Result<(), String> {
         #[cfg(feature = "gpu")]
         if self.native_surfaces.contains_key(&id) {
             return Err("native surface requires GPU presentation".into());
         }
-        let s = &self.surfaces[&id];
-        let damage = damage.clipped(s.rect());
+        let damage = damage.clipped(self.surfaces[&id].rect());
         if damage.empty() {
             self.stats.empty_damage += 1;
-            return Ok(());
+        } else if self.frame_mailbox.is_some() {
+            if self
+                .software_pending
+                .as_ref()
+                .is_some_and(|p| p.source != id)
+            {
+                self.flush(m, FlushReason::Immediate)?;
+            }
+            let pending = self.software_pending.get_or_insert_with(|| SoftwareFrame {
+                source: id,
+                writer: context,
+                started: std::time::Instant::now(),
+                damage: Damage::default(),
+            });
+            pending.writer = context;
+            pending.damage.add(damage);
+        } else {
+            return self.publish_software(id, m, Damage::from_rect(damage));
         }
+        if self.software_expired() {
+            self.flush(m, FlushReason::Timeout)?;
+        }
+        Ok(())
+    }
+    fn software_expired(&self) -> bool {
+        self.software_pending
+            .as_ref()
+            .is_some_and(|p| p.started.elapsed() >= std::time::Duration::from_millis(50))
+    }
+    /// Only the drawing context ends a frame; other waits can enforce the age bound.
+    pub fn flush_context(
+        &mut self,
+        context: u32,
+        m: &dyn SurfaceMemory,
+        reason: FlushReason,
+    ) -> Result<bool, String> {
+        if self
+            .software_pending
+            .as_ref()
+            .is_some_and(|p| p.writer == context)
+        {
+            self.flush(m, reason)
+        } else if matches!(reason, FlushReason::Wait) && self.software_expired() {
+            self.flush(m, FlushReason::Timeout)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn flush(&mut self, m: &dyn SurfaceMemory, reason: FlushReason) -> Result<bool, String> {
+        let Some(pending) = self.software_pending.take() else {
+            return Ok(false);
+        };
+        self.publish_software(pending.source, m, pending.damage)?;
+        self.stats.software_flushes[reason as usize] += 1;
+        Ok(true)
+    }
+    fn publish_software(
+        &mut self,
+        id: u32,
+        m: &dyn SurfaceMemory,
+        damage: Damage,
+    ) -> Result<(), String> {
+        let s = &self.surfaces[&id];
         let latest = self.retained_frame.as_ref();
         let reset = self.software_source != Some(id)
             || latest.is_none_or(|f| {
@@ -1735,7 +1847,11 @@ impl<P: Presenter> Surfaces<P> {
                     || !f.video.is_empty()
             })
             || !self.video_layers.is_empty();
-        let damage = if reset { s.rect() } else { damage };
+        let damage = if reset {
+            Damage::from_rect(s.rect())
+        } else {
+            damage
+        };
         if reset {
             self.damage_history.clear();
         }
@@ -1749,8 +1865,13 @@ impl<P: Presenter> Surfaces<P> {
         self.retained_frame = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.try_publish(|frame| {
-                self.stats.copied_bytes +=
-                    frame.store(s, m, self.stats.presentations, &self.damage_history, damage)?;
+                self.stats.copied_bytes += frame.store(
+                    s,
+                    m,
+                    self.stats.presentations,
+                    &self.damage_history,
+                    &damage,
+                )?;
                 frame.video = self.video_layers.clone();
                 self.retained_frame = Some(frame.clone());
                 Ok::<(), String>(())
@@ -1774,14 +1895,19 @@ impl<P: Presenter> Surfaces<P> {
             // Retiring this reference before writing keeps the pending slot's
             // raw buffer reusable when no consumer still owns the previous base.
             self.retained_frame = None;
-            self.stats.copied_bytes +=
-                frame.store(s, m, self.stats.presentations, &self.damage_history, damage)?;
+            self.stats.copied_bytes += frame.store(
+                s,
+                m,
+                self.stats.presentations,
+                &self.damage_history,
+                &damage,
+            )?;
             frame.video = self.video_layers.clone();
             self.retained_frame = Some(frame.clone());
         }
         self.stats.published_frames += 1;
         if !self.deferred_presentation {
-            self.capture_latest()?;
+            self.capture_complete()?;
         }
         Ok(())
     }

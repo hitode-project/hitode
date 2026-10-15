@@ -45,9 +45,9 @@ fn provider(m: &mut Machine<JitCpu>, fail: bool) {
             })
         },
         update: if fail {
-            |_, _, _| Err("test presentation failure".into())
+            |_, _, _, _| Err("test presentation failure".into())
         } else {
-            |_, _, _| Ok(0)
+            |_, _, _, _| Ok(0)
         },
         completed: |_, _| None,
     });
