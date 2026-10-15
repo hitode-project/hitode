@@ -44,6 +44,8 @@ pub struct OverlayInput {
     pub modal: bool,
     /// The overlay holds a focused control that takes key input.
     pub wants_keyboard: bool,
+    /// The overlay draws something; otherwise the host may hide it.
+    pub visible: bool,
 }
 
 impl OverlayInput {
@@ -53,6 +55,7 @@ impl OverlayInput {
             regions: Vec::new(),
             modal: true,
             wants_keyboard: true,
+            visible: true,
         }
     }
 

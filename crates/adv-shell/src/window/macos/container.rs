@@ -104,11 +104,19 @@ impl GameContainer {
         Ok(view)
     }
 
+    /// Hides the webview over a running game while the overlay draws nothing,
+    /// taking it out of the window's composition.
+    pub fn set_overlay_visible(&self, visible: bool) {
+        let game = self.ivars().game.borrow().is_some();
+        self.ivars().webview.setHidden(game && !visible);
+    }
+
     /// Mount below the webview, or remove the completed game's view.
     pub fn set_game(&self, game: Option<&GameView>) {
         if let Some(old) = self.ivars().game.borrow_mut().take() {
             old.removeFromSuperview();
         }
+        self.ivars().webview.setHidden(false);
         let window = self.window().unwrap();
         if let Some(frame) = self.ivars().window_frame.take()
             && !window.styleMask().contains(NSWindowStyleMask::FullScreen)

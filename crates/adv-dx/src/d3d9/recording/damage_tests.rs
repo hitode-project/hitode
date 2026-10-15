@@ -376,6 +376,7 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
 struct Rotation {
     targets: Vec<Target>,
     next: usize,
+    damage: Vec<Option<adv_device::surface::Rect>>,
 }
 fn rotate(f: &mut Fixture, count: usize) {
     let mut targets = vec![f.target(f.back)];
@@ -391,13 +392,17 @@ fn rotate(f: &mut Fixture, count: usize) {
                 .with_alpha_mode(AlphaMode::Opaque),
         );
     }
-    f.m.ext.insert(Rotation { targets, next: 0 });
-    f.m.ext.get_mut::<State>().provider.present = |ext, surface, gpu| {
+    f.m.ext.insert(Rotation {
+        targets,
+        ..Default::default()
+    });
+    f.m.ext.get_mut::<State>().provider.present = |ext, surface, damage, gpu| {
         let provider = ext.get::<State>().provider;
         let image = (provider.target)(ext, surface).unwrap().image;
         let serial = ext.get::<Presents>().serial + 1;
         let native = gpu.completed_frame(image, serial)?;
         let r = ext.get_mut::<Rotation>();
+        r.damage.push(damage);
         r.next = (r.next + 1) % r.targets.len();
         let replacement = r.targets[r.next].clone();
         (provider.replace)(ext, surface, replacement).unwrap();
@@ -408,24 +413,45 @@ fn rotate(f: &mut Fixture, count: usize) {
         Ok(serial)
     };
 }
-// spec: GFX-REC-5
+// spec: GFX-REC-5 HOST-VIEW-10
 #[test]
 fn age_two_and_three_rotating_targets_match_full_execution_bit_for_bit() {
     for count in [2, 3] {
         let mut f = fixture();
         rotate(&mut f, count);
         let mut colors = [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]];
+        let mut previous: Option<Vec<u8>> = None;
         for frame in 0..12 {
             colors[frame % 3][frame % 2] = (frame as f32 + 1.) / 16.;
             scene(&mut f, colors);
             present(&mut f);
+            let pixels = latest(&mut f);
             assert_eq!(
-                latest(&mut f),
+                pixels,
                 reference(&mut f, colors),
                 "rotation {count}, frame {frame}"
             );
+            // The published damage covers every pixel that differs from the previous present.
+            let published = f.m.ext.get::<Rotation>().damage.last().copied().flatten();
+            if let (Some(r), Some(previous)) = (published, &previous) {
+                for (i, (a, b)) in pixels
+                    .chunks_exact(4)
+                    .zip(previous.chunks_exact(4))
+                    .enumerate()
+                {
+                    let (x, y) = (i as u32 % 16, i as u32 / 16);
+                    let inside = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+                    assert!(
+                        inside || a == b,
+                        "rotation {count}, frame {frame}, pixel {x},{y}"
+                    );
+                }
+            }
+            previous = Some(pixels);
         }
         assert!(f.m.ext.get::<State>().frames.clipped_executions >= 7);
+        let damage = &f.m.ext.get::<Rotation>().damage;
+        assert!(damage.iter().filter(|d| d.is_some()).count() >= 7);
     }
 }
 // spec: GFX-REC-3 GFX-REC-4 GFX-REC-5

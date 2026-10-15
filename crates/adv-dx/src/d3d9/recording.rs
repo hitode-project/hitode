@@ -110,6 +110,10 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         }
     }
 }
+/// What the frame being presented changed since the previous presentation, when known.
+pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Rect> {
+    f.verify_region
+}
 fn frame<'a>(env: &'a mut Env<'_>, owner: Id) -> &'a mut Recording {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) else {
         unreachable!("retained recording device")

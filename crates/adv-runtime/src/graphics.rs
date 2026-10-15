@@ -264,9 +264,9 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .replace_native(id, target)
                 .map(|_| ())
         },
-        present: |ext, id, gpu| {
+        present: |ext, id, damage, gpu| {
             ext.get_mut::<Graphics<Snapshot>>()
-                .present_native_rotating(id, gpu)
+                .present_native_rotating(id, damage, gpu)
         },
         present_copy: |ext, id, gpu| {
             use adv_device::gpu::Error;
@@ -276,7 +276,7 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .ok_or_else(|| Error::Invalid("COPY front surface no longer exists".into()))?;
             let frame = gpu.present(&target.image, 0)?;
             graphics
-                .publish_native_frame(id, frame)
+                .publish_native_frame(id, frame, None)
                 .map_err(Error::Invalid)
         },
         repeat: |ext, id| ext.get_mut::<Graphics<Snapshot>>().repeat_native_frame(id),

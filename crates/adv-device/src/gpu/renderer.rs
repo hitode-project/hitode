@@ -324,6 +324,8 @@ impl Drop for FramePin {
 pub struct NativeFrame {
     pub image: Image,
     pub serial: u64,
+    /// What recent publications changed, set when the frame is published.
+    pub damage: crate::surface::FrameDamage,
     context: NativeContext,
     _pin: Arc<FramePin>,
 }
@@ -485,7 +487,9 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("adv neutral graphics"),
                 required_limits: limits,
-                required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
+                // SHADER_F16 serves the half-precision upscalers.
+                required_features: adapter.features()
+                    & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::SHADER_F16),
                 ..Default::default()
             })
             .await
@@ -1507,6 +1511,7 @@ impl Gpu {
         Ok(NativeFrame {
             image: snapshot,
             serial,
+            damage: Default::default(),
             context: self.context.clone(),
             _pin: pin,
         })
@@ -1541,6 +1546,7 @@ impl Gpu {
         Ok(NativeFrame {
             image,
             serial,
+            damage: Default::default(),
             context: self.context.clone(),
             _pin: pin,
         })
