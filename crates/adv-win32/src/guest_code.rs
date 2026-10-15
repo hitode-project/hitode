@@ -5,10 +5,36 @@
 
 use adv_abi::{GuestCode, Registry};
 mod heap;
+mod interlocked;
 
 /// Attach after every handler is registered: re-registering a handler drops it.
 pub(crate) fn install(reg: &mut Registry) {
     for (module, name, guest) in [
+        (
+            "kernel32.dll",
+            "InterlockedIncrement",
+            &interlocked::INCREMENT,
+        ),
+        (
+            "kernel32.dll",
+            "InterlockedDecrement",
+            &interlocked::DECREMENT,
+        ),
+        (
+            "kernel32.dll",
+            "InterlockedExchange",
+            &interlocked::EXCHANGE,
+        ),
+        (
+            "kernel32.dll",
+            "InterlockedExchangeAdd",
+            &interlocked::EXCHANGE_ADD,
+        ),
+        (
+            "kernel32.dll",
+            "InterlockedCompareExchange",
+            &interlocked::COMPARE_EXCHANGE,
+        ),
         ("ntdll.dll", "RtlAllocateHeap", &heap::ALLOCATE),
         ("ntdll.dll", "RtlFreeHeap", &heap::FREE),
         ("user32.dll", "SetRectEmpty", &SET_RECT_EMPTY),

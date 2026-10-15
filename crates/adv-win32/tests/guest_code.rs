@@ -459,3 +459,59 @@ fn contended_critical_sections_hand_over_between_guest_code_and_host() {
         contend(jit(), guest_code, false);
     }
 }
+
+fn atomics<B: Backend>(cpu: B, guest: bool) -> Vec<u8> {
+    let mut m = machine(cpu, guest);
+    let names = [
+        "InterlockedIncrement",
+        "InterlockedDecrement",
+        "InterlockedExchange",
+        "InterlockedExchangeAdd",
+        "InterlockedCompareExchange",
+    ];
+    let targets: Vec<_> = names
+        .iter()
+        .map(|n| m.resolve_import("kernel32.dll", n).unwrap())
+        .collect();
+    let values = [0, 1, u32::MAX, i32::MAX as u32, i32::MIN as u32, 0xdeadbeef];
+    let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let saved = run_loop(&mut m, |a| {
+        a.push_imm(0x12345678).call(set_error);
+        for (kind, &target) in targets.iter().enumerate() {
+            for (i, &value) in values.iter().enumerate() {
+                let p = DATA + 0x800 + 4 * (kind * values.len() + i) as u32;
+                raw(a, &[0xc7, 0x05], p);
+                a.bytes.extend_from_slice(&value.to_le_bytes());
+                if kind == 4 {
+                    a.push_imm(value);
+                }
+                if kind >= 2 {
+                    a.push_imm(0x87654321);
+                }
+                a.push_imm(p).call(target);
+                raw(a, &[0xa3], RESULTS + 4 * (kind * values.len() + i) as u32);
+            }
+        }
+        a.call(get_error);
+        raw(a, &[0xa3], RESULTS + 0x200);
+    });
+    assert_eq!(saved[..4], SENTINELS);
+    assert_eq!(saved[4], 0);
+    let mut bytes = vec![0; 0x5000];
+    m.cpu.read(DATA, &mut bytes).unwrap();
+    bytes
+}
+
+// spec: WIN32-API-16, PROC-MACH-2, PROC-MACH-3
+#[test]
+fn interlocked_guest_entries_match_host_wraparound_memory_and_abi() {
+    assert_eq!(
+        atomics(UnicornCpu::new(PARK_ADDR).unwrap(), true),
+        atomics(UnicornCpu::new(PARK_ADDR).unwrap(), false)
+    );
+    assert_eq!(
+        atomics(JitCpu::new(PARK_ADDR, false).unwrap(), true),
+        atomics(JitCpu::new(PARK_ADDR, false).unwrap(), false)
+    );
+}
