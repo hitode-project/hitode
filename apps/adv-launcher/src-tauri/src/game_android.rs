@@ -21,7 +21,7 @@ struct Host {
     view: Option<Rc<GameView>>,
     session: Option<Session>,
     playback: Option<Playback>,
-    /// The overlay's pause menu or report is open.
+    /// Shared lifecycle, audio focus and overlay pause gates.
     lifecycle: adv_shell::mobile::Lifecycle,
     /// The game was asked to close; another request forces it.
     closing: bool,
