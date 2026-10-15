@@ -92,7 +92,10 @@ pub(super) fn register(registry: &mut Registry) {
         texture_desc_ABI,
         texture_lock_ABI,
         texture_unlock_ABI,
-        set_texture_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_texture_ABI
+        },
         get_texture_ABI,
         texture_levels_ABI,
         texture_set_lod_ABI,
@@ -922,20 +925,29 @@ fn set_texture_binding(
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
+    let candidate = if texture.is_null() {
+        None
+    } else {
+        let Some(id) = com(env).identity::<Payload>(&env.sys.objects, texture.addr()) else {
+            return INVALID;
+        };
+        Some(id)
+    };
+    if d.recording.is_none() && old == candidate {
+        return 0;
+    }
     let new = if texture.is_null() {
         None
     } else {
-        let Some(r) = resource(env, texture.addr()) else {
+        let Some(Payload::Resource(r)) =
+            candidate.and_then(|id| com(env).get_identity(&env.sys.objects, id))
+        else {
             return INVALID;
         };
         if r.kind != Kind::Texture || r.device != device_id || r.desc.Pool > 1 {
             return INVALID;
         }
-        Some(
-            com(env)
-                .identity::<Payload>(&env.sys.objects, texture.addr())
-                .unwrap(),
-        )
+        candidate
     };
     if let Some(result) =
         super::shaders::stateblocks::record_texture_slot(env, device_id, slot, new)

@@ -302,6 +302,49 @@ impl Snapshot {
         ids
     }
 }
+impl Snapshot {
+    pub(in crate::d3d9) fn binding_state(&self) -> (&Bindings, &buffers::Bindings, Option<Id>) {
+        (&self.shaders, &self.buffers, self.texture)
+    }
+}
+pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -> bool {
+    let Some(b) = block(env, pointer) else {
+        return true;
+    };
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
+        return true;
+    };
+    if d.recording.is_some() {
+        return true;
+    }
+    let s = b.snapshot.as_ref().unwrap();
+    let delta = s.delta(d, b.versions);
+    let pairs = if capture {
+        changes(
+            &s.shaders,
+            &s.buffers,
+            s.texture,
+            (&d.shaders, &d.buffers, d.texture),
+            &delta,
+        )
+    } else {
+        changes(
+            &d.shaders,
+            &d.buffers,
+            d.texture,
+            (&s.shaders, &s.buffers, s.texture),
+            &delta,
+        )
+    };
+    // Public ownership guarantees that none of these releases frees guest storage.
+    pairs.iter().all(|(old, _)| {
+        old.is_none_or(|id| {
+            com(env)
+                .references(&env.sys.objects, id)
+                .is_some_and(|n| n > 0)
+        })
+    })
+}
 pub(in crate::d3d9) enum FixedKey {
     Fvf,
     Render(i32),
@@ -368,8 +411,14 @@ pub(in crate::d3d9) fn register(registry: &mut Registry) {
         block_add_ref_ABI,
         block_release_ABI,
         block_device_ABI,
-        capture_ABI,
-        apply_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::super::leaf_calls::state_block),
+            ..capture_ABI
+        },
+        adv_abi::Api {
+            env_leaf: Some(super::super::leaf_calls::state_block),
+            ..apply_ABI
+        },
         create_ABI,
         begin_ABI,
         end_ABI,

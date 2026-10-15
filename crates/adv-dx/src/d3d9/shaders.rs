@@ -118,9 +118,15 @@ pub(super) fn register(registry: &mut Registry) {
         pixel_function_ABI,
         create_vertex_ABI,
         create_pixel_ABI,
-        set_vertex_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_vertex_ABI
+        },
         get_vertex_ABI,
-        set_pixel_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_pixel_ABI
+        },
         get_pixel_ABI,
         set_vertex_f_ABI,
         get_vertex_f_ABI,
@@ -388,14 +394,20 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     let new = if pointer.is_null() {
         None
     } else {
-        let Some(s) =
-            shader(env, pointer.addr()).filter(|s| s.device == id && s.parsed.stage == stage)
-        else {
+        let Some(new) = com(env).identity::<Payload>(&env.sys.objects, pointer.addr()) else {
             return INVALID;
         };
-        let _ = s;
-        com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
+        Some(new)
     };
+    let d = device(env, this.addr()).unwrap();
+    if d.recording.is_none() && d.shaders.binding(stage) == new {
+        return 0;
+    }
+    if new.is_some_and(|new| {
+        bound(env, new).is_none_or(|s| s.device != id || s.parsed.stage != stage)
+    }) {
+        return INVALID;
+    }
     if let Some(code) = stateblocks::record_shader(env, id, stage, new) {
         return code;
     }

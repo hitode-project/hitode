@@ -49,5 +49,94 @@ pub(super) fn draw(env: &mut Env<'_>) -> Option<u64> {
     }
 }
 
+fn invoke(env: &mut Env<'_>) -> Option<u64> {
+    match (env.sys.thunks.get(env.thunk).f.handler)(env) {
+        Outcome::Return(value) => {
+            Some((u64::from(env.cpu.reg(adv_cpu::backend::Reg::Edx)) << 32) | u64::from(value))
+        }
+        _ => unreachable!("admitted state call cannot wait"),
+    }
+}
+fn readable_arguments(env: &Env<'_>) -> Option<()> {
+    for word in 0..u32::from(env.sys.thunks.get(env.thunk).f.conv.argc()) {
+        env.cpu.arg(word).ok()?;
+    }
+    Some(())
+}
+pub(super) fn state_block(env: &mut Env<'_>) -> Option<u64> {
+    readable_arguments(env)?;
+    let name = env.sys.thunks.get(env.thunk).name.as_str();
+    if !shaders::stateblocks::admits_leaf(env, env.cpu.arg(0).ok()?, name.ends_with("Capture")) {
+        return None;
+    }
+    invoke(env)
+}
+pub(super) fn binding(env: &mut Env<'_>) -> Option<u64> {
+    readable_arguments(env)?;
+    let this = env.cpu.arg(0).ok()?;
+    let d = device(env, this)?;
+    let (shaders, buffers, texture) = d
+        .recording
+        .as_ref()
+        .map_or((&d.shaders, &d.buffers, d.texture), |s| s.binding_state());
+    let name = env.sys.thunks.get(env.thunk).name.as_str();
+    let (old, pointer) = match name {
+        "IDirect3DDevice9::SetFVF" => (buffers.declaration, 0),
+        "IDirect3DDevice9::SetVertexDeclaration" => (buffers.declaration, env.cpu.arg(1).ok()?),
+        "IDirect3DDevice9::SetVertexShader" => (shaders.vertex, env.cpu.arg(1).ok()?),
+        "IDirect3DDevice9::SetPixelShader" => (shaders.pixel, env.cpu.arg(1).ok()?),
+        "IDirect3DDevice9::SetIndices" => (buffers.indices, env.cpu.arg(1).ok()?),
+        "IDirect3DDevice9::SetStreamSource" => {
+            let Some(stream) = buffers.streams.get(env.cpu.arg(1).ok()? as usize) else {
+                return invoke(env);
+            };
+            (stream.buffer, env.cpu.arg(2).ok()?)
+        }
+        "IDirect3DDevice9::SetTexture" => {
+            let Some(slot) = programmable::sampler_slot(env.cpu.arg(1).ok()?) else {
+                return invoke(env);
+            };
+            let pointer = env.cpu.arg(2).ok()?;
+            if resources::resource(env, pointer).is_some_and(|r| {
+                r.kind == resources::Kind::Texture
+                    && r.desc.Pool == 1
+                    && (residency::cold(env, pointer) || r.levels.iter().any(|l| l.dirty))
+            }) {
+                return None;
+            }
+            (
+                if slot == 0 {
+                    texture
+                } else {
+                    shaders.textures[slot]
+                },
+                pointer,
+            )
+        }
+        _ => unreachable!("registered binding leaf"),
+    };
+    let new = if pointer == 0 {
+        None
+    } else {
+        // Invalid incoming objects cannot replace any binding.
+        let Some(id) = com(env).identity::<Payload>(&env.sys.objects, pointer) else {
+            return invoke(env);
+        };
+        Some(id)
+    };
+    if old != new
+        && old.is_some_and(|id| {
+            com(env)
+                .references(&env.sys.objects, id)
+                .is_none_or(|n| n == 0)
+        })
+    {
+        return None;
+    }
+    invoke(env)
+}
+
+#[cfg(test)]
+mod binding_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests;
