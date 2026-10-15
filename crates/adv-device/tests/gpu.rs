@@ -148,6 +148,25 @@ fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_los
 }
 
 #[test]
+fn cancel_after_a_delivered_map_leaves_the_device_valid() {
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .expect("test GPU adapter");
+    gpu.set_readback_limit(1).unwrap();
+    let target = gpu.target(2, 2, false).unwrap();
+    gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+    let mut ticket = gpu.readback(&target.image, None).unwrap();
+    ticket.take_completion_job().unwrap()();
+    // The callback already unmapped; owner teardown races and still cancels.
+    ticket.cancel();
+    assert_eq!(ticket.poll().unwrap().unwrap(), [0, 0, 255, 255].repeat(4));
+    assert!(gpu.check().is_ok());
+    assert_eq!(read(&mut gpu, &target.image), [0, 0, 255, 255].repeat(4));
+}
+
+#[test]
 fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() {
     use adv_device::surface::{Snapshot, Surfaces};
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
@@ -806,7 +825,7 @@ fn invalid_commands_are_rejected_before_gpu_submission_and_context_can_be_rebuil
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 #[test]
 fn actual_software_adapter_clear_and_draw() {
     color_texture_blend_clip_depth_and_native_frame_readback(true);
