@@ -15,6 +15,7 @@ mod env_leaf;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
+pub mod frame_spin;
 mod invocation;
 pub mod layout;
 mod leaf;
@@ -138,6 +139,8 @@ pub struct Sys {
     pub stats: Stats,
     /// Scheduler latency observations, independent of optional execution profiling.
     pub scheduling: scheduling::SchedulingStats,
+    /// The host display's frame clock for frame spins (PROC-CLOCK-4).
+    pub frame_pacer: Option<std::sync::Arc<dyn frame_spin::FramePacer>>,
     pub schedule_trace: schedule_trace::ScheduleTrace,
     wakes: sched::ActiveContexts,
     /// Stopped contexts whose execution storage still needs to be reclaimed.
@@ -341,6 +344,7 @@ impl Sys {
             frames: Vec::new(),
             state: State::Ready { resume: None },
             yielded: false,
+            spin: Default::default(),
             thread_handle,
         });
         self.wakes.insert(
@@ -700,6 +704,7 @@ impl Sys {
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
         self.completed_frames = self.completed_frames.wrapping_add(1);
+        self.frame_spin_frame();
         if let Some(budget) = &mut self.stats.frame_budget {
             budget.mark_frame(u64::from(self.completed_frames));
         }
@@ -1719,6 +1724,7 @@ impl<B: Backend> Machine<B> {
             current: 0,
             frame: 0,
             completed_frames: 0,
+            frame_pacer: None,
             pid: 0x1000,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
@@ -2275,6 +2281,7 @@ impl<B: Backend> Machine<B> {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
                 let soon = self.sys.clock.now_us() + 1000;
+                let soon = self.sys.frame_spin_round(soon).unwrap_or(soon);
                 let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
                 self.sys.clock.begin_wait(Some(t));
                 return SliceResult::Complete(RunResult::Idle {
@@ -2526,6 +2533,9 @@ impl<B: Backend> Machine<B> {
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
             let run_elapsed = run_started.elapsed();
+            if let Some(c) = self.sys.contexts.get_mut(id as usize) {
+                c.spin.ran(run_elapsed);
+            }
             if self.sys.schedule_trace.enabled() {
                 self.sys.schedule_trace.event(
                     "run_end",
