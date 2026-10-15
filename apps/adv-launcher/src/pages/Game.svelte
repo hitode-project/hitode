@@ -12,7 +12,7 @@
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { canReveal, reveal } from "../lib/reveal";
-  import { modal, onOverlayInput, region, type Rect } from "../lib/overlay";
+  import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
 
   /**
    * The in-game overlay. The native game view is under this transparent page;
@@ -206,7 +206,7 @@
   {/if}
 
   {#if fps}
-    <div class="fps mono">{measuredFps.toFixed(0)} FPS</div>
+    <div class="fps mono" {@attach shown}>{measuredFps.toFixed(0)} FPS</div>
   {/if}
 
   {#if view !== "closed"}
@@ -308,7 +308,7 @@
   {/if}
 
   {#if backHint}
-    <div class="back" aria-hidden="true"><Icon name="chevron-left" size={18} stroke={1.8} /></div>
+    <div class="back" aria-hidden="true" {@attach shown}><Icon name="chevron-left" size={18} stroke={1.8} /></div>
   {/if}
 
   {#if textBar}
@@ -330,7 +330,7 @@
   {/if}
 
   {#if showRegions}
-    <div class="outlines" class:modal={outlineModal} aria-hidden="true">
+    <div class="outlines" class:modal={outlineModal} aria-hidden="true" {@attach shown}>
       {#each outlines as r, i (i)}
         <div style="left: {r.x}px; top: {r.y}px; width: {r.width}px; height: {r.height}px"></div>
       {/each}

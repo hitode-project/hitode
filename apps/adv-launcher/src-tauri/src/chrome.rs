@@ -21,7 +21,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, ns_string};
 use std::cell::RefCell;
-use tauri::{Emitter, Manager, WebviewWindow};
+use tauri::{Manager, WebviewWindow};
 
 define_class!(
     /// Emits the same `pause` event as the ⌘. menu item.
@@ -33,7 +33,7 @@ define_class!(
     impl PauseTarget {
         #[unsafe(method(pause:))]
         fn pause(&self, _sender: &AnyObject) {
-            let _ = self.ivars().emit("pause", ());
+            crate::game::pause(self.ivars());
         }
     }
 );

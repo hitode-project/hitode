@@ -11,7 +11,7 @@
 //! It is replaced by an item that calls AppHandle::exit; the game module then
 //! defers the exit until the game has closed.
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 const PAUSE: &str = "pause";
 const QUIT: &str = "quit";
@@ -40,7 +40,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 pub fn on_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     match id {
         PAUSE => {
-            let _ = app.emit(PAUSE, ());
+            #[cfg(target_os = "macos")]
+            crate::game::pause(app);
+            #[cfg(not(target_os = "macos"))]
+            let _ = tauri::Emitter::emit(app, PAUSE, ());
         }
         QUIT => app.exit(0),
         _ => {}
