@@ -13,17 +13,35 @@ pub(super) struct DiskCache {
     path: PathBuf,
     dirty: bool,
     updates: u32,
+    pending: Option<compile::Compile<()>>,
 }
 impl DiskCache {
     pub(super) fn changed(&mut self) {
         self.dirty = true;
         self.updates += 1;
-        if self.updates.is_multiple_of(16) {
-            self.save();
+        if self.updates.is_multiple_of(16)
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|job| job.ready().is_some())
+        {
+            let (cache, path) = (self.cache.clone(), self.path.clone());
+            self.pending = Some(compile::Compile::spawn(
+                LIMIT as usize,
+                compile::CompileCounters::default(),
+                move || {
+                    if let Some(data) = cache.get_data().filter(|v| v.len() as u64 <= LIMIT) {
+                        save_blob(&path, &data).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                },
+            ));
         }
     }
-
     fn save(&mut self) {
+        if let Some(job) = self.pending.take() {
+            let _ = job.resolve();
+        }
         if !self.dirty {
             return;
         }
@@ -59,6 +77,9 @@ pub(super) fn load_blob(path: &Path) -> Option<Vec<u8>> {
     Some(data.to_vec())
 }
 pub(super) fn save_blob(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if data.len() as u64 > LIMIT {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     let Some(directory) = path.parent() else {
         return Err(std::io::ErrorKind::InvalidInput.into());
     };
@@ -123,6 +144,7 @@ impl Gpu {
                 path,
                 dirty: false,
                 updates: 0,
+                pending: None,
             });
         }
         self.programmable.warm = warmup::Warmup::open(
@@ -162,5 +184,70 @@ mod tests {
         assert!(load_blob(&path).is_none());
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    // spec: GFX-CACHE-3
+    #[test]
+    fn native_size_boundary_rejects_extended_blobs_before_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "adv-driver-bound-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("cache.bin");
+        save_blob(&path, b"payload").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(LIMIT + 41).unwrap();
+        assert!(load_blob(&path).is_none());
+        file.set_len(LIMIT + 40).unwrap();
+        assert!(load_blob(&path).is_none()); // exact boundary, invalid checksum
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: GFX-CACHE-3, GFX-CACHE-8
+    #[test]
+    #[cfg(not(target_vendor = "apple"))]
+    fn incompatible_native_driver_header_falls_back_and_rebuilds() {
+        let mut gpu = pollster::block_on(Gpu::request_backend(
+            !cfg!(target_os = "android"),
+            GpuBackend::Vulkan,
+        ))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "adv-driver-fallback-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        gpu.set_pipeline_cache_directory(Some(&dir));
+        let disk = gpu.programmable.disk.as_mut().unwrap();
+        let mut data = disk.cache.get_data().unwrap();
+        // wgpu 30's driver validation key occupies bytes 32..48, before any
+        // native payload. A mismatched key must never reach the Vulkan driver.
+        assert!(data.len() >= 64);
+        data[32] ^= 1;
+        let path = disk.path.clone();
+        save_blob(&path, &data).unwrap();
+        gpu.set_pipeline_cache_directory(Some(&dir));
+        let target = gpu.target(1, 1, false).unwrap();
+        gpu.draw(
+            &target,
+            &[Vertex {
+                position: [-1., -1., 0., 1.],
+                color: [1.; 4],
+                uv: [0.; 2],
+            }; 3],
+            None,
+            DrawState::new(1, 1),
+        )
+        .unwrap();
+        gpu.flush_pipeline_cache();
+        gpu.check().unwrap();
+        assert!(load_blob(&path).is_some());
+        gpu.set_pipeline_cache_directory(None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
