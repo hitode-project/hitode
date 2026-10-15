@@ -439,11 +439,6 @@ impl Driver {
             callback(result);
         }
     }
-    #[cfg(target_os = "macos")]
-    fn request_frame(&self) -> bool {
-        let paced = self.ui.borrow().as_ref().is_some_and(frontend::Ui::paced);
-        self.view.request_frame(paced)
-    }
     fn drive(&self) {
         let next = match self.tick() {
             Ok(next) => next,
@@ -467,7 +462,7 @@ impl Driver {
         // A due presentation waits for the next vsync instead of the timer.
         #[cfg(target_os = "macos")]
         let next = match next {
-            Some(at) if at <= Instant::now() && self.request_frame() => None,
+            Some(at) if at <= Instant::now() && self.view.request_frame() => None,
             other => other,
         };
         #[cfg(target_os = "macos")]

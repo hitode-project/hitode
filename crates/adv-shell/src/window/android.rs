@@ -271,9 +271,9 @@ impl GameView {
     pub(crate) fn refresh_ready(&self) -> bool {
         self.ready.get()
     }
-    pub(crate) fn next_refresh(&self, paced: bool) -> Instant {
+    pub(crate) fn next_refresh(&self) -> Instant {
         let fps = (1_000_000_000.0 / self.period.get() as f64).round() as isize;
-        Instant::now() + refresh_interval(fps, paced)
+        Instant::now() + refresh_interval(fps)
     }
 }
 impl Drop for GameView {

@@ -71,9 +71,6 @@ pub struct Ui {
     frame_times: std::collections::VecDeque<Instant>,
     #[cfg(any(target_os = "macos", target_os = "android"))]
     next: Instant,
-    /// Whether the last frame came from a paced `Present` (see `refresh_interval`).
-    #[cfg(any(target_os = "macos", target_os = "android"))]
-    paced: bool,
     #[cfg(any(target_os = "macos", target_os = "android"))]
     pub(crate) menu_changed: bool,
     #[cfg(any(target_os = "macos", target_os = "android"))]
@@ -144,8 +141,6 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frame_times: std::collections::VecDeque::new(),
             #[cfg(any(target_os = "macos", target_os = "android"))]
             next: Instant::now(),
-            #[cfg(any(target_os = "macos", target_os = "android"))]
-            paced: false,
             #[cfg(any(target_os = "macos", target_os = "android"))]
             menu_changed: false,
             #[cfg(any(target_os = "macos", target_os = "android"))]
@@ -431,7 +426,6 @@ impl Ui {
             let completed = native.poll()?;
             if let Some(completed) = completed {
                 self.metric(Delivery::Native(completed.stats));
-                self.paced = completed.rendered.native;
                 self.repaint |= window.native_canvas(completed.rendered.canvas)?;
                 window.set_video_cursor_regions(completed.rendered.cursor_regions);
                 if matches!(
@@ -462,15 +456,10 @@ impl Ui {
                 && native.schedule(dimensions, self.repaint)?
             {
                 self.repaint = false;
-                self.next = window.next_refresh(self.paced);
+                self.next = window.next_refresh();
             }
         }
         self.deadline(window)
-    }
-    /// Whether the last frame came from a paced `Present`.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn paced(&self) -> bool {
-        self.paced
     }
     #[cfg(any(target_os = "macos", target_os = "android"))]
     pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {

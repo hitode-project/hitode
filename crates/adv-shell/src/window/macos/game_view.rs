@@ -219,12 +219,12 @@ impl GameView {
     }
     /// A display link caps the rate itself (`request_frame`); the timer
     /// fallback spaces presentations by the refresh interval.
-    pub(crate) fn next_refresh(&self, paced: bool) -> std::time::Instant {
+    pub(crate) fn next_refresh(&self) -> std::time::Instant {
         let now = std::time::Instant::now();
         if self.hub().link.borrow().is_some() {
             return now;
         }
-        now + refresh_interval(self.display_fps(), paced)
+        now + refresh_interval(self.display_fps())
     }
     fn display_fps(&self) -> isize {
         self.window()
@@ -243,6 +243,12 @@ impl GameView {
         }
         let link = unsafe { self.displayLinkWithTarget_selector(self, sel!(frameClockFired:)) };
         link.setPaused(true);
+        // The guest is told the display runs at 60 Hz (`refresh_interval`).
+        link.setPreferredFrameRateRange(CAFrameRateRange {
+            minimum: 30.0,
+            maximum: 60.0,
+            preferred: 60.0,
+        });
         unsafe {
             link.addToRunLoop_forMode(
                 &objc2_foundation::NSRunLoop::mainRunLoop(),
@@ -259,27 +265,13 @@ impl GameView {
             link.invalidate();
         }
         hub.on_frame.borrow_mut().take();
-        hub.link_paced.set(None);
         hub.vsync.clear();
     }
     /// Arms one display-link callback; false when the timer fallback is in use.
-    pub(crate) fn request_frame(&self, paced: bool) -> bool {
-        let hub = self.hub();
-        let Some(link) = hub.link.borrow().clone() else {
+    pub(crate) fn request_frame(&self) -> bool {
+        let Some(link) = self.hub().link.borrow().clone() else {
             return false;
         };
-        if hub.link_paced.replace(Some(paced)) != Some(paced) {
-            let maximum = if paced {
-                60.0
-            } else {
-                self.display_fps().max(60) as f32
-            };
-            link.setPreferredFrameRateRange(CAFrameRateRange {
-                minimum: 30.0,
-                maximum,
-                preferred: maximum,
-            });
-        }
         link.setPaused(false);
         true
     }
@@ -601,28 +593,15 @@ mod tests {
     // spec: HOST-SES-8
     #[test]
     fn presentation_never_exceeds_the_guest_refresh_rate() {
-        let fast = refresh_interval(180, true);
+        let fast = refresh_interval(180);
         assert!(
             fast > Duration::from_secs_f64(1.0 / 70.0)
                 && fast < Duration::from_secs_f64(1.0 / 60.0)
         );
-        assert_eq!(refresh_interval(120, true), fast);
-        assert_eq!(
-            refresh_interval(60, true),
-            Duration::from_secs_f64(1.0 / 60.0)
-        );
-        assert_eq!(
-            refresh_interval(48, true),
-            Duration::from_secs_f64(1.0 / 48.0)
-        );
-        assert_eq!(
-            refresh_interval(0, true),
-            Duration::from_secs_f64(1.0 / 24.0)
-        );
-        assert_eq!(
-            refresh_interval(180, false),
-            Duration::from_secs_f64(1.0 / 180.0)
-        );
+        assert_eq!(refresh_interval(120), fast);
+        assert_eq!(refresh_interval(60), Duration::from_secs_f64(1.0 / 60.0));
+        assert_eq!(refresh_interval(48), Duration::from_secs_f64(1.0 / 48.0));
+        assert_eq!(refresh_interval(0), Duration::from_secs_f64(1.0 / 24.0));
     }
     // spec: HOST-RUN-2
     #[test]

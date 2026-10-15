@@ -1546,15 +1546,13 @@ pub(crate) mod android_epoch;
 mod android_input_tests;
 
 #[cfg(any(target_os = "macos", target_os = "android"))]
-/// A paced guest (`Present` boundaries) is told the display runs at 60 Hz, so
-/// presenting faster only repeats conversion and composition. Faster displays
-/// keep 10% slack so a 60 Hz guest whose frames arrive early is still shown at
-/// once. Software frames carry no frame boundary: a GDI engine blits a frame
-/// in strips, and a slower cap would hold each half-drawn frame on screen
-/// longer, so they keep the display rate.
-pub(crate) fn refresh_interval(display_fps: isize, paced: bool) -> Duration {
+/// The guest is told the display runs at 60 Hz, and both `Present` and
+/// software frames are published at guest frame boundaries, so presenting
+/// faster only repeats conversion and composition. Faster displays keep 10%
+/// slack so a 60 Hz guest whose frames arrive early is still shown at once.
+pub(crate) fn refresh_interval(display_fps: isize) -> Duration {
     let fps = display_fps.clamp(24, 240) as f64;
-    if paced && fps > 60.0 {
+    if fps > 60.0 {
         Duration::from_secs_f64(0.9 / 60.0)
     } else {
         Duration::from_secs_f64(1.0 / fps)
