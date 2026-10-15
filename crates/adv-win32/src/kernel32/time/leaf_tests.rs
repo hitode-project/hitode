@@ -235,3 +235,30 @@ fn user_and_calendar_queries_match_handlers_and_decline_before_partial_writes() 
         assert_eq!(state(&mut leaf), state(&mut trap), "{name}");
     }
 }
+
+// spec: WIN32-API-15
+#[test]
+fn string_length_leaves_return_zero_after_access_failure_and_preserve_last_error() {
+    let (mut leaf, mut trap) = (machine(), machine());
+    for m in [&mut leaf, &mut trap] {
+        m.cpu.write(DATA + 8190, &[b'x', b'y']).unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        crate::util::set_last_error(&mut env, 0xabcdef);
+    }
+    for name in ["lstrlenA", "lstrlenW"] {
+        for pointer in [0, DATA + 8190] {
+            let (a, declined, _) = call(&mut leaf, K32, name, &[pointer], true);
+            assert!(!declined);
+            assert_eq!(a as u32, 0);
+            assert_eq!(a, call(&mut trap, K32, name, &[pointer], false).0);
+            assert_eq!(state(&mut leaf), state(&mut trap));
+            assert_eq!(state(&mut leaf).error, 0xabcdef);
+        }
+    }
+}
