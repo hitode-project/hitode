@@ -123,7 +123,8 @@ impl Metadata {
     }
     pub fn created(&self) -> io::Result<SystemTime> {
         match self {
-            Self::Host(info) => info.created(),
+            // Hosts without birth times (Android f2fs) report the last write.
+            Self::Host(info) => info.created().or_else(|_| info.modified()),
             Self::ReadOnly(_) => Ok(SystemTime::UNIX_EPOCH),
             Self::Optical(_, time) => Ok(time.unwrap_or(SystemTime::UNIX_EPOCH)),
         }
@@ -334,7 +335,11 @@ mod tests {
         file.set_len(0x1_0000_0003).unwrap();
         let mut stream = FileStream::from(file);
         stream.seek(SeekFrom::Start(7)).unwrap();
-        std::fs::hard_link(&source, &alias).unwrap();
+        // The adb shell SELinux domain on Android denies links; the product never links.
+        if let Err(error) = std::fs::hard_link(&source, &alias) {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            return;
+        }
         std::fs::rename(&source, &renamed).unwrap();
         std::fs::write(&source, b"new instance").unwrap();
         let standard = stream.standard_information().unwrap();

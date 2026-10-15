@@ -225,7 +225,8 @@ fn wide_layout_attributes_overlay_metadata_and_independent_frozen_cursors_match_
         let pattern = test.wide("*.dat");
         let alpha = test.wide("alpha.dat");
         let metadata = std::fs::metadata(test.root.join("data/overlay/ALPHA.dat")).unwrap();
-        let created = unix_seconds(metadata.created().ok()).unwrap();
+        let created =
+            unix_seconds(metadata.created().or_else(|_| metadata.modified()).ok()).unwrap();
         test.call("kernel32.dll!SetFileAttributesW", &[I(alpha), I(0x80)]);
         let cell = test.seed();
         let first_out = test.output();

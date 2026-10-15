@@ -40,7 +40,7 @@ pub(crate) fn backing_information(file: &std::fs::File) -> std::io::Result<[u32;
             })
             .unwrap_or(0)
     };
-    let created = filetime(metadata.created());
+    let created = filetime(metadata.created().or_else(|_| metadata.modified()));
     let accessed = filetime(metadata.accessed());
     let modified = filetime(metadata.modified());
     let links = u32::try_from(metadata.nlink()).map_err(|_| std::io::ErrorKind::Unsupported)?;
@@ -230,7 +230,11 @@ mod tests {
             .set_file_normal("data.bin")
             .unwrap();
         assert_eq!(query(&mut machine, first)[0], 0x80);
-        std::fs::hard_link(&path, root.join("game/alias.bin")).unwrap();
+        // The adb shell SELinux domain on Android denies links; the product never links.
+        if let Err(error) = std::fs::hard_link(&path, root.join("game/alias.bin")) {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            return;
+        }
         let linked = open(
             &mut env(&mut machine),
             "alias.bin",

@@ -162,6 +162,7 @@ impl Translator<'_> {
             }
             Op::Jcc(cc, _) => self.branch(cc, inst.taken.expect("jcc edges are resolved")),
             Op::Ret(release) => {
+                self.flush_mmx();
                 let esp = Operand::Guest(ESP);
                 self.prepare(esp);
                 if self.checking {
@@ -249,6 +250,7 @@ impl Translator<'_> {
     /// Canonical flags and the refund before leaving through a dynamic
     /// transfer, whose EIP is in w16.
     fn settle(&mut self) {
+        self.flush_mmx();
         self.canonicalize();
         let refund = self.trace.unused(self.index);
         if refund != 0 {
@@ -459,10 +461,12 @@ impl Translator<'_> {
     }
 
     /// Has the interpreter run the instruction at helper `index` of the
-    /// unit, with canonical flags; leaves when it asks to.
+    /// unit, with canonical flags; leaves when it asks to. Conditional callers
+    /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
         self.canonicalize();
         // The interpreter may change any SIMD register.
+        self.flush_mmx();
         self.vector = super::simd::Vector::default();
         self.mov_imm(X1, self.helpers + u32::from(index));
         self.far_call(self.stubs.interpret);
@@ -477,6 +481,7 @@ impl Translator<'_> {
 
     fn leaf(&mut self, inst: Inst, word: u32) {
         self.canonicalize();
+        self.flush_mmx();
         self.vector = super::simd::Vector::default();
         self.mov_imm(X1, inst.pc);
         self.mov_imm(super::X2, word);
@@ -492,6 +497,7 @@ impl Translator<'_> {
             self.cold.push(Cold::Leave {
                 label,
                 state: State::CANONICAL,
+                mmx_dirty: self.vector.dirty,
                 refund: self.trace.unused(self.index) + extra,
                 exit,
                 eip,
@@ -506,6 +512,7 @@ impl Translator<'_> {
     /// page intersection use the alias after a raw guest permission check.
     /// The remaining cases use `access`. Uses x3 and x4.
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
+        self.flush_mmx();
         let slow = self.asm.label();
         let alias = self.asm.label();
         let width = kind & 7;

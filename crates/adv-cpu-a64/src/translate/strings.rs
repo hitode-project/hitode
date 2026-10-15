@@ -118,6 +118,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Strings> {
 
 impl Translator<'_> {
     pub(super) fn strings(&mut self, op: Strings) {
+        self.flush_mmx();
         if self.checking {
             self.helper(op.helper);
             return;

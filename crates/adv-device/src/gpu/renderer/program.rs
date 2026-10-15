@@ -131,7 +131,25 @@ impl Pending {
             self.resolve_clear();
         }
     }
-    fn begin_pass(&mut self, target: &Target, image: &Image, clear: Clear, merged: bool) {
+    /// End a pass attaching `depth` so the next one applies its deferred clear.
+    pub(super) fn detach_depth(&mut self, depth: &Depth) {
+        if self
+            .attachments
+            .as_ref()
+            .is_some_and(|(_, view)| view.as_ref() == Some(depth.view()))
+        {
+            self.pass = None;
+            self.attachments = None;
+        }
+        #[cfg(target_vendor = "apple")]
+        if let Some(metal) = &mut self.metal {
+            metal.detach_depth(depth);
+        }
+    }
+    fn begin_pass(&mut self, target: &Target, image: &Image, mut clear: Clear, merged: bool) {
+        if let Some((depth, stencil)) = target.depth.as_ref().and_then(Depth::take_whole_clear) {
+            (clear.depth, clear.stencil) = (depth, stencil);
+        }
         #[cfg(target_vendor = "apple")]
         if let Some(depth) = &target.depth {
             depth.metal_initialized().store(true, Ordering::Relaxed);
@@ -695,6 +713,9 @@ impl Gpu {
         draw: &ProgrammableDraw,
         state: &DrawState,
     ) -> Result<(), Error> {
+        if state.depth.is_some() || state.stencil.is_some() || draw.program.writes_depth {
+            self.apply_partial_depth_clear(target)?;
+        }
         let context = self.context.clone();
         let _submission = context.enter_submission()?;
         self.own_target(target)?;

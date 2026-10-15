@@ -78,8 +78,14 @@ pub(crate) fn flush_software(env: &mut Env<'_>, reason: FlushReason) -> Option<O
         store.flush(&memory, reason)
     };
     let serial = store.stats.presentations;
+    let coverage = store.software_coverage();
     match result {
-        Ok(true) => (provider.completed)(env, serial),
+        Ok(true) => {
+            if matches!(reason, FlushReason::Message) {
+                crate::user32::message::frame_cap::published(env, coverage);
+            }
+            (provider.completed)(env, serial)
+        }
         Ok(false) => None,
         Err(error) => Some(Outcome::Fail(error)),
     }

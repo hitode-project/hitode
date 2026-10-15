@@ -7,6 +7,7 @@ mod line;
 mod programmable;
 mod renderer;
 mod submission;
+use depth::DeferredClear;
 pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,

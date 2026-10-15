@@ -44,17 +44,39 @@ impl Gpu {
         if rectangle.w == 0 || rectangle.h == 0 {
             return Ok(());
         }
-        if !target.padded_attachments()
-            && rectangle
-                == (Rect {
-                    x: 0,
-                    y: 0,
-                    w: width,
-                    h: height,
-                })
+        if rectangle
+            == (Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            })
         {
-            return self.clear_with_stencil(target, color, depth, stencil);
+            if !target.padded_attachments() {
+                return self.clear_with_stencil(target, color, depth, stencil);
+            }
+            // The color image is whole; only the larger depth image is partial.
+            if depth.is_some() || stencil.is_some() {
+                self.defer_depth_clear(target, rectangle, depth, stencil)?;
+            }
+            if color.is_some() {
+                return self.clear_with_stencil(&target.color_only(), color, None, None);
+            }
+            return self.check();
         }
+        self.bounded_clear(target, rectangle, color, depth, stencil)
+    }
+
+    /// Clear `rectangle` with a neutral draw, depth and stencil included.
+    pub(super) fn bounded_clear(
+        &mut self,
+        target: &Target,
+        rectangle: Rect,
+        color: Option<[f64; 4]>,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Result<(), Error> {
+        let (width, height) = (target.image.width(), target.image.height());
 
         let mut state = DrawState::new(width, height);
         state.scissor = Some(rectangle);
