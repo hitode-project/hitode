@@ -44,8 +44,7 @@ impl Gpu {
         if rectangle.w == 0 || rectangle.h == 0 {
             return Ok(());
         }
-        if self.clip.is_none()
-            && !target.padded_attachments()
+        if !target.padded_attachments()
             && rectangle
                 == (Rect {
                     x: 0,

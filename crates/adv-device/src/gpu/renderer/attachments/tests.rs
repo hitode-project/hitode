@@ -46,7 +46,7 @@ fn stencil(reference: u32) -> DrawState {
 }
 
 #[test]
-// spec: DEV-DEPTH-1
+// spec: DEV-DEPTH-1, GFX-PASS-1
 fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
         target_os = "macos",
@@ -69,7 +69,7 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
     let before = gpu.stats();
     gpu.clear_with_stencil(&small, Some([1., 0., 0., 0.5]), Some(0.25), Some(7))
         .unwrap();
-    assert_eq!(gpu.stats().submissions, before.submissions);
+    assert_eq!(gpu.stats().submissions, before.submissions + 1);
     assert_eq!(gpu.stats().readbacks, before.readbacks);
     assert!(
         read(&mut gpu, &small)
@@ -313,7 +313,7 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     child.draw_programmable(&target, &draw, &state).unwrap();
     assert_eq!(gpu.stats().submissions, before + 1);
     child.clear(&target, Some([0., 1., 0., 1.]), None).unwrap();
-    assert_eq!(child.stats().submissions, 2);
+    assert_eq!(child.stats().submissions, 1);
     assert!(
         read(&mut gpu, &target)
             .chunks_exact(4)

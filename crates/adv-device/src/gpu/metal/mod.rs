@@ -1,4 +1,4 @@
-//! Native programmable draws on the wgpu Metal queue; all other work stays wgpu.
+//! Native programmable passes on the wgpu Metal queue, including deferred clears.
 use super::*;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -35,11 +35,12 @@ impl Image {
             })
             .clone()
     }
-    fn initialize_metal(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn initialize_metal(&self, encoder: &mut wgpu::CommandEncoder, stats: &program::BatchStats) {
         if self.metal.initialized.swap(true, Ordering::Relaxed) {
             return;
         }
         for mip in 0..self.texture.mip_level_count() {
+            program::Clear::default().count(stats, false, false);
             let view = self.texture.create_view(&wgpu::TextureViewDescriptor {
                 base_mip_level: mip,
                 mip_level_count: Some(1),
@@ -116,6 +117,11 @@ impl State {
             pipelines: Default::default(),
         })
     }
+    pub(super) fn has_depth(&self, target: &Target) -> bool {
+        self.attachments
+            .as_ref()
+            .is_some_and(|(color, depth)| color == &target.image.render_view && depth.is_some())
+    }
     pub(super) fn flush(&mut self) {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
@@ -147,6 +153,7 @@ impl State {
         draw: &ProgrammableDraw,
         state: &DrawState,
         key: &program::Key,
+        initialization_target: &Target,
     ) -> Result<(), Error> {
         let blocks = [
             bytemuck::bytes_of(&draw.vertex_constants),
@@ -154,7 +161,9 @@ impl State {
             bytemuck::bytes_of(&draw.parameters),
         ];
         let same_owner = Arc::ptr_eq(&self.owner, &gpu.programmable.batch_stats);
-        let depth_uninitialized = target
+        // Bootstrap depth before the first native batch so later depth upgrades
+        // can reopen the encoder without submitting that batch.
+        let depth_uninitialized = initialization_target
             .depth
             .as_ref()
             .is_some_and(|d| !d.metal_initialized().load(Ordering::Relaxed));
@@ -194,9 +203,17 @@ impl State {
                 return Err(error);
             }
         };
+        let pipeline =
+            self.pipelines
+                .get(&self.device, key, &draw.program, target, &mut gpu.stats)?;
         // Admission is complete: Busy has not uploaded, encoded, or flushed work.
         if !same_owner {
             self.flush();
+        }
+        pending.select_target(target);
+        let clear = pending.clear.take().map(|(_, clear)| clear);
+        if clear.is_some() && pending.pass.is_none() {
+            pending.encoder = None;
         }
         pending.flush(&gpu.context.queue);
         self.owner = gpu.programmable.batch_stats.clone();
@@ -214,24 +231,18 @@ impl State {
                 .context
                 .device
                 .create_command_encoder(&Default::default());
-            attachment.image.initialize_metal(&mut encoder);
+            attachment.image.initialize_metal(&mut encoder, &self.owner);
             for image in &images {
-                image.initialize_metal(&mut encoder);
+                image.initialize_metal(&mut encoder, &self.owner);
             }
             gpu.context.queue.submit([encoder.finish()]);
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
             if depth_uninitialized || target.padded_attachments() {
                 pending.owner = Some(self.owner.clone());
-                gpu.begin_batch_pass(pending, target)?;
+                gpu.begin_batch_pass(pending, initialization_target)?;
                 pending.flush(&gpu.context.queue);
-                if let Some(depth) = &target.depth {
-                    depth.metal_initialized().store(true, Ordering::Relaxed);
-                }
             }
         }
-        let pipeline =
-            self.pipelines
-                .get(&self.device, key, &draw.program, target, &mut gpu.stats)?;
         if !self.last_metal {
             // Queue writes are deferred by wgpu until submit, even without a Pending pass.
             gpu.context.queue.submit([]);
@@ -279,10 +290,12 @@ impl State {
             target.depth.as_ref().map(|d| d.view().clone()),
         );
         unsafe {
-            if self.attachments.as_ref() != Some(&attachments) {
+            if clear.is_some() || self.attachments.as_ref() != Some(&attachments) {
                 if let Some(encoder) = self.encoder.take() {
                     encoder.endEncoding();
                 }
+                let clear = clear.unwrap_or_default();
+                clear.count(&self.owner, target.depth.is_some(), true);
                 let descriptor = MTLRenderPassDescriptor::new();
                 let color = descriptor.colorAttachments().objectAtIndexedSubscript(0);
                 let texture = attachment
@@ -292,19 +305,45 @@ impl State {
                     .unwrap();
                 color.setTexture(Some(texture.raw_handle()));
                 color.setLevel(attachment.image.mip as usize);
-                color.setLoadAction(MTLLoadAction::Load);
+                color.setLoadAction(if clear.color.is_some() {
+                    MTLLoadAction::Clear
+                } else {
+                    MTLLoadAction::Load
+                });
+                if let Some(c) = clear.color {
+                    color.setClearColor(MTLClearColor {
+                        red: c.r,
+                        green: c.g,
+                        blue: c.b,
+                        alpha: c.a,
+                    });
+                }
                 color.setStoreAction(MTLStoreAction::Store);
                 drop(texture);
                 if let Some(depth) = &target.depth {
                     let texture = depth.texture().as_hal::<wgpu::hal::api::Metal>().unwrap();
                     let depth_attachment = descriptor.depthAttachment();
                     depth_attachment.setTexture(Some(texture.raw_handle()));
-                    depth_attachment.setLoadAction(MTLLoadAction::Load);
+                    depth_attachment.setLoadAction(if clear.depth.is_some() {
+                        MTLLoadAction::Clear
+                    } else {
+                        MTLLoadAction::Load
+                    });
+                    if let Some(depth) = clear.depth {
+                        depth_attachment.setClearDepth(f64::from(depth));
+                    }
                     depth_attachment.setStoreAction(MTLStoreAction::Store);
                     if depth.format().has_stencil() {
                         let stencil = descriptor.stencilAttachment();
                         stencil.setTexture(Some(texture.raw_handle()));
-                        stencil.setLoadAction(MTLLoadAction::Load);
+                        stencil.setLoadAction(if clear.stencil.is_some() {
+                            MTLLoadAction::Clear
+                        } else {
+                            MTLLoadAction::Load
+                        });
+                        if let Some(value) = clear.stencil {
+                            stencil.setClearStencil(value);
+                        }
                         stencil.setStoreAction(MTLStoreAction::Store);
                     }
                 }

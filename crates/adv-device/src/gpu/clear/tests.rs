@@ -42,6 +42,7 @@ const FULL: Rect = Rect {
     h: 4,
 };
 
+// spec: GFX-PASS-1
 #[test]
 fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_path() {
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
@@ -55,7 +56,7 @@ fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_pa
         gpu.clear_region(&target, FULL, Some([1., 0., 0., 0.25]), None, None)
             .unwrap();
         assert_eq!(gpu.stats().draws, before.draws);
-        assert_eq!(gpu.stats().submissions, before.submissions + 1);
+        assert_eq!(gpu.stats().submissions, before.submissions);
         let before = gpu.stats();
         gpu.clear_region(
             &target,

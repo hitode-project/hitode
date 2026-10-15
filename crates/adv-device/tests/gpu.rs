@@ -1103,6 +1103,7 @@ fn concurrent_unpinned_image_clone_releases_notify_capacity_after_their_refcount
     b.join().unwrap();
 }
 
+// spec: GFX-PASS-1
 #[test]
 fn ownership_frames_freeze_all_writes_without_a_copy_and_unfreeze_after_the_last_clone() {
     let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
@@ -1112,7 +1113,7 @@ fn ownership_frames_freeze_all_writes_without_a_copy_and_unfreeze_after_the_last
         .unwrap();
     let before = gpu.stats();
     let frame = gpu.completed_frame(target.image.clone(), 1).unwrap();
-    assert_eq!(gpu.stats().submissions, before.submissions);
+    assert_eq!(gpu.stats().submissions, before.submissions + 1);
     assert_eq!(gpu.stats().native_frame_allocations, 0);
     let retained = frame.clone();
     drop(frame);
@@ -1173,8 +1174,9 @@ fn ownership_frames_freeze_all_writes_without_a_copy_and_unfreeze_after_the_last
     );
 }
 
+// spec: GFX-PASS-1
 #[test]
-fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutable_pool() {
+fn rotating_surface_retains_one_logical_id_and_a_bounded_immutable_pool() {
     use adv_device::surface::{Snapshot, Surfaces, frame_mailbox};
     let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
     let mut surfaces = Surfaces::new(8, 8, 0x1000, 0x10000, Snapshot::default()).unwrap();
@@ -1199,8 +1201,8 @@ fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutab
         );
         assert_eq!(
             gpu.stats().submissions,
-            before,
-            "Present ownership performs zero Queue submissions"
+            before + 1,
+            "Present submits the deferred clear without a frame copy"
         );
         if serial == 1 || serial % 2 == 0 {
             assert!(consumer.update());

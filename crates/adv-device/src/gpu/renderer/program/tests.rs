@@ -1,7 +1,11 @@
 use super::*;
 
 fn gpu() -> Gpu {
-    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     // These tests inspect the wgpu batching and binding caches directly.
     #[cfg(target_vendor = "apple")]
     {

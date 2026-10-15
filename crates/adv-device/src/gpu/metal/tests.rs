@@ -470,7 +470,7 @@ struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> };
     assert_eq!(render(true), render(false));
 }
 
-// spec: GFX-METAL-1
+// spec: GFX-METAL-1, GFX-PASS-1
 #[test]
 fn unsupported_shader_bindings_return_an_error_without_a_draw() {
     let mut gpu = gpu(true);

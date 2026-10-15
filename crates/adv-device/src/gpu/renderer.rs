@@ -701,6 +701,10 @@ impl Gpu {
         stats.submissions += batch.submissions.load(Ordering::Relaxed);
         stats.buffer_writes = batch.buffer_writes.load(Ordering::Relaxed);
         stats.last_flush_buffer_writes = batch.last_flush_buffer_writes.load(Ordering::Relaxed);
+        stats.passes = batch.passes.load(Ordering::Relaxed);
+        stats.color_loads = batch.color_loads.load(Ordering::Relaxed);
+        stats.depth_loads = batch.depth_loads.load(Ordering::Relaxed);
+        stats.merged_clears = batch.merged_clears.load(Ordering::Relaxed);
         stats.metal_draws = batch.metal_draws.load(Ordering::Relaxed);
         stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
         stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
@@ -923,21 +927,16 @@ impl Gpu {
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), Error> {
-        if self.clip.is_some() || target.padded_attachments() {
-            // A load-op clear would erase the larger depth image outside the
-            // logical color view. The bounded draw path clears only that view.
-            return self.clear_region(
-                target,
-                Rect {
-                    x: 0,
-                    y: 0,
-                    w: target.image.width,
-                    h: target.image.height,
-                },
-                color,
-                depth,
-                stencil,
-            );
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: target.image.width,
+            h: target.image.height,
+        };
+        if self.clip.is_some_and(|clip| whole.clipped(clip) != whole) || target.padded_attachments()
+        {
+            // Padded attachments and clipped clears retain their bounded draw.
+            return self.clear_region(target, whole, color, depth, stencil);
         }
         let context = self.context.clone();
         let submission = context.submission()?;
@@ -957,53 +956,40 @@ impl Gpu {
         if color.is_none() && depth.is_none() && stencil.is_none() {
             return Err(invalid("clear has no attachment"));
         }
-        let mut encoder = self
-            .context
-            .device
-            .create_command_encoder(&Default::default());
-        {
-            let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &target.image.render_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: color.map_or(wgpu::LoadOp::Load, |c| {
-                        wgpu::LoadOp::Clear(wgpu::Color {
-                            r: c[0],
-                            g: c[1],
-                            b: c[2],
-                            a: if target.image.alpha == AlphaMode::Opaque {
-                                1.0
-                            } else {
-                                c[3]
-                            },
-                        })
-                    }),
-                    store: wgpu::StoreOp::Store,
+        let mut pending = context.pending.lock().unwrap();
+        let clear = program::Clear {
+            color: color.map(|c| wgpu::Color {
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                a: if target.image.alpha == AlphaMode::Opaque {
+                    1.
+                } else {
+                    c[3]
                 },
-            })];
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &colors,
-                depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view: attachment.view(),
-                        depth_ops: Some(wgpu::Operations {
-                            load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: attachment.format().has_stencil().then_some(
-                            wgpu::Operations {
-                                load: stencil
-                                    .map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(v & 255)),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        ),
-                    }
-                }),
-                ..Default::default()
-            });
+            }),
+            depth,
+            stencil: stencil.map(|v| v & 255),
+        };
+        let same_owner = pending
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.programmable.batch_stats));
+        if same_owner
+            && let Some((old, previous)) = &mut pending.clear
+            && old.image.render_view == target.image.render_view
+            && old.depth.as_ref().map(Depth::view) == target.depth.as_ref().map(Depth::view)
+        {
+            previous.color = clear.color.or(previous.color);
+            previous.depth = clear.depth.or(previous.depth);
+            previous.stencil = clear.stencil.or(previous.stencil);
+        } else {
+            pending.flush(&context.queue);
+            pending.owner = Some(self.programmable.batch_stats.clone());
+            pending.encoder = Some(context.device.create_command_encoder(&Default::default()));
+            pending.clear = Some((target.clone(), clear));
         }
-        self.submit(encoder, &submission);
+        drop(submission);
         self.check()
     }
 
@@ -1161,6 +1147,9 @@ impl Gpu {
         if state.scissor.is_some_and(Rect::empty) {
             return Ok(());
         }
+        let mut pending = context.pending.lock().unwrap();
+        let selected = self.draw_target(&pending, target, &state);
+        let target = &selected;
         let key = PipelineKey {
             topology: state.topology,
             cull: state.cull,
@@ -1209,7 +1198,7 @@ impl Gpu {
             ..state.sampler
         };
         let binding = self.texture_binding(&self.bindings.clone(), &[(texture, sampler)], true);
-        let mut pending = context.pending.lock().unwrap();
+        pending.select_target(target);
         let immediate = self.prepare_batch(&mut pending, size, 0);
         let attachment = self.begin_batch_pass(&mut pending, target)?;
         let offset = pending
@@ -1914,3 +1903,6 @@ mod cache_tests {
 #[cfg(all(test, target_vendor = "apple"))]
 #[path = "metal/interop.rs"]
 mod metal_interop;
+
+#[cfg(test)]
+mod pass_tests;

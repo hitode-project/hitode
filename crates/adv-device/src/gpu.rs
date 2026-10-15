@@ -220,6 +220,10 @@ impl DrawState {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    pub passes: u64,
+    pub color_loads: u64,
+    pub depth_loads: u64,
+    pub merged_clears: u64,
     pub submissions: u64,
     pub draws: u64,
     pub vertices: u64,

@@ -30,6 +30,10 @@ pub(super) const UNIFORM_SLOTS: u64 = 32;
 
 #[derive(Default)]
 pub(super) struct BatchStats {
+    pub(super) passes: AtomicU64,
+    pub(super) color_loads: AtomicU64,
+    pub(super) depth_loads: AtomicU64,
+    pub(super) merged_clears: AtomicU64,
     pub(super) metal_draws: AtomicU64,
     pub(super) backend_switches: AtomicU64,
     pub(super) ring_bytes: AtomicU64,
@@ -63,6 +67,30 @@ impl Upload {
     }
 }
 
+#[derive(Default)]
+pub(super) struct Clear {
+    pub(super) color: Option<wgpu::Color>,
+    pub(super) depth: Option<f32>,
+    pub(super) stencil: Option<u32>,
+}
+impl Clear {
+    pub(super) fn count(&self, stats: &BatchStats, depth: bool, merged: bool) {
+        stats.passes.fetch_add(1, Ordering::Relaxed);
+        stats
+            .color_loads
+            .fetch_add(u64::from(self.color.is_none()), Ordering::Relaxed);
+        stats
+            .depth_loads
+            .fetch_add(u64::from(depth && self.depth.is_none()), Ordering::Relaxed);
+        stats.merged_clears.fetch_add(
+            u64::from(
+                merged && (self.color.is_some() || self.depth.is_some() || self.stencil.is_some()),
+            ),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 // All queue writes precede submission. CPU uploads retain each draw's bytes
 // until the shared batch flushes, including across fixed/programmed pass changes.
 #[derive(Default)]
@@ -70,9 +98,10 @@ pub(super) struct Pending {
     #[cfg(target_vendor = "apple")]
     pub(super) metal: Option<metal::State>,
     // Drop the pass before its encoder, including during producer teardown.
+    pub(super) clear: Option<(Target, Clear)>,
     pub(super) pass: Option<wgpu::RenderPass<'static>>,
     attachments: Option<(wgpu::TextureView, Option<wgpu::TextureView>)>,
-    encoder: Option<wgpu::CommandEncoder>,
+    pub(super) encoder: Option<wgpu::CommandEncoder>,
     pub(super) owner: Option<Arc<BatchStats>>,
     draws: u64,
     uniforms: Upload,
@@ -81,6 +110,68 @@ pub(super) struct Pending {
     last_constants: std::ops::Range<usize>,
 }
 impl Pending {
+    fn resolve_clear(&mut self) {
+        if let Some((target, clear)) = self.clear.take() {
+            self.pass = None;
+            self.begin_pass(&target, &target.image, clear, false);
+        }
+    }
+    pub(super) fn select_target(&mut self, target: &Target) {
+        if self.clear.as_ref().is_some_and(|(old, clear)| {
+            old.image.render_view != target.image.render_view
+                || ((clear.depth.is_some() || clear.stencil.is_some())
+                    && old.depth.as_ref().map(Depth::view)
+                        != target.depth.as_ref().map(Depth::view))
+        }) {
+            self.resolve_clear();
+        }
+    }
+    fn begin_pass(&mut self, target: &Target, image: &Image, clear: Clear, merged: bool) {
+        #[cfg(target_vendor = "apple")]
+        if let Some(depth) = &target.depth {
+            depth.metal_initialized().store(true, Ordering::Relaxed);
+        }
+        clear.count(self.owner.as_ref().unwrap(), target.depth.is_some(), merged);
+        let colors = [Some(wgpu::RenderPassColorAttachment {
+            view: &image.render_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: clear.color.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        self.pass = Some(
+            self.encoder
+                .as_mut()
+                .unwrap()
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &colors,
+                    depth_stencil_attachment: target.depth.as_ref().map(|d| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view: d.view(),
+                            depth_ops: Some(wgpu::Operations {
+                                load: clear.depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: d.format().has_stencil().then_some(wgpu::Operations {
+                                load: clear
+                                    .stencil
+                                    .map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                        }
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime(),
+        );
+        self.attachments = Some((
+            image.render_view.clone(),
+            target.depth.as_ref().map(|d| d.view().clone()),
+        ));
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(super) fn flush_metal(&mut self) {
         if let Some(metal) = &mut self.metal {
@@ -91,6 +182,7 @@ impl Pending {
     pub(super) fn flush(&mut self, queue: &wgpu::Queue) {
         #[cfg(target_vendor = "apple")]
         self.flush_metal();
+        self.resolve_clear();
         self.pass = None;
         self.attachments = None;
         if let Some(encoder) = self.encoder.take() {
@@ -150,6 +242,33 @@ pub fn validate_program(program: &Program) -> Result<(), Error> {
     Ok(())
 }
 impl Gpu {
+    pub(super) fn draw_target(
+        &self,
+        pending: &Pending,
+        target: &Target,
+        state: &DrawState,
+    ) -> Target {
+        let attached = pending
+            .attachments
+            .as_ref()
+            .is_some_and(|(color, depth)| color == &target.image.render_view && depth.is_some());
+        #[cfg(target_vendor = "apple")]
+        let attached = attached
+            || pending
+                .metal
+                .as_ref()
+                .is_some_and(|metal| metal.has_depth(target));
+        let clearing = pending.clear.as_ref().is_some_and(|(old, c)| {
+            old.image.render_view == target.image.render_view
+                && old.depth.as_ref().map(Depth::view) == target.depth.as_ref().map(Depth::view)
+                && (c.depth.is_some() || c.stencil.is_some())
+        });
+        let mut target = target.clone();
+        if state.depth.is_none() && state.stencil.is_none() && !attached && !clearing {
+            target.depth = None;
+        }
+        target
+    }
     pub(super) fn prepare_batch(
         &mut self,
         pending: &mut Pending,
@@ -174,7 +293,20 @@ impl Gpu {
                 .as_ref()
                 .is_some_and(|owner| !Arc::ptr_eq(owner, &self.programmable.batch_stats))
         {
+            let same_owner = pending
+                .owner
+                .as_ref()
+                .is_none_or(|owner| Arc::ptr_eq(owner, &self.programmable.batch_stats));
+            let clear = if same_owner {
+                pending.clear.take()
+            } else {
+                None
+            };
+            if clear.is_some() && pending.pass.is_none() {
+                pending.encoder = None;
+            }
             pending.flush(&self.context.queue);
+            pending.clear = clear;
         }
         if grow_vertices {
             self.upload_capacity = (vertices * slots).next_power_of_two().min(MAX_UPLOAD);
@@ -304,36 +436,12 @@ impl Gpu {
                     .create_command_encoder(&Default::default())
             });
             attachment.load(encoder, &target.image);
-            let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &attachment.image.render_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &colors,
-                    depth_stencil_attachment: target.depth.as_ref().map(|d| {
-                        wgpu::RenderPassDepthStencilAttachment {
-                            view: d.view(),
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: d.format().has_stencil().then_some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                        }
-                    }),
-                    ..Default::default()
-                })
-                .forget_lifetime();
-            pending.pass = Some(pass);
-            pending.attachments = Some((attachment.image.render_view.clone(), depth_view.cloned()));
+            let clear = pending
+                .clear
+                .take()
+                .map(|(_, clear)| clear)
+                .unwrap_or_default();
+            pending.begin_pass(target, &attachment.image, clear, true);
         }
         Ok(attachment)
     }
@@ -622,6 +730,11 @@ impl Gpu {
                 }
             }
         }
+        let mut pending = context.pending.lock().unwrap();
+        #[cfg(target_vendor = "apple")]
+        let initialization_target = target;
+        let selected = self.draw_target(&pending, target, state);
+        let target = &selected;
         let mut raster = PipelineKey {
             topology: state.topology,
             cull: state.cull,
@@ -690,14 +803,22 @@ impl Gpu {
             self.program_pipeline(key, &draw.program)?;
             return Ok(());
         }
-        let mut pending = context.pending.lock().unwrap();
         #[cfg(target_vendor = "apple")]
         if let Some(mut metal) = pending.metal.take() {
-            let result = metal.draw(self, &mut pending, target, draw, state, &key);
+            let result = metal.draw(
+                self,
+                &mut pending,
+                target,
+                draw,
+                state,
+                &key,
+                initialization_target,
+            );
             pending.metal = Some(metal);
             return result;
         }
         let pipeline = self.program_pipeline(key, &draw.program)?;
+        pending.select_target(target);
         let immediate = self.prepare_batch(&mut pending, total, index_size);
         let attachment = self.begin_batch_pass(&mut pending, target)?;
         let base = pending.constants(
