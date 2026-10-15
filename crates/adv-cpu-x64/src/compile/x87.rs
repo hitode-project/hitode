@@ -145,7 +145,8 @@ impl Emitter<'_> {
         operation: ir::FuncRef,
         opcode: Option<u16>,
     ) {
-        let fast = crate::floating::fast::classify(i);
+        let fast = crate::floating::fast::classify(i)
+            .filter(|fast| !matches!(fast, Fast::Round | Fast::Scale | Fast::Examine));
         if !self.x87_native
             || self.mmx_mode.is_some()
             || fast.is_none()
@@ -195,7 +196,7 @@ impl Emitter<'_> {
         status = self.b.ins().band_imm(status, !C1);
 
         match fast {
-            Fast::Wait => unreachable!(),
+            Fast::Wait | Fast::Round | Fast::Scale | Fast::Examine => unreachable!(),
             Fast::Load(Source::St(index)) => {
                 let from = self.x87_slot(top, index);
                 let value = self.x87_raw(from, tags, slow);

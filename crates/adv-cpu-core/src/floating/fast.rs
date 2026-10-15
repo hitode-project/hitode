@@ -78,6 +78,10 @@ pub enum Fast {
     LoadControl,
     StoreControl,
     StoreStatus,
+    /// Forms lowered by a64; the shared fast helper keeps its transactional path.
+    Round,
+    Scale,
+    Examine,
 }
 
 fn st(r: R) -> Option<u8> {
@@ -121,6 +125,9 @@ pub fn classify(i: &Instruction) -> Option<Fast> {
     let memory = i.op0_kind() == OpKind::Memory;
     Some(match m {
         M::Wait => Fast::Wait,
+        M::Frndint => Fast::Round,
+        M::Fscale => Fast::Scale,
+        M::Fxam => Fast::Examine,
         M::Fld | M::Fild => Fast::Load(source(i, m == M::Fild)?),
         M::Fst | M::Fstp | M::Fist | M::Fistp if memory => {
             let width = i.memory_size().size() as u8;
@@ -522,6 +529,7 @@ pub fn execute(
     match fast {
         // ES and deferred MMX were checked above. WAIT changes neither C1 nor
         // the last x87 instruction/data metadata, regardless of the control word.
+        Fast::Round | Fast::Scale | Fast::Examine => return None,
         Fast::Wait => metadata = false,
         Fast::Load(source) => {
             let (value, at) = raw::source(source, i, state, memory)?;

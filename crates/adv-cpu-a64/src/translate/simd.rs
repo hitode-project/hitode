@@ -63,6 +63,8 @@ pub enum Kind {
     MoveLow(u8),
     /// A selected 16-bit lane, zero-extended into a GPR.
     ExtractWord,
+    /// One sign bit per byte of an MMX or XMM source.
+    ByteMask,
     InsertWord,
     ShiftBytes(bool),
     StoreControl,
@@ -93,8 +95,8 @@ pub enum Kind {
     Emms,
     /// `addps`-style arithmetic on every lane, or on the low one (`true`).
     Float(Float, bool),
-    /// Scalar double-precision arithmetic.
-    Double(Float),
+    /// Double-precision arithmetic, scalar when the selector is true.
+    Double(Float, bool),
     /// Signed packed dwords to single or double precision (`true`).
     FromInt(bool),
     /// Single to double precision, packed or scalar (`true`).
@@ -145,7 +147,7 @@ impl Simd {
         matches!(
             self.kind,
             Kind::Float(..)
-                | Kind::Double(_)
+                | Kind::Double(..)
                 | Kind::ScalarFromInt(_)
                 | Kind::ScalarToInt(..)
                 | Kind::FromInt(_)
@@ -222,6 +224,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         }
         M::Movss | M::Movsd => Kind::Move,
         M::Pextrw => Kind::ExtractWord,
+        M::Pmovmskb => Kind::ByteMask,
         M::Pinsrw => Kind::InsertWord,
         M::Psrldq | M::Pslldq => Kind::ShiftBytes(mnemonic == M::Pslldq),
         M::Stmxcsr => Kind::StoreControl,
@@ -305,10 +308,13 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Subss => Kind::Float(Float::Fsub, true),
         M::Mulss => Kind::Float(Float::Fmul, true),
         M::Divss => Kind::Float(Float::Fdiv, true),
-        M::Addsd => Kind::Double(Float::Fadd),
-        M::Subsd => Kind::Double(Float::Fsub),
-        M::Mulsd => Kind::Double(Float::Fmul),
-        M::Divsd => Kind::Double(Float::Fdiv),
+        M::Addpd => Kind::Double(Float::Fadd, false),
+        M::Subpd => Kind::Double(Float::Fsub, false),
+        M::Mulpd => Kind::Double(Float::Fmul, false),
+        M::Addsd => Kind::Double(Float::Fadd, true),
+        M::Subsd => Kind::Double(Float::Fsub, true),
+        M::Mulsd => Kind::Double(Float::Fmul, true),
+        M::Divsd => Kind::Double(Float::Fdiv, true),
         M::Cvtdq2ps => Kind::FromInt(false),
         M::Cvtdq2pd => Kind::FromInt(true),
         M::Cvtps2pd => Kind::Widen(false),
@@ -340,7 +346,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (d, s) = (class(dst), class(src));
     let valid = match kind {
         Kind::Emms => true,
-        Kind::ExtractWord => d == 3 && matches!(s, 1 | 2),
+        Kind::ExtractWord | Kind::ByteMask => d == 3 && matches!(s, 1 | 2),
         Kind::InsertWord => matches!(d, 1 | 2) && (s == 3 || src == Loc::Mem),
         Kind::StoreControl => dst == Loc::Mem,
         Kind::ShiftBytes(_) => d == 2 && src == Loc::Imm,
@@ -349,7 +355,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         Kind::ToInt(_) => d == 1 && (s == 2 || src == Loc::Mem),
         Kind::Half(_) => d == 2 && src == Loc::Mem || dst == Loc::Mem && s == 2,
         Kind::Float(..)
-        | Kind::Double(_)
+        | Kind::Double(..)
         | Kind::FromInt(_)
         | Kind::Widen(_)
         | Kind::Narrow
@@ -499,6 +505,39 @@ impl Translator<'_> {
                 self.commit(index);
                 return;
             }
+            Kind::ByteMask => {
+                let Loc::Gpr(index) = simd.dst else {
+                    unreachable!()
+                };
+                let source = self.register(simd.src);
+                self.clobber(Operand::Guest(index));
+                self.emit_all(&[
+                    movz(X, X17, 0x4081, 0),
+                    movk(X, X17, 0x1020, 16),
+                    movk(X, X17, 0x0408, 32),
+                    movk(X, X17, 0x0002, 48),
+                ]);
+                for lane in 0..if matches!(simd.src, Loc::Xmm(_)) {
+                    2
+                } else {
+                    1
+                } {
+                    self.emit_all(&[
+                        vumov(3, X16, source, lane),
+                        and_imm(X, X16, X16, 0x8080808080808080),
+                        mul(X, X16, X16, X17),
+                        lsr_imm(X, X16, X16, 56),
+                    ]);
+                    if lane == 0 {
+                        self.emit(mov(W, X13, X16));
+                    } else {
+                        self.emit(orr(W, X13, X13, X16, Shift::Lsl, 8));
+                    }
+                }
+                self.emit(mov(W, super::ops::result(index), X13));
+                self.commit(index);
+                return;
+            }
             Kind::InsertWord => {
                 let value = match simd.src {
                     Loc::Gpr(index) => host(index),
@@ -538,7 +577,7 @@ impl Translator<'_> {
             }
             Kind::Half(high) => return self.half(simd, high, address),
             Kind::Float(..)
-            | Kind::Double(_)
+            | Kind::Double(..)
             | Kind::ScalarFromInt(_)
             | Kind::ScalarToInt(..)
             | Kind::FromInt(_)
@@ -674,11 +713,12 @@ impl Translator<'_> {
             | Kind::ShiftBytes(_)
             | Kind::StoreControl
             | Kind::ExtractWord
+            | Kind::ByteMask
             | Kind::ShiftImm(..)
             | Kind::ShiftBy(..)
             | Kind::Emms
             | Kind::Float(..)
-            | Kind::Double(_)
+            | Kind::Double(..)
             | Kind::ScalarFromInt(_)
             | Kind::ScalarToInt(..)
             | Kind::FromInt(_)
@@ -780,19 +820,18 @@ impl Translator<'_> {
         let double = matches!(
             simd.kind,
             Kind::Compare(_, true)
-                | Kind::Double(_)
+                | Kind::Double(..)
                 | Kind::FlagCompare(true)
                 | Kind::Narrow
                 | Kind::ScalarToInt(true, _)
         );
         let log2 = if double { 3 } else { 2 };
         let (scalar, inputs) = match simd.kind {
-            Kind::Float(_, scalar) | Kind::Compare(scalar, _) | Kind::MinMax(_, scalar) => {
-                (scalar, [Some(self.register(simd.dst)), Some(s)])
-            }
-            Kind::Double(_) | Kind::FlagCompare(_) => {
-                (true, [Some(self.register(simd.dst)), Some(s)])
-            }
+            Kind::Float(_, scalar)
+            | Kind::Double(_, scalar)
+            | Kind::Compare(scalar, _)
+            | Kind::MinMax(_, scalar) => (scalar, [Some(self.register(simd.dst)), Some(s)]),
+            Kind::FlagCompare(_) => (true, [Some(self.register(simd.dst)), Some(s)]),
             Kind::Widen(scalar) => (scalar, [None, Some(s)]),
             Kind::Narrow | Kind::ScalarToInt(..) => (true, [None, Some(s)]),
             _ => (false, [None, Some(s)]),
@@ -870,7 +909,10 @@ impl Translator<'_> {
                 };
                 self.emit_all(&[fcvt_int(W, truncate, X16, source), fmov_to_v(W, V0, X16)]);
             }
-            Kind::Double(op) => self.emit(dfloat(op, V0, inputs[0].unwrap(), s)),
+            Kind::Double(op, true) => self.emit(dfloat(op, V0, inputs[0].unwrap(), s)),
+            Kind::Double(op, false) => {
+                self.emit(vfloat(op, true, V0, inputs[0].unwrap(), s) | 1 << 22)
+            }
             Kind::FromInt(false) => self.emit(vfromint(V0, s)),
             Kind::FromInt(true) => self.emit_all(&[
                 vumov(2, X16, s, 0),
@@ -976,7 +1018,9 @@ impl Translator<'_> {
             | Kind::Float(_, true)
             | Kind::MinMax(_, true)
             | Kind::Narrow => vins(2, d, 0, V0, 0),
-            Kind::ScalarFromInt(true) | Kind::Double(_) | Kind::Widen(true) => vins(3, d, 0, V0, 0),
+            Kind::ScalarFromInt(true) | Kind::Double(_, true) | Kind::Widen(true) => {
+                vins(3, d, 0, V0, 0)
+            }
             Kind::ToInt(_) => vmov(false, d, V0),
             _ => vmov(true, d, V0),
         });

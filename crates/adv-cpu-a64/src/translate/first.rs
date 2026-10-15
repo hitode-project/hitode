@@ -294,6 +294,7 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         Op::Helper(_)
         | Op::Narrow(..)
         | Op::StepMemory(..)
+        | Op::NarrowStep(..)
         | Op::Direction(_)
         | Op::Simd(_)
         | Op::Strings(_)
