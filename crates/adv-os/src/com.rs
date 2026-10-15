@@ -4,7 +4,8 @@
 //! personality frontend. This module only associates initialized pointers with
 //! IIDs and a typed payload. Anonymous references in `Objects` carry COM strong
 //! ownership; interface aliases carry internal references until the last Release.
-//! There is no second payload table or independent reference counter here.
+//! Guest-counted objects retain one table owner and share their public count
+//! with authored vtable code through execution-owner-only counter storage.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,9 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use adv_machine::{Env, Identity, Namespace, Objects, Outcome};
 
 mod automation;
+mod guest;
 pub use automation::{
     AutomationStrings, MAX_BSTR_BYTES, alloc_bstr, copy_bstr, free_bstr, owns_bstr,
 };
+pub use guest::GuestReferences;
 
 /// Bytes in the guest GUID's little-endian in-memory layout.
 pub type Iid = [u8; 16];
@@ -95,6 +98,7 @@ pub struct ComObject<T: Any> {
     internal: u32,
     /// Once queried, the observable interface set must remain static.
     sealed: bool,
+    guest: Option<GuestReferences>,
 }
 
 /// The last Release returns the payload and interface allocations for cleanup.
@@ -155,6 +159,7 @@ impl Com {
             aliases: BTreeSet::from([pointer]),
             internal: 0,
             sealed: false,
+            guest: None,
         })?;
         if !objects.bind_alias(self.namespace, pointer, id) {
             // The initial owner was never published and must not be leaked.
@@ -231,12 +236,18 @@ impl Com {
             return false;
         }
         let needs_alias = !object.aliases.contains(&pointer);
+        if needs_alias && object.guest.as_ref().is_some_and(|c| c.load() >= c.limit()) {
+            return false;
+        }
         if needs_alias && !objects.bind_alias(self.namespace, pointer, id) {
             return false;
         }
         let object = objects.owned_mut(id).unwrap();
         object.interfaces.insert(iid, pointer);
         object.aliases.insert(pointer);
+        if needs_alias && let Some(counter) = &object.guest {
+            counter.set_limit(counter.limit() - 1);
+        }
         true
     }
 
@@ -248,6 +259,9 @@ impl Com {
             .any(|&pointer| self.identity::<T>(objects, pointer) != Some(id))
         {
             return None;
+        }
+        if let Some(counter) = &object.guest {
+            return Some(counter.load());
         }
         objects
             .strong_count(id)?
@@ -265,10 +279,20 @@ impl Com {
         else {
             return false;
         };
+        if self
+            .object(objects, id)
+            .and_then(|o| o.guest.as_ref())
+            .is_some_and(|c| c.load() >= c.limit())
+        {
+            return false;
+        }
         if !objects.retain(id) {
             return false;
         }
         objects.owned_mut(id).unwrap().internal = internal;
+        if let Some(counter) = &self.object(objects, id).unwrap().guest {
+            counter.set_limit(counter.limit() - 1);
+        }
         true
     }
 
@@ -282,9 +306,16 @@ impl Com {
         let internal = self.object(objects, id)?.internal.checked_sub(1)?;
         let references = self.references(objects, id)?;
         if internal == 0 && references == 0 {
+            if self.object(objects, id)?.guest.is_some() {
+                objects.owned_mut(id)?.internal = 0;
+                objects.release(id)?;
+            }
             return Some(Some(self.destroy(objects, id)?));
         }
         objects.owned_mut(id)?.internal = internal;
+        if let Some(counter) = &self.object(objects, id)?.guest {
+            counter.set_limit(counter.limit() + 1);
+        }
         objects.release(id)?;
         Some(None)
     }
@@ -341,6 +372,13 @@ impl Com {
         id: ComIdentity<T>,
     ) -> Option<u32> {
         let references = self.references(objects, id)?.checked_add(1)?;
+        if let Some(counter) = &self.object(objects, id)?.guest {
+            if references > counter.limit() {
+                return None;
+            }
+            counter.store(references);
+            return Some(references);
+        }
         objects.retain(id).then_some(references)
     }
 
@@ -354,8 +392,14 @@ impl Com {
         id: ComIdentity<T>,
     ) -> Option<Released<T>> {
         let references = self.references(objects, id)?.checked_sub(1)?;
+        let guest = self.object(objects, id)?.guest.as_ref();
+        if let Some(counter) = guest {
+            counter.store(references);
+        }
         if references != 0 || self.object(objects, id)?.internal != 0 {
-            objects.release(id)?;
+            if guest.is_none() {
+                objects.release(id)?;
+            }
             return Some(Released {
                 references,
                 destroyed: None,

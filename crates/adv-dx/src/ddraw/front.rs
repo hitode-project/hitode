@@ -49,6 +49,7 @@ pub fn register(registry: &mut Registry) {
     ] {
         registry.register(api);
     }
+    crate::refcounts::install(registry, "ddraw.dll");
 }
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
@@ -127,14 +128,26 @@ pub fn install<B: Backend>(
 }
 fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
     let provider = env.ext.get::<State>().provider;
-    let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
-    let mut memory = (provider.memory)(env.cpu);
-    match state
-        .draw
-        .activate(&mut env.sys.objects, store, iid, outer, output, &mut memory)
-    {
+    let result = {
+        let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
+        let mut memory = (provider.memory)(env.cpu);
+        state
+            .draw
+            .activate(&mut env.sys.objects, store, iid, outer, output, &mut memory)
+    };
+    publish_counters(env);
+    match result {
         Ok(hr) => Outcome::Return(hr),
         Err(error) => Outcome::Fail(format!("DirectDraw activation: {error}")),
+    }
+}
+fn publish_counters(env: &mut Env<'_>) {
+    let draw = &mut env.ext.get_mut::<State>().draw;
+    let (com, pending) = (draw.com, std::mem::take(&mut draw.pending_guest));
+    if let Some(com) = com {
+        for id in pending {
+            com.enable_guest(env, id);
+        }
     }
 }
 fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
@@ -198,6 +211,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
             store.stats.presentations != before,
         )
     };
+    publish_counters(env);
     if changed
         && result.is_ok()
         && let Some(outcome) = (provider.completed)(env, presented)

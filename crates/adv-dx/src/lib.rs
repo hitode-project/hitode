@@ -12,3 +12,5 @@ pub mod dsound;
 pub mod dxdiag;
 pub mod shader;
 pub mod wmvcore;
+
+mod refcounts;

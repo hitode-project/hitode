@@ -354,6 +354,7 @@ pub fn register(reg: &mut Registry) {
             );
         }
     }
+    crate::refcounts::install(reg, "dsound.dll");
 }
 
 /// The same no-driver failure used before the device personality is installed.
@@ -592,7 +593,7 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
         Kind::Notify(_) => unreachable!("notification is an alias of the buffer"),
     };
     let table = e.ext.get::<Sound>().tables[i];
-    let Some(ptr) = alloc(e, 4) else {
+    let Some(ptr) = alloc(e, 8) else {
         return Ok(None);
     };
     if let Err(error) = e.cpu.write_u32(ptr, table) {
@@ -600,7 +601,7 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
         return Err(error.to_string());
     }
     let notify = if with_notify {
-        let Some(notify) = alloc(e, 4) else {
+        let Some(notify) = alloc(e, 8) else {
             free(e, ptr);
             return Ok(None);
         };
@@ -654,6 +655,7 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
         release(e, ptr);
         return Ok(None);
     }
+    com.enable_guest(e, id);
     Ok(Some(ptr))
 }
 /// The shared buffer always owns an empty effects chain. Nonempty requests fail

@@ -96,8 +96,8 @@ fn object(env: &mut Env<'_>, wide: bool) -> Option<u32> {
     if !initialize(env) {
         return None;
     }
-    let primary = alloc(env, 4)?;
-    let Some(other) = alloc(env, 4) else {
+    let primary = alloc(env, 8)?;
+    let Some(other) = alloc(env, 8) else {
         free(env, primary);
         return None;
     };
@@ -131,6 +131,7 @@ fn object(env: &mut Env<'_>, wide: bool) -> Option<u32> {
         release(env, primary);
         return None;
     }
+    com.enable_guest(env, identity);
     Some(primary)
 }
 #[win32(dinput8, name = "DirectInput8Create", level = state)]
@@ -294,6 +295,8 @@ pub fn register(registry: &mut Registry) {
     ] {
         registry.register(api);
     }
+    crate::refcounts::install(registry, "dinput8.dll");
+    crate::refcounts::install(registry, "dinput.dll");
 }
 #[cfg(test)]
 mod tests;

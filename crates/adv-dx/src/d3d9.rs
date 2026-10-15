@@ -300,6 +300,7 @@ pub fn register(registry: &mut Registry) {
     update_texture::register(registry);
     shaders::register(registry);
     programmable::register(registry);
+    crate::refcounts::install(registry, "d3d9.dll");
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -441,7 +442,7 @@ fn object(
     payload: Payload,
 ) -> Option<(u32, Id)> {
     let table = *env.ext.get::<State>().tables.get(interface)?;
-    let pointer = alloc(env, 4)?;
+    let pointer = alloc(env, 8)?;
     if env.cpu.write_u32(pointer, table).is_err() {
         free(env, pointer);
         return None;
@@ -450,6 +451,15 @@ fn object(
         free(env, pointer);
         return None;
     };
+    let container = match com(env).get_identity(&env.sys.objects, id) {
+        Some(Payload::Resource(r)) => r.container,
+        _ => None,
+    };
+    if let Some(parent) = container {
+        com(env).alias_guest(env, id, parent);
+    } else {
+        com(env).enable_guest(env, id);
+    }
     Some((pointer, id))
 }
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
