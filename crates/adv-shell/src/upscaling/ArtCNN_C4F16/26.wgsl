@@ -2,6 +2,7 @@
 struct SLANG_ParameterGroup_Params_std140_0
 {
     @align(16) dimensions_0 : vec4<u32>,
+    @align(16) origin_0 : vec4<u32>,
 };
 
 @binding(0) @group(0) var<uniform> Params_0 : SLANG_ParameterGroup_Params_std140_0;
@@ -29,15 +30,15 @@ fn hook_0( pos_0 : vec2<f32>) -> vec4<f32>
 
 @compute
 @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) id_0 : vec3<u32>)
+fn main(@builtin(global_invocation_id) group_0 : vec3<u32>)
 {
-    var _S2 : vec2<u32> = id_0.xy;
-    if((any((_S2 >= (Params_0.dimensions_0.zw)))))
+    var id_0 : vec2<u32> = group_0.xy + Params_0.origin_0.zw;
+    if((any((id_0 >= (Params_0.dimensions_0.zw)))))
     {
         return;
     }
-    var pos_1 : vec2<f32> = (vec2<f32>(_S2) + vec2<f32>(0.5f)) / vec2<f32>(Params_0.dimensions_0.zw);
+    var pos_1 : vec2<f32> = (vec2<f32>(id_0) + vec2<f32>(0.5f)) / vec2<f32>(Params_0.dimensions_0.zw);
     var rgb_0 : vec3<f32> = (textureSampleLevel((INPUT_0), (sam_0), (pos_1), (0.0f))).xyz;
-    textureStore((OUTPUT_0), (_S2), (vec4<f32>(rgb_0 + vec3<f32>((hook_0(pos_1).x - dot(rgb_0, vec3<f32>(0.2125999927520752f, 0.71520000696182251f, 0.07220000028610229f)))), 1.0f)));
+    textureStore((OUTPUT_0), (id_0), (vec4<f32>(rgb_0 + vec3<f32>((hook_0(pos_1).x - dot(rgb_0, vec3<f32>(0.2125999927520752f, 0.71520000696182251f, 0.07220000028610229f)))), 1.0f)));
     return;
 }

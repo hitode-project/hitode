@@ -51,6 +51,8 @@ pub struct WindowPresenter {
     upscaling: Option<crate::upscaling::Upscaling>,
     max_acquire_ns: Cell<u64>,
     max_configure_ns: u64,
+    /// Upscaler runs and the input pixels their last passes recomputed.
+    upscaled: (u64, u64),
 }
 
 impl WindowPresenter {
@@ -87,18 +89,18 @@ impl WindowPresenter {
         Ok(surface)
     }
 
+    /// `layer` is the game view's frame `CAMetalLayer` (HOST-VIEW-9).
     #[cfg(target_os = "macos")]
     unsafe fn surface(
-        view: *mut std::ffi::c_void,
+        layer: *mut std::ffi::c_void,
         instance: &wgpu::Instance,
     ) -> Result<wgpu::Surface<'static>, String> {
-        let view = std::ptr::NonNull::new(view).ok_or("null GPU view")?;
-        // SAFETY: the UI owner keeps NSView alive until all surface jobs finish.
+        if layer.is_null() {
+            return Err("null GPU layer".into());
+        }
+        // SAFETY: the UI owner keeps the layer alive until all surface jobs finish.
         unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(wgpu::rwh::AppKitDisplayHandle::new().into()),
-                raw_window_handle: wgpu::rwh::AppKitWindowHandle::new(view).into(),
-            })
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer))
         }
         .map_err(|error| error.to_string())
     }
@@ -231,6 +233,7 @@ impl WindowPresenter {
             upscaling: None,
             max_acquire_ns: Cell::new(0),
             max_configure_ns: 0,
+            upscaled: (0, 0),
         })
     }
 
@@ -267,6 +270,7 @@ impl WindowPresenter {
         rectangle: [f32; 4],
         canvas: (u32, u32),
         changed: bool,
+        damage: Option<Rect>,
         overlays: &[VideoOverlay],
         submission: &Submission<'_>,
     ) -> Result<DrawResult, String> {
@@ -292,7 +296,22 @@ impl WindowPresenter {
         }
         let refresh = changed || rebuild;
         if let Some(upscaling) = &self.upscaling {
-            if refresh {
+            // Composed video changes without frame damage, so it redraws fully.
+            let damage = damage.filter(|_| !rebuild && overlays.is_empty());
+            if let Some(damage) = damage.filter(|_| refresh) {
+                self.compositor.compose_view_region(
+                    source,
+                    &upscaling.input,
+                    wgpu::TextureFormat::Rgba16Float,
+                    CompositionRegion {
+                        rectangle: [0., 0., canvas.0 as f32, canvas.1 as f32],
+                        source_uv: [0., 0., 1., 1.],
+                        scissor: Some(damage),
+                    },
+                    false,
+                    submission,
+                )?;
+            } else if refresh {
                 self.compositor.compose_frame(
                     source,
                     &upscaling.input,
@@ -303,7 +322,10 @@ impl WindowPresenter {
                     overlays,
                     submission,
                 )?;
-                upscaling.run(&self.context, submission);
+            }
+            if refresh {
+                self.upscaled.0 += 1;
+                self.upscaled.1 += upscaling.run(&self.context, submission, damage);
             }
         }
         if (width, height) != (self.configuration.width, self.configuration.height) {
@@ -883,6 +905,12 @@ pub(crate) struct Session {
     pub(crate) presenter: WindowPresenter,
     frames: FrameConsumer,
     native: Option<NativeFrame>,
+    /// The native publication last handed to `draw_view`.
+    publication: Option<u64>,
+    /// Whether the current frame reached `draw_view`; damage is contiguous only then.
+    contiguous: bool,
+    /// What the current frame changed since the one before it reached `draw_view`.
+    damage: Option<Rect>,
     software: Option<(wgpu::Texture, wgpu::TextureView)>,
     snapshot: Snapshot,
     serial: u64,
@@ -893,26 +921,83 @@ pub(crate) struct Session {
     cursor_regions: Arc<[VideoCursorRegion]>,
     stats: crate::performance::NativePresentation,
 }
-/// `canvas` when `viewport` places it at an exact integer scale that the
-/// compositor's aspect fit reproduces: one axis filled, both margins whole.
-fn integer_drawable(client: (u32, u32), canvas: (u32, u32), viewport: [f32; 4]) -> (u32, u32) {
-    let [x, y, w, h] = viewport;
-    let scale = (client.0 as f32 / canvas.0 as f32).min(client.1 as f32 / canvas.1 as f32);
-    let exact = |offset: f32, size: f32, full: u32, game: u32| {
-        size == game as f32 * scale && offset * 2.0 + size == full as f32
-    };
-    if scale >= 1.0
-        && scale.fract() == 0.0
-        && exact(x, w, client.0, canvas.0)
-        && exact(y, h, client.1, canvas.1)
-    {
-        canvas
-    } else {
-        client
+/// How the frame reaches the screen (HOST-VIEW-9): the drawable size, the
+/// frame's rectangle in client pixels, and whether the layer that shows it
+/// there magnifies with nearest sampling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placement {
+    pub(crate) drawable: (u32, u32),
+    pub(crate) rectangle: [f32; 4],
+    pub(crate) nearest: bool,
+}
+impl Placement {
+    /// An upscaler doubles the frame. The layer magnifies that output when the
+    /// viewport is at least as large; otherwise the drawable takes the
+    /// viewport's size and the output is resampled into it, both linearly.
+    fn upscaled(canvas: (u32, u32), viewport: [f32; 4]) -> Self {
+        let output = (canvas.0 * 2, canvas.1 * 2);
+        let [_, _, w, h] = viewport;
+        Self {
+            drawable: if w >= output.0 as f32 && h >= output.1 as f32 {
+                output
+            } else {
+                (w as u32, h as u32)
+            },
+            rectangle: viewport,
+            nearest: false,
+        }
     }
+    /// The drawable covers the client and the frame is composed into it.
+    fn client(client: (u32, u32)) -> Self {
+        Self {
+            drawable: client,
+            rectangle: [0.0, 0.0, client.0 as f32, client.1 as f32],
+            nearest: false,
+        }
+    }
+    /// The layer is placed at `viewport` and scales the drawable itself. An
+    /// exact integer scale keeps the game resolution under nearest sampling,
+    /// which equals sharp-bilinear there. Other scales prescale by the integer
+    /// part with nearest sampling and leave the rest to linear filtering, which
+    /// is the definition of sharp-bilinear.
+    fn layer(canvas: (u32, u32), viewport: [f32; 4]) -> Self {
+        let [_, _, w, h] = viewport;
+        let exact =
+            |size: f32, game: u32| size >= game as f32 && (size / game as f32).fract() == 0.0;
+        let factor = |size: f32, game: u32| (size / game as f32).floor().max(1.0) as u32;
+        let nearest = exact(w, canvas.0) && exact(h, canvas.1);
+        Self {
+            drawable: if nearest {
+                canvas
+            } else {
+                (
+                    canvas.0 * factor(w, canvas.0),
+                    canvas.1 * factor(h, canvas.1),
+                )
+            },
+            rectangle: viewport,
+            nearest,
+        }
+    }
+}
+/// The bounding box of `rects`, if any.
+fn bounds(rects: &[Rect]) -> Option<Rect> {
+    let first = *rects.first()?;
+    Some(rects.iter().fold(first, |a, b| {
+        let x = a.x.min(b.x);
+        let y = a.y.min(b.y);
+        Rect {
+            x,
+            y,
+            w: (a.x + a.w).max(b.x + b.w) - x,
+            h: (a.y + a.h).max(b.y + b.h) - y,
+        }
+    }))
 }
 pub(crate) struct Rendered {
     pub(crate) result: DrawResult,
+    /// Set when this render presented with it.
+    pub(crate) placement: Option<Placement>,
     pub(crate) serial: u64,
     pub(crate) canvas: (u32, u32),
     pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
@@ -923,6 +1008,9 @@ impl Session {
             presenter,
             frames,
             native: None,
+            publication: None,
+            contiguous: false,
+            damage: None,
             software: None,
             snapshot: Snapshot::default(),
             serial: 0,
@@ -944,7 +1032,7 @@ impl Session {
     }
 
     fn needs_configuration(&self, dimensions: (u32, u32)) -> bool {
-        self.drawable(dimensions)
+        self.placement(dimensions).drawable
             != (
                 self.presenter.configuration.width,
                 self.presenter.configuration.height,
@@ -966,22 +1054,23 @@ impl Session {
         }
     }
 
-    /// The drawable keeps the game resolution when the frame fills the client
-    /// at an exact integer scale, centered on whole pixels, with no upscaler or
-    /// video composed at display resolution. Core Animation then magnifies it
-    /// with nearest sampling (`GameView::new`), which equals sharp-bilinear at
-    /// integer scales, so no display-resolution pass runs.
-    fn drawable(&self, client: (u32, u32)) -> (u32, u32) {
+    /// On macOS the game view's layer scales the frame, so no display-resolution
+    /// pass runs. Composed video still draws at the client size.
+    fn placement(&self, client: (u32, u32)) -> Placement {
         let canvas = (self.width, self.height);
-        if !cfg!(target_os = "macos")
-            || self.presenter.upscaler != crate::Upscaler::Off
-            || !self.overlays.is_empty()
-            || canvas.0 == 0
-            || canvas.1 == 0
+        if !cfg!(target_os = "macos") || !self.overlays.is_empty() || canvas.0 == 0 || canvas.1 == 0
         {
-            return client;
+            return Placement::client(client);
         }
-        integer_drawable(client, canvas, self.viewport(client))
+        let viewport = self.viewport(client);
+        if self.presenter.upscaler != crate::Upscaler::Off
+            && viewport[2] > canvas.0 as f32
+            && viewport[3] > canvas.1 as f32
+        {
+            Placement::upscaled(canvas, viewport)
+        } else {
+            Placement::layer(canvas, viewport)
+        }
     }
 
     fn update_video(
@@ -1040,6 +1129,11 @@ impl Session {
                 self.width = frame.image.width();
                 self.height = frame.image.height();
                 self.serial = frame.serial;
+                self.damage = frame
+                    .damage
+                    .since(self.publication.filter(|_| self.contiguous));
+                self.publication = Some(frame.damage.publication());
+                self.contiguous = false;
                 self.native = Some(frame.clone());
                 if update_video {
                     self.update_video(&context, &submission)?;
@@ -1055,6 +1149,7 @@ impl Session {
                 if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
+                        placement: None,
                         serial: self.serial,
                         canvas: (self.width, self.height),
                         cursor_regions: self.cursor_regions.clone(),
@@ -1065,6 +1160,10 @@ impl Session {
                 self.height = self.snapshot.height;
                 self.serial = self.snapshot.frames;
                 if changed {
+                    self.damage = bounds(&self.snapshot.damage)
+                        .filter(|_| self.contiguous && self.native.is_none());
+                    self.publication = None;
+                    self.contiguous = false;
                     if self.software.is_none() || old_extent != (self.width, self.height) {
                         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("adv final software frame"),
@@ -1107,16 +1206,18 @@ impl Session {
         {
             return Ok(Rendered {
                 result: DrawResult::Skipped,
+                placement: None,
                 serial: self.serial,
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
             });
         }
-        let size = self.drawable((width, height));
-        let rectangle = if size == (width, height) {
+        let placement = self.placement((width, height));
+        let size = placement.drawable;
+        let rectangle = if placement == Placement::client((width, height)) {
             self.viewport((width, height))
         } else {
-            [0.0, 0.0, self.width as f32, self.height as f32]
+            [0.0, 0.0, size.0 as f32, size.1 as f32]
         };
         let view = if let Some(frame) = &self.native {
             frame.image.view()
@@ -1132,12 +1233,16 @@ impl Session {
             size,
             rectangle,
             canvas,
-            changed,
+            // A frame consumed without reaching `draw_view` still needs upscaling.
+            changed || !self.contiguous,
+            self.damage.filter(|_| !repaint),
             &self.overlays,
             &submission,
         )?;
+        self.contiguous = true;
         self.stats.presented += u64::from(matches!(result, DrawResult::Presented));
         Ok(Rendered {
+            placement: matches!(result, DrawResult::Presented).then_some(placement),
             result,
             serial: self.serial,
             canvas,
@@ -1305,7 +1410,7 @@ impl UiPresenter {
         session.presenter.upscaler = self.upscaler;
         session.presenter.scaling = self.scaling;
         let configure = self.reconfigure || session.needs_configuration(dimensions);
-        let drawable = session.drawable(dimensions);
+        let drawable = session.placement(dimensions).drawable;
         // Pause is nonblocking. The worker receives its token and waits for the
         // last short Queue lease before configure waits for GPU idle.
         let pause = configure
@@ -1328,6 +1433,7 @@ impl UiPresenter {
                 if !surface_live.load(std::sync::atomic::Ordering::Acquire) {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
+                        placement: None,
                         serial: session.serial,
                         canvas: (session.width, session.height),
                         cursor_regions: session.cursor_regions.clone(),
@@ -1346,6 +1452,8 @@ impl UiPresenter {
             session.stats.max_job_ns = session.stats.max_job_ns.max(nanoseconds(started.elapsed()));
             session.stats.max_acquire_ns = session.presenter.max_acquire_ns.get();
             session.stats.max_configure_ns = session.presenter.max_configure_ns;
+            (session.stats.upscaled_runs, session.stats.upscaled_pixels) =
+                session.presenter.upscaled;
             let _ = output.push(Completion {
                 session,
                 result,
@@ -1424,26 +1532,48 @@ mod tests {
     // spec: HOST-VIEW-1
     // spec: HOST-VIEW-9
     #[test]
-    fn integer_fits_keep_the_game_resolution_for_compositor_magnification() {
+    fn the_layer_scales_frames_from_their_integer_prescale() {
         let fit = |client: (u32, u32), canvas: (u32, u32)| {
             let viewport = crate::window::native_viewport(client.0, client.1, canvas.0, canvas.1);
-            integer_drawable(client, canvas, viewport)
+            let placement = Placement::layer(canvas, viewport);
+            assert_eq!(placement.rectangle, viewport);
+            (placement.drawable, placement.nearest)
         };
         let game = (1920, 1080);
-        assert_eq!(fit((3840, 2160), game), game);
-        assert_eq!(fit((3840, 2400), game), game);
-        assert_eq!(fit((1920, 1080), game), game);
-        // An odd margin cannot be centered on whole pixels.
-        assert_eq!(fit((3840, 2161), game), (3840, 2161));
-        assert_eq!(fit((3000, 2000), (1280, 720)), (3000, 2000));
-        assert_eq!(fit((960, 540), game), (960, 540));
-        // Integer mode leaving both margins is not what an aspect fit draws.
+        // Exact integer scales keep the game resolution under nearest sampling.
+        assert_eq!(fit((3840, 2160), game), (game, true));
+        assert_eq!(fit((3840, 2400), game), (game, true));
+        assert_eq!(fit((1920, 1080), game), (game, true));
+        // Other scales prescale by the integer part; the layer filters linearly.
+        assert_eq!(fit((2560, 1440), game), (game, false));
+        assert_eq!(fit((3000, 2000), (1280, 720)), ((2560, 1440), false));
+        // The layer sits on whole pixels, so an odd margin no longer matters.
+        assert_eq!(fit((3840, 2161), game), (game, true));
+        assert_eq!(fit((960, 540), game), (game, false));
+        // Integer mode places an exact multiple, margins included.
         let integer = crate::Scaling::Integer
             .rectangle((4000.0, 2400.0), (1280, 720))
             .map(|v| v as f32);
+        let placement = Placement::layer((1280, 720), integer);
+        assert_eq!((placement.drawable, placement.nearest), ((1280, 720), true));
+        assert_eq!(placement.rectangle, [80.0, 120.0, 3840.0, 2160.0]);
+        // Upscaled output is magnified by the layer when it fits the viewport,
+        // and resampled to the viewport's size when it is larger.
+        let upscaled = |client: (u32, u32), canvas: (u32, u32)| {
+            let viewport = crate::window::native_viewport(client.0, client.1, canvas.0, canvas.1);
+            Placement::upscaled(canvas, viewport).drawable
+        };
+        assert_eq!(upscaled((3840, 2160), (1280, 720)), (2560, 1440));
+        assert_eq!(upscaled((2560, 1440), (1280, 720)), (2560, 1440));
+        assert_eq!(upscaled((2560, 1440), game), (2560, 1440));
+        assert_eq!(upscaled((3000, 2000), game), (3000, 1687));
+        // Stretch prescales each axis by its own integer part.
+        let stretch = crate::Scaling::Stretch
+            .rectangle((3000.0, 1500.0), (1280, 720))
+            .map(|v| v as f32);
         assert_eq!(
-            integer_drawable((4000, 2400), (1280, 720), integer),
-            (4000, 2400)
+            Placement::layer((1280, 720), stretch).drawable,
+            (2560, 1440)
         );
     }
     #[test]
@@ -1730,7 +1860,7 @@ mod tests {
                         &submission,
                     )
                     .unwrap();
-                upscaling.run(&context, &submission);
+                upscaling.run(&context, &submission, None);
                 compositor
                     .compose_view(
                         upscaling.output(),

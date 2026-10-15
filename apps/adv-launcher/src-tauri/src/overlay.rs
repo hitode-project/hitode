@@ -3,6 +3,7 @@
 //! The routing rules themselves are in [`adv_shell::overlay`].
 use adv_shell::overlay::{OverlayInput, Rect, Router};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// `OverlayInput` as the webview sends it.
@@ -12,6 +13,7 @@ pub struct InputMessage {
     regions: Vec<RectMessage>,
     modal: bool,
     wants_keyboard: bool,
+    visible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,11 +44,12 @@ impl From<InputMessage> for OverlayInput {
             regions,
             modal: message.modal,
             wants_keyboard: message.wants_keyboard,
+            visible: message.visible,
         }
     }
 }
 
-type Listener = Box<dyn Fn(&OverlayInput) + Send + Sync>;
+type Listener = Box<dyn Fn(&OverlayInput, u64) + Send + Sync>;
 
 /// Routing state shared between the webview commands and the native game
 /// view. It starts exclusive: the webview owns all input until the game
@@ -54,6 +57,7 @@ type Listener = Box<dyn Fn(&OverlayInput) + Send + Sync>;
 pub struct OverlayState {
     pub(crate) router: Arc<Mutex<Router>>,
     listeners: Mutex<Vec<Listener>>,
+    changes: AtomicU64,
 }
 
 impl Default for OverlayState {
@@ -61,6 +65,7 @@ impl Default for OverlayState {
         Self {
             router: Arc::new(Mutex::new(Router::new(OverlayInput::exclusive()))),
             listeners: Mutex::default(),
+            changes: AtomicU64::new(0),
         }
     }
 }
@@ -71,10 +76,15 @@ impl OverlayState {
         self.router.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Calls `listener` after every change of the claim, on the thread that
-    /// received it (not the main thread). The host view uses it to move the
-    /// first responder when the keyboard target changes.
-    pub fn on_change(&self, listener: impl Fn(&OverlayInput) + Send + Sync + 'static) {
+    /// The number of changes so far; each listener call carries its own.
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
+    }
+
+    /// Calls `listener` after every change of the claim, with its number, on
+    /// the thread that received it (not the main thread). The host view uses
+    /// it to move the first responder and to hide the idle overlay.
+    pub fn on_change(&self, listener: impl Fn(&OverlayInput, u64) + Send + Sync + 'static) {
         self.listeners
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -82,20 +92,21 @@ impl OverlayState {
     }
 
     pub fn set(&self, input: OverlayInput) {
-        {
+        let change = {
             let mut router = self.router();
             if *router.input() == input {
                 return;
             }
             router.set_input(input.clone());
-        }
+            self.changes.fetch_add(1, Ordering::AcqRel) + 1
+        };
         for listener in self
             .listeners
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
         {
-            listener(&input);
+            listener(&input, change);
         }
     }
 }
@@ -120,7 +131,7 @@ mod tests {
     #[test]
     fn decodes_the_webview_message() {
         let input = parse(
-            r#"{"regions":[{"x":1224,"y":16,"width":40,"height":40}],"modal":false,"wantsKeyboard":true}"#,
+            r#"{"regions":[{"x":1224,"y":16,"width":40,"height":40}],"modal":false,"wantsKeyboard":true,"visible":true}"#,
         );
         assert_eq!(
             input.regions,
@@ -132,6 +143,7 @@ mod tests {
             }]
         );
         assert!(!input.modal);
+        assert!(input.visible);
         assert_eq!(input.keyboard(), Target::Overlay);
     }
 
@@ -140,29 +152,30 @@ mod tests {
     fn rejects_unknown_fields_and_drops_empty_regions() {
         assert!(
             serde_json::from_str::<InputMessage>(
-                r#"{"regions":[],"modal":false,"wantsKeyboard":false,"x":1}"#
+                r#"{"regions":[],"modal":false,"wantsKeyboard":false,"visible":false,"x":1}"#
             )
             .is_err()
         );
         let input = parse(
-            r#"{"regions":[{"x":0,"y":0,"width":0,"height":5},{"x":0,"y":0,"width":-3,"height":5}],"modal":false,"wantsKeyboard":false}"#,
+            r#"{"regions":[{"x":0,"y":0,"width":0,"height":5},{"x":0,"y":0,"width":-3,"height":5}],"modal":false,"wantsKeyboard":false,"visible":false}"#,
         );
         assert!(input.regions.is_empty());
     }
 
-    // spec: HOST-OVL-6
+    // spec: HOST-OVL-6 HOST-OVL-9
     #[test]
     fn starts_exclusive_and_notifies_only_on_change() {
         let state = OverlayState::default();
         assert_eq!(state.router().input(), &OverlayInput::exclusive());
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        state.on_change(move |_| {
-            seen.fetch_add(1, Ordering::Relaxed);
+        state.on_change(move |_, change| {
+            assert_eq!(seen.fetch_add(1, Ordering::Relaxed) as u64 + 1, change);
         });
         state.set(OverlayInput::default());
         state.set(OverlayInput::default());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.changes(), 1);
         assert_eq!(state.router().keyboard(), Target::Game);
     }
 }

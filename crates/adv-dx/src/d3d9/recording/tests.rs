@@ -52,7 +52,10 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
         p.latest = Some(frame);
         Ok(serial)
     };
-    state.provider.present = state.provider.present_copy;
+    state.provider.present = |ext, surface, _, gpu| {
+        let copy = ext.get::<State>().provider.present_copy;
+        copy(ext, surface, gpu)
+    };
     state.provider.repeat = |ext, _| {
         let p = ext.get_mut::<Presents>();
         p.serial += 1;

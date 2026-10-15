@@ -597,7 +597,9 @@ fn opaque_images_sample_one_and_preserve_semantics_across_frame_rotation() {
     let (producer, mut consumer) = frame_mailbox();
     surfaces.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
     for _ in 0..3 {
-        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        surfaces
+            .present_native_rotating(id, None, &mut gpu)
+            .unwrap();
         assert!(consumer.update());
         assert_eq!(
             consumer.current().native().unwrap().image.alpha_mode(),
@@ -1196,7 +1198,9 @@ fn rotating_surface_retains_one_logical_id_and_a_bounded_immutable_pool() {
         .unwrap();
         let before = gpu.stats().submissions;
         assert_eq!(
-            surfaces.present_native_rotating(id, &mut gpu).unwrap(),
+            surfaces
+                .present_native_rotating(id, None, &mut gpu)
+                .unwrap(),
             u64::from(serial)
         );
         assert_eq!(
@@ -1232,14 +1236,16 @@ fn rotating_surface_retains_one_logical_id_and_a_bounded_immutable_pool() {
     );
     let mut held = Vec::new();
     while surfaces.native_pool_size(id).unwrap() < 8 {
-        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        surfaces
+            .present_native_rotating(id, None, &mut gpu)
+            .unwrap();
         consumer.update();
         held.push(consumer.current().native().unwrap().clone());
     }
     // Fill the last reusable slots too, retaining each completed frame.
     loop {
         let serial = surfaces.stats.presentations;
-        match surfaces.present_native_rotating(id, &mut gpu) {
+        match surfaces.present_native_rotating(id, None, &mut gpu) {
             Ok(_) => {
                 consumer.update();
                 held.push(consumer.current().native().unwrap().clone());
@@ -1258,11 +1264,13 @@ fn rotating_surface_retains_one_logical_id_and_a_bounded_immutable_pool() {
         "real frame-capacity release resumes the pending producer"
     );
     assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
-    surfaces.present_native_rotating(id, &mut gpu).unwrap();
+    surfaces
+        .present_native_rotating(id, None, &mut gpu)
+        .unwrap();
     let before = surfaces.stats.presentations;
     let pause = context.pause_submissions().unwrap();
     assert!(matches!(
-        surfaces.present_native_rotating(id, &mut gpu),
+        surfaces.present_native_rotating(id, None, &mut gpu),
         Err(Error::Busy)
     ));
     assert_eq!(surfaces.stats.presentations, before);

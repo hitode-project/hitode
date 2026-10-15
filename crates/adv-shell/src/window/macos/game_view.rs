@@ -2,10 +2,12 @@
 use super::*;
 use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
-use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CAMetalLayer};
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer, CAMetalLayer, CATransaction};
 
 pub struct Input {
     hub: Rc<Hub>,
+    /// The frame's layer, a sublayer of the black base layer (HOST-VIEW-9).
+    frame: Retained<CAMetalLayer>,
     width: u32,
     height: u32,
     cursor_visible: bool,
@@ -137,11 +139,12 @@ impl GameView {
         fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
         let (width, height) = self.native_client_size()?;
-        // SAFETY: the owner retains NSView until the background service joins
-        // and the presenter drops. Surface creation stays on the main thread.
+        // SAFETY: the owner retains NSView, and with it the frame layer, until
+        // the background service joins and the presenter drops. Surface
+        // creation stays on the main thread.
         let (gpu, mut presenter) = pollster::block_on(unsafe {
             crate::native_gpu::WindowPresenter::request(
-                self as *const Self as *mut std::ffi::c_void,
+                Retained::as_ptr(&self.ivars().borrow().frame) as *mut std::ffi::c_void,
                 width.max(1),
                 height.max(1),
                 fallback,
@@ -300,8 +303,10 @@ impl GameView {
         let hub = Rc::new(Hub::default());
         hub.canvas.set((width, height));
         hub.main_enabled.set(true);
+        let frame = CAMetalLayer::new();
         let this = Self::alloc(mtm).set_ivars(RefCell::new(Input {
             hub,
+            frame: frame.clone(),
             width,
             height,
             cursor_visible: true,
@@ -316,15 +321,49 @@ impl GameView {
             msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(f64::from(width.max(1)), f64::from(height.max(1))))]
         };
         view.setWantsLayer(true);
-        let layer = CAMetalLayer::new();
-        // An integer-scaled frame keeps the game resolution and is magnified
-        // here (native_gpu `Session::drawable`); other drawables match the client.
-        unsafe {
-            layer.setContentsGravity(objc2_quartz_core::kCAGravityResizeAspect);
-            layer.setMagnificationFilter(objc2_quartz_core::kCAFilterNearest);
-        }
-        view.setLayer(Some(&layer));
+        // The base layer is the letterbox; `place` positions the frame's layer
+        // over it, and Core Animation scales the drawable into that rectangle.
+        let base = CALayer::new();
+        let black = objc2_core_graphics::CGColor::new_generic_gray(0.0, 1.0);
+        base.setBackgroundColor(Some(&black));
+        base.setOpaque(true);
+        unsafe { frame.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
+        frame.setOpaque(true);
+        base.addSublayer(&frame);
+        view.setLayer(Some(&base));
+        view.place(None);
         Ok(view)
+    }
+    /// Show the frame at `placement.rectangle` (client pixels), or across the
+    /// client without one. Implicit animations would blend old and new frames.
+    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+        let scale = self
+            .window()
+            .map_or(1.0, |window| window.backingScaleFactor());
+        let bounds = self.bounds().size;
+        let (rectangle, nearest) = match placement {
+            Some(placement) => (
+                placement.rectangle.map(|v| f64::from(v) / scale),
+                placement.nearest,
+            ),
+            None => ([0.0, 0.0, bounds.width, bounds.height], false),
+        };
+        let [x, y, w, h] = rectangle;
+        let frame = self.ivars().borrow().frame.clone();
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        frame.setFrame(objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(x, bounds.height - y - h),
+            objc2_core_foundation::CGSize::new(w, h),
+        ));
+        unsafe {
+            frame.setMagnificationFilter(if nearest {
+                objc2_quartz_core::kCAFilterNearest
+            } else {
+                objc2_quartz_core::kCAFilterLinear
+            });
+        }
+        CATransaction::commit();
     }
     pub(crate) fn hub(&self) -> Rc<Hub> {
         self.ivars().borrow().hub.clone()
@@ -609,6 +648,7 @@ mod tests {
         let hub = Rc::new(Hub::default());
         let mut input = Input {
             hub: hub.clone(),
+            frame: CAMetalLayer::new(),
             width: 640,
             height: 480,
             cursor_visible: true,

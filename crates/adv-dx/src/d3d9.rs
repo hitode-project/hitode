@@ -64,7 +64,9 @@ pub struct SurfaceProvider {
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
     pub replace: fn(&mut Ext, u32, Target) -> Result<(), String>,
-    pub present: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
+    /// Rotates the surface's front; the rectangle is what changed since its previous present.
+    pub present:
+        fn(&mut Ext, u32, Option<adv_device::surface::Rect>, &mut Gpu) -> Result<u64, Error>,
     /// Snapshot a preserved COPY front without rotating its writable target.
     pub present_copy: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
     /// Complete a guest Present without publishing or executing a GPU command.
@@ -1245,10 +1247,19 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {
-                let rotate = matches!(operation, Operation::Present { owner, .. } if
-                    matches!(com(env).get_identity(&env.sys.objects, *owner), Some(Payload::Device(d)) if d.frame.rotate));
-                if rotate {
-                    (provider.present)(env.ext, *surface, &mut gpu)
+                let rotate = match operation {
+                    Operation::Present { owner, .. } => {
+                        match com(env).get_identity(&env.sys.objects, *owner) {
+                            Some(Payload::Device(d)) if d.frame.rotate => {
+                                Some(recording::changed(&d.frame))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(damage) = rotate {
+                    (provider.present)(env.ext, *surface, damage, &mut gpu)
                 } else {
                     (provider.present_copy)(env.ext, *surface, &mut gpu)
                 }

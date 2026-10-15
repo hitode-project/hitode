@@ -134,7 +134,7 @@ mod mac {
         window.pump()
     }
 
-    // spec: HOST-VIEW-6
+    // spec: HOST-VIEW-6 HOST-OVL-9
     pub fn run() {
         let mtm = MainThreadMarker::new().expect("main thread");
         let mut window = Window::new("adv macos window test", 320, 240, true).unwrap();
@@ -330,7 +330,15 @@ mod mac {
             assert!(events.iter().any(|event| event.0 == 0x200));
             assert!(events.iter().any(|event| event.0 == 0x202));
             assert_eq!(router.lock().unwrap().captured(0), None);
+            container.set_overlay_visible(false);
+            assert!(overlay.isHidden());
+            container.set_overlay_visible(true);
+            assert!(!overlay.isHidden());
+            container.set_overlay_visible(false);
             container.set_game(None);
+            assert!(!overlay.isHidden(), "leaving the game shows the overlay");
+            container.set_overlay_visible(false);
+            assert!(!overlay.isHidden(), "without a game the overlay stays");
             let library_frame = native.frame();
             for (width, height) in [(1600, 900), (800, 600)] {
                 let embedded = GameView::new(width, height).unwrap();
