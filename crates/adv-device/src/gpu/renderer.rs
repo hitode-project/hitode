@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -345,12 +345,17 @@ pub struct Readback {
     context: NativeContext,
     submission: wgpu::SubmissionIndex,
     job_taken: bool,
+    /// Set by whichever of the map callback or cancel touches the buffer first.
+    claimed: Arc<AtomicBool>,
 }
 impl Readback {
     /// Cancel an unconsumed transfer during owner teardown. Unmapping cancels
     /// its pending map; Poll only delivers ready callbacks and never waits.
+    /// A callback that already claimed the buffer unmaps it itself.
     pub fn cancel(&self) {
-        self.buffer.unmap();
+        if !self.claimed.swap(true, Ordering::AcqRel) {
+            self.buffer.unmap();
+        }
         let _ = self.context.device.poll(wgpu::PollType::Poll);
     }
     pub fn poll(&mut self) -> Option<Result<Vec<u8>, Error>> {
@@ -1588,10 +1593,16 @@ impl Gpu {
         let (mut producer, consumer) = adv_sync::spsc::channel(1);
         let completion_buffer = buffer.clone();
         let (width, height) = (image.width, image.height);
+        let claimed = Arc::new(AtomicBool::new(false));
+        let completion_claim = claimed.clone();
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let cancelled = completion_claim.swap(true, Ordering::AcqRel);
             let result = result
                 .map_err(|error| Error::Device(error.to_string()))
                 .and_then(|()| {
+                    if cancelled {
+                        return Err(Error::Device("GPU readback cancelled".into()));
+                    }
                     let mapped = completion_buffer
                         .get_mapped_range(..)
                         .map_err(|error| Error::Device(error.to_string()))?;
@@ -1621,6 +1632,7 @@ impl Gpu {
             context: self.context.clone(),
             submission,
             job_taken: false,
+            claimed,
         })
     }
 }
