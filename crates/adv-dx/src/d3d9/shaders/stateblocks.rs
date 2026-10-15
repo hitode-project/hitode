@@ -34,6 +34,7 @@ impl ConstantMask {
 }
 #[derive(Clone, Default)]
 struct Mask {
+    dirty: u16,
     vertex: bool,
     pixel: bool,
     vertex_constants: ConstantMask,
@@ -64,7 +65,8 @@ pub(in crate::d3d9) struct Snapshot {
 pub(in crate::d3d9) struct StateBlock {
     pointer: u32,
     pub(in crate::d3d9) device: Id,
-    snapshot: Arc<Snapshot>,
+    snapshot: Option<Arc<Snapshot>>,
+    versions: [u64; 15],
 }
 impl Snapshot {
     fn current(env: &Env<'_>, id: Id, mask: Mask) -> Option<Self> {
@@ -108,86 +110,159 @@ impl Snapshot {
             mask,
         })
     }
-    fn matches(&self, d: &super::super::Device) -> bool {
+    fn delta(&self, d: &super::super::Device, versions: [u64; 15]) -> Mask {
+        let mut out = Mask::default();
         let m = &self.mask;
-        let a = &self.fixed;
-        let b = &d.fixed;
-        let constants = |a: &Constants, b: &Constants, m: &ConstantMask| {
-            m.floats
-                .iter()
-                .all(|&i| a.floats[i].map(f32::to_bits) == b.floats[i].map(f32::to_bits))
-                && m.integers.iter().all(|&i| a.integers[i] == b.integers[i])
-                && m.booleans.iter().all(|&i| a.booleans[i] == b.booleans[i])
+        macro_rules! scalar {
+            ($class:expr, $name:ident, $a:expr, $b:expr) => {
+                out.$name = versions[$class] != d.versions[$class] && m.$name && $a != $b;
+                out.dirty |= u16::from(out.$name) << $class;
+            };
+        }
+        macro_rules! indexed {
+            ($class:expr, $name:ident, $a:expr, $b:expr) => {
+                if versions[$class] != d.versions[$class] {
+                    out.$name = m
+                        .$name
+                        .iter()
+                        .copied()
+                        .filter(|&i| $a(i) != $b(i))
+                        .collect();
+                    out.dirty |= u16::from(!out.$name.is_empty()) << $class;
+                }
+            };
+        }
+        scalar!(7, fvf, self.fixed.fvf, d.fixed.fvf);
+        scalar!(
+            7,
+            declaration,
+            self.buffers.declaration,
+            d.buffers.declaration
+        );
+        scalar!(8, vertex, self.shaders.vertex, d.shaders.vertex);
+        scalar!(9, pixel, self.shaders.pixel, d.shaders.pixel);
+        scalar!(11, indices, self.buffers.indices, d.buffers.indices);
+        scalar!(12, texture, self.texture, d.texture);
+        indexed!(
+            10,
+            streams,
+            |i: usize| {
+                let s = self.buffers.streams[i];
+                (s.buffer, s.offset, s.stride)
+            },
+            |i: usize| {
+                let s = d.buffers.streams[i];
+                (s.buffer, s.offset, s.stride)
+            }
+        );
+        indexed!(
+            12,
+            textures,
+            |i: usize| self.shaders.textures[i],
+            |i: usize| d.shaders.textures[i]
+        );
+        indexed!(0, render, |i| self.fixed.render.get(&i), |i| d
+            .fixed
+            .render
+            .get(&i));
+        indexed!(1, stage, |i| self.fixed.stage.get(&i), |i| d
+            .fixed
+            .stage
+            .get(&i));
+        indexed!(
+            1,
+            stage_slots,
+            |(n, i): (usize, i32)| self.fixed.stage_slots[n].get(&i),
+            |(n, i): (usize, i32)| d.fixed.stage_slots[n].get(&i)
+        );
+        indexed!(2, sampler, |i| self.fixed.sampler.get(&i), |i| d
+            .fixed
+            .sampler
+            .get(&i));
+        indexed!(
+            2,
+            sampler_slots,
+            |(n, i): (usize, i32)| self.fixed.sampler_slots[n].get(&i),
+            |(n, i): (usize, i32)| d.fixed.sampler_slots[n].get(&i)
+        );
+        let viewport = |v: adv_abi::types::D3DVIEWPORT9| {
+            (
+                v.X,
+                v.Y,
+                v.Width,
+                v.Height,
+                v.MinZ.to_bits(),
+                v.MaxZ.to_bits(),
+            )
         };
-        (!m.vertex || self.shaders.vertex == d.shaders.vertex)
-            && (!m.pixel || self.shaders.pixel == d.shaders.pixel)
-            && (!m.fvf || a.fvf == b.fvf)
-            && (!m.declaration || self.buffers.declaration == d.buffers.declaration)
-            && (!m.indices || self.buffers.indices == d.buffers.indices)
-            && (!m.texture || self.texture == d.texture)
-            && m.streams.iter().all(|&i| {
-                let a = self.buffers.streams[i];
-                let b = d.buffers.streams[i];
-                (a.buffer, a.offset, a.stride) == (b.buffer, b.offset, b.stride)
-            })
-            && m.textures
-                .iter()
-                .all(|&i| self.shaders.textures[i] == d.shaders.textures[i])
-            && m.render.iter().all(|i| a.render.get(i) == b.render.get(i))
-            && m.stage.iter().all(|i| a.stage.get(i) == b.stage.get(i))
-            && m.stage_slots
-                .iter()
-                .all(|&(slot, i)| a.stage_slots[slot].get(&i) == b.stage_slots[slot].get(&i))
-            && m.sampler
-                .iter()
-                .all(|i| a.sampler.get(i) == b.sampler.get(i))
-            && m.sampler_slots
-                .iter()
-                .all(|&(slot, i)| a.sampler_slots[slot].get(&i) == b.sampler_slots[slot].get(&i))
-            && (!m.viewport
-                || (
-                    a.viewport.X,
-                    a.viewport.Y,
-                    a.viewport.Width,
-                    a.viewport.Height,
-                    a.viewport.MinZ.to_bits(),
-                    a.viewport.MaxZ.to_bits(),
-                ) == (
-                    b.viewport.X,
-                    b.viewport.Y,
-                    b.viewport.Width,
-                    b.viewport.Height,
-                    b.viewport.MinZ.to_bits(),
-                    b.viewport.MaxZ.to_bits(),
-                ))
-            && (!m.scissor
-                || (
-                    a.scissor.left,
-                    a.scissor.top,
-                    a.scissor.right,
-                    a.scissor.bottom,
-                ) == (
-                    b.scissor.left,
-                    b.scissor.top,
-                    b.scissor.right,
-                    b.scissor.bottom,
-                ))
-            && m.transforms
-                .iter()
-                .all(|&i| a.transforms[i].map(f32::to_bits) == b.transforms[i].map(f32::to_bits))
-            && m.clip_planes
-                .iter()
-                .all(|&i| a.clip_planes[i].map(f32::to_bits) == b.clip_planes[i].map(f32::to_bits))
-            && constants(
+        let scissor = |v: RECT| (v.left, v.top, v.right, v.bottom);
+        scalar!(
+            3,
+            viewport,
+            viewport(self.fixed.viewport),
+            viewport(d.fixed.viewport)
+        );
+        scalar!(
+            4,
+            scissor,
+            scissor(self.fixed.scissor),
+            scissor(d.fixed.scissor)
+        );
+        indexed!(
+            5,
+            transforms,
+            |i: usize| self.fixed.transforms[i].map(f32::to_bits),
+            |i: usize| d.fixed.transforms[i].map(f32::to_bits)
+        );
+        indexed!(
+            6,
+            clip_planes,
+            |i: usize| self.fixed.clip_planes[i].map(f32::to_bits),
+            |i: usize| d.fixed.clip_planes[i].map(f32::to_bits)
+        );
+        let mut dirty = out.dirty;
+        for (class, a, b, m, out) in [
+            (
+                13,
                 &self.shaders.vertex_constants,
                 &d.shaders.vertex_constants,
                 &m.vertex_constants,
-            )
-            && constants(
+                &mut out.vertex_constants,
+            ),
+            (
+                14,
                 &self.shaders.pixel_constants,
                 &d.shaders.pixel_constants,
                 &m.pixel_constants,
-            )
+                &mut out.pixel_constants,
+            ),
+        ] {
+            if versions[class] != d.versions[class] {
+                out.floats = m
+                    .floats
+                    .iter()
+                    .copied()
+                    .filter(|&i| a.floats[i].map(f32::to_bits) != b.floats[i].map(f32::to_bits))
+                    .collect();
+                out.integers = m
+                    .integers
+                    .iter()
+                    .copied()
+                    .filter(|&i| a.integers[i] != b.integers[i])
+                    .collect();
+                out.booleans = m
+                    .booleans
+                    .iter()
+                    .copied()
+                    .filter(|&i| a.booleans[i] != b.booleans[i])
+                    .collect();
+                dirty |= u16::from(
+                    !out.floats.is_empty() || !out.integers.is_empty() || !out.booleans.is_empty(),
+                ) << class;
+            }
+        }
+        out.dirty = dirty;
+        out
     }
     pub(super) fn mark_constants(
         &mut self,
@@ -245,6 +320,19 @@ pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey
         return;
     };
     let Some(r) = d.recording.as_mut() else {
+        let class = match key {
+            FixedKey::Fvf => 7,
+            FixedKey::Render(_) => 0,
+            FixedKey::Stage(_) | FixedKey::StageSlot(_, _) => 1,
+            FixedKey::Sampler(_) | FixedKey::SamplerSlot(_, _) => 2,
+            FixedKey::Viewport => 3,
+            FixedKey::Scissor => 4,
+            FixedKey::Transform(_) => 5,
+            FixedKey::ClipPlane(_) => 6,
+        };
+        d.versions[class] = d.versions[class]
+            .checked_add(1)
+            .expect("state version exhausted");
         return;
     };
     match key {
@@ -320,34 +408,36 @@ fn changes(
     shaders: &Bindings,
     buffers: &buffers::Bindings,
     texture: Option<Id>,
-    new: &Snapshot,
+    next: (&Bindings, &buffers::Bindings, Option<Id>),
+    mask: &Mask,
 ) -> Vec<(Option<Id>, Option<Id>)> {
+    let (new_shaders, new_buffers, new_texture) = next;
     let mut pairs = Vec::new();
     for (captured, old, new) in [
-        (new.mask.vertex, shaders.vertex, new.shaders.vertex),
-        (new.mask.pixel, shaders.pixel, new.shaders.pixel),
+        (mask.vertex, shaders.vertex, new_shaders.vertex),
+        (mask.pixel, shaders.pixel, new_shaders.pixel),
         (
-            new.mask.declaration,
+            mask.declaration,
             buffers.declaration,
-            new.buffers.declaration,
+            new_buffers.declaration,
         ),
-        (new.mask.indices, buffers.indices, new.buffers.indices),
-        (new.mask.texture, texture, new.texture),
+        (mask.indices, buffers.indices, new_buffers.indices),
+        (mask.texture, texture, new_texture),
     ] {
         if captured && old != new {
             pairs.push((old, new));
         }
     }
-    for &i in &new.mask.streams {
+    for &i in &mask.streams {
         let old = buffers.streams[i].buffer;
-        let new = new.buffers.streams[i].buffer;
+        let new = new_buffers.streams[i].buffer;
         if old != new {
             pairs.push((old, new));
         }
     }
-    for &i in &new.mask.textures {
+    for &i in &mask.textures {
         let old = shaders.textures[i];
-        let new = new.shaders.textures[i];
+        let new = new_shaders.textures[i];
         if old != new {
             pairs.push((old, new));
         }
@@ -380,7 +470,7 @@ pub(in crate::d3d9) fn release_snapshot(env: &mut Env<'_>, snapshot: Snapshot) {
     }
 }
 pub(in crate::d3d9) fn destroy(env: &mut Env<'_>, block: StateBlock) {
-    for id in block.snapshot.identities() {
+    for id in block.snapshot.unwrap().identities() {
         release_binding(env, Some(id));
     }
     if let Some(released) = com(env).release_identity(&mut env.sys.objects, block.device)
@@ -410,6 +500,7 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         178, 179, 180, 181, 182, 183, 184,
     ];
     Some(Mask {
+        dirty: 0,
         vertex,
         pixel,
         vertex_constants: if vertex {
@@ -512,7 +603,8 @@ fn make(env: &mut Env<'_>, device: Id, snapshot: Snapshot, output: GuestPtr<u32>
         Payload::StateBlock(Box::new(StateBlock {
             pointer: 0,
             device,
-            snapshot: Arc::new(snapshot),
+            snapshot: Some(Arc::new(snapshot)),
+            versions: [u64::MAX; 15],
         })),
     ) else {
         for id in retained {
@@ -613,27 +705,52 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     let id = b.device;
-    let old = Arc::clone(&b.snapshot);
+    let old = b.snapshot.as_ref().unwrap();
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
     };
     if d.recording.is_some() {
         return INVALID;
     }
-    if old.matches(d) {
-        return 0;
-    }
-    let snapshot = Snapshot::current(env, id, old.mask.clone()).unwrap();
-    let changes = changes(&old.shaders, &old.buffers, old.texture, &snapshot);
+    let mask = old.delta(d, b.versions);
+    let versions = d.versions;
+    let changes = changes(
+        &old.shaders,
+        &old.buffers,
+        old.texture,
+        (&d.shaders, &d.buffers, d.texture),
+        &mask,
+    );
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::StateBlock(b)) =
         com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
-        return INVALID;
+        unreachable!();
     };
-    b.snapshot = Arc::new(snapshot);
+    let mut snapshot = b.snapshot.take().unwrap();
+    let old = Arc::get_mut(&mut snapshot).expect("capture has exclusive snapshot ownership");
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
+        unreachable!();
+    };
+    transfer(
+        (
+            &mut old.fixed,
+            &mut old.shaders,
+            &mut old.buffers,
+            &mut old.texture,
+        ),
+        (&d.fixed, &d.shaders, &d.buffers, d.texture),
+        &mask,
+    );
+    let Some(Payload::StateBlock(b)) =
+        com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
+        unreachable!();
+    };
+    b.snapshot = Some(snapshot);
+    b.versions = versions;
     release_changes(env, &changes);
     0
 }
@@ -654,84 +771,127 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     let id = b.device;
-    let snapshot = Arc::clone(&b.snapshot);
-    let mask = &snapshot.mask;
+    let snapshot = Arc::clone(b.snapshot.as_ref().unwrap());
+    let versions = b.versions;
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
     };
     if d.recording.is_some() {
         return INVALID;
     }
-    let changes = changes(&d.shaders, &d.buffers, d.texture, &snapshot);
+    let mask = snapshot.delta(d, versions);
+    let changes = changes(
+        &d.shaders,
+        &d.buffers,
+        d.texture,
+        (&snapshot.shaders, &snapshot.buffers, snapshot.texture),
+        &mask,
+    );
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
+    transfer(
+        (&mut d.fixed, &mut d.shaders, &mut d.buffers, &mut d.texture),
+        (
+            &snapshot.fixed,
+            &snapshot.shaders,
+            &snapshot.buffers,
+            snapshot.texture,
+        ),
+        &mask,
+    );
+    // Other blocks must observe the restored classes; this block now matches.
+    for (class, v) in d.versions.iter_mut().enumerate() {
+        if mask.dirty & (1 << class) != 0 {
+            *v = v.checked_add(1).expect("state version exhausted");
+        }
+    }
+    let versions = d.versions;
+    let Some(Payload::StateBlock(b)) =
+        com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
+        unreachable!();
+    };
+    b.versions = versions;
+    release_changes(env, &changes);
+    0
+}
+fn transfer(
+    target: (
+        &mut fixed::Fixed,
+        &mut Bindings,
+        &mut buffers::Bindings,
+        &mut Option<Id>,
+    ),
+    source: (&fixed::Fixed, &Bindings, &buffers::Bindings, Option<Id>),
+    mask: &Mask,
+) {
+    let (fixed, shaders, buffers, texture) = target;
+    let (source_fixed, source_shaders, source_buffers, source_texture) = source;
     if mask.vertex {
-        d.shaders.vertex = snapshot.shaders.vertex;
+        shaders.vertex = source_shaders.vertex;
     }
     if mask.pixel {
-        d.shaders.pixel = snapshot.shaders.pixel;
+        shaders.pixel = source_shaders.pixel;
     }
     copy_constants(
-        &mut d.shaders.vertex_constants,
-        &snapshot.shaders.vertex_constants,
+        &mut shaders.vertex_constants,
+        &source_shaders.vertex_constants,
         &mask.vertex_constants,
     );
     copy_constants(
-        &mut d.shaders.pixel_constants,
-        &snapshot.shaders.pixel_constants,
+        &mut shaders.pixel_constants,
+        &source_shaders.pixel_constants,
         &mask.pixel_constants,
     );
     if mask.fvf {
-        d.fixed.fvf = snapshot.fixed.fvf;
+        fixed.fvf = source_fixed.fvf;
     }
     if mask.declaration {
-        d.buffers.declaration = snapshot.buffers.declaration;
+        buffers.declaration = source_buffers.declaration;
     }
     for &i in &mask.streams {
-        d.buffers.streams[i] = snapshot.buffers.streams[i];
+        buffers.streams[i] = source_buffers.streams[i];
     }
     if mask.indices {
-        d.buffers.indices = snapshot.buffers.indices;
+        buffers.indices = source_buffers.indices;
     }
     if mask.texture {
-        d.texture = snapshot.texture;
+        *texture = source_texture;
     }
     for &slot in &mask.textures {
-        d.shaders.textures[slot] = snapshot.shaders.textures[slot];
+        shaders.textures[slot] = source_shaders.textures[slot];
     }
     for &i in &mask.render {
-        d.fixed.render.insert(i, snapshot.fixed.render[&i]);
+        fixed.render.insert(i, source_fixed.render[&i]);
     }
     for &i in &mask.stage {
-        d.fixed.stage.insert(i, snapshot.fixed.stage[&i]);
+        fixed.stage.insert(i, source_fixed.stage[&i]);
     }
     for &(slot, i) in &mask.stage_slots {
-        d.fixed.stage_slots[slot].insert(i, snapshot.fixed.stage_slots[slot][&i]);
+        fixed.stage_slots[slot].insert(i, source_fixed.stage_slots[slot][&i]);
     }
     for &i in &mask.sampler {
-        d.fixed.sampler.insert(i, snapshot.fixed.sampler[&i]);
+        fixed.sampler.insert(i, source_fixed.sampler[&i]);
     }
     for &(slot, i) in &mask.sampler_slots {
-        d.fixed.sampler_slots[slot].insert(i, snapshot.fixed.sampler_slots[slot][&i]);
+        fixed.sampler_slots[slot].insert(i, source_fixed.sampler_slots[slot][&i]);
     }
     if mask.viewport {
-        d.fixed.viewport = snapshot.fixed.viewport;
+        fixed.viewport = source_fixed.viewport;
     }
     if mask.scissor {
-        d.fixed.scissor = snapshot.fixed.scissor;
+        fixed.scissor = source_fixed.scissor;
     }
     for &i in &mask.transforms {
-        d.fixed.transforms[i] = snapshot.fixed.transforms[i];
+        fixed.transforms[i] = source_fixed.transforms[i];
     }
     for &i in &mask.clip_planes {
-        d.fixed.clip_planes[i] = snapshot.fixed.clip_planes[i];
+        fixed.clip_planes[i] = source_fixed.clip_planes[i];
     }
-    release_changes(env, &changes);
-    0
 }
 #[derive(Clone, Copy)]
 enum Slot {
@@ -877,4 +1037,124 @@ pub(in crate::d3d9) fn record_stream(
         d.recording.as_mut().unwrap().buffers.streams[index as usize] = stream;
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint(d: &super::super::super::Device) -> u128 {
+        super::super::super::recording::hash((
+            super::super::super::recording::fixed_key(&d.fixed),
+            d.shaders
+                .vertex_constants
+                .floats
+                .map(|r| r.map(f32::to_bits)),
+            d.shaders.vertex_constants.integers,
+            d.shaders.vertex_constants.booleans,
+            d.shaders
+                .pixel_constants
+                .floats
+                .map(|r| r.map(f32::to_bits)),
+            d.shaders.pixel_constants.integers,
+            d.shaders.pixel_constants.booleans,
+        ))
+    }
+
+    #[test]
+    // spec: GFX-SHADER-4
+    fn partial_and_complete_deltas_match_full_apply_and_capture_reuses_storage() {
+        let mut m = super::super::super::tests::machine();
+        m.sys.objects = Objects::default();
+        m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, id, _, _) = super::super::super::tests::setup(&mut env);
+        let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+        assert_eq!(create(&mut env, GuestPtr::new(pointer), 1, output), 0);
+        let this = GuestPtr::new(output.read(env.cpu).unwrap());
+        assert_eq!(capture(&mut env, this), 0);
+        let saved = Arc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
+        let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
+            panic!()
+        };
+        d.fixed.render.insert(7, 1 - d.fixed.render[&7]);
+        d.versions[0] += 1;
+        let b = block(&env, this.addr()).unwrap();
+        let d = device(&env, pointer).unwrap();
+        let delta = b.snapshot.as_ref().unwrap().delta(d, b.versions);
+        assert_eq!(delta.render, [7].into_iter().collect());
+        assert_eq!(delta.dirty, 1);
+        assert_eq!(capture(&mut env, this), 0);
+        assert_eq!(
+            Arc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap()),
+            saved
+        );
+        let expected = fingerprint(device(&env, pointer).unwrap());
+        let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
+            panic!()
+        };
+        for value in d.fixed.render.values_mut() {
+            *value ^= 1;
+        }
+        for map in std::iter::once(&mut d.fixed.stage)
+            .chain(&mut d.fixed.stage_slots)
+            .chain(std::iter::once(&mut d.fixed.sampler))
+            .chain(d.fixed.sampler_slots.iter_mut().skip(1))
+        {
+            for value in map.values_mut() {
+                *value ^= 1;
+            }
+        }
+        d.fixed.fvf ^= 4;
+        d.fixed.viewport.MinZ = -0.;
+        d.fixed.scissor.left = 1;
+        d.fixed.transforms.fill([2.; 16]);
+        d.fixed.clip_planes.fill([3.; 4]);
+        for (constants, limit) in [
+            (&mut d.shaders.vertex_constants, 256),
+            (&mut d.shaders.pixel_constants, 224),
+        ] {
+            constants.floats[..limit].fill([f32::from_bits(0x7fc0_1234); 4]);
+            constants.integers.fill([-7; 4]);
+            constants.booleans.fill(-1);
+        }
+        for v in &mut d.versions {
+            *v += 1;
+        }
+        assert_eq!(apply(&mut env, this), 0);
+        assert_eq!(fingerprint(device(&env, pointer).unwrap()), expected);
+        let versions = device(&env, pointer).unwrap().versions;
+        assert_eq!(apply(&mut env, this), 0);
+        assert_eq!(device(&env, pointer).unwrap().versions, versions);
+        // Mutate after Capture, then compare the optimized path with full transfer.
+        let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
+            panic!()
+        };
+        d.shaders.vertex_constants.floats[3][0] = -0.;
+        d.versions[13] += 1;
+        let snapshot = Arc::clone(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
+        let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
+            panic!()
+        };
+        transfer(
+            (&mut d.fixed, &mut d.shaders, &mut d.buffers, &mut d.texture),
+            (
+                &snapshot.fixed,
+                &snapshot.shaders,
+                &snapshot.buffers,
+                snapshot.texture,
+            ),
+            &snapshot.mask,
+        );
+        assert_eq!(fingerprint(d), expected);
+        drop(snapshot);
+        assert_eq!(apply(&mut env, this), 0);
+        assert_eq!(fingerprint(device(&env, pointer).unwrap()), expected);
+    }
 }
