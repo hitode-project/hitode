@@ -11,6 +11,7 @@ publish.workspace = true
 adv-cpu = { path = "../adv-cpu" }
 thiserror.workspace = true
 log.workspace = true
+rustc-hash = "2.1"
 
 [lints]
 workspace = true

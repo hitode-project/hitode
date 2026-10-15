@@ -173,6 +173,7 @@ dependencies = [
  "adv-cpu",
  "adv-unicorn",
  "log",
+ "rustc-hash 2.1.3",
  "thiserror 2.0.21",
 ]
 
