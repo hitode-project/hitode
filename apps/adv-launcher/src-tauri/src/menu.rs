@@ -8,8 +8,10 @@
 //!
 //! The predefined Quit item sends `terminate:`, which tao's delegate does not
 //! intercept, so the process would exit without letting a running game save.
-//! It is replaced by an item that calls AppHandle::exit; the game module then
-//! defers the exit until the game has closed.
+//! It is replaced by an item that calls AppHandle::exit. On macOS, while a
+//! game runs, the item ends only the game, as the pause menu's 退出游戏 does;
+//! the Apple quit event (logout, shut down) still defers the exit until the
+//! game has closed.
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -45,6 +47,17 @@ pub fn on_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             #[cfg(not(target_os = "macos"))]
             let _ = tauri::Emitter::emit(app, PAUSE, ());
         }
+        // While a game runs, Quit ends only the game; the next one quits.
+        #[cfg(target_os = "macos")]
+        QUIT => {
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if !crate::game::end_game() {
+                    handle.exit(0);
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
         QUIT => app.exit(0),
         _ => {}
     }

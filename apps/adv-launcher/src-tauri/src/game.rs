@@ -364,22 +364,32 @@ pub async fn start_game(
     .map_err(|error| error.to_string())?
 }
 
+/// Asks the running game to close while the launcher stays; asked again while
+/// it is closing, the game is forced. Returns false when no game is running.
+pub(crate) fn end_game() -> bool {
+    HOST.with_borrow_mut(|host| {
+        let Some(host) = host else { return false };
+        let Some(session) = &host.session else {
+            return false;
+        };
+        if host.exit.is_some() || host.close_window {
+            session.force_close();
+        } else {
+            host.exit = Some(None);
+            session.request_close();
+        }
+        true
+    })
+}
+
 #[tauri::command]
 pub async fn stop_game(window: WebviewWindow) -> Result<(), String> {
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     window
         .run_on_main_thread(move || {
-            let stopped = HOST.with_borrow_mut(|host| {
-                let host = host.as_mut().ok_or("no game is running")?;
-                let session = host.session.as_ref().ok_or("no game is running")?;
-                if host.exit.is_some() || host.close_window {
-                    session.force_close();
-                } else {
-                    host.exit = Some(None);
-                    session.request_close();
-                }
-                Ok(())
-            });
+            let stopped = end_game()
+                .then_some(())
+                .ok_or("no game is running".to_string());
             let _ = reply.send(stopped);
         })
         .map_err(|e| e.to_string())?;
