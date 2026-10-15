@@ -96,6 +96,8 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 #[derive(Default)]
 pub struct Stats {
     pub leaf_calls: u64,
+    pub leaf_abandons: u64,
+    leaf_counts: Vec<(u64, u64)>,
     pub frame_budget: Option<crate::frame_budget::FrameBudget>,
     pub wait_diagnostics: Option<crate::wait_diagnostics::WaitDiagnostics>,
     /// Take wall-clock timings and keep per-frame rows.
@@ -114,14 +116,32 @@ pub struct Stats {
 impl Stats {
     pub(crate) fn leaf(&mut self, thunk: u32, thunks: &ThunkTable) {
         self.leaf_calls += 1;
+        self.note_leaf(thunk, false);
         if let Some(budget) = &mut self.frame_budget {
-            budget.host(0, thunk, thunks);
+            budget.leaf(thunk, thunks, false);
         }
         let i = thunk as usize;
         if self.per_thunk.len() <= i {
             self.per_thunk.resize(i + 1, (0, 0, 0));
         }
         self.per_thunk[i].1 += 1;
+    }
+
+    fn note_leaf(&mut self, thunk: u32, abandon: bool) {
+        self.leaf_counts
+            .resize(self.leaf_counts.len().max(thunk as usize + 1), (0, 0));
+        let counts = &mut self.leaf_counts[thunk as usize];
+        if abandon {
+            counts.1 += 1;
+        } else {
+            counts.0 += 1;
+        }
+    }
+    pub(crate) fn leaf_abandon(&mut self, thunk: u32, thunks: &ThunkTable) {
+        self.note_leaf(thunk, true);
+        if let Some(budget) = &mut self.frame_budget {
+            budget.leaf(thunk, thunks, true);
+        }
     }
 
     pub fn new() -> Self {
@@ -309,15 +329,19 @@ impl Stats {
     /// Host service time only: excludes guest callbacks/waits and native worker
     /// execution. Opt-in timing perturbs the run; never report it as CPU usage.
     pub fn write_host_csv(&self, thunks: &ThunkTable, writer: &mut dyn Write) -> io::Result<()> {
-        writeln!(writer, "module,function,calls,total_ns,max_ns")?;
+        writeln!(
+            writer,
+            "module,function,calls,total_ns,max_ns,leaf_calls,leaf_abandons"
+        )?;
         for (i, &(ns, calls, max)) in self.per_thunk.iter().enumerate() {
             if calls == 0 {
                 continue;
             }
             let thunk = thunks.get(i as u32);
+            let (leaves, abandons) = self.leaf_counts.get(i).copied().unwrap_or_default();
             writeln!(
                 writer,
-                "\"{}\",\"{}\",{calls},{ns},{max}",
+                "\"{}\",\"{}\",{calls},{ns},{max},{leaves},{abandons}",
                 thunk.module.replace('"', "\"\""),
                 thunk.name.replace('"', "\"\"")
             )?;

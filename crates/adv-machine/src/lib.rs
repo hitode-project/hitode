@@ -11,6 +11,7 @@
 //!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
+mod env_leaf;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
@@ -43,6 +44,7 @@ use adv_cpu::backend::{
 };
 
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
+pub use env_leaf::EnvLeafHandler;
 pub use ext::Ext;
 use layout::*;
 pub use leaf::{LeafEnv, LeafHandler};
@@ -1454,10 +1456,10 @@ impl TrapHandler for Dispatch<'_> {
         {
             return false;
         }
-        self.sys
-            .thunks
-            .transport_index(word)
-            .is_some_and(|index| self.sys.thunks.get(index).f.leaf.is_some())
+        self.sys.thunks.transport_index(word).is_some_and(|index| {
+            let f = self.sys.thunks.get(index).f;
+            f.leaf.is_some() || f.env_leaf.is_some()
+        })
     }
 
     fn on_leaf(&mut self, cpu: &mut dyn Guest, pc: u32, word: u32) -> Option<u64> {
@@ -1478,8 +1480,34 @@ impl TrapHandler for Dispatch<'_> {
             return None;
         }
         let index = self.sys.thunks.transport_index(word)?;
-        let handler = self.sys.thunks.get(index).f.leaf?;
+        let binding = self.sys.thunks.get(index).f;
+        let old_esp = cpu.reg(Reg::Esp);
+        let old_edx = cpu.reg(Reg::Edx);
         cpu.set_reg(Reg::Esp, esp);
+        let value = if let Some(handler) = binding.env_leaf {
+            handler(&mut Env {
+                context: self.sys.current,
+                cpu: &mut env_leaf::Cpu(cpu),
+                sys: self.sys,
+                ext: self.ext,
+                thunk: index,
+            })
+        } else {
+            Some(binding.leaf?(&mut LeafEnv::new(&mut Env {
+                context: self.sys.current,
+                cpu,
+                sys: self.sys,
+                ext: self.ext,
+                thunk: index,
+            })))
+        };
+        let Some(value) = value else {
+            cpu.set_reg(Reg::Esp, old_esp);
+            cpu.set_reg(Reg::Edx, old_edx);
+            self.sys.stats.leaf_abandons += 1;
+            self.sys.stats.leaf_abandon(index, &self.sys.thunks);
+            return None;
+        };
         self.sys.recent.push(
             self.sys.current,
             index,
@@ -1488,13 +1516,7 @@ impl TrapHandler for Dispatch<'_> {
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         self.sys.stats.leaf(index, &self.sys.thunks);
-        Some(handler(&mut LeafEnv::new(&mut Env {
-            context: self.sys.current,
-            cpu,
-            sys: self.sys,
-            ext: self.ext,
-            thunk: index,
-        })))
+        Some(value)
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {
@@ -1641,6 +1663,7 @@ impl<B: Backend> Machine<B> {
             "process_entry",
             HostFn {
                 leaf: None,
+                env_leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: process_entry,
                 data: 0,

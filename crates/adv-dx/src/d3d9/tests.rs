@@ -6,7 +6,11 @@ use adv_cpu::JitCpu;
 use adv_machine::{Clock, ObjectLimits};
 
 pub(super) fn machine() -> Machine<JitCpu> {
-    let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+    machine_with_native(false)
+}
+
+pub(super) fn machine_with_native(native: bool) -> Machine<JitCpu> {
+    let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, native).unwrap();
     let mut m = Machine::new(cpu, Registry::default(), Clock::virtual_time()).unwrap();
     m.sys.objects = Objects::with_limits(ObjectLimits {
         references: 3,

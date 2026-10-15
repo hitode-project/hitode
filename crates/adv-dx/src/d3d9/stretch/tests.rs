@@ -58,7 +58,10 @@ impl Fixture {
         Self::with_limits(adv_machine::ObjectLimits::default())
     }
     pub(in crate::d3d9) fn with_limits(limits: adv_machine::ObjectLimits) -> Self {
-        let mut m = super::super::tests::machine();
+        Self::with_native(limits, false)
+    }
+    pub(in crate::d3d9) fn with_native(limits: adv_machine::ObjectLimits, native: bool) -> Self {
+        let mut m = super::super::tests::machine_with_native(native);
         // The ownership-only base deliberately limits references to three.
         // This fixture exercises two live DEFAULT resources and a device wait.
         m.sys.objects = Objects::with_limits(limits);

@@ -12,6 +12,7 @@ const DATA: u32 = 0x410000;
 struct Binding {
     conv: Conv,
     wide: bool,
+    env_leaf: Option<crate::EnvLeafHandler>,
 }
 impl crate::Resolver for Binding {
     fn provides(&self, _: &str) -> bool {
@@ -20,7 +21,12 @@ impl crate::Resolver for Binding {
     fn host_fn(&self, _: &str, _: &str) -> Option<crate::HostFn> {
         Some(crate::HostFn {
             conv: self.conv,
-            handler: trap,
+            env_leaf: self.env_leaf,
+            handler: if self.env_leaf.is_some() {
+                ordinary_env
+            } else {
+                trap
+            },
             data: 0,
             trace: false,
             guest: None,
@@ -41,10 +47,27 @@ impl crate::Resolver for Binding {
     }
 }
 
+fn ordinary_env(env: &mut Env<'_>) -> Outcome {
+    let value = env.arg(1);
+    env.cpu.write_u32(env.arg(0), value).unwrap();
+    Outcome::Return(value)
+}
+
 fn fixture(conv: Conv, wide: bool) -> Machine<JitCpu> {
+    fixture_binding(conv, wide, None)
+}
+fn fixture_binding(
+    conv: Conv,
+    wide: bool,
+    env_leaf: Option<crate::EnvLeafHandler>,
+) -> Machine<JitCpu> {
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, true).unwrap(),
-        Binding { conv, wide },
+        Binding {
+            conv,
+            wide,
+            env_leaf,
+        },
         Clock::virtual_time(),
     )
     .unwrap();
@@ -232,4 +255,72 @@ fn ordinary_leaf_handler_uses_owned_invocation_arguments() {
     });
     assert!(matches!(result, Outcome::Return(91)));
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 91);
+}
+
+// spec: A64-CTL-12
+#[test]
+fn env_leaf_declines_restore_transport_and_count_each_call_once() {
+    for abandon in [false, true] {
+        let handler: crate::EnvLeafHandler = if abandon {
+            |_| None
+        } else {
+            |e| {
+                let value = e.arg(1);
+                e.cpu.write_u32(e.arg(0), value).unwrap();
+                Some((u64::from(e.cpu.reg(Reg::Edx)) << 32) | u64::from(value))
+            }
+        };
+        let mut light = fixture_binding(Conv::Stdcall { argc: 2 }, false, Some(handler));
+        let mut traced = fixture_binding(Conv::Stdcall { argc: 2 }, false, Some(handler));
+        traced.sys.trace = Trace::to_writer(Box::new(std::io::sink()));
+        for _ in 0..3 {
+            run(&mut light);
+            run(&mut traced);
+        }
+        assert_eq!(
+            light.cpu.capture_architecture().unwrap(),
+            traced.cpu.capture_architecture().unwrap()
+        );
+        assert_eq!(light.cpu.read_u32(DATA), traced.cpu.read_u32(DATA));
+        assert_eq!(light.sys.host_calls, 3);
+        assert_eq!(traced.sys.stats.leaf_calls, 0);
+        assert_eq!(traced.sys.stats.leaf_abandons, 0);
+        light.sys.stats.services_enabled = true;
+        light.sys.stats.frame_budget = Some(crate::frame_budget::FrameBudget::new(
+            light.sys.stats.total,
+            None,
+        ));
+        let before = (light.sys.stats.leaf_calls, light.sys.stats.leaf_abandons);
+        run(&mut light);
+        assert_eq!(light.sys.stats.leaf_calls - before.0, u64::from(!abandon));
+        assert_eq!(light.sys.stats.leaf_abandons - before.1, u64::from(abandon));
+        let mut csv = Vec::new();
+        light
+            .sys
+            .stats
+            .write_host_csv(&light.sys.thunks, &mut csv)
+            .unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        assert!(csv.ends_with(&format!(
+            ",{},{}\n",
+            light.sys.stats.leaf_calls, light.sys.stats.leaf_abandons
+        )));
+        let budget = light.sys.stats.frame_budget.as_mut().unwrap();
+        budget.mark_frame(1);
+        budget.finish(light.sys.stats.total, None);
+        assert!(budget.json().contains(&format!(
+            "\"calls\":1,\"leaf_calls\":{},\"leaf_abandons\":{}",
+            u64::from(!abandon),
+            u64::from(abandon)
+        )));
+    }
+}
+
+// spec: A64-CTL-12
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "unsynchronized register Eax")]
+fn env_leaf_rejects_unsynchronized_register_reads() {
+    let mut machine = fixture(Conv::Stdcall { argc: 2 }, false);
+    crate::env_leaf::Cpu(&mut machine.cpu).reg(Reg::Eax);
 }

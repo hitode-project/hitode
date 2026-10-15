@@ -16,6 +16,8 @@ struct Api {
     name: String,
     ns: u64,
     calls: u64,
+    leaf_calls: u64,
+    leaf_abandons: u64,
 }
 impl Api {
     fn json(&self) -> String {
@@ -31,8 +33,8 @@ impl Api {
             })
             .collect::<String>();
         format!(
-            "{{\"api\":\"{}\",\"ns\":{},\"calls\":{}}}",
-            name, self.ns, self.calls
+            "{{\"api\":\"{}\",\"ns\":{},\"calls\":{},\"leaf_calls\":{},\"leaf_abandons\":{}}}",
+            name, self.ns, self.calls, self.leaf_calls, self.leaf_abandons
         )
     }
 }
@@ -206,6 +208,19 @@ impl FrameBudget {
     pub fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    pub(crate) fn leaf(&mut self, thunk: u32, thunks: &ThunkTable, abandon: bool) {
+        self.host(0, thunk, thunks);
+        let api = &mut self.apis[thunk as usize];
+        if abandon {
+            api.leaf_abandons += 1;
+        } else {
+            api.leaf_calls += 1;
+        }
+        // The ordinary trap accounts for the actual call after a decline.
+        if abandon {
+            api.calls -= 1;
+        }
+    }
     pub fn host(&mut self, ns: u64, thunk: u32, thunks: &ThunkTable) {
         let index = thunk as usize;
         while self.classes.len() <= index {
@@ -218,7 +233,7 @@ impl FrameBudget {
             });
         }
         let api = &mut self.apis[index];
-        if api.calls == 0 {
+        if api.calls == 0 && api.leaf_abandons == 0 {
             self.touched.push(index);
         }
         api.ns += ns;
@@ -296,6 +311,8 @@ impl FrameBudget {
         for i in self.touched.drain(..) {
             self.apis[i].ns = 0;
             self.apis[i].calls = 0;
+            self.apis[i].leaf_calls = 0;
+            self.apis[i].leaf_abandons = 0;
         }
         let row = Row {
             serial,
@@ -531,6 +548,7 @@ mod tests {
                 name: format!("fixture.dll!api{n}"),
                 ns: n * 100,
                 calls: 2,
+                ..Default::default()
             })
             .collect();
         b.touched = (0..7).collect();

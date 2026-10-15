@@ -9,6 +9,7 @@ pub(super) fn register(registry: &mut Registry) {
             module,
             name: "__clean_type_info_names_internal",
             conv: adv_abi::Conv::Cdecl { argc: 1 },
+            env_leaf: None,
             handler: clean_names,
             level: adv_abi::ImplementationLevel::Implement,
         });

@@ -42,6 +42,7 @@ impl Conv {
 pub struct HostFn {
     /// Explicitly registered nonblocking implementation; ordinary traps reuse it.
     pub leaf: Option<crate::LeafHandler>,
+    pub env_leaf: Option<crate::EnvLeafHandler>,
     pub conv: Conv,
     pub handler: Handler,
     /// Opaque binding data interpreted by the registered handler, never the CPU.
@@ -186,6 +187,7 @@ impl ThunkTable {
             name: "<return pad>".into(),
             f: HostFn {
                 leaf: None,
+                env_leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: return_pad,
                 data: 0,
@@ -214,6 +216,7 @@ impl ThunkTable {
                     name: "<exception dispatch>".into(),
                     f: HostFn {
                         leaf: None,
+                        env_leaf: None,
                         conv: Conv::Cdecl { argc: 0 },
                         handler: return_pad,
                         data: 0,
@@ -466,6 +469,7 @@ impl ThunkTable {
             None => (
                 HostFn {
                     leaf: None,
+                    env_leaf: None,
                     conv: Conv::Cdecl { argc: 0 },
                     handler: unimplemented,
                     data: 0,

@@ -70,6 +70,13 @@ pub(super) struct Recording {
     readback: Option<adv_device::gpu::Readback>,
     job: Option<adv_sync::background::Task>,
 }
+pub(super) fn admits_leaf(env: &Env<'_>, pointer: u32, bytes: usize) -> bool {
+    device(env, pointer).is_some_and(|d| {
+        d.frame.active.is_none()
+            && d.frame.commands.len() + 1 < 4096
+            && d.frame.bytes + bytes < 64 * 1024 * 1024
+    })
+}
 pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;
@@ -561,4 +568,19 @@ impl Recording {
     pub(super) fn force_limit(&mut self) {
         self.bytes = 64 * 1024 * 1024;
     }
+}
+
+#[cfg(test)]
+pub(super) fn command_keys(env: &mut Env<'_>, pointer: u32) -> Vec<u64> {
+    let owner = com(env)
+        .identity::<Payload>(&env.sys.objects, pointer)
+        .unwrap();
+    let commands = std::mem::take(&mut frame(env, owner).commands);
+    let mut keys = Vec::new();
+    for operation in commands {
+        let prepared = key::prepare(env, owner, operation).ok().unwrap();
+        keys.push(prepared.key);
+        frame(env, owner).commands.push(prepared.operation);
+    }
+    keys
 }

@@ -101,6 +101,7 @@ fn dynamic_availability_exposes_fixed_names_only_with_capability() {
         module: "kernel32.dll",
         name: "FlsAlloc",
         conv: Conv::Stdcall { argc: 1 },
+        env_leaf: None,
         handler: |_| Outcome::Return(u32::MAX),
         level: ImplementationLevel::SafeFail,
     });
@@ -125,6 +126,7 @@ fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
         module: "kernel32.dll",
         name: "SetThreadpoolTimer",
         conv: Conv::Stdcall { argc: 4 },
+        env_leaf: None,
         handler: |_| Outcome::Return(0),
         level: ImplementationLevel::Implement,
     });

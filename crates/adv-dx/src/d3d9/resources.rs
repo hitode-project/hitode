@@ -966,41 +966,36 @@ fn set_texture_binding(
     0
 }
 
-#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement)]
-fn get_texture(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
-    stage: u32,
-    output: GuestPtr<u32>,
-) -> Outcome {
+#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement,leaf)]
+fn get_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
-        return Outcome::Return(INVALID);
+        return INVALID;
     }
     let Some(d) = device(env, this.addr()) else {
-        return Outcome::Return(INVALID);
+        return INVALID;
     };
     let Some(slot) = super::programmable::sampler_slot(stage) else {
-        return Outcome::Return(INVALID);
+        return INVALID;
     };
     let Some(id) = (if slot == 0 {
         d.texture
     } else {
         d.shaders.textures[slot]
     }) else {
-        return Outcome::Return(0);
+        return 0;
     };
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
-        return Outcome::Return(INVALID);
+        return INVALID;
     };
     let pointer = r.pointer;
     if add_ref(env, pointer).is_none() {
-        return Outcome::Return(OUT_OF_MEMORY);
+        return OUT_OF_MEMORY;
     }
     if output.write(env.cpu, pointer).is_err() {
         release(env, pointer);
-        return Outcome::Return(INVALID);
+        return INVALID;
     }
-    Outcome::Return(0)
+    0
 }
 
 #[cfg(test)]

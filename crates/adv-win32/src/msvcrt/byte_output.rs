@@ -143,6 +143,7 @@ pub(super) fn register(registry: &mut Registry) {
                 module,
                 name,
                 conv: adv_abi::Conv::Cdecl { argc: 1 },
+                env_leaf: None,
                 handler: input,
                 level: adv_abi::ImplementationLevel::Implement,
             });

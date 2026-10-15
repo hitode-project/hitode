@@ -874,6 +874,7 @@ fn unavailable_surface_encoding_clears_output_without_reading_surface() {
         module: "d3dx9_43.dll",
         name: "D3DXSaveSurfaceToFileInMemory",
         conv: api.conv,
+        env_leaf: None,
         handler: api.handler,
         level: ImplementationLevel::SafeFail,
     };

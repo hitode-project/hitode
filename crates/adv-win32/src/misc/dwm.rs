@@ -18,6 +18,7 @@ pub(super) fn register(registry: &mut Registry) {
         module: "dwmapi.dll",
         name: "DwmSetWindowAttribute",
         conv: Conv::Stdcall { argc: 4 },
+        env_leaf: None,
         handler: set_attribute,
         level: ImplementationLevel::SafeFail,
     });
