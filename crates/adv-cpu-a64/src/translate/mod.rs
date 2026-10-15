@@ -11,7 +11,9 @@
 //! recipe over such values until something would overwrite them. Flags no
 //! path reads before writing them again are not computed. Every exit makes
 //! the flags canonical, an internal edge only those its target reads, and
-//! every fault site records sense, carry and recipe for the owner.
+//! every fault site records sense, carry, recipe and the MMX dirty mask for
+//! the owner. MMX values are published before control edges and observers
+//! (A64-FP-4); XMM writes remain immediate.
 //!
 //! Memory accesses go straight to the window, where a host fault at a
 //! site reaches the owner (A64-MEM-5, A64-MEM-6). Instructions the owner has seen fault
@@ -82,6 +84,8 @@ pub struct Site {
     /// Whether the access checks its page first, so a fault here is not
     /// a reason to check it.
     pub checked: bool,
+    /// MMX values committed in d8-d15 but not yet in `CpuState`.
+    pub mmx_dirty: u8,
 }
 
 /// The last unit translated, in buffers the next translation reuses.
@@ -235,6 +239,7 @@ enum Cold {
     Leave {
         label: Label,
         state: State,
+        mmx_dirty: u8,
         refund: u32,
         exit: Exit,
         eip: u32,
@@ -429,6 +434,7 @@ impl Translator<'_> {
         self.keep = self.out.minus(inst.effects.writes);
         if trace.head(index) || trace.merge[index] {
             // Control may arrive from elsewhere.
+            self.flush_mmx();
             self.vector = simd::Vector::default();
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
@@ -443,6 +449,7 @@ impl Translator<'_> {
             self.cold.push(Cold::Leave {
                 label: refuse,
                 state: State::CANONICAL,
+                mmx_dirty: self.vector.dirty,
                 refund: prepaid,
                 exit: Exit::Dispatch,
                 eip: inst.pc,
@@ -472,6 +479,7 @@ impl Translator<'_> {
 
     /// An unconditional internal edge from the current instruction.
     fn jump(&mut self, to: usize) {
+        self.flush_mmx();
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
         if net > 0 {
@@ -481,6 +489,7 @@ impl Translator<'_> {
             self.cold.push(Cold::Leave {
                 label: refuse,
                 state: self.state,
+                mmx_dirty: self.vector.dirty,
                 refund: net as u32 + self.trace.unused(self.index),
                 exit: Exit::Dispatch,
                 eip: self.trace.insts[to].pc,
@@ -494,6 +503,7 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
+        self.flush_mmx();
         let from = self.index;
         match taken {
             Edge::Internal(to) if to <= from => {
@@ -520,6 +530,7 @@ impl Translator<'_> {
                     self.cold.push(Cold::Leave {
                         label: leave,
                         state: self.state,
+                        mmx_dirty: self.vector.dirty,
                         refund: self.trace.unused(from),
                         exit: Exit::Dispatch,
                         eip: self.trace.insts[to].pc,
@@ -560,6 +571,7 @@ impl Translator<'_> {
                 self.cold.push(Cold::Leave {
                     label,
                     state: self.state,
+                    mmx_dirty: self.vector.dirty,
                     refund: self.trace.unused(from),
                     exit: Exit::Dispatch,
                     eip,
@@ -636,6 +648,7 @@ impl Translator<'_> {
                 carry: self.state.carry,
                 recipe: self.state.recipe,
                 checked: self.checking,
+                mmx_dirty: self.vector.dirty,
             },
         ));
     }
@@ -928,6 +941,7 @@ impl Translator<'_> {
     /// Canonical flags, the refund for this path, then the exit: through a
     /// link point if `link`, on the main path if `main`, else to the owner.
     fn leave(&mut self, exit: Exit, eip: u32, refund: u32, link: bool, main: bool) {
+        self.flush_mmx();
         self.canonicalize();
         if refund != 0 {
             self.emit(add_imm(X, X9, X9, refund, false));
@@ -1004,6 +1018,7 @@ impl Translator<'_> {
             Cold::Leave {
                 label,
                 state,
+                mmx_dirty,
                 refund,
                 exit,
                 eip,
@@ -1011,6 +1026,7 @@ impl Translator<'_> {
             } => {
                 self.asm.bind(label);
                 self.state = state;
+                self.vector.dirty = mmx_dirty;
                 self.leave(exit, eip, refund, link, false);
             }
             Cold::Edge {

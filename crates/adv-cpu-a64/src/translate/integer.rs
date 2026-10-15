@@ -260,6 +260,7 @@ impl Translator<'_> {
     }
 
     fn compare_exchange8(&mut self, mem: Mem, helper: u8) {
+        self.flush_mmx();
         if self.checking {
             self.helper(helper);
             return;
@@ -653,6 +654,7 @@ impl Translator<'_> {
     }
 
     fn divide(&mut self, src: Src, signed: bool, helper: u8) {
+        self.flush_mmx();
         self.canonicalize();
         let value = self.source(src);
         let (eax, edx) = (host(EAX), host(EDX));
