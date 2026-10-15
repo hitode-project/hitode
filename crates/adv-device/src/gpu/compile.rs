@@ -56,11 +56,13 @@ impl<T: Send + Sync + 'static> Compile<T> {
                 }
             }
             let reservation = Reservation(bytes);
-            let job = work.clone();
+            let job = Arc::downgrade(&work.0);
             if let Some(sender) = worker() {
                 let _ = sender.try_send(Box::new(move || {
                     let _reservation = reservation;
-                    job.resolve();
+                    if let Some(job) = job.upgrade() {
+                        Compile(job).resolve();
+                    }
                 }));
             }
         }
@@ -199,6 +201,9 @@ impl Drop for Demand {
 pub fn prebuild<T: Send + Sync + 'static>(bytes: usize, jobs: Vec<Compile<T>>) -> Compile<()> {
     Compile::spawn(bytes, CompileCounters::default(), move || {
         for job in jobs {
+            if Arc::strong_count(&job.0) == 1 {
+                continue;
+            }
             let mut active = DEMAND.lock().unwrap();
             while *active != 0 {
                 active = DEMAND_DONE.wait(active).unwrap();
@@ -208,4 +213,22 @@ pub fn prebuild<T: Send + Sync + 'static>(bytes: usize, jobs: Vec<Compile<T>>) -
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    // spec: GFX-CACHE-7, GFX-CACHE-10
+    #[test]
+    fn abandoned_prebuilds_do_not_compile_or_retain_devices() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let job = Compile::spawn(BYTES + 1, CompileCounters::default(), move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let batch = prebuild(0, vec![job]);
+        batch.resolve().as_ref().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
 }

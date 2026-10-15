@@ -46,6 +46,7 @@ struct Journal {
     archive: Archive,
     bytes: usize,
     dirty: bool,
+    persisted: u64,
     revision: u64,
     keys: std::collections::HashSet<[u8; 32]>,
     sizes: VecDeque<usize>,
@@ -88,12 +89,14 @@ impl Store {
         let sizes: VecDeque<_> = archive.entries.iter().map(|r| r.encoded().len()).collect();
         let bytes = sizes.iter().sum();
         let keys = archive.entries.iter().map(Recipe::key).collect();
+        let persisted = archive.entries.len() as u64;
         Self {
             journal: Arc::new(Mutex::new(Journal {
                 path,
                 archive,
                 bytes,
                 dirty: false,
+                persisted,
                 revision: 0,
                 keys,
                 sizes,
@@ -111,6 +114,9 @@ impl Store {
             .iter()
             .cloned()
             .collect()
+    }
+    pub fn persisted(&self) -> u64 {
+        self.journal.lock().unwrap().persisted
     }
     pub fn len(&self) -> u64 {
         self.journal.lock().unwrap().archive.entries.len() as u64
@@ -159,7 +165,7 @@ impl Store {
     }
 }
 fn save(journal: &Mutex<Journal>) -> Result<(), String> {
-    let (bytes, path, revision) = {
+    let (bytes, path, revision, count) = {
         let journal = journal.lock().unwrap();
         if !journal.dirty {
             return Ok(());
@@ -168,6 +174,7 @@ fn save(journal: &Mutex<Journal>) -> Result<(), String> {
             serde_json::to_vec(&journal.archive).map_err(|e| e.to_string())?,
             journal.path.clone(),
             journal.revision,
+            journal.archive.entries.len() as u64,
         )
     };
     if bytes.len() > LIMIT {
@@ -176,6 +183,7 @@ fn save(journal: &Mutex<Journal>) -> Result<(), String> {
     save_blob(&path, &bytes).map_err(|e| e.to_string())?;
     {
         let mut journal = journal.lock().unwrap();
+        journal.persisted = count;
         if journal.revision == revision {
             journal.dirty = false;
         }
@@ -371,5 +379,18 @@ mod tests {
         );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: GFX-CACHE-10, GFX-CACHE-8
+    #[test]
+    fn failed_cache_writes_do_not_claim_persisted_entries() {
+        let path = directory();
+        std::fs::write(&path, b"file").unwrap();
+        let mut store = Store::open(&path, "driver".into());
+        store.remember(recipe(15));
+        store.flush();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.persisted(), 0);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 }

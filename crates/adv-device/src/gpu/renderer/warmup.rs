@@ -101,7 +101,7 @@ impl Warmup {
         Ok(result)
     }
     pub fn persisted(&self) -> u64 {
-        self.store.as_ref().map_or(0, Store::len)
+        self.store.as_ref().map_or(0, Store::persisted)
     }
     pub fn discarded(&self) -> u64 {
         self.rejected + self.store.as_ref().map_or(0, |s| s.discarded)
