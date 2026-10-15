@@ -187,3 +187,51 @@ fn first_eligible_poll_declines_without_advancing_clock_then_blocks() {
         assert_eq!(state(&mut leaf), state(&mut trap), "read {i}");
     }
 }
+
+// spec: WIN32-API-15, A64-CTL-12
+#[test]
+fn user_and_calendar_queries_match_handlers_and_decline_before_partial_writes() {
+    let (mut leaf, mut trap) = (machine(), machine());
+    for (module, names) in [
+        ("user32.dll", crate::query_leaves::USER),
+        (K32, crate::query_leaves::KERNEL),
+    ] {
+        for &name in names {
+            let args = match name {
+                "GetCursorPos"
+                | "GetClipCursor"
+                | "GetLocalTime"
+                | "GetSystemTime"
+                | "GetSystemTimeAsFileTime" => vec![DATA],
+                "GetWindowRect" | "GetClientRect" | "ClientToScreen" | "ScreenToClient" => {
+                    vec![leaf.ext.get::<Win32>().user.desktop, DATA]
+                }
+                "lstrlenA" | "lstrlenW" => vec![DATA + 512],
+                "lstrcpyA" | "lstrcpyW" | "lstrcmpA" | "lstrcmpW" => vec![DATA + 768, DATA + 512],
+                _ => vec![0, 0],
+            };
+            for m in [&mut leaf, &mut trap] {
+                m.cpu.write(DATA + 512, &[b'a', 0, b'b', 0, 0, 0]).unwrap();
+            }
+            assert_eq!(
+                call(&mut leaf, module, name, &args, true).0,
+                call(&mut trap, module, name, &args, false).0,
+                "{name}"
+            );
+            assert_eq!(state(&mut leaf), state(&mut trap), "{name}");
+        }
+    }
+    for (module, name, args) in [
+        ("user32.dll", "GetCursorPos", vec![DATA + 4092]),
+        ("user32.dll", "GetClipCursor", vec![DATA + 4092]),
+        ("user32.dll", "ScreenToClient", vec![0, DATA + 4092]),
+        (K32, "GetLocalTime", vec![DATA + 4092]),
+        (K32, "GetSystemTime", vec![0]),
+        (K32, "GetSystemTimeAsFileTime", vec![u32::MAX - 3]),
+    ] {
+        let (a, declined, _) = call(&mut leaf, module, name, &args, true);
+        assert!(declined, "{name}");
+        assert_eq!(a, call(&mut trap, module, name, &args, false).0, "{name}");
+        assert_eq!(state(&mut leaf), state(&mut trap), "{name}");
+    }
+}

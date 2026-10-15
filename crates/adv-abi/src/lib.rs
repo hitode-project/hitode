@@ -103,6 +103,12 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Exact implemented registrations, including internal COM method names.
+    pub fn registered(&self) -> impl Iterator<Item = (&str, &str, HostFn)> {
+        self.fns
+            .iter()
+            .map(|((module, name), entry)| (module.as_str(), name.as_str(), entry.host))
+    }
     /// Register one implementation for both light calls and ordinary traps.
     pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
         assert!(
@@ -346,6 +352,16 @@ impl Registry {
             .unwrap_or_else(|| panic!("guest code for unregistered {module}!{name}"))
             .host
             .guest = Some(guest);
+    }
+
+    /// Attach an audited adapter without replacing ABI metadata or guest code.
+    pub fn set_env_leaf(&mut self, module: &str, name: &str, leaf: EnvLeafHandler) {
+        assert!(!adv_machine::thunk::is_audio_binding(module, name));
+        self.fns
+            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
+            .expect("leaf requires an existing implementation")
+            .host
+            .env_leaf = Some(leaf);
     }
 
     pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
