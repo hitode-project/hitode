@@ -22,11 +22,9 @@ struct Host {
     session: Option<Session>,
     playback: Option<Playback>,
     /// The overlay's pause menu or report is open.
-    paused: bool,
+    lifecycle: adv_shell::mobile::Lifecycle,
     /// The game was asked to close; another request forces it.
     closing: bool,
-    resumed: bool,
-    audio_focus: bool,
 }
 
 /// The SurfaceView's window, with a reference of our own.
@@ -52,7 +50,7 @@ impl Host {
     /// AND-APP-3: the game runs only while resumed, with audio focus and no overlay pause.
     fn apply_pause(&self) {
         if let Some(session) = &self.session {
-            session.set_paused(self.paused || !self.resumed || !self.audio_focus);
+            session.set_paused(self.lifecycle.paused());
         }
     }
 
@@ -97,7 +95,7 @@ pub(crate) fn touch(pointer: i32, action: i32, x: f32, y: f32) {
 
 pub(crate) fn lifecycle(resumed: bool) {
     HOST.with_borrow_mut(|host| {
-        host.resumed = resumed;
+        host.lifecycle.set_resumed(resumed);
         if let Some(session) = &host.session {
             session.set_active(resumed);
         }
@@ -107,7 +105,7 @@ pub(crate) fn lifecycle(resumed: bool) {
 
 pub(crate) fn audio_focus(active: bool) {
     HOST.with_borrow_mut(|host| {
-        host.audio_focus = active;
+        host.lifecycle.set_audio_focus(active);
         host.apply_pause();
     });
 }
@@ -194,12 +192,12 @@ pub async fn start_game(
                     return Err(error);
                 }
             };
-            session.set_active(host.resumed);
+            session.set_active(host.lifecycle.foreground());
             session.set_upscaler(filter);
             playback.apply(&session)?;
             host.session = Some(session);
             host.playback = Some(playback);
-            host.paused = false;
+            host.lifecycle.set_overlay_pause(false);
             host.closing = false;
             host.apply_pause();
             Ok(())
@@ -237,7 +235,7 @@ pub async fn post_text(window: WebviewWindow, text: String) -> Result<usize, Str
 pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), String> {
     on_ui(&window, move || {
         with_session(|host, _| {
-            host.paused = paused;
+            host.lifecycle.set_overlay_pause(paused);
         })?;
         HOST.with_borrow(Host::apply_pause);
         Ok(())

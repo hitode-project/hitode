@@ -4,6 +4,7 @@ mod control;
 mod frontend;
 #[cfg(any(windows, target_os = "macos", target_os = "android"))]
 mod logging;
+pub mod mobile;
 #[cfg(any(
     target_os = "macos",
     target_os = "android",
