@@ -575,8 +575,8 @@ impl Native {
     /// `window` is the host address of guest address 0 in the guest's
     /// `GuestWindow`, which must outlive this.
     pub fn new(window: usize) -> Result<Self, String> {
-        adv_cpu_core::fault_recovery::install_translated(on_fault)?;
         let mut cache = CodeCache::new(CACHE_LEN)?;
+        adv_cpu_core::fault_recovery::install_translated(on_fault)?;
         let stubs = runtime::stubs();
         let base = cache.append(&stubs.code).ok_or("stubs do not fit")?;
         // SAFETY: `enter` follows the C calling convention with the

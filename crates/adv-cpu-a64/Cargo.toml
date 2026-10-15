@@ -12,6 +12,7 @@ adv-cpu-core = { path = "../adv-cpu-core" }
 adv-sync = { path = "../adv-sync" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 rustc-hash = "2.1"
+log.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

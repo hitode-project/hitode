@@ -8,6 +8,8 @@
 pub mod asm;
 #[cfg(native)]
 mod cache;
+#[cfg(native)]
+pub use cache::prepare_code_pool;
 mod cpu;
 pub mod encode;
 mod executor;

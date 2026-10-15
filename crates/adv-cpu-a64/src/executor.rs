@@ -73,6 +73,8 @@ pub struct Executor {
     /// such an executor maps no code cache and installs no fault handler.
     #[cfg(native)]
     native: Option<crate::native::Native>,
+    #[cfg(native)]
+    native_warning: Option<String>,
 }
 
 impl Executor {
@@ -106,13 +108,20 @@ impl Executor {
 
     fn create(memory: Memory, translate: bool) -> Result<Self, String> {
         #[cfg(native)]
-        let native = match translate {
-            true => Some(crate::native::Native::new(
+        let (native, native_warning) = match translate {
+            true => match crate::native::Native::new(
                 memory
                     .window_base()
                     .ok_or("a64 guest memory must live in a guest window")?,
-            )?),
-            false => None,
+            ) {
+                Ok(native) => (Some(native), None),
+                Err(error) => {
+                    let warning = format!("A64 JIT unavailable; using Tier 0: {error}");
+                    log::warn!("{warning}");
+                    (None, Some(warning))
+                }
+            },
+            false => (None, None),
         };
         Ok(Self {
             state: CpuState::default(),
@@ -128,6 +137,8 @@ impl Executor {
             deadline: None,
             #[cfg(native)]
             native,
+            #[cfg(native)]
+            native_warning,
         })
     }
 
@@ -224,6 +235,10 @@ impl Executor {
                 native.unchecked_faults,
                 native.checked_count()
             );
+        }
+        #[cfg(native)]
+        if let Some(warning) = &self.native_warning {
+            return warning.clone();
         }
         String::new()
     }

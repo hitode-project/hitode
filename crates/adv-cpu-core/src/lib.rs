@@ -10,6 +10,7 @@ pub mod backend;
 #[doc(hidden)]
 pub mod cliffs;
 mod code_image;
+pub mod code_pool;
 #[doc(hidden)]
 pub mod cpu_profile;
 pub mod engine;

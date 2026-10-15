@@ -1,6 +1,7 @@
 //! Executable storage for translated code (A64-CTL-1, A64-CTL-2).
 //!
-//! One contiguous range, so a direct `B`/`BL` reaches every unit. Code is
+//! Each owner leases a contiguous range from the host process code pool,
+//! so a direct `B`/`BL` reaches every unit within that lease. Code is
 //! never writable and executable through the same mapping at once:
 //!
 //! - Linux and Android map one memfd twice, a read-write view the
@@ -15,7 +16,9 @@
 //! `ic ivau` sequence costs about the same for one line as for a unit, so
 //! one sync per batch instead of one per unit or patch.
 
+use adv_cpu_core::code_pool::{CodeLease, CodePool};
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 /// Direct branches reach ±128 MiB.
 pub const MAX_LEN: usize = 128 << 20;
@@ -27,6 +30,7 @@ pub struct CodeCache {
     exec: NonNull<u8>,
     len: usize,
     used: usize,
+    _lease: CodeLease,
     /// Writes not yet synchronized, as offset and length.
     dirty: Vec<(usize, usize)>,
 }
@@ -36,12 +40,25 @@ impl CodeCache {
         if len == 0 || len > MAX_LEN || !len.is_multiple_of(page_size()?) {
             return Err(format!("bad code cache length {len:#x}"));
         }
-        let (write, exec) = os::map(len)?;
+        let pool = prepared_pool()?;
+        let lease = pool
+            .ranges
+            .lease(len)
+            .ok_or("prepared A64 code pool exhausted")?;
+        let offset = lease.range().start;
+        // SAFETY: this disjoint lease stays inside the process-lifetime pool.
+        let (write, exec) = unsafe {
+            (
+                NonNull::new_unchecked(pool.write.as_ptr().add(offset)),
+                NonNull::new_unchecked(pool.exec.as_ptr().add(offset)),
+            )
+        };
         Ok(Self {
             write,
             exec,
             len,
             used: 0,
+            _lease: lease,
             dirty: Vec::new(),
         })
     }
@@ -130,12 +147,46 @@ impl CodeCache {
     }
 }
 
-impl Drop for CodeCache {
-    fn drop(&mut self) {
-        // SAFETY: the views were mapped by `os::map` with this length and no
-        // translated code runs once the owner drops its cache.
-        unsafe { os::unmap(self.write, self.exec, self.len) };
-    }
+/// Call before creating guest machines (and before a future iOS JIT detach).
+/// The pool is fixed after this first preparation; mapping failure is retained.
+pub fn prepare_code_pool() -> Result<(), String> {
+    prepared_pool().map(|_| ())
+}
+
+struct PreparedPool {
+    ranges: CodePool,
+    write: NonNull<u8>,
+    exec: NonNull<u8>,
+}
+
+// SAFETY: the mapping lives for the host process. Leases exclude overlapping
+// writes; MAP_JIT permission toggles affect only the writing thread.
+unsafe impl Send for PreparedPool {}
+unsafe impl Sync for PreparedPool {}
+
+fn prepared_pool() -> Result<&'static PreparedPool, String> {
+    static POOL: OnceLock<Result<PreparedPool, String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let mib = match std::env::var("ADV_A64_CODE_POOL_MIB") {
+            Ok(value) => value
+                .parse::<usize>()
+                .map_err(|_| "invalid ADV_A64_CODE_POOL_MIB")?,
+            Err(std::env::VarError::NotPresent) => 512,
+            Err(_) => return Err("invalid ADV_A64_CODE_POOL_MIB".into()),
+        };
+        let len = mib
+            .checked_mul(1 << 20)
+            .ok_or("A64 code pool size overflow")?;
+        let ranges = CodePool::new(len, page_size()?)?;
+        let (write, exec) = os::map(len)?;
+        Ok(PreparedPool {
+            ranges,
+            write,
+            exec,
+        })
+    })
+    .as_ref()
+    .map_err(Clone::clone)
 }
 
 fn page_size() -> Result<usize, String> {
@@ -347,7 +398,60 @@ mod tests {
         assert_eq!(cache.next(), second);
     }
 
-    // spec: A64-CTL-1
+    // spec: A64-CTL-1, A64-CTL-13, A64-ISA-3
+    #[test]
+    fn pool_exhaustion_runs_tier_zero_without_new_mappings() {
+        if std::env::var_os("ADV_POOL_EXHAUSTION_CHILD").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let mut command =
+                match std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER") {
+                    Some(runner) => {
+                        let mut c = std::process::Command::new(runner);
+                        c.arg(exe);
+                        c
+                    }
+                    None => std::process::Command::new(exe),
+                };
+            let output = command
+                .args([
+                    "--exact",
+                    "cache::tests::pool_exhaustion_runs_tier_zero_without_new_mappings",
+                ])
+                .env("ADV_POOL_EXHAUSTION_CHILD", "1")
+                .env("ADV_A64_CODE_POOL_MIB", "64")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let pool = prepared_pool().unwrap();
+        let mut leases = Vec::new();
+        while let Some(lease) = pool.ranges.lease(64 << 20) {
+            leases.push(lease);
+        }
+        let mut executor = crate::Executor::new(0x10000, 0x10000).unwrap();
+        assert!(executor.diagnostics().contains("code pool exhausted"));
+        executor.protect(0x10000, 0x10000, 7).unwrap();
+        // Authored integer instruction, not sample code.
+        executor.write(0x10000, &[0x40]).unwrap();
+        executor.state.eip = 0x10000;
+        assert_eq!(
+            executor.run(0x10001, 8).unwrap(),
+            adv_cpu_core::RunOutcome::ReachedStop
+        );
+        assert_eq!(executor.state.regs[0], 1);
+        assert_eq!(executor.stats.native_entries, 0);
+        assert!(executor.stats.interpreter_instructions > 0);
+        drop(executor);
+        drop(leases);
+        assert!(CodeCache::new(64 << 20).is_ok());
+    }
+
+    // spec: A64-CTL-1, A64-CTL-13
     #[test]
     fn a_full_cache_refuses_more_code() {
         let page = page_size().unwrap();
@@ -355,5 +459,9 @@ mod tests {
         assert!(cache.append(&vec![NOP; page / 4]).is_some());
         assert!(cache.append(&[NOP]).is_none());
         assert!(CodeCache::new(MAX_LEN + page).is_err());
+        let start = cache.next() - page;
+        cache.truncate(0);
+        assert_eq!(cache.append(&[NOP]), Some(start));
+        cache.sync();
     }
 }
