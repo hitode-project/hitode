@@ -222,12 +222,14 @@
           </div>
 
           <div class="middle">
-            <div class="prow">
-              <span>{t("超分辨率")}</span>
-              <UpscalingSelect value={filterOverride(gameId) ?? "inherit"} inherit={prefs.filter}
-                onpick={(value) => setGameFilter(gameId, value)} />
+            <div class="rows">
+              <div class="prow">
+                <span>{t("超分辨率")}</span>
+                <UpscalingSelect value={filterOverride(gameId) ?? "inherit"} inherit={prefs.filter}
+                  onpick={(value) => setGameFilter(gameId, value)} />
+              </div>
+              {#if filterError}<p role="alert">{filterError}</p>{/if}
             </div>
-            {#if filterError}<p role="alert">{filterError}</p>{/if}
             <div class="sep"></div>
           {#if gameView || preview}
             <div class="rows">
