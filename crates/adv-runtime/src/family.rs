@@ -282,6 +282,7 @@ impl<B: Backend> Runtime<B> {
             win32.vfs.sections = parent.vfs.sections.clone();
             win32.user.host_keys = parent.user.host_keys.clone();
         }
+        child.sys.frame_pacer = self.machine.sys.frame_pacer.clone();
         crate::vorbis::install(&mut child, self.family.codec).map_err(|e| Error::new(8, e))?;
         let (win32, modules) = child.ext.get2_mut::<Win32, Modules>();
         let prepared = Loader::new(&mut child.cpu, &mut child.sys, modules, &win32.vfs)
