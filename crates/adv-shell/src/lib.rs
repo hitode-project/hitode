@@ -717,7 +717,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             diagnostics.shaders.malformed,
             diagnostics.shaders.untranslated
         );
-        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{},\"metal_draws\":{},\"backend_switches\":{},\"ring_bytes\":{},\"ring_busy\":{},\"passes\":{},\"color_loads\":{},\"depth_loads\":{},\"merged_clears\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits,g.metal_draws,g.backend_switches,g.ring_bytes,g.ring_busy,g.passes,g.color_loads,g.depth_loads,g.merged_clears));
+        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{},\"metal_draws\":{},\"backend_switches\":{},\"ring_bytes\":{},\"ring_busy\":{},\"passes\":{},\"color_loads\":{},\"depth_loads\":{},\"merged_clears\":{},\"compile_waits\":{},\"compile_wait_ns\":{},\"prebuild_hits\":{},\"prebuild_misses\":{},\"persisted_pipelines\":{},\"discarded_pipelines\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits,g.metal_draws,g.backend_switches,g.ring_bytes,g.ring_busy,g.passes,g.color_loads,g.depth_loads,g.merged_clears,g.compile_waits,g.compile_wait_ns,g.prebuild_hits,g.prebuild_misses,g.persisted_pipelines,g.discarded_pipelines));
         format!(
             "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"shader_versions\":{}}}",
             diagnostics.live_interfaces,
@@ -1409,7 +1409,12 @@ fn run_execution(
     #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     runtime.set_d3d9_shader_caps(options.d3d9_sm3);
     #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
-    runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
+    runtime.set_d3d9_shader_cache(Some(
+        options
+            .d3d9_shader_cache
+            .clone()
+            .unwrap_or_else(|| options.data_dir.join("artifacts/gpu")),
+    ));
     runtime.machine.sys.stats.services_enabled =
         options.host_profile.is_some() || options.schedule_profile.is_some();
     if let Some(path) = &options.schedule_profile {
