@@ -273,7 +273,7 @@ struct TextureBinding {
 /// Validate before handing guest-derived source to the device. Failure remains
 /// a failed command, rather than poisoning the GPU's uncaptured-error channel.
 pub fn validate_program(program: &Program) -> Result<(), Error> {
-    if program.source.len() > 4 * 1024 * 1024 {
+    if program.source.len() > Program::MAX_SOURCE_LEN {
         return Err(invalid("program source exceeds limit"));
     }
     let module = wgpu::naga::front::wgsl::parse_str(&program.source)

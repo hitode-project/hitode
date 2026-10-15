@@ -153,12 +153,13 @@ pub struct ProgrammableDraw {
 }
 
 impl Program {
+    pub(super) const MAX_SOURCE_LEN: usize = 4 * 1024 * 1024;
     pub fn source(&self) -> &str {
         &self.source
     }
     pub fn new(source: Arc<str>, textures: Vec<bool>) -> Self {
         static NEXT_PROGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let writes_depth = wgpu::naga::front::wgsl::parse_str(&source).is_ok_and(|module| {
+        let writes_depth = source.len() <= Self::MAX_SOURCE_LEN && wgpu::naga::front::wgsl::parse_str(&source).is_ok_and(|module| {
             let depth = Some(Binding::BuiltIn(BuiltIn::FragDepth));
             module.entry_points.iter().filter(|e| e.name == "fragment_main")
                 .filter_map(|e| e.function.result.as_ref()).any(|result| {
