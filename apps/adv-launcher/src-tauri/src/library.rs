@@ -116,6 +116,8 @@ impl Library {
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&value)?).and_then(|()| fs::rename(tmp, &self.path))
     }
+    /// Save management (`saves.rs`) exists only on macOS.
+    #[cfg(target_os = "macos")]
     pub(crate) fn data_dir(&self, id: &str) -> io::Result<PathBuf> {
         self.game(id)?;
         Ok(self.path.parent().unwrap().join("games").join(id))

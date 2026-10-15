@@ -1,12 +1,6 @@
 //! JNI bridge for MainActivity and GameContainer (AND-APP-12).
 //!
-//! A1-d connects these synchronous, main-thread forwarding points to adv-shell:
-//! - `forward_surface_created(window: NonNull<ANativeWindow>, width: u32, height: u32)`;
-//! - `forward_surface_changed(window: NonNull<ANativeWindow>, width: u32, height: u32)`;
-//! - `forward_surface_destroyed(window: NonNull<ANativeWindow>, width: u32, height: u32)`;
-//! - `forward_touch(pointer: i32, action: i32, x: f32, y: f32)`;
-//! - `forward_pause()`, `forward_resume()`, `forward_audio_focus(active: bool)`.
-//!
+//! The callbacks run on the UI thread and forward to `game` (AND-APP-13).
 //! Surface handles are borrowed only for the call, then released. A receiver
 //! retaining a window must acquire its own reference. Touch actions are Android
 //! DOWN (0), UP (1), MOVE (2), CANCEL (3), with coordinates in view pixels.
@@ -157,30 +151,30 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeAudioFocus(
     forward_audio_focus(active != 0);
 }
 
-fn forward_surface_created(_window: NonNull<ANativeWindow>, width: u32, height: u32) {
-    log::debug!("surface created: {width}x{height}");
+fn forward_surface_created(window: NonNull<ANativeWindow>, width: u32, height: u32) {
+    crate::game::surface(Some(window), width, height);
 }
 
-fn forward_surface_changed(_window: NonNull<ANativeWindow>, width: u32, height: u32) {
-    log::debug!("surface changed: {width}x{height}");
+fn forward_surface_changed(window: NonNull<ANativeWindow>, width: u32, height: u32) {
+    crate::game::surface(Some(window), width, height);
 }
 
-fn forward_surface_destroyed(_window: NonNull<ANativeWindow>, width: u32, height: u32) {
-    log::debug!("surface destroyed: {width}x{height}");
+fn forward_surface_destroyed(_window: NonNull<ANativeWindow>, _width: u32, _height: u32) {
+    crate::game::surface(None, 0, 0);
 }
 
 fn forward_touch(pointer: i32, action: i32, x: f32, y: f32) {
-    log::debug!("touch: pointer={pointer} action={action} x={x} y={y}");
+    crate::game::touch(pointer, action, x, y);
 }
 
 fn forward_pause() {
-    log::debug!("activity paused");
+    crate::game::lifecycle(false);
 }
 
 fn forward_resume() {
-    log::debug!("activity resumed");
+    crate::game::lifecycle(true);
 }
 
 fn forward_audio_focus(active: bool) {
-    log::debug!("audio focus: {active}");
+    crate::game::audio_focus(active);
 }

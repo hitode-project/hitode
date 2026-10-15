@@ -3,10 +3,15 @@
 //! view that adv-shell presents into (decision 25).
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg_attr(target_os = "android", path = "game_android.rs")]
+mod game;
 mod library;
 #[cfg(desktop)]
 mod menu;
 pub mod overlay;
+#[cfg(any(target_os = "macos", target_os = "android"))]
+mod play;
 mod report;
 mod settings;
 mod vndb;
@@ -15,10 +20,8 @@ use serde::Serialize;
 #[cfg(target_os = "macos")]
 mod chrome;
 #[cfg(target_os = "macos")]
-mod game;
-#[cfg(target_os = "macos")]
 mod saves;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 use game::{post_text, start_game, stop_game};
 
 #[derive(Serialize)]
@@ -40,7 +43,7 @@ fn host_info() -> HostInfo {
 }
 
 /// Sends text to the running guest as IME characters (Runtime::post_text).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 #[tauri::command]
 fn post_text(text: String) -> Result<usize, String> {
     let _ = text;
@@ -136,7 +139,36 @@ pub fn run() {
         library::library_restore,
         library::reveal_path
     ]);
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        host_info,
+        post_text,
+        start_game,
+        stop_game,
+        game::pause_game,
+        game::set_game_filter,
+        game::set_game_playback,
+        game::game_fps,
+        overlay::set_overlay_input,
+        report::report_base,
+        report::save_report,
+        settings::pick_game_file,
+        settings::font_families,
+        library::library_pick_folder,
+        library::library_list,
+        vndb::vndb_search,
+        vndb::vndb_apply,
+        vndb::vndb_unlink,
+        library::set_tracking,
+        library::library_inspect,
+        library::library_scan,
+        library::library_add,
+        library::library_update,
+        library::library_remove,
+        library::library_restore,
+        library::reveal_path
+    ]);
+    #[cfg(target_os = "ios")]
     let builder = builder.invoke_handler(tauri::generate_handler![
         host_info,
         post_text,

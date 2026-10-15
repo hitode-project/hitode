@@ -1,9 +1,11 @@
 //! macOS game ownership on Tauri's main AppKit thread.
-use crate::library::{self, LastRun, Library};
+use crate::library::Library;
 use crate::overlay::OverlayState;
+pub use crate::play::Playback;
+use crate::play::upscaler;
 use adv_shell::overlay::Target;
 use adv_shell::{
-    Options, Session,
+    Session,
     window::{GameContainer, GameView},
 };
 use objc2::{
@@ -23,7 +25,6 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSAppleEventManager, NSNotificationCenter, NSObjectProtocol, NSOperationQueue,
 };
-use serde::Serialize;
 use std::{cell::RefCell, sync::Mutex, time::Instant};
 use tauri::{Emitter, Manager, WebviewWindow};
 
@@ -231,26 +232,6 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Serialize)]
-#[serde(untagged)]
-enum Finished {
-    Exit {
-        #[serde(rename = "gameId")]
-        game_id: String,
-        #[serde(rename = "exitCode")]
-        exit_code: u8,
-        /// Failure and frame timing for the anonymous report.
-        summary: adv_report::RunSummary,
-    },
-    Error {
-        #[serde(rename = "gameId")]
-        game_id: String,
-        error: String,
-        /// The failure kind and time bucket; never the error text.
-        summary: adv_report::RunSummary,
-    },
-}
-
 #[tauri::command]
 pub async fn start_game(
     window: WebviewWindow,
@@ -278,21 +259,7 @@ pub async fn start_game(
                     return Err("a game is already running".into());
                 }
                 let backup_data = data_dir.clone();
-                let mut options = Options::new(exe, data_dir);
-                options.codepage = Some(codepage);
-                options.audio = true;
-                if playback.discs.len() > 4 {
-                    return Err("at most four disc images can be mounted".into());
-                }
-                options.cdroms = playback
-                    .discs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| ((b'D' + i as u8) as char, p.clone()))
-                    .collect();
-                options.font_files = playback.font_files.clone();
-                options.font_families = playback.font_families.clone();
-                options.font_smoothing = playback.smoothing;
+                let options = playback.options(exe, data_dir, codepage)?;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
@@ -315,39 +282,7 @@ pub async fn start_game(
                         if let Err(error) = crate::saves::automatic(&backup_data) {
                             let _ = finished_window.emit("backup_failed", error.to_string());
                         }
-                        let summary = match &result {
-                            Ok(finished) => finished.summary.clone(),
-                            Err(error) => adv_shell::error_summary(error, elapsed),
-                        };
-                        if let Err(error) = finished_window
-                            .state::<Mutex<Library>>()
-                            .lock()
-                            .unwrap()
-                            .finished(
-                                &id,
-                                elapsed.as_secs() as u32,
-                                LastRun {
-                                    ended: library::now(),
-                                    summary: Some(summary.clone()),
-                                    error: result.as_ref().err().cloned(),
-                                },
-                            )
-                        {
-                            eprintln!("could not save play session: {error}");
-                        }
-                        let payload = match result {
-                            Ok(finished) => Finished::Exit {
-                                game_id: id,
-                                exit_code: finished.exit_code,
-                                summary,
-                            },
-                            Err(error) => Finished::Error {
-                                game_id: id,
-                                summary,
-                                error,
-                            },
-                        };
-                        let _ = finished_window.emit("game_finished", payload);
+                        crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);
                         } else if close {
@@ -476,18 +411,6 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
     .map_err(|error| error.to_string())?
 }
 
-fn upscaler(name: &str) -> Result<adv_shell::Upscaler, String> {
-    use adv_shell::Upscaler;
-    match name {
-        "off" => Ok(Upscaler::Off),
-        "anime4k" => Ok(Upscaler::Anime4k),
-        "cunny" => Ok(Upscaler::Cunny),
-        "artcnn" => Ok(Upscaler::Artcnn),
-        "k7" => Ok(Upscaler::K7),
-        _ => Err("unknown upscaling filter".into()),
-    }
-}
-
 #[tauri::command]
 pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<(), String> {
     let filter = upscaler(&filter)?;
@@ -553,33 +476,6 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
     }
 }
 
-#[derive(Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Playback {
-    scale: String,
-    volume: u8,
-    muted: bool,
-    toggle: bool,
-    pause_in_background: bool,
-    discs: Vec<std::path::PathBuf>,
-    font_files: Vec<std::path::PathBuf>,
-    font_families: std::collections::BTreeMap<String, String>,
-    smoothing: Option<bool>,
-}
-impl Playback {
-    fn apply(&self, session: &Session) -> Result<(), String> {
-        let scale = match self.scale.as_str() {
-            "fit" => adv_shell::Scaling::Fit,
-            "int" => adv_shell::Scaling::Integer,
-            "stretch" => adv_shell::Scaling::Stretch,
-            _ => return Err("unknown scaling mode".into()),
-        };
-        session.set_scaling(scale);
-        session.set_volume(if self.muted { 0 } else { self.volume });
-        session.set_fast_forward_toggle(self.toggle);
-        Ok(())
-    }
-}
 impl Host {
     fn apply_pause(&self) {
         if let Some(session) = &self.session {
