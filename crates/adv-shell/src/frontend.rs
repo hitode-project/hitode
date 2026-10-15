@@ -427,6 +427,10 @@ impl Ui {
             if let Some(completed) = completed {
                 self.metric(Delivery::Native(completed.stats));
                 self.repaint |= window.native_canvas(completed.rendered.canvas)?;
+                #[cfg(target_os = "macos")]
+                if let Some(placement) = completed.rendered.placement {
+                    window.place(Some(placement));
+                }
                 window.set_video_cursor_regions(completed.rendered.cursor_regions);
                 if matches!(
                     completed.rendered.result,
