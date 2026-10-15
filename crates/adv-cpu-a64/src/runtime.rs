@@ -96,12 +96,15 @@ pub struct Runtime {
     /// The indirect branch that last missed the table: source EIP in the
     /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
     pub branch: u64,
+    /// Light host dispatch: bit 0 exits after INT, bit 1 requests ordinary INT.
+    pub leaf: u64,
 }
 
 impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
         assert_eq!(window % (1 << 32), 0, "the window is 4 GiB aligned");
         Self {
+            leaf: 0,
             cpu,
             window,
             shadow: 0,
@@ -154,6 +157,7 @@ impl Exit {
 
 /// Byte offsets of the stubs in their code.
 pub struct Stubs {
+    pub leaf: usize,
     pub code: Vec<u32>,
     pub enter: usize,
     pub exit: usize,
@@ -289,7 +293,10 @@ pub fn stubs() -> Stubs {
     emit_access(&mut asm, fault_label);
     let interpret = asm.offset();
     emit_interpret(&mut asm);
+    let leaf = asm.offset();
+    emit_leaf(&mut asm);
     Stubs {
+        leaf,
         code: asm.finish(),
         enter,
         exit,
@@ -302,6 +309,41 @@ pub fn stubs() -> Stubs {
         access,
         interpret,
     }
+}
+
+/// Only ESP and EDX cross into the leaf environment; flags stay in registers.
+fn emit_leaf(asm: &mut Asm) {
+    asm.emit_all(&[
+        stp(X, Pre, r(7), r(8), SP, -64),
+        stp(X, Offset, r(9), r(10), SP, 16),
+        stp(X, Offset, r(11), r(12), SP, 32),
+        mrs_nzcv(r(17)),
+        stp(X, Offset, r(17), Reg::LR, SP, 48),
+        ldr(X, r(0), RUNTIME, CPU),
+        str(W, r(23), r(0), REGS as u32 + 16),
+        str(W, r(21), r(0), REGS as u32 + 8),
+        mov(X, r(0), RUNTIME),
+        ldr(X, r(16), RUNTIME, offset_of!(Runtime, leaf) as u32),
+        blr(r(16)),
+    ]);
+    let refused = asm.label();
+    asm.tbz(true, r(0), 1, refused);
+    asm.emit_all(&[
+        ldr(X, r(16), RUNTIME, CPU),
+        ldr(W, r(19), r(16), REGS as u32),
+        ldr(W, r(21), r(16), REGS as u32 + 8),
+        ldr(W, r(17), r(16), REGS as u32 + 16),
+        add_ext(X, r(23), WINDOW, r(17), Uxtw, 0),
+    ]);
+    asm.bind(refused);
+    asm.emit_all(&[
+        ldp(X, Offset, r(17), Reg::LR, SP, 48),
+        msr_nzcv(r(17)),
+        ldp(X, Offset, r(11), r(12), SP, 32),
+        ldp(X, Offset, r(9), r(10), SP, 16),
+        ldp(X, Post, r(7), r(8), SP, 64),
+        ret(Reg::LR),
+    ]);
 }
 
 /// `interpret`, called with w1 the helper's index and canonical flags.

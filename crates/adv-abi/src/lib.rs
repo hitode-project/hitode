@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 
 pub use adv_abi_macros::win32;
 pub use adv_machine::{Conv, Env, GuestCode, Handler, HostFn, Outcome};
+pub use adv_machine::{LeafEnv, LeafHandler};
 
 #[doc(hidden)]
 pub mod capability;
@@ -101,6 +102,16 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Register one implementation for both light calls and ordinary traps.
+    pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
+        self.add(module, name, conv, adv_machine::thunk::leaf_trap);
+        self.fns
+            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
+            .expect("just inserted")
+            .host
+            .leaf = Some(handler);
+    }
+
     /// Opt in only after validating a complete native provider's ABI.
     pub fn replace_module(&mut self, module: &str) {
         self.replacements.insert(module.to_ascii_lowercase());
@@ -131,6 +142,7 @@ impl Registry {
             (module.to_ascii_lowercase(), name.to_owned()),
             Entry {
                 host: HostFn {
+                    leaf: None,
                     conv,
                     handler,
                     trace: false,
@@ -331,6 +343,7 @@ impl Registry {
                 system_exports::Kind::Code
             )
             .then_some(HostFn {
+                leaf: None,
                 // The unknown ABI never returns, so no cleanup is guessed.
                 conv: Conv::Cdecl { argc: 0 },
                 handler: stub::fixed_dispatch,
@@ -344,6 +357,7 @@ impl Registry {
             .position(|s| core::ptr::eq(s, signature))
             .expect("signature in table");
         Some(HostFn {
+            leaf: None,
             conv: signature.conv.unwrap_or(Conv::Cdecl { argc: 0 }),
             handler: stub::dispatch,
             trace: true,

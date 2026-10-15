@@ -680,31 +680,41 @@ pub(super) fn register(reg: &mut Registry) {
             i < 64 && std::mem::replace(&mut w.tls_used[i], false),
         ))
     });
-    stdcall(reg, K32, "TlsGetValue", 1, |e| {
-        let i = e.arg(0);
-        let teb = e.ctx().teb;
-        let v = if i < 64 {
-            e.cpu
-                .read_u32(teb + adv_machine::layout::teb::TLS_SLOTS + 4 * i)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        set_last_error(e, 0);
-        Outcome::Return(v)
-    });
-    stdcall(reg, K32, "TlsSetValue", 2, |e| {
-        let (i, v) = (e.arg(0), e.arg(1));
-        let teb = e.ctx().teb;
-        if i >= 64 {
-            set_last_error(e, err::INVALID_PARAMETER);
-            return Outcome::Return(0);
-        }
-        let _ = e
-            .cpu
-            .write_u32(teb + adv_machine::layout::teb::TLS_SLOTS + 4 * i, v);
-        Outcome::Return(1)
-    });
+    reg.add_leaf(
+        K32,
+        "TlsGetValue",
+        adv_abi::Conv::Stdcall { argc: 1 },
+        |e| {
+            let i = e.arg(0);
+            let teb = e.teb;
+            let v = if i < 64 {
+                e.read_u32(teb + adv_machine::layout::teb::TLS_SLOTS + 4 * i)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let _ = e.write_u32(teb + adv_machine::layout::teb::LAST_ERROR, 0);
+            e.return32(v)
+        },
+    );
+    reg.add_leaf(
+        K32,
+        "TlsSetValue",
+        adv_abi::Conv::Stdcall { argc: 2 },
+        |e| {
+            let (i, v) = (e.arg(0), e.arg(1));
+            let teb = e.teb;
+            if i >= 64 {
+                let _ = e.write_u32(
+                    teb + adv_machine::layout::teb::LAST_ERROR,
+                    err::INVALID_PARAMETER,
+                );
+                return e.return32(0);
+            }
+            let _ = e.write_u32(teb + adv_machine::layout::teb::TLS_SLOTS + 4 * i, v);
+            e.return32(1)
+        },
+    );
     // Only these known leaf implementations can be reused as RTL providers.
     // Copying arbitrary Win32 frontends could route back into their own alias.
     for (front, native) in [

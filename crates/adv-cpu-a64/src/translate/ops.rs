@@ -45,7 +45,10 @@ impl Translator<'_> {
     pub(super) fn op(&mut self, inst: Inst) {
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
-            Op::Helper(index) => self.helper(index),
+            Op::Helper(index) => match inst.leaf {
+                Some(word) => self.leaf(inst, word),
+                None => self.helper(index),
+            },
             Op::Simd(simd) => self.simd(simd),
             Op::Strings(strings) => self.strings(strings),
             Op::Integer(integer) => self.integer(integer),
@@ -466,6 +469,31 @@ impl Translator<'_> {
             label: leave,
             refund: self.trace.unused(self.index),
         });
+    }
+
+    fn leaf(&mut self, inst: Inst, word: u32) {
+        self.canonicalize();
+        self.vector = super::simd::Vector::default();
+        self.mov_imm(X1, inst.pc);
+        self.mov_imm(super::X2, word);
+        self.far_call(self.stubs.leaf);
+        self.state = State::CANONICAL;
+        // Bit 1 refuses before INT; bit 0 leaves after the completed call.
+        for (bit, exit, eip, extra) in [
+            (1, super::Exit::Interpret, inst.pc, 1),
+            (0, super::Exit::Dispatch, inst.next_pc, 0),
+        ] {
+            let label = self.asm.label();
+            self.asm.tbz(true, X0, bit, label);
+            self.cold.push(Cold::Leave {
+                label,
+                state: State::CANONICAL,
+                refund: self.trace.unused(self.index) + extra,
+                exit,
+                eip,
+                link: false,
+            });
+        }
     }
 
     /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,

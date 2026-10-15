@@ -5,6 +5,20 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
+    fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
+        false
+    }
+
+    fn leaf(
+        &mut self,
+        _state: &mut CpuState,
+        _memory: &mut Memory,
+        _pc: u32,
+        _word: u32,
+    ) -> Option<u64> {
+        None
+    }
+
     /// The execution owner's guest clock for RDTSC. This must not block,
     /// allocate, perform IO, lock, or panic. None uses the standalone counter.
     fn guest_time_us(&mut self) -> Option<u64> {

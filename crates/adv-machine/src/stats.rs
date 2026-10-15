@@ -95,6 +95,7 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 
 #[derive(Default)]
 pub struct Stats {
+    pub leaf_calls: u64,
     pub frame_budget: Option<crate::frame_budget::FrameBudget>,
     pub wait_diagnostics: Option<crate::wait_diagnostics::WaitDiagnostics>,
     /// Take wall-clock timings and keep per-frame rows.
@@ -111,6 +112,18 @@ pub struct Stats {
 }
 
 impl Stats {
+    pub(crate) fn leaf(&mut self, thunk: u32, thunks: &ThunkTable) {
+        self.leaf_calls += 1;
+        if let Some(budget) = &mut self.frame_budget {
+            budget.host(0, thunk, thunks);
+        }
+        let i = thunk as usize;
+        if self.per_thunk.len() <= i {
+            self.per_thunk.resize(i + 1, (0, 0, 0));
+        }
+        self.per_thunk[i].1 += 1;
+    }
+
     pub fn new() -> Self {
         Self {
             total: FrameRow {

@@ -400,6 +400,20 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn leaf_call(&self, pc: u32, word: u32) -> bool {
+        self.handler.leaf_call(pc, word)
+    }
+
+    fn leaf(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        pc: u32,
+        word: u32,
+    ) -> Option<u64> {
+        self.handler.on_leaf(&mut View { state, memory }, pc, word)
+    }
+
     fn guest_time_us(&mut self) -> Option<u64> {
         self.handler.guest_time_us()
     }

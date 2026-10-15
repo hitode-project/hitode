@@ -108,6 +108,7 @@ impl Harness {
             Features { flagm },
             addr(at),
             Stubs {
+                leaf: addr(self.forbidden),
                 exit: addr(self.stubs.exit),
                 dispatch: addr(self.dispatch),
                 lookup: addr(self.forbidden),
@@ -116,6 +117,7 @@ impl Harness {
                 access: addr(self.forbidden),
                 interpret: addr(self.forbidden),
             },
+            &|_, _| false,
         );
         assert!(
             !work

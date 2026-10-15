@@ -71,6 +71,7 @@ pub enum Mode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Inst {
+    pub leaf: Option<u32>,
     pub pc: u32,
     pub next_pc: u32,
     pub op: Op,
@@ -139,7 +140,13 @@ fn slot(pc: u32, frame: u16) -> usize {
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry.
-    pub fn build(&mut self, memory: &Memory, entry: u32, stops: &[u32]) {
+    pub fn build(
+        &mut self,
+        memory: &Memory,
+        entry: u32,
+        stops: &[u32],
+        leaf: &dyn Fn(u32, u32) -> bool,
+    ) {
         self.insts.clear();
         self.code.clear();
         self.frames.clear();
@@ -190,6 +197,19 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
+                leaf: if matches!(op, Op::Helper(_)) && size == 2 {
+                    let mut bytes = [0; 7];
+                    memory
+                        .read_into(pc.wrapping_sub(5), &mut bytes)
+                        .ok()
+                        .and_then(|_| {
+                            let word = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                            (bytes[0] == 0x68 && bytes[5..] == [0xcd, 0x2e] && leaf(pc, word))
+                                .then_some(word)
+                        })
+                } else {
+                    None
+                },
                 pc,
                 next_pc,
                 op,
@@ -199,6 +219,9 @@ impl Trace {
                 taken: None,
                 frame,
             };
+            if inst.leaf.is_some() {
+                self.code.push((pc.wrapping_sub(5), 7));
+            }
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
                 len + 4 < MAX_INSTRUCTIONS

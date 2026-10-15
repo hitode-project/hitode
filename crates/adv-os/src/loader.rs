@@ -602,6 +602,9 @@ impl<'a> Loader<'a> {
         self.cpu.protect(base, size, Prot::READ)?;
         self.cpu
             .protect(base + image.text_rva, image.text_size, Prot::RX)?;
+        self.sys
+            .thunks
+            .register_thunk_pages(base + image.text_rva, image.text_size);
         if image.data_size != 0 {
             self.cpu
                 .protect(base + image.data_rva, image.data_size, Prot::RW)?;

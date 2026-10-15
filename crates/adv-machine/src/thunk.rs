@@ -7,7 +7,7 @@
 //! call that is actually used.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, MemFault};
@@ -16,6 +16,7 @@ use crate::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, THUNK_CAP, THUNK_STRIDE, t
 use crate::{Env, Outcome};
 
 pub type Handler = fn(&mut Env<'_>) -> Outcome;
+pub use crate::leaf::trap as leaf_trap;
 
 /// Calling convention of a host function, as seen by the guest caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +40,8 @@ impl Conv {
 
 #[derive(Clone, Copy)]
 pub struct HostFn {
+    /// Explicitly registered nonblocking implementation; ordinary traps reuse it.
+    pub leaf: Option<crate::LeafHandler>,
     pub conv: Conv,
     pub handler: Handler,
     /// Opaque binding data interpreted by the registered handler, never the CPU.
@@ -144,6 +147,8 @@ pub const RETURN_PAD: u32 = 0;
 pub(crate) const EXCEPTION_DISPATCH: u32 = 1;
 
 pub struct ThunkTable {
+    /// Published copies in synthetic DLL images share the transport bindings.
+    thunk_pages: HashSet<u32>,
     resolver: Box<dyn Resolver>,
     /// Machine-internal functions, bound ahead of the resolver.
     internal: HashMap<(String, String), HostFn>,
@@ -180,6 +185,7 @@ impl ThunkTable {
             module: String::new(),
             name: "<return pad>".into(),
             f: HostFn {
+                leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: return_pad,
                 data: 0,
@@ -198,6 +204,7 @@ impl ThunkTable {
             },
         };
         Self {
+            thunk_pages: HashSet::new(),
             resolver,
             internal: HashMap::new(),
             thunks: vec![
@@ -206,6 +213,7 @@ impl ThunkTable {
                     module: String::new(),
                     name: "<exception dispatch>".into(),
                     f: HostFn {
+                        leaf: None,
                         conv: Conv::Cdecl { argc: 0 },
                         handler: return_pad,
                         data: 0,
@@ -229,6 +237,17 @@ impl ThunkTable {
 
     pub fn resolver(&self) -> &dyn Resolver {
         self.resolver.as_ref()
+    }
+
+    pub fn register_thunk_pages(&mut self, base: u32, size: u32) {
+        self.thunk_pages
+            .extend((0..size).step_by(4096).map(|offset| (base + offset) >> 12));
+    }
+
+    pub fn is_thunk_page(&self, pc: u32) -> bool {
+        (crate::layout::THUNK_BASE..crate::layout::THUNK_BASE + crate::layout::THUNK_SIZE)
+            .contains(&pc)
+            || self.thunk_pages.contains(&(pc >> 12))
     }
 
     /// Immutable encoding of an existing binding, independent of guest hook
@@ -446,6 +465,7 @@ impl ThunkTable {
             // Unknown convention: it fails before returning, so `ret` is never reached.
             None => (
                 HostFn {
+                    leaf: None,
                     conv: Conv::Cdecl { argc: 0 },
                     handler: unimplemented,
                     data: 0,

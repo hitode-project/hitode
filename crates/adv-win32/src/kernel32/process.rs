@@ -538,14 +538,17 @@ fn output_debug_string_w(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-fn get_last_error(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(crate::util::last_error(env))
+fn get_last_error(env: &mut adv_abi::LeafEnv<'_>) -> u64 {
+    env.return32(
+        env.read_u32(env.teb + adv_machine::layout::teb::LAST_ERROR)
+            .unwrap_or(0),
+    )
 }
 
-fn set_last_error_(env: &mut Env<'_>) -> Outcome {
+fn set_last_error_(env: &mut adv_abi::LeafEnv<'_>) -> u64 {
     let e = env.arg(0);
-    set_last_error(env, e);
-    Outcome::Return(0)
+    let _ = env.write_u32(env.teb + adv_machine::layout::teb::LAST_ERROR, e);
+    env.return32(0)
 }
 
 fn create_thread(env: &mut Env<'_>) -> Outcome {
@@ -1023,9 +1026,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
     });
-    stdcall(reg, K32, "GetCurrentThreadId", 0, |e| {
-        Outcome::Return(e.ctx().tid)
-    });
+    reg.add_leaf(
+        K32,
+        "GetCurrentThreadId",
+        adv_abi::Conv::Stdcall { argc: 0 },
+        |e| e.return32(e.tid),
+    );
     stdcall(reg, K32, "GetCurrentProcess", 0, |_| {
         Outcome::Return(u32::MAX)
     });
@@ -1116,8 +1122,18 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);
     stdcall(reg, K32, "OutputDebugStringW", 1, output_debug_string_w);
-    stdcall(reg, K32, "GetLastError", 0, get_last_error);
-    stdcall(reg, K32, "SetLastError", 1, set_last_error_);
+    reg.add_leaf(
+        K32,
+        "GetLastError",
+        adv_abi::Conv::Stdcall { argc: 0 },
+        get_last_error,
+    );
+    reg.add_leaf(
+        K32,
+        "SetLastError",
+        adv_abi::Conv::Stdcall { argc: 1 },
+        set_last_error_,
+    );
     stdcall(reg, K32, "GlobalMemoryStatus", 1, global_memory_status);
     stdcall(reg, K32, "GlobalMemoryStatusEx", 1, global_memory_status_ex);
     stdcall(reg, K32, "GetComputerNameA", 2, |e| {

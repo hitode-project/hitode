@@ -355,6 +355,16 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// Authorize an exact PUSH token / INT pair for a light host call.
+    fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
+        false
+    }
+
+    /// Only ESP and EDX are synchronized. None requests ordinary INT dispatch.
+    fn on_leaf(&mut self, _cpu: &mut dyn Guest, _pc: u32, _word: u32) -> Option<u64> {
+        None
+    }
+
     /// The execution owner's guest clock, when one is installed. CPU reference
     /// counters use the same domain as guest OS time; this is not device time.
     /// A standalone backend may use its own reference clock when absent.

@@ -105,12 +105,9 @@ fn fixture() -> (Machine<JitCpu>, u32) {
     (machine, data)
 }
 fn invoke(machine: &mut Machine<JitCpu>, data: u32, module: &str, name: &str, args: &[u32]) -> u32 {
-    let handler = (machine.sys.thunks.resolver() as &dyn std::any::Any)
-        .downcast_ref::<Registry>()
-        .unwrap()
-        .get(module, name)
-        .unwrap()
-        .handler;
+    let target = machine.resolve_import(module, name).unwrap();
+    let thunk = (target - layout::THUNK_BASE) / layout::THUNK_STRIDE;
+    let handler = machine.sys.thunks.get(thunk).f.handler;
     machine.cpu.write_u32(data, 0x12345678).unwrap();
     for (index, value) in args.iter().enumerate() {
         machine
@@ -123,7 +120,7 @@ fn invoke(machine: &mut Machine<JitCpu>, data: u32, module: &str, name: &str, ar
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,
-        thunk: 0,
+        thunk,
     }) {
         Outcome::Return(value) => value,
         _ => panic!("{name} did not return a Win32 value"),

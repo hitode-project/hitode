@@ -16,6 +16,7 @@ pub mod ext;
 pub mod frame_budget;
 mod invocation;
 pub mod layout;
+mod leaf;
 pub mod objects;
 pub mod outcome;
 pub mod patch;
@@ -44,6 +45,7 @@ use adv_cpu::backend::{
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
 pub use ext::Ext;
 use layout::*;
+pub use leaf::{LeafEnv, LeafHandler};
 pub use objects::{Identity, Namespace, ObjectLimits};
 pub use outcome::{Continuation, Outcome, Resume, WakeReason};
 pub use patch::Detour;
@@ -1429,6 +1431,57 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn leaf_call(&self, pc: u32, word: u32) -> bool {
+        if self.sys.trace.enabled()
+            || self.sys.call_limit.is_some()
+            || !self.sys.thunks.is_thunk_page(pc)
+            || !self.sys.thunks.is_thunk_page(pc.wrapping_sub(5))
+        {
+            return false;
+        }
+        self.sys
+            .thunks
+            .transport_index(word)
+            .is_some_and(|index| self.sys.thunks.get(index).f.leaf.is_some())
+    }
+
+    fn on_leaf(&mut self, cpu: &mut dyn Guest, pc: u32, word: u32) -> Option<u64> {
+        if !self.leaf_call(pc, word) {
+            return None;
+        }
+        let esp = cpu.reg(Reg::Esp).wrapping_add(4);
+        if self
+            .sys
+            .current_context()
+            .frames
+            .last()
+            .is_some_and(|frame| esp >= frame.stack)
+        {
+            return None;
+        }
+        if cpu.read_u32(cpu.reg(Reg::Esp)).ok() != Some(word) {
+            return None;
+        }
+        let index = self.sys.thunks.transport_index(word)?;
+        let handler = self.sys.thunks.get(index).f.leaf?;
+        cpu.set_reg(Reg::Esp, esp);
+        self.sys.recent.push(
+            self.sys.current,
+            index,
+            cpu.read_u32(cpu.reg(Reg::Esp)).unwrap_or(0),
+        );
+        self.sys.host_calls += 1;
+        self.sys.stats.total.host_calls += 1;
+        self.sys.stats.leaf(index, &self.sys.thunks);
+        Some(handler(&mut LeafEnv::new(&mut Env {
+            context: self.sys.current,
+            cpu,
+            sys: self.sys,
+            ext: self.ext,
+            thunk: index,
+        })))
+    }
+
     fn guest_time_us(&mut self) -> Option<u64> {
         Some(self.sys.clock.guest_now_us())
     }
@@ -1572,6 +1625,7 @@ impl<B: Backend> Machine<B> {
             INTERNAL_MODULE,
             "process_entry",
             HostFn {
+                leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: process_entry,
                 data: 0,

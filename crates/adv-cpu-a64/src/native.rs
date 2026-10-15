@@ -448,6 +448,46 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     (charge as u64) << 32 | u64::from(status)
 }
 
+unsafe extern "C" fn leaf(runtime: *mut Runtime, pc: u32, word: u32) -> u32 {
+    // SAFETY: run owns these objects exclusively until generated code returns.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    let (native, memory, cpu) =
+        unsafe { (&mut *owner.native, &mut *owner.memory, &mut *(*runtime).cpu) };
+    if owner.bridge.is_null() {
+        return 2;
+    }
+    let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
+    let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bridge
+            .handler
+            .as_mut()
+            .and_then(|handler| handler.leaf(cpu, memory, pc, word))
+    }));
+    match result {
+        Ok(Some(value)) => {
+            cpu.regs[0] = value as u32;
+            cpu.regs[2] = (value >> 32) as u32;
+            cpu.eip = pc.wrapping_add(2);
+            u32::from(
+                native.past()
+                    || native
+                        .interrupt
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                    || memory.epoch != epoch
+                    || memory.dirty_pages.len() != dirty
+                    || native.stops.contains(&cpu.eip),
+            )
+        }
+        Ok(None) => 2,
+        Err(_) => {
+            owner.error = Some("leaf host handler panicked".into());
+            1
+        }
+    }
+}
+
 /// The virtual counter, which reads in a few nanoseconds where
 /// `Instant::now` takes tens.
 fn ticks() -> u64 {
@@ -468,6 +508,8 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 }
 
 pub(crate) struct Native {
+    bridge: *mut std::ffi::c_void,
+    pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     cache: CodeCache,
     enter: Enter,
     stubs: Stubs,
@@ -547,6 +589,8 @@ impl Native {
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {
+            bridge: std::ptr::null_mut(),
+            interrupt: None,
             stub_len: cache.used(),
             faults: Faults {
                 start: base,
@@ -561,6 +605,7 @@ impl Native {
             cache,
             enter,
             stubs: Stubs {
+                leaf: base + stubs.leaf,
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
                 lookup: base + stubs.lookup,
@@ -613,6 +658,7 @@ impl Native {
         fuel: u64,
         bridge: *mut std::ffi::c_void,
     ) -> Result<Option<Run>, String> {
+        self.bridge = bridge;
         self.invalidate(memory);
         self.observe_stop(stop);
         let (entry, translated) = match self.units.get(&cpu.eip).copied() {
@@ -677,6 +723,7 @@ impl Native {
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
             (*runtime).interpret = interpret as *const () as u64;
+            (*runtime).leaf = leaf as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -957,6 +1004,16 @@ impl Native {
             self.features,
             at,
             self.stubs,
+            &|pc, word| {
+                if self.bridge.is_null() {
+                    return false;
+                }
+                // SAFETY: translation occurs only during the bridge's run.
+                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()
+                    .is_some_and(|handler| handler.leaf_call(pc, word))
+            },
         );
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;

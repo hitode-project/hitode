@@ -292,6 +292,7 @@ impl Executor {
         #[cfg(native)]
         if let Some(native) = &mut self.native {
             native.deadline = self.deadline.map(crate::native::deadline);
+            native.interrupt = self.host_interrupts.then(|| self.interrupt.clone());
         }
         let result = self.run_inner(stop, budget, &mut bridge);
         // Export canonical floating state at every public CPU boundary.
@@ -501,3 +502,5 @@ impl Executor {
 
 #[cfg(test)]
 mod differential;
+#[cfg(all(test, native))]
+mod leaf_tests;

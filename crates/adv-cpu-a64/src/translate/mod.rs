@@ -145,6 +145,7 @@ impl Workspace {
 /// Host addresses of the `runtime` stubs units branch to.
 #[derive(Clone, Copy, Debug)]
 pub struct Stubs {
+    pub leaf: usize,
     pub exit: usize,
     pub dispatch: usize,
     /// Continues at the guest EIP in w16 through the indirect table.
@@ -334,8 +335,9 @@ pub fn translate(
     features: Features,
     at: usize,
     stubs: Stubs,
+    leaf: &dyn Fn(u32, u32) -> bool,
 ) {
-    work.trace.build(memory, eip, stops);
+    work.trace.build(memory, eip, stops, leaf);
     for &(start, len) in &work.trace.code {
         memory.watch_code(start, len as usize);
     }
