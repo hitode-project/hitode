@@ -50,7 +50,7 @@ impl Engine for JitCpu {
                 executor.load_warm_profile(&profile);
             }
         }
-        if options.frame_timing {
+        if options.frame_timing || options.profiling {
             executor.enable_frame_timing(true);
         }
         executor.set_profiling(options.profiling);
@@ -83,6 +83,13 @@ impl Engine for JitCpu {
             native_entries: stats.native_entries,
             interpreter_entries: stats.interpreter_entries,
         }
+    }
+
+    fn tier0_instructions(&self) -> Option<u64> {
+        let executor = self.executor();
+        executor
+            .frame_timing
+            .then(|| executor.frame_counters().retired_tier0_instructions)
     }
 
     fn report_fields(&self) -> String {
@@ -242,6 +249,36 @@ fn cliffs_report(c: &Cliffs) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: EXEC-CORE-5
+    #[test]
+    fn tier0_retirement_is_null_until_diagnostics_and_counts_rep_once() {
+        let mut cpu = JitCpu::new(0x12000, false).unwrap();
+        assert_eq!(cpu.tier0_instructions(), None);
+        let options = EngineOptions {
+            profiling: true,
+            async_compilation: false,
+            ..EngineOptions::default()
+        };
+        cpu.configure(&options).unwrap();
+        let executor = cpu.executor_mut();
+        executor
+            .map(0x10000, 4096, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        executor
+            .map(0x20000, 4096, crate::READ | crate::WRITE)
+            .unwrap();
+        executor.write(0x10000, &[0xf3, 0xaa]).unwrap(); // authored REP STOSB
+        executor.state.eip = 0x10000;
+        executor.state.regs[1] = 10;
+        executor.state.regs[7] = 0x20000;
+        assert_eq!(
+            executor.run(0x10002, 100).unwrap(),
+            crate::RunOutcome::ReachedStop
+        );
+        assert_eq!(executor.stats.interpreter_instructions, 10);
+        assert_eq!(cpu.tier0_instructions(), Some(1));
+    }
 
     #[test]
     fn experimental_compile_threads_preserve_default_and_reject_invalid_values() {

@@ -142,6 +142,14 @@ impl Executor {
         })
     }
 
+    pub(crate) fn count_tier0(&mut self, enabled: bool) {
+        self.interpreter.frame_retired = enabled.then_some(0);
+    }
+
+    pub(crate) fn tier0_instructions(&self) -> Option<u64> {
+        self.interpreter.frame_retired
+    }
+
     pub fn memory(&self) -> &Memory {
         &self.memory
     }

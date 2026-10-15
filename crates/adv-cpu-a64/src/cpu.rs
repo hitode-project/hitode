@@ -556,9 +556,15 @@ impl Engine for Cpu {
         Self::new(park, native)
     }
 
-    /// Translation is synchronous and needs no policy.
-    fn configure(&mut self, _options: &EngineOptions) -> Result<(), String> {
+    /// Translation stays synchronous; diagnostics may count exact Tier 0 retirement.
+    fn configure(&mut self, options: &EngineOptions) -> Result<(), String> {
+        self.inner
+            .count_tier0(options.profiling || options.frame_timing);
         Ok(())
+    }
+
+    fn tier0_instructions(&self) -> Option<u64> {
+        self.inner.tier0_instructions()
     }
 
     fn set_waker(&mut self, wake: WakeEvent) -> Result<(), String> {
@@ -616,5 +622,31 @@ impl Engine for Cpu {
 
     fn profile(&self) -> BTreeMap<u32, adv_cpu_core::ProfileSample> {
         BTreeMap::new()
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+    // spec: EXEC-CORE-5
+    #[test]
+    fn exact_tier0_counting_is_diagnostic_and_counts_rep_once() {
+        let mut cpu = Cpu::new(0x12000, false).unwrap();
+        assert_eq!(cpu.tier0_instructions(), None);
+        cpu.configure(&EngineOptions {
+            profiling: true,
+            ..EngineOptions::default()
+        })
+        .unwrap();
+        let executor = cpu.executor_mut();
+        executor.map(0x10000, 4096, 7).unwrap();
+        executor.map(0x20000, 4096, 3).unwrap();
+        executor.write(0x10000, &[0xf3, 0xaa]).unwrap(); // authored REP STOSB
+        executor.state.eip = 0x10000;
+        executor.state.regs[1] = 10;
+        executor.state.regs[7] = 0x20000;
+        assert_eq!(executor.run(0x10002, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(executor.stats.interpreter_instructions, 10);
+        assert_eq!(cpu.tier0_instructions(), Some(1));
     }
 }

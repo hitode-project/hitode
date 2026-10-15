@@ -93,6 +93,11 @@ pub trait Engine: Backend + Sized {
     /// Engine-specific report members as `"key": value` pairs joined by
     /// commas, without surrounding braces; empty when there are none.
     fn report_fields(&self) -> String;
+    /// Exact retired Tier 0 instructions while diagnostic counting is enabled.
+    /// REP elements remain work units and retire only one completed instruction.
+    fn tier0_instructions(&self) -> Option<u64> {
+        None
+    }
     /// Write files that accompany a JSON report at `report`.
     fn write_report_extras(&self, _report: &Path) -> Result<(), String> {
         Ok(())

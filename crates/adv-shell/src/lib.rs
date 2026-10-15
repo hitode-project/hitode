@@ -829,6 +829,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"leaf_host_calls\": {},\n  \"leaf_host_abandons\": {},\n  \"async_compilation\": {},\n  {},\n",
+            "  \"tier0_instructions\": {},\n  \"tier0_instructions_per_second\": {},\n",
             "  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
@@ -866,6 +867,18 @@ fn build_report(context: ReportContext<'_>) -> String {
         runtime.machine.sys.stats.leaf_abandons,
         options.jit && options.async_compilation,
         runtime.machine.cpu.report_fields(),
+        runtime
+            .machine
+            .cpu
+            .tier0_instructions()
+            .map_or_else(|| "null".into(), |n| n.to_string()),
+        runtime.machine.cpu.tier0_instructions().map_or_else(
+            || "null".into(),
+            |n| format!(
+                "{:.3}",
+                n as f64 / started.elapsed().as_secs_f64().max(1e-9)
+            )
+        ),
         runtime.machine.sys.contexts.len(),
         runtime.machine.sys.tls_images.len(),
         modules,
