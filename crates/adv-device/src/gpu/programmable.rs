@@ -2,6 +2,7 @@
 //! the GPU vertex fetcher and a small unpack expression produce shader inputs.
 use super::{Image, Sampler};
 use std::sync::Arc;
+use wgpu::naga::{Binding, BuiltIn, TypeInner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttributeFormat {
@@ -125,6 +126,7 @@ impl Default for ConstantBlock {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Program {
     pub(super) id: u64,
+    pub(super) writes_depth: bool,
     /// Complete validated WGSL with vertex_main and fragment_main entry points.
     pub(super) source: Arc<str>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
@@ -154,7 +156,16 @@ impl Program {
     }
     pub fn new(source: Arc<str>, textures: Vec<bool>) -> Self {
         static NEXT_PROGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let writes_depth = wgpu::naga::front::wgsl::parse_str(&source).is_ok_and(|module| {
+            let depth = Some(Binding::BuiltIn(BuiltIn::FragDepth));
+            module.entry_points.iter().filter(|e| e.name == "fragment_main")
+                .filter_map(|e| e.function.result.as_ref()).any(|result| {
+                    result.binding == depth || matches!(&module.types[result.ty].inner,
+                        TypeInner::Struct { members, .. } if members.iter().any(|m| m.binding == depth))
+                })
+        });
         Self {
+            writes_depth,
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source,
             textures,

@@ -188,3 +188,29 @@ fn consecutive_component_clears_and_dropped_targets_keep_order() {
         solid(&read(&mut gpu, &image), [0, 0, 255, 255]);
     }
 }
+
+// spec: GFX-PASS-2
+#[test]
+fn fragment_depth_outputs_keep_attachments_without_enabling_depth_writes() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, true).unwrap();
+        gpu.clear(&target, Some([1., 0., 0., 1.]), Some(0.25))
+            .unwrap();
+        read(&mut gpu, &target.image);
+        let mut depth = draw();
+        depth.program = Program::new(depth.program.source.replace(
+            "@fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }",
+            "struct O { @location(0) color:vec4<f32>, @builtin(frag_depth) depth:f32 }; @fragment fn fragment_main()->O { return O(c.f[0], 0.9); }"
+        ).into(), vec![]);
+        let mut state = DrawState::new(4, 4);
+        gpu.draw_programmable(&target, &depth, &state).unwrap();
+        solid(&read(&mut gpu, &target.image), [0, 255, 0, 255]);
+        let mut red = draw();
+        red.pixel_constants.floats[0] = [1., 0., 0., 1.];
+        state.depth = Some(Compare::Less);
+        state.depth_write = true;
+        gpu.draw_programmable(&target, &red, &state).unwrap();
+        solid(&read(&mut gpu, &target.image), [0, 255, 0, 255]);
+    }
+}

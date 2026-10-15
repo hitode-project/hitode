@@ -733,7 +733,10 @@ impl Gpu {
         let mut pending = context.pending.lock().unwrap();
         #[cfg(target_vendor = "apple")]
         let initialization_target = target;
-        let selected = self.draw_target(&pending, target, state);
+        let mut selected = self.draw_target(&pending, target, state);
+        if draw.program.writes_depth {
+            selected.depth = target.depth.clone();
+        }
         let target = &selected;
         let mut raster = PipelineKey {
             topology: state.topology,
