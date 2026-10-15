@@ -72,7 +72,7 @@ fn metadata(env: &mut Env<'_>, path: &str, api: &str) -> Result<DirEntry, i32> {
             name: String::new(),
             is_dir: metadata.is_dir(),
             size: metadata.len(),
-            created: metadata.created().ok(),
+            created: metadata.created().or_else(|_| metadata.modified()).ok(),
             accessed: metadata.accessed().ok(),
             modified: metadata.modified().ok(),
             attributes: vfs.file_attributes(path)?,

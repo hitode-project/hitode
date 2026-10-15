@@ -436,7 +436,13 @@ fn copy_reads_unflushed_shared_source_in_bounded_chunks_and_retargets_old_target
         [0x11; 4096]
     );
     // Aliases and early failures must not copy-up/truncate the source or target.
-    std::fs::hard_link(root.join("game/source.bin"), root.join("game/alias.bin")).unwrap();
+    // The adb shell SELinux domain on Android denies links; the product never links.
+    if let Err(error) =
+        std::fs::hard_link(root.join("game/source.bin"), root.join("game/alias.bin"))
+    {
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        return;
+    }
     for target in ["source.bin", "SOURCE.bin", "alias.bin"] {
         assert_eq!(
             returned(copy_file(

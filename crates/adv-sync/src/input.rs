@@ -43,6 +43,12 @@ impl KeyState {
             });
         }
     }
+    /// Some key or mouse button is down.
+    pub fn any_pressed(&self) -> bool {
+        self.keys
+            .iter()
+            .any(|key| key.load(Ordering::Relaxed) & 0x80 != 0)
+    }
     pub fn snapshot(&self) -> [u8; 256] {
         std::array::from_fn(|key| self.get(key as u32))
     }

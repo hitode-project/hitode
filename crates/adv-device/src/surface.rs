@@ -1173,6 +1173,8 @@ pub struct Surfaces<P: Presenter> {
     surfaces: BTreeMap<u32, Surface>,
     damage_history: DamageHistory,
     software_source: Option<u32>,
+    /// Damaged and total pixels of the last software publication.
+    software_coverage: (u64, u64),
     software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
@@ -1236,6 +1238,7 @@ impl<P: Presenter> Surfaces<P> {
             surfaces: BTreeMap::new(),
             damage_history: DamageHistory::default(),
             software_source: None,
+            software_coverage: (0, 0),
             software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
@@ -1864,6 +1867,10 @@ impl<P: Presenter> Surfaces<P> {
             Ok(false)
         }
     }
+    /// Damaged and total pixels of the last software publication.
+    pub fn software_coverage(&self) -> (u64, u64) {
+        self.software_coverage
+    }
     pub fn flush(&mut self, m: &dyn SurfaceMemory, reason: FlushReason) -> Result<bool, String> {
         let Some(pending) = self.software_pending.take() else {
             return Ok(false);
@@ -1903,6 +1910,10 @@ impl<P: Presenter> Surfaces<P> {
             .software_started
             .get_or_insert_with(std::time::Instant::now);
         self.software_source = Some(id);
+        self.software_coverage = (
+            damage.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum(),
+            u64::from(s.width) * u64::from(s.height),
+        );
         self.damage_history.push((self.stats.presentations, damage));
         // Retire our latest reference before recycling the writer's private slot.
         self.retained_frame = None;

@@ -289,9 +289,11 @@ unsafe fn capture(context: *const c_void, pc: usize) -> Option<HostContextSnapsh
 }
 
 /// Redirects a fault in another engine's translated code: returns the new PC,
-/// or 0 to leave the fault to the previous handler. Runs in signal context, so
+/// or 0 to leave the fault to the previous handler. The snapshot includes
+/// all host vector registers. Runs in signal context, so
 /// it must not allocate, lock or unwind.
-pub type TranslatedFault = unsafe fn(pc: usize, fault_address: usize) -> usize;
+pub type TranslatedFault =
+    unsafe fn(pc: usize, fault_address: usize, snapshot: &HostContextSnapshot) -> usize;
 
 static TRANSLATED: OnceLock<TranslatedFault> = OnceLock::new();
 
@@ -316,7 +318,12 @@ unsafe extern "C" fn dispatch(
         0 => TRANSLATED
             .get()
             // SAFETY: the registered handler upholds the signal-context contract.
-            .map_or(0, |handler| unsafe { handler(pc, fault_address) }),
+            .map_or(0, |handler| {
+                // SAFETY: the POSIX dispatcher supplies this signal's context.
+                unsafe { capture(context, pc) }.map_or(0, |snapshot| unsafe {
+                    handler(pc, fault_address, &snapshot)
+                })
+            }),
         target => target,
     }
 }

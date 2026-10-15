@@ -83,7 +83,7 @@ pub(super) fn query(
             Err(error) => return failure(env, error),
         };
         for (offset, value) in [
-            (0, time(metadata.created())),
+            (0, time(metadata.created().or_else(|_| metadata.modified()))),
             (8, time(metadata.accessed())),
             (16, time(metadata.modified())),
             (24, time(metadata.modified())),
