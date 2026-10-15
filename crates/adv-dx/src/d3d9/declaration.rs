@@ -287,6 +287,7 @@ pub(super) fn bind(env: &mut Env<'_>, device: Id, new: Option<Id>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[7] += 1;
     d.buffers.declaration = new;
     d.fixed.clear_fvf();
     if new != old

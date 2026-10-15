@@ -365,6 +365,11 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
         return UNAVAILABLE;
     }
     f.fvf = fvf;
+    super::shaders::stateblocks::mark_fixed(
+        env,
+        this.addr(),
+        super::shaders::stateblocks::FixedKey::Fvf,
+    );
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();

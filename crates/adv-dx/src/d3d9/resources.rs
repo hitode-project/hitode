@@ -952,6 +952,7 @@ fn set_texture_binding(
     }
     if let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     {
+        d.versions[12] += 1;
         if slot == 0 {
             d.texture = new;
         } else {

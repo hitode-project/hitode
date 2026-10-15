@@ -468,6 +468,7 @@ fn set_stream(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[10] += 1;
     d.buffers.streams[stream as usize] = Stream {
         buffer: new,
         offset: if new.is_some() { offset } else { old.offset },
@@ -554,6 +555,7 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[11] += 1;
     d.buffers.indices = new;
     if new != old
         && let Some(id) = old
@@ -593,6 +595,10 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this) else {
         return;
     };
+    d.versions[10] += 1;
+    if indexed {
+        d.versions[11] += 1;
+    }
     let stream = std::mem::take(&mut d.buffers.streams[0]).buffer;
     let indices = if indexed {
         d.buffers.indices.take()
