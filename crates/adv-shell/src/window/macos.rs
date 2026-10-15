@@ -146,6 +146,13 @@ pub(crate) struct Hub {
     menus: RefCell<menu::Runtime>,
     menu_sink: RefCell<Option<MenuSink>>,
     dialogs: dialog::Output,
+    /// The view's display link (macOS 14 and later), paused between requests.
+    link: RefCell<Option<Retained<objc2_quartz_core::CADisplayLink>>>,
+    /// Frame-rate cap the link was last given: 60 for paced frames, else the display.
+    link_paced: Cell<Option<bool>>,
+    on_frame: RefCell<Option<Rc<dyn Fn()>>>,
+    in_frame: Cell<bool>,
+    pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
 }
 impl Hub {
     pub(crate) fn push(&self, event: Event) {

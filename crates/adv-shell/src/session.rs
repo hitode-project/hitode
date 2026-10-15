@@ -104,6 +104,10 @@ impl Session {
         #[cfg(target_os = "macos")]
         ui.install_sinks(&mut projection.borrow_mut());
         worker.gpu = Some(gpu);
+        #[cfg(target_os = "macos")]
+        {
+            worker.vsync = Some(view.vsync());
+        }
         let service = background.start().map_err(|e| e.to_string())?;
         let completion_wake = ui.wake();
         view.watch(completion_wake.clone());
@@ -210,6 +214,12 @@ impl Session {
             run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
             run_loop.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
             descriptor.enable_call_backs(kCFFileDescriptorReadCallBack);
+            let weak = Rc::downgrade(&driver);
+            driver.view.start_frame_clock(Rc::new(move || {
+                if let Some(driver) = weak.upgrade() {
+                    driver.drive();
+                }
+            }));
             Ok(Self {
                 driver,
                 descriptor,
@@ -429,6 +439,11 @@ impl Driver {
             callback(result);
         }
     }
+    #[cfg(target_os = "macos")]
+    fn request_frame(&self) -> bool {
+        let paced = self.ui.borrow().as_ref().is_some_and(frontend::Ui::paced);
+        self.view.request_frame(paced)
+    }
     fn drive(&self) {
         let next = match self.tick() {
             Ok(next) => next,
@@ -449,6 +464,12 @@ impl Driver {
                 self.finish(Err(error));
             }
         }
+        // A due presentation waits for the next vsync instead of the timer.
+        #[cfg(target_os = "macos")]
+        let next = match next {
+            Some(at) if at <= Instant::now() && self.request_frame() => None,
+            other => other,
+        };
         #[cfg(target_os = "macos")]
         if let Some(timer) = self.timer.borrow().as_ref() {
             if timer.is_valid() {
@@ -499,6 +520,7 @@ impl Drop for Session {
         }
         #[cfg(target_os = "macos")]
         {
+            self.driver.view.stop_frame_clock();
             self.timer.invalidate();
             self.descriptor.invalidate();
             self.source.invalidate();

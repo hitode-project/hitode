@@ -1442,6 +1442,10 @@ fn run_execution(
     if let Some(worker) = window.as_mut() {
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
+        #[cfg(target_os = "macos")]
+        if let Some(vsync) = worker.vsync.take() {
+            runtime.machine.ext.insert(vsync);
+        }
     }
     #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     if cfg!(windows)

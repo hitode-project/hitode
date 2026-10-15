@@ -48,6 +48,9 @@ pub struct Worker {
         all(windows, feature = "gpu")
     ))]
     pub(crate) gpu: Option<adv_device::gpu::Gpu>,
+    /// The host frame clock's vsync grid, handed to guest refresh pacing.
+    #[cfg(target_os = "macos")]
+    pub(crate) vsync: Option<Arc<adv_sync::vsync::Vsync>>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
     frames: Option<FrameProducer>,
@@ -119,6 +122,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
                 all(windows, feature = "gpu")
             ))]
             gpu: None,
+            #[cfg(target_os = "macos")]
+            vsync: None,
             incoming,
             requests: requests_tx,
             frames: Some(frames_tx),
@@ -461,6 +466,11 @@ impl Ui {
             }
         }
         self.deadline(window)
+    }
+    /// Whether the last frame came from a paced `Present`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn paced(&self) -> bool {
+        self.paced
     }
     #[cfg(any(target_os = "macos", target_os = "android"))]
     pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {

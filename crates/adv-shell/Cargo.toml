@@ -36,7 +36,7 @@ block2 = "0.6.2"
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-foundation = "0.3.2"
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "CABase", "CADisplayLink", "CAFrameRateRange", "CALayer", "CAMetalLayer"] }
 
 [dev-dependencies]
 pollster = "0.4"

@@ -32,6 +32,7 @@ pub(super) fn machine_with_native(native: bool) -> Machine<JitCpu> {
         present_copy: |_, _, _| unreachable!(),
         repeat: |_, _| unreachable!(),
         presentation_serial: |_| Some(0),
+        vsync: |_| None,
         window: |_, _, _| Some((16, 12)),
         visible: |_, _, _| Some(false),
         fast_forward: |_| false,
@@ -141,6 +142,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             recording: None,
             frame: recording::Recording::default(),
             gpu_lost: false,
+            boundary: None,
         })),
     )
     .unwrap();

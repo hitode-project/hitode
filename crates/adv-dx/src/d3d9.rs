@@ -76,6 +76,9 @@ pub struct SurfaceProvider {
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
     pub display: fn(&Ext) -> (u32, u32, u32),
+    /// Time since the host display's latest vsync and its period; None keeps
+    /// refresh boundaries on the machine clock.
+    pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,
     /// Apply guest display/window state only after device creation/reset succeeds.
     pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
     pub device_released: fn(&mut Env<'_>, u32),
@@ -115,6 +118,8 @@ struct Device {
     recording: Option<shaders::stateblocks::Snapshot>,
     frame: recording::Recording,
     gpu_lost: bool,
+    /// The last refresh boundary, so vsync-locked boundaries keep their phase.
+    boundary: Option<u64>,
 }
 pub struct State {
     com: Com,
@@ -946,6 +951,7 @@ fn create_device(
         recording: None,
         frame: recording::Recording::default(),
         gpu_lost: false,
+        boundary: None,
     };
     let Some((pointer, id)) = object(
         env,
@@ -1594,6 +1600,8 @@ fn present(
         d.parameters.PresentationInterval,
         (provider.display)(env.ext).2,
         occluded,
+        (provider.vsync)(env.ext),
+        d.boundary,
     ) {
         Ok(deadline) => deadline,
         Err(()) => return Outcome::Return(UNAVAILABLE),
@@ -1601,6 +1609,9 @@ fn present(
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
+        d.boundary = deadline;
+    }
     if device(env, this.addr()).unwrap().gpu_lost {
         return Outcome::Return(DEVICE_LOST);
     }

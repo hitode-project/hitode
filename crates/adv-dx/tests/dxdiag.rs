@@ -66,6 +66,7 @@ impl Fixture {
                     present_copy: |_, _, _| panic!("DxDiag never presents"),
                     repeat: |_, _| panic!("DxDiag never presents"),
                     presentation_serial: |_| Some(0),
+                    vsync: |_| None,
                     window: |_, _, _| None,
                     visible: |_, _, _| None,
                     fast_forward: |_| false,

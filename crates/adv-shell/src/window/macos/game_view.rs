@@ -2,7 +2,7 @@
 use super::*;
 use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CAMetalLayer};
 
 pub struct Input {
     hub: Rc<Hub>,
@@ -75,6 +75,8 @@ define_class!(
         fn mouse_moved(&self, event: &NSEvent) { self.ivars().borrow_mut().handle(self, event); }
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) { self.ivars().borrow_mut().handle(self, event); }
+        #[unsafe(method(frameClockFired:))]
+        fn frame_clock_fired(&self, link: &CADisplayLink) { self.frame(link); }
     }
 );
 
@@ -210,15 +212,96 @@ impl GameView {
         self.setHidden(true);
         self.hub().occluded.set(true);
     }
+    /// With a display link, presentation happens only inside its callback.
     pub(crate) fn refresh_ready(&self) -> bool {
+        let hub = self.hub();
+        hub.link.borrow().is_none() || hub.in_frame.get()
+    }
+    /// A display link caps the rate itself (`request_frame`); the timer
+    /// fallback spaces presentations by the refresh interval.
+    pub(crate) fn next_refresh(&self, paced: bool) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        if self.hub().link.borrow().is_some() {
+            return now;
+        }
+        now + refresh_interval(self.display_fps(), paced)
+    }
+    fn display_fps(&self) -> isize {
+        self.window()
+            .and_then(|window| window.screen())
+            .map_or(60, |screen| screen.maximumFramesPerSecond())
+    }
+    /// Starts the display-link frame clock where AppKit provides one (macOS
+    /// 14). It stays paused until `request_frame`; each callback publishes the
+    /// vsync grid for guest pacing and runs `on_frame` once.
+    pub(crate) fn start_frame_clock(&self, on_frame: Rc<dyn Fn()>) {
+        let hub = self.hub();
+        let available: bool =
+            unsafe { msg_send![self, respondsToSelector: sel!(displayLinkWithTarget:selector:)] };
+        if hub.link.borrow().is_some() || !available {
+            return;
+        }
+        let link = unsafe { self.displayLinkWithTarget_selector(self, sel!(frameClockFired:)) };
+        link.setPaused(true);
+        unsafe {
+            link.addToRunLoop_forMode(
+                &objc2_foundation::NSRunLoop::mainRunLoop(),
+                objc2_foundation::NSRunLoopCommonModes,
+            );
+        }
+        *hub.on_frame.borrow_mut() = Some(on_frame);
+        *hub.link.borrow_mut() = Some(link);
+    }
+    /// Invalidating the link releases its strong reference to this view.
+    pub(crate) fn stop_frame_clock(&self) {
+        let hub = self.hub();
+        if let Some(link) = hub.link.borrow_mut().take() {
+            link.invalidate();
+        }
+        hub.on_frame.borrow_mut().take();
+        hub.link_paced.set(None);
+        hub.vsync.clear();
+    }
+    /// Arms one display-link callback; false when the timer fallback is in use.
+    pub(crate) fn request_frame(&self, paced: bool) -> bool {
+        let hub = self.hub();
+        let Some(link) = hub.link.borrow().clone() else {
+            return false;
+        };
+        if hub.link_paced.replace(Some(paced)) != Some(paced) {
+            let maximum = if paced {
+                60.0
+            } else {
+                self.display_fps().max(60) as f32
+            };
+            link.setPreferredFrameRateRange(CAFrameRateRange {
+                minimum: 30.0,
+                maximum,
+                preferred: maximum,
+            });
+        }
+        link.setPaused(false);
         true
     }
-    pub(crate) fn next_refresh(&self, paced: bool) -> std::time::Instant {
-        let fps = self
-            .window()
-            .and_then(|window| window.screen())
-            .map_or(60, |screen| screen.maximumFramesPerSecond());
-        std::time::Instant::now() + refresh_interval(fps, paced)
+    fn frame(&self, link: &CADisplayLink) {
+        let hub = self.hub();
+        link.setPaused(true);
+        let period = link.duration();
+        if period > 0.0 {
+            let now = std::time::Instant::now();
+            let ago = (objc2_quartz_core::CACurrentMediaTime() - link.timestamp()).max(0.0);
+            let at = now.checked_sub(Duration::from_secs_f64(ago)).unwrap_or(now);
+            hub.vsync.publish(at, Duration::from_secs_f64(period));
+        }
+        let on_frame = hub.on_frame.borrow().clone();
+        if let Some(on_frame) = on_frame {
+            hub.in_frame.set(true);
+            on_frame();
+            hub.in_frame.set(false);
+        }
+    }
+    pub(crate) fn vsync(&self) -> Arc<adv_sync::vsync::Vsync> {
+        self.hub().vsync.clone()
     }
     pub fn new(width: u32, height: u32) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
