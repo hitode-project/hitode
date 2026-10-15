@@ -732,6 +732,7 @@ impl Gpu {
         stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
         stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
         stats.ring_busy = batch.ring_busy.load(Ordering::Relaxed);
+
         stats
     }
 
@@ -1021,36 +1022,13 @@ impl Gpu {
             self.stats.pipeline_cache_hits += 1;
             return Ok(pipeline.clone());
         }
-        let pipeline = self.context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("adv fixed pipeline"), layout: Some(&self.layout),
-            vertex: wgpu::VertexState { module: &self.shader, entry_point: Some("vertex_main"),
-                compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
-                })] },
-            primitive: wgpu::PrimitiveState {
-                topology: topology(key.topology),
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: match key.cull { Cull::None => None, Cull::Clockwise => Some(wgpu::Face::Back),
-                    Cull::CounterClockwise => Some(wgpu::Face::Front) },
-                ..Default::default()
-            },
-            depth_stencil: key.depth_format.map(|format| wgpu::DepthStencilState {
-                format: format.format(), depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
-                depth_compare: Some(key.depth.map_or(wgpu::CompareFunction::Always, compare)),
-                stencil: key.stencil.map(stencil_state).unwrap_or_default(), bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState { module: &self.shader, entry_point: Some("fragment_main"),
-                compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT, blend: key.color_blend.map(|color| wgpu::BlendState {
-                        color: blend(color), alpha: blend(key.alpha_blend.unwrap_or(color)) }),
-                    write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(key.color_write)),
-                })] }),
-            multiview_mask: None, cache: None,
-        });
-        self.check()?;
+        let pipeline = build_fixed(
+            &self.context,
+            &self.shader,
+            &self.layout,
+            self.programmable.disk.as_ref().map(|d| &d.cache),
+            key,
+        )?;
         // Submitted command buffers retain their own pipeline references. A
         // full cache can retire an entry immediately instead of waiting for a
         // capacity wake that could never occur. Hits leave FIFO order intact.
@@ -1942,3 +1920,43 @@ mod metal_interop;
 
 #[cfg(test)]
 mod pass_tests;
+
+fn build_fixed(
+    context: &NativeContext,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    driver: Option<&wgpu::PipelineCache>,
+    key: PipelineKey,
+) -> Result<wgpu::RenderPipeline, Error> {
+    let pipeline = context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("adv fixed pipeline"), layout: Some(layout),
+            vertex: wgpu::VertexState { module: shader, entry_point: Some("vertex_main"),
+                compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+                })] },
+            primitive: wgpu::PrimitiveState {
+                topology: topology(key.topology),
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: match key.cull { Cull::None => None, Cull::Clockwise => Some(wgpu::Face::Back),
+                    Cull::CounterClockwise => Some(wgpu::Face::Front) },
+                ..Default::default()
+            },
+            depth_stencil: key.depth_format.map(|format| wgpu::DepthStencilState {
+                format: format.format(), depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
+                depth_compare: Some(key.depth.map_or(wgpu::CompareFunction::Always, compare)),
+                stencil: key.stencil.map(stencil_state).unwrap_or_default(), bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some("fragment_main"),
+                compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT, blend: key.color_blend.map(|color| wgpu::BlendState {
+                        color: blend(color), alpha: blend(key.alpha_blend.unwrap_or(color)) }),
+                    write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(key.color_write)),
+                })] }),
+            multiview_mask: None, cache: driver,
+        });
+    context.check()?;
+    Ok(pipeline)
+}
