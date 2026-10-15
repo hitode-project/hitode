@@ -39,7 +39,9 @@ fn d3dx_texture_fronts_match_native() {
         let mut runtime =
             Runtime::with_cpu(&exe, &data, cpu::Cpu::new(backend).unwrap(), 32, 32).unwrap();
         runtime
-            .install_gpu(block_on(adv_device::gpu::Gpu::request(true)).unwrap())
+            .install_gpu(
+                block_on(adv_device::gpu::Gpu::request(!cfg!(target_os = "android"))).unwrap(),
+            )
             .unwrap();
         runtime.machine.sys.clock = Clock::virtual_time();
         assert!(
