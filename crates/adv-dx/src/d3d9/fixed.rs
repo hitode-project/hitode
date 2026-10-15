@@ -86,7 +86,7 @@ pub(super) struct Draw {
     pub vertices: Vec<Vertex>,
     pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
     pub state: DrawState,
-    pub programmable: Option<adv_device::gpu::ProgrammableDraw>,
+    pub programmable: Option<Box<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
     pub program_key: u128,
 }

@@ -581,8 +581,8 @@ fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {
 }
 fn fingerprint(f: &mut Fixture, d: fixed::Draw) -> u128 {
     let owner = id(f);
-    let e = env(f);
-    let p = key::prepare(&e, owner, Operation::Draw(d)).unwrap();
+    let mut e = env(f);
+    let p = key::prepare(&mut e, owner, Operation::Draw(d)).unwrap();
     hash((p.key, p.reads, p.writes))
 }
 
@@ -639,7 +639,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
     let mut d = draw(f);
     let mut state = d.state;
     state.texture_op = TextureOp::Texture;
-    d.programmable = Some(ProgrammableDraw {
+    d.programmable = Some(Box::new(ProgrammableDraw {
         program: Program::new(
             Arc::from("authored immutable program identity"),
             vec![false],
@@ -662,7 +662,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
             sampler: state.sampler,
         }],
         parameters: [[0; 4]; 40],
-    });
+    }));
     d.program_key = 1;
     d
 }
@@ -681,26 +681,37 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
     }
     changed!(|d: &mut fixed::Draw| d.recording_key = 1);
     changed!(|d: &mut fixed::Draw| d.program_key = 2);
+    let fixed = draw(&mut f);
+    let fixed_key = fingerprint(&mut f, fixed);
     for n in 0..10 {
-        changed!(|d: &mut fixed::Draw| {
-            let v = &mut d.vertices[0];
-            if n < 4 {
-                v.position[n] = f32::from_bits(v.position[n].to_bits() ^ 1)
-            } else if n < 8 {
-                v.color[n - 4] = -0.0
-            } else {
-                v.uv[n - 8] = -0.0
-            }
-        });
+        let mut d = draw(&mut f);
+        let v = &mut d.vertices[0];
+        if n < 4 {
+            v.position[n] = f32::from_bits(v.position[n].to_bits() ^ 1);
+        } else if n < 8 {
+            v.color[n - 4] = -0.;
+        } else {
+            v.uv[n - 8] = -0.;
+        }
+        assert_ne!(fingerprint(&mut f, d), fixed_key);
     }
-    changed!(|d: &mut fixed::Draw| d.texcoords = Some((1, vec![[0.; 4]; 3])));
+    let mut d = draw(&mut f);
+    d.texcoords = Some((1, vec![[0.; 4]; 3]));
+    assert_ne!(fingerprint(&mut f, d), fixed_key);
+    let mut d = programmable_draw(&mut f);
+    d.vertices[0].color[0] = 0.75;
+    assert_eq!(
+        fingerprint(&mut f, d),
+        original,
+        "programmable execution reads its raw streams"
+    );
     let extra = {
-        let mut d = programmable_draw(&mut f);
+        let mut d = draw(&mut f);
         d.texcoords = Some((1, vec![[0.; 4]; 3]));
         fingerprint(&mut f, d)
     };
     for n in 0..4 {
-        let mut d = programmable_draw(&mut f);
+        let mut d = draw(&mut f);
         let mut v = vec![[0.; 4]; 3];
         v[0][n] = -0.0;
         d.texcoords = Some((1, v));
@@ -935,6 +946,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {
             d.texture = Some(resource);
+            d.versions[12] += 1;
         }
         clear(&mut f, 0xff000000);
         let mut d = draw(&mut f);
@@ -948,6 +960,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
     {
         d.texture = None;
+        d.versions[12] += 1;
     }
     let locked = f.lock(source, 0, 0);
     f.m.cpu.write(locked.pBits, &vec![64; 16 * 12 * 4]).unwrap();

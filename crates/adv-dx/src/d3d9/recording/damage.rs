@@ -256,7 +256,7 @@ pub(super) struct Analysis {
     epoch: u64,
 }
 impl Analysis {
-    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &HashMap<Content, u128>) {
+    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &Contents) {
         let Some(image) = image(&p.operation) else {
             return;
         };
@@ -274,11 +274,7 @@ impl Analysis {
             // Preserve destination dependencies for accumulating blends/partial writes.
             let key = hash((
                 command,
-                (!overwrite && !s.independent).then(|| {
-                    #[cfg(feature = "d3d9-counters")]
-                    lookup(1);
-                    contents.get(&k).copied().unwrap_or(0)
-                }),
+                (!overwrite && !s.independent).then(|| contents.get(&k).copied().unwrap_or(0)),
             ));
             s.entries.push((key, p.bounds));
         }

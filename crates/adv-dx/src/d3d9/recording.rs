@@ -43,6 +43,74 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Content(Id, u32, u8, u32);
+#[derive(Default)]
+struct Contents {
+    indices: HashMap<Content, usize>,
+    slots: Vec<(Content, Option<u128>, Option<u128>)>,
+    touched: Vec<usize>,
+    vacant: Vec<usize>,
+}
+impl Contents {
+    fn resolve(&mut self, key: Content) -> usize {
+        #[cfg(feature = "d3d9-counters")]
+        lookup(1);
+        *self.indices.entry(key).or_insert_with(|| {
+            if let Some(n) = self.vacant.pop() {
+                self.slots[n] = (key, None, None);
+                n
+            } else {
+                self.slots.push((key, None, None));
+                self.slots.len() - 1
+            }
+        })
+    }
+    fn get(&self, key: &Content) -> Option<&u128> {
+        #[cfg(feature = "d3d9-counters")]
+        lookup(1);
+        self.slots.get(*self.indices.get(key)?)?.1.as_ref()
+    }
+    fn had_base(&self, key: &Content) -> bool {
+        self.indices
+            .get(key)
+            .is_some_and(|&n| self.slots[n].2.is_some())
+    }
+    fn restore(&mut self, key: Content, value: Option<u128>, had_base: bool) {
+        let n = self.resolve(key);
+        self.slots[n].1 = value;
+        if !had_base {
+            self.slots[n].2 = None;
+        }
+    }
+    fn unchanged(&self) -> bool {
+        self.touched.iter().all(|&n| {
+            self.slots[n]
+                .2
+                .is_none_or(|base| self.slots[n].1 == Some(base))
+        })
+    }
+    fn reset(&mut self) {
+        for n in self.touched.drain(..) {
+            self.slots[n].2 = None;
+        }
+    }
+    fn forget(&mut self, pointer: u32) -> bool {
+        let before = self.indices.len();
+        self.indices.retain(|k, &mut n| {
+            if k.3 != pointer {
+                return true;
+            }
+            self.slots[n].1 = None;
+            self.slots[n].2 = None;
+            self.vacant.push(n);
+            false
+        });
+        self.indices.len() != before
+    }
+    #[cfg(test)]
+    fn keys(&self) -> impl Iterator<Item = &Content> {
+        self.slots.iter().filter(|s| s.1.is_some()).map(|s| &s.0)
+    }
+}
 #[derive(Clone, Copy)]
 pub(super) enum Reason {
     Present,
@@ -113,8 +181,8 @@ pub(super) struct Recording {
     head: usize,
     bytes: usize,
     key: u128,
-    contents: HashMap<Content, u128>,
-    base: HashMap<Content, u128>,
+    contents: Contents,
+    binding_cache: Option<key::Bindings>,
     upload: u128,
     active: Option<u64>,
     next: u64,
@@ -137,10 +205,10 @@ pub(super) fn admits_leaf(env: &Env<'_>, pointer: u32, bytes: usize) -> bool {
 pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;
-        let before = f.contents.len();
-        f.contents.retain(|k, _| k.3 != pointer);
+        let changed = f.contents.forget(pointer);
+        f.binding_cache = None;
         f.damage.forget(pointer);
-        if f.contents.len() != before {
+        if changed {
             f.partial = true;
             f.last = None;
         }
@@ -320,33 +388,32 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
         return Outcome::Return(0);
     }
     let f = frame(env, owner);
-    #[cfg(feature = "d3d9-counters")]
-    lookup(
-        p.reads.len() as u64
-            + p.writes.len() as u64 * 3
-            + if limit { p.writes.len() as u64 * 2 } else { 0 },
-    );
     let previous = limit.then(|| {
         (
             f.key,
             p.bytes,
             p.writes
                 .iter()
-                .map(|(k, _)| (*k, f.contents.get(k).copied(), f.base.contains_key(k)))
+                .map(|(k, _)| (*k, f.contents.get(k).copied(), f.contents.had_base(k)))
                 .collect::<Vec<_>>(),
         )
     });
-    let command = hash((
-        p.key,
-        p.reads
-            .iter()
-            .map(|k| (*k, f.contents.get(k).copied().unwrap_or(0)))
-            .collect::<Vec<_>>(),
-    ));
+    use std::hash::Hash;
+    let mut command = xxhash_rust::xxh3::Xxh3::new();
+    p.key.hash(&mut command);
+    p.reads.len().hash(&mut command);
+    for k in &p.reads {
+        (*k, f.contents.get(k).copied().unwrap_or(0)).hash(&mut command);
+    }
+    let command = command.digest128();
     f.damage.record(&p, command, &f.contents);
     for (k, overwrite) in p.writes {
-        let old = f.contents.get(&k).copied().unwrap_or(0);
-        f.base.entry(k).or_insert(old);
+        let slot = f.contents.resolve(k);
+        let old = f.contents.slots[slot].1.unwrap_or(0);
+        if f.contents.slots[slot].2.is_none() {
+            f.contents.slots[slot].2 = Some(old);
+            f.contents.touched.push(slot);
+        }
         let next = if matches!(p.operation, Operation::Upload { .. }) {
             f.upload = f.upload.checked_add(1).expect("upload content exhausted");
             f.upload
@@ -355,7 +422,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
         } else {
             hash((old, command))
         };
-        f.contents.insert(k, next);
+        f.contents.slots[slot].1 = Some(next);
     }
     if limit
         && let Operation::Upload {
@@ -367,7 +434,15 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     f.key = hash((f.key, command));
     #[cfg(feature = "d3d9-counters")]
     let work = matches!(p.operation, Operation::Draw(_)).then_some((
-        (p.bytes + std::mem::size_of::<Operation>()) as u64,
+        (p.bytes
+            + std::mem::size_of::<Operation>()
+            + match &p.operation {
+                Operation::Draw(d) => d
+                    .programmable
+                    .as_ref()
+                    .map_or(0, |p| std::mem::size_of_val(p.as_ref())),
+                _ => 0,
+            }) as u64,
         p.lookups + lookups() - before,
     ));
     #[cfg(feature = "d3d9-counters")]
@@ -396,14 +471,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
             f.bytes -= bytes;
             f.key = key;
             for (k, old, had_base) in contents {
-                if let Some(old) = old {
-                    f.contents.insert(k, old);
-                } else {
-                    f.contents.remove(&k);
-                }
-                if !had_base {
-                    f.base.remove(&k);
-                }
+                f.contents.restore(k, old, had_base);
             }
             env.ext.get_mut::<State>().frames.recorded_commands -= 1;
             #[cfg(feature = "d3d9-counters")]
@@ -624,7 +692,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             && f.last == Some(presentation)
             && f.last_serial.is_some()
             && f.last_serial == serial
-            && f.base.iter().all(|(k, v)| f.contents.get(k) == Some(v))
+            && f.contents.unchanged()
     });
     if repeat && !verify {
         let provider = env.ext.get::<State>().provider;
@@ -697,7 +765,7 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.verify_region = None;
     f.last = Some(presentation);
     f.last_serial = serial;
-    f.base.clear();
+    f.contents.reset();
     f.key = 0;
     f.partial = false;
     f.verdict = None;
