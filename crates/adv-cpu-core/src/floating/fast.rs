@@ -508,6 +508,10 @@ pub fn execute(
     state: &mut CpuState,
     memory: &mut Memory,
 ) -> Option<u32> {
+    // Classified for a64 only; shared callers keep the path they had before.
+    if matches!(fast, Fast::Round | Fast::Scale | Fast::Examine) {
+        return execute_other(op, state, memory);
+    }
     let i = &op.instruction;
     let x87 = &state.x87;
     if x87.status & 0x80 != 0 || state.mmx_mode != 0 {
@@ -529,7 +533,7 @@ pub fn execute(
     match fast {
         // ES and deferred MMX were checked above. WAIT changes neither C1 nor
         // the last x87 instruction/data metadata, regardless of the control word.
-        Fast::Round | Fast::Scale | Fast::Examine => return None,
+        Fast::Round | Fast::Scale | Fast::Examine => unreachable!(),
         Fast::Wait => metadata = false,
         Fast::Load(source) => {
             let (value, at) = raw::source(source, i, state, memory)?;
