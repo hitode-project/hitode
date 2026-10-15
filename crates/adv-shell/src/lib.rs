@@ -717,7 +717,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             diagnostics.shaders.malformed,
             diagnostics.shaders.untranslated
         );
-        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits));
+        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{},\"metal_draws\":{},\"backend_switches\":{},\"ring_bytes\":{},\"ring_busy\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits,g.metal_draws,g.backend_switches,g.ring_bytes,g.ring_busy));
         format!(
             "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"shader_versions\":{}}}",
             diagnostics.live_interfaces,
@@ -2232,6 +2232,13 @@ fn run_execution(
         stats.interpreter_entries,
         idle_waits
     );
+    #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
+    if let Some(gpu) = runtime.gpu_diagnostics().gpu {
+        println!(
+            "GPU Metal: draws={} backend_switches={} ring_bytes={} ring_busy={}",
+            gpu.metal_draws, gpu.backend_switches, gpu.ring_bytes, gpu.ring_busy
+        );
+    }
     let exit_code = if let Some(error) = failure {
         eprintln!("{error}");
         1

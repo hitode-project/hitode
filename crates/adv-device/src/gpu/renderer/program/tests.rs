@@ -1,7 +1,13 @@
 use super::*;
 
 fn gpu() -> Gpu {
-    pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap()
+    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    // These tests inspect the wgpu batching and binding caches directly.
+    #[cfg(target_vendor = "apple")]
+    {
+        gpu.context.pending.lock().unwrap().metal = None;
+    }
+    gpu
 }
 fn read(gpu: &mut Gpu, target: &Target) -> Vec<u8> {
     let mut ticket = gpu.readback(&target.image, None).unwrap();

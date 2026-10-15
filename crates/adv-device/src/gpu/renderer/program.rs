@@ -1,11 +1,11 @@
 use super::*;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct Key {
-    program: u64,
-    textures: Vec<bool>,
-    streams: Vec<(u32, Vec<Attribute>)>,
-    raster: PipelineKey,
+pub(super) struct Key {
+    pub(super) program: u64,
+    pub(super) textures: Vec<bool>,
+    pub(super) streams: Vec<(u32, Vec<Attribute>)>,
+    pub(super) raster: PipelineKey,
 }
 #[derive(Clone)]
 struct Pipeline {
@@ -30,6 +30,10 @@ pub(super) const UNIFORM_SLOTS: u64 = 32;
 
 #[derive(Default)]
 pub(super) struct BatchStats {
+    pub(super) metal_draws: AtomicU64,
+    pub(super) backend_switches: AtomicU64,
+    pub(super) ring_bytes: AtomicU64,
+    pub(super) ring_busy: AtomicU64,
     pub(super) submissions: AtomicU64,
     pub(super) buffer_writes: AtomicU64,
     pub(super) last_flush_buffer_writes: AtomicU64,
@@ -63,11 +67,13 @@ impl Upload {
 // until the shared batch flushes, including across fixed/programmed pass changes.
 #[derive(Default)]
 pub(super) struct Pending {
+    #[cfg(target_vendor = "apple")]
+    pub(super) metal: Option<metal::State>,
     // Drop the pass before its encoder, including during producer teardown.
     pub(super) pass: Option<wgpu::RenderPass<'static>>,
     attachments: Option<(wgpu::TextureView, Option<wgpu::TextureView>)>,
     encoder: Option<wgpu::CommandEncoder>,
-    owner: Option<Arc<BatchStats>>,
+    pub(super) owner: Option<Arc<BatchStats>>,
     draws: u64,
     uniforms: Upload,
     pub(super) vertices: Upload,
@@ -75,7 +81,16 @@ pub(super) struct Pending {
     last_constants: std::ops::Range<usize>,
 }
 impl Pending {
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn flush_metal(&mut self) {
+        if let Some(metal) = &mut self.metal {
+            metal.flush();
+            metal.select_wgpu();
+        }
+    }
     pub(super) fn flush(&mut self, queue: &wgpu::Queue) {
+        #[cfg(target_vendor = "apple")]
+        self.flush_metal();
         self.pass = None;
         self.attachments = None;
         if let Some(encoder) = self.encoder.take() {
@@ -345,19 +360,6 @@ impl Gpu {
         }
         validate_program(program)?;
         let device = &self.context.device;
-        let limits = device.limits();
-        if key.streams.len() > limits.max_vertex_buffers as usize
-            || key.streams.iter().map(|s| s.1.len()).sum::<usize>()
-                > limits.max_vertex_attributes as usize
-            || key.textures.iter().filter(|v| **v).count()
-                > limits.max_sampled_textures_per_shader_stage as usize
-            || key.textures.iter().filter(|v| !**v).count()
-                > limits.max_sampled_textures_per_shader_stage as usize
-        {
-            return Err(Error::Unavailable(
-                "programmable draw exceeds adapter input limits".into(),
-            ));
-        }
         let buffer_entry = |binding, size, visibility| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -539,7 +541,7 @@ impl Gpu {
         state: &DrawState,
     ) -> Result<(), Error> {
         let context = self.context.clone();
-        let _submission = context.submission()?;
+        let _submission = context.enter_submission()?;
         self.own_target(target)?;
         target.image.writable()?;
         let count = draw
@@ -654,19 +656,29 @@ impl Gpu {
             b.source = f(b.source);
             b.destination = f(b.destination);
         }
-        let pipeline = self.program_pipeline(
-            Key {
-                program: draw.program.id,
-                textures: draw.program.textures.clone(),
-                streams: draw
-                    .streams
-                    .iter()
-                    .map(|s| (s.stride, s.attributes.clone()))
-                    .collect(),
-                raster,
-            },
-            &draw.program,
-        )?;
+        let key = Key {
+            program: draw.program.id,
+            textures: draw.program.textures.clone(),
+            streams: draw
+                .streams
+                .iter()
+                .map(|s| (s.stride, s.attributes.clone()))
+                .collect(),
+            raster,
+        };
+        let limits = self.context.device.limits();
+        if key.streams.len() > limits.max_vertex_buffers as usize
+            || key.streams.iter().map(|s| s.1.len()).sum::<usize>()
+                > limits.max_vertex_attributes as usize
+            || key.textures.iter().filter(|v| **v).count()
+                > limits.max_sampled_textures_per_shader_stage as usize
+            || key.textures.iter().filter(|v| !**v).count()
+                > limits.max_sampled_textures_per_shader_stage as usize
+        {
+            return Err(Error::Unavailable(
+                "programmable draw exceeds adapter input limits".into(),
+            ));
+        }
         let index_size = draw
             .indices
             .as_ref()
@@ -675,9 +687,17 @@ impl Gpu {
             return Err(invalid("index upload exceeds command limit"));
         }
         if state.scissor.is_some_and(Rect::empty) {
+            self.program_pipeline(key, &draw.program)?;
             return Ok(());
         }
         let mut pending = context.pending.lock().unwrap();
+        #[cfg(target_vendor = "apple")]
+        if let Some(mut metal) = pending.metal.take() {
+            let result = metal.draw(self, &mut pending, target, draw, state, &key);
+            pending.metal = Some(metal);
+            return result;
+        }
+        let pipeline = self.program_pipeline(key, &draw.program)?;
         let immediate = self.prepare_batch(&mut pending, total, index_size);
         let attachment = self.begin_batch_pass(&mut pending, target)?;
         let base = pending.constants(

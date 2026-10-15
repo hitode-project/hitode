@@ -48,6 +48,12 @@ impl Gate {
     pub(super) fn wait_for_frame(&self) {
         self.frame_waiter.store(true, Ordering::Release);
     }
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn notify_execution(&self) {
+        if let Some(wake) = self.execution.get() {
+            wake.signal();
+        }
+    }
     pub(super) fn frame_available(&self) {
         if self.frame_waiter.swap(false, Ordering::AcqRel)
             && let Some(wake) = self.execution.get()

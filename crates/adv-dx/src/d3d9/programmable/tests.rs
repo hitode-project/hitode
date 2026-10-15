@@ -1,5 +1,9 @@
 use super::*;
 use adv_device::gpu::*;
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/metal_compare.rs"
+));
 
 fn vertex() -> Shader {
     Shader::parse(&[
@@ -191,6 +195,8 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         let mut read = gpu.readback(&target.image, None).unwrap();
         read.take_completion_job().unwrap()();
         let pixels = read.poll().unwrap().unwrap();
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        emit_metal_pixels(&pixels);
         let got = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
         let want =
             [expected[2], expected[1], expected[0], expected[3]].map(|x| (x * 255.).round() as u8);
@@ -222,4 +228,13 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         }
         std::fs::remove_dir(dir).unwrap();
     }
+}
+
+// spec: GFX-METAL-1
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+#[test]
+fn declaration_fixtures_match_native_metal_and_wgpu_exactly() {
+    compare_metal_fixture(
+        "every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults",
+    );
 }

@@ -6,6 +6,9 @@ use std::sync::{
 
 use super::*;
 mod attachments;
+#[cfg(target_vendor = "apple")]
+#[path = "metal/mod.rs"]
+mod metal;
 mod pipeline_disk;
 mod program;
 pub use program::validate_program;
@@ -81,6 +84,12 @@ impl NativeContext {
         }
     }
     pub fn submission(&self) -> Result<Submission<'_>, Error> {
+        let submission = self.enter_submission()?;
+        #[cfg(target_vendor = "apple")]
+        self.pending.lock().unwrap().flush_metal();
+        Ok(submission)
+    }
+    fn enter_submission(&self) -> Result<Submission<'_>, Error> {
         self.check()?;
         Ok(Submission {
             context: self,
@@ -146,6 +155,8 @@ pub struct Image {
     view: wgpu::TextureView,
     render_view: wgpu::TextureView,
     view_life: Arc<()>,
+    #[cfg(target_vendor = "apple")]
+    metal: metal::ImageState,
     mip: u32,
     levels: u32,
     width: u32,
@@ -188,6 +199,10 @@ impl Image {
         image.render_view = view.clone();
         image.view = view;
         image.view_life = Arc::new(());
+        #[cfg(target_vendor = "apple")]
+        {
+            image.metal.view = Default::default();
+        }
         image.mip = mip;
         image.levels = 1;
         image.width = (self.width >> level).max(1);
@@ -495,6 +510,13 @@ impl Gpu {
             pending: Arc::new(Mutex::new(program::Pending::default())),
             _software: software.clone(),
         };
+        #[cfg(target_vendor = "apple")]
+        if cfg!(target_arch = "aarch64")
+            && std::env::var("ADV_GPU_BACKEND").as_deref() != Ok("wgpu")
+            && context.adapter.get_info().backend == wgpu::Backend::Metal
+        {
+            context.pending.lock().unwrap().metal = Some(metal::State::new(&context)?);
+        }
         let error_scope = context
             .device
             .push_error_scope(wgpu::ErrorFilter::Validation);
@@ -679,6 +701,10 @@ impl Gpu {
         stats.submissions += batch.submissions.load(Ordering::Relaxed);
         stats.buffer_writes = batch.buffer_writes.load(Ordering::Relaxed);
         stats.last_flush_buffer_writes = batch.last_flush_buffer_writes.load(Ordering::Relaxed);
+        stats.metal_draws = batch.metal_draws.load(Ordering::Relaxed);
+        stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
+        stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
+        stats.ring_busy = batch.ring_busy.load(Ordering::Relaxed);
         stats
     }
 
@@ -766,6 +792,8 @@ impl Gpu {
             view,
             render_view,
             view_life: Arc::new(()),
+            #[cfg(target_vendor = "apple")]
+            metal: metal::ImageState::default(),
             mip: 0,
             levels,
             width,
@@ -1882,3 +1910,7 @@ mod cache_tests {
         assert_eq!(latest.poll().unwrap().unwrap(), [0, 255, 0, 255].repeat(4));
     }
 }
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "metal/interop.rs"]
+mod metal_interop;

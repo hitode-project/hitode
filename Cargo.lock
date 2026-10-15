@@ -92,12 +92,17 @@ name = "adv-device"
 version = "0.1.0"
 dependencies = [
  "adv-sync",
+ "block2",
  "bytemuck",
  "cpal",
  "encoding_rs",
  "ffmpeg-next",
  "fontdb",
  "log",
+ "naga-types",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
  "ogg",
  "png 0.17.16",
  "pollster",

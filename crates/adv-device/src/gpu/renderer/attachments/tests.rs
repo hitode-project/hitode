@@ -230,6 +230,11 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
         target_os = "android"
     ))))
     .unwrap();
+    // This fixture asserts wgpu upload and bind-group counts.
+    #[cfg(target_vendor = "apple")]
+    {
+        gpu.context.pending.lock().unwrap().metal = None;
+    }
     let target = gpu.target(64, 1, false).unwrap();
     gpu.clear(&target, Some([0.; 4]), None).unwrap();
     let before = gpu.stats().submissions;

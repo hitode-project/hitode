@@ -25,6 +25,8 @@ impl DepthFormat {
 pub struct Depth(std::sync::Arc<DepthImage>);
 struct DepthImage {
     _texture: wgpu::Texture,
+    #[cfg(target_vendor = "apple")]
+    metal_initialized: std::sync::atomic::AtomicBool,
     view: wgpu::TextureView,
     context: u64,
     width: u32,
@@ -42,12 +44,22 @@ impl Depth {
     ) -> Self {
         Self(std::sync::Arc::new(DepthImage {
             _texture: texture,
+            #[cfg(target_vendor = "apple")]
+            metal_initialized: std::sync::atomic::AtomicBool::new(false),
             view,
             context,
             width,
             height,
             format,
         }))
+    }
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn metal_initialized(&self) -> &std::sync::atomic::AtomicBool {
+        &self.0.metal_initialized
+    }
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn texture(&self) -> &wgpu::Texture {
+        &self.0._texture
     }
     pub(super) fn context(&self) -> u64 {
         self.0.context

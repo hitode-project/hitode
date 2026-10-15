@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "dep:naga-types"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -59,5 +59,11 @@ workspace = true
 name = "gpu"
 required-features = ["gpu"]
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["metal"] }
+
+objc2 = { version = "0.6.4", optional = true }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSString", "NSRange"] }
+block2 = { version = "0.6.2", optional = true }
+naga-types = { version = "=30.0.1", optional = true }
