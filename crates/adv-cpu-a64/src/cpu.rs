@@ -260,6 +260,17 @@ impl Guest for View<'_> {
             read_alias,
         })
     }
+    fn map_shared_counters(
+        &mut self,
+        addr: u32,
+        len: u32,
+    ) -> Result<Rc<dyn adv_cpu_core::backend::CounterStorage>, MemFault> {
+        let storage = self
+            .memory
+            .map_shared_audio(addr, len as usize)
+            .map_err(|_| fault(addr, len as usize))?;
+        Ok(Rc::new(storage))
+    }
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
         let len32 = u32::try_from(len).map_err(|_| fault(src, len))?;
         if !self.accessible(src, len32, Prot::READ) {
@@ -348,6 +359,8 @@ impl Guest for Cpu {
             copy_on_write: bool
         ) -> Result<(), MemFault>;
         fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<SharedRegion, MemFault>;
+        fn map_shared_counters(&mut self, addr: u32, len: u32)
+            -> Result<Rc<dyn adv_cpu_core::backend::CounterStorage>, MemFault>;
         fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault>;
         fn push_f64(&mut self, value: f64) -> ();
         fn pop_f64(&mut self) -> Option<f64>;

@@ -217,12 +217,12 @@ fn leaf_counts_reach_host_services_and_frame_budget_without_timing() {
     machine
         .sys
         .stats
-        .write_host_csv(&machine.sys.thunks, &mut csv)
+        .write_host_csv(&machine.cpu, &machine.sys.thunks, &mut csv)
         .unwrap();
     assert!(
         String::from_utf8(csv)
             .unwrap()
-            .contains(&format!("\"fixture.dll\",\"leaf\",{},0,0", leaves + 1))
+            .contains("\"fixture.dll\",\"leaf\",1,0,0")
     );
     // Close the API row through the usual frame accounting boundary.
     let budget = machine.sys.stats.frame_budget.as_mut().unwrap();
@@ -298,7 +298,7 @@ fn env_leaf_declines_restore_transport_and_count_each_call_once() {
         light
             .sys
             .stats
-            .write_host_csv(&light.sys.thunks, &mut csv)
+            .write_host_csv(&light.cpu, &light.sys.thunks, &mut csv)
             .unwrap();
         let csv = String::from_utf8(csv).unwrap();
         assert!(csv.ends_with(&format!(

@@ -36,6 +36,13 @@ pub use file_page::FilePage;
 pub mod x87;
 pub use adv_sync::shared::{SharedReadView, SharedRegion};
 
+/// Execution-owner-only byte-atomic storage for guest COM reference words.
+/// The Rc returned by Guest prevents transfer to device callbacks.
+pub trait CounterStorage {
+    fn load(&self, offset: usize) -> u32;
+    fn store(&self, offset: usize, value: u32);
+}
+
 /// Guest general-purpose registers plus EIP/EFLAGS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Reg {
@@ -226,6 +233,13 @@ pub trait Guest {
     /// read-only alias. Unsupported backends reject this explicitly. Guest
     /// protection/unmapping never invalidates the returned read view.
     fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<SharedRegion, MemFault> {
+        Err(MemFault { addr, len })
+    }
+    fn map_shared_counters(
+        &mut self,
+        addr: u32,
+        len: u32,
+    ) -> Result<std::rc::Rc<dyn CounterStorage>, MemFault> {
         Err(MemFault { addr, len })
     }
     /// Alias worker-confined file data pages. COPY views share reads until the

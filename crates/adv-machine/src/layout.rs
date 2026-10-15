@@ -22,6 +22,9 @@ pub const THUNK_SIZE: u32 = THUNK_STRIDE * THUNK_CAP;
 /// Native-semantics guest implementations that thunks jump to.
 pub const GUEST_CODE_BASE: u32 = THUNK_BASE + THUNK_SIZE;
 pub const GUEST_CODE_SIZE: u32 = 0x4_0000;
+/// Writable guest probe counters, separate from executable bodies.
+pub const GUEST_COUNTS_BASE: u32 = GUEST_CODE_BASE + GUEST_CODE_SIZE;
+pub const GUEST_COUNTS_SIZE: u32 = 0x4_0000;
 
 /// Where a parked guest's EIP points. Mapped, never executed.
 pub const PARK_ADDR: u32 = 0x7e10_0000;
@@ -75,6 +78,8 @@ pub mod teb {
     pub const LAST_ERROR: u32 = 0x34;
     pub const TLS_SLOTS: u32 = 0xe10;
     pub const TLS_SLOT_COUNT: u32 = 64;
+    /// Synthetic private extension after modeled Windows fields.
+    pub const AUDIO_GUEST: u32 = 0xffc;
 }
 
 /// PEB field offsets (x86).

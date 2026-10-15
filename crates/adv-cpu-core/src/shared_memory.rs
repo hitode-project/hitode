@@ -9,6 +9,15 @@ pub struct SharedAllocation {
     len: usize,
 }
 
+impl crate::backend::CounterStorage for Arc<SharedAllocation> {
+    fn load(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(std::array::from_fn(|i| self.load_u8(offset + i)))
+    }
+    fn store(&self, offset: usize, value: u32) {
+        self.store_bytes(offset, &value.to_le_bytes());
+    }
+}
+
 // SAFETY: mapping ownership and addresses are immutable. Every exposed data
 // access is a byte-width atomic. No ordinary shared Rust slice is produced.
 unsafe impl Send for SharedAllocation {}

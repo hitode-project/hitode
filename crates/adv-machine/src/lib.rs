@@ -15,6 +15,7 @@ mod env_leaf;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
+mod guest_words;
 mod invocation;
 pub mod layout;
 mod leaf;
@@ -46,6 +47,7 @@ use adv_cpu::backend::{
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
 pub use env_leaf::EnvLeafHandler;
 pub use ext::Ext;
+pub use guest_words::{GuestWord, GuestWordPool};
 use layout::*;
 pub use leaf::{LeafEnv, LeafHandler};
 pub use objects::{Identity, Namespace, ObjectLimits};
@@ -87,6 +89,7 @@ pub struct Sys {
     pub objects: Objects,
     pub vm: Vm,
     pub contexts: Vec<Context>,
+    pub guest_words: GuestWordPool,
     /// The context currently running (or last run).
     pub current: CtxId,
     /// Presentation sequence for diagnostics, advanced by the graphics front.
@@ -318,9 +321,15 @@ impl Sys {
             }
         };
 
+        let audio_guest = self.guest_words.allocate(cpu, &mut self.vm);
+        cpu.write_u32(
+            teb + teb::AUDIO_GUEST,
+            audio_guest.as_ref().map_or(0, |word| word.address),
+        )?;
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
             audio_call_us: None,
+            audio_guest,
             suspend_count: 0,
             completion: std::sync::Arc::new(process::Completion::default()),
             id,
@@ -552,12 +561,13 @@ impl Sys {
             .collect()
     }
 
-    /// Whether this thread called audio strictly after a guest-clock timestamp.
+    /// Audio after a timestamp, or a guest reference marker protecting the
+    /// context conservatively for its lifetime.
     pub fn audio_called_after(&self, id: CtxId, since_us: u64) -> bool {
-        self.contexts
-            .get(id as usize)
-            .and_then(|c| c.audio_call_us)
-            .is_some_and(|at| at > since_us)
+        self.contexts.get(id as usize).is_some_and(|c| {
+            c.audio_call_us.is_some_and(|at| at > since_us)
+                || c.audio_guest.as_ref().is_some_and(|word| word.load() != 0)
+        })
     }
 
     pub fn context(&self, id: CtxId) -> &Context {
@@ -1691,6 +1701,7 @@ impl<B: Backend> Machine<B> {
         );
         cpu.map(THUNK_BASE, THUNK_SIZE, Prot::RX)?;
         cpu.map(GUEST_CODE_BASE, GUEST_CODE_SIZE, Prot::RX)?;
+        cpu.map(GUEST_COUNTS_BASE, GUEST_COUNTS_SIZE, Prot::RW)?;
         let mut pad = Asm::new(thunk_addr(thunk::RETURN_PAD));
         pad.trap().hlt();
         cpu.write(thunk_addr(thunk::RETURN_PAD), &pad.bytes)?;
@@ -1716,6 +1727,7 @@ impl<B: Backend> Machine<B> {
             objects: Objects::default(),
             vm,
             contexts: Vec::new(),
+            guest_words: GuestWordPool::default(),
             current: 0,
             frame: 0,
             completed_frames: 0,
@@ -2223,6 +2235,16 @@ impl<B: Backend> Machine<B> {
         started: Instant,
         hard_budget: Option<Duration>,
     ) -> SliceResult {
+        let count_guest = self.sys.stats.enabled
+            || self.sys.stats.services_enabled
+            || self.sys.stats.frame_budget.is_some();
+        if let Err(error) = self
+            .sys
+            .thunks
+            .set_guest_counting(&mut self.cpu, count_guest)
+        {
+            return SliceResult::Complete(self.fail(error.to_string()));
+        }
         self.sys.clock.begin_work();
         // Only a sliced host driver can service external channels on a soft
         // return. The synchronous run() API retains its run-until-blocked contract.

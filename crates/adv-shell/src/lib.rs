@@ -814,7 +814,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             .machine
             .sys
             .stats
-            .write_host_csv(&runtime.machine.sys.thunks, &mut csv)
+            .write_host_csv(&runtime.machine.cpu, &runtime.machine.sys.thunks, &mut csv)
             .unwrap();
         json(std::str::from_utf8(&csv).unwrap())
     } else {
@@ -2211,7 +2211,7 @@ fn run_execution(
             .machine
             .sys
             .stats
-            .write_host_csv(&runtime.machine.sys.thunks, &mut file)
+            .write_host_csv(&runtime.machine.cpu, &runtime.machine.sys.thunks, &mut file)
             .map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }

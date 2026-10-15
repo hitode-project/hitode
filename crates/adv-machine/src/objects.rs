@@ -142,6 +142,9 @@ impl Default for Objects {
 }
 
 impl Objects {
+    pub fn reference_limit(&self) -> u32 {
+        self.limits.references
+    }
     pub fn with_limits(limits: ObjectLimits) -> Self {
         let table = NEXT_TABLE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

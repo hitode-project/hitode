@@ -116,6 +116,9 @@ pub struct Stats {
 impl Stats {
     pub(crate) fn leaf(&mut self, thunk: u32, thunks: &ThunkTable) {
         self.leaf_calls += 1;
+        if !(self.enabled || self.services_enabled || self.frame_budget.is_some()) {
+            return;
+        }
         self.note_leaf(thunk, false);
         if let Some(budget) = &mut self.frame_budget {
             budget.leaf(thunk, thunks, false);
@@ -138,6 +141,9 @@ impl Stats {
         }
     }
     pub(crate) fn leaf_abandon(&mut self, thunk: u32, thunks: &ThunkTable) {
+        if !(self.enabled || self.services_enabled || self.frame_budget.is_some()) {
+            return;
+        }
         self.note_leaf(thunk, true);
         if let Some(budget) = &mut self.frame_budget {
             budget.leaf(thunk, thunks, true);
@@ -328,22 +334,37 @@ impl Stats {
 
     /// Host service time only: excludes guest callbacks/waits and native worker
     /// execution. Opt-in timing perturbs the run; never report it as CPU usage.
-    pub fn write_host_csv(&self, thunks: &ThunkTable, writer: &mut dyn Write) -> io::Result<()> {
+    pub fn write_host_csv(
+        &self,
+        cpu: &dyn adv_cpu::backend::Guest,
+        thunks: &ThunkTable,
+        writer: &mut dyn Write,
+    ) -> io::Result<()> {
         writeln!(
             writer,
-            "module,function,calls,total_ns,max_ns,leaf_calls,leaf_abandons"
+            "module,function,calls,total_ns,max_ns,leaf_calls,leaf_abandons,guest_calls,ordinary_calls,guest_fraction,leaf_fraction"
         )?;
-        for (i, &(ns, calls, max)) in self.per_thunk.iter().enumerate() {
-            if calls == 0 {
+        for (i, thunk) in thunks.iter() {
+            let (ns, calls, max) = self.per_thunk.get(i as usize).copied().unwrap_or_default();
+            let (leaves, abandons) = self
+                .leaf_counts
+                .get(i as usize)
+                .copied()
+                .unwrap_or_default();
+            let [entries, own, linked] = thunks.guest_counts(cpu, i);
+            let guest = entries.saturating_sub(own + linked);
+            let ordinary = calls.saturating_sub(leaves) + linked;
+            let total = (guest + ordinary + leaves).max(1) as f64;
+            if guest + ordinary + leaves + abandons == 0 {
                 continue;
             }
-            let thunk = thunks.get(i as u32);
-            let (leaves, abandons) = self.leaf_counts.get(i).copied().unwrap_or_default();
             writeln!(
                 writer,
-                "\"{}\",\"{}\",{calls},{ns},{max},{leaves},{abandons}",
+                "\"{}\",\"{}\",{calls},{ns},{max},{leaves},{abandons},{guest},{ordinary},{:.6},{:.6}",
                 thunk.module.replace('"', "\"\""),
-                thunk.name.replace('"', "\"\"")
+                thunk.name.replace('"', "\"\""),
+                guest as f64 / total,
+                leaves as f64 / total
             )?;
         }
         Ok(())
