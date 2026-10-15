@@ -7,6 +7,7 @@ use super::*;
 use std::collections::HashMap;
 mod damage;
 mod key;
+mod passes;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
@@ -172,6 +173,7 @@ fn lookups() -> u64 {
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Rect>,
     verify_image: Option<adv_device::gpu::Image>,
@@ -407,7 +409,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     }
     let command = command.digest128();
     f.damage.record(&p, command, &f.contents);
-    for (k, overwrite) in p.writes {
+    for &(k, overwrite) in &p.writes {
         let slot = f.contents.resolve(k);
         let old = f.contents.slots[slot].1.unwrap_or(0);
         if f.contents.slots[slot].2.is_none() {
@@ -435,6 +437,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let work = matches!(p.operation, Operation::Draw(_)).then_some((
         (p.bytes
+            + passes::Plan::bytes(p.reads.len(), p.writes.len())
             + std::mem::size_of::<Operation>()
             + match &p.operation {
                 Operation::Draw(d) => d
@@ -455,6 +458,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let f = frame(env, owner);
     f.bytes += p.bytes;
+    f.passes.record(&p.operation, p.reads, p.writes);
     f.commands.push(p.operation);
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     env.ext.get_mut::<State>().frames.recorded_commands += 1;
@@ -467,6 +471,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             f.commands.pop();
+            f.passes.truncate(f.commands.len());
             f.damage.invalidate();
             f.bytes -= bytes;
             f.key = key;
@@ -525,6 +530,11 @@ pub(super) fn flush(
                 (env.ext.get::<State>().provider.target)(env.ext, surface).map(|t| t.image);
             return Ok(Completion::Command);
         }
+        if f.passes.skip(f.head) {
+            f.commands[f.head] = Operation::Consumed;
+            f.head += 1;
+            continue;
+        }
         let operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
         let clip = if env.ext.get::<State>().verify_frames {
             None
@@ -564,6 +574,7 @@ pub(super) fn flush(
                     d.gpu_lost = true;
                     d.frame.damage.invalidate();
                     d.frame.commands.clear();
+                    d.frame.passes.truncate(0);
                     d.frame.head = 0;
                 }
                 return Ok(Completion::Command);
@@ -608,6 +619,7 @@ pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
         let held = std::mem::take(&mut f.held_uploads);
         f.active = None;
         f.commands.clear();
+        f.passes.truncate(0);
         f.head = 0;
         f.bytes = 0;
         for (resource, level) in held {
@@ -627,6 +639,7 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
             if f.active == Some(*token) {
                 f.active = None;
                 f.partial = true;
+                f.passes.truncate(f.commands.len());
                 f.last = None;
                 f.damage.invalidate();
                 f.rotate = false;
@@ -706,6 +719,11 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         let image = (provider.target)(env.ext, *surface).unwrap().image;
         let f = frame(env, *owner);
         let force = f.partial || f.last != Some(presentation);
+        let _dead_passes = if !verify && !f.partial && f.head == 0 {
+            f.passes.plan()
+        } else {
+            0
+        };
         f.damage.plan(force);
         f.rotate = !force && f.damage.rotatable(hash(image.view()));
         if verify && copy.is_none() {
@@ -727,6 +745,10 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         let fraction =
             f64::from(clip.w) * f64::from(clip.h) / (f64::from(full.w) * f64::from(full.h));
         let counters = &mut env.ext.get_mut::<State>().frames;
+        #[cfg(feature = "d3d9-counters")]
+        {
+            counters.eliminated_passes += _dead_passes;
+        }
         if verify || clip == full {
             counters.full_executions += 1;
         } else {

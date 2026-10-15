@@ -75,6 +75,84 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
 fn present(f: &mut Fixture) {
     f.okay("IDirect3DDevice9::Present", &[f.device, 0, 0, 0, 0]);
 }
+
+#[test]
+// spec: GFX-REC-9, GFX-REC-2, GFX-REC-3, GFX-REC-8
+fn dead_pass_pixels_match_verification_and_near_misses_keep_observed_outputs() {
+    for (read, partial) in [(false, false), (true, false), (false, true)] {
+        let mut outputs = Vec::new();
+        for verify in [false, true] {
+            let mut f = fixture();
+            f.m.ext.get_mut::<State>().verify_frames = verify;
+            let d = f.device;
+            let other = f.render_target(16, 12, 21);
+            clear(&mut f, 0xff112233);
+            let draw = draw(&mut f);
+            record_draw(&mut f, draw);
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[d, 0, other]);
+            if read {
+                let owner = id(&mut f);
+                let source = device(&env(&mut f), d).unwrap().back_buffer.unwrap();
+                let destination = com(&env(&mut f))
+                    .identity::<Payload>(&f.m.sys.objects, other)
+                    .unwrap();
+                let target = f.target(other);
+                let image = f.image(f.back);
+                let rectangle = Rect {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 12,
+                };
+                let result = record(
+                    &mut env(&mut f),
+                    owner,
+                    Operation::Copy {
+                        source: image,
+                        rectangle,
+                        destination: target,
+                        region: rectangle,
+                        filter: Filter::Nearest,
+                        resources: [source, destination],
+                    },
+                );
+                assert_eq!(f.finish(result), 0);
+            } else {
+                clear(&mut f, 0xff334455);
+            }
+            let back = f.back;
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[d, 0, back]);
+            if partial {
+                let viewport = f.packet(adv_abi::types::D3DVIEWPORT9 {
+                    X: 0,
+                    Y: 0,
+                    Width: 15,
+                    Height: 12,
+                    MinZ: 0.,
+                    MaxZ: 1.,
+                });
+                f.okay("IDirect3DDevice9::SetViewport", &[d, viewport]);
+            }
+            clear(&mut f, 0xff667788);
+            present(&mut f);
+            if !verify && !read && !partial {
+                assert_eq!(stats(&f).draws, 0);
+            } else {
+                assert!(stats(&f).draws > 0);
+            }
+            assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
+            #[cfg(feature = "d3d9-counters")]
+            assert_eq!(
+                f.m.ext.get::<State>().frames.eliminated_passes,
+                u64::from(!verify && !read && !partial)
+            );
+            let back = f.target(f.back).image;
+            let other = f.target(other).image;
+            outputs.push((f.pixels(&back), f.pixels(&other)));
+        }
+        assert_eq!(outputs[0], outputs[1], "read={read}, partial={partial}");
+    }
+}
 fn clear(f: &mut Fixture, color: u32) {
     f.okay(
         "IDirect3DDevice9::Clear",
