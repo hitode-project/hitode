@@ -118,9 +118,11 @@ impl State {
         })
     }
     pub(super) fn has_depth(&self, target: &Target) -> bool {
-        self.attachments
-            .as_ref()
-            .is_some_and(|(color, depth)| color == &target.image.render_view && depth.is_some())
+        self.attachments.as_ref().is_some_and(|(color, depth)| {
+            color == &target.image.render_view
+                && depth.is_some()
+                && depth.as_ref() == target.depth.as_ref().map(Depth::view)
+        })
     }
     pub(super) fn flush(&mut self) {
         if let Some(encoder) = self.encoder.take() {

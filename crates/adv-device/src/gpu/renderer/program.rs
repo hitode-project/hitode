@@ -293,10 +293,11 @@ impl Gpu {
         target: &Target,
         state: &DrawState,
     ) -> Target {
-        let attached = pending
-            .attachments
-            .as_ref()
-            .is_some_and(|(color, depth)| color == &target.image.render_view && depth.is_some());
+        let attached = pending.attachments.as_ref().is_some_and(|(color, depth)| {
+            color == &target.image.render_view
+                && depth.is_some()
+                && depth.as_ref() == target.depth.as_ref().map(Depth::view)
+        });
         #[cfg(target_vendor = "apple")]
         let attached = attached
             || pending

@@ -214,3 +214,33 @@ fn fragment_depth_outputs_keep_attachments_without_enabling_depth_writes() {
         solid(&read(&mut gpu, &target.image), [0, 255, 0, 255]);
     }
 }
+
+// spec: GFX-PASS-2
+#[test]
+fn unused_depth_rebinding_keeps_a_color_only_pass() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let a = gpu.target(4, 4, true).unwrap();
+        let b = a
+            .clone()
+            .with_depth(Some(gpu.depth(4, 4, DepthFormat::Float32).unwrap()))
+            .unwrap();
+        for target in [&a, &b] {
+            gpu.clear(target, Some([0.; 4]), Some(1.)).unwrap();
+            read(&mut gpu, &target.image);
+        }
+        let draw = draw();
+        let mut state = DrawState::new(4, 4);
+        gpu.draw_programmable(&a, &draw, &state).unwrap();
+        read(&mut gpu, &a.image);
+        let before = gpu.stats();
+        state.depth = Some(Compare::Always);
+        gpu.draw_programmable(&a, &draw, &state).unwrap();
+        state.depth = None;
+        gpu.draw_programmable(&b, &draw, &state).unwrap();
+        gpu.draw_programmable(&a, &draw, &state).unwrap();
+        solid(&read(&mut gpu, &a.image), [0, 255, 0, 255]);
+        assert_eq!(gpu.stats().passes - before.passes, 2);
+        assert_eq!(gpu.stats().depth_loads - before.depth_loads, 1);
+    }
+}
