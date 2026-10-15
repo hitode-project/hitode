@@ -31,21 +31,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adv-android"
-version = "0.1.0"
-dependencies = [
- "adv-device",
- "adv-machine",
- "adv-runtime",
- "adv-sync",
- "jni 0.21.1",
- "libc",
- "ndk-context",
- "pollster",
- "serde_json",
-]
-
-[[package]]
 name = "adv-cpu"
 version = "0.1.0"
 dependencies = [

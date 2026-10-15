@@ -36,8 +36,6 @@ RULES: dict[str, set[str]] = {
     # Tauri player frontend: library and in-game overlay over the native game view.
     "adv-launcher": {"adv-shell", "tauri-plugin-storage"},
     "tauri-plugin-storage": set(),
-    # Android platform frontend owns runtime, presentation and audio output.
-    "adv-android": {"adv-runtime", "adv-device", "adv-sync"},
     "adv-tune": {"adv-abi", "adv-device"},
     # Test support: reachable only from dev-dependencies.
     "adv-unicorn": {"adv-cpu"},
