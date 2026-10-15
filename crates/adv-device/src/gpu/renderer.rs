@@ -11,6 +11,7 @@ mod attachments;
 mod metal;
 mod pipeline_disk;
 mod program;
+mod recipes;
 pub use program::validate_program;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
@@ -411,7 +412,7 @@ impl Readback {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct PipelineKey {
     topology: Topology,
     cull: Cull,

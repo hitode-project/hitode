@@ -40,7 +40,7 @@ impl Drop for DiskCache {
     }
 }
 
-fn load_blob(path: &Path) -> Option<Vec<u8>> {
+pub(super) fn load_blob(path: &Path) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if !(40..=LIMIT + 40).contains(&len) {
@@ -57,7 +57,7 @@ fn load_blob(path: &Path) -> Option<Vec<u8>> {
     }
     Some(data.to_vec())
 }
-fn save_blob(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(super) fn save_blob(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let Some(directory) = path.parent() else {
         return Err(std::io::ErrorKind::InvalidInput.into());
     };

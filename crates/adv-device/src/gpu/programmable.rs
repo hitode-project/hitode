@@ -3,7 +3,7 @@
 use super::{Image, Sampler};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AttributeFormat {
     Float1,
     Float2,
@@ -95,7 +95,7 @@ impl AttributeFormat {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Attribute {
     pub location: u32,
     pub offset: u32,
