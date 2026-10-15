@@ -1,6 +1,8 @@
 //! The player frontend: a Tauri window whose webview draws the game library
 //! and, while a game runs, a transparent in-game overlay above the native game
 //! view that adv-shell presents into (decision 25).
+#[cfg(target_os = "android")]
+pub mod android;
 mod library;
 #[cfg(desktop)]
 mod menu;
@@ -33,7 +35,7 @@ fn host_info() -> HostInfo {
     HostInfo {
         platform: std::env::consts::OS,
         version: env!("CARGO_PKG_VERSION"),
-        game_view: cfg!(target_os = "macos"),
+        game_view: cfg!(any(target_os = "macos", target_os = "android")),
     }
 }
 
@@ -52,6 +54,8 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_storage::init());
     let builder = builder.setup(|app| {
         use tauri::Manager;
+        #[cfg(target_os = "android")]
+        android::setup(app.handle().clone());
         app.manage(std::sync::Mutex::new(library::Library::load(
             app.path().app_data_dir()?,
         )?));

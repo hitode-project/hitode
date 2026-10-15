@@ -18,3 +18,4 @@ __pycache__/
 # the iOS set stays ignored and is regenerated with the iOS project.
 !/apps/adv-launcher/src-tauri/icons/*.png
 !/apps/adv-launcher/src-tauri/icons/android/*/*.png
+!/apps/adv-launcher/src-tauri/gen/android/app/src/main/res/mipmap-*/*.png

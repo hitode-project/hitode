@@ -10,6 +10,7 @@ description = "Tauri launcher: game library and in-game overlay over the native 
 
 [lib]
 name = "adv_launcher"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "adv-launcher"
@@ -36,6 +37,9 @@ tauri-plugin-opener = "=2.7.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 tauri-plugin-storage = { path = "plugins/storage" }
+jni = "0.21.1"
+ndk-sys = "0.6"
+log.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 adv-shell = { path = "../../../crates/adv-shell", features = ["media"] }
