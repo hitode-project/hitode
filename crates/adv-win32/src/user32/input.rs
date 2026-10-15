@@ -482,12 +482,12 @@ mod tests {
         assert_eq!((state.keys[1] & 0x80, state.keys[2] & 0x80), (0x80, 0));
         env.cpu.write_u32(stack + 4, 1).unwrap();
         assert!(matches!(
-            super::super::get_async_key_state(&mut env),
+            super::super::get_async_key_state__win32_adapter(&mut env),
             Outcome::Return(0x8000)
         ));
         env.cpu.write_u32(stack + 4, 2).unwrap();
         assert!(matches!(
-            super::super::get_async_key_state(&mut env),
+            super::super::get_async_key_state__win32_adapter(&mut env),
             Outcome::Return(0)
         ));
         assert_eq!(release(&mut env), 1);

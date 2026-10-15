@@ -28,6 +28,12 @@ fn char_next(env: &mut Env<'_>, text: AnsiStr) -> Result<AnsiStr, MemFault> {
         .map(|address| AnsiStr(GuestPtr::new(address)))
 }
 
+fn char_next_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let text = AnsiStr(GuestPtr::new(env.cpu.arg(0).ok()?));
+    let next = char_next(env, text).ok()?;
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(next.0.addr()))
+}
+
 #[win32(user32, name = "CharNextW", level = implement)]
 fn char_next_w(env: &mut Env<'_>, text: WideStr) -> Result<WideStr, MemFault> {
     let mut next = text.0;
@@ -232,7 +238,10 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
-    reg.register(char_next_ABI);
+    reg.register(adv_abi::Api {
+        env_leaf: Some(char_next_leaf),
+        ..char_next_ABI
+    });
     reg.register(char_upper_ABI);
     reg.register(char_lower_ABI);
     reg.register(oem_to_char_ABI);

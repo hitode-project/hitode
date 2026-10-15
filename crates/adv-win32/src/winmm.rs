@@ -42,9 +42,15 @@ pub fn register(registry: &mut Registry) {
     joystick::register(registry);
     midi::register(registry);
     sound::register(registry);
+    registry.add_env_leaf(
+        "winmm.dll",
+        "timeGetTime",
+        adv_abi::Conv::Stdcall { argc: 0 },
+        get_time,
+        crate::kernel32::time::tick_leaf,
+    );
     for (name, argc, handler) in [
         ("timeGetDevCaps", 2, caps as adv_machine::Handler),
-        ("timeGetTime", 0, get_time),
         ("timeBeginPeriod", 1, begin_period),
         ("timeEndPeriod", 1, end_period),
         ("timeSetEvent", 5, set_event),

@@ -1,6 +1,6 @@
 //! Code page and locale functions.
 
-use adv_abi::Registry;
+use adv_abi::{Registry, win32};
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
@@ -47,14 +47,14 @@ fn get_cp_info(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn is_dbcs_lead_byte(env: &mut Env<'_>) -> Outcome {
-    let b = env.arg(0) as u8;
-    Outcome::Return(u32::from(env.ext.get::<Win32>().codec.is_lead_byte(0, b)))
+#[win32(kernel32, name = "IsDBCSLeadByte", level = implement, leaf)]
+fn is_dbcs_lead_byte(env: &mut Env<'_>, b: u32) -> i32 {
+    i32::from(env.ext.get::<Win32>().codec.is_lead_byte(0, b as u8))
 }
 
-fn is_dbcs_lead_byte_ex(env: &mut Env<'_>) -> Outcome {
-    let (cp, b) = (env.arg(0), env.arg(1) as u8);
-    Outcome::Return(u32::from(env.ext.get::<Win32>().codec.is_lead_byte(cp, b)))
+#[win32(kernel32, name = "IsDBCSLeadByteEx", level = implement, leaf)]
+fn is_dbcs_lead_byte_ex(env: &mut Env<'_>, cp: u32, b: u32) -> i32 {
+    i32::from(env.ext.get::<Win32>().codec.is_lead_byte(cp, b as u8))
 }
 
 /// Shared tail of the A<->W converters: output size query, copy, or insufficient buffer.
@@ -390,8 +390,8 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(u32::from(is_valid_codepage(e.arg(0))))
     });
     stdcall(reg, K32, "GetCPInfo", 2, get_cp_info);
-    stdcall(reg, K32, "IsDBCSLeadByte", 1, is_dbcs_lead_byte);
-    stdcall(reg, K32, "IsDBCSLeadByteEx", 2, is_dbcs_lead_byte_ex);
+    reg.register(is_dbcs_lead_byte_ABI);
+    reg.register(is_dbcs_lead_byte_ex_ABI);
     stdcall(reg, K32, "MultiByteToWideChar", 6, multi_byte_to_wide_char);
     stdcall(reg, K32, "WideCharToMultiByte", 8, wide_char_to_multi_byte);
     stdcall(reg, K32, "LCMapStringW", 6, lc_map_string_w);

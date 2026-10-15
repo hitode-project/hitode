@@ -381,12 +381,80 @@ const POLL_GAP_US: u64 = 50;
 
 /// The last clock read and how many reads on that context came back to back,
 /// with no other host call and almost no guest time between them.
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ClockPoll {
     context: Option<CtxId>,
     call: u64,
     read_us: u64,
     streak: u32,
+}
+
+impl ClockPoll {
+    fn next_streak(&self, context: CtxId, call: u64, now: u64) -> u32 {
+        if self.context == Some(context)
+            && self.call + 1 == call
+            && now.saturating_sub(self.read_us) <= POLL_GAP_US
+        {
+            self.streak.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    fn record(&mut self, context: CtxId, call: u64, now: u64) {
+        self.streak = self.next_streak(context, call, now);
+        (self.context, self.call, self.read_us) = (Some(context), call, now);
+    }
+}
+
+/// Preview without advancing virtual time or committing real-clock progress.
+/// A declined leaf must leave the ordinary path its original clock and streak.
+fn leaf_clock(env: &Env<'_>) -> Option<(adv_machine::Clock, u64)> {
+    let mut clock = env.sys.clock.clone();
+    let now = clock.guest_now_us();
+    // Dispatch increments host_calls after a successful leaf, before a trap.
+    let (context, call) = (env.sys.current, env.sys.host_calls + 1);
+    if env
+        .ext
+        .try_get::<ClockPoll>()
+        .is_some_and(|poll| poll.next_streak(context, call, now) >= POLL_STREAK)
+    {
+        return None;
+    }
+    Some((clock, now))
+}
+
+fn record_leaf_clock(env: &mut Env<'_>, clock: adv_machine::Clock, now: u64) {
+    env.sys.clock = clock;
+    env.ext
+        .get_or_default::<ClockPoll>()
+        .record(env.sys.current, env.sys.host_calls + 1, now);
+}
+
+pub(crate) fn tick_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let (clock, us) = leaf_clock(env)?;
+    record_leaf_clock(env, clock, us);
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from((us / 1000) as u32))
+}
+
+fn counter_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let out = GuestPtr::<i64>::new(env.cpu.arg(0).ok()?);
+    adv_abi::guest::check_range(env.cpu, out.addr(), 8, adv_cpu::backend::Prot::WRITE).ok()?;
+    let (clock, us) = leaf_clock(env)?;
+    out.write(
+        env.cpu,
+        (us * (adv_machine::clock::QPC_FREQ / 1_000_000)) as i64,
+    )
+    .ok()?;
+    record_leaf_clock(env, clock, us);
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | 1)
+}
+
+fn frequency_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let out = GuestPtr::<i64>::new(env.cpu.arg(0).ok()?);
+    adv_abi::guest::check_range(env.cpu, out.addr(), 8, adv_cpu::backend::Prot::WRITE).ok()?;
+    query_performance_frequency(env, out).ok()?;
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | 1)
 }
 
 /// Read the guest clock for a polling API. A context that does nothing but reread
@@ -400,15 +468,7 @@ pub(crate) fn poll_clock(
     let now = env.sys.clock.guest_now_us();
     let (context, call) = (env.sys.current, env.sys.host_calls);
     let poll = env.ext.get_or_default::<ClockPoll>();
-    let back_to_back = poll.context == Some(context)
-        && poll.call + 1 == call
-        && now.saturating_sub(poll.read_us) <= POLL_GAP_US;
-    poll.streak = if back_to_back {
-        poll.streak.saturating_add(1)
-    } else {
-        1
-    };
-    (poll.context, poll.call, poll.read_us) = (Some(context), call, now);
+    poll.record(context, call, now);
     if poll.streak < POLL_STREAK {
         return finish(env, now);
     }
@@ -501,7 +561,10 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(dos_date_time_to_file_time_ABI);
     stdcall(reg, K32, "GetSystemTime", 1, get_system_time);
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
-    reg.register(get_tick_count_ABI);
+    reg.register(adv_abi::Api {
+        env_leaf: Some(tick_leaf),
+        ..get_tick_count_ABI
+    });
     stdcall(reg, K32, "GetDateFormatW", 6, |e| {
         get_date_time_format(e, false, true)
     });
@@ -514,8 +577,14 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetTimeFormatA", 6, |e| {
         get_date_time_format(e, true, false)
     });
-    reg.register(query_performance_counter_ABI);
-    reg.register(query_performance_frequency_ABI);
+    reg.register(adv_abi::Api {
+        env_leaf: Some(counter_leaf),
+        ..query_performance_counter_ABI
+    });
+    reg.register(adv_abi::Api {
+        env_leaf: Some(frequency_leaf),
+        ..query_performance_frequency_ABI
+    });
     reg.register(sleep_ABI);
     stdcall(
         reg,
@@ -694,3 +763,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod leaf_tests;

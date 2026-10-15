@@ -11,7 +11,18 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 
 fn api(machine: &mut Machine<JitCpu>, code: &mut Asm, name: &str, args: &[u32], output: u32) {
-    let address = machine.resolve_import("kernel32.dll", name).unwrap();
+    api_from(machine, code, "kernel32.dll", name, args, output);
+}
+
+fn api_from(
+    machine: &mut Machine<JitCpu>,
+    code: &mut Asm,
+    module: &str,
+    name: &str,
+    args: &[u32],
+    output: u32,
+) {
+    let address = machine.resolve_import(module, name).unwrap();
     for arg in args.iter().rev() {
         code.push_imm(*arg);
     }
@@ -21,16 +32,6 @@ fn api(machine: &mut Machine<JitCpu>, code: &mut Asm, name: &str, args: &[u32], 
 fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
-    for (module, name) in [
-        ("kernel32.dll", "GetTickCount"),
-        ("kernel32.dll", "QueryPerformanceCounter"),
-        ("winmm.dll", "timeGetTime"),
-    ] {
-        assert!(
-            registry.get(module, name).unwrap().leaf.is_none(),
-            "polling API can block"
-        );
-    }
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, true).unwrap(),
         registry,
@@ -69,10 +70,44 @@ fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     api(&mut machine, &mut code, "GetLastError", &[], 28);
     api(&mut machine, &mut code, "TlsGetValue", &[64], 32);
     api(&mut machine, &mut code, "GetLastError", &[], 36);
-    code.pop_ecx().dec_ecx().jnz(again).ret();
+    for (module, name, args, offset) in [
+        ("kernel32.dll", "GetTickCount", vec![], 40),
+        ("winmm.dll", "timeGetTime", vec![], 44),
+        (
+            "kernel32.dll",
+            "QueryPerformanceCounter",
+            vec![DATA + 128],
+            48,
+        ),
+        (
+            "kernel32.dll",
+            "QueryPerformanceFrequency",
+            vec![DATA + 136],
+            52,
+        ),
+        ("user32.dll", "GetKeyState", vec![0x41], 56),
+        ("user32.dll", "GetAsyncKeyState", vec![0x41], 60),
+        ("user32.dll", "GetKeyboardState", vec![DATA + 256], 64),
+        ("kernel32.dll", "IsDBCSLeadByte", vec![0x82], 68),
+        ("kernel32.dll", "IsDBCSLeadByteEx", vec![932, 0x82], 72),
+        ("user32.dll", "CharNextA", vec![DATA + 512], 76),
+        ("user32.dll", "GetKeyboardState", vec![0], 80),
+    ] {
+        api_from(&mut machine, &mut code, module, name, &args, offset);
+    }
+    code.pop_ecx().dec_ecx().jnz(again);
+    code.mov_ecx_imm(2050);
+    let poll = code.here();
+    code.push_ecx();
+    api(&mut machine, &mut code, "GetTickCount", &[], 84);
+    code.pop_ecx().dec_ecx().jnz(poll).ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();
-    machine.spawn("API caller", CODE, &[], 65536).unwrap();
-    assert!(matches!(machine.run(), RunResult::Exited(_)));
+    let context = machine.spawn("API caller", CODE, &[], 65536).unwrap();
+    let user = &mut machine.ext.get_mut::<adv_win32::Win32>().user;
+    user.keys[0x41] = 0x80;
+    user.queues.entry(context).or_default().keyboard.0[0x41] = 0x81;
+    let result = machine.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(_)), "{result:?}");
     assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0x12345678);
     assert_eq!(machine.cpu.read_u32(DATA + 8).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA + 12).unwrap(), 0xabcdef01);
@@ -82,12 +117,19 @@ fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     assert_eq!(machine.cpu.read_u32(DATA + 28).unwrap(), 87);
     assert_eq!(machine.cpu.read_u32(DATA + 32).unwrap(), 0);
     assert_eq!(machine.cpu.read_u32(DATA + 36).unwrap(), 0);
-    let mut output = vec![0; 40];
+    assert_eq!(machine.cpu.read_u32(DATA + 56).unwrap(), 0xffff8001);
+    assert_eq!(machine.cpu.read_u32(DATA + 60).unwrap(), 0x8000);
+    assert_eq!(machine.cpu.read_u8(DATA + 256 + 0x41).unwrap(), 0x81);
+    assert_eq!(machine.cpu.read_u32(DATA + 64).unwrap(), 1);
+    assert_eq!(machine.cpu.read_u32(DATA + 72).unwrap(), 1);
+    assert_eq!(machine.cpu.read_u32(DATA + 80).unwrap(), 0);
+    assert_eq!(machine.sys.stats.leaf_abandons, if traced { 0 } else { 15 });
+    let mut output = vec![0; 520];
     machine.cpu.read(DATA, &mut output).unwrap();
     (output, machine.sys.stats.leaf_calls, machine.sys.host_calls)
 }
 
-// spec: A64-CTL-12
+// spec: A64-CTL-12, WIN32-API-15
 #[test]
 fn registered_leaf_apis_match_their_traced_handlers() {
     let (leaf, leaves, calls) = run(false);

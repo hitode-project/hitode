@@ -53,9 +53,9 @@ fn key(machine: &mut Machine<JitCpu>, vk: u32, asynchronous: bool) -> u32 {
     machine.cpu.write_u32(stack + 4, vk).unwrap();
     let mut env = env(machine);
     returned(if asynchronous {
-        super::super::get_async_key_state(&mut env)
+        super::super::get_async_key_state__win32_adapter(&mut env)
     } else {
-        super::super::get_key_state(&mut env)
+        super::super::get_key_state__win32_adapter(&mut env)
     })
 }
 fn keyboard(machine: &mut Machine<JitCpu>, output: u32) -> u32 {
