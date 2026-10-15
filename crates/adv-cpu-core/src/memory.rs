@@ -2420,10 +2420,13 @@ mod window_tests {
             memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
             // A host page with a copy left still traps every store.
             assert_eq!(allows(&memory, 0x10000, Write), host == 4096, "{host}");
-            assert!(
-                allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write),
-                "{host}"
-            );
+            // A 4 KiB host page holds no neighbouring copy.
+            if host > PAGE_SIZE {
+                assert!(
+                    allows(&memory, 0x11000, Read) && !allows(&memory, 0x11000, Write),
+                    "{host}"
+                );
+            }
             memory.privatize_copy_pages(0x10000, host).unwrap();
             assert!(allows(&memory, 0x10000, Write), "{host}");
         }
