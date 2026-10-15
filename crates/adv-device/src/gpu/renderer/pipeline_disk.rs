@@ -22,6 +22,7 @@ impl DiskCache {
             self.save();
         }
     }
+
     fn save(&mut self) {
         if !self.dirty {
             return;
@@ -88,45 +89,53 @@ impl Gpu {
     /// Opt in using an application-owned local cache directory. Drivers/backends
     /// without native cache support continue using the portable shader cache.
     pub fn set_pipeline_cache_directory(&mut self, directory: Option<&Path>) {
+        self.programmable.warm = warmup::Warmup::default();
         self.programmable.disk = None;
         let Some(directory) = directory else {
             return;
         };
-        if !self
+        let key = recipes::partition(&self.context.adapter.get_info());
+        let store = recipes::Store::open(directory, key.clone());
+        if self
             .context
             .device
             .features()
             .contains(wgpu::Features::PIPELINE_CACHE)
         {
-            return;
+            let path = directory.join(format!("{key}.bin"));
+            let data = load_blob(&path);
+            // SAFETY: only get_data() results are written with our envelope, checked
+            // length and SHA-256. The explicit application-owned cache is trusted
+            // like the application's other compiled caches; it is never a guest
+            // path. wgpu additionally checks its backend/adapter/driver header and
+            // discards obsolete data because fallback is enabled.
+            let cache = unsafe {
+                self.context
+                    .device
+                    .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                        label: Some("programmable driver cache"),
+                        data: data.as_deref(),
+                        fallback: true,
+                    })
+            };
+            self.programmable.disk = Some(DiskCache {
+                cache,
+                path,
+                dirty: false,
+                updates: 0,
+            });
         }
-        let Some(key) = wgpu::util::pipeline_cache_key(&self.context.adapter.get_info()) else {
-            return;
-        };
-        let path = directory.join(format!("{key}.bin"));
-        let data = load_blob(&path);
-        // SAFETY: only get_data() results are written with our envelope, checked
-        // length and SHA-256. The explicit application-owned cache is trusted
-        // like the application's other compiled caches; it is never a guest
-        // path. wgpu additionally checks its backend/adapter/driver header and
-        // discards obsolete data because fallback is enabled.
-        let cache = unsafe {
-            self.context
-                .device
-                .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                    label: Some("programmable driver cache"),
-                    data: data.as_deref(),
-                    fallback: true,
-                })
-        };
-        self.programmable.disk = Some(DiskCache {
-            cache,
-            path,
-            dirty: false,
-            updates: 0,
-        });
+        self.programmable.warm = warmup::Warmup::open(
+            store,
+            &self.context,
+            &self.uniform,
+            &self.shader,
+            &self.layout,
+            self.programmable.disk.as_ref().map(|d| &d.cache),
+        );
     }
     pub fn flush_pipeline_cache(&mut self) {
+        self.programmable.warm.flush();
         if let Some(disk) = &mut self.programmable.disk {
             disk.save();
         }

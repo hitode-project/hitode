@@ -22,6 +22,7 @@ pub(super) struct Cache {
     texture_bindings: HashMap<TextureKey, TextureBinding>,
     texture_clock: u64,
     pub(super) disk: Option<super::pipeline_disk::DiskCache>,
+    pub(super) warm: super::warmup::Warmup,
 }
 const CONSTANT_SIZE: u64 = std::mem::size_of::<ConstantBlock>() as u64;
 const PARAMETER_SIZE: u64 = 640;
@@ -513,13 +514,19 @@ impl Gpu {
             self.stats.pipeline_cache_hits += 1;
             return Ok(p.clone());
         }
-        let result = Pipeline::build(
-            &self.context,
-            &self.uniform,
-            self.programmable.disk.as_ref().map(|d| &d.cache),
-            &key,
-            program,
-        )?;
+        let result = self
+            .programmable
+            .warm
+            .pipeline(
+                recipes::Recipe::program(&key, program),
+                &self.context,
+                &self.uniform,
+                &self.shader,
+                &self.layout,
+                self.programmable.disk.as_ref().map(|d| &d.cache),
+                Some(program),
+            )?
+            .program()?;
         self.stats.bind_group_creations += 1;
         if self.programmable.entries.len() >= self.pipeline_limit
             && let Some(old) = self.programmable.order.pop_front()

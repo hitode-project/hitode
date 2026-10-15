@@ -242,6 +242,10 @@ pub struct Stats {
     pub pipeline_cache_hits: u64,
     pub compile_waits: u64,
     pub compile_wait_ns: u64,
+    pub prebuild_hits: u64,
+    pub prebuild_misses: u64,
+    pub persisted_pipelines: u64,
+    pub discarded_pipelines: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

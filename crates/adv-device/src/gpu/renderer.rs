@@ -734,7 +734,13 @@ impl Gpu {
         stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
         stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
         stats.ring_busy = batch.ring_busy.load(Ordering::Relaxed);
-
+        let (waits, ns) = self.programmable.warm.counters.snapshot();
+        stats.compile_waits += waits;
+        stats.compile_wait_ns += ns;
+        stats.prebuild_hits = self.programmable.warm.hits;
+        stats.prebuild_misses = self.programmable.warm.misses;
+        stats.persisted_pipelines = self.programmable.warm.persisted();
+        stats.discarded_pipelines = self.programmable.warm.discarded();
         stats
     }
 
@@ -1024,13 +1030,22 @@ impl Gpu {
             self.stats.pipeline_cache_hits += 1;
             return Ok(pipeline.clone());
         }
-        let pipeline = build_fixed(
-            &self.context,
-            &self.shader,
-            &self.layout,
-            self.programmable.disk.as_ref().map(|d| &d.cache),
-            key,
-        )?;
+        let pipeline = self
+            .programmable
+            .warm
+            .pipeline(
+                recipes::Recipe::Fixed(key),
+                &self.context,
+                &self.uniform,
+                &self.shader,
+                &self.layout,
+                self.programmable.disk.as_ref().map(|d| &d.cache),
+                None,
+            )?
+            .fixed()?;
+        if let Some(disk) = &mut self.programmable.disk {
+            disk.changed();
+        }
         // Submitted command buffers retain their own pipeline references. A
         // full cache can retire an entry immediately instead of waiting for a
         // capacity wake that could never occur. Hits leave FIFO order intact.
