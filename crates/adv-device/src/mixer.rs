@@ -13,6 +13,9 @@ pub struct PcmBlock {
 /// use the requested output rate; queued frames use each block's source rate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PcmMetrics {
+    pub low_lead_events: u64,
+    /// Lifetime minimum lead/refill interval, scaled by 1000; zero before observation.
+    pub min_lead_ratio_permille: u64,
     pub queued_blocks: u64,
     pub queued_source_frames: u64,
     /// First accepted block of a new stream or after an explicit flush.

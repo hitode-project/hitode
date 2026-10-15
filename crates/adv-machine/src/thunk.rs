@@ -96,7 +96,28 @@ pub trait Resolver: Any {
     }
 }
 
+/// Registration-time classification shared by ABI registration and thunk publication.
+pub fn is_audio_binding(module: &str, name: &str) -> bool {
+    ["dsound.dll", "quartz.dll", "wmvcore.dll"]
+        .iter()
+        .any(|m| module.eq_ignore_ascii_case(m))
+        || (module.eq_ignore_ascii_case("winmm.dll")
+            && [
+                "waveOut",
+                "waveIn",
+                "midiOut",
+                "mci",
+                "mixer",
+                "aux",
+                "PlaySound",
+                "sndPlaySound",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)))
+}
+
 pub struct Thunk {
+    pub audio: bool,
     pub module: String,
     pub name: String,
     pub f: HostFn,
@@ -183,6 +204,7 @@ fn return_pad(_: &mut Env<'_>) -> Outcome {
 impl ThunkTable {
     pub fn new(resolver: Box<dyn Resolver>) -> Self {
         let pad = Thunk {
+            audio: false,
             module: String::new(),
             name: "<return pad>".into(),
             f: HostFn {
@@ -212,6 +234,7 @@ impl ThunkTable {
             thunks: vec![
                 pad,
                 Thunk {
+                    audio: false,
                     module: String::new(),
                     name: "<exception dispatch>".into(),
                     f: HostFn {
@@ -479,6 +502,11 @@ impl ThunkTable {
                 false,
             ),
         };
+        let audio = is_audio_binding(&key.0, name);
+        assert!(
+            !audio || (f.leaf.is_none() && f.env_leaf.is_none()),
+            "audio bindings cannot be leaf calls"
+        );
         let guest_slot = match f.guest {
             Some(guest) => Some(self.place(cpu, index, guest, &links)?),
             None => None,
@@ -488,6 +516,7 @@ impl ThunkTable {
         assert!(pristine.len() <= THUNK_STRIDE as usize);
         cpu.write(thunk_addr(index), &pristine)?;
         self.thunks.push(Thunk {
+            audio,
             module: key.0.clone(),
             name: name.to_owned(),
             f,

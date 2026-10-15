@@ -27,6 +27,7 @@ impl Queued {
     }
 }
 pub(crate) struct OwnedVoice {
+    pub lead: crate::actor::Lead,
     queue: VecDeque<Queued>,
     pub state: Arc<SourceState>,
     converter: Converter,
@@ -64,6 +65,7 @@ impl OwnedVoice {
         let timeline_end = queued.end();
         queue.push_back(queued);
         Ok(Box::new(Self {
+            lead: Default::default(),
             queue,
             state,
             converter,
@@ -125,6 +127,16 @@ impl OwnedVoice {
         self.timeline_end = queued.end();
         self.queue.push_back(queued);
         Ok(())
+    }
+    pub fn lead_us(&self) -> Option<f64> {
+        // queued_us retains whole-block credit until retirement and includes
+        // in-flight commands. Only the unplayed, accepted suffix is usable lead.
+        (!self.ended && !self.paused).then(|| {
+            self.queue
+                .iter()
+                .map(|b| (b.end() - b.pts.max(self.rendered_until)).max(0.0))
+                .sum()
+        })
     }
     pub fn set_gain(&mut self, gain: [f32; 2]) {
         self.target = gain;

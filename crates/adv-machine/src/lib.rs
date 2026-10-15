@@ -320,6 +320,7 @@ impl Sys {
 
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
+            audio_call_us: None,
             suspend_count: 0,
             completion: std::sync::Arc::new(process::Completion::default()),
             id,
@@ -549,6 +550,14 @@ impl Sys {
                 format!("[{ctx}] {}!{} from {caller:#010x}", t.module, t.name)
             })
             .collect()
+    }
+
+    /// Whether this thread called audio strictly after a guest-clock timestamp.
+    pub fn audio_called_after(&self, id: CtxId, since_us: u64) -> bool {
+        self.contexts
+            .get(id as usize)
+            .and_then(|c| c.audio_call_us)
+            .is_some_and(|at| at > since_us)
     }
 
     pub fn context(&self, id: CtxId) -> &Context {
@@ -1361,6 +1370,10 @@ impl Dispatch<'_> {
     }
 
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
+        if self.sys.thunks.get(index).audio {
+            self.sys.contexts[self.sys.current as usize].audio_call_us =
+                Some(self.sys.clock.now_us());
+        }
         let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(cpu, |frame| esp >= frame.stack, "callback")?;

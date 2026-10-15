@@ -315,6 +315,11 @@ impl<B: Backend> Runtime<B> {
                 "\nAudio: enabled {}; queued {} samples; nonzero {}",
                 sound.enabled, sound.queued_samples, sound.nonzero_samples
             ));
+            let pcm = sound.audio.stream().metrics();
+            report.push_str(&format!(
+                "\nPCM: low_lead_events {}; min_lead_ratio_permille {}",
+                pcm.low_lead_events, pcm.min_lead_ratio_permille
+            ));
         }
         let control = self.machine.ext.get::<RunControl>();
         if let Some(last) = control.last_frame {

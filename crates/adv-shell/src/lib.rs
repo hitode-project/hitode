@@ -778,6 +778,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "{{\"queued_blocks\": {}, \"queued_source_frames\": {}, \"playback_starts\": {}, ",
             "\"flushes\": {}, \"ends\": {}, \"removals\": {}, \"max_stream_queue_us\": {}, ",
             "\"missing_stream_frames\": {}, \"missing_output_frames\": {}, ",
+            "\"low_lead_events\": {}, \"min_lead_ratio_permille\": {}, ",
             "\"buffers\": {}, \"playing\": {}, \"looping\": {}, \"locked\": {}}}"
         ),
         pcm.queued_blocks,
@@ -789,6 +790,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         pcm.max_stream_queue_us,
         pcm.missing_stream_frames,
         pcm.missing_output_frames,
+        pcm.low_lead_events,
+        pcm.min_lead_ratio_permille,
         sources.buffers,
         sources.playing,
         sources.looping,

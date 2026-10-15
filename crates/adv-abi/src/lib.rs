@@ -105,6 +105,10 @@ impl Default for Registry {
 impl Registry {
     /// Register one implementation for both light calls and ordinary traps.
     pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
+        assert!(
+            !adv_machine::thunk::is_audio_binding(module, name),
+            "audio bindings cannot be leaf calls"
+        );
         self.add(module, name, conv, adv_machine::thunk::leaf_trap);
         self.fns
             .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
@@ -129,6 +133,10 @@ impl Registry {
         ordinary: Handler,
         leaf: EnvLeafHandler,
     ) {
+        assert!(
+            !adv_machine::thunk::is_audio_binding(module, name),
+            "audio bindings cannot be leaf calls"
+        );
         self.add(module, name, conv, ordinary);
         self.fns
             .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))

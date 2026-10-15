@@ -666,3 +666,56 @@ fn detour_replaces_a_guest_function_and_can_run_the_original() {
     );
     assert_eq!(m.sys.thunks.get(d.thunk).name, "f");
 }
+
+// spec: EXEC-CORE-4
+#[test]
+fn audio_traps_record_latest_deadline_clock_per_thread() {
+    let mut registry = Registry::default();
+    for (module, name) in [
+        ("winmm.dll", "waveOutWrite"),
+        ("dsound.dll", "IDirectSoundBuffer8::GetStatus"),
+        ("winmm.dll", "timeGetTime"),
+    ] {
+        registry.add(module, name, Conv::Stdcall { argc: 0 }, |env| {
+            let now = env.sys.clock.now_us();
+            if env.sys.thunks.get(env.thunk).audio {
+                assert_eq!(env.ctx().audio_call_us, Some(now));
+                assert!(env.sys.audio_called_after(env.context, now - 1));
+                assert!(!env.sys.audio_called_after(env.context, now));
+            } else if env.ctx().name == "audio" {
+                assert_eq!(env.ctx().audio_call_us, Some(now - 100));
+            } else {
+                assert_eq!(env.ctx().audio_call_us, None);
+            }
+            env.sys.clock.advance_to(now + 100);
+            Outcome::Return(0)
+        });
+    }
+    let mut m = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    m.cpu.map(CODE, 4096, Prot::RWX).unwrap();
+    let wave = m.resolve_import("winmm.dll", "waveOutWrite").unwrap();
+    let dsound = m
+        .resolve_import("dsound.dll", "IDirectSoundBuffer8::GetStatus")
+        .unwrap();
+    let timer = m.resolve_import("winmm.dll", "timeGetTime").unwrap();
+    let mut audio = Asm::new(CODE);
+    audio.call(wave).call(dsound).call(timer).ret();
+    m.cpu.write(CODE, &audio.bytes).unwrap();
+    let mut timing = Asm::new(WORKER);
+    timing.call(timer).ret();
+    m.cpu.write(WORKER, &timing.bytes).unwrap();
+    let a = m.spawn("audio", CODE, &[], 65536).unwrap();
+    let t = m.spawn("timer", WORKER, &[], 65536).unwrap();
+    let before = m.sys.clock.now_us();
+    assert!(!m.sys.audio_called_after(a, 0));
+    assert!(!m.sys.audio_called_after(u32::MAX, 0));
+    assert!(matches!(m.run_virtual(10_000), RunResult::Exited(_)));
+    assert!(m.sys.context(a).audio_call_us.unwrap() >= before + 100);
+    assert!(m.sys.audio_called_after(a, before));
+    assert!(!m.sys.audio_called_after(t, 0));
+}

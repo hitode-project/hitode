@@ -1952,6 +1952,50 @@ mod tests {
         pump(&mut child).unwrap();
         assert!(child.ext.get::<Sound>().audio.active());
     }
+    // spec: EXEC-CORE-4
+    #[test]
+    fn real_audio_bindings_mark_dispatch_but_timer_does_not() {
+        use adv_cpu::backend::asm::Asm;
+        for api in [
+            "timeGetTime",
+            "waveOutWrite",
+            "IDirectSoundBuffer8::GetStatus",
+        ] {
+            let mut m = machine();
+            let pointer = buffer(
+                &mut m,
+                Format {
+                    rate: 1000,
+                    channels: 1,
+                    bits: 8,
+                },
+                1000,
+            );
+            let code_at = 0x0040_0000;
+            m.cpu.map(code_at, 4096, Prot::RX).unwrap();
+            let module = if api.contains("::") {
+                "dsound.dll"
+            } else {
+                "winmm.dll"
+            };
+            let target = m.resolve_import(module, api).unwrap();
+            let mut code = Asm::new(code_at);
+            if api.contains("::") {
+                code.push_imm(DATA).push_imm(pointer);
+            } else if api == "waveOutWrite" {
+                code.push_imm(0).push_imm(0).push_imm(0);
+            }
+            code.call(target).ret();
+            m.cpu.write(code_at, &code.bytes).unwrap();
+            let thread = m.spawn("audio marker", code_at, &[], 65536).unwrap();
+            assert!(matches!(
+                m.run_virtual(10_000),
+                adv_machine::RunResult::Exited(_)
+            ));
+            assert_eq!(m.sys.audio_called_after(thread, 0), api != "timeGetTime");
+        }
+    }
+
     fn invoke(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
         m.resolve_import("dsound.dll", name).unwrap();
         let thunk = m

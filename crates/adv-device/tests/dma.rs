@@ -1155,3 +1155,56 @@ fn owned_real_timestamp_gap_counts_missing_but_silent_pcm_and_natural_end_do_not
     assert_eq!(control.stream().metrics().missing_stream_frames, 200);
     assert_eq!(control.stream().metrics().missing_output_frames, 200);
 }
+
+// spec: MEDIA-AUDIO-4
+#[test]
+fn headroom_callback_is_allocation_free_and_tracks_each_stream() {
+    let control = AudioControl::new(false);
+    let view = Arc::new(View((0..2000).map(|_| AtomicU8::new(0)).collect()));
+    add(&control, 1, view, 1000, vec![(0, 1), (1000, 2)]);
+    assert!(control.written(1, 0, 1200));
+    assert!(control.play_ring(1, true, 1));
+    control
+        .push_pcm(adv_device::mixer::PcmBlock {
+            stream_id: 2,
+            guest_pts_us: 0,
+            sample_rate: 1000,
+            channels: 1,
+            samples: vec![0.0; 600],
+        })
+        .unwrap_or_else(|_| panic!());
+    let stream = control.stream();
+    assert_eq!(stream.metrics().min_lead_ratio_permille, 0);
+    let mut reader = stream.device_reader(1000, 1).unwrap();
+    for n in 1..=3 {
+        no_alloc(|| {
+            reader.read(&mut [0.0; 100], 0);
+        });
+        control.sync_clock(n * 100_000);
+        assert!(control.written(1, 1000 + n as u32 * 200, 200));
+        control
+            .push_pcm(adv_device::mixer::PcmBlock {
+                stream_id: 2,
+                guest_pts_us: 500_000 + n * 100_000,
+                sample_rate: 1000,
+                channels: 1,
+                samples: vec![0.0; 100],
+            })
+            .unwrap_or_else(|_| panic!());
+        no_alloc(|| {
+            reader.read(&mut [], 0);
+        });
+    }
+    no_alloc(|| {
+        reader.read(&mut [0.0; 401], 0);
+    });
+    assert_eq!(stream.alarm_epoch(), 2);
+    assert_eq!(stream.metrics().low_lead_events, 2);
+    no_alloc(|| {
+        reader.read(&mut [0.0; 300], 0);
+    });
+    assert_eq!(stream.alarm_epoch(), 3);
+    assert_eq!(stream.metrics().missing_output_frames, 101);
+    assert_eq!(stream.metrics().missing_stream_frames, 202);
+    assert_eq!(stream.metrics().min_lead_ratio_permille, 0);
+}

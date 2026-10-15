@@ -214,6 +214,8 @@ pub(crate) enum State {
 }
 
 pub struct Context {
+    /// Last audio trap, measured by the same guest clock as wait deadlines.
+    pub audio_call_us: Option<u64>,
     pub suspend_count: u32,
     pub completion: std::sync::Arc<crate::process::Completion>,
     pub id: CtxId,

@@ -23,6 +23,46 @@ use std::{
 };
 
 const SOURCES: usize = 256;
+
+/// Callback-owned observation only; refill timestamps are sampled by the producer.
+#[derive(Default)]
+pub(crate) struct Lead {
+    last_us: Option<u64>,
+    refills: u8,
+    interval_us: f64,
+    low: bool,
+}
+impl Lead {
+    pub(crate) fn refill(&mut self, now: u64) {
+        if let Some(last) = self.last_us {
+            let interval = now.saturating_sub(last) as f64;
+            self.interval_us = if self.refills == 1 {
+                interval
+            } else {
+                self.interval_us * 0.75 + interval * 0.25
+            };
+        }
+        self.last_us = Some(now);
+        self.refills = self.refills.saturating_add(1);
+    }
+    fn observe(&mut self, lead_us: Option<f64>, counters: &Counters) {
+        let ratio = lead_us
+            .filter(|_| self.refills >= 4 && self.interval_us > 0.0)
+            .map(|lead| lead / self.interval_us);
+        let low = ratio.is_some_and(|ratio| ratio < 2.0);
+        if let Some(ratio) = ratio {
+            counters.min_lead_ratio_permille.fetch_min(
+                ((ratio * 1000.0) as u64).min(u64::MAX - 1),
+                Ordering::Relaxed,
+            );
+        }
+        if low && !self.low {
+            counters.low_lead_events.fetch_add(1, Ordering::Relaxed);
+            counters.alarm_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+        self.low = low;
+    }
+}
 #[derive(Default)]
 pub(crate) struct SourceState {
     pub queued_us: AtomicU64,
@@ -124,13 +164,13 @@ pub(crate) enum Retired {
 }
 enum Command {
     Ring(u64, Box<RingVoice>, Arc<RingState>),
-    Owned(u64, Box<OwnedVoice>),
-    Pcm(PcmBlock),
+    Owned(u64, Box<OwnedVoice>, u64),
+    Pcm(PcmBlock, u64),
     Play(u64, bool, u64, u64, Option<u32>),
     Epoch(u64, u64),
     Stop(u64, Option<u64>),
     Position(u64, u32, u64, Option<u64>),
-    Written(u64, u32, u32),
+    Written(u64, u32, u32, u64),
     Gain(u64, [f32; 2]),
     Retune(u64, u32, Converter, Option<u64>),
     Notices(u64, Vec<(u32, u32)>),
@@ -181,6 +221,9 @@ struct Counters {
     max_stream_queue_us: AtomicU64,
     missing_stream_frames: AtomicU64,
     missing_output_frames: AtomicU64,
+    alarm_epoch: AtomicU64,
+    low_lead_events: AtomicU64,
+    min_lead_ratio_permille: AtomicU64,
     active_sources: AtomicU64,
     audible_sources: AtomicU64,
     output_samples: AtomicU64,
@@ -242,7 +285,10 @@ impl AudioControl {
             active_until_us: AtomicU64::new(0),
             connected: AtomicBool::new(false),
             waker: OnceLock::new(),
-            counters: Counters::default(),
+            counters: Counters {
+                min_lead_ratio_permille: AtomicU64::new(u64::MAX),
+                ..Counters::default()
+            },
         });
         let engine = Box::new(Engine {
             commands: commands_rx,
@@ -255,6 +301,8 @@ impl AudioControl {
             rate: 44100,
             channels: 2,
             notification_retry: None,
+            #[cfg(test)]
+            observe_lead: true,
         });
         shared
             .engine
@@ -493,7 +541,12 @@ impl AudioControl {
                 .queued_source_frames
                 .fetch_add(u64::from(len / align), Ordering::Relaxed);
         }
-        self.send(Command::Written(source, offset, len))
+        let now = self
+            .stream
+            .shared
+            .clock
+            .now_us(self.local.borrow().guest_us);
+        self.send(Command::Written(source, offset, len, now))
     }
     pub fn set_notifications(&self, source: u64, entries: Vec<(u32, u32)>) -> bool {
         self.send(Command::Notices(source, entries))
@@ -578,6 +631,7 @@ impl AudioControl {
             return Err(block);
         }
         let guest_now = self.local.borrow().guest_us;
+        let refill_us = self.stream.shared.clock.now_us(guest_now);
         if self.stream.shared.clock.uses_device_time() {
             // Both sides of the clock translation were sampled by sync_clock.
             // Sampling only device time here would add producer work to each PTS.
@@ -598,7 +652,7 @@ impl AudioControl {
             }
             queue_us = state.queued_us.fetch_add(duration, Ordering::Relaxed) + duration;
             state.queued_blocks.fetch_add(1, Ordering::Release);
-            Command::Pcm(block)
+            Command::Pcm(block, refill_us)
         } else {
             if self.local.borrow().formats.len() + self.local.borrow().rings.len() >= SOURCES {
                 return Err(block);
@@ -620,19 +674,19 @@ impl AudioControl {
                 .borrow_mut()
                 .formats
                 .insert(source, (frequency, state));
-            Command::Owned(source, voice)
+            Command::Owned(source, voice, refill_us)
         };
         let new_source = matches!(&command, Command::Owned(..));
         if let Err(command) = self.try_send(command) {
             return match command {
-                Command::Pcm(block) => {
+                Command::Pcm(block, _) => {
                     if let Some((_, state)) = self.local.borrow().formats.get(&source) {
                         state.queued_us.fetch_sub(duration, Ordering::Relaxed);
                         state.queued_blocks.fetch_sub(1, Ordering::Release);
                     }
                     Err(block)
                 }
-                Command::Owned(_, mut voice) => {
+                Command::Owned(_, mut voice, _) => {
                     self.local.borrow_mut().formats.remove(&source);
                     Err(voice.take_initial())
                 }
@@ -676,6 +730,8 @@ pub(crate) struct Engine {
     rate: u32,
     channels: u16,
     notification_retry: Option<AudioEvent>,
+    #[cfg(test)]
+    observe_lead: bool,
 }
 impl Engine {
     fn service(&mut self, shared: &Shared) {
@@ -708,7 +764,7 @@ impl Engine {
                 | Command::Pause(id, ..)
                 | Command::End(id)
                 | Command::Remove(id) => Some(*id),
-                Command::Pcm(b) => Some(b.stream_id),
+                Command::Pcm(b, _) => Some(b.stream_id),
                 _ => None,
             };
             let at = source.and_then(|id| {
@@ -726,14 +782,19 @@ impl Engine {
                     },
                     at,
                 ),
-                Command::Owned(source, voice) => self.insert(Voice::Owned { source, voice }, at),
-                Command::Pcm(block) => {
+                Command::Owned(source, mut voice, refill_us) => {
+                    voice.lead.refill(refill_us);
+                    self.insert(Voice::Owned { source, voice }, at);
+                }
+                Command::Pcm(block, refill_us) => {
                     if let Some(Voice::Owned { voice, .. }) =
                         at.and_then(|i| self.voices[i].as_mut())
                     {
                         if let Err(block) = voice.push(block) {
                             voice.return_credit(&block);
                             self.retire(Retired::Pcm(block));
+                        } else {
+                            voice.lead.refill(refill_us);
                         }
                     } else {
                         self.retire(Retired::Pcm(block));
@@ -809,7 +870,10 @@ impl Engine {
                                     voice.detach(issued as f64);
                                 }
                             }
-                            (Voice::Ring { voice, .. }, Command::Written(_, offset, len)) => {
+                            (Voice::Ring { voice, .. }, Command::Written(_, offset, len, now)) => {
+                                if len != 0 {
+                                    voice.lead.refill(now);
+                                }
                                 voice.written(offset, len)
                             }
                             (Voice::Ring { voice, .. }, Command::Notices(_, entries)) => {
@@ -929,6 +993,10 @@ impl Engine {
         if self.suspended {
             return;
         }
+        let missing_before = shared
+            .counters
+            .missing_stream_frames
+            .load(Ordering::Relaxed);
         let first_pts = self.cursor_us;
         let active_before = self.voices.iter().flatten().any(Voice::active);
         let step = 1_000_000.0 / f64::from(self.rate);
@@ -1046,6 +1114,32 @@ impl Engine {
             .counters
             .audible_sources
             .store(audible, Ordering::Relaxed);
+        #[cfg(test)]
+        if !self.observe_lead {
+            return;
+        }
+        // Once per callback, including callbacks larger than a 256-frame mix block.
+        for voice in self.voices.iter_mut().flatten() {
+            match voice {
+                Voice::Ring { voice, .. } => {
+                    let lead = voice.lead_us();
+                    voice.lead.observe(lead, &shared.counters);
+                }
+                Voice::Owned { voice, .. } => {
+                    let lead = voice.lead_us();
+                    voice.lead.observe(lead, &shared.counters);
+                }
+            }
+        }
+        // Every missing output frame also increments a stream counter.
+        if shared
+            .counters
+            .missing_stream_frames
+            .load(Ordering::Relaxed)
+            > missing_before
+        {
+            shared.counters.alarm_epoch.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1059,9 +1153,16 @@ impl crate::AudioStream {
     pub fn set_waker(&self, waker: WakeEvent) -> Result<(), WakeEvent> {
         self.shared.waker.set(waker)
     }
+    /// Monotonic observation epoch, readable without synchronizing with the callback.
+    pub fn alarm_epoch(&self) -> u64 {
+        self.shared.counters.alarm_epoch.load(Ordering::Relaxed)
+    }
     pub fn metrics(&self) -> PcmMetrics {
         let c = &self.shared.counters;
+        let min_ratio = c.min_lead_ratio_permille.load(Ordering::Relaxed);
         PcmMetrics {
+            low_lead_events: c.low_lead_events.load(Ordering::Relaxed),
+            min_lead_ratio_permille: if min_ratio == u64::MAX { 0 } else { min_ratio },
             queued_blocks: c.queued_blocks.load(Ordering::Relaxed),
             queued_source_frames: c.queued_source_frames.load(Ordering::Relaxed),
             playback_starts: c.playback_starts.load(Ordering::Relaxed),
@@ -1343,5 +1444,229 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AudioEvent::Released { source: 1 }))
         );
+    }
+
+    fn pcm(source: u64, pts: u64, frames: usize) -> PcmBlock {
+        PcmBlock {
+            stream_id: source,
+            guest_pts_us: pts,
+            sample_rate: 1000,
+            channels: 1,
+            samples: (0..frames).map(|i| (i % 17) as f32 / 32.0).collect(),
+        }
+    }
+
+    fn headroom_fixture(ring: bool) -> (AudioControl, crate::DeviceReader) {
+        let control = AudioControl::new(false);
+        if ring {
+            control
+                .add_ring(
+                    1,
+                    RingConfig {
+                        view: Arc::new(Samples),
+                        bytes: 1000,
+                        channels: 1,
+                        bits: 8,
+                        frequency: 1000,
+                        output_rate: 44100,
+                        notifications: vec![(0, 1), (500, 2)],
+                    },
+                )
+                .unwrap();
+            assert!(control.written(1, 0, 600));
+            assert!(control.play_ring(1, true, 1));
+        } else {
+            assert!(control.push_pcm(pcm(1, 0, 600)).is_ok());
+        }
+        let mut reader = control.stream().device_reader(1000, 2).unwrap();
+        for n in 1..=3 {
+            reader.read(&mut [0.0; 200], 0);
+            control.local.borrow_mut().guest_us = n * 100_000;
+            if ring {
+                assert!(control.written(1, 500 + n as u32 * 100, 100));
+            } else {
+                assert!(control.push_pcm(pcm(1, 500_000 + n * 100_000, 100)).is_ok());
+            }
+            reader.read(&mut [], 0);
+            assert_eq!(control.stream().alarm_epoch(), 0);
+        }
+        (control, reader)
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn headroom_transitions_rearm_for_ring_and_owned() {
+        for ring in [true, false] {
+            let (control, mut reader) = headroom_fixture(ring);
+            assert_eq!(control.stream().metrics().min_lead_ratio_permille, 6000);
+            reader.read(&mut [0.0; 800], 0); // Exactly twice the period is not low.
+            assert_eq!(control.stream().alarm_epoch(), 0);
+            reader.read(&mut [0.0; 2], 0);
+            assert_eq!(control.stream().alarm_epoch(), 1);
+            assert_eq!(control.stream().metrics().min_lead_ratio_permille, 1990);
+            reader.read(&mut [0.0; 100], 0);
+            assert_eq!(control.stream().alarm_epoch(), 1);
+            control.local.borrow_mut().guest_us = 751_000;
+            if ring {
+                assert!(control.written(1, 900, 300));
+            } else {
+                assert!(control.push_pcm(pcm(1, 900_000, 300)).is_ok());
+            }
+            reader.read(&mut [], 0); // Recovered, including coverage across ring wrap.
+            assert_eq!(control.stream().alarm_epoch(), 1);
+            reader.read(&mut [0.0; 200], 0);
+            assert_eq!(control.stream().alarm_epoch(), 2);
+            assert_eq!(control.stream().metrics().low_lead_events, 2);
+            assert_eq!(control.stream().metrics().missing_stream_frames, 0);
+        }
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn headroom_warmup_ema_and_zero_minimum_are_distinct() {
+        let counters = Counters {
+            min_lead_ratio_permille: AtomicU64::new(u64::MAX),
+            ..Default::default()
+        };
+        let mut lead = Lead::default();
+        for now in [0, 100, 200] {
+            lead.refill(now);
+            lead.observe(Some(0.0), &counters);
+            assert_eq!(counters.alarm_epoch.load(Ordering::Relaxed), 0);
+        }
+        lead.refill(300);
+        lead.observe(Some(0.0), &counters);
+        lead.observe(Some(1000.0), &counters);
+        assert_eq!(counters.min_lead_ratio_permille.load(Ordering::Relaxed), 0);
+        lead.refill(500);
+        assert_eq!(lead.interval_us, 125.0);
+        lead.observe(Some(249.0), &counters);
+        assert_eq!(counters.alarm_epoch.load(Ordering::Relaxed), 2);
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn headroom_excludes_ended_paused_and_static_voices() {
+        let (control, mut reader) = headroom_fixture(false);
+        assert!(control.pause_pcm(1, true, 300_000));
+        reader.read(&mut [0.0; 2000], 0);
+        assert_eq!(control.stream().alarm_epoch(), 0);
+        assert!(control.pause_pcm(1, false, 1_300_000));
+        assert!(control.end_pcm(1));
+        reader.read(&mut [0.0; 4000], 0);
+        assert_eq!(control.stream().alarm_epoch(), 0);
+        assert_eq!(control.stream().metrics().missing_stream_frames, 0);
+
+        let control = AudioControl::new(false);
+        control
+            .add_ring(
+                1,
+                RingConfig {
+                    view: Arc::new(Samples),
+                    bytes: 1000,
+                    channels: 1,
+                    bits: 8,
+                    frequency: 1000,
+                    output_rate: 44100,
+                    notifications: vec![],
+                },
+            )
+            .unwrap();
+        for now in [0, 100_000, 200_000, 300_000] {
+            control.local.borrow_mut().guest_us = now;
+            assert!(control.written(1, 0, 1000));
+        }
+        assert!(control.play_ring(1, false, 1));
+        let mut reader = control.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+        assert_eq!(control.stream().alarm_epoch(), 0);
+        assert_eq!(control.stream().metrics().min_lead_ratio_permille, 0);
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn missing_pcm_alarms_once_per_callback_even_across_mix_chunks() {
+        for ring in [true, false] {
+            let (control, mut reader) = headroom_fixture(ring);
+            reader.read(&mut [0.0; 1400], 0); // 100 missing frames, three chunks.
+            let metrics = control.stream().metrics();
+            assert_eq!(metrics.missing_stream_frames, 100);
+            assert_eq!(metrics.missing_output_frames, 100);
+            assert_eq!(metrics.low_lead_events, 1);
+            assert_eq!(control.stream().alarm_epoch(), 2);
+            reader.read(&mut [0.0; 1024], 0);
+            assert_eq!(control.stream().alarm_epoch(), 3);
+        }
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn monitoring_preserves_output_bits_cursors_and_notifications() {
+        for ring in [true, false] {
+            let (observed, mut a) = headroom_fixture(ring);
+            let (reference, mut b) = headroom_fixture(ring);
+            b.engine.observe_lead = false; // Test-only: production is always on.
+            for n in 0..12 {
+                for control in [&observed, &reference] {
+                    control.local.borrow_mut().guest_us = 300_000 + n * 137_000;
+                    if n == 3 {
+                        assert!(control.set_stereo_gain(1, [0.3, 0.7]));
+                    }
+                    if n == 5 {
+                        if ring {
+                            assert!(control.written(1, 900, 500));
+                        } else {
+                            assert!(control.push_pcm(pcm(1, 900_000, 500)).is_ok());
+                        }
+                    }
+                    if n == 7 {
+                        control.set_frequency(1, 1300).unwrap();
+                    }
+                    if n == 9 {
+                        if ring {
+                            assert!(control.stop_ring(1));
+                        } else {
+                            assert!(control.end_pcm(1));
+                        }
+                    }
+                }
+                let mut left = [0.0; 274];
+                let mut right = [0.0; 274];
+                let ar = a.read(&mut left, 0);
+                let br = b.read(&mut right, 0);
+                assert_eq!(left.map(f32::to_bits), right.map(f32::to_bits));
+                assert_eq!(ar.first_pts_us, br.first_pts_us);
+                assert_eq!(ar.missing_stream_frames, br.missing_stream_frames);
+                assert_eq!(ar.missing_output_frames, br.missing_output_frames);
+                if ring {
+                    let state = |reader: &crate::DeviceReader| {
+                        let Voice::Ring { voice, .. } = reader.engine.voices[0].as_ref().unwrap()
+                        else {
+                            panic!()
+                        };
+                        (voice.total_position(), voice.position(), voice.playing)
+                    };
+                    assert_eq!(state(&a), state(&b));
+                }
+                let notices = |control: &AudioControl| {
+                    control
+                        .take_events()
+                        .into_iter()
+                        .map(|event| match event {
+                            AudioEvent::Notification {
+                                source,
+                                generation,
+                                event,
+                                due_us,
+                            } => (source, generation, event, due_us),
+                            AudioEvent::Released { source } => (source, 0, 0, 0),
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(notices(&observed), notices(&reference));
+            }
+            assert!(observed.stream().alarm_epoch() > 0);
+            assert_eq!(reference.stream().alarm_epoch(), 0);
+        }
     }
 }

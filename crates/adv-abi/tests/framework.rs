@@ -547,3 +547,46 @@ fn gdiplus_status_failure_is_nonzero_and_generated_tables_have_no_duplicates() {
         }
     }
 }
+
+// spec: EXEC-CORE-4
+#[test]
+fn audio_registration_rejects_both_leaf_kinds() {
+    for (module, name) in [
+        ("DSOUND.DLL", "IDirectSoundBuffer8::Play"),
+        ("quartz.dll", "IMediaControl::Run"),
+        ("wmvcore.dll", "IWMSyncReader::GetNextSample"),
+        ("winmm.dll", "waveOutWrite"),
+        ("winmm.dll", "waveInStart"),
+        ("winmm.dll", "midiOutShortMsg"),
+        ("winmm.dll", "mciSendStringW"),
+        ("winmm.dll", "mixerGetControlDetailsW"),
+        ("winmm.dll", "auxSetVolume"),
+        ("winmm.dll", "PlaySoundW"),
+        ("winmm.dll", "sndPlaySoundA"),
+    ] {
+        for env_leaf in [false, true] {
+            let result = std::panic::catch_unwind(|| {
+                let mut registry = Registry::default();
+                if env_leaf {
+                    registry.add_env_leaf(
+                        module,
+                        name,
+                        Conv::Stdcall { argc: 0 },
+                        |_| Outcome::Return(0),
+                        |_| Some(0),
+                    );
+                } else {
+                    registry.add_leaf(module, name, Conv::Stdcall { argc: 0 }, |_| 0);
+                }
+            });
+            assert!(result.is_err(), "{module}!{name}: env_leaf={env_leaf}");
+        }
+    }
+    for name in ["timeGetTime", "timeBeginPeriod", "timeSetEvent"] {
+        assert!(!adv_machine::thunk::is_audio_binding("winmm.dll", name));
+    }
+    assert!(!adv_machine::thunk::is_audio_binding(
+        "fixture.dll",
+        "waveOutWrite"
+    ));
+}

@@ -55,6 +55,7 @@ impl Coverage {
     }
 }
 pub struct RingVoice {
+    pub(crate) lead: crate::actor::Lead,
     view: Arc<dyn SharedReadView>,
     pub bytes: u32,
     channels: u16,
@@ -99,6 +100,7 @@ impl RingVoice {
         }
         let frames = config.bytes / align;
         Ok(Box::new(Self {
+            lead: Default::default(),
             view: config.view,
             bytes: config.bytes,
             channels: config.channels,
@@ -153,6 +155,42 @@ impl RingVoice {
             self.read_frame = self.phase >> 32;
             self.converter.reset();
         }
+    }
+    /// Contiguous coverage from the playback phase, bounded to one ring traversal.
+    pub(crate) fn lead_us(&self) -> Option<f64> {
+        if !self.streaming || !self.playing {
+            return None;
+        }
+        let total = self.frames();
+        let first = self.phase >> 32;
+        let limit = if self.looping {
+            total
+        } else {
+            total.saturating_sub(first)
+        };
+        let mut covered = 0;
+        while covered < limit {
+            let frame = first + covered;
+            let position = frame % total;
+            let bit = (position % 64) as u32;
+            let run = (64 - u64::from(bit))
+                .min(total - position)
+                .min(limit - covered);
+            let mask = self.written[position as usize / 64]
+                .epochs
+                .iter()
+                .filter(|e| {
+                    e.generation == self.generation as u32 && e.turn >= (frame / total) as u32
+                })
+                .fold(0, |mask, e| mask | e.mask);
+            let available = u64::from((mask >> bit).trailing_ones()).min(run);
+            covered += available;
+            if available < run {
+                break;
+            }
+        }
+        let fraction = (self.phase & 0xffff_ffff) as f64 / 4294967296.0;
+        Some((covered as f64 - fraction).max(0.0) * 1_000_000.0 / f64::from(self.frequency))
     }
     pub fn output_rate(&self) -> u32 {
         self.converter.rate
@@ -407,5 +445,85 @@ impl RingVoice {
                 *bits &= !(1 << bit);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Silence;
+    impl SharedReadView for Silence {
+        fn len(&self) -> usize {
+            131
+        }
+        fn load_u8(&self, _: usize) -> u8 {
+            128
+        }
+    }
+
+    // spec: MEDIA-AUDIO-4
+    #[test]
+    fn lead_matches_frame_coverage_across_wrap_generations_and_partial_words() {
+        let mut voice = RingVoice::new(RingConfig {
+            view: Arc::new(Silence),
+            bytes: 131,
+            channels: 1,
+            bits: 8,
+            frequency: 1000,
+            output_rate: 1000,
+            notifications: vec![],
+        })
+        .unwrap();
+        voice.playing = true;
+        voice.streaming = true;
+        voice.generation = 7;
+        for (cell, mask) in voice
+            .written
+            .iter_mut()
+            .zip([u64::MAX, u64::MAX ^ (1 << 20), 7])
+        {
+            cell.epochs = [
+                Written {
+                    generation: 7,
+                    turn: 2,
+                    mask,
+                },
+                Written {
+                    generation: 7,
+                    turn: 3,
+                    mask: 0xffff,
+                },
+            ];
+        }
+        for looping in [false, true] {
+            voice.looping = looping;
+            for first in 0..524 {
+                voice.phase = (first << 32) | 0x4000_0000;
+                let limit = if looping {
+                    131
+                } else {
+                    131u64.saturating_sub(first)
+                };
+                let count = (0..limit)
+                    .take_while(|n| {
+                        let frame = first + n;
+                        let pos = frame % 131;
+                        voice.written[pos as usize / 64].covers(
+                            7,
+                            (frame / 131) as u32,
+                            (pos % 64) as u32,
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    voice.lead_us(),
+                    Some((count as f64 - 0.25).max(0.0) * 1000.0)
+                );
+            }
+        }
+        voice.generation = 8;
+        assert_eq!(voice.lead_us(), Some(0.0));
+        voice.playing = false;
+        assert_eq!(voice.lead_us(), None);
     }
 }
