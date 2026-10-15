@@ -98,6 +98,7 @@ dependencies = [
  "encoding_rs",
  "ffmpeg-next",
  "fontdb",
+ "libc",
  "log",
  "naga-types",
  "objc2",

@@ -77,6 +77,20 @@ pub struct NativeContext {
 }
 
 impl NativeContext {
+    /// Prepare exactly the same source used by demand compilation. The returned
+    /// module is immutable and usable only on this device, including forks.
+    pub fn prepare_program(&self, mut program: Program) -> Result<Program, Error> {
+        validate_program(&program)?;
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("translated shader"),
+                source: wgpu::ShaderSource::Wgsl(program.source.to_string().into()),
+            });
+        self.check()?;
+        program.compiled = Some((self.id, module));
+        Ok(program)
+    }
     pub fn check(&self) -> Result<(), Error> {
         match self.failure.get() {
             Some(error) => Err(Error::Device(error.clone())),

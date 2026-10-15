@@ -2,6 +2,7 @@
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
 use crate::surface::Rect;
 mod clear;
+pub mod compile;
 mod depth;
 mod line;
 mod programmable;
@@ -239,6 +240,8 @@ pub struct Stats {
     pub last_flush_buffer_writes: u64,
     pub bind_group_creations: u64,
     pub pipeline_cache_hits: u64,
+    pub compile_waits: u64,
+    pub compile_wait_ns: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

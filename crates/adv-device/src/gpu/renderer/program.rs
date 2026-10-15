@@ -574,10 +574,14 @@ impl Gpu {
             bind_group_layouts: &[Some(&constants), Some(&textures)],
             immediate_size: 0,
         });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("translated shader"),
-            source: wgpu::ShaderSource::Wgsl(program.source.to_string().into()),
-        });
+        let prepared;
+        let module = match &program.compiled {
+            Some((id, module)) if *id == self.context.id => module,
+            _ => {
+                prepared = self.context.prepare_program(program.clone())?;
+                &prepared.compiled.as_ref().unwrap().1
+            }
+        };
         let attributes: Vec<Vec<_>> = key
             .streams
             .iter()

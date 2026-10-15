@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "dep:naga-types"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "dep:naga-types", "dep:libc"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -20,6 +20,7 @@ slow-tests = []
 cpal = { version = "0.16", optional = true }
 log.workspace = true
 sha2 = "0.10"
+libc = { version = "0.2", optional = true }
 adv-sync = { path = "../adv-sync" }
 rubato = { version = "0.16", default-features = false }
 symphonia = { version = "0.5.5", default-features = false, features = ["pcm", "adpcm", "vorbis"] }
