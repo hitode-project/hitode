@@ -26,6 +26,9 @@ pub(crate) struct NativePresentation {
     pub max_job_ns: u64,
     pub max_acquire_ns: u64,
     pub max_configure_ns: u64,
+    pub upscaled_runs: u64,
+    /// Input pixels recomputed by each run's last upscaling pass.
+    pub upscaled_pixels: u64,
 }
 impl NativePresentation {
     fn json(&self) -> String {
@@ -35,7 +38,8 @@ impl NativePresentation {
                 "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
                 "\"max_job_ns\": {}, \"max_acquire_ns\": {}, \"max_configure_ns\": {}, ",
                 "\"software_uploaded_bytes\": {}, \"software_converted_bytes\": {}, ",
-                "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}}}"
+                "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}, ",
+                "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}}}"
             ),
             self.consumed,
             self.uploads,
@@ -54,7 +58,9 @@ impl NativePresentation {
             self.converted_bytes as f64
                 / self
                     .software_started
-                    .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9))
+                    .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9)),
+            self.upscaled_runs,
+            self.upscaled_pixels
         )
     }
 }

@@ -62,6 +62,8 @@ struct Host {
     // Pending game close, with an exit code only when the application should quit.
     exit: Option<Option<i32>>,
     quit: Retained<QuitHandler>,
+    /// The last overlay change applied to the webview's visibility.
+    overlay_change: u64,
     observers: Vec<Observer>,
 }
 /// A block observer and the notification center it is registered with.
@@ -215,21 +217,43 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 exit: None,
                 quit,
                 observers,
+                overlay_change: 0,
             })
         });
     })?;
     let handle = app.handle().clone();
-    app.state::<OverlayState>().on_change(move |input| {
+    app.state::<OverlayState>().on_change(move |input, change| {
         let target = input.keyboard();
+        let visible = input.visible;
         let _ = handle.run_on_main_thread(move || {
-            HOST.with_borrow(|host| {
+            HOST.with_borrow_mut(|host| {
                 if let Some(host) = host {
                     host.focus(target);
+                    // Changes from before the latest `pause` are stale.
+                    if change > host.overlay_change {
+                        host.overlay_change = change;
+                        host.container.set_overlay_visible(visible);
+                    }
                 }
             })
         });
     });
     Ok(())
+}
+
+/// Emits `pause` after showing the overlay: a hidden WKWebView runs no
+/// animation frames, so it could never publish the menu that shows it.
+pub(crate) fn pause<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        HOST.with_borrow_mut(|host| {
+            if let Some(host) = host {
+                host.overlay_change = handle.state::<OverlayState>().changes();
+                host.container.set_overlay_visible(true);
+            }
+        });
+        let _ = handle.emit("pause", ());
+    });
 }
 
 #[tauri::command]

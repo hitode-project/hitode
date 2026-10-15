@@ -28,7 +28,7 @@ pub(super) fn machine_with_native(native: bool) -> Machine<JitCpu> {
         target: |_, _| None,
         remove: |_, _, _| Ok(()),
         replace: |_, _, _| unreachable!(),
-        present: |_, _, _| unreachable!(),
+        present: |_, _, _, _| unreachable!(),
         present_copy: |_, _, _| unreachable!(),
         repeat: |_, _| unreachable!(),
         presentation_serial: |_| Some(0),

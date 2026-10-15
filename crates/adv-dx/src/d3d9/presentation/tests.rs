@@ -458,7 +458,7 @@ fn install_surfaces(env: &mut Env<'_>) {
         ext.get_mut::<Surfaces>().targets.remove(&surface).unwrap();
         Ok(())
     };
-    state.provider.present = |ext, surface, gpu| {
+    state.provider.present_copy = |ext, surface, gpu| {
         let surfaces = ext.get_mut::<Surfaces>();
         let serial = surfaces.serial + 1;
         let frame = gpu.present(&surfaces.targets[&surface].image, serial)?;
@@ -466,7 +466,10 @@ fn install_surfaces(env: &mut Env<'_>) {
         surfaces.serial = serial;
         Ok(serial)
     };
-    state.provider.present_copy = state.provider.present;
+    state.provider.present = |ext, surface, _, gpu| {
+        let copy = ext.get::<State>().provider.present_copy;
+        copy(ext, surface, gpu)
+    };
     state.provider.presentation_serial = |ext| Some(ext.get::<Surfaces>().serial);
     state.provider.repeat = |ext, _| {
         let s = ext.get_mut::<Surfaces>();

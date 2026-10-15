@@ -62,7 +62,7 @@ impl Fixture {
                     target: |_, _| None,
                     remove: |_, _, _| panic!("DxDiag never removes surfaces"),
                     replace: |_, _, _| panic!("DxDiag never replaces surfaces"),
-                    present: |_, _, _| panic!("DxDiag never presents"),
+                    present: |_, _, _, _| panic!("DxDiag never presents"),
                     present_copy: |_, _, _| panic!("DxDiag never presents"),
                     repeat: |_, _| panic!("DxDiag never presents"),
                     presentation_serial: |_| Some(0),

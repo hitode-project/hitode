@@ -433,6 +433,45 @@ impl Rect {
         }
     }
 }
+/// The damage of the last eight native publications, each relative to the
+/// publication before it. A consumer that last saw publication `n` redraws the
+/// union since `n`, so frames replaced in the mailbox still count.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameDamage {
+    publication: u64,
+    /// (publication, surface, damage); `None` damage means the whole frame.
+    recent: [(u64, u32, Option<Rect>); 8],
+}
+impl FrameDamage {
+    pub fn publication(&self) -> u64 {
+        self.publication
+    }
+    fn push(&mut self, surface: u32, damage: Option<Rect>) {
+        self.publication += 1;
+        self.recent[(self.publication % 8) as usize] = (self.publication, surface, damage);
+    }
+    /// The area changed since publication `last`, or `None` for the whole frame:
+    /// when `last` is unknown or too old, or another surface published since it.
+    pub fn since(&self, last: Option<u64>) -> Option<Rect> {
+        let last = last?;
+        if last >= self.publication || self.publication - last >= 8 {
+            return None;
+        }
+        let surface = self.recent[(self.publication % 8) as usize].1;
+        let mut union = Rect::default();
+        for publication in last..=self.publication {
+            let (n, s, damage) = self.recent[(publication % 8) as usize];
+            if n != publication || s != surface {
+                return None;
+            }
+            if publication > last {
+                union = union.union(damage?);
+            }
+        }
+        Some(union)
+    }
+}
+
 /// Bounded software damage, stored without per-publication allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Damage {
@@ -1137,6 +1176,8 @@ pub struct Surfaces<P: Presenter> {
     software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
+    #[cfg(feature = "gpu")]
+    native_damage: FrameDamage,
     primary: Option<u32>,
     deferred_presentation: bool,
     pending_frame: Option<PendingFrame>,
@@ -1198,6 +1239,8 @@ impl<P: Presenter> Surfaces<P> {
             software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
+            #[cfg(feature = "gpu")]
+            native_damage: FrameDamage::default(),
             primary: None,
             deferred_presentation: false,
             pending_frame: None,
@@ -2009,7 +2052,7 @@ impl<P: Presenter> Surfaces<P> {
         let frame = gpu
             .present(image, serial)
             .map_err(|error| error.to_string())?;
-        self.publish_native_frame(id, frame)?;
+        self.publish_native_frame(id, frame, None)?;
         Ok(())
     }
 
@@ -2041,9 +2084,11 @@ impl<P: Presenter> Surfaces<P> {
     /// rotates one available target. No texture copy or Queue submit is needed.
     /// The pool is bounded; retaining all frames returns Busy before publication.
     #[cfg(feature = "gpu")]
+    /// `damage` is what changed since this surface's previous presentation.
     pub fn present_native_rotating(
         &mut self,
         id: u32,
+        damage: Option<Rect>,
         gpu: &mut crate::gpu::Gpu,
     ) -> Result<u64, crate::gpu::Error> {
         use crate::gpu::Error;
@@ -2090,7 +2135,7 @@ impl<P: Presenter> Surfaces<P> {
         let frame = gpu.completed_frame_under(native.target.image.clone(), serial, &submission)?;
         let replacement =
             replacement.unwrap_or_else(|| native.spares.swap_remove(reusable.unwrap()));
-        if let Err(error) = self.publish_native_frame(id, frame) {
+        if let Err(error) = self.publish_native_frame(id, frame, damage) {
             if reusable.is_some() {
                 self.native_surfaces
                     .get_mut(&id)
@@ -2113,6 +2158,7 @@ impl<P: Presenter> Surfaces<P> {
         &mut self,
         id: u32,
         mut frame: crate::gpu::NativeFrame,
+        damage: Option<Rect>,
     ) -> Result<u64, String> {
         let native = self
             .native_surfaces
@@ -2130,6 +2176,8 @@ impl<P: Presenter> Surfaces<P> {
             .checked_add(1)
             .ok_or("presentation serial exhausted")?;
         frame.serial = serial;
+        self.native_damage.push(id, damage);
+        frame.damage = self.native_damage;
         if self.frame_mailbox.is_none() && !self.deferred_presentation {
             self.presenter.present_native(&frame)?;
             self.captured_serial = serial;
@@ -2822,4 +2870,33 @@ pub fn size(w: u32, h: u32) -> Result<u32, String> {
     w.checked_mul(h)
         .and_then(|n| n.checked_mul(4))
         .ok_or("surface overflow".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameDamage, Rect};
+
+    // spec: HOST-VIEW-10
+    #[test]
+    fn frame_damage_unions_publications_and_reports_gaps_as_unknown() {
+        let rect = |x, w| Rect { x, y: 0, w, h: 1 };
+        let mut damage = FrameDamage::default();
+        damage.push(1, Some(rect(0, 2)));
+        damage.push(1, Some(rect(10, 2)));
+        assert_eq!(damage.since(Some(1)), Some(rect(10, 2)));
+        assert_eq!(damage.since(Some(0)), None, "an unknown publication");
+        assert_eq!(damage.since(None), None);
+        assert_eq!(damage.since(Some(2)), None, "nothing new is a full redraw");
+        damage.push(1, None);
+        damage.push(1, Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(3)), Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(2)), None, "a full publication in between");
+        damage.push(2, Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(4)), None, "another surface in between");
+        for _ in 0..8 {
+            damage.push(2, Some(rect(0, 1)));
+        }
+        assert_eq!(damage.since(Some(5)), None, "evicted history");
+        assert_eq!(damage.since(Some(6)), Some(rect(0, 1)));
+    }
 }
