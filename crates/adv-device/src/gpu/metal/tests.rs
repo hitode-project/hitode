@@ -58,6 +58,33 @@ fn native_triangle_matches_wgpu_with_fresh_and_cleared_targets() {
     assert_eq!(native.stats().metal_draws, 4);
 }
 
+#[test]
+// spec: GFX-METAL-1, GFX-REC-7
+fn sparse_native_constants_match_full_wgpu_and_ignore_unused_registers() {
+    let mut native = gpu(true);
+    let mut reference = gpu(false);
+    let target = native.target(4, 4, false).unwrap();
+    let expected = reference.target(4, 4, false).unwrap();
+    let mut draw = draw();
+    draw.program.constants = [crate::constants::ConstantUsage::default(); 2];
+    draw.program.constants[1].set(0);
+    draw.pixel_constants.floats[0] = [0.13, 0.71, 0.29, 0.53];
+    let state = DrawState::new(4, 4);
+    let before = native.stats().ring_bytes;
+    native.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(native.stats().ring_bytes - before, 16 + 640 + 52);
+    let written = native.stats().ring_bytes;
+    draw.vertex_constants.floats.fill([f32::NAN; 4]);
+    draw.pixel_constants.floats[255] = [f32::INFINITY; 4];
+    native.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(native.stats().ring_bytes - written, 52);
+    draw.program.constants = [crate::constants::ConstantUsage::ALL; 2];
+    reference
+        .draw_programmable(&expected, &draw, &state)
+        .unwrap();
+    assert_eq!(read(&mut native, &target), read(&mut reference, &expected));
+}
+
 fn textured_draw(
     program: &Program,
     stride: usize,

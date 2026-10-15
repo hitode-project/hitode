@@ -10,8 +10,8 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X16, X17, biased,
-    host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X13, X16, X17,
+    biased, host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::IndirectBranchKind;
@@ -80,7 +80,11 @@ impl Translator<'_> {
             Op::Alu(_, Src::Imm(_), _) => unreachable!(),
             Op::Step(increment, index) => self.step(increment, index),
             Op::StepMemory(increment, mem) => self.step_memory(increment, mem),
-            Op::Narrow(alu, width, dst, src) => self.narrow_op(alu, width, dst, src),
+            Op::Narrow(alu, width, dst, src) => self.narrow_op(alu, width, dst, src, false),
+            Op::NarrowStep(increment, width, dst) => {
+                let alu = if increment { Alu::Add } else { Alu::Sub };
+                self.narrow_op(Some(alu), width, dst, Part::Imm(1), true);
+            }
             Op::Neg(index) => {
                 let guest = Operand::Guest(index);
                 self.emit(subs(W, result(index), Reg::ZR, host(index), Lsl, 0));
@@ -697,7 +701,11 @@ impl Translator<'_> {
     /// the recipe temporaries, so PF and AF recipes see their low bits; the
     /// flags come from the operands shifted to the top of a W register.
     /// Stores precede the flags (A64-FLAG-4).
-    fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part) {
+    fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part, step: bool) {
+        let step = step && self.keep.any(FlagSet::CF);
+        if step {
+            self.convert(FlagSet::CF);
+        }
         let shift = 32 - 8 * u32::from(width);
         // Both temporaries are overwritten. A fault site observes every
         // flag, so then nothing may still read them.
@@ -757,6 +765,10 @@ impl Translator<'_> {
             self.dead();
             return;
         }
+        if step {
+            let carry = if alu == Alu::Add { Cond::Lo } else { Cond::Hs };
+            self.emit(cset(W, X13, carry));
+        }
         // The right operand shifted to the top, as a register and a shift.
         let shifted = |t: &mut Self| match right {
             Operand::Imm(value) => (t.imm(value << shift, X16), 0),
@@ -793,6 +805,13 @@ impl Translator<'_> {
                 (Sense::Addition, recipe)
             }
         };
+        if step {
+            if self.features.flagm {
+                self.emit(rmif(X13, 63, 2));
+            } else {
+                self.emit_all(&[mrs_nzcv(X16), bfi(X, X16, X13, 29, 1), msr_nzcv(X16)]);
+            }
+        }
         let logic = matches!(alu, Alu::And | Alu::Test | Alu::Or | Alu::Xor);
         self.state = State {
             sense,

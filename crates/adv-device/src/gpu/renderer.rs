@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -324,6 +324,8 @@ impl Drop for FramePin {
 pub struct NativeFrame {
     pub image: Image,
     pub serial: u64,
+    /// What recent publications changed, set when the frame is published.
+    pub damage: crate::surface::FrameDamage,
     context: NativeContext,
     _pin: Arc<FramePin>,
 }
@@ -343,12 +345,17 @@ pub struct Readback {
     context: NativeContext,
     submission: wgpu::SubmissionIndex,
     job_taken: bool,
+    /// Set by whichever of the map callback or cancel touches the buffer first.
+    claimed: Arc<AtomicBool>,
 }
 impl Readback {
     /// Cancel an unconsumed transfer during owner teardown. Unmapping cancels
     /// its pending map; Poll only delivers ready callbacks and never waits.
+    /// A callback that already claimed the buffer unmaps it itself.
     pub fn cancel(&self) {
-        self.buffer.unmap();
+        if !self.claimed.swap(true, Ordering::AcqRel) {
+            self.buffer.unmap();
+        }
         let _ = self.context.device.poll(wgpu::PollType::Poll);
     }
     pub fn poll(&mut self) -> Option<Result<Vec<u8>, Error>> {
@@ -485,7 +492,9 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("adv neutral graphics"),
                 required_limits: limits,
-                required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
+                // SHADER_F16 serves the half-precision upscalers.
+                required_features: adapter.features()
+                    & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::SHADER_F16),
                 ..Default::default()
             })
             .await
@@ -1215,7 +1224,11 @@ impl Gpu {
         let offset = pending
             .vertices
             .append(&self.upload, bytemuck::cast_slice(vertices), 4);
-        let base = pending.constants(&self.uniform, &[bytemuck::cast_slice(&parameters)]);
+        let base = pending.constants(
+            &context.device,
+            &self.uniform,
+            std::iter::once((0, bytemuck::cast_slice(&parameters))),
+        );
         {
             let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline);
@@ -1503,6 +1516,7 @@ impl Gpu {
         Ok(NativeFrame {
             image: snapshot,
             serial,
+            damage: Default::default(),
             context: self.context.clone(),
             _pin: pin,
         })
@@ -1537,6 +1551,7 @@ impl Gpu {
         Ok(NativeFrame {
             image,
             serial,
+            damage: Default::default(),
             context: self.context.clone(),
             _pin: pin,
         })
@@ -1589,10 +1604,16 @@ impl Gpu {
         let (mut producer, consumer) = adv_sync::spsc::channel(1);
         let completion_buffer = buffer.clone();
         let (width, height) = (image.width, image.height);
+        let claimed = Arc::new(AtomicBool::new(false));
+        let completion_claim = claimed.clone();
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let cancelled = completion_claim.swap(true, Ordering::AcqRel);
             let result = result
                 .map_err(|error| Error::Device(error.to_string()))
                 .and_then(|()| {
+                    if cancelled {
+                        return Err(Error::Device("GPU readback cancelled".into()));
+                    }
                     let mapped = completion_buffer
                         .get_mapped_range(..)
                         .map_err(|error| Error::Device(error.to_string()))?;
@@ -1622,6 +1643,7 @@ impl Gpu {
             context: self.context.clone(),
             submission,
             job_taken: false,
+            claimed,
         })
     }
 }

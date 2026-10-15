@@ -1,7 +1,11 @@
 use super::*;
 
 fn gpu() -> Gpu {
-    let gpu = pollster::block_on(Gpu::request(!cfg!(target_os = "macos"))).unwrap();
+    let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .unwrap();
     // These tests inspect the wgpu batching and binding caches directly.
     #[cfg(target_vendor = "apple")]
     {
@@ -67,6 +71,59 @@ fn adjacent_constants_reuse_offsets_and_clones_reuse_pipelines() {
     assert_eq!(gpu.stats().pipeline_cache_hits, 2);
     assert_eq!(gpu.stats().bind_group_creations, 2);
     assert_eq!(read(&mut gpu, &target), [0, 255, 0, 255].repeat(2));
+    assert_eq!(gpu.stats().last_flush_buffer_writes, 1);
+}
+
+#[test]
+// spec: GFX-REC-7, GFX-BUFFER-2
+fn sparse_uniforms_ignore_unused_changes_and_wrap_the_complete_binding_window() {
+    let mut gpu = gpu();
+    let target = gpu.target(2, 1, false).unwrap();
+    let state = DrawState::new(2, 1);
+    let mut draw = draw();
+    draw.program.constants = [crate::constants::ConstantUsage::default(); 2];
+    draw.program.constants[1].set(0);
+    draw.pixel_constants.floats[0] = [1., 0., 0., 1.];
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    {
+        let pending = gpu.context.pending.lock().unwrap();
+        assert_eq!(pending.uniforms.bytes.len(), 16 + PARAMETER_SIZE as usize);
+        assert_eq!(pending.uniform_copies[0].0, CONSTANT_SIZE as usize);
+    }
+    draw.vertex_constants.floats.fill([f32::NAN; 4]);
+    draw.pixel_constants.floats[255] = [f32::INFINITY; 4];
+    draw.pixel_constants.integers.fill([123; 4]);
+    draw.pixel_constants.booleans.fill([1; 4]);
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    {
+        let mut pending = gpu.context.pending.lock().unwrap();
+        assert_eq!(pending.last_constants.start, 0);
+        assert_eq!(pending.uniforms.bytes.len(), 656);
+        // Leave room for the used bytes, but not the complete binding window.
+        pending.uniform_end = gpu.uniform.size() as usize - 256;
+    }
+    draw.pixel_constants.floats[0] = [0., 1., 0., 1.];
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    {
+        let pending = gpu.context.pending.lock().unwrap();
+        let base = pending.last_constants.start as u64;
+        assert_eq!(base, 0, "wrap flushes before reusing storage");
+        assert!(base + 2 * CONSTANT_SIZE + PARAMETER_SIZE <= gpu.uniform.size());
+        assert_eq!(
+            base % u64::from(
+                gpu.context
+                    .device
+                    .limits()
+                    .min_uniform_buffer_offset_alignment
+            ),
+            0
+        );
+    }
+    let sparse = read(&mut gpu, &target);
+    assert_eq!(sparse, [0, 255, 0, 255].repeat(2));
+    draw.program.constants = [crate::constants::ConstantUsage::ALL; 2];
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    assert_eq!(read(&mut gpu, &target), sparse);
     assert_eq!(gpu.stats().last_flush_buffer_writes, 1);
 }
 

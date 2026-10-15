@@ -20,7 +20,7 @@ pub const MAX_SHADER_TOKENS: usize = 65_536;
 pub const MAX_EXECUTION_STEPS: usize = 65_536;
 pub const MAX_FLOW_DEPTH: usize = 32;
 pub const MAX_TRANSLATION_BYTES: usize = 4 * 1024 * 1024;
-pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-6";
+pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-7";
 /// Read a guest token stream without mistaking immediate or comment data for END.
 /// The callback's index is in DWORDs, and is always below MAX_SHADER_TOKENS.
 pub fn read_bytecode<E: std::fmt::Display>(
@@ -255,6 +255,7 @@ pub(crate) struct Flow {
 }
 #[derive(Clone, Debug)]
 pub struct Translation {
+    pub constants: adv_device::constants::ConstantUsage,
     pub source: String,
     pub samplers: Vec<SamplerBinding>,
     pub writes_depth: bool,

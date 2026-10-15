@@ -87,8 +87,8 @@ pub(super) struct Draw {
     pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
     pub state: DrawState,
     pub programmable: Option<adv_device::gpu::ProgrammableDraw>,
-    pub recording_key: u64,
-    pub program_key: u64,
+    pub recording_key: u128,
+    pub program_key: u128,
 }
 pub(super) struct Rejected {
     pub code: u32,

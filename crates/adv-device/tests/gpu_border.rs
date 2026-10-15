@@ -168,8 +168,8 @@ fn border_nearest_linear_mixed_address_and_mips_are_portable() {
     #[cfg(target_os = "macos")]
     verify(GpuBackend::Metal);
     #[cfg(not(target_os = "macos"))]
-    {
-        verify(GpuBackend::Vulkan);
-        verify(GpuBackend::Gl);
-    }
+    verify(GpuBackend::Vulkan);
+    // Android runs Vulkan only; its GLES shading version lacks textureNumLevels.
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    verify(GpuBackend::Gl);
 }

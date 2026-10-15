@@ -129,6 +129,8 @@ pub struct Program {
     pub(super) source: Arc<str>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
     pub textures: Vec<bool>,
+    /// External register usage; hand-authored programs default to complete blocks.
+    pub constants: [crate::constants::ConstantUsage; 2],
 }
 #[derive(Clone)]
 pub struct ProgramTexture {
@@ -158,6 +160,27 @@ impl Program {
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source,
             textures,
+            constants: [crate::constants::ConstantUsage::ALL; 2],
         }
+    }
+}
+
+impl ProgrammableDraw {
+    pub fn constant_ranges(&self) -> impl Iterator<Item = (usize, &[u8])> + Clone {
+        [&self.vertex_constants, &self.pixel_constants]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(stage, block)| {
+                self.program.constants[stage].ranges().map(move |r| {
+                    (
+                        stage * std::mem::size_of::<ConstantBlock>() + r.start,
+                        &bytemuck::bytes_of(block)[r],
+                    )
+                })
+            })
+            .chain(std::iter::once((
+                2 * std::mem::size_of::<ConstantBlock>(),
+                bytemuck::bytes_of(&self.parameters),
+            )))
     }
 }

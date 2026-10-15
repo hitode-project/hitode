@@ -2,6 +2,7 @@
 struct SLANG_ParameterGroup_Params_std140_0
 {
     @align(16) dimensions_0 : vec4<u32>,
+    @align(16) origin_0 : vec4<u32>,
 };
 
 @binding(0) @group(0) var<uniform> Params_0 : SLANG_ParameterGroup_Params_std140_0;
@@ -23,13 +24,13 @@ fn hook_0( pos_0 : vec2<f32>) -> vec4<f32>
 
 @compute
 @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) id_0 : vec3<u32>)
+fn main(@builtin(global_invocation_id) group_0 : vec3<u32>)
 {
-    var _S1 : vec2<u32> = id_0.xy;
-    if((any((_S1 >= (Params_0.dimensions_0.xy)))))
+    var id_0 : vec2<u32> = group_0.xy + Params_0.origin_0.xy;
+    if((any((id_0 >= (Params_0.dimensions_0.xy)))))
     {
         return;
     }
-    textureStore((conv2d_3_0), (_S1), (hook_0((vec2<f32>(_S1) + vec2<f32>(0.5f)) / vec2<f32>(Params_0.dimensions_0.xy))));
+    textureStore((conv2d_3_0), (id_0), (hook_0((vec2<f32>(id_0) + vec2<f32>(0.5f)) / vec2<f32>(Params_0.dimensions_0.xy))));
     return;
 }

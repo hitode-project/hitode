@@ -244,6 +244,11 @@ pub const fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9BA0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
 }
 
+/// `mul rd, rn, rm`: the low half of the product.
+pub const fn mul(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x1B00_7C00 | size.sf() | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
 /// `msub rd, rn, rm, ra`: `ra - rn * rm`.
 pub const fn msub(size: Size, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
     0x1B00_8000 | size.sf() | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
@@ -992,6 +997,10 @@ pub enum Unary {
     Fneg = 0x1E61_4000,
     /// `frintn dd, dn`: to the nearest integer, ties to even.
     Frintn = 0x1E64_4000,
+    /// `frintm dd, dn`: toward negative infinity.
+    Frintm = 0x1E65_4000,
+    /// `frintp dd, dn`: toward positive infinity.
+    Frintp = 0x1E64_C000,
     /// `frintz dd, dn`: toward zero.
     Frintz = 0x1E65_C000,
     /// `fcvt dd, sn`.
@@ -1500,6 +1509,8 @@ mod tests {
             (msub(X, r(15), r(17), r(6), r(16)), "msub x15, x17, x6, x16"),
             (umull(r(16), r(19), r(6)), "umull x16, w19, w6"),
             (mrs_fpsr(r(17)), "mrs x17, fpsr"),
+            (mul(X, r(0), r(1), r(2)), "mul x0, x1, x2"),
+            (mul(W, r(0), r(1), r(2)), "mul w0, w1, w2"),
             (dfloat(Float::Fadd, v(0), v(1), v(2)), "fadd d0, d1, d2"),
             (dfloat(Float::Fsub, v(0), v(1), v(2)), "fsub d0, d1, d2"),
             (dfloat(Float::Fmul, v(0), v(1), v(2)), "fmul d0, d1, d2"),
@@ -1510,6 +1521,8 @@ mod tests {
             (unary(Unary::Fabs, v(0), v(1)), "fabs d0, d1"),
             (unary(Unary::Fneg, v(0), v(1)), "fneg d0, d1"),
             (unary(Unary::Frintn, v(0), v(1)), "frintn d0, d1"),
+            (unary(Unary::Frintm, v(0), v(1)), "frintm d0, d1"),
+            (unary(Unary::Frintp, v(0), v(1)), "frintp d0, d1"),
             (unary(Unary::Frintz, v(0), v(1)), "frintz d0, d1"),
             (unary(Unary::Widen, v(0), v(1)), "fcvt d0, s1"),
             (unary(Unary::Narrow, v(0), v(1)), "fcvt s0, d1"),

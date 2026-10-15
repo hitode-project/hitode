@@ -148,6 +148,25 @@ fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_los
 }
 
 #[test]
+fn cancel_after_a_delivered_map_leaves_the_device_valid() {
+    let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        target_os = "macos",
+        target_os = "android"
+    ))))
+    .expect("test GPU adapter");
+    gpu.set_readback_limit(1).unwrap();
+    let target = gpu.target(2, 2, false).unwrap();
+    gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+    let mut ticket = gpu.readback(&target.image, None).unwrap();
+    ticket.take_completion_job().unwrap()();
+    // The callback already unmapped; owner teardown races and still cancels.
+    ticket.cancel();
+    assert_eq!(ticket.poll().unwrap().unwrap(), [0, 0, 255, 255].repeat(4));
+    assert!(gpu.check().is_ok());
+    assert_eq!(read(&mut gpu, &target.image), [0, 0, 255, 255].repeat(4));
+}
+
+#[test]
 fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() {
     use adv_device::surface::{Snapshot, Surfaces};
     let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
@@ -597,7 +616,9 @@ fn opaque_images_sample_one_and_preserve_semantics_across_frame_rotation() {
     let (producer, mut consumer) = frame_mailbox();
     surfaces.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
     for _ in 0..3 {
-        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        surfaces
+            .present_native_rotating(id, None, &mut gpu)
+            .unwrap();
         assert!(consumer.update());
         assert_eq!(
             consumer.current().native().unwrap().image.alpha_mode(),
@@ -804,7 +825,7 @@ fn invalid_commands_are_rejected_before_gpu_submission_and_context_can_be_rebuil
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 #[test]
 fn actual_software_adapter_clear_and_draw() {
     color_texture_blend_clip_depth_and_native_frame_readback(true);
@@ -1194,7 +1215,9 @@ fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutab
         .unwrap();
         let before = gpu.stats().submissions;
         assert_eq!(
-            surfaces.present_native_rotating(id, &mut gpu).unwrap(),
+            surfaces
+                .present_native_rotating(id, None, &mut gpu)
+                .unwrap(),
             u64::from(serial)
         );
         assert_eq!(
@@ -1230,14 +1253,16 @@ fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutab
     );
     let mut held = Vec::new();
     while surfaces.native_pool_size(id).unwrap() < 8 {
-        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        surfaces
+            .present_native_rotating(id, None, &mut gpu)
+            .unwrap();
         consumer.update();
         held.push(consumer.current().native().unwrap().clone());
     }
     // Fill the last reusable slots too, retaining each completed frame.
     loop {
         let serial = surfaces.stats.presentations;
-        match surfaces.present_native_rotating(id, &mut gpu) {
+        match surfaces.present_native_rotating(id, None, &mut gpu) {
             Ok(_) => {
                 consumer.update();
                 held.push(consumer.current().native().unwrap().clone());
@@ -1256,11 +1281,13 @@ fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutab
         "real frame-capacity release resumes the pending producer"
     );
     assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
-    surfaces.present_native_rotating(id, &mut gpu).unwrap();
+    surfaces
+        .present_native_rotating(id, None, &mut gpu)
+        .unwrap();
     let before = surfaces.stats.presentations;
     let pause = context.pause_submissions().unwrap();
     assert!(matches!(
-        surfaces.present_native_rotating(id, &mut gpu),
+        surfaces.present_native_rotating(id, None, &mut gpu),
         Err(Error::Busy)
     ));
     assert_eq!(surfaces.stats.presentations, before);

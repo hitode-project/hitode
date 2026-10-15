@@ -1,6 +1,8 @@
 //! Exercise instruction commits, faults, retries and fuel through the native owner.
 use super::*;
 
+mod helper_gaps;
+
 fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {
     let mut a = CodeAssembler::new(32).unwrap();
     build(&mut a);

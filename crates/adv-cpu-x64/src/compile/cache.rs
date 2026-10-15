@@ -53,7 +53,14 @@ pub(super) fn x87_operations(
             crate::floating::NativeX87 {
                 instruction: *instruction,
                 opcode,
-                fast: crate::floating::fast::classify(instruction),
+                fast: crate::floating::fast::classify(instruction).filter(|fast| {
+                    !matches!(
+                        fast,
+                        crate::floating::fast::Fast::Round
+                            | crate::floating::fast::Fast::Scale
+                            | crate::floating::fast::Fast::Examine
+                    )
+                }),
             }
         })
         .collect()

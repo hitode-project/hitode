@@ -10,7 +10,10 @@ import { call } from "./bridge";
  *   `{@attach region}`, in CSS pixels from the top-left corner;
  * - `modal`: some element marked with `{@attach modal}` is visible, so every
  *   press belongs to the overlay;
- * - `wantsKeyboard`: a modal layer is open or an editable control has focus.
+ * - `wantsKeyboard`: a modal layer is open or an editable control has focus;
+ * - `visible`: the overlay draws something over the game: a region, a modal
+ *   layer or an element marked with `{@attach shown}`. While it is false the
+ *   host may hide the webview, which also stops its animation frames.
  *
  * Outside the game screen the overlay claims everything. Updates are batched
  * per animation frame and only sent when the description changes.
@@ -27,12 +30,14 @@ export interface OverlayInput {
   regions: Rect[];
   modal: boolean;
   wantsKeyboard: boolean;
+  visible: boolean;
 }
 
-const EXCLUSIVE: OverlayInput = { regions: [], modal: true, wantsKeyboard: true };
+const EXCLUSIVE: OverlayInput = { regions: [], modal: true, wantsKeyboard: true, visible: true };
 
 const regions = new Set<Element>();
 const modals = new Set<Element>();
+const shownElements = new Set<Element>();
 let gameActive = false;
 let frame = 0;
 let lastSent = "";
@@ -59,6 +64,16 @@ export function modal(node: Element): () => void {
   schedule();
   return () => {
     modals.delete(node);
+    schedule();
+  };
+}
+
+/** Marks non-interactive overlay content, such as the FPS readout, that keeps the webview shown. */
+export function shown(node: Element): () => void {
+  shownElements.add(node);
+  schedule();
+  return () => {
+    shownElements.delete(node);
     schedule();
   };
 }
@@ -114,7 +129,12 @@ export function describe(): OverlayInput {
   }
   rects.sort((a, b) => a.y - b.y || a.x - b.x || a.width - b.width || a.height - b.height);
   const isModal = [...modals].some(visible);
-  return { regions: rects, modal: isModal, wantsKeyboard: isModal || editable(document.activeElement) };
+  return {
+    regions: rects,
+    modal: isModal,
+    wantsKeyboard: isModal || editable(document.activeElement),
+    visible: rects.length > 0 || isModal || [...shownElements].some(visible),
+  };
 }
 
 function schedule(): void {
