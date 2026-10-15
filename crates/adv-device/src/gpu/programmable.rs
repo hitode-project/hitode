@@ -2,7 +2,6 @@
 //! the GPU vertex fetcher and a small unpack expression produce shader inputs.
 use super::{Image, Sampler};
 use std::sync::Arc;
-use wgpu::naga::{Binding, BuiltIn, TypeInner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttributeFormat {
@@ -159,14 +158,8 @@ impl Program {
     }
     pub fn new(source: Arc<str>, textures: Vec<bool>) -> Self {
         static NEXT_PROGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let writes_depth = source.len() <= Self::MAX_SOURCE_LEN && wgpu::naga::front::wgsl::parse_str(&source).is_ok_and(|module| {
-            let depth = Some(Binding::BuiltIn(BuiltIn::FragDepth));
-            module.entry_points.iter().filter(|e| e.name == "fragment_main")
-                .filter_map(|e| e.function.result.as_ref()).any(|result| {
-                    result.binding == depth || matches!(&module.types[result.ty].inner,
-                        TypeInner::Struct { members, .. } if members.iter().any(|m| m.binding == depth))
-                })
-        });
+        // Conservative: a false match only keeps a bound depth attachment.
+        let writes_depth = source.contains("frag_depth");
         Self {
             writes_depth,
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
