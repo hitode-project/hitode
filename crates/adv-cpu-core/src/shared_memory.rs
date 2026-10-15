@@ -107,7 +107,7 @@ impl crate::backend::SharedReadView for SharedAllocation {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use os::create_backing;
+pub use crate::dual_view::create_backing;
 
 #[cfg(windows)]
 mod os {
@@ -252,7 +252,9 @@ mod tests {
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 mod os {
     use super::*;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use crate::dual_view::Backing;
+    #[cfg(test)]
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     pub(super) struct Mapping {
         pub read: View,
@@ -276,18 +278,9 @@ mod os {
                 .filter(|&page| page != 0)
                 .ok_or_else(|| format!("query shared PCM host page size: {page}"))?;
             let len = mapping_len(len, page)?;
-            let size = libc::off_t::try_from(len).map_err(|_| "shared PCM backing is too large")?;
-            let fd = create_backing(c"adv-pcm")?;
-            // SAFETY: this newly created private object has no other owner and
-            // is sized before either alias is mapped. New backing bytes are zero.
-            if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
-                return Err(format!(
-                    "size shared PCM backing: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            let write = View::new(fd.as_raw_fd(), len, libc::PROT_READ | libc::PROT_WRITE)?;
-            let read = View::new(fd.as_raw_fd(), len, libc::PROT_READ)?;
+            let backing = Backing::new(c"adv-pcm", len)?;
+            let write = View::new(&backing, len, libc::PROT_READ | libc::PROT_WRITE)?;
+            let read = View::new(&backing, len, libc::PROT_READ)?;
             // OwnedFd closes here. On errors it also closes, and View drops any
             // completed mapping if creating the second view failed.
             Ok(Self { read, write })
@@ -309,100 +302,10 @@ mod os {
         Ok(len)
     }
 
-    /// A fresh, unnamed, zero-length memfd. The a64 code cache maps one twice,
-    /// as a writable and an executable view.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn create_backing(name: &std::ffi::CStr) -> Result<OwnedFd, String> {
-        // Android's libc memfd_create symbol requires API 30, while this project
-        // also supports API 29. The kernel syscall avoids that loader dependency.
-        // SAFETY: the name is NUL terminated and CLOEXEC is a supported flag.
-        #[cfg(target_os = "android")]
-        let fd = unsafe {
-            libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) as libc::c_int
-        };
-        #[cfg(target_os = "linux")]
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(format!(
-                "create {name:?} memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: success returns a fresh descriptor owned solely by this call.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    #[cfg(target_os = "macos")]
-    fn create_backing(_: &std::ffi::CStr) -> Result<OwnedFd, String> {
-        use std::ffi::CString;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
-
-        // Names fit Darwin's short SHM_NAME_MAX. O_EXCL prevents attaching to
-        // another object's storage, including a stale name after process death.
-        for _ in 0..128 {
-            let id = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
-            let name = CString::new(format!("/ap-{:x}-{id:x}", std::process::id())).unwrap();
-            // SAFETY: valid C name, exclusive creation and owner-only access.
-            // Darwin marks shm_open descriptors close-on-exec.
-            let fd = unsafe {
-                libc::shm_open(
-                    name.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EEXIST) {
-                    continue;
-                }
-                return Err(format!("create shared PCM shm object: {error}"));
-            }
-            // SAFETY: this descriptor is fresh and has not escaped.
-            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            loop {
-                // SAFETY: remove the newly created name immediately. The fd,
-                // and later the mappings, retain the otherwise anonymous object.
-                if unsafe { libc::shm_unlink(name.as_ptr()) } == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(format!("unlink shared PCM shm object: {error}"));
-                }
-            }
-            return Ok(fd);
-        }
-        Err("create shared PCM shm object: exhausted exclusive names".into())
-    }
-
     impl View {
-        fn new(fd: RawFd, len: usize, protection: libc::c_int) -> Result<Self, String> {
-            // SAFETY: the object is sized to len, the offset is zero, and the OS
-            // chooses a disjoint address. MAP_SHARED supplies true physical aliases.
-            let address = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    protection,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            };
-            if address == libc::MAP_FAILED {
-                return Err(format!(
-                    "map shared PCM alias: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            let Some(ptr) = NonNull::new(address.cast()) else {
-                // SAFETY: mmap succeeded at zero; Rust cannot expose that address
-                // as non-null storage, but the mapping must still be released.
-                unsafe { libc::munmap(address, len) };
-                return Err("shared PCM alias mapped at a null address".into());
-            };
+        fn new(backing: &Backing, len: usize, protection: i32) -> Result<Self, String> {
+            // SAFETY: independent view, owned by this View until its Drop.
+            let ptr = unsafe { backing.map(None, protection)? };
             Ok(Self { ptr, len })
         }
 
@@ -438,6 +341,7 @@ mod os {
             assert!(SharedAllocation::new(0).is_err());
         }
 
+        // spec: A64-MEM-12
         #[test]
         fn callback_alias_is_os_read_only_and_reads_the_same_physical_bytes() {
             let storage = SharedAllocation::new(8192).unwrap();

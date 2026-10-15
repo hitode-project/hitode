@@ -13,6 +13,7 @@ mod code_image;
 pub mod code_pool;
 #[doc(hidden)]
 pub mod cpu_profile;
+pub mod dual_view;
 pub mod engine;
 pub mod execution_abi;
 #[doc(hidden)]

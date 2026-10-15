@@ -296,122 +296,30 @@ impl SharedAlias {
         };
     }
 
-    fn create_backing() -> Result<std::os::fd::OwnedFd, String> {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        // Match the existing PCM backend's API 29 contract: Android exposes
-        // memfd_create in libc only starting at API 30; its syscall is older.
-        #[cfg(target_os = "android")]
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                c"adv-cpu-direct".as_ptr(),
-                libc::MFD_CLOEXEC,
-            ) as libc::c_int
-        };
-        #[cfg(target_os = "linux")]
-        let fd = unsafe { libc::memfd_create(c"adv-cpu-direct".as_ptr(), libc::MFD_CLOEXEC) };
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            if fd < 0 {
-                return Err(format!(
-                    "create direct guest backing: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            for _ in 0..128 {
-                // Darwin has a short SHM_NAME_MAX. Hex names remain within it
-                // even at the maximum process id and counter value.
-                let id = NEXT.fetch_add(1, Ordering::Relaxed);
-                let name =
-                    std::ffi::CString::new(format!("/ad-{:x}-{id:x}", std::process::id())).unwrap();
-                // POSIX shm_open sets close-on-exec on the returned descriptor.
-                let fd = unsafe {
-                    libc::shm_open(
-                        name.as_ptr(),
-                        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                        0o600,
-                    )
-                };
-                if fd < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EEXIST) {
-                        continue;
-                    }
-                    return Err(format!("create direct guest backing: {error}"));
-                }
-                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                loop {
-                    if unsafe { libc::shm_unlink(name.as_ptr()) } == 0 {
-                        break;
-                    }
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EINTR) {
-                        return Err(format!("unlink direct guest backing: {error}"));
-                    }
-                }
-                return Ok(owned);
-            }
-            Err("create direct guest backing: exhausted exclusive names".into())
-        }
-    }
-
     /// Maps the window view at `place` when given, replacing what is there.
     fn new(len: usize, place: Option<NonNull<u8>>) -> Result<(NonNull<u8>, Self), String> {
-        use std::os::fd::AsRawFd;
-        let owned = Self::create_backing()?;
-        let fd = owned.as_raw_fd();
-        let size =
-            libc::off_t::try_from(len).map_err(|_| "direct guest backing length overflow")?;
-        if unsafe { libc::ftruncate(fd, size) } != 0 {
-            return Err(format!(
-                "size direct guest backing: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let map = |address: *mut u8, protection, fixed| unsafe {
-            libc::mmap(
-                address.cast(),
-                len,
-                protection,
-                libc::MAP_SHARED | fixed,
-                fd,
-                0,
-            )
-        };
-        let window = match place {
-            Some(place) => map(place.as_ptr(), libc::PROT_NONE, libc::MAP_FIXED),
-            None => map(std::ptr::null_mut(), libc::PROT_NONE, 0),
-        };
-        if window == libc::MAP_FAILED {
-            return Err(format!(
-                "map direct guest window: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let alias = map(std::ptr::null_mut(), libc::PROT_READ | libc::PROT_WRITE, 0);
-        if alias == libc::MAP_FAILED {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                match place {
-                    Some(place) => super::window::vacate(place.as_ptr(), len),
-                    None => {
-                        libc::munmap(window, len);
+        let backing = crate::dual_view::Backing::new(c"adv-cpu-direct", len)?;
+        // SAFETY: place belongs to this reservation, or asks for a new view.
+        let window = unsafe { backing.map(place, libc::PROT_NONE)? };
+        let alias = match unsafe { backing.map(None, libc::PROT_READ | libc::PROT_WRITE) } {
+            Ok(alias) => alias,
+            Err(error) => {
+                // SAFETY: restore the reservation before returning an alias failure.
+                unsafe {
+                    match place {
+                        Some(place) => super::window::vacate(place.as_ptr(), len),
+                        None => {
+                            libc::munmap(window.as_ptr().cast(), len);
+                        }
                     }
                 }
+                return Err(error);
             }
-            return Err(format!("map checked guest alias: {error}"));
-        }
-        drop(owned);
+        };
         Ok((
-            NonNull::new(window.cast()).unwrap(),
+            window,
             Self {
-                pointer: NonNull::new(alias.cast()).unwrap(),
+                pointer: alias,
                 len,
                 #[cfg(test)]
                 fail_after: std::cell::Cell::new(None),
