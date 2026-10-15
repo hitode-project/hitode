@@ -49,6 +49,7 @@ impl Plan {
         let covered = &mut self.covered;
         covered.clear();
         let mut end = self.effects.len();
+        #[cfg(feature = "d3d9-counters")]
         let mut count = 0;
         while end != 0 {
             let last = &self.effects[end - 1];
@@ -70,7 +71,10 @@ impl Plan {
                     .all(|(k, _)| covered.contains(k));
             if dead {
                 self.skipped[start..end].fill(true);
-                count += 1;
+                #[cfg(feature = "d3d9-counters")]
+                {
+                    count += 1;
+                }
             } else {
                 for e in group.iter().rev() {
                     for &(k, overwrite) in &e.writes {
@@ -87,7 +91,14 @@ impl Plan {
             }
             end = start;
         }
-        count
+        #[cfg(feature = "d3d9-counters")]
+        {
+            count
+        }
+        #[cfg(not(feature = "d3d9-counters"))]
+        {
+            0
+        }
     }
 }
 

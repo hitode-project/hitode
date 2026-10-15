@@ -71,6 +71,8 @@ impl Contents {
         self.slots.get(*self.indices.get(key)?)?.1.as_ref()
     }
     fn had_base(&self, key: &Content) -> bool {
+        #[cfg(feature = "d3d9-counters")]
+        lookup(1);
         self.indices
             .get(key)
             .is_some_and(|&n| self.slots[n].2.is_some())

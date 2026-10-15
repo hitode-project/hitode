@@ -232,3 +232,32 @@ fn state_block_leaves_admit_safe_transfers_and_decline_snapshot_destruction() {
             .is_none()
     );
 }
+
+#[test]
+// spec: GFX-REC-6
+fn managed_texture_leaf_declines_before_dirty_upload_and_admits_resident_noop() {
+    let mut f = Fixture::new();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    let d = f.device;
+    let texture = create(
+        &mut f,
+        "IDirect3DDevice9::CreateTexture",
+        vec![d, 2, 2, 1, 0, 21, 1],
+    );
+    let before = versions(&mut f);
+    let commands = f.m.ext.get::<State>().frames.recorded_commands;
+    assert_eq!(
+        leaf(&mut f, "IDirect3DDevice9::SetTexture", &[d, 0, texture]),
+        None
+    );
+    assert_eq!(versions(&mut f), before);
+    assert_eq!(f.m.ext.get::<State>().frames.recorded_commands, commands);
+    f.okay("IDirect3DDevice9::SetTexture", &[d, 0, texture]);
+    assert_eq!(
+        leaf(&mut f, "IDirect3DDevice9::SetTexture", &[d, 0, texture]),
+        Some(0)
+    );
+}

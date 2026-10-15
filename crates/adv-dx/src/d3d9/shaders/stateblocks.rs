@@ -1128,6 +1128,45 @@ pub(in crate::d3d9) fn record_stream(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "d3d9-counters")]
+    #[test]
+    // spec: GFX-REC-8, GFX-SHADER-4
+    fn state_block_work_counts_changed_entries_and_unchanged_reapplication() {
+        let mut m = crate::d3d9::tests::machine();
+        m.sys.objects = Objects::default();
+        m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, id, _, _) = crate::d3d9::tests::setup(&mut env);
+        let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+        assert_eq!(create(&mut env, GuestPtr::new(pointer), 1, output), 0);
+        let this = GuestPtr::new(output.read(env.cpu).unwrap());
+        let full = block(&env, this.addr())
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .mask
+            .items();
+        assert_eq!(capture(&mut env, this), 0);
+        let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
+            panic!()
+        };
+        d.fixed.render.insert(7, 1 - d.fixed.render[&7]);
+        d.versions[0] += 1;
+        assert_eq!(apply(&mut env, this), 0);
+        assert_eq!(apply(&mut env, this), 0);
+        let work = env.ext.get::<State>().frames;
+        assert_eq!(work.stateblock_applies, 2);
+        assert_eq!(work.stateblock_items, 1);
+        eprintln!("StateBlock work: full membership {full}; changed Apply 1; repeated Apply 0");
+    }
+
     fn fingerprint(d: &super::super::super::Device) -> u128 {
         super::super::super::recording::hash((
             super::super::super::recording::fixed_key(&d.fixed),
