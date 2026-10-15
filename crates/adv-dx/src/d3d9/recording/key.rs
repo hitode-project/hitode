@@ -3,12 +3,12 @@
 //! never WGSL text hashed again for every draw.
 use super::*;
 use adv_device::gpu::{DrawState, Image};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
-pub(in crate::d3d9) fn hash(value: impl Hash) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+pub(in crate::d3d9) fn hash(value: impl Hash) -> u128 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
     value.hash(&mut h);
-    h.finish()
+    h.digest128()
 }
 pub(in crate::d3d9) fn rect(r: adv_device::surface::Rect) -> (u32, u32, u32, u32) {
     (r.x, r.y, r.w, r.h)
@@ -22,7 +22,7 @@ fn target_key(t: &Target) -> impl Hash {
         t.depth().map(|d| (d.width(), d.height(), d.format())),
     )
 }
-pub(super) fn raster(s: DrawState) -> u64 {
+pub(super) fn raster(s: DrawState) -> u128 {
     let DrawState {
         topology,
         last_pixel,
@@ -72,7 +72,7 @@ pub(super) fn raster(s: DrawState) -> u64 {
         alpha_reference.to_bits(),
     ))
 }
-pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u64 {
+pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
     let fixed::Fixed {
         fvf,
         render,
@@ -127,7 +127,7 @@ fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
 }
 pub(super) struct Prepared {
     pub operation: Operation,
-    pub key: u64,
+    pub key: u128,
     pub reads: Vec<Content>,
     pub writes: Vec<(Content, bool)>,
     pub bytes: usize,
@@ -138,7 +138,7 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
         return Err(INVALID);
     };
     validate(&operation)?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
     let (mut reads, mut writes, mut bytes) = (Vec::new(), Vec::new(), 0);
     let mut write = |id, level, aspect, overwrite| {
         let c = content(env, id, level, aspect);
@@ -313,22 +313,21 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                     streams,
                     indices,
                     vertex_count,
-                    vertex_constants,
-                    pixel_constants,
                     textures,
-                    parameters,
+                    ..
                 } = p;
                 program.textures.hash(&mut h);
                 for s in streams {
                     (s.stride, &s.attributes, &s.bytes).hash(&mut h);
                     bytes += s.bytes.len();
                 }
-                (indices, vertex_count, parameters).hash(&mut h);
+                (indices, vertex_count).hash(&mut h);
                 bytes += indices
                     .as_ref()
                     .map_or(0, |i| std::mem::size_of_val(i.as_slice()));
-                bytemuck::bytes_of(vertex_constants).hash(&mut h);
-                bytemuck::bytes_of(pixel_constants).hash(&mut h);
+                for (offset, bytes) in p.constant_ranges() {
+                    (offset, bytes).hash(&mut h);
+                }
                 for t in textures {
                     (t.sampler, t.image.as_ref().map(image)).hash(&mut h);
                 }
@@ -340,7 +339,7 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
     Ok(Prepared {
         bounds,
         operation,
-        key: h.finish(),
+        key: h.digest128(),
         reads,
         writes,
         bytes,

@@ -10,7 +10,7 @@ const STACK: u32 = 0x550000;
 struct Evidence {
     device: u32,
     ranges: Vec<(u32, usize)>,
-    snapshots: Vec<(u64, Vec<u64>, adv_cpu::ArchitecturalState, Vec<u8>, u64)>,
+    snapshots: Vec<(u128, Vec<u128>, adv_cpu::ArchitecturalState, Vec<u8>, u64)>,
     frames: Vec<adv_device::gpu::NativeFrame>,
 }
 fn capture(env: &mut Env<'_>) -> Outcome {

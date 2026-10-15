@@ -10,22 +10,34 @@ mod key;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
-pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u64 {
+pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     let d = device(env, pointer).unwrap();
-    let constants = |c: &shaders::Constants| {
-        hash((
-            c.floats.map(|v| v.map(f32::to_bits)),
-            c.integers,
-            c.booleans,
-        ))
+    let constants = |id: Option<Id>, c: &shaders::Constants| {
+        use std::hash::Hash;
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        if let Some(usage) = id
+            .and_then(|id| shaders::bound(env, id))
+            .and_then(|s| s.translation.as_ref().ok())
+            .map(|t| t.constants)
+        {
+            for n in usage.ranges().flat_map(|r| r.start / 16..r.end / 16) {
+                match n {
+                    0..256 => c.floats[n].map(f32::to_bits).hash(&mut h),
+                    256..272 => c.integers[n - 256].hash(&mut h),
+                    272..288 => c.booleans[n - 272].hash(&mut h),
+                    _ => {}
+                }
+            }
+        }
+        h.digest128()
     };
     hash((
         fixed_key(&d.fixed),
         d.shaders.vertex,
         d.shaders.pixel,
         d.buffers.declaration,
-        constants(&d.shaders.vertex_constants),
-        constants(&d.shaders.pixel_constants),
+        constants(d.shaders.vertex, &d.shaders.vertex_constants),
+        constants(d.shaders.pixel, &d.shaders.pixel_constants),
     ))
 }
 
@@ -64,14 +76,14 @@ pub(super) struct Recording {
     held_uploads: Vec<(Id, Option<u32>)>,
     head: usize,
     bytes: usize,
-    key: u64,
-    contents: HashMap<Content, u64>,
-    base: HashMap<Content, u64>,
-    upload: u64,
+    key: u128,
+    contents: HashMap<Content, u128>,
+    base: HashMap<Content, u128>,
+    upload: u128,
     active: Option<u64>,
     next: u64,
     partial: bool,
-    last: Option<u64>,
+    last: Option<u128>,
     last_serial: Option<u64>,
     verdict: Option<bool>,
     presented: Option<(Completion, Option<u64>)>,
@@ -611,7 +623,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
     finish(env, *owner, *token, presentation, serial);
     Ok(completion)
 }
-fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u64, serial: Option<u64>) {
+fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: Option<u64>) {
     unlock(env, owner, token);
     let f = frame(env, owner);
     f.damage.finish();
@@ -727,7 +739,7 @@ impl Recording {
 }
 
 #[cfg(test)]
-pub(super) fn command_keys(env: &mut Env<'_>, pointer: u32) -> Vec<u64> {
+pub(super) fn command_keys(env: &mut Env<'_>, pointer: u32) -> Vec<u128> {
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();

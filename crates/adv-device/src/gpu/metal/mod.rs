@@ -155,11 +155,7 @@ impl State {
         key: &program::Key,
         initialization_target: &Target,
     ) -> Result<(), Error> {
-        let blocks = [
-            bytemuck::bytes_of(&draw.vertex_constants),
-            bytemuck::bytes_of(&draw.pixel_constants),
-            bytemuck::bytes_of(&draw.parameters),
-        ];
+        let blocks = draw.constant_ranges();
         let same_owner = Arc::ptr_eq(&self.owner, &gpu.programmable.batch_stats);
         // Bootstrap depth before the first native batch so later depth upgrades
         // can reopen the encoder without submitting that batch.
@@ -180,9 +176,11 @@ impl State {
         let reuse = !initialize
             && !target.padded_attachments()
             && same_owner
-            && self
-                .constants
-                .is_some_and(|offset| self.ring.equal(offset, &blocks));
+            && self.constants.is_some_and(|offset| {
+                blocks
+                    .clone()
+                    .all(|(at, bytes)| self.ring.equal(offset + at as u64, bytes))
+            });
         let constants_size = if reuse { 0 } else { program::UNIFORM_STRIDE };
         let size = (constants_size
             + 256
@@ -258,16 +256,14 @@ impl State {
             self.constants.unwrap()
         } else {
             let base = offset;
-            for block in blocks {
-                self.ring.write(offset, block);
-                offset += block.len() as u64;
+            for (at, block) in blocks.clone() {
+                self.ring.write(base + at as u64, block);
             }
             offset = base + program::UNIFORM_STRIDE;
             self.constants = Some(base);
-            self.owner.ring_bytes.fetch_add(
-                blocks.iter().map(|b| b.len() as u64).sum(),
-                Ordering::Relaxed,
-            );
+            self.owner
+                .ring_bytes
+                .fetch_add(blocks.map(|(_, b)| b.len() as u64).sum(), Ordering::Relaxed);
             base
         };
         let sizes_offset = offset;

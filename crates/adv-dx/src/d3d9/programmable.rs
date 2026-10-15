@@ -92,13 +92,17 @@ fn format(kind: u8) -> Result<AttributeFormat, u32> {
         _ => return Err(INVALID),
     })
 }
-fn constants(c: &shaders::Constants) -> ConstantBlock {
-    ConstantBlock {
-        floats: c.floats,
-        integers: c.integers,
-        booleans: c.booleans.map(|b| [b, 0, 0, 0]),
-        ..ConstantBlock::default()
+fn constants(c: &shaders::Constants, usage: adv_device::constants::ConstantUsage) -> ConstantBlock {
+    let mut block = ConstantBlock::default();
+    for n in usage.ranges().flat_map(|r| (r.start / 16)..(r.end / 16)) {
+        match n {
+            0..256 => block.floats[n] = c.floats[n],
+            256..272 => block.integers[n - 256] = c.integers[n - 256],
+            272..288 => block.booleans[n - 272][0] = c.booleans[n - 272],
+            _ => {}
+        }
     }
+    block
 }
 #[derive(Clone)]
 struct Input {
@@ -588,17 +592,22 @@ fn prepare_checked(
             parameters[14][0] |= 1 << ordinal;
         }
     }
-    let mut pixel_constants = constants(&d.shaders.pixel_constants);
+    let usage = [vt, pt].map(|t| t.map_or(Default::default(), |t| t.constants));
+    let mut pixel_constants = constants(&d.shaders.pixel_constants, usage[1]);
     for (n, stage) in d.fixed.stage_slots.iter().enumerate() {
-        pixel_constants.bump_matrix[n] = [7, 8, 9, 10].map(|k| f32::from_bits(stage[&k]));
-        pixel_constants.bump_luminance[n] = [
-            f32::from_bits(stage[&22]),
-            f32::from_bits(stage[&23]),
-            0.,
-            0.,
-        ];
+        if usage[1].registers[4] & (1 << (32 + n)) != 0 {
+            pixel_constants.bump_matrix[n] = [7, 8, 9, 10].map(|k| f32::from_bits(stage[&k]));
+        }
+        if usage[1].registers[4] & (1 << (40 + n)) != 0 {
+            pixel_constants.bump_luminance[n] = [
+                f32::from_bits(stage[&22]),
+                f32::from_bits(stage[&23]),
+                0.,
+                0.,
+            ];
+        }
     }
-    let vertex_constants = constants(&d.shaders.vertex_constants);
+    let vertex_constants = constants(&d.shaders.vertex_constants, usage[0]);
     let key = ProgramKey {
         vertex: vs.as_ref().map(|s| s.id),
         pixel: ps.as_ref().map(|s| s.id),
@@ -617,7 +626,8 @@ fn prepare_checked(
             &input_spec,
             &slots,
         )?;
-        let program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
+        let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
+        program.constants = usage;
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if program.source().len() <= MAX_BYTES {
             if cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {

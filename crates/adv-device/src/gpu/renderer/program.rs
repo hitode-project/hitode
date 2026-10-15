@@ -108,6 +108,11 @@ pub(super) struct Pending {
     pub(super) vertices: Upload,
     indices: Upload,
     last_constants: std::ops::Range<usize>,
+    last_copies: std::ops::Range<usize>,
+    uniform_copies: Vec<(usize, std::ops::Range<usize>)>,
+    uniform_staging: Option<wgpu::Buffer>,
+    uniform_encoder: Option<wgpu::CommandEncoder>,
+    uniform_end: usize,
 }
 impl Pending {
     fn resolve_clear(&mut self) {
@@ -188,7 +193,13 @@ impl Pending {
         if let Some(encoder) = self.encoder.take() {
             let writes =
                 self.uniforms.flush(queue) + self.vertices.flush(queue) + self.indices.flush(queue);
-            queue.submit([encoder.finish()]);
+            queue.submit(
+                self.uniform_encoder
+                    .take()
+                    .map(|e| e.finish())
+                    .into_iter()
+                    .chain([encoder.finish()]),
+            );
             let stats = self.owner.take().unwrap();
             stats.submissions.fetch_add(1, Ordering::Relaxed);
             stats.buffer_writes.fetch_add(writes, Ordering::Relaxed);
@@ -198,21 +209,55 @@ impl Pending {
         }
         self.draws = 0;
         self.last_constants = 0..0;
+        self.last_copies = 0..0;
+        self.uniform_copies.clear();
+        self.uniform_end = 0;
     }
-    pub(super) fn constants(&mut self, buffer: &wgpu::Buffer, blocks: &[&[u8]]) -> u32 {
-        let size = blocks.iter().map(|b| b.len()).sum::<usize>();
-        let mut previous = self.uniforms.bytes[self.last_constants.clone()].iter();
-        if self.last_constants.len() == size
-            && blocks.iter().flat_map(|b| b.iter()).eq(&mut previous)
+    pub(super) fn constants<'a>(
+        &mut self,
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+        blocks: impl Iterator<Item = (usize, &'a [u8])> + Clone,
+    ) -> u32 {
+        let previous = &self.uniform_copies[self.last_copies.clone()];
+        if !previous.is_empty()
+            && blocks.clone().count() == previous.len()
+            && blocks.clone().zip(previous).all(|((at, bytes), (old, r))| {
+                at + self.last_constants.start == *old && bytes == &self.uniforms.bytes[r.clone()]
+            })
         {
             return self.last_constants.start as u32;
         }
-        let start = self.uniforms.bytes.len().next_multiple_of(256);
-        self.uniforms.bytes.resize(start, 0);
-        for block in blocks {
-            self.uniforms.append(buffer, block, 4);
+        let start = self.uniform_end;
+        // Pack live ranges once, then restore their uniform offsets before any
+        // render commands execute. Each batch still has one queue write per buffer.
+        let staging = self.uniform_staging.get_or_insert_with(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("packed constants"),
+                size: buffer.size(),
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let encoder = self
+            .uniform_encoder
+            .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+        self.last_copies.start = self.uniform_copies.len();
+        for (at, block) in blocks {
+            let packed = self.uniforms.append(staging, block, 4);
+            encoder.copy_buffer_to_buffer(
+                staging,
+                packed,
+                buffer,
+                (start + at) as u64,
+                block.len() as u64,
+            );
+            self.uniform_copies
+                .push((start + at, packed as usize..packed as usize + block.len()));
         }
-        self.last_constants = start..start + size;
+        self.last_copies.end = self.uniform_copies.len();
+        self.uniform_end = start + UNIFORM_STRIDE as usize;
+        self.last_constants = start..self.uniform_end;
         start as u32
     }
 }
@@ -286,6 +331,7 @@ impl Gpu {
                 .as_ref()
                 .is_none_or(|(_, cap)| *cap < indices * slots);
         if immediate
+            || pending.uniform_end as u64 + UNIFORM_STRIDE > self.uniform.size()
             || grow_vertices
             || grow_indices
             || pending
@@ -824,14 +870,7 @@ impl Gpu {
         pending.select_target(target);
         let immediate = self.prepare_batch(&mut pending, total, index_size);
         let attachment = self.begin_batch_pass(&mut pending, target)?;
-        let base = pending.constants(
-            &self.uniform,
-            &[
-                bytemuck::bytes_of(&draw.vertex_constants),
-                bytemuck::bytes_of(&draw.pixel_constants),
-                bytemuck::bytes_of(&draw.parameters),
-            ],
-        );
+        let base = pending.constants(&self.context.device, &self.uniform, draw.constant_ranges());
         let white = draw
             .textures
             .iter()

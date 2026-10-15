@@ -17,7 +17,7 @@ pub(super) struct Reader {
     start: u32,
 }
 impl Reader {
-    pub(super) fn key(&self) -> u64 {
+    pub(super) fn key(&self) -> u128 {
         super::super::recording::hash(&self.raw)
     }
     pub(super) fn new(
