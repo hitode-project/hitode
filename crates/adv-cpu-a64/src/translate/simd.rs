@@ -1,11 +1,13 @@
 //! MMX and SSE instructions in NEON (A64-REG-5, A64-FP-4, A64-FP-5).
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
-//! A register is loaded from `CpuState` when the unit first reads it and
-//! stored back whenever an instruction writes it, so `CpuState` is always
-//! current: fault sites, exits and helpers need no spill. An MMX write
-//! also stores the x87 register it aliases, with the exponent of an MMX
-//! value. The cache is forgotten where control can arrive from elsewhere
+//! A register is loaded from `CpuState` when the unit first reads it.
+//! XMM writes immediately update `CpuState`. MMX writes mark d8-d15 dirty;
+//! control edges, helpers, leaf calls, checked accesses and x87/EMMS entries
+//! spill them to MMX and the aliased x87 significand and exponent (0xffff).
+//! Direct faults record the dirty mask and recover that prefix from the
+//! signal context before re-executing the interrupted instruction.
+//! The cache is forgotten where control can arrive from elsewhere
 //! (region heads and merges) and after a helper, which may change any
 //! register; d8-d15 survive the Rust calls between, and the `access`
 //! stub keeps v16-v23.
@@ -421,6 +423,8 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
 pub struct Vector {
     /// MMX registers in d8-d15, by bit.
     mmx: u8,
+    /// MMX registers whose canonical copies need writing back.
+    pub dirty: u8,
     /// XMM registers in v16-v23, by bit.
     xmm: u8,
     /// No x87 exception is pending, and TOP and the tags are 0.
@@ -481,6 +485,7 @@ impl Translator<'_> {
         let full = simd.full();
         match simd.kind {
             Kind::Emms => {
+                self.flush_mmx();
                 self.cpu();
                 self.emit_all(&[movz(W, X17, 0xffff, 0), strh(X17, X5, runtime::X87_TAG)]);
                 self.vector.ready = false;
@@ -1067,26 +1072,46 @@ impl Translator<'_> {
         }
     }
 
-    /// Stores a destination register written in its host register.
+    /// Records an MMX write or immediately publishes an XMM write.
     fn written(&mut self, loc: Loc) {
-        self.cpu();
         match loc {
             Loc::Mmx(n) => {
                 self.vector.mmx |= 1 << n;
-                let v = VReg::new(8 + n);
-                let x87 = runtime::X87_REGS + 10 * u32::from(n);
-                self.at_cpu(false, VMem::D, v, runtime::MMX + 8 * u32::from(n));
-                self.at_cpu(false, VMem::D, v, x87);
-                self.emit(movz(W, X17, 0xffff, 0));
-                self.half_at_cpu(X17, x87 + 8);
+                self.vector.dirty |= 1 << n;
             }
             Loc::Xmm(n) => {
+                self.cpu();
                 self.vector.xmm |= 1 << n;
                 let offset = runtime::XMM + 16 * u32::from(n);
                 self.at_cpu(false, VMem::Q, VReg::new(16 + n), offset);
             }
             _ => unreachable!("not a SIMD register"),
         }
+    }
+
+    /// Publishes the MMX prefix without changing flags, addresses, x5 or SIMD
+    /// temporaries. x0/x3/x4 are free at control and observer boundaries.
+    pub(super) fn flush_mmx(&mut self) {
+        let dirty = self.vector.dirty;
+        if dirty == 0 {
+            return;
+        }
+        self.emit_all(&[
+            ldr(X, super::X3, RUNTIME, runtime::CPU_STATE),
+            movz(W, super::X0, 0xffff, 0),
+        ]);
+        for n in 0..8 {
+            if dirty & (1 << n) == 0 {
+                continue;
+            }
+            let v = VReg::new(8 + n);
+            let x87 = runtime::X87_REGS + 10 * u32::from(n);
+            self.emit(vstr(VMem::D, v, super::X3, runtime::MMX + 8 * u32::from(n)));
+            self.emit(add_imm(X, super::X4, super::X3, x87, false));
+            self.emit(vstr(VMem::D, v, super::X4, 0));
+            self.emit(strh(super::X0, super::X4, 8));
+        }
+        self.vector.dirty = 0;
     }
 
     /// Loads the `CpuState` pointer into x5 unless it is there.
@@ -1111,17 +1136,6 @@ impl Translator<'_> {
         self.emit(if load { word } else { word & !(1 << 22) });
     }
 
-    /// Stores the low half of `rt` at `offset` into `CpuState`; uses x16.
-    fn half_at_cpu(&mut self, rt: Reg, offset: u32) {
-        if offset.is_multiple_of(2) {
-            self.emit(strh(rt, X5, offset));
-        } else if offset < 256 {
-            self.emit(sturh(rt, X5, offset as i32));
-        } else {
-            self.emit_all(&[add_imm(X, X16, X5, offset, false), strh(rt, X16, 0)]);
-        }
-    }
-
     /// A label that leaves for the interpreter to run the instruction.
     fn bail(&mut self) -> crate::asm::Label {
         let label = self.asm.label();
@@ -1129,6 +1143,7 @@ impl Translator<'_> {
         self.cold.push(Cold::Leave {
             label,
             state: self.state,
+            mmx_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
             exit: Exit::Interpret,
             eip: inst.pc,
@@ -1148,6 +1163,71 @@ mod tests {
         build(&mut a);
         let bytes = a.assemble(0x1000).unwrap();
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
+    }
+
+    // spec: A64-FP-4
+    #[test]
+    fn mixed_mmx_scaling_loop_instruction_count() {
+        use crate::translate::{Features, Stubs, Workspace, translate};
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut repeat = a.create_label();
+        a.set_label(&mut repeat).unwrap();
+        a.pxor(mm6, mm6).unwrap();
+        a.movq(mm7, mm5).unwrap();
+        for _ in 0..4 {
+            a.movd(mm0, dword_ptr(esi)).unwrap();
+            a.movd(mm1, dword_ptr(esi + 4)).unwrap();
+            a.punpcklbw(mm0, mm6).unwrap();
+            a.punpcklbw(mm1, mm6).unwrap();
+            a.pmullw(mm0, mm4).unwrap();
+            a.paddw(mm0, mm1).unwrap();
+            a.psrlw(mm0, 8).unwrap();
+            a.packuswb(mm0, mm7).unwrap();
+            a.movd(dword_ptr(edi), mm0).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.add(eax, edx).unwrap();
+            a.shr(eax, 1).unwrap();
+        }
+        a.dec(ecx).unwrap();
+        a.jnz(repeat).unwrap();
+        let code = a.assemble(0x10000).unwrap();
+        let mut memory = adv_cpu_core::Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, 7).unwrap();
+        memory.write(0x10000, &code).unwrap();
+        let mut work = Workspace::default();
+        translate(
+            &mut work,
+            &mut memory,
+            0x10000,
+            &[0x10000 + code.len() as u32],
+            &|_| false,
+            0,
+            Features { flagm: false },
+            0,
+            Stubs {
+                leaf: 0,
+                exit: 0,
+                dispatch: 0,
+                lookup: 0,
+                lookup_slow: 0,
+                ret_miss: 0,
+                access: 0,
+                interpret: 0,
+            },
+            &|_, _| false,
+        );
+        println!(
+            "mixed MMX loop: {} guest instructions, {} A64 instructions",
+            work.trace.len(),
+            work.words().len()
+        );
+        assert!(
+            work.trace
+                .insts
+                .iter()
+                .all(|i| !matches!(i.op, super::super::decode::Op::Helper(_)))
+        );
     }
 
     #[test]

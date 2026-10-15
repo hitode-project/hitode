@@ -56,6 +56,8 @@ pub struct SchedulingStats {
     pub external_interrupts: u64,
     pub internal_preemptions: u64,
     pub polling_rounds: u64,
+    /// Polling rounds that waited for a vsync after a frame (PROC-CLOCK-4).
+    pub frame_spin_waits: u64,
     pub timed_wakes: u64,
     pub timed_wake_lateness_us_total: u64,
     pub timed_wake_lateness_us_max: u64,

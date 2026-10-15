@@ -76,12 +76,14 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
             .chunks_exact(4)
             .all(|pixel| pixel == [0, 0, 255, 128])
     );
-    let cache = gpu.attachment_scratch.as_ref().unwrap().id;
+    // Deferred depth clears allocate no scratch before a draw attaches depth.
+    assert!(gpu.attachment_scratch.is_none());
     gpu.clear(&large, Some([0., 0., 0., 1.]), None).unwrap();
     let mut state = DrawState::new(8, 6);
     state.depth = Some(Compare::Less);
     gpu.draw(&large, &quad(0.5, [0., 1., 0., 1.]), None, state)
         .unwrap();
+    let cache = gpu.attachment_scratch.as_ref().map(|image| image.id);
     let pixels = read(&mut gpu, &large);
     for y in 0..6 {
         for x in 0..8 {
@@ -108,7 +110,7 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
         }
     }
     gpu.clear(&small, Some([0., 1., 1., 1.]), None).unwrap();
-    assert_eq!(gpu.attachment_scratch.as_ref().unwrap().id, cache);
+    assert_eq!(gpu.attachment_scratch.as_ref().map(|image| image.id), cache);
     assert!(
         read(&mut gpu, &small)
             .chunks_exact(4)
@@ -132,7 +134,6 @@ fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch
         .with_depth(Some(gpu.depth(8, 6, DepthFormat::Unorm16).unwrap()))
         .unwrap();
     gpu.clear(&mip, Some([0., 0., 1., 1.]), Some(1.)).unwrap();
-    let id = gpu.attachment_scratch.as_ref().unwrap().id;
     let mut state = DrawState::new(4, 4);
     state.depth = Some(Compare::Less);
     state.depth_write = true;
@@ -144,6 +145,7 @@ fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch
     });
     gpu.draw(&mip, &quad(0.5, [0., 1., 0., 1.]), None, state)
         .unwrap();
+    let id = gpu.attachment_scratch.as_ref().unwrap().id;
     let pixels = read(&mut gpu, &mip);
     for y in 0..4 {
         for x in 0..4 {
@@ -213,6 +215,16 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
         .with_depth(Some(gpu.depth(10, 8, DepthFormat::Float32).unwrap()))
         .unwrap();
     gpu.clear(&other, Some([0., 0., 1., 1.]), Some(1.)).unwrap();
+    // The deferred depth clear needs no scratch until a draw attaches depth.
+    assert_eq!(gpu.attachment_scratch.as_ref().unwrap().id, id);
+    let mut other_state = DrawState::new(2, 3);
+    other_state.depth = Some(Compare::Less);
+    gpu.draw_programmable(&other, &draw, &other_state).unwrap();
+    assert!(
+        read(&mut gpu, &other)
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 0, 255, 255])
+    );
     assert_ne!(gpu.attachment_scratch.as_ref().unwrap().id, id);
     assert_eq!(gpu.attachment_scratch.as_ref().unwrap().width, 10);
     assert!(

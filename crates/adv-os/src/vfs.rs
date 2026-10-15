@@ -447,7 +447,7 @@ impl Vfs {
                         name,
                         is_dir: md.is_dir(),
                         size: md.len(),
-                        created: md.created().ok(),
+                        created: md.created().or_else(|_| md.modified()).ok(),
                         accessed: md.accessed().ok(),
                         modified: md.modified().ok(),
                         attributes: self.attributes.read(&e.path(), &md).ok()?,

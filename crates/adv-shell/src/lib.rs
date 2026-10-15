@@ -1,6 +1,7 @@
 //! Native presentation and deadline-driven input for a guest PE process.
 mod audio;
 mod control;
+mod frame_pacer;
 mod frontend;
 #[cfg(any(windows, target_os = "macos", target_os = "android"))]
 mod logging;
@@ -825,7 +826,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
-            "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
+            "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"polling_rounds\": {},\n  \"frame_spin_waits\": {},\n  \"input_messages\": {},\n",
             "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"leaf_host_calls\": {},\n  \"leaf_host_abandons\": {},\n  \"async_compilation\": {},\n  {},\n",
             "  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
@@ -857,6 +858,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         checksum(&frame.bgra),
         idle_waits,
         wait_time.as_secs_f64(),
+        runtime.machine.sys.scheduling.polling_rounds,
+        runtime.machine.sys.scheduling.frame_spin_waits,
         inputs,
         context_runs,
         options.jit && options.async_compilation && options.tiered_compilation,
@@ -1450,10 +1453,18 @@ fn run_execution(
     if let Some(worker) = window.as_mut() {
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
+        #[allow(unused_mut)]
+        let mut pacer = frame_pacer::HostPacer {
+            vsync: None,
+            keys: keys.clone(),
+            origin: Instant::now(),
+        };
         #[cfg(target_os = "macos")]
         if let Some(vsync) = worker.vsync.take() {
+            pacer.vsync = Some(vsync.clone());
             runtime.machine.ext.insert(vsync);
         }
+        runtime.machine.sys.frame_pacer = Some(std::sync::Arc::new(pacer));
     }
     #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     if cfg!(windows)

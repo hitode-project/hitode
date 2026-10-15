@@ -19,6 +19,7 @@ use adv_machine::{Env, Object, Outcome, Wait};
 use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
 use crate::{Win32, stdcall};
+pub(crate) mod frame_cap;
 pub(crate) mod sent;
 
 /// Internal procedure for built-in classes, whose encoding follows the window.
@@ -127,6 +128,8 @@ pub(super) fn guest_text(env: &mut Env<'_>, text: &str, wide: bool) -> u32 {
 
 #[cfg(test)]
 mod dwm_tests;
+#[cfg(test)]
+mod frame_cap_tests;
 #[cfg(test)]
 mod keyboard_tests;
 
@@ -1468,6 +1471,20 @@ fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool, wide: bool
             finish_hooked_message(env, m, out, remove);
             Outcome::Return(1)
         });
+    }
+    // A frame above the display rate waits for the vsync or a message.
+    if let Some(until) = frame_cap::take(env) {
+        let event = queue_event(env);
+        if event != 0 {
+            let deadline = next_deadline(env, f).map_or(until, |d| d.min(until));
+            return Outcome::block_timed(
+                Wait::Object {
+                    handle: event,
+                    deadline: Some(deadline),
+                },
+                |_, _| Outcome::Return(0),
+            );
+        }
     }
     // Nothing: let other contexts run (the caller is a polling loop).
     Outcome::block_then_return(Wait::Yield, 0)

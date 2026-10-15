@@ -265,6 +265,12 @@ pub struct Target {
     depth: Option<Depth>,
 }
 impl Target {
+    pub(super) fn color_only(&self) -> Self {
+        Self {
+            image: self.image.clone(),
+            depth: None,
+        }
+    }
     pub(super) fn padded_attachments(&self) -> bool {
         self.depth.as_ref().is_some_and(|depth| {
             depth.width() != self.image.width || depth.height() != self.image.height
@@ -988,6 +994,14 @@ impl Gpu {
         if color.is_none() && depth.is_none() && stencil.is_none() {
             return Err(invalid("clear has no attachment"));
         }
+        if depth.is_some() || stencil.is_some() {
+            drop(submission);
+            self.defer_depth_clear(target, whole, depth, stencil)?;
+            if color.is_none() {
+                return self.check();
+            }
+            return self.clear_with_stencil(&target.color_only(), color, None, None);
+        }
         let mut pending = context.pending.lock().unwrap();
         let clear = program::Clear {
             color: color.map(|c| wgpu::Color {
@@ -1023,6 +1037,50 @@ impl Gpu {
         }
         drop(submission);
         self.check()
+    }
+
+    /// Depth/stencil clears wait on their image for the next pass attaching it.
+    pub(super) fn defer_depth_clear(
+        &mut self,
+        target: &Target,
+        region: Rect,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Result<(), Error> {
+        let attachment = target.depth.as_ref().unwrap();
+        let clear = DeferredClear {
+            region,
+            depth,
+            stencil: stencil.map(|v| v & 255),
+            image: target.image.clone(),
+        };
+        while let Err(old) = attachment.defer_clear(clear.clone()) {
+            let old_target = Target {
+                image: old.image,
+                depth: Some(attachment.clone()),
+            };
+            self.bounded_clear(&old_target, old.region, None, old.depth, old.stencil)?;
+        }
+        self.context
+            .pending
+            .lock()
+            .unwrap()
+            .detach_depth(attachment);
+        Ok(())
+    }
+    /// Partial clears cannot be load actions; draw them before depth is used.
+    pub(super) fn apply_partial_depth_clear(&mut self, target: &Target) -> Result<(), Error> {
+        let Some(attachment) = &target.depth else {
+            return Ok(());
+        };
+        if let Some(old) = attachment.take_partial_clear() {
+            let old_target = Target {
+                image: old.image,
+                depth: Some(attachment.clone()),
+            };
+            self.bounded_clear(&old_target, old.region, None, old.depth, old.stencil)?;
+        }
+        Ok(())
     }
 
     fn pipeline(&mut self, key: PipelineKey) -> Result<wgpu::RenderPipeline, Error> {
@@ -1099,6 +1157,9 @@ impl Gpu {
         image: Option<&Image>,
         mut state: DrawState,
     ) -> Result<(), Error> {
+        if state.depth.is_some() || state.stencil.is_some() {
+            self.apply_partial_depth_clear(target)?;
+        }
         let context = self.context.clone();
         let _submission = context.submission()?;
         self.own_target(target)?;
