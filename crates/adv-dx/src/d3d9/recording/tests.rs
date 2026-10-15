@@ -121,6 +121,26 @@ fn record_draw(f: &mut Fixture, d: fixed::Draw) {
         Outcome::Return(0)
     ));
 }
+
+#[cfg(feature = "d3d9-counters")]
+#[test]
+// spec: GFX-REC-3, GFX-REC-8
+fn authored_recording_work_counts() {
+    let mut f = fixture();
+    for _ in 0..3 {
+        let d = draw(&mut f);
+        record_draw(&mut f, d);
+    }
+    let count = f.m.ext.get::<State>().frames;
+    assert_eq!(count.recorded_draws, 3);
+    assert!(count.recorded_draw_bytes >= 3 * 3 * std::mem::size_of::<Vertex>() as u64);
+    eprintln!("{}", count.work_report());
+    let result = flush(&mut f, Reason::Readback);
+    assert_eq!(f.finish(result), 0);
+    let image = f.target(f.back).image;
+    let pixels = f.pixels(&image);
+    assert!(pixels.chunks_exact(4).any(|p| p[0] != 0));
+}
 fn stats(f: &Fixture) -> Stats {
     f.m.ext.get::<State>().gpu.as_ref().unwrap().stats()
 }

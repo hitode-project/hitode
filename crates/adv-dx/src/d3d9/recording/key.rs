@@ -106,9 +106,13 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
     ))
 }
 fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
     match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => {
             let identity = r.container.unwrap_or(id);
+            #[cfg(feature = "d3d9-counters")]
+            lookup(1);
             let pointer = match com(env).get_identity(&env.sys.objects, identity) {
                 Some(Payload::Resource(r)) => r.pointer,
                 _ => r.pointer,
@@ -119,6 +123,8 @@ fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
     }
 }
 fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
     let count = match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => r.levels.len().max(1),
         _ => 1,
@@ -126,6 +132,8 @@ fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
     out.extend((0..count as u32).map(|n| content(env, id, Some(n), 0)));
 }
 pub(super) struct Prepared {
+    #[cfg(feature = "d3d9-counters")]
+    pub lookups: u64,
     pub operation: Operation,
     pub key: u128,
     pub reads: Vec<Content>,
@@ -134,6 +142,11 @@ pub(super) struct Prepared {
     pub bounds: adv_device::surface::Rect,
 }
 pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {
+    #[cfg(feature = "d3d9-counters")]
+    let before = {
+        lookup(1);
+        lookups() - 1
+    };
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Err(INVALID);
     };
@@ -337,6 +350,8 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
     }
     let bounds = super::damage::bounds(env, d, &operation);
     Ok(Prepared {
+        #[cfg(feature = "d3d9-counters")]
+        lookups: lookups() - before,
         bounds,
         operation,
         key: h.digest128(),

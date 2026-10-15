@@ -274,7 +274,11 @@ impl Analysis {
             // Preserve destination dependencies for accumulating blends/partial writes.
             let key = hash((
                 command,
-                (!overwrite && !s.independent).then(|| contents.get(&k).copied().unwrap_or(0)),
+                (!overwrite && !s.independent).then(|| {
+                    #[cfg(feature = "d3d9-counters")]
+                    lookup(1);
+                    contents.get(&k).copied().unwrap_or(0)
+                }),
             ));
             s.entries.push((key, p.bounds));
         }

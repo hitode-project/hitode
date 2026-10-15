@@ -56,6 +56,12 @@ pub(super) enum Reason {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
+    pub recorded_draws: u64,
+    pub recorded_draw_bytes: u64,
+    pub recording_lookups: u64,
+    pub stateblock_applies: u64,
+    pub stateblock_items: u64,
+    pub eliminated_passes: u64,
     pub recorded_commands: u64,
     /// Present, readback, lock, DC, Reset, Release, limit, existing GPU wait.
     pub flushes: [u64; 8],
@@ -64,6 +70,36 @@ pub struct Counters {
     pub full_executions: u64,
     pub clipped_executions: u64,
     pub clipped_area_sum: f64,
+}
+impl Counters {
+    pub fn work_report(&self) -> String {
+        if !cfg!(feature = "d3d9-counters") {
+            return String::new();
+        }
+        format!(
+            "\nD3D9 work: draws {}; recorded bytes {} ({:.2}/draw); recording lookups {} ({:.2}/draw); StateBlock applies {}; applied items {} ({:.2}/apply); dead frames {}; dead passes {}",
+            self.recorded_draws,
+            self.recorded_draw_bytes,
+            self.recorded_draw_bytes as f64 / self.recorded_draws.max(1) as f64,
+            self.recording_lookups,
+            self.recording_lookups as f64 / self.recorded_draws.max(1) as f64,
+            self.stateblock_applies,
+            self.stateblock_items,
+            self.stateblock_items as f64 / self.stateblock_applies.max(1) as f64,
+            self.eliminated_frames,
+            self.eliminated_passes
+        )
+    }
+}
+#[cfg(feature = "d3d9-counters")]
+thread_local! { static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(feature = "d3d9-counters")]
+fn lookup(count: u64) {
+    LOOKUPS.set(LOOKUPS.get() + count);
+}
+#[cfg(feature = "d3d9-counters")]
+fn lookups() -> u64 {
+    LOOKUPS.get()
 }
 #[derive(Default)]
 pub(super) struct Recording {
@@ -250,6 +286,8 @@ fn barrier_if_busy(
     }
 }
 fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
+    #[cfg(feature = "d3d9-counters")]
+    let before = lookups();
     if !matches!(
         com(env).get_identity(&env.sys.objects, owner),
         Some(Payload::Device(_))
@@ -282,6 +320,12 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
         return Outcome::Return(0);
     }
     let f = frame(env, owner);
+    #[cfg(feature = "d3d9-counters")]
+    lookup(
+        p.reads.len() as u64
+            + p.writes.len() as u64 * 3
+            + if limit { p.writes.len() as u64 * 2 } else { 0 },
+    );
     let previous = limit.then(|| {
         (
             f.key,
@@ -321,6 +365,20 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
         f.held_uploads.push((*resource, *level));
     }
     f.key = hash((f.key, command));
+    #[cfg(feature = "d3d9-counters")]
+    let work = matches!(p.operation, Operation::Draw(_)).then_some((
+        (p.bytes + std::mem::size_of::<Operation>()) as u64,
+        p.lookups + lookups() - before,
+    ));
+    #[cfg(feature = "d3d9-counters")]
+    if let Some((bytes, lookups)) = work {
+        let count = &mut env.ext.get_mut::<State>().frames;
+        count.recorded_draws += 1;
+        count.recorded_draw_bytes += bytes;
+        count.recording_lookups += lookups;
+    }
+    #[cfg(feature = "d3d9-counters")]
+    let f = frame(env, owner);
     f.bytes += p.bytes;
     f.commands.push(p.operation);
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
@@ -348,6 +406,13 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
                 }
             }
             env.ext.get_mut::<State>().frames.recorded_commands -= 1;
+            #[cfg(feature = "d3d9-counters")]
+            if let Some((bytes, lookups)) = work {
+                let count = &mut env.ext.get_mut::<State>().frames;
+                count.recorded_draws -= 1;
+                count.recorded_draw_bytes -= bytes;
+                count.recording_lookups -= lookups;
+            }
         }
         outcome
     } else {

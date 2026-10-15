@@ -55,6 +55,36 @@ struct Mask {
     transforms: BTreeSet<usize>,
     clip_planes: BTreeSet<usize>,
 }
+#[cfg(feature = "d3d9-counters")]
+impl Mask {
+    fn items(&self) -> u64 {
+        let constants = |m: &ConstantMask| m.floats.len() + m.integers.len() + m.booleans.len();
+        ([
+            self.vertex,
+            self.pixel,
+            self.fvf,
+            self.declaration,
+            self.indices,
+            self.texture,
+            self.viewport,
+            self.scissor,
+        ]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+            + self.streams.len()
+            + self.textures.len()
+            + self.render.len()
+            + self.stage.len()
+            + self.stage_slots.len()
+            + self.sampler.len()
+            + self.sampler_slots.len()
+            + self.transforms.len()
+            + self.clip_planes.len()
+            + constants(&self.vertex_constants)
+            + constants(&self.pixel_constants)) as u64
+    }
+}
 pub(in crate::d3d9) struct Snapshot {
     pub(in crate::d3d9) fixed: fixed::Fixed,
     pub(in crate::d3d9) shaders: Bindings,
@@ -865,6 +895,12 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         unreachable!();
     };
     b.versions = versions;
+    #[cfg(feature = "d3d9-counters")]
+    {
+        let count = &mut env.ext.get_mut::<State>().frames;
+        count.stateblock_applies += 1;
+        count.stateblock_items += mask.items();
+    }
     release_changes(env, &changes);
     0
 }
