@@ -912,6 +912,7 @@ pub(crate) struct Session {
     /// What the current frame changed since the one before it reached `draw_view`.
     damage: Option<Rect>,
     software: Option<(wgpu::Texture, wgpu::TextureView)>,
+    metal_upload: bool,
     snapshot: Snapshot,
     serial: u64,
     width: u32,
@@ -1004,6 +1005,8 @@ pub(crate) struct Rendered {
 }
 impl Session {
     pub(crate) fn new(presenter: WindowPresenter, frames: FrameConsumer) -> Self {
+        let metal_upload = cfg!(target_vendor = "apple")
+            && presenter.context.adapter.get_info().backend == wgpu::Backend::Metal;
         Self {
             presenter,
             frames,
@@ -1012,6 +1015,7 @@ impl Session {
             contiguous: false,
             damage: None,
             software: None,
+            metal_upload,
             snapshot: Snapshot::default(),
             serial: 0,
             width: 0,
@@ -1145,7 +1149,21 @@ impl Session {
                     self.snapshot.frames = 0;
                 }
                 let old_extent = (self.snapshot.width, self.snapshot.height);
-                self.frames.current().snapshot(&mut self.snapshot)?;
+                let frame = self.frames.current();
+                let since = if old_extent == frame.extent() {
+                    self.snapshot.frames
+                } else {
+                    0
+                };
+                let metal = self.metal_upload;
+                let no_copy = metal && self.video.is_empty();
+                if no_copy {
+                    (self.snapshot.width, self.snapshot.height) = frame.extent();
+                    self.snapshot.frames = frame.serial();
+                    self.snapshot.damage = frame.damage_since(since);
+                } else {
+                    frame.snapshot(&mut self.snapshot)?;
+                }
                 if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
@@ -1177,20 +1195,39 @@ impl Session {
                             dimension: wgpu::TextureDimension::D2,
                             format: wgpu::TextureFormat::Bgra8Unorm,
                             usage: wgpu::TextureUsages::TEXTURE_BINDING
-                                | wgpu::TextureUsages::COPY_DST,
+                                | wgpu::TextureUsages::COPY_DST
+                                | if metal {
+                                    wgpu::TextureUsages::STORAGE_BINDING
+                                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                                } else {
+                                    wgpu::TextureUsages::empty()
+                                },
                             view_formats: &[],
                         });
                         let view = texture.create_view(&Default::default());
                         self.software = Some((texture, view));
                     }
-                    let bytes = crate::software_frame::upload(
-                        &submission,
-                        &self.software.as_ref().unwrap().0,
-                        &self.snapshot,
-                    );
+                    let texture = &self.software.as_ref().unwrap().0;
+                    if no_copy {
+                        #[cfg(target_vendor = "apple")]
+                        {
+                            submission
+                                .upload_software(texture, self.frames.current(), since)
+                                .map_err(|error| error.to_string())?;
+                            self.stats.gpu_transfer_bytes += self
+                                .snapshot
+                                .damage
+                                .iter()
+                                .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+                                .sum::<u64>();
+                        }
+                    } else {
+                        let bytes =
+                            crate::software_frame::upload(&submission, texture, &self.snapshot);
+                        self.stats.uploaded_bytes += bytes;
+                        self.stats.converted_bytes += bytes;
+                    }
                     self.stats.uploads += self.snapshot.damage.len() as u64;
-                    self.stats.uploaded_bytes += bytes;
-                    self.stats.converted_bytes += bytes;
                     self.stats.software_started.get_or_insert_with(Instant::now);
                 }
                 self.native = None;

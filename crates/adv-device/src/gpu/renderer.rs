@@ -73,6 +73,8 @@ pub struct NativeContext {
     failure: Arc<OnceLock<String>>,
     gate: Arc<submission::Gate>,
     pending: Arc<Mutex<program::Pending>>,
+    #[cfg(target_vendor = "apple")]
+    software: Arc<OnceLock<Result<metal::Software, Error>>>,
     // Keep the software-device turn alive until its last process/compositor
     // context is gone, including when the process that requested it exits.
     _software: Option<Arc<SoftwareTurn>>,
@@ -516,7 +518,9 @@ impl Gpu {
                 required_limits: limits,
                 // SHADER_F16 serves the half-precision upscalers.
                 required_features: adapter.features()
-                    & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::SHADER_F16),
+                    & (wgpu::Features::PIPELINE_CACHE
+                        | wgpu::Features::SHADER_F16
+                        | wgpu::Features::BGRA8UNORM_STORAGE),
                 ..Default::default()
             })
             .await
@@ -539,6 +543,8 @@ impl Gpu {
             failure,
             gate: submission::Gate::new().map_err(|error| Error::Unavailable(error.to_string()))?,
             pending: Arc::new(Mutex::new(program::Pending::default())),
+            #[cfg(target_vendor = "apple")]
+            software: Arc::new(OnceLock::new()),
             _software: software.clone(),
         };
         #[cfg(target_vendor = "apple")]

@@ -18,6 +18,8 @@ pub(crate) struct NativePresentation {
     pub consumed: u64,
     pub uploads: u64,
     pub uploaded_bytes: u64,
+    /// GPU bytes copied or decoded from no-copy software publications.
+    pub gpu_transfer_bytes: u64,
     pub converted_bytes: u64,
     pub software_started: Option<Instant>,
     pub presented: u64,
@@ -38,6 +40,7 @@ impl NativePresentation {
                 "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
                 "\"max_job_ns\": {}, \"max_acquire_ns\": {}, \"max_configure_ns\": {}, ",
                 "\"software_uploaded_bytes\": {}, \"software_converted_bytes\": {}, ",
+                "\"software_gpu_transfer_bytes\": {}, ",
                 "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}, ",
                 "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}}}"
             ),
@@ -51,6 +54,7 @@ impl NativePresentation {
             self.max_configure_ns,
             self.uploaded_bytes,
             self.converted_bytes,
+            self.gpu_transfer_bytes,
             self.uploaded_bytes as f64
                 / self
                     .software_started

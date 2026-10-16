@@ -6,6 +6,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod packed;
+#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+mod pixels;
+#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+use pixels::Pixels;
+#[cfg(not(all(feature = "gpu", target_vendor = "apple")))]
+type Pixels = Vec<u8>;
 
 /// Memory needed by software surfaces. PAL guests with shared storage borrow pixels;
 /// other CPU backends can supply an owned buffer at this boundary.
@@ -145,11 +151,11 @@ pub struct GraphicsStats {
 pub struct PendingFrame {
     width: u32,
     height: u32,
-    pitch: u32,
-    format: PixelFormat,
-    palette: Option<Arc<[[u8; 4]; 256]>>,
+    pub(crate) pitch: u32,
+    pub(crate) format: PixelFormat,
+    pub(crate) palette: Option<Arc<[[u8; 4]; 256]>>,
     serial: u64,
-    pixels: Arc<Vec<u8>>,
+    pub(crate) pixels: Arc<Pixels>,
     damage: Damage,
     bottom_up: bool,
     history: DamageHistory,
@@ -166,7 +172,7 @@ impl Default for PendingFrame {
             format: PixelFormat::Bgra32,
             palette: None,
             serial: 0,
-            pixels: Arc::new(Vec::new()),
+            pixels: Arc::new(Pixels::new()),
             damage: Damage::default(),
             bottom_up: false,
             history: DamageHistory::default(),
@@ -210,7 +216,7 @@ impl PendingFrame {
         self.history = history.clone();
         self.damage = *damage;
         if Arc::get_mut(&mut self.pixels).is_none() {
-            self.pixels = Arc::new(Vec::new());
+            self.pixels = Arc::new(Pixels::new());
         }
         let output = Arc::get_mut(&mut self.pixels).unwrap();
         output.resize((surface.pitch * surface.height) as usize, 0);
@@ -315,6 +321,20 @@ impl PendingFrame {
     pub fn damage(&self) -> &[Rect] {
         &self.damage
     }
+    /// Changes since an independent software consumer's last complete frame.
+    pub fn damage_since(&self, serial: u64) -> Damage {
+        damage_since(
+            &self.history,
+            serial,
+            self.serial,
+            Rect {
+                x: 0,
+                y: 0,
+                w: self.width,
+                h: self.height,
+            },
+        )
+    }
     pub fn extent(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -377,7 +397,7 @@ impl PendingFrame {
         self.palette = None;
         self.serial = frame.serial;
         if !self.pixels.is_empty() {
-            self.pixels = Arc::new(Vec::new());
+            self.pixels = Arc::new(Pixels::new());
         }
         self.native = Some(frame);
     }

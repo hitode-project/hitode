@@ -6,7 +6,9 @@ use objc2_metal::*;
 use std::sync::atomic::AtomicBool;
 mod pipeline;
 mod ring;
+mod software;
 use ring::{CAPACITY, MAX_DRAW, Ring};
+pub(super) use software::Software;
 type Object<T> = Retained<ProtocolObject<T>>;
 
 #[derive(Clone, Default)]

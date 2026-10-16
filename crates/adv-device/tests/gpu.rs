@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use adv_device::gpu::*;
 use adv_device::surface::Rect;
+#[cfg(target_vendor = "apple")]
+#[path = "gpu/software.rs"]
+mod software;
 
 struct Memory(Vec<u8>);
 impl adv_device::surface::SurfaceMemory for Memory {
