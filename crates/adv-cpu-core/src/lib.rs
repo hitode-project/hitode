@@ -23,7 +23,7 @@ pub mod fault_recipe;
     any(
         target_os = "linux",
         target_os = "android",
-        all(target_os = "macos", target_arch = "aarch64")
+        all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")
     ),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]

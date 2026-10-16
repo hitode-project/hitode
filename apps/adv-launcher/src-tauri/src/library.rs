@@ -484,7 +484,7 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
 }
 
 #[tauri::command]
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
     use tauri_plugin_storage::StorageExt;
     let storage = app.storage();
@@ -501,12 +501,6 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
         .map(|copy| Some(copy.path))
 }
 
-#[tauri::command]
-#[cfg(target_os = "ios")]
-pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
-    let _ = app;
-    Err("folder selection is not supported on iOS".into())
-}
 #[tauri::command]
 pub fn library_list(state: Store<'_>) -> Reply<Vec<LibraryGame>> {
     let mut library = state.lock().unwrap();

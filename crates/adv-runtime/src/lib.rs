@@ -15,6 +15,8 @@ pub use adv_win32::winmm::mmio;
 mod report;
 pub use adv_abi::{ApiDiagnostics, DynamicLookupFailure, MessageBoxCall, RunMode};
 pub use adv_cpu::{CompileStrategy, Engine, EngineOptions, HostFeatures};
+#[cfg(target_os = "ios")]
+pub use adv_cpu::{prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 pub use adv_win32::user32::dialog::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,

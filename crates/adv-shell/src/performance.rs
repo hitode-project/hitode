@@ -174,11 +174,7 @@ impl Performance {
     pub fn set_ui_metrics_dropped(&mut self, total: u64) {
         self.ui_metrics_dropped_total = total;
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "android",
-        all(windows, feature = "gpu")
-    ))]
+    #[cfg(any(host_view, all(windows, feature = "gpu")))]
     pub(crate) fn native(&mut self, stats: NativePresentation) {
         self.native = Some(stats);
     }

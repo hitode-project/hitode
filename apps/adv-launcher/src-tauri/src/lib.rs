@@ -3,14 +3,15 @@
 //! view that adv-shell presents into (decision 25).
 #[cfg(target_os = "android")]
 pub mod android;
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 #[cfg_attr(target_os = "android", path = "game_android.rs")]
+#[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
 mod library;
 #[cfg(desktop)]
 mod menu;
 pub mod overlay;
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
 mod report;
 mod settings;
@@ -21,7 +22,7 @@ use serde::Serialize;
 mod chrome;
 #[cfg(target_os = "macos")]
 mod saves;
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 use game::{post_text, start_game, stop_game};
 
 #[derive(Serialize)]
@@ -38,12 +39,16 @@ fn host_info() -> HostInfo {
     HostInfo {
         platform: std::env::consts::OS,
         version: env!("CARGO_PKG_VERSION"),
-        game_view: cfg!(any(target_os = "macos", target_os = "android")),
+        game_view: cfg!(any(
+            target_os = "macos",
+            target_os = "android",
+            target_os = "ios"
+        )),
     }
 }
 
 /// Sends text to the running guest as IME characters (Runtime::post_text).
-#[cfg(not(any(target_os = "macos", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 #[tauri::command]
 fn post_text(text: String) -> Result<usize, String> {
     let _ = text;
@@ -52,8 +57,12 @@ fn post_text(text: String) -> Result<usize, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(mobile)]
+    adv_shell::init_system_log();
+    #[cfg(target_os = "ios")]
+    game::prepare_jit();
     let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_storage::init());
     let builder = builder.setup(|app| {
         use tauri::Manager;
@@ -69,7 +78,7 @@ pub fn run() {
                 app.set_menu(menu)?;
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         game::setup(app)?;
         Ok(())
     });
@@ -172,6 +181,12 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         host_info,
         post_text,
+        start_game,
+        stop_game,
+        game::pause_game,
+        game::set_game_filter,
+        game::set_game_playback,
+        game::game_fps,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,

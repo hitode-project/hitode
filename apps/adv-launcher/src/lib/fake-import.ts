@@ -3,8 +3,8 @@ import { library } from "./library.svelte";
 import type { Game } from "./types";
 
 // Fake data and simulated host actions for adding games. Scanning and single
-// imports and Android storage use them only in a plain browser (`pnpm dev`).
-// The installer and iOS Files flow use simulated actions.
+// imports and phone storage use them only in a plain browser (`pnpm dev`).
+// The installer flow uses simulated actions.
 
 /** Guest text encoding offered when adding a game. */
 export type Enc = "ja" | "zh";
@@ -76,11 +76,6 @@ export function requestStoragePermission(): void {
 
 /** Space a game takes when copied into the app's own storage instead. */
 export const COPY_SIZE = "2.3 GB";
-
-/** iOS: what the Files picker returns; part of the picked game is still in iCloud. */
-export function pickFolderIos(): { name: string; inCloud: boolean } {
-  return { name: "夏影のアルバム", inCloud: true };
-}
 
 /* ---------- Single game ---------- */
 

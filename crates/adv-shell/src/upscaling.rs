@@ -405,11 +405,7 @@ mod tests {
     // spec: HOST-VIEW-10
     #[test]
     fn partial_runs_match_full_runs_within_the_model_radius() {
-        let gpu = pollster::block_on(adv_device::gpu::Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let gpu = pollster::block_on(adv_device::gpu::Gpu::request(!cfg!(host_view))).unwrap();
         let context = gpu.context().clone();
         let size = (160, 128);
         let mut seed = 0x2545_f491u32;
