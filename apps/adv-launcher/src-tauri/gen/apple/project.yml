@@ -124,6 +124,8 @@ targets:
       base:
         PRODUCT_NAME: HitodeJIT
         PRODUCT_BUNDLE_IDENTIFIER: org.hitode.launcher.JitHelper
+        # Tauri signs only the app target; scripts/ios-team.mjs fills this in before xcodebuild.
+        DEVELOPMENT_TEAM: $(APPLE_DEVELOPMENT_TEAM)
         ARCHS: [arm64]
         SKIP_INSTALL: YES
         LIBRARY_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)
