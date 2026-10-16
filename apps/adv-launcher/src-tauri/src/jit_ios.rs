@@ -116,9 +116,18 @@ fn finish(app: &AppHandle, result: Result<(), String>) {
     let _ = app.run_on_main_thread(move || {
         EXTENSION.with(|slot| {
             if let Some((extension, request)) = slot.borrow_mut().take() {
+                // A missing private selector would raise an Objective-C
+                // exception, which aborts once it reaches Rust frames.
+                let cancel = objc2::sel!(cancelExtensionRequestWithIdentifier:);
                 // SAFETY: request is the identifier returned by this NSExtension.
                 unsafe {
-                    let _: () = msg_send![&*extension, cancelRequestWithIdentifier: &*request];
+                    let responds: bool = msg_send![&*extension, respondsToSelector: cancel];
+                    if responds {
+                        let _: () =
+                            msg_send![&*extension, cancelExtensionRequestWithIdentifier: &*request];
+                    } else {
+                        log::warn!("JIT extension request cannot be cancelled");
+                    }
                 }
             }
         });
