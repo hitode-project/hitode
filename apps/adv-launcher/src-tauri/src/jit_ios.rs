@@ -20,14 +20,37 @@ use tauri::{AppHandle, Manager};
 #[derive(Default)]
 struct RequestState {
     waiting: bool,
+    /// What the running request does: a `Task` name or `external`.
+    task: Option<&'static str>,
     stage: Option<String>,
     error: Option<String>,
 }
 static REQUEST: Mutex<RequestState> = Mutex::new(RequestState {
     waiting: false,
+    task: None,
     stage: None,
     error: None,
 });
+/// Whether the helper holds the DDI set; unknown until it is asked.
+static DDI: Mutex<Option<bool>> = Mutex::new(None);
+
+/// What one helper request does; the name is the helper's `mode`.
+#[derive(Clone, Copy, PartialEq)]
+enum Task {
+    Enable,
+    DdiStatus,
+    DownloadDdi,
+}
+
+impl Task {
+    fn name(self) -> &'static str {
+        match self {
+            Task::Enable => "enable",
+            Task::DdiStatus => "ddiStatus",
+            Task::DownloadDdi => "downloadDdi",
+        }
+    }
+}
 thread_local! {
     static EXTENSION: RefCell<Option<(Retained<AnyObject>, Retained<AnyObject>)>> = const { RefCell::new(None) };
 }
@@ -38,9 +61,12 @@ pub struct JitStatus {
     ready: bool,
     error: Option<String>,
     waiting: bool,
+    task: Option<&'static str>,
     stage: Option<String>,
     live_container: bool,
     pairing_file: bool,
+    /// Whether the developer disk image is downloaded; `None` until checked.
+    ddi: Option<bool>,
 }
 
 fn pairing_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -61,9 +87,11 @@ pub fn jit_status(app: AppHandle) -> JitStatus {
             .clone()
             .or_else(|| state.and_then(Result::err)),
         waiting: request.waiting,
+        task: request.task,
         stage: request.stage.clone(),
         live_container: std::env::var_os("LC_HOME_PATH").is_some(),
         pairing_file: pairing_path(&app).is_ok_and(|path| path.is_file()),
+        ddi: *DDI.lock().unwrap(),
     }
 }
 
@@ -72,31 +100,81 @@ pub fn request_jit(app: AppHandle, external: Option<bool>) -> Result<(), String>
     if let Some(result) = adv_shell::code_pool_state() {
         return result;
     }
+    if !external.unwrap_or(false) {
+        if std::env::var_os("LC_HOME_PATH").is_some() {
+            return Err("Use StikDebug inside LiveContainer".into());
+        }
+        let pairing =
+            std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?;
+        return run_helper(app, Task::Enable, pairing);
+    }
     let mut state = REQUEST.lock().unwrap();
     if state.waiting {
         return Ok(());
     }
-    let external = external.unwrap_or(false);
-    let pairing = if external {
-        Vec::new()
-    } else {
-        if std::env::var_os("LC_HOME_PATH").is_some() {
-            return Err("Use StikDebug inside LiveContainer".into());
-        }
-        std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?
-    };
     *state = RequestState {
         waiting: true,
-        stage: Some(if external { "external" } else { "starting" }.into()),
+        task: Some("external"),
+        stage: Some("external".into()),
+        error: None,
+    };
+    drop(state);
+    let handle = app.clone();
+    let result = app
+        .run_on_main_thread(move || open_stikdebug(handle))
+        .map_err(|e| e.to_string());
+    if let Err(error) = &result {
+        finish(&app, Err(error.clone()));
+    }
+    result
+}
+
+/// Fixture: `ADV_IOS_JIT_AT_LAUNCH` names one helper task to run at launch,
+/// so device tests need no tap.
+pub fn request_at_launch(app: &AppHandle) {
+    let Ok(name) = std::env::var("ADV_IOS_JIT_AT_LAUNCH") else {
+        return;
+    };
+    let result = match name.as_str() {
+        "enable" => request_jit(app.clone(), Some(false)),
+        "ddiStatus" => check_ddi(app.clone()),
+        "downloadDdi" => download_ddi(app.clone()),
+        _ => Err(format!("unknown ADV_IOS_JIT_AT_LAUNCH task {name}")),
+    };
+    if let Err(error) = result {
+        log::warn!("JIT request at launch: {error}");
+    }
+}
+
+/// Asks the helper whether the developer disk image is downloaded.
+#[tauri::command]
+pub fn check_ddi(app: AppHandle) -> Result<(), String> {
+    run_helper(app, Task::DdiStatus, Vec::new())
+}
+
+/// Downloads the developer disk image ahead of enabling JIT, while the
+/// user's usual network, proxy included, still holds the VPN slot.
+#[tauri::command]
+pub fn download_ddi(app: AppHandle) -> Result<(), String> {
+    run_helper(app, Task::DownloadDdi, Vec::new())
+}
+
+fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String> {
+    let mut state = REQUEST.lock().unwrap();
+    if state.waiting {
+        return Ok(());
+    }
+    *state = RequestState {
+        waiting: true,
+        task: Some(task.name()),
+        stage: Some("starting".into()),
         error: None,
     };
     drop(state);
     let handle = app.clone();
     let result = app
         .run_on_main_thread(move || {
-            if external {
-                open_stikdebug(handle);
-            } else if let Err(error) = start_helper(&handle, pairing) {
+            if let Err(error) = start_helper(&handle, task, pairing) {
                 finish(&handle, Err(error));
             }
         })
@@ -107,30 +185,78 @@ pub fn request_jit(app: AppHandle, external: Option<bool>) -> Result<(), String>
     result
 }
 
+/// Copies a pairing file chosen in Files to where the helper reads it
+/// (IOS-JIT-2). Returns whether one was imported; the errors are codes the
+/// settings row explains.
+#[tauri::command]
+pub async fn import_pairing_file(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_storage::StorageExt;
+    let Some(source) = app.storage().pick_file().await?.path else {
+        return Ok(false);
+    };
+    let bytes = std::fs::read(&source);
+    let _ = std::fs::remove_file(&source);
+    let bytes = bytes.map_err(|e| e.to_string())?;
+    check_pairing(&bytes)?;
+    let dest = pairing_path(&app)?;
+    let staging = dest.with_extension("plist.part");
+    std::fs::write(&staging, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&staging, &dest).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// StikDebug's RemotePairing file, not SideStore's lockdown pairing record,
+/// which shares the plist format but cannot open the tunnel.
+fn check_pairing(bytes: &[u8]) -> Result<(), String> {
+    let dict: plist::Dictionary =
+        plist::from_bytes(bytes).map_err(|_| "invalidPairing".to_string())?;
+    if ["public_key", "private_key", "identifier"]
+        .iter()
+        .all(|key| dict.contains_key(key))
+    {
+        Ok(())
+    } else if dict.contains_key("HostPrivateKey") {
+        Err("lockdownPairing".into())
+    } else {
+        Err("invalidPairing".into())
+    }
+}
+
 fn finish(app: &AppHandle, result: Result<(), String>) {
     let error = result.err();
-    if let Some(error) = &error {
-        log::warn!("JIT request: {error}");
+    match &error {
+        Some(error) => log::warn!("JIT request: {error}"),
+        None => log::info!("JIT request finished"),
     }
     // Cancel the completed extension request on its owning thread.
     let _ = app.run_on_main_thread(move || {
         EXTENSION.with(|slot| {
             if let Some((extension, request)) = slot.borrow_mut().take() {
+                // A missing private selector would raise an Objective-C
+                // exception, which aborts once it reaches Rust frames.
+                let cancel = objc2::sel!(cancelExtensionRequestWithIdentifier:);
                 // SAFETY: request is the identifier returned by this NSExtension.
                 unsafe {
-                    let _: () = msg_send![&*extension, cancelRequestWithIdentifier: &*request];
+                    let responds: bool = msg_send![&*extension, respondsToSelector: cancel];
+                    if responds {
+                        let _: () =
+                            msg_send![&*extension, cancelExtensionRequestWithIdentifier: &*request];
+                    } else {
+                        log::warn!("JIT extension request cannot be cancelled");
+                    }
                 }
             }
         });
         *REQUEST.lock().unwrap() = RequestState {
             waiting: false,
+            task: None,
             stage: None,
             error,
         };
     });
 }
 
-fn start_helper(app: &AppHandle, pairing: Vec<u8>) -> Result<(), String> {
+fn start_helper(app: &AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -179,7 +305,7 @@ fn start_helper(app: &AppHandle, pairing: Vec<u8>) -> Result<(), String> {
     EXTENSION.with(|slot| *slot.borrow_mut() = Some((extension, request)));
     let app = app.clone();
     std::thread::spawn(move || {
-        let result = listen(listener, &token, pairing);
+        let result = listen(listener, &token, task, pairing);
         finish(&app, result);
     });
     Ok(())
@@ -191,7 +317,7 @@ struct Progress {
     error: Option<String>,
 }
 
-fn listen(listener: TcpListener, token: &str, pairing: Vec<u8>) -> Result<(), String> {
+fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let (stream, _) = loop {
         match listener.accept() {
@@ -202,6 +328,8 @@ fn listen(listener: TcpListener, token: &str, pairing: Vec<u8>) -> Result<(), St
             Err(e) => return Err(format!("JIT extension did not connect: {e}")),
         }
     };
+    // Darwin sockets inherit O_NONBLOCK from the listener they were accepted on.
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
@@ -218,11 +346,16 @@ fn listen(listener: TcpListener, token: &str, pairing: Vec<u8>) -> Result<(), St
     if line.trim_end() != token {
         return Err("JIT extension authentication failed".into());
     }
-    let request = serde_json::json!({"pid": std::process::id(), "pairing": pairing});
+    let request = serde_json::json!({
+        "mode": task.name(),
+        "pid": std::process::id(),
+        "pairing": pairing,
+    });
     writeln!(reader.get_mut(), "{request}").map_err(|e| e.to_string())?;
     reader
         .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(250)))
+        // Above the helper's 240 s enable limit and its 300 s per-file download.
+        .set_read_timeout(Some(Duration::from_secs(330)))
         .map_err(|e| e.to_string())?;
     let mut preparation = None;
     let result = (|| {
@@ -232,8 +365,17 @@ fn listen(listener: TcpListener, token: &str, pairing: Vec<u8>) -> Result<(), St
                 return Err("JIT extension disconnected before completing".into());
             }
             let progress: Progress = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-            if progress.stage == "finished" {
-                return progress.error.map_or(Ok(()), Err);
+            log::info!("JIT helper: {}", progress.stage);
+            match progress.stage.as_str() {
+                "finished" => {
+                    if task == Task::DownloadDdi && progress.error.is_none() {
+                        *DDI.lock().unwrap() = Some(true);
+                    }
+                    return progress.error.map_or(Ok(()), Err);
+                }
+                "ddiPresent" => *DDI.lock().unwrap() = Some(true),
+                "ddiMissing" => *DDI.lock().unwrap() = Some(false),
+                _ => {}
             }
             if progress.stage == "attaching" && preparation.is_none() {
                 preparation = Some(std::thread::spawn(|| {
@@ -243,6 +385,9 @@ fn listen(listener: TcpListener, token: &str, pairing: Vec<u8>) -> Result<(), St
             REQUEST.lock().unwrap().stage = Some(progress.stage);
         }
     })();
+    if task != Task::Enable {
+        return result;
+    }
     if let Some(thread) = preparation {
         let prepared = thread
             .join()

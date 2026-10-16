@@ -45,6 +45,7 @@ log.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
 log.workspace = true
+plist = "1.8"
 objc2 = "0.6.4"
 block2 = "0.6.2"
 objc2-foundation = { version = "0.3.2", features = ["NSDictionary", "NSNotification", "NSOperation", "block2"] }
