@@ -72,6 +72,7 @@ struct Pass {
     bindings: &'static [(u32, Binding)],
     block: u32,
     scale: u32,
+    radius: u32,
 }
 struct Model {
     textures: &'static [(wgpu::TextureFormat, u32)],
@@ -94,8 +95,40 @@ impl Upscaling {
         choice: Upscaler,
         size: (u32, u32),
     ) -> Result<Self, String> {
+        let matrix = context.device.features().contains(
+            wgpu::Features::SHADER_F16
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::SUBGROUP_BARRIER
+                | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+        ) && context
+            .adapter
+            .cooperative_matrix_properties()
+            .iter()
+            .any(|p| {
+                p.m_size == 8
+                    && p.n_size == 8
+                    && p.k_size == 8
+                    && p.ab_type == wgpu::CooperativeScalarType::F16
+                    && p.cr_type == wgpu::CooperativeScalarType::F16
+            });
+        Self::with_model(
+            context,
+            choice,
+            size,
+            if matrix {
+                models::matrix_model(choice)
+            } else {
+                models::fused_model(choice)
+            },
+        )
+    }
+    fn with_model(
+        context: &NativeContext,
+        choice: Upscaler,
+        size: (u32, u32),
+        model: Model,
+    ) -> Result<Self, String> {
         let device = &context.device;
-        let model = models::model(choice);
         let max = device.limits().max_texture_dimension_2d;
         if size.0 > max / 2 || size.1 > max / 2 {
             return Err("upscaled game frame exceeds the GPU texture limit".into());
@@ -207,12 +240,11 @@ impl Upscaling {
         })
     }
     /// Recompute after the input changed within `damage`, or entirely. Every
-    /// pass is a 3×3 convolution, reading one input pixel around each output
-    /// (the final pass also samples the input bilinearly). The last pass covers
-    /// everything the change can reach; each earlier pass covers one pixel more
-    /// than the pass after it, so no pass reads values outside what it was just
-    /// given, even where a texture still holds another tensor. Returns the
-    /// input pixels the last pass recomputed.
+    /// layer is a 3×3 convolution; a fused pass retains the sum of its layers'
+    /// radii. The final pass also samples the input bilinearly. Earlier passes
+    /// cover the next pass's rounded workgroups plus its radius, so reads stay
+    /// within values computed this run. Returns the input pixels recomputed by
+    /// the last pass.
     pub(crate) fn run(
         &self,
         context: &NativeContext,
@@ -247,7 +279,7 @@ impl Upscaling {
                     h: needed.h.next_multiple_of(unit),
                     ..needed
                 };
-                needed = grow(*region, 1);
+                needed = grow(*region, spec.radius);
             }
         }
         if regions.iter().any(|r| r.w == 0 || r.h == 0) {
@@ -288,7 +320,12 @@ impl Upscaling {
     }
     /// Input pixels the last pass recomputes after a change within `damage`.
     pub(crate) fn reach(&self) -> u32 {
-        self.model.passes.len() as u32 + 1
+        self.model
+            .passes
+            .iter()
+            .map(|pass| pass.radius)
+            .sum::<u32>()
+            + 1
     }
     pub(crate) fn output(&self) -> &wgpu::TextureView {
         &self.textures[self.model.output]
@@ -299,7 +336,7 @@ impl Upscaling {
 mod tests {
     use super::*;
 
-    /// `k / 256` as IEEE half-precision bits; exact for k below 256.
+    /// `k / 256` as IEEE half-precision bits; exact for k up to 256.
     fn half(k: u32) -> [u8; 2] {
         if k == 0 {
             return [0, 0];
@@ -400,6 +437,119 @@ mod tests {
             }
         }
         assert_eq!(half, 4 + 6 + 8, "the three Magpie models declare FP16");
+        for choice in [
+            Upscaler::Anime4k,
+            Upscaler::Cunny,
+            Upscaler::Artcnn,
+            Upscaler::K7,
+        ] {
+            for pass in models::fused_model(choice).passes {
+                for source in [pass.source.to_owned(), widen(pass.source)] {
+                    let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+                    Validator::new(ValidationFlags::all(), Capabilities::all())
+                        .validate(&module)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    // spec: HOST-VIEW-7, HOST-VIEW-10
+    #[test]
+    fn optimized_layers_match_reference_display_pixels_and_clamped_edges() {
+        let mut gpu = pollster::block_on(adv_device::gpu::Gpu::request(false)).unwrap();
+        let context = &gpu.context().clone();
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let compositor = crate::native_gpu::Compositor::new(context.clone(), format);
+        for choice in [
+            Upscaler::Anime4k,
+            Upscaler::Cunny,
+            Upscaler::Artcnn,
+            Upscaler::K7,
+        ] {
+            let mut maximum = [0u8; 2];
+            for (size, patterns) in [((1, 1), 3), ((35, 29), 3), ((130, 97), 3), ((513, 257), 1)] {
+                let scalers = [
+                    Upscaling::with_model(context, choice, size, models::model(choice)).unwrap(),
+                    Upscaling::with_model(context, choice, size, models::fused_model(choice))
+                        .unwrap(),
+                    Upscaling::new(context, choice, size).unwrap(),
+                ];
+                if size == (1, 1) {
+                    eprintln!(
+                        "{choice:?}: passes={} matrix_rgb={}",
+                        scalers[2].model.passes.len(),
+                        scalers[2].model.passes[0]
+                            .source
+                            .contains("coopMultiplyAdd")
+                    );
+                }
+                let mut seed = 0x2545_f491u32;
+                for pattern in 0..patterns {
+                    let pixels: Vec<_> = (0..size.0 * size.1)
+                        .map(|i| match pattern {
+                            0 => [0; 3].map(|_| {
+                                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                                (seed >> 16) % 257
+                            }),
+                            1 => {
+                                if (i % size.0 + i / size.0) % 2 == 0 {
+                                    [0, 256, 0]
+                                } else {
+                                    [256, 0, 256]
+                                }
+                            }
+                            _ => [127, 128, 129],
+                        })
+                        .collect();
+                    for scaler in &scalers {
+                        write(context, &scaler.input, &pixels);
+                        scaler.run(context, &context.submission().unwrap(), None);
+                    }
+                    for output_size in [(size.0 * 2, size.1 * 2), (size.0 * 3, size.1 * 3)] {
+                        let destination = gpu.image(output_size.0, output_size.1).unwrap();
+                        let mut results = Vec::new();
+                        for scaler in &scalers {
+                            compositor
+                                .compose_view(
+                                    scaler.output(),
+                                    destination.view(),
+                                    format,
+                                    [0., 0., output_size.0 as f32, output_size.1 as f32],
+                                    &context.submission().unwrap(),
+                                )
+                                .unwrap();
+                            let mut transfer = gpu.readback(&destination, None).unwrap();
+                            transfer.take_completion_job().unwrap()();
+                            results.push(transfer.poll().unwrap().unwrap());
+                        }
+                        for (maximum, result) in maximum.iter_mut().zip(&results[1..]) {
+                            let delta = results[0]
+                                .iter()
+                                .zip(result)
+                                .map(|(a, b)| a.abs_diff(*b))
+                                .max()
+                                .unwrap();
+                            *maximum = (*maximum).max(delta);
+                            assert!(
+                                delta <= 2,
+                                "{choice:?} {size:?} pattern={pattern} output={output_size:?} channel_error={delta}"
+                            );
+                        }
+                        assert!(
+                            results
+                                .iter()
+                                .all(|r| r.chunks_exact(4).all(|p| p[3] == 255))
+                        );
+                    }
+                }
+                assert!(scalers.iter().all(|s| s.reach() == scalers[0].reach()));
+            }
+            eprintln!(
+                "{choice:?}: max_channel_error fused={} selected={}",
+                maximum[0], maximum[1]
+            );
+        }
     }
 
     // spec: HOST-VIEW-10
