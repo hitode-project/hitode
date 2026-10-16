@@ -590,3 +590,65 @@ fn native_warm_restart_prebuilds_exact_pipelines_for_all_depth_formats() {
     hot.set_pipeline_cache_directory(None);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+// spec: GFX-METAL-1
+#[test]
+fn backend_switch_reasons_partition_the_total() {
+    let mut gpu = gpu(true);
+    let target = gpu.target(4, 4, false).unwrap();
+    let image = gpu.image(4, 4).unwrap();
+    let region = Rect {
+        x: 0,
+        y: 0,
+        w: 2,
+        h: 2,
+    };
+    let state = DrawState::new(4, 4);
+    let mut command = draw();
+    command.pixel_constants.floats[0] = [1.; 4];
+    for reason in [
+        SwitchReason::PartialClear,
+        SwitchReason::Copy,
+        SwitchReason::Upload,
+        SwitchReason::FixedDraw,
+        SwitchReason::Readback,
+        SwitchReason::Other,
+    ] {
+        gpu.draw_programmable(&target, &command, &state).unwrap();
+        let before = gpu.stats();
+        match reason {
+            SwitchReason::PartialClear => gpu
+                .clear_region(&target, region, Some([0.; 4]), None, None)
+                .unwrap(),
+            SwitchReason::Copy => gpu.copy(&target.image, region, &image, 0, 0).unwrap(),
+            SwitchReason::Upload => gpu.upload(&image, region, 8, &[255; 16]).unwrap(),
+            SwitchReason::FixedDraw => gpu
+                .draw(
+                    &target,
+                    &[Vertex {
+                        position: [0., 0., 0., 1.],
+                        color: [1.; 4],
+                        uv: [0.; 2],
+                    }; 3],
+                    None,
+                    state,
+                )
+                .unwrap(),
+            SwitchReason::Readback => {
+                read(&mut gpu, &target);
+            }
+            SwitchReason::Other => {
+                gpu.context.submission().unwrap().submit([]);
+            }
+        }
+        let after = gpu.stats();
+        assert_eq!(
+            after.backend_switches_by_reason[reason as usize],
+            before.backend_switches_by_reason[reason as usize] + 1
+        );
+        assert_eq!(
+            after.backend_switches_by_reason.iter().sum::<u64>(),
+            after.backend_switches
+        );
+    }
+}

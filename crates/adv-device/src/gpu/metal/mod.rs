@@ -157,9 +157,10 @@ impl State {
         self.constants = None;
         self.draws = 0;
     }
-    pub(super) fn select_wgpu(&mut self) {
+    pub(super) fn select_wgpu(&mut self, reason: SwitchReason) {
         if self.last_metal {
             self.owner.backend_switches.fetch_add(1, Ordering::Relaxed);
+            self.owner.backend_switches_by_reason[reason as usize].fetch_add(1, Ordering::Relaxed);
             self.last_metal = false;
         }
     }
@@ -247,7 +248,7 @@ impl State {
             .collect();
         if initialize || target.padded_attachments() {
             self.flush();
-            self.select_wgpu();
+            self.select_wgpu(SwitchReason::Other);
             let mut encoder = gpu
                 .context
                 .device
@@ -269,6 +270,8 @@ impl State {
             gpu.context.queue.submit([]);
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
             self.owner.backend_switches.fetch_add(1, Ordering::Relaxed);
+            self.owner.backend_switches_by_reason[SwitchReason::Other as usize]
+                .fetch_add(1, Ordering::Relaxed);
             self.last_metal = true;
         }
         if self.command.is_none() {
@@ -504,7 +507,7 @@ impl State {
             self.flush();
         }
         if target.padded_attachments() {
-            self.select_wgpu();
+            self.select_wgpu(SwitchReason::Copy);
             let mut encoder = gpu
                 .context
                 .device

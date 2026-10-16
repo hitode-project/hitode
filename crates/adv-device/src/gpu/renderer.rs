@@ -17,6 +17,16 @@ mod warmup;
 pub use metal::DisplayCompletion;
 pub use program::validate_program;
 
+#[derive(Clone, Copy)]
+pub(super) enum SwitchReason {
+    PartialClear,
+    Copy,
+    Upload,
+    FixedDraw,
+    Readback,
+    Other,
+}
+
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
 
 /// The software adapter (WARP on Windows) has crashed the whole process when
@@ -104,9 +114,12 @@ impl NativeContext {
         }
     }
     pub fn submission(&self) -> Result<Submission<'_>, Error> {
+        self.submission_for(SwitchReason::Other)
+    }
+    fn submission_for(&self, _reason: SwitchReason) -> Result<Submission<'_>, Error> {
         let submission = self.enter_submission()?;
         #[cfg(target_vendor = "apple")]
-        self.pending.lock().unwrap().flush_metal();
+        self.pending.lock().unwrap().flush_metal(_reason);
         Ok(submission)
     }
     fn enter_submission(&self) -> Result<Submission<'_>, Error> {
@@ -750,6 +763,8 @@ impl Gpu {
         stats.merged_clears = batch.merged_clears.load(Ordering::Relaxed);
         stats.metal_draws = batch.metal_draws.load(Ordering::Relaxed);
         stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
+        stats.backend_switches_by_reason =
+            std::array::from_fn(|i| batch.backend_switches_by_reason[i].load(Ordering::Relaxed));
         stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
         stats.ring_busy = batch.ring_busy.load(Ordering::Relaxed);
         let (waits, ns) = self.programmable.warm.counters.snapshot();
@@ -955,7 +970,7 @@ impl Gpu {
         pitch: u32,
         bgra: &[u8],
     ) -> Result<(), Error> {
-        let submission = self.context.submission()?;
+        let submission = self.context.submission_for(SwitchReason::Upload)?;
         self.own(image)?;
         image.writable()?;
         rectangle_in(image, rectangle)?;
@@ -1195,13 +1210,23 @@ impl Gpu {
         target: &Target,
         vertices: &[Vertex],
         image: Option<&Image>,
+        state: DrawState,
+    ) -> Result<(), Error> {
+        self.draw_fixed(target, vertices, image, state, SwitchReason::FixedDraw)
+    }
+    pub(super) fn draw_fixed(
+        &mut self,
+        target: &Target,
+        vertices: &[Vertex],
+        image: Option<&Image>,
         mut state: DrawState,
+        reason: SwitchReason,
     ) -> Result<(), Error> {
         if state.depth.is_some() || state.stencil.is_some() {
             self.apply_partial_depth_clear(target)?;
         }
         let context = self.context.clone();
-        let _submission = context.submission()?;
+        let _submission = context.submission_for(reason)?;
         self.own_target(target)?;
         target.image.writable()?;
         if let Some(image) = image {
@@ -1495,7 +1520,7 @@ impl Gpu {
         y: u32,
     ) -> Result<(), Error> {
         let context = self.context.clone();
-        let submission = context.submission()?;
+        let submission = context.submission_for(SwitchReason::Copy)?;
         self.copy_under(source, rectangle, destination, x, y, &submission)
     }
 
@@ -1571,7 +1596,7 @@ impl Gpu {
     /// Present through a GPU snapshot. No readback, CPU conversion or upload.
     pub fn present(&mut self, image: &Image, serial: u64) -> Result<NativeFrame, Error> {
         let context = self.context.clone();
-        let submission = context.submission()?;
+        let submission = context.submission_for(SwitchReason::Copy)?;
         self.own(image)?;
         let mut reusable = self.frames.iter().position(Image::reusable);
         if reusable.is_none() && self.frames.len() >= MAX_NATIVE_FRAMES {
@@ -1664,7 +1689,7 @@ impl Gpu {
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
         let context = self.context.clone();
-        let submission_guard = context.submission()?;
+        let submission_guard = context.submission_for(SwitchReason::Readback)?;
         self.own(image)?;
         self.readbacks
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {

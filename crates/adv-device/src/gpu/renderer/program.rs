@@ -37,6 +37,7 @@ pub(super) struct BatchStats {
     pub(super) merged_clears: AtomicU64,
     pub(super) metal_draws: AtomicU64,
     pub(super) backend_switches: AtomicU64,
+    pub(super) backend_switches_by_reason: [AtomicU64; 6],
     pub(super) ring_bytes: AtomicU64,
     pub(super) ring_busy: AtomicU64,
     pub(super) submissions: AtomicU64,
@@ -197,15 +198,15 @@ impl Pending {
     }
 
     #[cfg(target_vendor = "apple")]
-    pub(super) fn flush_metal(&mut self) {
+    pub(super) fn flush_metal(&mut self, reason: SwitchReason) {
         if let Some(metal) = &mut self.metal {
             metal.flush();
-            metal.select_wgpu();
+            metal.select_wgpu(reason);
         }
     }
     pub(super) fn flush(&mut self, queue: &wgpu::Queue) {
         #[cfg(target_vendor = "apple")]
-        self.flush_metal();
+        self.flush_metal(SwitchReason::Other);
         self.resolve_clear();
         self.pass = None;
         self.attachments = None;
