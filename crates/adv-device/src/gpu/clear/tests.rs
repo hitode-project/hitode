@@ -74,7 +74,13 @@ fn partial_color_clear_preserves_outside_alpha_and_full_region_keeps_the_fast_pa
         let after = gpu.stats();
         assert_eq!(after.draws, before.draws + 1);
         assert_eq!(after.vertices, before.vertices + 6);
-        assert_eq!(after.submissions, before.submissions);
+        // Native first use initializes wgpu ownership before entering Metal.
+        let initialization = if after.metal_draws > before.metal_draws {
+            2
+        } else {
+            0
+        };
+        assert_eq!(after.submissions, before.submissions + initialization);
         assert_eq!(after.readbacks, before.readbacks);
         assert_eq!(
             after.native_frame_allocations,
@@ -141,7 +147,13 @@ fn selected_partial_depth_and_stencil_preserve_other_components_and_outside_valu
     .unwrap();
     let after = gpu.stats();
     assert_eq!(after.draws, before.draws + 2);
-    assert_eq!(after.submissions, before.submissions);
+    // Depth bootstrap adds one submission to native first-use initialization.
+    let initialization = if after.metal_draws > before.metal_draws {
+        3
+    } else {
+        0
+    };
+    assert_eq!(after.submissions, before.submissions + initialization);
     assert_eq!(after.readbacks, before.readbacks);
     assert_eq!(
         after.native_frame_allocations,

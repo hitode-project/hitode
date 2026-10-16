@@ -4,6 +4,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::*;
 use std::sync::atomic::AtomicBool;
+mod clear;
 mod display;
 pub(super) mod pipeline;
 mod ring;

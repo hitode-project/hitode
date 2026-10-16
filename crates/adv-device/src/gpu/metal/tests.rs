@@ -644,11 +644,132 @@ fn backend_switch_reasons_partition_the_total() {
         let after = gpu.stats();
         assert_eq!(
             after.backend_switches_by_reason[reason as usize],
-            before.backend_switches_by_reason[reason as usize] + 1
+            before.backend_switches_by_reason[reason as usize]
+                + u64::from(!matches!(reason, SwitchReason::PartialClear))
         );
         assert_eq!(
             after.backend_switches_by_reason.iter().sum::<u64>(),
             after.backend_switches
         );
     }
+}
+
+// spec: GFX-METAL-1, GFX-PASS-1, GFX-PASS-2, GFX-PASS-3
+#[test]
+fn native_bounded_clears_match_wgpu_without_switching_or_submitting() {
+    let mut native = gpu(true);
+    let mut reference = gpu(false);
+    for alpha in [AlphaMode::Stored, AlphaMode::Opaque] {
+        for format in [
+            None,
+            Some(DepthFormat::Float32),
+            Some(DepthFormat::Unorm16),
+            Some(DepthFormat::Depth24Stencil8),
+        ] {
+            let targets = [&mut native, &mut reference].map(|gpu| {
+                let mut target = gpu.target(8, 6, false).unwrap();
+                target.image.alpha = alpha;
+                target
+                    .with_depth(format.map(|f| gpu.depth(8, 6, f).unwrap()))
+                    .unwrap()
+            });
+            let mut command = draw();
+            let positions = [
+                [-1f32, -1., 0.5, 1.],
+                [3., -1., 0.5, 1.],
+                [-1., 3., 0.5, 1.],
+            ];
+            command.streams[0].bytes = bytemuck::cast_slice(&positions).to_vec();
+            command.pixel_constants.floats[0] = [0.8, 0.2, 0.4, 0.6];
+            let mut state = DrawState::new(8, 6);
+            state.depth = format.map(|_| Compare::Always);
+            state.depth_write = format.is_some();
+            for (gpu, target) in [(&mut native, &targets[0]), (&mut reference, &targets[1])] {
+                gpu.draw_programmable(target, &command, &state).unwrap();
+                let before = gpu.stats();
+                gpu.clear_region(
+                    target,
+                    Rect {
+                        x: 1,
+                        y: 2,
+                        w: 4,
+                        h: 3,
+                    },
+                    Some([0.13, 0.71, 0.29, 0.53]),
+                    format.map(|_| 0.25),
+                    format.filter(|f| f.has_stencil()).map(|_| 42),
+                )
+                .unwrap();
+                assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+                if gpu.stats().metal_draws > before.metal_draws {
+                    assert_eq!(gpu.stats().submissions, before.submissions);
+                }
+                state.scissor = format.is_none().then_some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                });
+                state.depth = format.map(|_| Compare::LessEqual);
+                command.pixel_constants.floats[0] = [0.2, 0.4, 0.8, 1.];
+                gpu.draw_programmable(target, &command, &state).unwrap();
+                command.pixel_constants.floats[0] = [0.8, 0.2, 0.4, 0.6];
+                state.depth = format.map(|_| Compare::Always);
+                state.scissor = None;
+            }
+            assert_eq!(
+                read(&mut native, &targets[0]),
+                read(&mut reference, &targets[1]),
+                "{alpha:?} {format:?}"
+            );
+        }
+    }
+    assert_eq!(
+        native.stats().prebuild_misses,
+        reference.stats().prebuild_misses
+    );
+}
+
+// spec: GFX-METAL-1, GFX-CACHE-8, GFX-CACHE-10
+#[test]
+fn bounded_clear_pipelines_prebuild_from_persistent_recipes() {
+    let directory = std::env::temp_dir().join(format!(
+        "adv-metal-clear-{}-{}",
+        std::process::id(),
+        NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let render = |gpu: &mut Gpu| {
+        let target = gpu.target(4, 4, false).unwrap();
+        gpu.draw_programmable(&target, &draw(), &DrawState::new(4, 4))
+            .unwrap();
+        gpu.clear_region(
+            &target,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            Some([0.13, 0.71, 0.29, 0.53]),
+            None,
+            None,
+        )
+        .unwrap();
+        read(gpu, &target)
+    };
+    let mut cold = gpu(true);
+    cold.set_pipeline_cache_directory(Some(&directory));
+    let expected = render(&mut cold);
+    cold.flush_pipeline_cache();
+    assert_eq!(cold.stats().prebuild_misses, 2);
+    assert_eq!(cold.stats().persisted_pipelines, 2);
+    drop(cold);
+    let mut hot = gpu(true);
+    hot.set_pipeline_cache_directory(Some(&directory));
+    hot.programmable.warm.drain();
+    assert_eq!(render(&mut hot), expected);
+    assert_eq!(hot.stats().compile_waits, 0);
+    assert_eq!(hot.stats().prebuild_misses, 0);
+    hot.set_pipeline_cache_directory(None);
+    std::fs::remove_dir_all(directory).unwrap();
 }
