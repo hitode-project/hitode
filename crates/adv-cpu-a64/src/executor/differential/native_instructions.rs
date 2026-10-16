@@ -2,6 +2,7 @@
 use super::*;
 
 mod helper_gaps;
+mod mmx_lazy;
 
 fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {
     let mut a = CodeAssembler::new(32).unwrap();

@@ -261,3 +261,80 @@ fn cached_leaf_can_return_to_ordinary_dispatch() {
     assert_eq!((calls.leaves, calls.traps), (1, 1));
     assert_eq!(executor.state.regs[0], WORD);
 }
+
+// spec: A64-FP-4, A64-CTL-12, A64-VER-1
+#[test]
+fn leaf_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
+    use iced_x86::code_asm::*;
+    struct Observer(Calls);
+    impl ExecutionTrap for Observer {
+        fn leaf_call(&self, pc: u32, word: u32) -> bool {
+            self.0.leaf_call(pc, word)
+        }
+        fn leaf(
+            &mut self,
+            state: &mut CpuState,
+            memory: &mut Memory,
+            pc: u32,
+            word: u32,
+        ) -> Option<u64> {
+            assert_eq!(state.mmx[3], 0x11111111);
+            assert_eq!(
+                state.x87.regs[3],
+                adv_cpu_core::X87Register::from_parts(0x11111111, 0xffff)
+            );
+            // This is the canonical state consumed by context readers as well.
+            let mut context = state.clone();
+            let context = context.capture_architecture();
+            assert_eq!(context.x87.regs[3], state.x87.regs[3]);
+            self.0.leaf(state, memory, pc, word)
+        }
+        fn call(
+            &mut self,
+            state: &mut CpuState,
+            memory: &mut Memory,
+            vector: u32,
+        ) -> Result<bool, String> {
+            self.0.call(state, memory, vector)
+        }
+    }
+    for flagm in [false, true] {
+        for first in [false, true] {
+            for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
+                let (mut native, _) = fixture((flagm, first, checks));
+                let (mut oracle, _) = fixture((flagm, first, checks));
+                let mut code = CodeAssembler::new(32).unwrap();
+                code.movd(mm3, eax).unwrap();
+                code.push(DATA + 32).unwrap();
+                code.call(u64::from(THUNK)).unwrap();
+                code.movq(qword_ptr((DATA + 64) as i32), mm3).unwrap();
+                let code = code.assemble(u64::from(CODE)).unwrap();
+                let stop = CODE + code.len() as u32;
+                for executor in [&mut native, &mut oracle] {
+                    executor.protect(CODE, 0x4000, READ | WRITE).unwrap();
+                    executor.write(CODE, &code).unwrap();
+                    executor.protect(CODE, 0x4000, READ | EXEC).unwrap();
+                }
+                oracle.interpreter_only = true;
+                let mut observer = Observer(Calls::new(true));
+                let mut ordinary = Calls::new(false);
+                assert_eq!(
+                    native
+                        .run_with_traps(stop, 100, &mut observer, false)
+                        .unwrap(),
+                    oracle
+                        .run_with_traps(stop, 100, &mut ordinary, false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    native.state.clone().capture_architecture(),
+                    oracle.state.clone().capture_architecture()
+                );
+                assert_eq!(bytes(&native), bytes(&oracle));
+                if !first {
+                    assert_eq!(observer.0.leaves, 1);
+                }
+            }
+        }
+    }
+}

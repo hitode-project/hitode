@@ -238,6 +238,7 @@ pub struct Context {
     pub(crate) state: State,
     /// Its last block was a yield (Sleep(0)): it is polling, not waiting on anything.
     pub(crate) yielded: bool,
+    pub(crate) spin: crate::frame_spin::FrameSpin,
     /// Kernel object signaled when this context ends.
     pub thread_handle: Handle,
 }

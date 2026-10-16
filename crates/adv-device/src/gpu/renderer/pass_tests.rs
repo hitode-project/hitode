@@ -233,6 +233,13 @@ fn unused_depth_rebinding_keeps_a_color_only_pass() {
         let mut state = DrawState::new(4, 4);
         gpu.draw_programmable(&a, &draw, &state).unwrap();
         read(&mut gpu, &a.image);
+        // Initialize both depth images, then defer one more clear of a's.
+        state.depth = Some(Compare::Always);
+        gpu.draw_programmable(&a, &draw, &state).unwrap();
+        gpu.draw_programmable(&b, &draw, &state).unwrap();
+        state.depth = None;
+        gpu.clear(&a, None, Some(1.)).unwrap();
+        read(&mut gpu, &a.image);
         let before = gpu.stats();
         state.depth = Some(Compare::Always);
         gpu.draw_programmable(&a, &draw, &state).unwrap();
@@ -241,6 +248,73 @@ fn unused_depth_rebinding_keeps_a_color_only_pass() {
         gpu.draw_programmable(&a, &draw, &state).unwrap();
         solid(&read(&mut gpu, &a.image), [0, 255, 0, 255]);
         assert_eq!(gpu.stats().passes - before.passes, 2);
-        assert_eq!(gpu.stats().depth_loads - before.depth_loads, 1);
+        // The deferred depth clear becomes that pass's load action.
+        assert_eq!(gpu.stats().depth_loads - before.depth_loads, 0);
+    }
+}
+
+// spec: GFX-PASS-3
+#[test]
+fn depth_clears_wait_for_a_pass_that_attaches_depth() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, true).unwrap();
+        let green = draw();
+        let mut red = draw();
+        red.pixel_constants.floats[0] = [1., 0., 0., 1.];
+        let mut state = DrawState::new(4, 4);
+        // Attach depth once at 1.0, so a skipped clear would let red pass.
+        gpu.clear(&target, None, Some(1.)).unwrap();
+        state.depth = Some(Compare::Always);
+        gpu.draw_programmable(&target, &green, &state).unwrap();
+        read(&mut gpu, &target.image);
+        let before = gpu.stats();
+        gpu.clear(&target, Some([0., 0., 1., 1.]), Some(0.25))
+            .unwrap();
+        state.depth = None;
+        gpu.draw_programmable(&target, &green, &state).unwrap();
+        solid(&read(&mut gpu, &target.image), [0, 255, 0, 255]);
+        let after = gpu.stats();
+        assert_eq!(after.passes - before.passes, 1);
+        assert_eq!(after.merged_clears - before.merged_clears, 1);
+        assert_eq!(after.depth_loads - before.depth_loads, 0);
+        state.depth = Some(Compare::Less);
+        gpu.draw_programmable(&target, &red, &state).unwrap();
+        solid(&read(&mut gpu, &target.image), [0, 255, 0, 255]);
+        assert_eq!(gpu.stats().depth_loads - after.depth_loads, 0);
+    }
+}
+
+// spec: GFX-PASS-3
+#[test]
+fn a_partial_depth_clear_follows_the_deferred_whole_clear() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, true).unwrap();
+        let mut red = draw();
+        red.pixel_constants.floats[0] = [1., 0., 0., 1.];
+        gpu.clear(&target, Some([0., 1., 0., 1.]), Some(0.25))
+            .unwrap();
+        gpu.set_clip(Some(Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 4,
+        }));
+        gpu.clear_region(&target, FULL, None, Some(0.75), None)
+            .unwrap();
+        gpu.set_clip(None);
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Less);
+        gpu.draw_programmable(&target, &red, &state).unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for (at, pixel) in pixels.chunks_exact(4).enumerate() {
+            let expected = if at % 4 < 2 {
+                [0, 0, 255, 255]
+            } else {
+                [0, 255, 0, 255]
+            };
+            assert_eq!(pixel, expected, "pixel {at}");
+        }
     }
 }
