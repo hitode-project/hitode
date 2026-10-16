@@ -2,11 +2,20 @@ import { t } from "./i18n.svelte";
 import { untrack } from "svelte";
 import { call, inTauri, onHostEvent } from "./bridge";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
+import { jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 
-/** The states of the launch screen; a game that fails to run comes back here as "failed". */
-export type LaunchState = "prepare" | "failed" | "unsupported";
+/**
+ * The states of the launch screen; a game that fails to run comes back here as
+ * "failed". iOS waits for a JIT request in progress ("jit-wait") and otherwise
+ * recommends JIT once per session ("jit"): a game started without it runs
+ * interpreted to its end.
+ */
+export type LaunchState = "prepare" | "failed" | "unsupported" | "jit" | "jit-wait";
+
+/** The user chose to play without JIT this session. */
+let jitDeclined = false;
 
 const UNSUPPORTED_PLATFORM = "此平台暂不支持启动";
 
@@ -178,7 +187,7 @@ export class LaunchFlow {
   constructor(gameId: () => string) {
     this.#gameId = gameId;
     // A pending error (the game failed while running) is shown by the effect below.
-    if (!(gameId() in runs.errors)) this.#start();
+    if (!(gameId() in runs.errors)) void this.#start();
     $effect(() => {
       const id = this.#gameId();
       if (runs.errors[id] === undefined) return;
@@ -190,10 +199,23 @@ export class LaunchFlow {
     });
   }
 
-  #start(): void {
+  async #start(): Promise<void> {
     const id = this.#gameId();
     this.view = "prepare";
     this.reason = "";
+    if (jit.active && !jitDeclined) {
+      if (!jit.status) await jit.refresh();
+      if (jit.busy) {
+        this.view = "jit-wait";
+        await jit.settled();
+        if (!this.#alive || this.view !== "jit-wait") return;
+      }
+      if (jit.status && !jit.status.ready) {
+        this.view = "jit";
+        return;
+      }
+      this.view = "prepare";
+    }
     const game = library.get(id);
     if (game?.offline) {
       this.#fail("unsupported", game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹"));
@@ -236,7 +258,22 @@ export class LaunchFlow {
   }
 
   retry(): void {
-    this.#start();
+    void this.#start();
+  }
+
+  /** Enables JIT from the recommendation, then starts the game once it is ready. */
+  async enableJit(): Promise<void> {
+    this.view = "jit-wait";
+    if (jit.status?.liveContainer) await jit.stikDebug();
+    else await jit.enable();
+    await jit.settled();
+    if (this.#alive && this.view === "jit-wait") void this.#start();
+  }
+
+  /** 仍然开始: plays interpreted, without asking again this session. */
+  withoutJit(): void {
+    jitDeclined = true;
+    void this.#start();
   }
 
   /** Replaces the launch screen so leaving the report does not relaunch the game. */

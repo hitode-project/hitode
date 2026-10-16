@@ -31,6 +31,8 @@ export interface Prefs {
   touchMode: TouchMode;
   /** Phones and tablets: the touch controls beside the game are expanded. */
   touchControls: boolean;
+  /** iOS: ask for JIT whenever the launcher opens, once a pairing file is imported. */
+  autoJit: boolean;
 }
 
 const KEY = "adv-launcher.prefs";
@@ -51,6 +53,7 @@ const defaults: Prefs = {
   trackPlayTime: true,
   touchMode: "direct",
   touchControls: true,
+  autoJit: true,
 };
 
 function load(): Prefs {
