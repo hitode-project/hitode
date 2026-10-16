@@ -92,7 +92,7 @@ impl WindowPresenter {
     }
 
     /// `layer` is the game view's frame `CAMetalLayer` (HOST-VIEW-9).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe fn surface(
         layer: *mut std::ffi::c_void,
         instance: &wgpu::Instance,
@@ -152,7 +152,7 @@ impl WindowPresenter {
         fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, Self), String> {
         let descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL,
             ..descriptor
@@ -212,11 +212,13 @@ impl WindowPresenter {
         }
         // UI already selects the vblank opportunity. Never add a FIFO wait for
         // the guest or let a queue of old frames accumulate in the swapchain.
+        // Phone compositors offer only FIFO; their display-link pacing presents
+        // at most once per refresh, so no queue builds there either.
         configuration.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
         } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
-        } else if cfg!(target_os = "android") {
+        } else if cfg!(mobile) {
             wgpu::PresentMode::Fifo
         } else {
             return Err("native surface has no nonblocking presentation mode".into());
@@ -1064,11 +1066,14 @@ impl Session {
         }
     }
 
-    /// On macOS the game view's layer scales the frame, so no display-resolution
+    /// On macOS and iOS the game view's layer scales the frame, so no display-resolution
     /// pass runs. Composed video still draws at the client size.
     fn placement(&self, client: (u32, u32)) -> Placement {
         let canvas = (self.width, self.height);
-        if !cfg!(target_os = "macos") || !self.overlays.is_empty() || canvas.0 == 0 || canvas.1 == 0
+        if !cfg!(any(target_os = "macos", target_os = "ios"))
+            || !self.overlays.is_empty()
+            || canvas.0 == 0
+            || canvas.1 == 0
         {
             return Placement::client(client);
         }
@@ -1688,11 +1693,7 @@ mod tests {
     }
     #[test]
     fn sharp_bilinear_preserves_integer_pixels_and_blends_fractional_boundaries() {
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
         let source = gpu.image(2, 2).unwrap();
         let pixels: Vec<_> = [0, 255, 255, 0]
             .into_iter()
@@ -1768,11 +1769,7 @@ mod tests {
     #[test]
     fn video_load_pass_preserves_native_base_and_restores_it_without_a_window() {
         use adv_device::surface::{BlitRect, VideoFrame};
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
         let target = gpu.target(6, 2, false).unwrap();
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
         let base = gpu.present(&target.image, 1).unwrap();
@@ -1914,11 +1911,7 @@ mod tests {
     #[test]
     fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
         use crate::{Upscaler, upscaling::Upscaling};
-        let mut gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
         let (width, height) = (19, 13);
         let source = gpu.image(width, height).unwrap();
         let mut pixels = Vec::new();

@@ -3,15 +3,15 @@ use adv_runtime::boot::Runtime;
 use std::time::{Duration, Instant};
 
 pub struct AudioOutput {
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     suspended: bool,
-    #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+    #[cfg(any(host_view, windows))]
     output: Option<adv_device::Output>,
 }
 
 impl AudioOutput {
     pub fn new(enabled: bool, headless: bool, runtime: &Runtime) -> Self {
-        #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+        #[cfg(any(host_view, windows))]
         {
             let output = if enabled && !headless {
                 Some(adv_device::Output::new(runtime.audio_stream()))
@@ -20,11 +20,11 @@ impl AudioOutput {
             };
             Self {
                 output,
-                #[cfg(any(target_os = "macos", target_os = "android"))]
+                #[cfg(host_view)]
                 suspended: false,
             }
         }
-        #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
+        #[cfg(not(any(host_view, windows)))]
         {
             let _ = runtime;
             if enabled && !headless {
@@ -36,25 +36,25 @@ impl AudioOutput {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub fn set_suspended(&mut self, suspended: bool) {
         self.suspended = suspended;
         if let Some(output) = self.output.as_mut() {
             output.suspend();
         }
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub fn set_volume(&self, percent: u8) {
         if let Some(output) = &self.output {
             output.set_volume(percent);
         }
     }
     pub fn update(&mut self) {
-        #[cfg(any(target_os = "macos", target_os = "android"))]
+        #[cfg(host_view)]
         if self.suspended {
             return;
         }
-        #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+        #[cfg(any(host_view, windows))]
         if let Some(output) = self.output.as_mut() {
             output.update();
             if output.is_running() {
@@ -65,15 +65,15 @@ impl AudioOutput {
     }
 
     pub fn wait_duration(&self, delay: Option<Duration>) -> Option<Duration> {
-        #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+        #[cfg(any(host_view, windows))]
         let wake = self.output.as_ref().and_then(adv_device::Output::next_wake);
-        #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
+        #[cfg(not(any(host_view, windows)))]
         let wake = None;
         cap_delay(delay, wake, Instant::now())
     }
 
     pub fn json(&self) -> String {
-        #[cfg(any(windows, target_os = "macos", target_os = "android"))]
+        #[cfg(any(host_view, windows))]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let Some(output) = &self.output else {
@@ -110,7 +110,7 @@ impl AudioOutput {
                 metrics.capture_dropped.load(Relaxed)
             )
         }
-        #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
+        #[cfg(not(any(host_view, windows)))]
         {
             "{\"device_requested\": false, \"device_running\": false}".into()
         }

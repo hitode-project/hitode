@@ -17,19 +17,19 @@ pub enum Event {
         wparam: u32,
         lparam: u32,
     },
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     Text(String, std::sync::mpsc::SyncSender<usize>),
     Close,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     ForceClose,
     FocusLost,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     AudioSuspended(bool),
     /// The launcher paused the game: no guest execution, frozen guest time
     /// and suspended audio until it resumes.
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     Paused(bool),
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     Volume(u8),
     Repaint,
 }
@@ -1533,19 +1533,21 @@ mod tests {
     }
 }
 
-#[cfg(target_os = "android")]
-pub(crate) mod android;
-#[cfg(target_os = "android")]
-pub(crate) use android::native_viewport;
-#[cfg(target_os = "android")]
-pub use android::{GameView, TouchAction};
-#[cfg(any(target_os = "android", test))]
+#[cfg(mobile)]
+pub(crate) mod mobile;
+#[cfg(target_os = "ios")]
+pub use mobile::GameContainer;
+#[cfg(mobile)]
+pub(crate) use mobile::native_viewport;
+#[cfg(mobile)]
+pub use mobile::{GameView, TouchAction};
+#[cfg(any(mobile, test))]
 pub(crate) mod android_epoch;
 #[cfg(all(test, not(target_os = "android")))]
 #[path = "window/android/input.rs"]
 mod android_input_tests;
 
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(host_view)]
 /// The guest is told the display runs at 60 Hz, and both `Present` and
 /// software frames are published at guest frame boundaries, so presenting
 /// faster only repeats conversion and composition. Faster displays keep 10%

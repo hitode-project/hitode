@@ -107,11 +107,7 @@ mod tests {
     // spec: HOST-DAMAGE-1
     #[test]
     fn incremental_gpu_uploads_preserve_other_rows_and_skipped_patches() {
-        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
         let context = gpu.context();
         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
             label: None,

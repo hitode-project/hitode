@@ -1,7 +1,0 @@
-{
-  "identifier": "android-storage",
-  "description": "Android game folder import",
-  "platforms": ["android"],
-  "windows": ["main"],
-  "permissions": ["storage:default"]
-}

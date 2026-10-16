@@ -193,6 +193,26 @@ pub fn prepare_code_pool() -> Result<(), String> {
     prepared_pool().map(|_| ())
 }
 
+/// iOS: prepares the pool at once when a JIT debugger is already attached,
+/// as one that launched the app is. `None` leaves the pool untouched for a
+/// debugger that attaches later.
+#[cfg(target_os = "ios")]
+pub fn prepare_code_pool_if_debugged() -> Option<Result<(), String>> {
+    backend::debugged().then(prepare_code_pool)
+}
+
+/// iOS: waits up to `timeout` for the JIT debugger (StikDebug) to attach,
+/// then prepares the pool and lets it detach (IOS-JIT-1). Without one, the
+/// pool fails for good and guests run Tier 0.
+#[cfg(target_os = "ios")]
+pub fn prepare_code_pool_after_attach(timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !backend::debugged() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    prepare_code_pool()
+}
+
 struct PreparedPool {
     ranges: CodePool,
     mapping: backend::Mapping,

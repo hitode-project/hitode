@@ -8,5 +8,6 @@ fn main() {
         "cancel_copy",
     ])
     .android_path("android")
+    .ios_path("ios")
     .build();
 }

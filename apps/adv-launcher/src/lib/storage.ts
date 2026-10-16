@@ -2,15 +2,16 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { hostInfo, inTauri } from "./bridge";
 import { hasStoragePermission as fakeStatus, requestStoragePermission as fakeRequest } from "./fake-import";
 
-const android = inTauri ? hostInfo().then((info) => info.platform === "android") : Promise.resolve(false);
+/** Phones pick folders through the storage plugin: SAF on Android, Files on iOS. */
+const mobile = inTauri ? hostInfo().then((info) => info.platform === "android" || info.platform === "ios") : Promise.resolve(false);
 
 export async function hasStoragePermission(): Promise<boolean> {
-  if (await android) return (await invoke<{ granted: boolean }>("plugin:storage|storage_status")).granted;
+  if (await mobile) return (await invoke<{ granted: boolean }>("plugin:storage|storage_status")).granted;
   return inTauri || fakeStatus();
 }
 
 export async function requestStoragePermission(): Promise<boolean> {
-  if (await android) return (await invoke<{ granted: boolean }>("plugin:storage|request_storage")).granted;
+  if (await mobile) return (await invoke<{ granted: boolean }>("plugin:storage|request_storage")).granted;
   fakeRequest();
   return true;
 }
@@ -32,14 +33,14 @@ export function takePreparedFolder(): string | null {
   return folder;
 }
 
-/** Keep the permission sheet open while SAF copies, then hand its complete path to the scan. */
+/** Keep the permission sheet open while a picked folder copies, then hand its complete path to the scan. */
 export async function prepareFolder(
   copy: boolean,
   signal: AbortSignal,
   onSize: (bytes: number) => void,
   onProgress: (progress: CopyProgress) => void,
 ): Promise<boolean> {
-  if (!(await android)) return true;
+  if (!(await mobile)) return true;
   const folder = await invoke<Folder>("plugin:storage|pick_folder");
   if (!folder.uri || signal.aborted) return false;
   if (!copy && folder.path) {
@@ -64,7 +65,7 @@ export async function prepareFolder(
 }
 
 export async function pickStorageFolder(options?: FolderPickOptions): Promise<string | null | undefined> {
-  if (!(await android)) return undefined;
+  if (!(await mobile)) return undefined;
   const { signal, onSize, onProgress } = options ?? {
     signal: new AbortController().signal, onSize: () => {}, onProgress: () => {},
   };

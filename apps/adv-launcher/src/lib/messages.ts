@@ -45,8 +45,6 @@ export const messages: Record<string, [string, string]> = {
   "复制到本机": ["Copy to this device", "この端末へコピー"],
   "复制后可离线游玩，占用": ["Play offline after copying. Storage:", "コピー後はオフラインで遊べます。使用容量："],
   "返回": ["Back", "戻る"],
-  "部分文件在 iCloud 中，需要先下载": ["Download the files stored in iCloud first", "iCloud のファイルを先にダウンロードしてください"],
-  "下载并添加": ["Download and add", "ダウンロードして追加"],
   "选择游戏文件夹": ["Choose a game folder", "ゲームフォルダーを選択"],
   "在“文件”里选中整个游戏文件夹。": ["Select the entire game folder in Files.", "「ファイル」でゲームフォルダー全体を選択してください。"],
   "打开“文件”": ["Open Files", "「ファイル」を開く"],
