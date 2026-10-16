@@ -254,3 +254,5 @@ dac00230	rbit x16, x17
 1b027c20	mul w0, w1, w2
 1e654020	frintm d0, d1
 1e64c020	frintp d0, d1
+0e0e0528	dup v8.4h, v9.h[3]
+4e140630	dup v16.4s, v17.s[2]

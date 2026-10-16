@@ -1176,6 +1176,11 @@ pub const fn vdup(arr: Arr, rd: VReg, rn: Reg) -> u32 {
     0x0E00_0C00 | arr.q() | imm5(arr.log2(), 0) << 16 | rn.number() << 5 | rd.number()
 }
 
+/// `dup vd.<arr>, vn.<element>[lane]`.
+pub const fn vdup_lane(arr: Arr, rd: VReg, rn: VReg, lane: u32) -> u32 {
+    0x0E00_0400 | arr.q() | imm5(arr.log2(), lane) << 16 | rn.number() << 5 | rd.number()
+}
+
 /// `mov vd.<lane>[to], vn.<lane>[from]` with lanes of `1 << log2` bytes.
 pub const fn vins(log2: u32, rd: VReg, to: u32, rn: VReg, from: u32) -> u32 {
     0x6E00_0400 | imm5(log2, to) << 16 | (from << log2) << 11 | rn.number() << 5 | rd.number()
@@ -1822,6 +1827,8 @@ mod tests {
             ),
             (vdup(Arr::H4, v(0), r(16)), "dup v0.4h, w16"),
             (vdup(Arr::D2, v(1), r(17)), "dup v1.2d, x17"),
+            (vdup_lane(Arr::H4, v(8), v(9), 3), "dup v8.4h, v9.h[3]"),
+            (vdup_lane(Arr::S4, v(16), v(17), 2), "dup v16.4s, v17.s[2]"),
             (vins(2, v(0), 3, v(17), 1), "mov v0.s[3], v17.s[1]"),
             (vins(3, v(16), 1, v(1), 0), "mov v16.d[1], v1.d[0]"),
             (vins(1, v(8), 2, v(9), 7), "mov v8.h[2], v9.h[7]"),

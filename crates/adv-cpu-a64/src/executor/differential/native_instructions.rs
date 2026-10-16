@@ -3,6 +3,7 @@ use super::*;
 
 mod helper_gaps;
 mod mmx_lazy;
+mod pixel_loops;
 
 fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {
     let mut a = CodeAssembler::new(32).unwrap();

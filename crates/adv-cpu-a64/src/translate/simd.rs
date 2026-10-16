@@ -2,10 +2,13 @@
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it.
-//! XMM writes immediately update `CpuState`. MMX writes mark d8-d15 dirty;
-//! control edges, helpers, leaf calls, checked accesses and x87/EMMS entries
+//! XMM writes immediately update `CpuState`, except inside integer pixel loops.
+//! MMX writes mark d8-d15 dirty;
+//! control edges outside those loops, helpers, leaf calls, checked accesses
+//! and x87/EMMS entries
 //! spill them to MMX and the aliased x87 significand and exponent (0xffff).
-//! Direct faults record the dirty mask and recover that prefix from the
+//! Pixel-loop exits also publish dirty XMM registers. Direct faults record
+//! both dirty masks and recover that prefix from the
 //! signal context before re-executing the interrupted instruction.
 //! The cache is forgotten where control can arrive from elsewhere
 //! (region heads and merges) and after a helper, which may change any
@@ -423,8 +426,10 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
 pub struct Vector {
     /// MMX registers in d8-d15, by bit.
     mmx: u8,
-    /// MMX registers whose canonical copies need writing back.
-    pub dirty: u8,
+    /// MMX (bits 0–7) and XMM (bits 8–15) needing publication.
+    pub dirty: u16,
+    /// Integer pixel loops defer XMM publication until an observer.
+    pub deferred: bool,
     /// XMM registers in v16-v23, by bit.
     xmm: u8,
     /// No x87 exception is pending, and TOP and the tags are 0.
@@ -485,7 +490,7 @@ impl Translator<'_> {
         let full = simd.full();
         match simd.kind {
             Kind::Emms => {
-                self.flush_mmx();
+                self.flush_simd();
                 self.cpu();
                 self.emit_all(&[movz(W, X17, 0xffff, 0), strh(X17, X5, runtime::X87_TAG)]);
                 self.vector.ready = false;
@@ -700,6 +705,11 @@ impl Translator<'_> {
             }
             Kind::Shuffle(log2) => {
                 let log2 = u32::from(log2);
+                let lane = u32::from(simd.imm & 3);
+                if u32::from(simd.imm) == lane * 0x55 {
+                    self.emit(vdup_lane(Arr::new(log2, full), d, s, lane));
+                    return self.written(simd.dst);
+                }
                 for lane in 0..4 {
                     let from = u32::from(simd.imm) >> (2 * lane) & 3;
                     self.emit(vins(log2, V0, lane, s, from));
@@ -1072,7 +1082,7 @@ impl Translator<'_> {
         }
     }
 
-    /// Records an MMX write or immediately publishes an XMM write.
+    /// Defers MMX writes and pixel-loop XMM writes; publishes other XMM writes.
     fn written(&mut self, loc: Loc) {
         match loc {
             Loc::Mmx(n) => {
@@ -1080,8 +1090,12 @@ impl Translator<'_> {
                 self.vector.dirty |= 1 << n;
             }
             Loc::Xmm(n) => {
-                self.cpu();
                 self.vector.xmm |= 1 << n;
+                if self.vector.deferred {
+                    self.vector.dirty |= 1 << (8 + n);
+                    return;
+                }
+                self.cpu();
                 let offset = runtime::XMM + 16 * u32::from(n);
                 self.at_cpu(false, VMem::Q, VReg::new(16 + n), offset);
             }
@@ -1089,9 +1103,9 @@ impl Translator<'_> {
         }
     }
 
-    /// Publishes the MMX prefix without changing flags, addresses, x5 or SIMD
+    /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
     /// temporaries. x0/x3/x4 are free at control and observer boundaries.
-    pub(super) fn flush_mmx(&mut self) {
+    pub(super) fn flush_simd(&mut self) {
         let dirty = self.vector.dirty;
         if dirty == 0 {
             return;
@@ -1110,6 +1124,19 @@ impl Translator<'_> {
             self.emit(add_imm(X, super::X4, super::X3, x87, false));
             self.emit(vstr(VMem::D, v, super::X4, 0));
             self.emit(strh(super::X0, super::X4, 8));
+        }
+        if dirty >> 8 != 0 {
+            self.emit(add_imm(X, super::X4, super::X3, runtime::XMM, false));
+        }
+        for n in 0..8 {
+            if dirty & (1 << (8 + n)) != 0 {
+                self.emit(vstr(
+                    VMem::Q,
+                    VReg::new(16 + n),
+                    super::X4,
+                    16 * u32::from(n),
+                ));
+            }
         }
         self.vector.dirty = 0;
     }
@@ -1143,7 +1170,7 @@ impl Translator<'_> {
         self.cold.push(Cold::Leave {
             label,
             state: self.state,
-            mmx_dirty: self.vector.dirty,
+            simd_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
             exit: Exit::Interpret,
             eip: inst.pc,

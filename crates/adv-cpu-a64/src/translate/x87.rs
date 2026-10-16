@@ -101,7 +101,7 @@ enum Take {
 /// tag word, w15 TOP; x7, x16 and x17 are scratch.
 impl Translator<'_> {
     pub(super) fn x87(&mut self, x: X87) {
-        self.flush_mmx();
+        self.flush_simd();
         if self.checking && x.mem.is_some() {
             self.helper(x.helper);
             return;

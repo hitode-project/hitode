@@ -12,8 +12,8 @@
 //!
 //! Faults (A64-MEM-5, A64-MEM-9): every host instruction that may fault has a side-table
 //! site naming its guest instruction. The signal handler only checks that the
-//! PC is such a site, records it and the low halves of v8-v15, and resumes
-//! at the fault stub. The owner publishes the site's dirty MMX prefix before
+//! PC is such a site, records it and v8-v23, and resumes
+//! at the fault stub. The owner publishes the site's dirty SIMD prefix before
 //! interpreting the instruction. Because a
 //! translated instruction commits nothing before its last possible fault
 //! (A64-FLAG-3), the owner then rebuilds the flags from the site's carry and
@@ -89,8 +89,8 @@ struct Faults {
     stub: usize,
     /// The site that faulted, written in signal context.
     pc: Cell<usize>,
-    /// Low halves of v8-v15 captured before the fault stub restores host SIMD.
-    mmx: Cell<[u64; 8]>,
+    /// v8-v23 captured before the fault stub restores host SIMD.
+    simd: Cell<[[u8; 16]; 16]>,
     /// The shadow stack's guard pages.
     guard: (usize, usize),
     /// Where an overflow resumes, and the runtime field it reads the
@@ -124,7 +124,7 @@ unsafe fn on_fault(
                 return 0;
             }
             // SAFETY: `run` keeps the pointee alive and unmodified, apart
-            // from the `pc` and `mmx` cells, until it clears the slot.
+            // from the `pc` and `simd` cells, until it clears the slot.
             let faults = unsafe { &*faults };
             if !(faults.start..faults.end.get()).contains(&pc) {
                 return 0;
@@ -139,9 +139,9 @@ unsafe fn on_fault(
             if faults.site(pc).is_none() {
                 return 0;
             }
-            faults.mmx.set(std::array::from_fn(|n| {
-                u64::from_le_bytes(snapshot.simd[8 + n][..8].try_into().unwrap())
-            }));
+            faults
+                .simd
+                .set(std::array::from_fn(|n| snapshot.simd[8 + n]));
             faults.pc.set(pc);
             faults.stub
         })
@@ -609,7 +609,7 @@ impl Native {
                 sites: Vec::new(),
                 stub: base + stubs.fault,
                 pc: Cell::new(0),
-                mmx: Cell::new([0; 8]),
+                simd: Cell::new([[0; 16]; 16]),
                 guard: shadow.guard(),
                 reset: base + stubs.shadow_reset,
                 resume: &raw mut runtime.resume,
@@ -760,10 +760,16 @@ impl Native {
             let pc = self.faults.pc.get();
             let site = self.faults.site(pc).expect("faulting site");
             recover(cpu, site, self.runtime.temps);
-            for (n, value) in self.faults.mmx.get().into_iter().enumerate() {
-                if site.mmx_dirty & (1 << n) != 0 {
+            for (n, bytes) in self.faults.simd.get().into_iter().enumerate() {
+                if site.simd_dirty & (1 << n) == 0 {
+                    continue;
+                }
+                if n < 8 {
+                    let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                     cpu.mmx[n] = value;
                     cpu.x87.regs[n] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
+                } else {
+                    cpu.xmm[n - 8] = bytes;
                 }
             }
             retired -= u64::from(site.refund);
@@ -1143,7 +1149,7 @@ mod tests {
             carry: Carry::Host,
             recipe: Recipe::Canonical,
             checked: false,
-            mmx_dirty: 0,
+            simd_dirty: 0,
         };
         let words = [
             load,
@@ -1252,7 +1258,7 @@ mod tests {
                 carry: Carry::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
                 checked: false,
-                mmx_dirty: 0,
+                simd_dirty: 0,
             },
             [0; 2],
         );

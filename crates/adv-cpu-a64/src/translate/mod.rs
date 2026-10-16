@@ -11,9 +11,10 @@
 //! recipe over such values until something would overwrite them. Flags no
 //! path reads before writing them again are not computed. Every exit makes
 //! the flags canonical, an internal edge only those its target reads, and
-//! every fault site records sense, carry, recipe and the MMX dirty mask for
+//! every fault site records sense, carry, recipe and the SIMD dirty mask for
 //! the owner. MMX values are published before control edges and observers
-//! (A64-FP-4); XMM writes remain immediate.
+//! (A64-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
+//! remain immediate outside those loops.
 //!
 //! Memory accesses go straight to the window, where a host fault at a
 //! site reaches the owner (A64-MEM-5, A64-MEM-6). Instructions the owner has seen fault
@@ -39,6 +40,7 @@ pub mod first;
 mod flags;
 mod integer;
 mod ops;
+mod pixels;
 mod simd;
 mod strings;
 #[cfg(all(test, emulator))]
@@ -84,8 +86,8 @@ pub struct Site {
     /// Whether the access checks its page first, so a fault here is not
     /// a reason to check it.
     pub checked: bool,
-    /// MMX values committed in d8-d15 but not yet in `CpuState`.
-    pub mmx_dirty: u8,
+    /// Unpublished MMX (bits 0–7) and XMM (bits 8–15) values in host SIMD.
+    pub simd_dirty: u16,
 }
 
 /// The last unit translated, in buffers the next translation reuses.
@@ -239,7 +241,7 @@ enum Cold {
     Leave {
         label: Label,
         state: State,
-        mmx_dirty: u8,
+        simd_dirty: u16,
         refund: u32,
         exit: Exit,
         eip: u32,
@@ -322,6 +324,8 @@ struct Translator<'a> {
     /// Of those, the ones it does not write.
     keep: FlagSet,
     vector: simd::Vector,
+    pixel: Option<pixels::Active>,
+    pixel_copies: Vec<pixels::Copy>,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -381,6 +385,8 @@ pub fn translate(
         out: FlagSet::ALL,
         keep: FlagSet::ALL,
         vector: simd::Vector::default(),
+        pixel: None,
+        pixel_copies: Vec::new(),
     };
     if trace.len() == 0 {
         // Nothing to translate: other units may still link here.
@@ -432,15 +438,16 @@ impl Translator<'_> {
         self.checking = (self.checked)(inst.pc);
         self.out = trace.live_out[index];
         self.keep = self.out.minus(inst.effects.writes);
-        if trace.head(index) || trace.merge[index] {
+        let steady = self.pixel.is_some_and(|p| p.steady);
+        if !steady && (trace.head(index) || trace.merge[index]) {
             // Control may arrive from elsewhere.
-            self.flush_mmx();
+            self.flush_simd();
             self.vector = simd::Vector::default();
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
             self.vector.cpu = false;
         }
-        if trace.head(index) {
+        if !steady && trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
             let refuse = self.asm.label();
@@ -449,19 +456,25 @@ impl Translator<'_> {
             self.cold.push(Cold::Leave {
                 label: refuse,
                 state: State::CANONICAL,
-                mmx_dirty: self.vector.dirty,
+                simd_dirty: self.vector.dirty,
                 refund: prepaid,
                 exit: Exit::Dispatch,
                 eip: inst.pc,
                 link: false,
             });
             self.state = State::CANONICAL;
-        } else if trace.merge[index] {
+        } else if !steady && trace.merge[index] {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
         }
-        self.asm.bind(self.labels[index]);
+        if !steady {
+            self.asm.bind(self.labels[index]);
+            self.pixel_start(index);
+        }
         self.op(inst);
+        if self.pixel_end() {
+            return;
+        }
         if let Next::Edge(edge) = inst.next {
             self.follow(edge);
         }
@@ -479,7 +492,7 @@ impl Translator<'_> {
 
     /// An unconditional internal edge from the current instruction.
     fn jump(&mut self, to: usize) {
-        self.flush_mmx();
+        self.flush_simd();
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
         if net > 0 {
@@ -489,7 +502,7 @@ impl Translator<'_> {
             self.cold.push(Cold::Leave {
                 label: refuse,
                 state: self.state,
-                mmx_dirty: self.vector.dirty,
+                simd_dirty: self.vector.dirty,
                 refund: net as u32 + self.trace.unused(self.index),
                 exit: Exit::Dispatch,
                 eip: self.trace.insts[to].pc,
@@ -503,12 +516,22 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
-        self.flush_mmx();
+        if self.pixel.is_none() {
+            self.flush_simd();
+        }
         let from = self.index;
         match taken {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
-                self.convert(self.trace.live_in[to]);
+                let pixel = self
+                    .pixel
+                    .filter(|p| p.plan.end == from && p.plan.start == to);
+                self.convert(if pixel.is_some() {
+                    FlagSet::ALL
+                } else {
+                    self.trace.live_in[to]
+                });
+                let target = pixel.map_or(self.labels[to], |p| p.entry);
                 let test = self.test(cc);
                 let net = self.trace.net(from, to);
                 if net > 0 {
@@ -517,7 +540,7 @@ impl Translator<'_> {
                         (self.asm.label(), self.asm.label(), self.asm.label());
                     self.emit(sub_imm(X, X9, X9, net, false));
                     self.asm.tbz(true, X9, 63, refuse);
-                    self.jump_if(test, self.labels[to]);
+                    self.jump_if(test, target);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
                     self.cold.push(Cold::Refuse {
@@ -530,14 +553,14 @@ impl Translator<'_> {
                     self.cold.push(Cold::Leave {
                         label: leave,
                         state: self.state,
-                        mmx_dirty: self.vector.dirty,
+                        simd_dirty: self.vector.dirty,
                         refund: self.trace.unused(from),
                         exit: Exit::Dispatch,
                         eip: self.trace.insts[to].pc,
                         link: false,
                     });
                 } else if net == 0 {
-                    self.jump_if(test, self.labels[to]);
+                    self.jump_if(test, target);
                 } else {
                     let label = self.asm.label();
                     self.jump_if(test, label);
@@ -571,7 +594,7 @@ impl Translator<'_> {
                 self.cold.push(Cold::Leave {
                     label,
                     state: self.state,
-                    mmx_dirty: self.vector.dirty,
+                    simd_dirty: self.vector.dirty,
                     refund: self.trace.unused(from),
                     exit: Exit::Dispatch,
                     eip,
@@ -648,7 +671,7 @@ impl Translator<'_> {
                 carry: self.state.carry,
                 recipe: self.state.recipe,
                 checked: self.checking,
-                mmx_dirty: self.vector.dirty,
+                simd_dirty: self.vector.dirty,
             },
         ));
     }
@@ -941,7 +964,7 @@ impl Translator<'_> {
     /// Canonical flags, the refund for this path, then the exit: through a
     /// link point if `link`, on the main path if `main`, else to the owner.
     fn leave(&mut self, exit: Exit, eip: u32, refund: u32, link: bool, main: bool) {
-        self.flush_mmx();
+        self.flush_simd();
         self.canonicalize();
         if refund != 0 {
             self.emit(add_imm(X, X9, X9, refund, false));
@@ -1018,7 +1041,7 @@ impl Translator<'_> {
             Cold::Leave {
                 label,
                 state,
-                mmx_dirty,
+                simd_dirty,
                 refund,
                 exit,
                 eip,
@@ -1026,7 +1049,7 @@ impl Translator<'_> {
             } => {
                 self.asm.bind(label);
                 self.state = state;
-                self.vector.dirty = mmx_dirty;
+                self.vector.dirty = simd_dirty;
                 self.leave(exit, eip, refund, link, false);
             }
             Cold::Edge {
@@ -1125,6 +1148,7 @@ impl Translator<'_> {
     }
 
     fn finish(mut self, at: usize) {
+        self.pixel_copies();
         while let Some(cold) = self.cold.pop() {
             self.cold(cold);
         }

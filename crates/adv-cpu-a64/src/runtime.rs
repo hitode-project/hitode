@@ -34,7 +34,7 @@
 //! owner's `interpret` helper run the instruction, loads the guest back as
 //! `enter` does and returns the helper's status, 0 to continue.
 //!
-//! Units keep `CpuState` current for MMX and XMM registers and cache them
+//! Units publish dirty SIMD registers before calling stubs and cache them
 //! in d8-d15 and v16-v23 (`translate::simd`), so only `access`, which
 //! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
