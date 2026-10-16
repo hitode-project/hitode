@@ -39,6 +39,146 @@ fn initial() -> CpuState {
     }
 }
 
+// spec: A64-CTL-6
+#[test]
+fn bytecode_vm_dispatch_instruction_gate() {
+    // Authored VM: eight byte opcodes and eight handlers, each returning to
+    // the fetch/dispatch pair. Compare the existing emitter with a resolved
+    // site-table prototype; this deliberately adds no production mechanism.
+    let guest_table = DATA + 0x100;
+    let code = bytes(|a| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.jmp(dword_ptr(eax * 4 + guest_table as i32)).unwrap();
+        for _ in 0..8 {
+            a.inc(edx).unwrap();
+            a.jmp(CODE as u64).unwrap();
+        }
+    });
+    let mut mem = memory(&code, &[]);
+    let mut work = Workspace::default();
+    let stubs = Stubs {
+        leaf: HOST_CODE as usize,
+        exit: HOST_CODE as usize,
+        dispatch: HOST_CODE as usize,
+        lookup: HOST_CODE as usize,
+        lookup_slow: HOST_CODE as usize,
+        ret_miss: HOST_CODE as usize,
+        access: HOST_CODE as usize,
+        interpret: HOST_CODE as usize,
+    };
+    translate(
+        &mut work,
+        &mut mem,
+        CODE,
+        &[],
+        &|_| false,
+        0,
+        Features { flagm: false },
+        HOST_CODE as usize,
+        stubs,
+        &|_, _| false,
+    );
+    let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
+    let target_load = work.sites().last().unwrap().0 / 4;
+    let before = branch + 1 - target_load;
+    assert_eq!(before, 8, "guest target load through the hit-path br");
+    // LDR (register), option 011: [x17, x19, lsl #3]. The existing
+    // encoder's option 010 is UXTW; bit 13 selects the X-register form.
+    let resolved = ldr_reg(X, X17, X17, host(0), true) | (1 << 13);
+    let baseline = work.words()[2..=branch].to_vec();
+    work.images.push((CODE, 0x30000));
+    mem.protect(DATA, 4096, 1).unwrap();
+    translate(
+        &mut work,
+        &mut mem,
+        CODE,
+        &[],
+        &|_| false,
+        0,
+        Features { flagm: false },
+        HOST_CODE as usize,
+        stubs,
+        &|_, _| false,
+    );
+    assert_eq!(work.tables.len(), 1);
+    let hot = work.words().iter().position(|&w| w == br(X17)).unwrap();
+    assert_eq!(work.words()[hot - 1], resolved);
+    let after = 3;
+    assert!(before - after >= 4);
+    let mut results = Vec::new();
+    for direct in [false, true] {
+        let mut asm = crate::asm::Asm::new();
+        let top = asm.label();
+        let table = asm.label();
+        let next = asm.label();
+        let handlers: Vec<_> = (0..8).map(|_| asm.label()).collect();
+        asm.bind(top);
+        if direct {
+            asm.emit(ldr_narrow(Narrow::Byte, host(0), WINDOW, host(6)));
+            asm.adr(X17, table);
+            asm.emit_all(&[resolved, br(X17)]);
+        } else {
+            // Skip only the unit's two-instruction budget head. The rest
+            // is the real emitter, including opcode fetch and guest load.
+            asm.emit_all(&baseline);
+        }
+        for (opcode, &handler) in handlers.iter().enumerate() {
+            asm.bind(handler);
+            asm.emit(add_imm(W, X0, X0, opcode as u32 + 1, false));
+            asm.b(next);
+        }
+        asm.bind(next);
+        asm.emit_all(&[
+            add_imm(W, host(6), host(6), 1, false),
+            subs_imm(W, X9, X9, 1, false),
+        ]);
+        asm.b_cond(Cond::Ne, top);
+        asm.emit(ret(Reg::LR));
+        if !asm.offset().is_multiple_of(8) {
+            asm.emit(NOP);
+        }
+        asm.bind(table);
+        for &handler in &handlers {
+            let address = HOST_CODE + asm.position(handler) as u64;
+            asm.emit_all(&[address as u32, (address >> 32) as u32]);
+        }
+        let mut emu = Emulator::new();
+        emu.map(WINDOW_BASE + u64::from(DATA), 0x1000);
+        emu.map(CONTEXT, 0x1000);
+        let indirect = CONTEXT + 0x10000;
+        emu.map(indirect, (runtime::TABLE_LEN * 16) as u64);
+        emu.write(CONTEXT + u64::from(runtime::TABLE), &indirect.to_le_bytes());
+        emu.write(WINDOW_BASE + u64::from(DATA), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        for (opcode, &handler) in handlers.iter().enumerate() {
+            let target = CODE + 0x100 + opcode as u32 * 16;
+            emu.write(
+                WINDOW_BASE + u64::from(guest_table) + opcode as u64 * 4,
+                &target.to_le_bytes(),
+            );
+            let entry = indirect + (runtime::table_slot(target) * 16) as u64;
+            emu.write(entry, &u64::from(target).to_le_bytes());
+            emu.write(
+                entry + 8,
+                &(HOST_CODE + asm.position(handler) as u64).to_le_bytes(),
+            );
+        }
+        emu.set_x(WINDOW, WINDOW_BASE);
+        emu.set_x(RUNTIME, CONTEXT);
+        emu.set_x(host(6), u64::from(DATA));
+        emu.set_x(X9, 8);
+        emu.set_x(X0, 0);
+        emu.call(&asm.finish()).unwrap();
+        results.push((emu.x(X0), emu.x(host(6))));
+    }
+    assert_eq!(results, vec![(36, u64::from(DATA + 8)); 2]);
+    eprintln!("VM dispatch gate: {before} -> {after} A64 instructions; dependent loads 2 -> 1");
+    eprintln!(
+        "VM complete fetch-to-br: {} -> {} A64 instructions",
+        baseline.len(),
+        after + 1
+    );
+}
+
 fn reference(code: &[u8], data: &[u8], initial: &CpuState) -> CpuState {
     let mut memory = memory(code, data);
     let mut state = initial.clone();
@@ -510,6 +650,80 @@ fn floating_guard_and_snan_bail_before_destination_or_mxcsr_commit() {
                 assert_eq!(exit, Exit::Interpret);
                 assert_eq!(left, 99);
                 assert_eq!(got, want);
+            }
+        }
+    }
+}
+
+// spec: A64-CTL-6, A64-CTL-10
+#[test]
+fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() {
+    for (n, ae, byte, clobber, expected) in [
+        (7, false, false, false, 8),
+        (8, true, false, false, 8),
+        (1023, false, false, false, 1024),
+        (1024, true, false, false, 1024),
+        (1024, false, false, false, 0),
+        (0, true, false, false, 0),
+        (0, false, true, false, 256),
+        (7, false, false, true, 0),
+    ] {
+        let table = DATA + 4096 - 16;
+        let code = bytes(|a| {
+            if byte {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+            } else {
+                a.cmp(eax, n).unwrap();
+                if ae {
+                    a.jae(CODE as u64 + 0x800).unwrap();
+                } else {
+                    a.ja(CODE as u64 + 0x800).unwrap();
+                }
+            }
+            a.mov(ecx, 13).unwrap();
+            if clobber {
+                a.mov(al, 1).unwrap();
+            }
+            a.jmp(dword_ptr(eax * 4 + table as i32)).unwrap();
+        });
+        let mut mem = memory(&code, &vec![0; 8192]);
+        mem.protect(DATA, 8192, 1).unwrap();
+        let mut work = Workspace::default();
+        work.images.push((CODE, 0x30000));
+        let stubs = Stubs {
+            leaf: HOST_CODE as usize,
+            exit: HOST_CODE as usize,
+            dispatch: HOST_CODE as usize,
+            lookup: HOST_CODE as usize,
+            lookup_slow: HOST_CODE as usize,
+            ret_miss: HOST_CODE as usize,
+            access: HOST_CODE as usize,
+            interpret: HOST_CODE as usize,
+        };
+        for writable_tail in [false, true] {
+            if writable_tail {
+                mem.protect(DATA + 4096, 4096, 3).unwrap();
+            }
+            translate(
+                &mut work,
+                &mut mem,
+                CODE,
+                &[],
+                &|_| false,
+                0,
+                Features { flagm: false },
+                HOST_CODE as usize,
+                stubs,
+                &|_, _| false,
+            );
+            let count = work.tables.first().map_or(0, |t| t.targets.len());
+            assert_eq!(
+                count,
+                if writable_tail { 0 } else { expected },
+                "n={n} ae={ae} byte={byte} clobber={clobber} writable_tail={writable_tail}"
+            );
+            if count != 0 {
+                assert!(work.code().contains(&(table, (count * 4) as u32)));
             }
         }
     }

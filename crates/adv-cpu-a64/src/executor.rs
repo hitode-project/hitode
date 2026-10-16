@@ -55,6 +55,7 @@ pub struct Stats {
 }
 
 pub struct Executor {
+    pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     pub state: CpuState,
     pub stats: Stats,
     pub(crate) memory: Memory,
@@ -124,7 +125,13 @@ impl Executor {
             },
             false => (None, None),
         };
+        let images = std::rc::Rc::default();
+        #[cfg(native)]
+        let images = native
+            .as_ref()
+            .map_or(images, |n| std::rc::Rc::clone(&n.images));
         Ok(Self {
+            images,
             state: CpuState::default(),
             stats: Stats::default(),
             memory,

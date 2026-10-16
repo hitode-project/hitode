@@ -44,6 +44,7 @@ mod ops;
 mod pixels;
 mod simd;
 mod strings;
+pub(crate) mod tables;
 #[cfg(all(test, emulator))]
 mod tests;
 mod trace;
@@ -94,6 +95,8 @@ pub struct Site {
 /// The last unit translated, in buffers the next translation reuses.
 #[derive(Default)]
 pub struct Workspace {
+    pub(crate) images: Vec<(u32, u32)>,
+    pub(crate) tables: Vec<tables::Table>,
     pub(crate) trace: Trace,
     asm: Asm,
     labels: Vec<Label>,
@@ -133,7 +136,7 @@ impl Workspace {
         self.retired
     }
 
-    /// Guest bytes the unit was translated from, as sorted disjoint
+    /// Guest bytes the unit depends on, as sorted
     /// (address, length) spans.
     pub fn code(&self) -> &[(u32, u32)] {
         &self.trace.code
@@ -238,6 +241,11 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    Table {
+        index: usize,
+        table: Label,
+        stub: Label,
+    },
     /// Leaves for a static EIP with canonical flags after refunding the
     /// countdown: through a link point, or through the exit stub.
     Leave {
@@ -311,6 +319,7 @@ struct Translator<'a> {
     /// Branches to stubs: word index and target address.
     far: &'a mut Vec<(usize, usize)>,
     links: &'a mut Vec<Link>,
+    tables: &'a mut Vec<tables::Table>,
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
     checked: &'a dyn Fn(u32) -> bool,
@@ -350,6 +359,7 @@ pub fn translate(
     leaf: &dyn Fn(u32, u32) -> bool,
 ) {
     work.trace.build(memory, eip, stops, leaf);
+    tables::prepare(work, memory);
     for &(start, len) in &work.trace.code {
         memory.watch_code(start, len as usize);
     }
@@ -363,6 +373,8 @@ pub fn translate(
         links,
         retired,
         channels,
+        tables,
+        images: _,
     } = work;
     *channels = false;
     asm.reset();
@@ -381,6 +393,7 @@ pub fn translate(
         cold,
         far,
         links,
+        tables,
         stubs,
         checked,
         helpers,
@@ -1048,8 +1061,9 @@ impl Translator<'_> {
         self.emit(movk(X, X4, (branch >> 32) as u16, 32));
     }
 
-    fn cold(&mut self, cold: Cold) {
+    fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::Table { index, table, stub } => self.table_cold(index, table, stub, at),
             Cold::Leave {
                 label,
                 state,
@@ -1161,8 +1175,9 @@ impl Translator<'_> {
 
     fn finish(mut self, at: usize) {
         self.pixel_copies();
+        self.cold.sort_by_key(|c| !matches!(c, Cold::Table { .. }));
         while let Some(cold) = self.cold.pop() {
-            self.cold(cold);
+            self.cold(cold, at);
         }
         self.asm.resolve();
         let words = self.asm.words_mut();

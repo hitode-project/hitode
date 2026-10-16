@@ -118,8 +118,11 @@ impl Cpu {
     }
 
     fn view<T>(&mut self, f: impl FnOnce(&mut View<'_>) -> T) -> T {
-        let Executor { state, memory, .. } = &mut self.inner;
-        f(&mut View { state, memory })
+        f(&mut View {
+            state: &mut self.inner.state,
+            memory: &mut self.inner.memory,
+            images: &self.inner.images,
+        })
     }
 }
 
@@ -129,6 +132,7 @@ fn same_wake(a: &WakeEvent, b: &WakeEvent) -> bool {
 
 /// The guest as trap handlers see it: the CPU state and its memory.
 struct View<'a> {
+    images: &'a Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     state: &'a mut CpuState,
     memory: &'a mut Memory,
 }
@@ -167,6 +171,12 @@ fn accessible(memory: &Memory, addr: u32, len: u32, prot: Prot) -> bool {
 }
 
 impl Guest for View<'_> {
+    fn wants_code_images(&self) -> bool {
+        cfg!(native)
+    }
+    fn register_code_image(&mut self, image: adv_cpu_core::AotImage) {
+        self.images.borrow_mut().push((image.base, image.size));
+    }
     fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
         Ok(self.memory.next_mapped_page(addr, limit))
     }
@@ -323,6 +333,10 @@ impl Guest for View<'_> {
             .map_err(|_| fault(addr, size as usize))
     }
     fn unmap(&mut self, addr: u32, size: u32) -> Result<(), MemFault> {
+        self.images.borrow_mut().retain(|&(base, len)| {
+            u64::from(base) >= u64::from(addr) + u64::from(size)
+                || u64::from(addr) >= u64::from(base) + u64::from(len)
+        });
         self.memory
             .unmap(addr, size as usize)
             .map_err(|_| fault(addr, size as usize))
@@ -339,7 +353,11 @@ macro_rules! forward {
 }
 
 impl Guest for Cpu {
+    fn wants_code_images(&self) -> bool {
+        cfg!(native) && self.native
+    }
     forward! {
+        fn register_code_image(&mut self, image: adv_cpu_core::AotImage) -> ();
         fn lock_pages(&mut self, addr: u32, len: u32) -> Result<(), PageLockError>;
         fn unlock_pages(&mut self, addr: u32, len: u32) -> Result<(), PageLockError>;
         fn retire_locked_pages(&mut self) -> Result<(), PageLockError>;
@@ -409,6 +427,7 @@ impl Guest for Cpu {
 
 /// The executor's raw trap interface over a machine-layer handler.
 struct Raw<'a> {
+    images: &'a Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     handler: &'a mut dyn TrapHandler,
 }
 
@@ -424,7 +443,16 @@ impl ExecutionTrap for Raw<'_> {
         pc: u32,
         word: u32,
     ) -> Option<u64> {
-        self.handler.on_leaf(&mut View { state, memory }, pc, word)
+        let images = self.images;
+        self.handler.on_leaf(
+            &mut View {
+                state,
+                memory,
+                images,
+            },
+            pc,
+            word,
+        )
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {
@@ -437,9 +465,15 @@ impl ExecutionTrap for Raw<'_> {
         vector: u32,
     ) -> Result<bool, String> {
         state.commit_mmx();
-        let action = self
-            .handler
-            .on_trap(&mut View { state, memory }, vector as u8);
+        let images = self.images;
+        let action = self.handler.on_trap(
+            &mut View {
+                state,
+                memory,
+                images,
+            },
+            vector as u8,
+        );
         Ok(action == TrapAction::Park)
     }
 }
@@ -519,8 +553,12 @@ impl Backend for Cpu {
             }
             // The deadline bounds the run, not the fuel: a short fuel would
             // leave units that do not fit it to the interpreter.
-            let result =
-                m.run_with_traps(self.park, u64::MAX >> 2, &mut Raw { handler }, !self.native);
+            let images = Rc::clone(&m.images);
+            let mut raw = Raw {
+                handler,
+                images: &images,
+            };
+            let result = m.run_with_traps(self.park, u64::MAX >> 2, &mut raw, !self.native);
             let kind = match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;

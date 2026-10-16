@@ -198,9 +198,11 @@ impl Translator<'_> {
                 }
             }
             Op::JmpIndirect(source) => {
-                self.target_to_w16(source);
-                self.settle();
-                self.probe(false, IndirectBranchKind::Jump);
+                if !self.table_jump(source) {
+                    self.target_to_w16(source);
+                    self.settle();
+                    self.probe(false, IndirectBranchKind::Jump);
+                }
             }
             Op::CallIndirect(source) => {
                 self.target_to_w16(source);
@@ -249,7 +251,7 @@ impl Translator<'_> {
 
     /// Canonical flags and the refund before leaving through a dynamic
     /// transfer, whose EIP is in w16.
-    fn settle(&mut self) {
+    pub(super) fn settle(&mut self) {
         self.flush_simd();
         self.canonicalize();
         let refund = self.trace.unused(self.index);
@@ -258,10 +260,12 @@ impl Translator<'_> {
         }
     }
 
+    /// Unresolved switch entries and ordinary indirect transfers share this
+    /// probe; resolved switch entries use the site table (A64-CTL-6).
     /// Branches to the unit for the EIP in w16 through the indirect table,
     /// from this site's own branch (A64-CTL-6); `link` calls it. A miss records
     /// a transfer of `kind`.
-    fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
+    pub(super) fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
         self.emit_all(&[
             ldr(X, X17, RUNTIME, runtime::TABLE),
             ubfx(X, X6, X16, 2, 16),
@@ -324,7 +328,7 @@ impl Translator<'_> {
         self.forget(esp);
     }
 
-    fn target_to_w16(&mut self, source: Src) {
+    pub(super) fn target_to_w16(&mut self, source: Src) {
         match source {
             Src::Reg(index) => self.emit(mov(W, X16, host(index))),
             Src::Mem(mem) => {

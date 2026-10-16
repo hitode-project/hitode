@@ -3,6 +3,7 @@ use super::*;
 
 mod channels;
 mod helper_gaps;
+mod jump_tables;
 mod mmx_lazy;
 mod pixel_loops;
 
