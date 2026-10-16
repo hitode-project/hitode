@@ -8,6 +8,10 @@ pub struct Input {
     hub: Rc<Hub>,
     /// The frame's layer, a sublayer of the black base layer (HOST-VIEW-9).
     frame: Retained<CAMetalLayer>,
+    display: Retained<CALayer>,
+    displayed: Option<adv_device::gpu::NativeFrame>,
+    retired: Vec<adv_device::gpu::NativeFrame>,
+    retirement: Option<Retained<NSTimer>>,
     width: u32,
     height: u32,
     cursor_visible: bool,
@@ -79,6 +83,8 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) { self.ivars().borrow_mut().handle(self, event); }
         #[unsafe(method(frameClockFired:))]
         fn frame_clock_fired(&self, link: &CADisplayLink) { self.frame(link); }
+        #[unsafe(method(retireFrames:))]
+        fn retire_frames_timer(&self, _timer: &NSTimer) { self.retire_frames(); }
     }
 );
 
@@ -151,6 +157,15 @@ impl GameView {
             )
         })?;
         presenter.configure_exclusive(width.max(1), height.max(1))?;
+        // Core Animation's contentsOpaque handles IOSurface alpha independently
+        // of the public opaque flag (which only describes layer coverage).
+        let display = &self.ivars().borrow().display;
+        presenter.direct_layer = display.respondsToSelector(sel!(setContentsOpaque:));
+        if presenter.direct_layer {
+            unsafe {
+                let _: () = msg_send![display, setContentsOpaque: true];
+            }
+        }
         Ok((gpu, presenter))
     }
 
@@ -269,6 +284,13 @@ impl GameView {
         }
         hub.on_frame.borrow_mut().take();
         hub.vsync.clear();
+        let mut input = self.ivars().borrow_mut();
+        unsafe { input.display.setContents(None) };
+        // The view outlives execution teardown; keep its pins until then even
+        // if Core Animation still references the removed contents.
+        if let Some(timer) = input.retirement.take() {
+            timer.invalidate();
+        }
     }
     /// Arms one display-link callback; false when the timer fallback is in use.
     pub(crate) fn request_frame(&self) -> bool {
@@ -281,6 +303,7 @@ impl GameView {
     fn frame(&self, link: &CADisplayLink) {
         let hub = self.hub();
         link.setPaused(true);
+        self.retire_frames();
         let period = link.duration();
         if period > 0.0 {
             let now = std::time::Instant::now();
@@ -304,9 +327,14 @@ impl GameView {
         hub.canvas.set((width, height));
         hub.main_enabled.set(true);
         let frame = CAMetalLayer::new();
+        let display = CALayer::new();
         let this = Self::alloc(mtm).set_ivars(RefCell::new(Input {
             hub,
             frame: frame.clone(),
+            display: display.clone(),
+            displayed: None,
+            retired: Vec::new(),
+            retirement: None,
             width,
             height,
             cursor_visible: true,
@@ -330,6 +358,10 @@ impl GameView {
         unsafe { frame.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
         frame.setOpaque(true);
         base.addSublayer(&frame);
+        unsafe { display.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
+        display.setOpaque(true);
+        display.setHidden(true);
+        base.addSublayer(&display);
         view.setLayer(Some(&base));
         view.place(None);
         Ok(view)
@@ -349,21 +381,76 @@ impl GameView {
             None => ([0.0, 0.0, bounds.width, bounds.height], false),
         };
         let [x, y, w, h] = rectangle;
-        let frame = self.ivars().borrow().frame.clone();
+        let input = self.ivars().borrow();
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        frame.setFrame(objc2_core_foundation::CGRect::new(
-            objc2_core_foundation::CGPoint::new(x, bounds.height - y - h),
-            objc2_core_foundation::CGSize::new(w, h),
-        ));
-        unsafe {
-            frame.setMagnificationFilter(if nearest {
-                objc2_quartz_core::kCAFilterNearest
-            } else {
-                objc2_quartz_core::kCAFilterLinear
-            });
+        for frame in [&*input.frame as &CALayer, &input.display] {
+            frame.setFrame(objc2_core_foundation::CGRect::new(
+                objc2_core_foundation::CGPoint::new(x, bounds.height - y - h),
+                objc2_core_foundation::CGSize::new(w, h),
+            ));
+            unsafe {
+                frame.setMagnificationFilter(if nearest {
+                    objc2_quartz_core::kCAFilterNearest
+                } else {
+                    objc2_quartz_core::kCAFilterLinear
+                });
+            }
         }
         CATransaction::commit();
+    }
+    pub(crate) fn shared_frame(&self, frame: Option<adv_device::gpu::NativeFrame>) {
+        let mut input = self.ivars().borrow_mut();
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let surface = frame.as_ref().map(|frame| frame.io_surface().unwrap());
+        // IOSurfaceRef is the supported Core Animation layer contents object.
+        unsafe {
+            input.display.setContents(
+                surface.map(|surface| &*(std::ptr::from_ref(surface).cast::<AnyObject>())),
+            );
+        }
+        input.display.setHidden(frame.is_none());
+        input.frame.setHidden(frame.is_some());
+        if let Some(old) = std::mem::replace(&mut input.displayed, frame) {
+            if input
+                .displayed
+                .as_ref()
+                .is_none_or(|next| !next.image.shares_storage(&old.image))
+            {
+                input.retired.push(old);
+            }
+        }
+        CATransaction::commit();
+        if !input.retired.is_empty() && input.retirement.is_none() {
+            // A hidden window can stop its display link while the compositor
+            // still owns retired frames. Drain those pins without stalling the guest.
+            let timer = unsafe {
+                NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                    1. / 60.,
+                    self,
+                    sel!(retireFrames:),
+                    None,
+                    true,
+                )
+            };
+            unsafe {
+                objc2_foundation::NSRunLoop::mainRunLoop()
+                    .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes)
+            };
+            input.retirement = Some(timer);
+        }
+    }
+    fn retire_frames(&self) {
+        let mut input = self.ivars().borrow_mut();
+        input
+            .retired
+            .retain(|frame| frame.io_surface().unwrap().is_in_use());
+        if input.retired.is_empty()
+            && let Some(timer) = input.retirement.take()
+        {
+            timer.invalidate();
+        }
     }
     pub(crate) fn hub(&self) -> Rc<Hub> {
         self.ivars().borrow().hub.clone()
@@ -649,6 +736,10 @@ mod tests {
         let mut input = Input {
             hub: hub.clone(),
             frame: CAMetalLayer::new(),
+            display: CALayer::new(),
+            displayed: None,
+            retired: Vec::new(),
+            retirement: None,
             width: 640,
             height: 480,
             cursor_visible: true,

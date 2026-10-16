@@ -42,6 +42,10 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 [dev-dependencies]
 pollster = "0.4"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CARenderer", "objc2-metal", "objc2-core-video"] }
+
 [target.'cfg(windows)'.dependencies]
 adv-device = { path = "../adv-device", features = ["device"] }
 log = "0.4"

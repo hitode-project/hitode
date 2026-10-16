@@ -13,6 +13,8 @@ mod pipeline_disk;
 mod program;
 mod recipes;
 mod warmup;
+#[cfg(target_vendor = "apple")]
+pub use metal::DisplayCompletion;
 pub use program::validate_program;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +75,8 @@ pub struct NativeContext {
     failure: Arc<OnceLock<String>>,
     gate: Arc<submission::Gate>,
     pending: Arc<Mutex<program::Pending>>,
+    #[cfg(target_vendor = "apple")]
+    software: Arc<OnceLock<Result<metal::Software, Error>>>,
     // Keep the software-device turn alive until its last process/compositor
     // context is gone, including when the process that requested it exits.
     _software: Option<Arc<SoftwareTurn>>,
@@ -516,7 +520,13 @@ impl Gpu {
                 required_limits: limits,
                 // SHADER_F16 serves the half-precision upscalers.
                 required_features: adapter.features()
-                    & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::SHADER_F16),
+                    & (wgpu::Features::PIPELINE_CACHE
+                        | wgpu::Features::SHADER_F16
+                        | wgpu::Features::BGRA8UNORM_STORAGE
+                        | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+                        | wgpu::Features::SUBGROUP
+                        | wgpu::Features::SUBGROUP_BARRIER),
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
             })
             .await
@@ -539,6 +549,8 @@ impl Gpu {
             failure,
             gate: submission::Gate::new().map_err(|error| Error::Unavailable(error.to_string()))?,
             pending: Arc::new(Mutex::new(program::Pending::default())),
+            #[cfg(target_vendor = "apple")]
+            software: Arc::new(OnceLock::new()),
             _software: software.clone(),
         };
         #[cfg(target_vendor = "apple")]
@@ -824,6 +836,16 @@ impl Gpu {
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        Self::wrap_image(context, texture, width, height, levels)
+    }
+
+    fn wrap_image(
+        context: &NativeContext,
+        texture: wgpu::Texture,
+        width: u32,
+        height: u32,
+        levels: u32,
+    ) -> Image {
         let view = texture.create_view(&Default::default());
         let render_view = texture.create_view(&wgpu::TextureViewDescriptor {
             mip_level_count: Some(1),
@@ -870,6 +892,24 @@ impl Gpu {
             .then(|| self.depth(width, height, DepthFormat::Float32))
             .transpose()?;
         Ok(Target { image, depth })
+    }
+
+    /// A rotating display target whose Metal storage can be shared with Core Animation.
+    pub fn presentation_target(
+        &self,
+        width: u32,
+        height: u32,
+        depth: bool,
+    ) -> Result<Target, Error> {
+        let image = self.presentation_image(width, height)?;
+        let depth = depth
+            .then(|| self.depth(width, height, DepthFormat::Float32))
+            .transpose()?;
+        Ok(Target { image, depth })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    fn presentation_image(&self, width: u32, height: u32) -> Result<Image, Error> {
+        self.image(width, height)
     }
 
     /// A color mip chain, with no per-level allocation or automatic generation.
@@ -1523,6 +1563,7 @@ impl Gpu {
             },
             extent(rectangle.w, rectangle.h),
         );
+        self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
         self.submit(encoder, submission);
         self.check()
     }
@@ -1543,7 +1584,7 @@ impl Gpu {
         let index = if let Some(index) = reusable {
             if self.frames[index].width != image.width || self.frames[index].height != image.height
             {
-                self.frames[index] = self.image(image.width, image.height)?;
+                self.frames[index] = self.presentation_image(image.width, image.height)?;
                 self.stats.native_frame_allocations += 1;
             }
             index
@@ -1551,7 +1592,8 @@ impl Gpu {
             if self.frames.len() >= MAX_NATIVE_FRAMES {
                 return Err(Error::Busy);
             }
-            self.frames.push(self.image(image.width, image.height)?);
+            self.frames
+                .push(self.presentation_image(image.width, image.height)?);
             self.stats.native_frame_allocations += 1;
             self.frames.len() - 1
         };

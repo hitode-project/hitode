@@ -58,7 +58,6 @@ struct Host {
     session: Option<Session>,
     playback: Option<Playback>,
     paused: bool,
-    close_window: bool,
     // Pending game close, with an exit code only when the application should quit.
     exit: Option<Option<i32>>,
     quit: Retained<QuitHandler>,
@@ -213,7 +212,6 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 session: None,
                 playback: None,
                 paused: false,
-                close_window: false,
                 exit: None,
                 quit,
                 observers,
@@ -292,15 +290,12 @@ pub async fn start_game(
                     view,
                     options,
                     Box::new(move |result| {
-                        let (close, exit) = HOST.with_borrow_mut(|host| {
+                        let exit = HOST.with_borrow_mut(|host| {
                             let host = host.as_mut().unwrap();
                             host.session.take();
                             host.container.set_game(None);
                             host.focus(Target::Overlay);
-                            (
-                                std::mem::take(&mut host.close_window),
-                                host.exit.take().flatten(),
-                            )
+                            host.exit.take().flatten()
                         });
                         let elapsed = started_at.elapsed();
                         if let Err(error) = crate::saves::automatic(&backup_data) {
@@ -309,8 +304,6 @@ pub async fn start_game(
                         crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);
-                        } else if close {
-                            let _ = finished_window.close();
                         }
                     }),
                 );
@@ -367,19 +360,7 @@ pub async fn start_game(
 /// Asks the running game to close while the launcher stays; asked again while
 /// it is closing, the game is forced. Returns false when no game is running.
 pub(crate) fn end_game() -> bool {
-    HOST.with_borrow_mut(|host| {
-        let Some(host) = host else { return false };
-        let Some(session) = &host.session else {
-            return false;
-        };
-        if host.exit.is_some() || host.close_window {
-            session.force_close();
-        } else {
-            host.exit = Some(None);
-            session.request_close();
-        }
-        true
-    })
+    HOST.with_borrow_mut(|host| host.as_mut().is_some_and(Host::end_game))
 }
 
 #[tauri::command]
@@ -480,10 +461,11 @@ pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                     host.focus(window.state::<OverlayState>().router().keyboard());
                 }
                 tauri::WindowEvent::Focused(false) => session.resign_key(),
+                // Closing the window while a game runs ends only the game, as
+                // Quit does; the library stays open.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
-                    host.close_window = true;
-                    session.request_close();
+                    host.end_game();
                 }
                 _ => {}
             }
@@ -511,6 +493,21 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 
 impl Host {
+    /// Asks the running game to close, or forces it when already asked.
+    /// Returns false when no game is running.
+    fn end_game(&mut self) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        if self.exit.is_some() {
+            session.force_close();
+        } else {
+            self.exit = Some(None);
+            session.request_close();
+        }
+        true
+    }
+
     fn apply_pause(&self) {
         if let Some(session) = &self.session {
             let background =
