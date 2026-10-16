@@ -348,14 +348,15 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
         return true;
     }
     let s = b.snapshot.as_ref().unwrap();
-    let delta = s.delta(d, b.versions);
+    // Binding pairs compare values directly, so the captured mask yields the
+    // same pairs as the revision delta without building it.
     let pairs = if capture {
         changes(
             &s.shaders,
             &s.buffers,
             s.texture,
             (&d.shaders, &d.buffers, d.texture),
-            &delta,
+            &s.mask,
         )
     } else {
         changes(
@@ -363,7 +364,7 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
             &d.buffers,
             d.texture,
             (&s.shaders, &s.buffers, s.texture),
-            &delta,
+            &s.mask,
         )
     };
     // Public ownership guarantees that none of these releases frees guest storage.
