@@ -1,7 +1,7 @@
 //! Authored pixel arithmetic; no engine code or fingerprints.
 use super::*;
 
-fn configs() -> impl Iterator<Item = Config> {
+pub(super) fn configs() -> impl Iterator<Item = Config> {
     [false, true].into_iter().flat_map(|flagm| {
         [false, true].into_iter().flat_map(move |first| {
             [Checks::Adaptive, Checks::All, Checks::Slow]

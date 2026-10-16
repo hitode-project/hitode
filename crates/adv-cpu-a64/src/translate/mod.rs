@@ -33,8 +33,9 @@
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
 //! x5, which are free inside units; a run of SIMD instructions keeps the
 //! `CpuState` pointer in x5, MMX registers in d8-d15 and XMM registers in
-//! v16-v23, with v0-v2 as scratch.
+//! v16-v23, with v0-v3 as scratch.
 
+mod channels;
 mod decode;
 pub mod first;
 mod flags;
@@ -101,6 +102,7 @@ pub struct Workspace {
     far: Vec<(usize, usize)>,
     links: Vec<Link>,
     retired: u32,
+    pub(crate) channels: bool,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -326,6 +328,7 @@ struct Translator<'a> {
     vector: simd::Vector,
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
+    channels: &'a mut bool,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -359,7 +362,9 @@ pub fn translate(
         far,
         links,
         retired,
+        channels,
     } = work;
+    *channels = false;
     asm.reset();
     labels.clear();
     labels.extend((0..trace.len()).map(|_| asm.label()));
@@ -387,6 +392,7 @@ pub fn translate(
         vector: simd::Vector::default(),
         pixel: None,
         pixel_copies: Vec::new(),
+        channels,
     };
     if trace.len() == 0 {
         // Nothing to translate: other units may still link here.
@@ -470,6 +476,7 @@ impl Translator<'_> {
         if !steady {
             self.asm.bind(self.labels[index]);
             self.pixel_start(index);
+            self.channel_batch(index);
         }
         self.op(inst);
         if self.pixel_end() {

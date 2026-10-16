@@ -1257,6 +1257,17 @@ pub const fn vstr_reg(size: VMem, rt: VReg, rn: Reg, rm: Reg) -> u32 {
     vldr_reg(size, rt, rn, rm) & !(1 << 22)
 }
 
+/// `st2/st3/st4 {vt.16b, ...}, [rn]`: interleave 16 pixels.
+pub const fn vst_interleaved(channels: u32, rt: VReg, rn: Reg) -> u32 {
+    let op = match channels {
+        2 => 0x8000,
+        3 => 0x4000,
+        4 => 0,
+        _ => panic!("invalid channel count"),
+    };
+    0x4C00_0000 | op | rn.number() << 5 | rt.number()
+}
+
 /// `ldur st/dt/qt, [rn, #offset]` with an unscaled signed offset.
 pub const fn vldur(size: VMem, rt: VReg, rn: Reg, offset: i32) -> u32 {
     assert!(offset >= -256 && offset < 256);

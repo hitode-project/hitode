@@ -94,8 +94,13 @@ impl FastPermissions {
         let mut host = None;
         let mut permission = |page: usize| {
             let mut permissions = permissions[page];
-            if watched.is_some_and(|pages| !pages[page]) {
-                permissions &= !EXEC;
+            if let Some(watched) = watched {
+                if !watched[page] {
+                    permissions &= !EXEC;
+                } else if permissions & WRITE != 0 {
+                    // Negative fetch dependencies protect writable data too.
+                    permissions |= EXEC;
+                }
             }
             // Owned COPY snapshots already have initialized linear bytes and
             // no external alias. Reads can use ordinary native loads. EXEC is

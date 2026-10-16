@@ -1,6 +1,7 @@
 //! Exercise instruction commits, faults, retries and fuel through the native owner.
 use super::*;
 
+mod channels;
 mod helper_gaps;
 mod mmx_lazy;
 mod pixel_loops;

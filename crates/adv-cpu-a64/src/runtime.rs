@@ -98,6 +98,8 @@ pub struct Runtime {
     pub branch: u64,
     /// Light host dispatch: bit 0 exits after INT, bit 1 requests ordinary INT.
     pub leaf: u64,
+    #[cfg(test)]
+    pub channel_batches: u64,
 }
 
 impl Runtime {
@@ -105,6 +107,8 @@ impl Runtime {
         assert_eq!(window % (1 << 32), 0, "the window is 4 GiB aligned");
         Self {
             leaf: 0,
+            #[cfg(test)]
+            channel_batches: 0,
             cpu,
             window,
             shadow: 0,
@@ -220,6 +224,8 @@ const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
+#[cfg(test)]
+pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));

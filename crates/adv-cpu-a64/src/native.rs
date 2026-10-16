@@ -545,6 +545,7 @@ pub(crate) struct Native {
     strikes: FxHashMap<u32, u32>,
     /// Guest instructions whose accesses check their page first.
     checked: FxHashSet<u32>,
+    channels: bool,
     /// Faults at unchecked sites so far.
     pub(crate) unchecked_faults: u64,
     /// The run's wall deadline as a virtual counter value.
@@ -636,6 +637,7 @@ impl Native {
             checks: Checks::Adaptive,
             strikes: FxHashMap::default(),
             checked: FxHashSet::default(),
+            channels: false,
             unchecked_faults: 0,
             deadline: None,
             diagnostics: Diagnostics::default(),
@@ -711,7 +713,7 @@ impl Native {
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         let budget = fuel.min(SLICE);
-        if self.checks != Checks::Adaptive || !self.checked.is_empty() {
+        if self.channels || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
         }
         self.cache.sync();
@@ -854,6 +856,11 @@ impl Native {
         self.deadline.is_some_and(|at| ticks() >= at)
     }
 
+    #[cfg(test)]
+    pub(crate) fn channel_batches(&self) -> u64 {
+        self.runtime.channel_batches
+    }
+
     /// Guest instructions whose accesses check their page.
     pub(crate) fn checked_count(&self) -> usize {
         self.checked.len()
@@ -941,6 +948,7 @@ impl Native {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
         self.units.clear();
+        self.channels = false;
         self.pages.clear();
         self.links.clear();
         self.linked.clear();
@@ -1062,6 +1070,12 @@ impl Native {
                     }
                 }
             }
+        }
+        self.channels |= entry.is_some() && work.channels;
+        // Code discovery can protect a host page shared with ordinary data.
+        // Revalidate the non-faulting batch proof before linked code resumes.
+        if self.channels {
+            self.classify(memory);
         }
         self.work = work;
         entry

@@ -2365,6 +2365,11 @@ mod window_tests {
             // [0x14000, 0x18000): code is observed on one page.
             memory.watch_code(0x14000, 1);
             let classes = memory.native_permissions();
+            assert_eq!(
+                classes[4] & 7,
+                READ | WRITE | EXEC,
+                "{host}: watched data page"
+            );
             let mixed = host == 16384;
             assert_eq!(
                 classes[1] & 7,
