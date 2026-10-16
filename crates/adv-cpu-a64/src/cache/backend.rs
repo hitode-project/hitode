@@ -1,9 +1,6 @@
 //! Executable view ownership and platform preparation boundary.
 use std::ptr::NonNull;
 
-#[cfg(target_os = "ios")]
-compile_error!("iOS code views are not implemented: Mach memory entry preparation is required");
-
 pub(super) struct Mapping {
     pub write: NonNull<u8>,
     pub exec: NonNull<u8>,
@@ -69,7 +66,9 @@ unsafe fn clean_and_invalidate(write: *const u8, exec: *const u8, ranges: &[(usi
     unsafe { asm!("dsb ish", "isb", options(nostack)) };
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Linux and Android alias a memfd; iOS aliases a Mach memory entry, so
+/// no write ever toggles a view's protection.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
 mod os {
     use std::ptr::NonNull;
 
@@ -94,7 +93,22 @@ mod os {
     /// Every range must be mapped in both views.
     pub unsafe fn synchronize(write: *const u8, exec: *const u8, ranges: &[(usize, usize)]) {
         // SAFETY: forwarded.
-        unsafe { super::clean_and_invalidate(write, exec, ranges) };
+        #[cfg(not(target_os = "ios"))]
+        unsafe {
+            super::clean_and_invalidate(write, exec, ranges)
+        };
+        #[cfg(target_os = "ios")]
+        {
+            unsafe extern "C" {
+                fn sys_icache_invalidate(start: *mut libc::c_void, len: libc::size_t);
+            }
+            let _ = write;
+            for &(offset, len) in ranges {
+                // SAFETY: the range is mapped in the execute view; Darwin
+                // cleans data lines as the core requires.
+                unsafe { sys_icache_invalidate(exec.add(offset).cast_mut().cast(), len) };
+            }
+        }
     }
 
     /// # Safety
