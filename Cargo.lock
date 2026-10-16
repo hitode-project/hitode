@@ -177,6 +177,7 @@ dependencies = [
  "objc2-avf-audio",
  "objc2-foundation",
  "objc2-ui-kit",
+ "plist",
  "reqwest",
  "serde",
  "serde_json",

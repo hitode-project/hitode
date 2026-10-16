@@ -29,16 +29,13 @@ pub async fn enable(
 ) -> Result<()> {
     progress("connecting");
     let mut pairing = RpPairingFile::from_bytes(pairing)?;
-    let socket = TcpStream::connect(("10.7.0.1", 49152)).await?;
+    let socket = connect_vpn(49152).await?;
     let mut remote = RemotePairingClient::new(RpPairingSocket::new(socket), "Hitode");
     remote.attempt_pair_verify().await?;
     remote.validate_pairing(&mut pairing).await?;
     let port = remote.create_tcp_listener().await?;
-    let tunnel = connect_tls_psk_tunnel_native(
-        TcpStream::connect(("10.7.0.1", port)).await?,
-        remote.encryption_key(),
-    )
-    .await?;
+    let tunnel =
+        connect_tls_psk_tunnel_native(connect_vpn(port).await?, remote.encryption_key()).await?;
     let rsd_port = tunnel.info.server_rsd_port;
     let client_address = tunnel.info.client_address.parse()?;
     let server_address = tunnel.info.server_address.parse()?;
@@ -55,7 +52,7 @@ pub async fn enable(
     let mut parts = version.split('.');
     let major: u32 = parts.next().ok_or("missing iOS major version")?.parse()?;
     let minor: u32 = parts.next().unwrap_or("0").parse()?;
-    let cryptex = (major, minor) >= (26, 4);
+    let cryptex = uses_cryptex(major, minor);
     progress("checkingDdi");
     if cryptex {
         if cryptexd::installed_ddi(&mut adapter, &mut rsd)
@@ -98,21 +95,63 @@ pub async fn enable(
     Ok(())
 }
 
-async fn download_ddi(cache: &Path, cryptex: bool, progress: &impl Fn(&str)) -> Result<PathBuf> {
-    let variant = if cryptex {
-        "Xcode_iOS_DDI_Cryptex"
-    } else {
-        "Xcode_iOS_DDI_Personalized"
-    };
-    let directory = cache.join(DDI_REVISION).join(variant);
-    std::fs::create_dir_all(&directory)?;
+/// Connects to this device through LocalDevVPN, which is the only route here.
+async fn connect_vpn(port: u16) -> Result<TcpStream> {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(("10.7.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(socket)) => Ok(socket),
+        Ok(Err(error)) => Err(format!("LocalDevVPN unreachable: {error}").into()),
+        Err(_) => Err("LocalDevVPN unreachable: connection timed out".into()),
+    }
+}
+
+/// iOS 26.4 and later install the DDI as a cryptex.
+fn uses_cryptex(major: u32, minor: u32) -> bool {
+    (major, minor) >= (26, 4)
+}
+
+/// The DDI set this device needs, judged from the running system; the helper
+/// runs on the device it mounts the image on.
+pub fn local_cryptex() -> bool {
+    let version = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+    uses_cryptex(version.majorVersion as u32, version.minorVersion as u32)
+}
+
+fn ddi_variant(cryptex: bool) -> (&'static str, Vec<&'static str>) {
     let mut files = vec!["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache"];
     if cryptex {
         files.extend(["Image.dmg.cryptex_info", "Image.dmg.root_hash"]);
+        ("Xcode_iOS_DDI_Cryptex", files)
+    } else {
+        ("Xcode_iOS_DDI_Personalized", files)
     }
+}
+
+/// Whether every file of the DDI set is already downloaded.
+pub fn ddi_present(cache: &Path, cryptex: bool) -> bool {
+    let (variant, files) = ddi_variant(cryptex);
+    let directory = cache.join(DDI_REVISION).join(variant);
+    files.iter().all(|file| directory.join(file).is_file())
+}
+
+/// Downloads the missing files of the DDI set. It needs no tunnel, so users
+/// can fetch it before LocalDevVPN takes the VPN slot from their usual one.
+pub async fn download_ddi(
+    cache: &Path,
+    cryptex: bool,
+    progress: &impl Fn(&str),
+) -> Result<PathBuf> {
+    let (variant, files) = ddi_variant(cryptex);
+    let directory = cache.join(DDI_REVISION).join(variant);
+    std::fs::create_dir_all(&directory)?;
+    // Image.dmg is about 16 MB; slow links need minutes, not seconds.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .build()?;
     let mut use_mirror = false;
     for file in files {

@@ -90,6 +90,8 @@ pub fn run() {
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         game::setup(app)?;
+        #[cfg(target_os = "ios")]
+        jit_ios::request_at_launch(app.handle());
         Ok(())
     });
     #[cfg(desktop)]
@@ -213,6 +215,9 @@ pub fn run() {
         game::game_wheel,
         jit_ios::jit_status,
         jit_ios::request_jit,
+        jit_ios::import_pairing_file,
+        jit_ios::check_ddi,
+        jit_ios::download_ddi,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,

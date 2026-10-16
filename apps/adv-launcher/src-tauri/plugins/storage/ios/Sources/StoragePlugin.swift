@@ -27,6 +27,10 @@ struct Copied: Encodable {
   let path: String
 }
 
+struct PickedFile: Encodable {
+  let path: String?
+}
+
 struct StorageError: LocalizedError {
   let errorDescription: String?
   init(_ message: String) { errorDescription = message }
@@ -39,6 +43,8 @@ struct StorageError: LocalizedError {
 class StoragePlugin: Plugin, UIDocumentPickerDelegate {
   private let lock = NSLock()
   private var picking: Invoke?
+  /// A single-file pick, told apart from folder picks by its controller.
+  private var pickingFile: (picker: UIDocumentPickerViewController, invoke: Invoke)?
   /// Picked folders keep their security scope until imported.
   private var picked: [String: URL] = [:]
   private var copying: String?
@@ -55,8 +61,8 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
 
   @objc public func pickFolder(_ invoke: Invoke) {
     DispatchQueue.main.async {
-      guard self.picking == nil else {
-        invoke.reject("A folder picker is already open")
+      guard self.picking == nil, self.pickingFile == nil else {
+        invoke.reject("A picker is already open")
         return
       }
       guard let presenter = self.manager.viewController else {
@@ -71,9 +77,38 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
     }
   }
 
+  /// A pairing file or similar plist. Files hands over a private copy, so
+  /// no security scope outlives the call.
+  @objc public func pickFile(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      guard self.picking == nil, self.pickingFile == nil else {
+        invoke.reject("A picker is already open")
+        return
+      }
+      guard let presenter = self.manager.viewController else {
+        invoke.reject("No view controller to present the file picker")
+        return
+      }
+      let types =
+        ["mobiledevicepairing", "mobiledevicepair"].compactMap {
+          UTType(filenameExtension: $0, conformingTo: .data)
+        } + [.propertyList, .xml, .data]
+      let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+      picker.delegate = self
+      picker.allowsMultipleSelection = false
+      self.pickingFile = (picker, invoke)
+      presenter.present(picker, animated: true)
+    }
+  }
+
   public func documentPicker(
     _ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]
   ) {
+    if let file = pickingFile, file.picker === controller {
+      pickingFile = nil
+      file.invoke.resolve(PickedFile(path: urls.first?.path))
+      return
+    }
     guard let invoke = picking else { return }
     picking = nil
     guard let url = urls.first else {
@@ -94,6 +129,11 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
   }
 
   public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    if let file = pickingFile, file.picker === controller {
+      pickingFile = nil
+      file.invoke.resolve(PickedFile(path: nil))
+      return
+    }
     picking?.resolve(Folder(uri: nil, path: nil))
     picking = nil
   }

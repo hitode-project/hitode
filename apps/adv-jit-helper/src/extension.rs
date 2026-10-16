@@ -12,9 +12,24 @@ use std::{
     time::Duration,
 };
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+enum Mode {
+    #[default]
+    Enable,
+    /// Reports `ddiPresent` or `ddiMissing` without touching the network.
+    DdiStatus,
+    /// Fetches the DDI set without the tunnel.
+    DownloadDdi,
+}
+
 #[derive(Deserialize)]
 struct Request {
+    #[serde(default)]
+    mode: Mode,
+    #[serde(default)]
     pid: u32,
+    #[serde(default)]
     pairing: Vec<u8>,
 }
 
@@ -58,7 +73,9 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line)?;
-    let cache = PathBuf::from(std::env::var("HOME")?).join("Library/Caches/HitodeJIT");
+    // Application Support, not Caches: the system may purge caches, and a
+    // fresh download may be impossible while LocalDevVPN holds the VPN slot.
+    let cache = PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/HitodeJIT");
     let output = std::sync::Mutex::new(stream);
     let send = |stage: &str, error: Option<String>| {
         let message = serde_json::json!({"stage": stage, "error": error});
@@ -67,17 +84,31 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(240),
-            crate::device::enable(request.pid, &request.pairing, &cache, &|stage| {
-                send(stage, None)
-            }),
-        )
-        .await
-        .map_err(|_| "JIT helper timed out".to_string())?
-        .map_err(|error| error.to_string())
-    });
+    let cryptex = crate::device::local_cryptex();
+    let result = match request.mode {
+        Mode::DdiStatus => {
+            let present = crate::device::ddi_present(&cache, cryptex);
+            send(if present { "ddiPresent" } else { "ddiMissing" }, None);
+            Ok(())
+        }
+        Mode::DownloadDdi => runtime.block_on(async {
+            crate::device::download_ddi(&cache, cryptex, &|stage| send(stage, None))
+                .await
+                .map(drop)
+                .map_err(|error| error.to_string())
+        }),
+        Mode::Enable => runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(240),
+                crate::device::enable(request.pid, &request.pairing, &cache, &|stage| {
+                    send(stage, None)
+                }),
+            )
+            .await
+            .map_err(|_| "JIT helper timed out".to_string())?
+            .map_err(|error| error.to_string())
+        }),
+    };
     send("finished", result.err());
     Ok(())
 }
