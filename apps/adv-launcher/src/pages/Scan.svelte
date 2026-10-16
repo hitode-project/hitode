@@ -3,6 +3,7 @@
   import ImportFooter from "../components/ImportFooter.svelte";
   import ImportMini from "../components/ImportMini.svelte";
   import ImportSwitch from "../components/ImportSwitch.svelte";
+  import ScanExe from "../components/ScanExe.svelte";
   import Icon from "../components/Icon.svelte";
   import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -62,7 +63,13 @@
                 <span class="mono ell" lang="ja">{g.path}</span>
               </span>
             </label>
-            <span class="exe mono" style="color: var(--fg2); white-space: nowrap">{g.exe}</span>
+            <span class="exe">
+              {#if locked}
+                <span class="mono" style="color: var(--fg2); white-space: nowrap">{g.exe}</span>
+              {:else}
+                <ScanExe name={g.name} exes={g.exes} value={scan.exeOf(g)?.path ?? g.exe} onpick={(v) => scan.setExe(g, v)} />
+              {/if}
+            </span>
             {#if !locked}
               <ImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label={t("{0} 的编码", g.name)} onpick={(v) => scan.setEnc(g, v)} />
             {/if}
@@ -185,6 +192,12 @@
   }
   .row.on {
     background: var(--sel);
+  }
+  .row .exe {
+    display: flex;
+    justify-content: flex-end;
+    min-width: 0;
+    max-width: 240px;
   }
   .row.off {
     opacity: 0.55;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { slide } from "svelte/transition";
   import { t } from "../lib/i18n.svelte";
   import { call, inTauri } from "../lib/bridge";
   import { library } from "../lib/library.svelte";
@@ -20,12 +21,18 @@
   let busy = $state(false);
   let saving = $state(false);
   let error = $state("");
+  /** A search first lists its best few; after a pick only the choice stays. */
+  const FIRST = 5;
+  let expanded = $state(false);
+  let collapsed = $state(false);
+  const shown = $derived(collapsed && selected ? results.filter((vn) => vn.id === selected!.id) : expanded ? results : results.slice(0, FIRST));
   async function search(next = false) {
     if (!query.trim() || busy) return;
     busy = true; error = "";
     const text = next ? activeQuery : query.trim();
     const number = next ? page + 1 : 1;
-    if (!next) { results = []; selected = null; more = false; searched = false; }
+    collapsed = false;
+    if (!next) { results = []; selected = null; more = false; searched = false; expanded = false; }
     try {
       const found = await call<{ results: Novel[]; more: boolean } | null>("vndb_search", { query: text, page: number }, null);
       if (!found) throw Error(t("请在桌面启动器中使用 VNDB"));
@@ -65,15 +72,17 @@
     {#if busy}<p role="status">{t("正在获取资料…")}</p>{/if}
     {#if error}<p role="alert">{error}</p>{/if}
     <div class="results">
-      {#each results as vn (vn.id)}
-        <button class="result" class:on={selected?.id === vn.id} disabled={busy} onclick={() => selected = vn} aria-pressed={selected?.id === vn.id}>
+      {#each shown as vn (vn.id)}
+        <button class="result" transition:slide={{ duration: 180 }} class:on={selected?.id === vn.id} disabled={busy} onclick={() => { selected = vn; collapsed = true; }} aria-pressed={selected?.id === vn.id}>
           {#if vn.image}<img src={vn.image.thumbnail} alt="" class:blur={prefs.blurAdult && vn.image.sexual >= 1} referrerpolicy="no-referrer" />{/if}
           <span><strong>{vn.alttitle || vn.title}</strong><br />{vn.title}<br /><small>{vn.id} · {vn.released ?? "—"} · {vn.developers.map((d) => d.name).join(" / ")}</small></span>
         </button>
       {/each}
     </div>
     {#if searched && results.length === 0}<p>{t("没有找到作品")}</p>{/if}
-    {#if more}<button class="quiet" disabled={busy} onclick={() => search(true)}>{t("加载更多")}</button>{/if}
+    {#if collapsed && selected}<button class="quiet" disabled={busy} onclick={() => (collapsed = false)}>{t("更换作品")}</button>
+    {:else if !expanded && results.length > FIRST}<button class="quiet" onclick={() => (expanded = true)}>{t("显示全部 {0} 个结果", results.length)}</button>
+    {:else if more}<button class="quiet" disabled={busy} onclick={() => search(true)}>{t("加载更多")}</button>{/if}
     {#if selected}
       <section>
         <h3>{selected.alttitle || selected.title}</h3>

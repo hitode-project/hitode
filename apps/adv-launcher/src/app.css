@@ -102,3 +102,79 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .notice { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 12px; background: var(--field); font-size: 13px; line-height: 18px; }
 .notice > svg { flex: 0 0 auto; margin-top: 1px; color: var(--fg2); }
 .mono { font-family: var(--font-mono); font-size: 12px; color: var(--fg3); word-break: break-all; }
+
+/* Press feedback, as native controls give it: the highlight comes at once and
+   eases away. Raised specificity outranks the `all: unset` of row buttons. */
+:root { -webkit-tap-highlight-color: transparent; }
+:root button {
+  transition: background-color 0.15s ease, color 0.15s ease, opacity 0.2s ease, filter 0.15s ease, transform 0.18s ease, box-shadow 0.18s ease;
+}
+:root button:not(:disabled):active {
+  opacity: 0.6;
+  transition-duration: 0s;
+}
+:root :is(.primary, .secondary, .ghost, .icon-btn):not(:disabled):active {
+  transform: scale(0.96);
+}
+
+/* Screen changes (nav.svelte.ts). The desktop sidebar stays; its page
+   crossfades and settles. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.18s;
+}
+::view-transition-old(page) {
+  animation: 0.12s ease both vt-out;
+}
+::view-transition-new(page) {
+  animation: 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both vt-rise;
+}
+/* iOS: a push slides the new screen over a dimmed, parallaxed old one. */
+:root[data-platform="ios"][data-motion="forward"]::view-transition-new(root) {
+  animation: 0.4s cubic-bezier(0.2, 0.9, 0.25, 1) both vt-push-in;
+}
+:root[data-platform="ios"][data-motion="forward"]::view-transition-old(root) {
+  animation: 0.4s cubic-bezier(0.2, 0.9, 0.25, 1) both vt-push-out;
+}
+:root[data-platform="ios"][data-motion="back"]::view-transition-new(root) {
+  animation: 0.36s cubic-bezier(0.2, 0.9, 0.25, 1) both vt-pop-in;
+}
+:root[data-platform="ios"][data-motion="back"]::view-transition-old(root) {
+  z-index: 1;
+  animation: 0.36s cubic-bezier(0.2, 0.9, 0.25, 1) both vt-pop-out;
+}
+/* Android: Material's shared X axis. */
+:root[data-platform="android"][data-motion="forward"]::view-transition-new(root) {
+  animation: 0.3s cubic-bezier(0.2, 0, 0, 1) both vt-axis-in;
+}
+:root[data-platform="android"][data-motion="forward"]::view-transition-old(root) {
+  animation: 0.3s cubic-bezier(0.2, 0, 0, 1) both vt-axis-out;
+}
+:root[data-platform="android"][data-motion="back"]::view-transition-new(root) {
+  animation: 0.3s cubic-bezier(0.2, 0, 0, 1) both vt-axis-in-back;
+}
+:root[data-platform="android"][data-motion="back"]::view-transition-old(root) {
+  animation: 0.3s cubic-bezier(0.2, 0, 0, 1) both vt-axis-out-back;
+}
+:root[data-motion]::view-transition-old(root),
+:root[data-motion]::view-transition-new(root) {
+  mix-blend-mode: normal;
+}
+@keyframes vt-out { to { opacity: 0; } }
+@keyframes vt-rise { from { opacity: 0; transform: translateY(8px); } }
+@keyframes vt-push-in { from { transform: translateX(100%); } }
+@keyframes vt-push-out { to { transform: translateX(-30%); filter: brightness(0.82); } }
+@keyframes vt-pop-in { from { transform: translateX(-30%); filter: brightness(0.82); } }
+@keyframes vt-pop-out { to { transform: translateX(100%); } }
+@keyframes vt-axis-in { from { opacity: 0; transform: translateX(30px); } 40% { opacity: 0; } }
+@keyframes vt-axis-out { to { opacity: 0; transform: translateX(-30px); } 40% { opacity: 0; } }
+@keyframes vt-axis-in-back { from { opacity: 0; transform: translateX(-30px); } 40% { opacity: 0; } }
+@keyframes vt-axis-out-back { to { opacity: 0; transform: translateX(30px); } 40% { opacity: 0; } }
+@keyframes vt-in { from { opacity: 0; } }
+/* Reduced motion: screens only crossfade. */
+@media (prefers-reduced-motion: reduce) {
+  :root button:not(:disabled):active { transform: none; }
+  ::view-transition-group(*) { animation: none !important; }
+  ::view-transition-old(*) { animation: 0.15s ease both vt-out !important; }
+  ::view-transition-new(*) { animation: 0.15s ease both vt-in !important; }
+}

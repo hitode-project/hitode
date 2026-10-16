@@ -42,7 +42,7 @@ export interface Meta {
 
 export const FAKE_SCAN_ROOT = "[所选文件夹]/ADV";
 
-function exe(path: string, codepage: 932 | 936 = 932): ScanFound["exe"] {
+function exe(path: string, codepage: 932 | 936 = 932): NonNullable<ScanFound["exe"]> {
   return { path, size: 3_400_000, arch: "x86", codepage, inLibrary: null };
 }
 
@@ -53,7 +53,11 @@ const FAKE_FOUND: ScanFound[] = [
   { relative: "旧作/2003/灯台守のいない島", depth: 3, title: "灯台守のいない島", exe: exe("Toudai.exe"), setup: false, inLibrary: null },
   { relative: "旧作/2010/雨音ステップ", depth: 3, title: "雨音ステップ", exe: null, setup: false, inLibrary: null },
   { relative: "旧作/2005/蒼の残響", depth: 3, title: "蒼の残響", exe: null, setup: true, inLibrary: null },
-].map((f) => ({ ...f, folder: `${FAKE_SCAN_ROOT}/${f.relative}` }));
+].map((f) => ({
+  ...f,
+  folder: `${FAKE_SCAN_ROOT}/${f.relative}`,
+  exes: f.exe ? [f.exe, ...(f.depth === 2 ? [exe("Config.exe"), exe("Launcher.exe")] : [])] : [],
+}));
 
 /** What library_scan would find under the fake root, `depth` levels down. */
 export function fakeScan(depth: number): ScanFound[] {
