@@ -19,7 +19,10 @@ struct Request {
 }
 
 define_class!(
+    // NSExtensionPrincipalClass names this class; objc2's default name would
+    // carry the module path and crate version.
     #[unsafe(super(NSObject))]
+    #[name = "HitodeJitRequestHandler"]
     pub struct HitodeJitRequestHandler;
     unsafe impl NSObjectProtocol for HitodeJitRequestHandler {}
     unsafe impl NSExtensionRequestHandling for HitodeJitRequestHandler {
