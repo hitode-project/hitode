@@ -129,6 +129,8 @@ pub struct Memory {
     pub perms: Arc<Vec<u8>>,
     pub fast: FastPermissions,
     pub epoch: u64,
+    /// Owner-specific validation stamp for Tier 0 page dependencies.
+    pub(crate) code_generation: u64,
     /// Allocation identity survives moves and cannot alias a reused host address.
     pub versions: Vec<u64>,
     /// Monotonic code observations owned by the controller, not guest protection.
@@ -475,6 +477,7 @@ impl Memory {
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
+            code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             code: BTreeMap::new(),
@@ -525,6 +528,7 @@ impl Memory {
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
+            code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             code: BTreeMap::new(),
@@ -848,6 +852,7 @@ impl Memory {
             ranges => *ranges = None,
         }
         self.epoch += 1;
+        self.code_generation += 1;
         for version in &mut self.versions[start..=last] {
             *version = self.epoch;
         }
@@ -1261,6 +1266,7 @@ impl Memory {
         }
         if !changed.is_empty() {
             self.epoch += 1;
+            self.code_generation += 1;
         }
         for &page in &changed {
             self.sync_window(page..page + 1)?;
@@ -1651,8 +1657,9 @@ impl Memory {
             }
             *page = perms | (*page & (SHARED | AUDIO));
         }
-        self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
+        // Revoke validation even if synchronizing host protection fails.
         self.touch(addr, len);
+        self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
         Ok(())
     }
 

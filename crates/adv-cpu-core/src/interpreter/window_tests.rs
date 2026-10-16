@@ -348,3 +348,85 @@ fn local_callee_code_write_exits_before_cached_successor() {
     assert_eq!(s.regs[4], STACK - 4);
     assert_eq!(m.read_data(CODE, 4).unwrap().as_ref(), &word.to_le_bytes());
 }
+
+// spec: EXEC-CORE-6
+#[test]
+fn unchanged_generation_skips_stamps_and_changed_generation_restamps() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    a.mov(eax, 7).unwrap();
+    a.ret().unwrap();
+    let mut m = memory(&a.assemble(CODE as u64).unwrap());
+    let mut decodes = 0;
+    let mut block = DecodedBlock::fetch(&mut m, CODE, None, &mut decodes);
+    assert_eq!(block.generation, Some(m.code_generation));
+    // A stale local stamp would trigger the old per-page revalidation. The
+    // unchanged owner generation proves that no page stamp needs consulting.
+    block.pages[0].version ^= 1;
+    let stale = block.pages[0].version;
+    assert!(block.valid(&mut m));
+    assert_eq!(block.pages[0].version, stale);
+    m.touch(TABLE, 1);
+    assert_ne!(block.generation, Some(m.code_generation));
+    assert!(block.valid(&mut m));
+    assert_eq!(block.pages[0].version, Page::at(&m, CODE).version);
+    assert_eq!(block.generation, Some(m.code_generation));
+}
+
+// spec: EXEC-CORE-6
+#[test]
+fn data_write_on_code_page_keeps_generation_and_decoding() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, 7).unwrap();
+    a.jmp(top).unwrap();
+    let code = a.assemble(CODE as u64).unwrap();
+    let mut m = memory(&code);
+    m.protect(CODE, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+    let mut s = state();
+    let mut interpreter = Interpreter::new();
+    interpreter.run_block(&mut s, &mut m, 2, STOP, None);
+    let decodes = interpreter.decode_count();
+    let generation = m.code_generation;
+    m.write(CODE + 0x800, &[9]).unwrap();
+    assert_eq!(m.code_generation, generation);
+    interpreter.run_block(&mut s, &mut m, 2, STOP, None);
+    assert_eq!(interpreter.decode_count(), decodes);
+    // A code write revokes the fast path even if the bytes are identical.
+    m.write(CODE, &code[..1]).unwrap();
+    assert_ne!(m.code_generation, generation);
+    interpreter.run_block(&mut s, &mut m, 2, STOP, None);
+    assert_eq!(interpreter.decode_count(), decodes);
+    m.write(CODE + 1, &9u32.to_le_bytes()).unwrap();
+    interpreter.run_block(&mut s, &mut m, 2, STOP, None);
+    assert_eq!(s.regs[0], 9);
+    assert!(interpreter.decode_count() > decodes);
+}
+
+// spec: EXEC-CORE-6
+#[test]
+fn generation_covers_mapping_permissions_and_distinct_owners() {
+    let mut m = Memory::reserve(CODE, 3 * PAGE_SIZE).unwrap();
+    let initial = m.code_generation;
+    m.map(CODE, PAGE_SIZE, READ | WRITE).unwrap();
+    assert_ne!(m.code_generation, initial);
+    let mapped = m.code_generation;
+    m.protect(CODE, PAGE_SIZE, READ).unwrap();
+    assert_ne!(m.code_generation, mapped);
+    let protected = m.code_generation;
+    m.unmap(CODE, PAGE_SIZE).unwrap();
+    assert_ne!(m.code_generation, protected);
+    let unmapped = m.code_generation;
+    m.map_shared_audio(CODE, PAGE_SIZE).unwrap();
+    assert_ne!(m.code_generation, unmapped);
+    let shared = m.code_generation;
+    m.map_private_copy_pages(CODE + PAGE_SIZE as u32, &[0; PAGE_SIZE], READ | WRITE)
+        .unwrap();
+    assert_ne!(m.code_generation, shared);
+    let snapshot = m.code_generation;
+    m.privatize_copy_pages(CODE + PAGE_SIZE as u32, PAGE_SIZE)
+        .unwrap();
+    assert_ne!(m.code_generation, snapshot);
+    let other = Memory::reserve(CODE, 3 * PAGE_SIZE).unwrap();
+    assert_ne!(m.code_generation, other.code_generation);
+}

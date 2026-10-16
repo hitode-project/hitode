@@ -792,7 +792,7 @@ const BLOCK_INSTRUCTIONS: usize = 64;
 const BLOCK_BYTES: usize = 512;
 
 /// A contiguous decode window with local branch targets indexed by byte offset.
-/// Validate bytes and all page dependencies at each entry. A store changing the
+/// Validate changed page dependencies at entry. A store changing the
 /// code epoch ends execution before the cached suffix can run.
 struct DecodedBlock {
     pc: u32,
@@ -803,22 +803,35 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
+    /// SHARED dependencies never qualify for the owner-generation shortcut.
+    generation: Option<u64>,
 }
 
 impl DecodedBlock {
-    /// As `Cached::valid`: watch and compare bytes only after a page changed.
+    /// An unchanged owner generation proves all private page stamps current.
     fn valid(&mut self, memory: &mut Memory) -> bool {
-        if self.pages.iter().all(|page| page.current(memory)) {
+        if self.generation == Some(memory.code_generation) {
             return true;
         }
-        memory.watch_code(self.pc, self.bytes.len());
-        if !self.revalidate(memory) {
-            return false;
+        if !self.pages.iter().all(|page| page.current(memory)) {
+            memory.watch_code(self.pc, self.bytes.len());
+            if !self.revalidate(memory) {
+                return false;
+            }
+            for page in &mut self.pages {
+                *page = Page::at(memory, page.address);
+            }
         }
-        for page in &mut self.pages {
-            *page = Page::at(memory, page.address);
-        }
+        self.stamp_generation(memory);
         true
+    }
+
+    fn stamp_generation(&mut self, memory: &Memory) {
+        self.generation = self
+            .pages
+            .iter()
+            .all(|page| page.permissions & crate::memory::SHARED == 0)
+            .then_some(memory.code_generation);
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
@@ -840,6 +853,7 @@ impl DecodedBlock {
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
+            generation: None,
         };
         let mut pc = start;
         let mut furthest_target = start;
@@ -932,6 +946,7 @@ impl DecodedBlock {
             }
             pc = next;
         }
+        block.stamp_generation(memory);
         block
     }
 
