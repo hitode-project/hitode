@@ -118,6 +118,7 @@ struct Device {
     fixed: fixed::Fixed,
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
+    versions: [u64; 15],
     frame: recording::Recording,
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
@@ -961,6 +962,7 @@ fn create_device(
         fixed,
         shaders: shaders::Bindings::default(),
         recording: None,
+        versions: [0; 15],
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,

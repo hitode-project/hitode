@@ -75,6 +75,84 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
 fn present(f: &mut Fixture) {
     f.okay("IDirect3DDevice9::Present", &[f.device, 0, 0, 0, 0]);
 }
+
+#[test]
+// spec: GFX-REC-9, GFX-REC-2, GFX-REC-3, GFX-REC-8
+fn dead_pass_pixels_match_verification_and_near_misses_keep_observed_outputs() {
+    for (read, partial) in [(false, false), (true, false), (false, true)] {
+        let mut outputs = Vec::new();
+        for verify in [false, true] {
+            let mut f = fixture();
+            f.m.ext.get_mut::<State>().verify_frames = verify;
+            let d = f.device;
+            let other = f.render_target(16, 12, 21);
+            clear(&mut f, 0xff112233);
+            let draw = draw(&mut f);
+            record_draw(&mut f, draw);
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[d, 0, other]);
+            if read {
+                let owner = id(&mut f);
+                let source = device(&env(&mut f), d).unwrap().back_buffer.unwrap();
+                let destination = com(&env(&mut f))
+                    .identity::<Payload>(&f.m.sys.objects, other)
+                    .unwrap();
+                let target = f.target(other);
+                let image = f.image(f.back);
+                let rectangle = Rect {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 12,
+                };
+                let result = record(
+                    &mut env(&mut f),
+                    owner,
+                    Operation::Copy {
+                        source: image,
+                        rectangle,
+                        destination: target,
+                        region: rectangle,
+                        filter: Filter::Nearest,
+                        resources: [source, destination],
+                    },
+                );
+                assert_eq!(f.finish(result), 0);
+            } else {
+                clear(&mut f, 0xff334455);
+            }
+            let back = f.back;
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[d, 0, back]);
+            if partial {
+                let viewport = f.packet(adv_abi::types::D3DVIEWPORT9 {
+                    X: 0,
+                    Y: 0,
+                    Width: 15,
+                    Height: 12,
+                    MinZ: 0.,
+                    MaxZ: 1.,
+                });
+                f.okay("IDirect3DDevice9::SetViewport", &[d, viewport]);
+            }
+            clear(&mut f, 0xff667788);
+            present(&mut f);
+            if !verify && !read && !partial {
+                assert_eq!(stats(&f).draws, 0);
+            } else {
+                assert!(stats(&f).draws > 0);
+            }
+            assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
+            #[cfg(feature = "d3d9-counters")]
+            assert_eq!(
+                f.m.ext.get::<State>().frames.eliminated_passes,
+                u64::from(!verify && !read && !partial)
+            );
+            let back = f.target(f.back).image;
+            let other = f.target(other).image;
+            outputs.push((f.pixels(&back), f.pixels(&other)));
+        }
+        assert_eq!(outputs[0], outputs[1], "read={read}, partial={partial}");
+    }
+}
 fn clear(f: &mut Fixture, color: u32) {
     f.okay(
         "IDirect3DDevice9::Clear",
@@ -120,6 +198,26 @@ fn record_draw(f: &mut Fixture, d: fixed::Draw) {
         record(&mut env(f), owner, Operation::Draw(d)),
         Outcome::Return(0)
     ));
+}
+
+#[cfg(feature = "d3d9-counters")]
+#[test]
+// spec: GFX-REC-3, GFX-REC-8
+fn authored_recording_work_counts() {
+    let mut f = fixture();
+    for _ in 0..3 {
+        let d = draw(&mut f);
+        record_draw(&mut f, d);
+    }
+    let count = f.m.ext.get::<State>().frames;
+    assert_eq!(count.recorded_draws, 3);
+    assert!(count.recorded_draw_bytes >= 3 * 3 * std::mem::size_of::<Vertex>() as u64);
+    eprintln!("{}", count.work_report());
+    let result = flush(&mut f, Reason::Readback);
+    assert_eq!(f.finish(result), 0);
+    let image = f.target(f.back).image;
+    let pixels = f.pixels(&image);
+    assert!(pixels.chunks_exact(4).any(|p| p[0] != 0));
 }
 fn stats(f: &Fixture) -> Stats {
     f.m.ext.get::<State>().gpu.as_ref().unwrap().stats()
@@ -561,8 +659,8 @@ fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {
 }
 fn fingerprint(f: &mut Fixture, d: fixed::Draw) -> u128 {
     let owner = id(f);
-    let e = env(f);
-    let p = key::prepare(&e, owner, Operation::Draw(d)).unwrap();
+    let mut e = env(f);
+    let p = key::prepare(&mut e, owner, Operation::Draw(d)).unwrap();
     hash((p.key, p.reads, p.writes))
 }
 
@@ -619,7 +717,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
     let mut d = draw(f);
     let mut state = d.state;
     state.texture_op = TextureOp::Texture;
-    d.programmable = Some(ProgrammableDraw {
+    d.programmable = Some(Box::new(ProgrammableDraw {
         program: Program::new(
             Arc::from("authored immutable program identity"),
             vec![false],
@@ -642,7 +740,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
             sampler: state.sampler,
         }],
         parameters: [[0; 4]; 40],
-    });
+    }));
     d.program_key = 1;
     d
 }
@@ -661,26 +759,37 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
     }
     changed!(|d: &mut fixed::Draw| d.recording_key = 1);
     changed!(|d: &mut fixed::Draw| d.program_key = 2);
+    let fixed = draw(&mut f);
+    let fixed_key = fingerprint(&mut f, fixed);
     for n in 0..10 {
-        changed!(|d: &mut fixed::Draw| {
-            let v = &mut d.vertices[0];
-            if n < 4 {
-                v.position[n] = f32::from_bits(v.position[n].to_bits() ^ 1)
-            } else if n < 8 {
-                v.color[n - 4] = -0.0
-            } else {
-                v.uv[n - 8] = -0.0
-            }
-        });
+        let mut d = draw(&mut f);
+        let v = &mut d.vertices[0];
+        if n < 4 {
+            v.position[n] = f32::from_bits(v.position[n].to_bits() ^ 1);
+        } else if n < 8 {
+            v.color[n - 4] = -0.;
+        } else {
+            v.uv[n - 8] = -0.;
+        }
+        assert_ne!(fingerprint(&mut f, d), fixed_key);
     }
-    changed!(|d: &mut fixed::Draw| d.texcoords = Some((1, vec![[0.; 4]; 3])));
+    let mut d = draw(&mut f);
+    d.texcoords = Some((1, vec![[0.; 4]; 3]));
+    assert_ne!(fingerprint(&mut f, d), fixed_key);
+    let mut d = programmable_draw(&mut f);
+    d.vertices[0].color[0] = 0.75;
+    assert_eq!(
+        fingerprint(&mut f, d),
+        original,
+        "programmable execution reads its raw streams"
+    );
     let extra = {
-        let mut d = programmable_draw(&mut f);
+        let mut d = draw(&mut f);
         d.texcoords = Some((1, vec![[0.; 4]; 3]));
         fingerprint(&mut f, d)
     };
     for n in 0..4 {
-        let mut d = programmable_draw(&mut f);
+        let mut d = draw(&mut f);
         let mut v = vec![[0.; 4]; 3];
         v[0][n] = -0.0;
         d.texcoords = Some((1, v));
@@ -915,6 +1024,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {
             d.texture = Some(resource);
+            d.versions[12] += 1;
         }
         clear(&mut f, 0xff000000);
         let mut d = draw(&mut f);
@@ -928,6 +1038,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
     {
         d.texture = None;
+        d.versions[12] += 1;
     }
     let locked = f.lock(source, 0, 0);
     f.m.cpu.write(locked.pBits, &vec![64; 16 * 12 * 4]).unwrap();

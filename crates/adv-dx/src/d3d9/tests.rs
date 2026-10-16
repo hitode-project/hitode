@@ -140,6 +140,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             fixed: fixed::Fixed::new(16, 12),
             shaders: shaders::Bindings::default(),
             recording: None,
+            versions: [0; 15],
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,

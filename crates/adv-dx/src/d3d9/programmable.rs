@@ -409,7 +409,11 @@ fn prepare_checked(
         vertex_count = draw.vertices.len() as u32;
         output_indices = None;
         let mut stream = VertexStream {
-            bytes: bytemuck::cast_slice(&draw.vertices).to_vec(),
+            bytes: if draw.texcoords.is_some() {
+                Vec::new()
+            } else {
+                bytemuck::cast_slice(&draw.vertices).to_vec()
+            },
             stride: 40,
             attributes: vec![
                 Attribute {
@@ -656,7 +660,7 @@ fn prepare_checked(
         }
         program
     };
-    draw.programmable = Some(ProgrammableDraw {
+    draw.programmable = Some(Box::new(ProgrammableDraw {
         program,
         streams,
         indices: output_indices,
@@ -665,7 +669,7 @@ fn prepare_checked(
         pixel_constants,
         textures: bindings,
         parameters,
-    });
+    }));
     Ok(draw)
 }
 fn texture(

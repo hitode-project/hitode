@@ -60,9 +60,15 @@ pub(super) fn register(registry: &mut Registry) {
         index_lock_ABI,
         vertex_unlock_ABI,
         index_unlock_ABI,
-        set_stream_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_stream_ABI
+        },
         get_stream_ABI,
-        set_indices_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_indices_ABI
+        },
         get_indices_ABI,
         adv_abi::Api {
             env_leaf: Some(super::leaf_calls::draw),
@@ -441,16 +447,25 @@ fn set_stream(
     let new = if pointer.is_null() {
         None
     } else {
-        let Some(b) =
-            buffer(env, pointer.addr()).filter(|b| b.kind == Kind::Vertex && b.device == device)
-        else {
+        let Some(new) = com(env).identity::<Payload>(&env.sys.objects, pointer.addr()) else {
             return INVALID;
         };
-        if offset > b.len || stride > 2048 {
+        Some(new)
+    };
+    if d.recording.is_none()
+        && new == old.buffer
+        && (new.is_none() || (old.offset == offset && old.stride == stride))
+    {
+        return 0;
+    }
+    if let Some(new) = new {
+        let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, new) else {
+            return INVALID;
+        };
+        if b.kind != Kind::Vertex || b.device != device || offset > b.len || stride > 2048 {
             return INVALID;
         }
-        com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
-    };
+    }
     let recorded = Stream {
         buffer: new,
         offset: if new.is_some() { offset } else { old.offset },
@@ -468,6 +483,7 @@ fn set_stream(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[10] += 1;
     d.buffers.streams[stream as usize] = Stream {
         buffer: new,
         offset: if new.is_some() { offset } else { old.offset },
@@ -540,11 +556,15 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let new = if pointer.is_null() {
         None
     } else {
-        if buffer(env, pointer.addr()).is_none_or(|b| b.kind != Kind::Index || b.device != device) {
+        let Some(new) = com(env).identity::<Payload>(&env.sys.objects, pointer.addr()) else {
             return INVALID;
-        }
-        com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
+        };
+        Some(new)
     };
+    if d.recording.is_none() && new == old {
+        return 0;
+    }
+    if new.is_some_and(|new| !matches!(com(env).get_identity(&env.sys.objects, new), Some(Payload::Buffer(b)) if b.kind == Kind::Index && b.device == device)) { return INVALID; }
     if let Some(result) = super::shaders::stateblocks::record_indices(env, device, new) {
         return result;
     }
@@ -554,6 +574,7 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[11] += 1;
     d.buffers.indices = new;
     if new != old
         && let Some(id) = old
@@ -593,6 +614,10 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this) else {
         return;
     };
+    d.versions[10] += 1;
+    if indexed {
+        d.versions[11] += 1;
+    }
     let stream = std::mem::take(&mut d.buffers.streams[0]).buffer;
     let indices = if indexed {
         d.buffers.indices.take()
