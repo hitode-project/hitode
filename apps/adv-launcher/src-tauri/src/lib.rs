@@ -7,6 +7,8 @@ pub mod android;
 #[cfg_attr(target_os = "android", path = "game_android.rs")]
 #[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
+#[cfg(target_os = "ios")]
+mod jit_ios;
 mod library;
 #[cfg(desktop)]
 mod menu;
@@ -209,8 +211,8 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_wheel,
-        game::jit_status,
-        game::request_jit,
+        jit_ios::jit_status,
+        jit_ios::request_jit,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,

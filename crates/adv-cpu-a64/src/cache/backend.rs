@@ -372,6 +372,8 @@ mod os {
     fn prepared(len: usize) -> Result<(NonNull<u8>, NonNull<u8>), String> {
         // A busy debugger leaves the brk encoding in x0, which is never aligned.
         let exec = (0..20)
+            // A failed preparation can detach while returning a null region.
+            .take_while(|_| traced())
             .find_map(|attempt| {
                 if attempt > 0 {
                     std::thread::sleep(Duration::from_millis(50));

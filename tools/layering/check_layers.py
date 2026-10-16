@@ -33,6 +33,7 @@ RULES: dict[str, set[str]] = {
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
+    "adv-jit-helper": set(),
     # Tauri player frontend: library and in-game overlay over the native game view.
     "adv-launcher": {"adv-shell", "tauri-plugin-storage"},
     "tauri-plugin-storage": set(),

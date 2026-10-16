@@ -20,6 +20,7 @@ members = [
     "crates/adv-unicorn",
     "crates/adv-win32",
     "apps/adv-run",
+    "apps/adv-jit-helper",
     "apps/adv-launcher/src-tauri",
 ]
 exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]

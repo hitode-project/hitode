@@ -45,6 +45,7 @@ targets:
       path: adv-launcher_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
+        NSLocalNetworkUsageDescription: Connect to this device through LocalDevVPN to enable JIT.
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
@@ -78,6 +79,8 @@ targets:
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
       groups: [app]
     dependencies:
+      - target: HitodeJIT
+        embed: true
       - framework: libapp.a
         embed: false
       - sdk: AudioToolbox.framework
@@ -98,3 +101,50 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+  HitodeJIT:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: JitHelper
+    info:
+      path: JitHelper/Info.plist
+      properties:
+        CFBundleDisplayName: Hitode JIT
+        CFBundleShortVersionString: 1.0.0
+        CFBundleVersion: "1.0.0"
+        NSLocalNetworkUsageDescription: Connect to this device through LocalDevVPN to enable JIT.
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.ar.viewer
+          NSExtensionPrincipalClass: HitodeJitRequestHandler
+          NSExtensionAttributes:
+            NSExtensionActivationRule: FALSEPREDICATE
+        XPCService:
+          ServiceType: Application
+    settings:
+      base:
+        PRODUCT_NAME: HitodeJIT
+        PRODUCT_BUNDLE_IDENTIFIER: org.hitode.launcher.JitHelper
+        ARCHS: [arm64]
+        SKIP_INSTALL: YES
+        LIBRARY_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)
+        OTHER_LDFLAGS: $(inherited) -ladv_jit_helper -liconv -lresolv
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: Security.framework
+    preBuildScripts:
+      - name: Build JIT Helper
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd "$SRCROOT/../../../../.."
+          export CARGO_TARGET_DIR="$PWD/target"
+          target=aarch64-apple-ios
+          if [ "$PLATFORM_NAME" = iphonesimulator ]; then target=aarch64-apple-ios-sim; fi
+          profile=debug
+          release=""
+          if [ "$CONFIGURATION" = release ]; then profile=release; release=--release; fi
+          cargo build --locked -p adv-jit-helper --target "$target" $release
+          cp "$CARGO_TARGET_DIR/$target/$profile/libadv_jit_helper.a" "$BUILT_PRODUCTS_DIR/"
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/libadv_jit_helper.a
