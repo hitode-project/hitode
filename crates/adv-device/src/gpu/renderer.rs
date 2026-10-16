@@ -522,7 +522,11 @@ impl Gpu {
                 required_features: adapter.features()
                     & (wgpu::Features::PIPELINE_CACHE
                         | wgpu::Features::SHADER_F16
-                        | wgpu::Features::BGRA8UNORM_STORAGE),
+                        | wgpu::Features::BGRA8UNORM_STORAGE
+                        | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+                        | wgpu::Features::SUBGROUP
+                        | wgpu::Features::SUBGROUP_BARRIER),
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
             })
             .await

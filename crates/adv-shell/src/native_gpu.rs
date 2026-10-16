@@ -581,7 +581,7 @@ impl Compositor {
         )
     }
 
-    fn compose_view(
+    pub(crate) fn compose_view(
         &self,
         source: &wgpu::TextureView,
         destination: &wgpu::TextureView,
