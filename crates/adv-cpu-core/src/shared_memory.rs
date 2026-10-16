@@ -258,7 +258,12 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 mod os {
     use super::*;
     use crate::dual_view::Backing;
@@ -437,7 +442,8 @@ mod os {
     windows,
     target_os = "linux",
     target_os = "android",
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "ios"
 )))]
 mod os {
     use super::*;
