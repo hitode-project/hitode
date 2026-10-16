@@ -161,13 +161,21 @@ mod os {
     }
 }
 
-/// iOS 26+ with TXM: the app cannot create executable memory. The attached
-/// debugger (StikDebug's universal protocol) allocates the read-execute
-/// region, and a vm_remap alias of the same pages is the write view. Every
-/// region must exist before the debugger detaches (IOS-JIT-1).
+/// iOS: the app cannot create executable memory on its own; a debugger
+/// grants it (IOS-JIT-1).
+///
+/// - With StikDebug's universal script the debugger stays attached and
+///   allocates the read-execute region, which TXM (iOS 26+) requires; a
+///   vm_remap alias of the same pages is the write view. Every region must
+///   exist before it detaches.
+/// - A debugger without a script only attaches and detaches, which leaves
+///   CS_DEBUGGED set. Before iOS 26 that is enough: the app maps the pages
+///   read-write and makes a read-execute alias itself.
 #[cfg(target_os = "ios")]
 mod os {
     use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     unsafe extern "C" {
         static mach_task_self_: libc::mach_port_t;
@@ -201,10 +209,17 @@ mod os {
     }
     const CS_OPS_STATUS: libc::c_uint = 0;
     const CS_DEBUGGED: u32 = 0x1000_0000;
+    const P_TRACED: i32 = 0x800;
     const VM_FLAGS_ANYWHERE: libc::c_int = 1;
     const VM_INHERIT_NONE: libc::c_uint = 2;
     /// TXM marks executable pages at this granularity.
     const PAGE: usize = 16 << 10;
+    /// A debugger without a script detaches right after attaching; one that
+    /// runs the script stays until told to detach.
+    const SCRIPT_GRACE: Duration = Duration::from_millis(500);
+
+    /// The script's debugger prepared the pool and still waits for detach.
+    static SCRIPTED: AtomicBool = AtomicBool::new(false);
 
     /// x16 = 1: the debugger prepares an RX region of x1 bytes; x0 = null
     /// asks it to allocate one. The region returns in x0.
@@ -224,7 +239,7 @@ mod os {
         unsafe { mach_task_self_ }
     }
 
-    /// A breakpoint without a debugger would kill the process.
+    /// JIT was granted: CS_DEBUGGED stays set after the debugger detaches.
     pub fn debugged() -> bool {
         let mut status = 0u32;
         // SAFETY: queries this process's own code-signing status word.
@@ -239,6 +254,100 @@ mod os {
         result == 0 && status & CS_DEBUGGED != 0
     }
 
+    /// A debugger is attached right now (Apple QA1361).
+    fn traced() -> bool {
+        // kinfo_proc is 648 bytes; extern_proc.p_flag sits at offset 32.
+        let mut info = [0u64; 96];
+        let mut len = size_of_val(&info);
+        let mut name = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            unsafe { libc::getpid() },
+        ];
+        // SAFETY: the buffer outlives the call and `len` is its size.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                4,
+                info.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let flag = info[4] as u32 as i32;
+        result == 0 && len >= 36 && flag & P_TRACED != 0
+    }
+
+    /// The major iOS version, from `kern.osproductversion`.
+    fn ios_major() -> Option<u32> {
+        let mut text = [0u8; 32];
+        let mut len = text.len();
+        // SAFETY: the buffer outlives the call and `len` is its size.
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                text.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        let text = std::str::from_utf8(&text[..len.saturating_sub(1)]).ok()?;
+        text.split('.').next()?.parse().ok()
+    }
+
+    /// Whether the debugger runs the script: it is still attached after a
+    /// scriptless one would have left.
+    fn scripted() -> bool {
+        let deadline = Instant::now() + SCRIPT_GRACE;
+        while traced() {
+            if Instant::now() >= deadline {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Maps the pages of `source` again at a new address with `protection`.
+    fn alias(source: usize, len: usize, protection: libc::vm_prot_t) -> Result<usize, String> {
+        let mut address: libc::vm_address_t = 0;
+        let (mut current, mut maximum) = (0, 0);
+        // SAFETY: shares (copy = false) mapped pages at a new address.
+        let mut result = unsafe {
+            vm_remap(
+                task(),
+                &mut address,
+                len,
+                0,
+                VM_FLAGS_ANYWHERE,
+                task(),
+                source,
+                0,
+                &mut current,
+                &mut maximum,
+                VM_INHERIT_NONE,
+            )
+        };
+        if result == 0 {
+            // SAFETY: the alias is ours.
+            result = unsafe { vm_protect(task(), address, len, 0, protection) };
+            if result != 0 {
+                // SAFETY: unused alias of this call.
+                unsafe { libc::munmap(address as *mut libc::c_void, len) };
+            }
+        }
+        if result != 0 {
+            return Err(format!("alias code region: kern_return {result}"));
+        }
+        Ok(address)
+    }
+
     pub fn map(len: usize) -> Result<(NonNull<u8>, NonNull<u8>), String> {
         if !debugged() {
             return Err(
@@ -250,65 +359,80 @@ mod os {
                 "code pool of {len} bytes is not whole 16 KiB pages"
             ));
         }
+        if scripted() {
+            prepared(len)
+        } else if ios_major().is_some_and(|major| major < 26) {
+            own(len)
+        } else {
+            Err("JIT unavailable: iOS 26 needs StikDebug's universal.js script for Hitode".into())
+        }
+    }
+
+    /// The script's debugger allocates the executable view.
+    fn prepared(len: usize) -> Result<(NonNull<u8>, NonNull<u8>), String> {
         // A busy debugger leaves the brk encoding in x0, which is never aligned.
         let exec = (0..20)
             .find_map(|attempt| {
                 if attempt > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                // SAFETY: the debugger is attached and services the breakpoint.
+                // SAFETY: the script's debugger is attached and services the breakpoint.
                 let region = unsafe { prepare_region(std::ptr::null_mut(), len) };
                 NonNull::new(region).filter(|r| r.as_ptr() as usize % PAGE == 0)
             })
             .ok_or("the debugger did not prepare an executable region")?;
-        let mut write: libc::vm_address_t = 0;
-        let (mut current, mut maximum) = (0, 0);
-        // SAFETY: shares (copy = false) the prepared pages at a new address.
-        let mut result = unsafe {
-            vm_remap(
-                task(),
-                &mut write,
-                len,
-                0,
-                VM_FLAGS_ANYWHERE,
-                task(),
-                exec.as_ptr() as libc::vm_address_t,
-                0,
-                &mut current,
-                &mut maximum,
-                VM_INHERIT_NONE,
-            )
-        };
-        if result == 0 {
-            // SAFETY: the alias is ours; the executable view keeps read-execute.
-            result = unsafe {
-                vm_protect(
-                    task(),
-                    write,
-                    len,
-                    0,
-                    libc::VM_PROT_READ | libc::VM_PROT_WRITE,
-                )
-            };
-            if result != 0 {
-                // SAFETY: unused alias of this call.
-                unsafe { libc::munmap(write as *mut libc::c_void, len) };
-            }
-        }
-        if result != 0 {
+        SCRIPTED.store(true, Ordering::Relaxed);
+        let write = alias(
+            exec.as_ptr() as usize,
+            len,
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE,
+        )
+        .inspect_err(|_| {
             // SAFETY: the prepared region is unused.
             unsafe { libc::munmap(exec.as_ptr().cast(), len) };
-            return Err(format!("alias prepared code region: kern_return {result}"));
-        }
+        })?;
         let write = NonNull::new(write as *mut u8).ok_or("code alias at null")?;
         Ok((write, exec))
     }
 
-    /// Ends the debugger's part once the pool exists; nothing executable can
-    /// be added afterwards.
+    /// Before TXM, CS_DEBUGGED lets the app make its own read-execute alias.
+    fn own(len: usize) -> Result<(NonNull<u8>, NonNull<u8>), String> {
+        // SAFETY: a new private anonymous mapping at an OS-chosen address.
+        let write = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if write == libc::MAP_FAILED {
+            return Err(format!(
+                "map JIT code pool: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let exec = alias(
+            write as usize,
+            len,
+            libc::VM_PROT_READ | libc::VM_PROT_EXECUTE,
+        )
+        .inspect_err(|_| {
+            // SAFETY: the mapping is unused.
+            unsafe { libc::munmap(write, len) };
+        })?;
+        let write = NonNull::new(write.cast::<u8>()).ok_or("code pool at null")?;
+        let exec = NonNull::new(exec as *mut u8).ok_or("code alias at null")?;
+        Ok((write, exec))
+    }
+
+    /// Ends the script's part once the pool exists; nothing executable can
+    /// be added afterwards. A debugger without the script has already left.
     pub fn finish_preparation() {
-        if debugged() {
-            // SAFETY: the debugger is attached and services the breakpoint.
+        if SCRIPTED.load(Ordering::Relaxed) && traced() {
+            // SAFETY: the script's debugger is attached and services the breakpoint.
             unsafe { detach() };
         }
     }

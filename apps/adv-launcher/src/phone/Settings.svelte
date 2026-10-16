@@ -5,6 +5,7 @@
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
+  import JitRow from "../components/JitRow.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
   import { reportContents } from "../lib/fake-settings";
@@ -60,6 +61,9 @@
 
     <section class="sec" aria-labelledby="p-play">
       <h2 id="p-play">{t("游戏中")}</h2>
+      {#if device.platform === "ios" && device.gameView}
+        <JitRow />
+      {/if}
       {#if device.gameView || preview}
         <div class="row">
           <span class="t">{t("缩放")}</span>

@@ -8,7 +8,8 @@ mod logging;
 pub mod mobile;
 #[cfg(target_os = "ios")]
 pub use adv_runtime::{
-    prepare_code_pool_after_attach, prepare_code_pool_if_debugged, reserve_guest_window,
+    code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged,
+    reserve_guest_window,
 };
 #[cfg(mobile)]
 pub use logging::init_system_log;

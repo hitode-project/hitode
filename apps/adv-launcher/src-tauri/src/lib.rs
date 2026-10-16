@@ -209,6 +209,8 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_wheel,
+        game::jit_status,
+        game::request_jit,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,

@@ -11,7 +11,7 @@ mod cache;
 #[cfg(native)]
 pub use cache::prepare_code_pool;
 #[cfg(target_os = "ios")]
-pub use cache::{prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
+pub use cache::{code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
 mod cpu;
 pub mod encode;
 mod executor;

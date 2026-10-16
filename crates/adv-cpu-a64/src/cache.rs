@@ -202,8 +202,8 @@ pub fn prepare_code_pool_if_debugged() -> Option<Result<(), String>> {
 }
 
 /// iOS: waits up to `timeout` for the JIT debugger (StikDebug) to attach,
-/// then prepares the pool and lets it detach (IOS-JIT-1). Without one, the
-/// pool fails for good and guests run Tier 0.
+/// then prepares the pool and lets it detach (IOS-JIT-1). Until one comes,
+/// guests run Tier 0 and a later request may wait again.
 #[cfg(target_os = "ios")]
 pub fn prepare_code_pool_after_attach(timeout: std::time::Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
@@ -211,6 +211,13 @@ pub fn prepare_code_pool_after_attach(timeout: std::time::Duration) -> Result<()
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     prepare_code_pool()
+}
+
+/// iOS: the pool's outcome once prepared; `None` while it waits for JIT.
+#[cfg(target_os = "ios")]
+pub fn code_pool_state() -> Option<Result<(), String>> {
+    POOL.get()
+        .map(|pool| pool.as_ref().map(|_| ()).map_err(Clone::clone))
 }
 
 struct PreparedPool {
@@ -223,8 +230,14 @@ struct PreparedPool {
 unsafe impl Send for PreparedPool {}
 unsafe impl Sync for PreparedPool {}
 
+static POOL: OnceLock<Result<PreparedPool, String>> = OnceLock::new();
+
 fn prepared_pool() -> Result<&'static PreparedPool, String> {
-    static POOL: OnceLock<Result<PreparedPool, String>> = OnceLock::new();
+    // iOS: JIT may still be granted later, so its absence is not kept.
+    #[cfg(target_os = "ios")]
+    if POOL.get().is_none() && !backend::debugged() {
+        return Err("JIT unavailable: no debugger is attached (launch through StikDebug)".into());
+    }
     POOL.get_or_init(|| {
         let mib = match std::env::var("ADV_A64_CODE_POOL_MIB") {
             Ok(value) => value
