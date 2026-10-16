@@ -10,6 +10,8 @@ mod game;
 mod library;
 #[cfg(desktop)]
 mod menu;
+#[cfg(mobile)]
+mod mobile_view;
 pub mod overlay;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
@@ -164,6 +166,13 @@ pub fn run() {
         game::set_game_filter,
         game::set_game_playback,
         game::game_fps,
+        game::set_touch_mode,
+        game::game_mouse_button,
+        game::game_key,
+        game::keep_game,
+        game::game_frames,
+        game::game_presented,
+        game::game_wheel,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,
@@ -193,6 +202,13 @@ pub fn run() {
         game::set_game_filter,
         game::set_game_playback,
         game::game_fps,
+        game::set_touch_mode,
+        game::game_mouse_button,
+        game::game_key,
+        game::keep_game,
+        game::game_frames,
+        game::game_presented,
+        game::game_wheel,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,

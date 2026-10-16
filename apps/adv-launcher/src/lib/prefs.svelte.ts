@@ -7,6 +7,8 @@ export type Scale = "fit" | "int";
 export type Filter = "off" | "anime4k" | "cunny" | "artcnn" | "k7";
 /** Whether the fast-forward key works while held or toggles. */
 export type FastForward = "hold" | "toggle";
+/** Phones and tablets: touches click where they land, or move a cursor. */
+export type TouchMode = "direct" | "trackpad";
 
 export interface Prefs {
   theme: Theme;
@@ -26,6 +28,9 @@ export interface Prefs {
   /** Whether the user has chosen automatic or manual VNDB lookup. */
   vndbAsked: boolean;
   trackPlayTime: boolean;
+  touchMode: TouchMode;
+  /** Phones and tablets: the touch controls beside the game are expanded. */
+  touchControls: boolean;
 }
 
 const KEY = "adv-launcher.prefs";
@@ -44,6 +49,8 @@ const defaults: Prefs = {
   fetchVndb: false,
   vndbAsked: false,
   trackPlayTime: true,
+  touchMode: "direct",
+  touchControls: true,
 };
 
 function load(): Prefs {

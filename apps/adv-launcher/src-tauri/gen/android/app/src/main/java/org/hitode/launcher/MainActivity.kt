@@ -125,6 +125,19 @@ class MainActivity : TauriActivity() {
     external fun nativeSurfaceCreated(surface: Surface, width: Int, height: Int)
     external fun nativeSurfaceChanged(surface: Surface, width: Int, height: Int)
     external fun nativeSurfaceDestroyed(surface: Surface, width: Int, height: Int)
+    /** Called by the native trackpad cursor (AND-APP-14). */
+    fun setCursor(shown: Boolean, x: Float, y: Float) {
+        container?.setCursor(shown, x, y)
+    }
+
+    external fun nativeScreen(
+        width: Float,
+        height: Float,
+        cutouts: FloatArray,
+        cornerRadius: Float,
+        gestures: FloatArray,
+        density: Float,
+    ): FloatArray?
     external fun nativeRouteTouch(xCss: Float, yCss: Float): Boolean
     external fun nativeTouch(pointer: Int, action: Int, x: Float, y: Float)
     external fun nativePause()

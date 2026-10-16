@@ -1,5 +1,5 @@
 pub use crate::mobile::TouchAction;
-pub(crate) use crate::mobile::{Touch, position};
+pub(crate) use crate::mobile::position;
 /// Android physical key codes to Win32 virtual keys and set-1 scan codes.
 pub(crate) fn key(code: i32) -> Option<(u32, u32)> {
     const LETTERS: [u32; 26] = [

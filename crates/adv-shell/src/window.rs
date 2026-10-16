@@ -1540,7 +1540,7 @@ pub use mobile::GameContainer;
 #[cfg(mobile)]
 pub(crate) use mobile::native_viewport;
 #[cfg(mobile)]
-pub use mobile::{GameView, TouchAction};
+pub use mobile::{GameView, TouchAction, ViewEvent};
 #[cfg(any(mobile, test))]
 pub(crate) mod android_epoch;
 #[cfg(all(test, not(target_os = "android")))]
