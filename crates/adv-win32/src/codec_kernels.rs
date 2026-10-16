@@ -1,7 +1,8 @@
 //! Library-ABI acceleration for verified static codec kernels (shell default: Native).
 //!
-//! Guest owns all stream, seek, cancellation and allocation state. Native mode
-//! replaces only an admitted inverse MDCT and permits decoder rounding differences;
+//! Guest owns stream I/O, seek, cancellation and public buffer lifetimes. Native mode
+//! replaces admitted Vorbis transforms (allowing rounding differences) and delegates
+//! complete, pixel-exact Theora packets to the library ABI provider;
 //! it is not an instruction-exact x87 implementation. Verify always publishes the
 //! original guest computation, never promotes a binding, and never writes its candidate.
 use std::collections::BTreeMap;
@@ -61,6 +62,7 @@ pub struct InstallReport {
 
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
+    pub theora: crate::theora::Stats,
     pub mode: Mode,
     pub installed: u64,
     pub calls: u64,
@@ -159,7 +161,11 @@ impl Provider {
 }
 
 pub fn stats<B: Backend>(machine: &Machine<B>) -> Option<Stats> {
-    machine.ext.try_get::<Provider>().map(|p| p.stats.clone())
+    machine.ext.try_get::<Provider>().map(|p| {
+        let mut stats = p.stats.clone();
+        stats.theora = crate::theora::stats(machine);
+        stats
+    })
 }
 
 /// Install only after guest images are mapped, before executing any guest code.
@@ -346,6 +352,9 @@ pub fn install<B: Backend>(
         provider.stats.installed += 1;
         report.installed += 1;
     }
+    let theora = crate::theora::install(machine, mode)?;
+    report.installed += theora;
+    report.candidates += theora;
     if report.installed == 0 {
         let reason = "no verified static codec kernel matched the supplied signatures";
         report.reason = Some(reason.to_owned());

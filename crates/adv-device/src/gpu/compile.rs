@@ -103,6 +103,10 @@ fn worker() -> Option<&'static mpsc::SyncSender<Task>> {
                 .name("adv-gpu-compile".into())
                 .spawn(move || {
                     let allowed = lower_priority();
+                    #[cfg(target_vendor = "apple")]
+                    if allowed {
+                        DEMAND.lock().unwrap().register_worker();
+                    }
                     while let Ok(task) = receiver.recv() {
                         if allowed {
                             task();
@@ -181,18 +185,84 @@ mod tests {
     }
 }
 
-static DEMAND: Mutex<usize> = Mutex::new(0);
+struct DemandState {
+    count: usize,
+    #[cfg(target_vendor = "apple")]
+    worker: usize,
+    #[cfg(target_vendor = "apple")]
+    priority_override: usize,
+}
+impl DemandState {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            #[cfg(target_vendor = "apple")]
+            worker: 0,
+            #[cfg(target_vendor = "apple")]
+            priority_override: 0,
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    fn register_worker(&mut self) {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+        }
+        // SAFETY: registration runs on the process-lifetime compiler worker.
+        self.worker = unsafe { pthread_self() };
+        if self.count != 0 {
+            self.donate();
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    fn donate(&mut self) {
+        unsafe extern "C" {
+            fn pthread_override_qos_class_start_np(
+                thread: usize,
+                class: u32,
+                relative: i32,
+            ) -> *mut core::ffi::c_void;
+        }
+        if self.worker != 0 && self.priority_override == 0 {
+            // SAFETY: the static compiler worker stays alive while demand exists.
+            // The override describes the foreground's dependency on its result.
+            self.priority_override =
+                unsafe { pthread_override_qos_class_start_np(self.worker, 0x21, 0) } as usize;
+        }
+    }
+    fn enter(&mut self) {
+        self.count += 1;
+        #[cfg(target_vendor = "apple")]
+        if self.count == 1 {
+            self.donate();
+        }
+    }
+    fn leave(&mut self) {
+        self.count -= 1;
+        #[cfg(target_vendor = "apple")]
+        if self.count == 0 && self.priority_override != 0 {
+            unsafe extern "C" {
+                fn pthread_override_qos_class_end_np(value: *mut core::ffi::c_void) -> i32;
+            }
+            // SAFETY: each successful override is released exactly once.
+            unsafe {
+                pthread_override_qos_class_end_np(self.priority_override as *mut _);
+            }
+            self.priority_override = 0;
+        }
+    }
+}
+static DEMAND: Mutex<DemandState> = Mutex::new(DemandState::new());
 static DEMAND_DONE: std::sync::Condvar = std::sync::Condvar::new();
 struct Demand;
 impl Demand {
     fn enter() -> Self {
-        *DEMAND.lock().unwrap() += 1;
+        DEMAND.lock().unwrap().enter();
         Self
     }
 }
 impl Drop for Demand {
     fn drop(&mut self) {
-        *DEMAND.lock().unwrap() -= 1;
+        DEMAND.lock().unwrap().leave();
         DEMAND_DONE.notify_all();
     }
 }
@@ -205,7 +275,7 @@ pub fn prebuild<T: Send + Sync + 'static>(bytes: usize, jobs: Vec<Compile<T>>) -
                 continue;
             }
             let mut active = DEMAND.lock().unwrap();
-            while *active != 0 {
+            while active.count != 0 {
                 active = DEMAND_DONE.wait(active).unwrap();
             }
             drop(active);
@@ -230,5 +300,25 @@ mod cancellation_tests {
         let batch = prebuild(0, vec![job]);
         batch.resolve().as_ref().unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod priority_tests {
+    use super::*;
+    // spec: GFX-CACHE-7
+    #[test]
+    fn demand_before_worker_registration_donates_until_last_waiter_leaves() {
+        let mut state = DemandState::new();
+        state.enter();
+        assert_eq!(state.priority_override, 0);
+        state.register_worker();
+        assert_ne!(state.priority_override, 0);
+        let original = state.priority_override;
+        state.enter();
+        state.leave();
+        assert_eq!(state.priority_override, original);
+        state.leave();
+        assert_eq!(state.priority_override, 0);
     }
 }

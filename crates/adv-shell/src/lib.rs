@@ -120,7 +120,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --codepage auto|932|936 guest ANSI encoding: Japanese or GBK (default: auto)\n\
   --headless              run without a host window\n\
   --codec guest|native    whole-module Vorbis provider (default: native)\n\
-  --codec-kernels guest|verify|native  static codec math (default: native; allows FP rounding differences)\n\
+  --codec-kernels guest|verify|native  codec library acceleration (default: native; Vorbis permits FP rounding differences)\n\
   --codec-signatures PATH reviewed library signatures (default: the bundled set)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
@@ -780,12 +780,17 @@ fn build_report(context: ReportContext<'_>) -> String {
                 "\"fallback_calls\":{},\"revocations\":{},\"errors\":{},\"compared_floats\":{},",
                 "\"different_floats\":{},\"nonfinite_floats\":{},\"max_abs\":{},\"rms\":{},",
                 "\"relative_rms\":{},\"total_kernel_ns\":{},\"max_kernel_ns\":{},",
-                "\"last_rejection\":{},\"table_mismatch\":{},\"fallback_reasons\":{{{}}}}}"
+                "\"last_rejection\":{},\"table_mismatch\":{},\"fallback_reasons\":{{{}}},",
+                "\"theora\":{{\"installed\":{},\"initialized\":{},\"frames\":{},\"native_frames\":{},",
+                "\"compared_bytes\":{},\"different_bytes\":{},\"state_mismatches\":{},\"decode_ns\":{},\"reason\":{}}}}}"
             ), json(s.mode.as_str()), s.installed, s.calls, s.native_calls, s.verify_calls,
                 s.fallback_calls, s.revocations, s.errors, s.compared_floats, s.different_floats,
                 s.nonfinite_floats, s.max_abs, s.rms, s.relative_rms, s.total_kernel_ns, s.max_kernel_ns,
                 s.last_rejection.as_deref().map_or_else(|| "null".into(), json),
-                s.table_mismatch.as_deref().map_or_else(|| "null".into(), json), reasons)
+                s.table_mismatch.as_deref().map_or_else(|| "null".into(), json), reasons,
+                s.theora.installed,s.theora.initialized,s.theora.frames,s.theora.native_frames,
+                s.theora.compared_bytes,s.theora.different_bytes,s.theora.state_mismatches,s.theora.decode_ns,
+                s.theora.reason.as_deref().map_or_else(||"null".into(),json))
         },
     );
     let pcm = runtime.audio_pcm_metrics();

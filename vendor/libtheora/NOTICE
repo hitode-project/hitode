@@ -1,0 +1,14 @@
+Xiph libtheora 1.2.0 (2025-03-29), decoder sources and public headers.
+Source: https://downloads.xiph.org/releases/theora/libtheora-1.2.0.tar.xz
+SHA-256: ebdf77a8f5c0a8f7a9e42323844fa09502b34eb1d1fece7b5f54da41fe2122ec
+License: BSD-3-Clause; see COPYING.
+
+libogg 1.3.6 public ABI headers (no libogg implementation is linked).
+Source: https://github.com/xiph/ogg/tree/v1.3.6/include/ogg
+License: BSD-3-Clause; see COPYING.ogg.
+config_types.h supplies the fixed-width C integer types for these headers.
+
+Local change: decode.c and decint.h support suspending at stripe callbacks
+so guest continuations can run before decoding the following stripe.
+Independent native planes may share two persistent workers, joining before
+frame publication. Scalar decoding remains available as the test oracle.

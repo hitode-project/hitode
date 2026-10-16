@@ -1,0 +1,396 @@
+# Xiph libtheora decoder, MSVC x86 integer/MMX ABI family.
+# Source: https://downloads.xiph.org/releases/theora/ (BSD-3-Clause).
+# Only hashes, lengths and operand offsets; no guest addresses or code bytes.
+root packet 6
+root init 6
+hook clear 7
+code clear 88 87ec2e92709392dbda20fc109574df775b54482a7cd93b61459fd3a1d3d023db
+link clear 3 abs n17 0
+code init 629 cd92cc1520cf396a8780613b8cfeee78650d1bb30f757203d38c40932568c199
+link init 16 rel n14 0
+link init 57 rel n15 0
+link init 69 abs malloc 0
+link init 100 rel n16 0
+link init 135 abs malloc 0
+link init 164 abs n17 0
+link init 182 rel clear 0
+link init 293 rel n18 0
+link init 601 abs n17 0
+link init 615 rel clear 0
+slot malloc
+code n10 83 d70d3a9c34ea56b6f876f128d0319d4cd61c2d5ce1b0c0475134c9e0f9ac2d6a
+code n100 583 b5886b1702eb3fc07e6ab323861c4f21255a6f2eab23228f33d80a40282ce9fb
+link n100 108 rel n23 0
+link n100 180 rel n83 0
+link n100 236 rel n80 0
+link n100 348 abs n96 0
+link n100 208 abs n104 204
+data n101 24 9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0
+link n101 0 abs n79 618
+link n101 4 abs n79 682
+link n101 8 abs n79 698
+link n101 12 abs n79 772
+link n101 16 abs n79 723
+link n101 20 abs n79 327
+data n102 47 88aca4b364b9ed2f46554494148f5948754947d9074fecb9c1e511e954af0239
+link n102 0 abs n9 0
+link n102 4 abs n8 0
+link n102 8 abs n7 0
+link n102 12 abs n6 0
+data n103 132 34beba973b0510a4bee9e595fccf4524afbd12d8ffab40e7e2829b239cd2d304
+data n104 224 b8d3a0b3b0ef0e8b7292c97057f2eaac4893fa6fb0f13048059ca446a1319fd5
+data n105 64 e7203a933c6c873516eafd6091921a7937471d2f9a9c27e70c9258d98f324ac6
+data n106 64 d77b3717a76e0c791be96ea9137d1d80098a8bb8b73f2087089d0ef8f2b9a507
+data n107 20 44ee0092f023775ab6841ab23b9eb97ab68ca6e8fd4ed88e04934e2097fd787e
+data n108 52 ffa34cf971d615763f526816415c1d286cb8d5620cb30f8db5a3cf725a9dddb4
+code n109 364 2830f6e57458e080f6c6c5ece1aed30f1fb0bbc6005e14163a64a64fa9b4e2fc
+link n109 45 rel n80 0
+link n109 113 abs n82 0
+link n109 120 rel n83 0
+link n109 177 rel n80 0
+link n109 311 rel n80 0
+code n11 62 5053d59c1c55d65c0c4402462d0ce92d8a8a14887f025303b333c396e284f86c
+code n110 347 ccded65219b945a5d4c33af7fb36d338ed74aafc8da4440b136bcfe7b4ecea64
+link n110 74 rel n80 0
+link n110 100 abs n82 0
+link n110 107 rel n83 0
+link n110 158 rel n80 0
+link n110 296 rel n80 0
+data n111 136 6a14355f4604edfdb10fb86e13baf937715808012af03d442857ee11306c71ab
+code n12 59 f80361504f8c8602b8f4c56d67e6137269fb3062a1e003ecb94691e876db8c40
+code n13 45 a3db43d79ab2012453dde05b5d0fa329904a472d3c62ba50e4702f8c56650923
+code n14 633 8efbb5e8cda2dad7ee9a3698b6a47b7fa8bd1cae3b998c8a3a98084d51480d3a
+link n14 184 rel n23 0
+link n14 241 rel n24 0
+link n14 253 abs n25 0
+link n14 260 abs n26 0
+link n14 265 abs n27 0
+link n14 276 abs n28 0
+link n14 281 abs n29 0
+link n14 288 abs n30 0
+link n14 295 abs n31 0
+link n14 300 abs n32 0
+link n14 307 abs n33 0
+link n14 312 abs n34 0
+link n14 317 abs n35 0
+link n14 324 abs n36 0
+link n14 336 abs n37 0
+link n14 347 abs n38 0
+link n14 352 abs n39 0
+link n14 359 abs n40 0
+link n14 364 abs n41 0
+link n14 371 abs n42 0
+link n14 376 abs n43 0
+link n14 383 abs n44 0
+link n14 388 abs n45 0
+link n14 395 abs n46 0
+link n14 459 rel n47 0
+link n14 479 rel n48 0
+link n14 608 rel n49 0
+code n15 98 086283d3be694a31f49e474021d2f795e8fd37ca8b5c5f1e325b347259cce000
+code n16 1396 29698dce2228400e8ecb58ab4da66b8e20bc75f7e69978896bc892c0ef82cfc7
+link n16 52 abs n21 0
+link n16 71 abs n22 0
+link n16 101 abs n21 0
+link n16 115 abs n22 0
+link n16 545 abs n19 0
+link n16 600 abs n19 0
+link n16 710 abs n21 0
+link n16 779 abs n20 0
+link n16 607 abs n16 628
+link n16 612 abs n16 628
+link n16 616 abs n16 636
+link n16 620 abs n16 648
+link n16 624 abs n16 668
+link n16 784 abs n16 800
+link n16 788 abs n16 808
+link n16 792 abs n16 824
+link n16 796 abs n16 844
+slot n17
+code n18 903 05dc988166b1b13ca6450bc60a943db6fba32465f87c2b38f6b3eea78ddc4ac7
+link n18 121 abs n53 16
+link n18 154 abs n53 24
+link n18 430 abs n53 16
+link n18 467 abs n36 0
+link n18 549 abs n53 24
+data n19 16 374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb
+link n19 0 abs n16 628
+link n19 4 abs n16 636
+link n19 8 abs n16 648
+link n19 12 abs n16 668
+data n20 16 374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb
+link n20 0 abs n16 800
+link n20 4 abs n16 808
+link n20 8 abs n16 824
+link n20 12 abs n16 844
+slot n21
+slot n22
+code n23 346 cc3319e1d8bf1de3aea7d27d800a207e9f162fcf8b02f770da2f78af89cbd709
+link n23 53 abs n22 0
+link n23 72 abs n21 0
+link n23 192 abs n21 0
+code n24 488 09857254e3b3b4041338a0fb7513959ef895ca882b4533feab5231742868f03c
+link n24 13 rel n71 0
+link n24 38 rel n72 0
+link n24 123 rel n72 0
+link n24 134 rel n73 0
+link n24 268 rel n72 0
+link n24 305 rel n72 0
+link n24 328 rel n74 0
+link n24 343 rel n72 0
+link n24 354 rel n73 0
+link n24 413 rel n72 0
+link n24 436 rel n73 0
+link n24 464 rel n72 0
+link n24 475 rel n74 0
+data n25 128 ffddb89df909fb7409a55cadf8e1be14ce8fdbee81cf01e571eef8403042909f
+code n26 558 276523e3011bac85d560b251269175b858132463d1690470c8ae4f1dea8e315d
+link n26 149 rel n32 0
+link n26 481 rel n62 0
+link n26 521 rel n30 0
+link n26 544 rel n34 0
+code n27 3 e9be6a1bee9469387a05d3c4e3932f68ede109bb4bd40ef195bb07003db89bf7
+code n28 1485 6745169cc6601ea4b290acfe9a32ff4385d1b372d96b7b9b3217614894a6f888
+code n29 30 d2fce95b3b4bd3d0bcc7016f923284527c8239944d14d7536d7db49babb4d1bf
+code n30 175 ef760c3d665f8ca297e1b52a3887915f16f490dfd6f9e36827ac09a7748c9ce0
+code n31 200 445836e54b4f35163d745ac86f224436d0849a3747289becdda5136559c66034
+code n32 955 124f6b04ce906993bb1b38c697f9e184e66e95fe9b74acb5898b6b33c3de5d42
+link n32 14 abs n69 0
+link n32 951 rel n70 0
+code n33 97 97bc9660b7fe3f523f893f21b2ebef3a1ffa62db739a087aa976d4cfc1183eef
+code n34 108 bfab82e5f8807849dea5be72935e50470a192d4f615a5db21e5adf8b2cf4f6ac
+code n35 134 66ad9947f18340304faa52dd8b60f6e5da292ec99b7846c83447273f37967410
+data n36 208 b95aa69968599821ce55e1e1b910b4705bde08262b1d8145d68812e533a46ff5
+code n37 3 b6cbececf1b07e74f37d57710c68c31f0b92cb08d51093252b321b07542e177b
+code n38 526 7837d6f1f785068b3d2902616e217d4dde16c1c3d76ae04979abbe94a16dfb3d
+link n38 209 rel n67 0
+link n38 227 rel n68 0
+link n38 263 rel n67 0
+link n38 300 rel n68 0
+link n38 376 rel n67 0
+link n38 412 rel n67 0
+link n38 449 rel n68 0
+code n39 136 d21b20e4fcf2c3dfd7b75d7b083d2b8e52ce52e86899287ec2e09196e6a09338
+link n39 20 rel n23 0
+data n4 2 47dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f254
+code n40 292 c12afb7718c7fc18cf1808e06637effdbffcd106d63c54f0529b7a55889d9b35
+link n40 215 rel n62 0
+code n41 376 d48f710e32c01b29cd2c12e24070e7b6776dde9b899cee0d509ea59ff5962356
+link n41 33 rel n56 0
+link n41 101 rel n56 0
+link n41 127 abs n57 0
+link n41 359 rel n58 0
+link n41 368 rel n59 0
+code n42 542 8d2176879682c2c575f39e1c7937076d3193982036bd381b129cbf0da106e581
+code n43 477 d46211236f6f78c6c683b20780136fee9a3c5d7f75851d2b27946d533ae1764d
+code n44 367 b5f4016d2a939ec2a9cb20c782647d60d147ac3aecae1bd9b6e6c64905e3177a
+code n45 164 83e10eb750d88b5e5ea695f58c42ceb7d2a452d26838e2a4d86cbe02c3c07418
+code n46 127 8f98f1d2a7cdeeec2c2cde090c6336042586070e832e7dec996f590f78f6df58
+code n47 1099 088fb66dbd62906522a9bd1106db4f80bae1bb8e7a06a8e3d43adf84c5c238c7
+link n47 433 abs n51 0
+link n47 481 abs malloc 0
+link n47 737 rel n52 0
+link n47 784 abs n53 0
+link n47 881 rel n23 0
+link n47 1064 rel n54 0
+link n47 837 abs n36 128
+code n48 757 d921c733a9a36b5ea21665e53733d8771aac22e4c7dc070eefe46f443b37a5aa
+link n48 182 abs malloc 0
+link n48 470 rel n50 0
+link n48 723 abs n17 0
+code n49 72 4e7f96ffad28fc1734016c34be1b3f235e463a85bab1ce263800e2f8f6e6510e
+link n49 3 abs n17 0
+data n5 2 4755a61f493b774380efe5b082306b8d6c27789f7f91ca73cd858426dee15107
+code n50 120 73f9dd466f84c0966a9c10d4f77e1135597b31e29592bd0e694257489e71c7b4
+slot n51
+code n52 372 bf86c1fa4a2af1cd258f5c3f478d29ee73233b7f5f3827e75616e71ac3b9f6d6
+link n52 113 rel n23 0
+link n52 131 abs n55 0
+data n53 32 211dc8aa521560133b5303d10511d2733ed67f0293184e612ab9b44c7b0766d2
+link n53 0 abs n13 0
+link n53 4 abs n12 0
+link n53 8 abs n11 0
+link n53 12 abs n10 0
+code n54 1189 f73a5acfaf4b0eb4dbeef8ac0e081ab23d5dc0cd379e379e963730dd41bdbe0f
+data n55 124 54a74f8158394768d2736b3c5bcf2b54bab6459dab103210d012cbf7a1416671
+code n56 161 b11810be0479cbf3f0ec0b32fbab4b947ee2c47a57bdb180ab1c40ff29fd9eef
+slot n57
+code n58 568 41ac152fb8a7bab8bb32dfd82a6032d16af2a7e54931dca525bba2ea2bf0ba68
+link n58 27 rel n61 0
+link n58 225 rel n56 0
+link n58 309 rel n61 0
+link n58 333 abs n57 0
+code n59 741 0cd382276c0bfad16681d9eab9301b7df9ec7d17260433853f7dc2bc765e0447
+link n59 469 rel n60 0
+link n59 495 abs n57 0
+code n6 41 bfe95eda0ec00cee07a52676823e896c840aa198c00c3b046fb54cbdea2948ba
+code n60 378 f0669267b5e4f22eb7e1a9249d4648fdd6b69903bc5ecbc2ead4f519df1adcef
+code n61 267 ca6250683414083301aca11723c9222e93804b16d3f0cf09e54f1f4b80896b97
+code n62 179 c93882bd18a1563034dc67c6f8fbc306dc84350b1c619ad98d996fab56d49d0a
+link n62 33 abs n63 0
+link n62 38 abs n64 0
+link n62 45 abs n65 0
+link n62 50 abs n66 0
+link n62 92 abs n64 0
+link n62 97 abs n63 0
+link n62 104 abs n66 0
+link n62 109 abs n65 0
+data n63 64 82868aaa7b8401a114d80263d152018643930d93bfee351b2e98299d05b78a64
+data n64 37 132cdcd345860bba7907432cc903ee650fda1f4cd3a0722972081e8b54880576
+data n65 64 3f89e018a3035070ae625071fb672b5a2b00b974577ece5f40ff328d5b0679a1
+data n66 64 af0fd2e65b4de40dec4d5c7ec0a75801e0dca99c8c7903b042d2fc0372be262b
+code n67 934 6050d85a52cdb61a6b23b3a804c7965f21511a0b9f8abaf65b6c232dd367eece
+code n68 1002 35208a6dddd75417bd399f667379be23924096ad6862c11b9f694dbe854c2762
+data n69 64 6b42d6e6c48ac191116280e090de21f6e18c0de85f40b01e9e7b273a96196158
+code n7 129 b839bd5ccf3f9b180c0b08654ae0fae96f6bd4ed61dc39164849becabfeb4453
+code n70 1619 465e7141da028f0aaecb0a959de7244f30f7f10ddb8b2856c660bf20ac593a94
+link n70 19 abs n69 0
+code n71 43 488db8ee0361f7eec0dc40c8bad5264a02167f47d09736828539c0e8ecd12f9a
+code n72 39 dd69e775185bbcb837c6b45f33aa9b0df1871680755a106b280b528379d02d91
+code n73 113 440a3779e36194d5572c3161cc643b055d513372ea11c532c9bec352b0f575ee
+code n74 92 f08dbed3942d52b18d7248dc55f22802b29e95f64f802eaeef3325d74cf19519
+code n75 429 5103e203de880c7d8e395df3def863624451357d1182b32639d8c319f382257d
+link n75 35 rel n80 0
+link n75 79 rel n80 0
+link n75 126 rel n80 0
+link n75 175 rel n80 0
+link n75 223 rel n80 0
+link n75 272 rel n80 0
+link n75 317 rel n80 0
+link n75 382 rel n80 0
+code n76 572 ea234087ce886ecd7cbc77fe5f2f02937aee621eb8e4a491205fbd48e61b3e20
+link n76 15 rel n109 0
+link n76 32 rel n110 0
+link n76 68 rel n80 0
+link n76 510 abs n111 0
+link n76 521 rel n83 0
+code n77 31 04614067463d9a7345e7de2955a0c9fb5906c602499fb5df7f220ae231db613b
+code n78 324 0cf3922068369310ce51cd4da98a6d9cd03fcc0c9502ba8ba907b346bcf349a7
+link n78 42 rel n80 0
+link n78 100 rel n80 0
+link n78 158 abs n106 0
+link n78 178 abs n107 0
+link n78 192 abs n108 0
+link n78 284 rel n83 0
+link n78 130 abs n106 56
+code n79 934 a23823008cd2bc1e6aa3e92b0abecedb429729ac225fbf9293c1a14a222df040
+link n79 35 abs n102 0
+link n79 58 rel n80 0
+link n79 82 abs n103 0
+link n79 87 abs n104 0
+link n79 116 abs n105 0
+link n79 323 abs n101 0
+link n79 412 rel n83 0
+link n79 426 rel n83 0
+link n79 634 rel n83 0
+link n79 648 rel n83 0
+link n79 730 rel n83 0
+link n79 744 rel n83 0
+link n79 126 abs n105 48
+code n8 129 0d88adb83a7e649929989873fe70bc2c09a6d170f631922b40e4d7526072b946
+code n80 129 ef95ce656d3d61956beb98ee2e24dc090dd9eaa8f4ba4ba57b0987887a01d344
+code n81 122 b916a4a9070471aeccf0f044e899bc38bb491c403be7346638567f86f07a74f4
+link n81 7 abs n82 0
+link n81 14 rel n83 0
+link n81 72 rel n80 0
+data n82 44 6735bd9ab28b67724801dbaf5ab9a69e85ca5bb4a822693ba67d787127f9a4df
+code n83 162 4cc6178c6c47e60e77884c1f67f316269fd1fcf603ac78c09c2508a80d67d6f6
+code n84 377 b535e1507e323b721da559199850fb12ed536cbb2d0d556416fcefe97eb90c2f
+link n84 88 rel n80 0
+link n84 130 rel n80 0
+link n84 180 rel n99 0
+link n84 208 rel n80 0
+link n84 250 rel n80 0
+link n84 338 rel n100 0
+link n84 291 abs n111 124
+code n85 491 21adeb3b7ba8f0971e78dbf64b8b2311dce7209804dcef159d0e87562f92b0ce
+link n85 362 rel n98 0
+code n86 849 fe29c2e72d1876cc1b10eca2dcf92cd36af21f08c7b2ab520155acc885e65f37
+link n86 456 abs n97 0
+code n87 595 f283e8ff094b9209d3d32f8c1d6722652981f0cbed32920b6143a839f85ff279
+link n87 260 abs n96 0
+code n88 155 0bb4d997d824cdf4296f6acb5f9902e60afde9cb030c620165c9a2c016d007b2
+link n88 107 rel n23 0
+link n88 124 rel n23 0
+code n89 732 52aac55b2c36d315a497e168f6edf5068ae6c208b6d7d2eef3d2e4431eb88060
+link n89 129 rel n23 0
+link n89 216 rel n16 0
+link n89 361 rel n93 0
+link n89 476 rel n93 0
+link n89 498 rel n94 0
+link n89 614 rel n16 0
+link n89 703 rel n94 0
+code n9 98 e4bcbea39ac7ab313b06bb31588f8c2780cd1fd3d62a7f79598ee18ddb177329
+code n90 666 4510156ac3b11f02f47666acf40575a1bd2a51a93b6bf38c76b210942cd783dd
+link n90 375 rel n92 0
+link n90 488 rel n92 0
+link n90 519 rel n92 0
+link n90 572 rel n92 0
+code n91 180 abccde96440484c69edb58f3b4fcfb84186c59623f4b79681eddc9177ff3ba32
+link n91 142 rel n16 0
+link n91 154 rel n16 0
+code n92 2420 a573f3ed6025787add979751035d3aa45b7c57ccd42197406ad3806fb5bb2c22
+link n92 40 abs n5 0
+link n92 83 abs n4 0
+code n93 811 6f7b6d8a5600aae4429c539383e6b569159d664c5548ed68949052336cd1d575
+link n93 176 abs n95 0
+code n94 603 af74f2c6b5ae9cce308fa46680b743a208051da858c2a145bb19329902df3f77
+link n94 16 abs n95 0
+link n94 586 abs n95 0
+slot n95
+data n96 368 5d3381983929c6fdf91810bef237cbbe322cffef62633223f3a058ecff452ed4
+data n97 60 5dcc1b5872dd9ff1c234501f1fefda01f664164e1583c3e1bb3dbea47588ab31
+link n97 0 abs n86 460
+link n97 4 abs n86 706
+link n97 8 abs n86 460
+link n97 12 abs n86 658
+link n97 16 abs n86 472
+link n97 20 abs n86 658
+link n97 24 abs n86 600
+link n97 28 abs n86 497
+link n97 32 abs n86 506
+link n97 36 abs n86 540
+link n97 40 abs n86 506
+link n97 44 abs n86 658
+link n97 48 abs n86 506
+link n97 52 abs n86 562
+link n97 56 abs n86 600
+code n98 778 c95450b0f0cdf2d9523595b76a6451d5aea54d71a54f312e16cc8f792331becb
+link n98 37 abs n17 0
+link n98 129 abs malloc 0
+link n98 166 rel n23 0
+link n98 260 abs n17 0
+link n98 357 abs malloc 0
+link n98 509 abs n17 0
+link n98 698 rel n50 0
+code n99 717 aa563a9b656d6aefe272b86abf58dc81e1c2fb8679601af3ddfeef7d1e391e25
+link n99 116 rel n23 0
+link n99 239 rel n83 0
+link n99 307 rel n80 0
+link n99 431 abs n96 0
+link n99 273 abs n104 204
+code packet 2397 3e6f5b8ea28b64b9fcafeddf5fc281ac425338209e9102afae370765fe13d018
+link packet 106 rel n75 0
+link packet 521 rel n76 0
+link packet 695 rel n23 0
+link packet 761 rel n77 0
+link packet 922 rel n78 0
+link packet 929 rel n79 0
+link packet 1031 rel n80 0
+link packet 1079 rel n81 0
+link packet 1182 rel n80 0
+link packet 1319 rel n80 0
+link packet 1348 abs n82 0
+link packet 1355 rel n83 0
+link packet 1406 rel n80 0
+link packet 1563 rel n80 0
+link packet 1613 rel n84 0
+link packet 1663 rel n77 0
+link packet 1734 rel n85 0
+link packet 1748 rel n50 0
+link packet 1887 rel n86 0
+link packet 1901 rel n87 0
+link packet 2001 rel n88 0
+link packet 2081 rel n89 0
+link packet 2144 rel n90 0
+link packet 2335 rel n91 0

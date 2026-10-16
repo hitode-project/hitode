@@ -150,7 +150,7 @@ def notices(resources: Path, build: dict) -> tuple[int, int]:
         rust_count += 1
     # Local patched dependencies and statically linked SoftFloat need notices too.
     for name, path in [('cpal', 'vendor/cpal'), ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
-                       ('softfloat', 'crates/adv-cpu-core/softfloat')]:
+                       ('softfloat', 'crates/adv-cpu-core/softfloat'), ('libtheora', 'vendor/libtheora')]:
         count += copy_licenses(ROOT / path, licenses / name)
     source = resources / 'Source'
     source.mkdir(exist_ok=True)

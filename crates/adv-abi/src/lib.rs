@@ -914,3 +914,5 @@ impl adv_machine::Resolver for Registry {
 pub fn leaf_edx(env: &Env<'_>) -> u32 {
     env.cpu.reg(adv_cpu::backend::Reg::Edx)
 }
+
+pub mod library_signature;

@@ -95,6 +95,7 @@ dependencies = [
  "adv-sync",
  "block2",
  "bytemuck",
+ "cc",
  "cpal",
  "encoding_rs",
  "ffmpeg-next",
