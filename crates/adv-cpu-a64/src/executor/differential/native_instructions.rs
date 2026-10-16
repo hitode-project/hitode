@@ -850,3 +850,95 @@ fn cmpxchg8b_matches_interpreter_flags_faults_and_native_commits() {
         }
     }
 }
+
+// spec: A64-FP-5, A64-VER-1
+#[test]
+fn sse_status_reuse_keeps_sticky_precision_and_restarts_after_mxcsr_and_x87() {
+    let p = fixture(|a| {
+        a.mov(eax, 0x3f800001).unwrap();
+        a.movd(xmm0, eax).unwrap();
+        a.mulss(xmm0, xmm0).unwrap();
+        a.addss(xmm0, xmm0).unwrap();
+        a.stmxcsr(dword_ptr(ebx + 64)).unwrap();
+        a.mov(dword_ptr(ebx + 128), 0x1f80).unwrap();
+        a.ldmxcsr(dword_ptr(ebx + 128)).unwrap();
+        a.mov(dword_ptr(ebx + 132), 3).unwrap();
+        a.fld1().unwrap();
+        a.fidiv(dword_ptr(ebx + 132)).unwrap();
+        a.fstp(st0).unwrap();
+        a.xorps(xmm1, xmm1).unwrap();
+        a.addss(xmm1, xmm1).unwrap();
+        a.stmxcsr(dword_ptr(ebx + 68)).unwrap();
+        a.mulss(xmm0, xmm0).unwrap();
+        a.stmxcsr(dword_ptr(ebx + 72)).unwrap();
+    });
+    for config in pixel_loops::configs() {
+        for budget in [3, 8, 12, 1000] {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            assert_eq!(
+                native.run(p.stop, budget).unwrap(),
+                oracle.run(p.stop, budget).unwrap()
+            );
+            same(&native, &oracle);
+            assert_eq!(
+                native.run(p.stop, 1000).unwrap(),
+                oracle.run(p.stop, 1000).unwrap()
+            );
+            same(&native, &oracle);
+            let flags = native.memory().read(DATA + 64, 12).unwrap();
+            assert_eq!(u32::from_le_bytes(flags[0..4].try_into().unwrap()), 0x1fa0);
+            assert_eq!(u32::from_le_bytes(flags[4..8].try_into().unwrap()), 0x1f80);
+            assert_eq!(u32::from_le_bytes(flags[8..12].try_into().unwrap()), 0x1fa0);
+        }
+    }
+}
+
+// spec: A64-FP-5, A64-CTL-7, A64-VER-1
+#[test]
+fn sse_loop_status_matches_interpreter_across_budgets_exceptions_and_observers() {
+    for observer in 0..3 {
+        for input in [0x3f800001, 1, 0x7f000000] {
+            let p = fixture(|a| {
+                let mut top = a.create_label();
+                a.mov(eax, input).unwrap();
+                a.movd(xmm0, eax).unwrap();
+                a.mov(ecx, 5).unwrap();
+                a.mov(dword_ptr(ebx + 128), 0x1f80).unwrap();
+                a.mov(dword_ptr(ebx + 132), 3).unwrap();
+                a.set_label(&mut top).unwrap();
+                a.mulss(xmm0, xmm0).unwrap();
+                match observer {
+                    1 => a.ldmxcsr(dword_ptr(ebx + 128)).unwrap(),
+                    2 => {
+                        a.fld1().unwrap();
+                        a.fidiv(dword_ptr(ebx + 132)).unwrap();
+                        a.fstp(st0).unwrap();
+                    }
+                    _ => {}
+                }
+                a.addss(xmm0, xmm0).unwrap();
+                a.movss(dword_ptr(ebx + ecx * 4), xmm0).unwrap();
+                a.dec(ecx).unwrap();
+                a.jnz(top).unwrap();
+                a.stmxcsr(dword_ptr(ebx + 64)).unwrap();
+            });
+            for config in pixel_loops::configs() {
+                for budget in [8, 14, 1000] {
+                    let mut native = executor(&p, config, false);
+                    let mut oracle = executor(&p, config, true);
+                    assert_eq!(
+                        native.run(p.stop, budget).unwrap(),
+                        oracle.run(p.stop, budget).unwrap()
+                    );
+                    same(&native, &oracle);
+                    assert_eq!(
+                        native.run(p.stop, 1000).unwrap(),
+                        oracle.run(p.stop, 1000).unwrap()
+                    );
+                    same(&native, &oracle);
+                }
+            }
+        }
+    }
+}

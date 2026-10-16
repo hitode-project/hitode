@@ -1537,6 +1537,17 @@ fn run_execution(
     {
         performance.execution_scheduling = Some(configure_execution_thread());
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if window.is_some() {
+        // The guest produces the next interactive frame on this worker.
+        let error = unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+        };
+        performance.execution_scheduling = Some(format!(
+            "{{\"requested_qos\": \"user_interactive\", \"applied\": {}, \"set_errno\": {error}}}",
+            error == 0
+        ));
+    }
     let mut scene_gate = control::SceneGate::default();
     let mut inputs = 0u64;
     let mut injected = false;

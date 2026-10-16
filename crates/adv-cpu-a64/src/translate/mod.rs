@@ -33,7 +33,7 @@
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
 //! x5, which are free inside units; a run of SIMD instructions keeps the
 //! `CpuState` pointer in x5, MMX registers in d8-d15 and XMM registers in
-//! v16-v23, with v0-v3 as scratch.
+//! v16-v23, with v0-v6 as scratch.
 
 mod channels;
 mod decode;
@@ -442,6 +442,10 @@ impl Translator<'_> {
         let inst = trace.insts[index];
         self.index = index;
         self.checking = (self.checked)(inst.pc);
+        if self.checking && inst.effects.site {
+            self.vector.fp_clean = false;
+            self.vector.fp_default = false;
+        }
         self.out = trace.live_out[index];
         self.keep = self.out.minus(inst.effects.writes);
         let steady = self.pixel.is_some_and(|p| p.steady);
@@ -474,6 +478,7 @@ impl Translator<'_> {
             self.state = State::CANONICAL;
         }
         if !steady {
+            self.floating_loop_start(index);
             self.asm.bind(self.labels[index]);
             self.pixel_start(index);
             self.channel_batch(index);

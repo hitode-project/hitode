@@ -108,7 +108,10 @@ impl Samples {
 
 #[derive(Default)]
 pub struct Performance {
-    #[cfg(target_os = "android")]
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     pub(crate) execution_scheduling: Option<String>,
     measurement_start: Option<Instant>,
     measurement_start_frame: u64,
@@ -152,7 +155,10 @@ impl Performance {
     /// The first new frame establishes a boundary: its partial interval is excluded.
     pub fn reset(&mut self, serial: u64) {
         *self = Self {
-            #[cfg(target_os = "android")]
+            #[cfg(any(
+                target_os = "android",
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
             execution_scheduling: self.execution_scheduling.take(),
             measurement_start: Some(Instant::now()),
             measurement_start_frame: serial,
@@ -261,12 +267,18 @@ impl Performance {
         }
     }
     pub fn json(&self) -> String {
-        #[cfg(target_os = "android")]
+        #[cfg(any(
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ))]
         let platform = format!(
             "\"execution_scheduling\": {}, ",
             self.execution_scheduling.as_deref().unwrap_or("null")
         );
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
         let platform = "";
         format!(
             concat!(

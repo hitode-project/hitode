@@ -436,6 +436,10 @@ pub struct Vector {
     ready: bool,
     /// x5 holds the `CpuState` pointer.
     pub cpu: bool,
+    /// FPSR has no exceptional status, and its inexact bit is already in MXCSR.
+    pub fp_clean: bool,
+    /// MXCSR's control bits have passed the native SSE guard.
+    pub fp_default: bool,
 }
 
 fn vmem(bytes: u8) -> VMem {
@@ -448,6 +452,71 @@ fn vmem(bytes: u8) -> VMem {
 }
 
 impl Translator<'_> {
+    /// Clear host status on entry, before a simple SSE loop's backedge label.
+    /// Every arithmetic instruction still publishes MXCSR and checks exceptions.
+    pub(super) fn floating_loop_start(&mut self, start: usize) {
+        use super::decode::Op;
+        use super::trace::{Edge, Mode, Next};
+
+        if !self.trace.merge[start] {
+            return;
+        }
+        let mut floating = false;
+        for end in start..self.trace.len() {
+            let inst = self.trace.insts[end];
+            if (end != start && (self.trace.head(end) || self.trace.merge[end]))
+                || inst.mode != Mode::Plain
+                || inst.leaf.is_some()
+                || (inst.effects.site && (self.checked)(inst.pc))
+            {
+                return;
+            }
+            match inst.op {
+                Op::Simd(s) => floating |= s.floating(),
+                Op::Nop
+                | Op::Mov(..)
+                | Op::Lea(..)
+                | Op::Alu(..)
+                | Op::Step(..)
+                | Op::Neg(_)
+                | Op::Not(_)
+                | Op::Extend(..)
+                | Op::Cdq
+                | Op::Jmp(_)
+                | Op::Jcc(..)
+                | Op::Setcc(..)
+                | Op::Cmov(..)
+                | Op::Shift(..)
+                | Op::Imul(..)
+                | Op::Carry(..)
+                | Op::Narrow(..)
+                | Op::Direction(_) => {}
+                _ => return,
+            }
+            if inst.taken == Some(Edge::Internal(start))
+                || inst.next == Next::Edge(Edge::Internal(start))
+            {
+                // Any other incoming edge could skip the entry reset.
+                if floating
+                    && !self.trace.insts.iter().enumerate().any(|(i, inst)| {
+                        i != end
+                            && (inst.taken == Some(Edge::Internal(start))
+                                || inst.next == Next::Edge(Edge::Internal(start)))
+                    })
+                {
+                    self.emit(msr_fpsr(Reg::ZR));
+                    self.vector.fp_clean = true;
+                }
+                return;
+            }
+            if inst.next != Next::Fall
+                || matches!(inst.taken, Some(Edge::Internal(_) | Edge::Interpret(_)))
+            {
+                return;
+            }
+        }
+    }
+
     pub(super) fn simd(&mut self, simd: Simd) {
         if self.checking && simd.memory() {
             self.helper(simd.helper);
@@ -810,16 +879,16 @@ impl Translator<'_> {
     /// MXCSR, leaving for the interpreter on any exception but inexact.
     /// Uses x13, x14 and v0-v6.
     fn floating(&mut self, simd: Simd, address: Reg) {
-        let (v3, v4, v5, v6) = (VReg::new(3), VReg::new(4), VReg::new(5), VReg::new(6));
+        let (v4, v5, v6) = (VReg::new(4), VReg::new(5), VReg::new(6));
         self.cpu();
         let bail = self.bail();
         // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
-        self.emit_all(&[
-            ldr(W, X13, X5, runtime::MXCSR),
-            and_imm(W, X17, X13, 0xffc0),
-            eor_imm(W, X17, X17, 0x1f80),
-        ]);
-        self.asm.cbz(W, true, X17, bail);
+        self.emit(ldr(W, X13, X5, runtime::MXCSR));
+        if !self.vector.fp_default {
+            self.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
+            self.asm.cbz(W, true, X17, bail);
+            self.vector.fp_default = true;
+        }
         let s = match simd.src {
             Loc::Mem => {
                 self.site();
@@ -840,7 +909,6 @@ impl Translator<'_> {
                 | Kind::Narrow
                 | Kind::ScalarToInt(true, _)
         );
-        let log2 = if double { 3 } else { 2 };
         let (scalar, inputs) = match simd.kind {
             Kind::Float(_, scalar)
             | Kind::Double(_, scalar)
@@ -853,13 +921,28 @@ impl Translator<'_> {
         };
         // DE: after shifting away the sign, a nonzero subnormal is below
         // 2^24 (binary32) or 2^53 (binary64). Scalar upper lanes are ignored.
-        let (lanes, arr) = match simd.kind {
-            Kind::ToInt(_) | Kind::Widen(false) => (2, Arr::S2),
-            _ if double => (if scalar { 1 } else { 2 }, Arr::D2),
-            _ if scalar => (1, Arr::S2),
-            _ => (4, Arr::S4),
+        let arr = match simd.kind {
+            Kind::ToInt(_) | Kind::Widen(false) => Arr::S2,
+            _ if double => Arr::D2,
+            _ => Arr::S4,
         };
-        if !matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) {
+        if !matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) && scalar {
+            for input in inputs.into_iter().flatten() {
+                let clean = self.asm.label();
+                let size = if double { X } else { W };
+                let fraction = if double { 52 } else { 23 };
+                let exponent = if double { 11 } else { 8 };
+                self.emit_all(&[
+                    fmov_from_v(size, X16, input),
+                    ubfx(size, X17, X16, fraction, exponent),
+                ]);
+                self.asm.cbz(size, true, X17, clean);
+                self.emit(lsl_imm(size, X16, X16, exponent + 1));
+                self.asm.cbz(size, false, X16, clean);
+                self.emit(orr_imm(W, X13, X13, 2));
+                self.asm.bind(clean);
+            }
+        } else if !matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) {
             self.emit_all(&[
                 movz(X, X16, 1, 0),
                 vdup(arr, v4, X16),
@@ -876,15 +959,9 @@ impl Translator<'_> {
             }
             self.emit(vdup(arr, v5, X16));
             for (n, input) in inputs.into_iter().flatten().enumerate() {
-                let x = if lanes == 1 {
-                    self.emit_all(&[vzero(true, v3), vins(log2, v3, 0, input, 0)]);
-                    v3
-                } else {
-                    input
-                };
                 let target = if n == 0 { v6 } else { V0 };
                 self.emit_all(&[
-                    vshift(ShiftImm::Shl, arr, target, x, 1),
+                    vshift(ShiftImm::Shl, arr, target, input, 1),
                     vsame(Same::Sub, arr, target, target, v4),
                     vsame(Same::Uqsub, arr, target, v5, target),
                 ]);
@@ -907,7 +984,9 @@ impl Translator<'_> {
             self.emit(orr_imm(W, X13, X13, 2));
             self.asm.bind(clean);
         }
-        self.emit(msr_fpsr(Reg::ZR));
+        if !self.vector.fp_clean {
+            self.emit(msr_fpsr(Reg::ZR));
+        }
         match simd.kind {
             Kind::ScalarFromInt(double) => {
                 self.emit_all(&[fmov_from_v(W, X16, s), scvtf(W, V0, X16)]);
@@ -988,6 +1067,9 @@ impl Translator<'_> {
             Kind::ToInt(truncate) => self.emit(vtoint(truncate, false, V0, s)),
             _ => unreachable!(),
         }
+        // Successful SSE operations can retain sticky inexact across the next
+        // operation: MXCSR has already recorded it. Observers reset this fact.
+        self.vector.fp_clean = true;
         // Anything but inexact leaves; inexact sets PE.
         self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
         self.asm.cbz(X, true, X14, bail);
