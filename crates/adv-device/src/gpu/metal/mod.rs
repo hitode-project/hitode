@@ -4,6 +4,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::*;
 use std::sync::atomic::AtomicBool;
+mod blit;
 mod clear;
 mod display;
 pub(super) mod pipeline;
@@ -76,6 +77,8 @@ pub(super) struct State {
     failure: Arc<OnceLock<String>>,
     ring: Ring,
     command: Option<Object<dyn MTLCommandBuffer>>,
+    initialization: Option<wgpu::CommandEncoder>,
+    reference_queue: wgpu::Queue,
     encoder: Option<Object<dyn MTLRenderCommandEncoder>>,
     attachments: Option<(wgpu::TextureView, Option<wgpu::TextureView>)>,
     constants: Option<u64>,
@@ -115,6 +118,8 @@ impl State {
             gate: context.gate.clone(),
             failure: context.failure.clone(),
             command: None,
+            initialization: None,
+            reference_queue: context.queue.clone(),
             encoder: None,
             attachments: None,
             constants: None,
@@ -144,6 +149,10 @@ impl State {
     pub(super) fn flush(&mut self) {
         if let Some(encoder) = self.encoder.take() {
             encoder.endEncoding();
+        }
+        if let Some(encoder) = self.initialization.take() {
+            self.reference_queue.submit([encoder.finish()]);
+            self.owner.submissions.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(command) = self.command.take() {
             self.ring
@@ -247,20 +256,21 @@ impl State {
             .iter()
             .map(|t| t.image.as_ref().unwrap_or(&white))
             .collect();
-        if initialize || target.padded_attachments() {
+        if initialize || !attachment.image.metal.initialized.load(Ordering::Relaxed) {
             self.flush();
             self.select_wgpu(SwitchReason::Other);
             let mut encoder = gpu
                 .context
                 .device
                 .create_command_encoder(&Default::default());
+            target.image.initialize_metal(&mut encoder, &self.owner);
             attachment.image.initialize_metal(&mut encoder, &self.owner);
             for image in &images {
                 image.initialize_metal(&mut encoder, &self.owner);
             }
             gpu.context.queue.submit([encoder.finish()]);
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
-            if depth_uninitialized || target.padded_attachments() {
+            if depth_uninitialized {
                 pending.owner = Some(self.owner.clone());
                 gpu.begin_batch_pass(pending, initialization_target)?;
                 pending.flush(&gpu.context.queue);
@@ -277,6 +287,7 @@ impl State {
         }
         if self.command.is_none() {
             self.batch_start = self.ring.head;
+            self.command = Some(self.queue.commandBuffer().unwrap());
         }
         let mut offset = start % CAPACITY;
         let base = if reuse {
@@ -308,6 +319,7 @@ impl State {
             self.ring.write(offset, bytemuck::cast_slice(indices));
         }
         self.ring.head = start + size;
+        attachment.load_metal(self, gpu, &target.image);
         let attachments = (
             attachment.image.render_view.clone(),
             target.depth.as_ref().map(|d| d.view().clone()),
@@ -501,21 +513,9 @@ impl State {
         } else {
             self.ring.head
         };
-        if self.draws == 32
-            || next + MAX_DRAW - self.batch_start > CAPACITY
-            || target.padded_attachments()
-        {
+        attachment.store_metal(self, gpu, &target.image);
+        if self.draws == 32 || next + MAX_DRAW - self.batch_start > CAPACITY {
             self.flush();
-        }
-        if target.padded_attachments() {
-            self.select_wgpu(SwitchReason::Copy);
-            let mut encoder = gpu
-                .context
-                .device
-                .create_command_encoder(&Default::default());
-            attachment.store(&mut encoder, &target.image);
-            gpu.context.queue.submit([encoder.finish()]);
-            self.owner.submissions.fetch_add(1, Ordering::Relaxed);
         }
         gpu.check()
     }

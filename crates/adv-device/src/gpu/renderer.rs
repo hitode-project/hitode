@@ -1520,7 +1520,7 @@ impl Gpu {
         y: u32,
     ) -> Result<(), Error> {
         let context = self.context.clone();
-        let submission = context.submission_for(SwitchReason::Copy)?;
+        let submission = context.enter_submission()?;
         self.copy_under(source, rectangle, destination, x, y, &submission)
     }
 
@@ -1567,6 +1567,23 @@ impl Gpu {
             x = region.x;
             y = region.y;
         }
+        #[cfg(target_vendor = "apple")]
+        {
+            let context = self.context.clone();
+            let mut pending = context.pending.lock().unwrap();
+            if pending.clear.is_some() {
+                pending.flush_metal(SwitchReason::Copy);
+                pending.flush(&context.queue);
+            }
+            if let Some(metal) = &mut pending.metal {
+                if metal.active() {
+                    metal.copy(self, source, rectangle, destination, x, y);
+                    self.stats.image_copy_bytes +=
+                        u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
+                    return self.check();
+                }
+            }
+        }
         let mut encoder = self
             .context
             .device
@@ -1596,7 +1613,7 @@ impl Gpu {
     /// Present through a GPU snapshot. No readback, CPU conversion or upload.
     pub fn present(&mut self, image: &Image, serial: u64) -> Result<NativeFrame, Error> {
         let context = self.context.clone();
-        let submission = context.submission_for(SwitchReason::Copy)?;
+        let submission = context.enter_submission()?;
         self.own(image)?;
         let mut reusable = self.frames.iter().position(Image::reusable);
         if reusable.is_none() && self.frames.len() >= MAX_NATIVE_FRAMES {
@@ -1637,6 +1654,7 @@ impl Gpu {
             0,
             &submission,
         )?;
+        submission.flush();
         self.stats.native_frames += 1;
         let pin = FramePin::new(&snapshot)?;
         Ok(NativeFrame {
