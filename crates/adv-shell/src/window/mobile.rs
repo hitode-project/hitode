@@ -1,23 +1,40 @@
-//! An Android SurfaceView supplied by the embedding host. All access is on its main looper.
+//! The mobile game view, on the host's main thread: an Android SurfaceView
+//! supplied by the embedding host, or an iOS `CAMetalLayer` view this crate
+//! creates for the host to insert.
 use super::{Event, WakeEvent, refresh_interval};
+#[cfg(target_os = "android")]
+use std::ptr::NonNull;
 use std::{
     cell::{Cell, RefCell},
-    ptr::NonNull,
     rc::Rc,
     sync::Arc,
     time::Instant,
 };
+#[cfg(target_os = "android")]
 #[path = "android/input.rs"]
 mod input;
+#[cfg(target_os = "ios")]
+#[path = "ios.rs"]
+mod input;
+#[cfg(target_os = "ios")]
+pub use input::GameContainer;
 pub use input::TouchAction;
+#[cfg(target_os = "android")]
 type SurfaceSink = Box<dyn Fn(Option<NonNull<ndk_sys::ANativeWindow>>) -> Result<(), String>>;
 pub struct GameView {
+    #[cfg(target_os = "android")]
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
+    #[cfg(target_os = "ios")]
+    pub(super) host: RefCell<Option<objc2::rc::Retained<input::HostView>>>,
+    /// The display-link vsync grid for guest pacing (PROC-CLOCK-4).
+    #[cfg(target_os = "ios")]
+    pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
     client: Cell<(u32, u32)>,
     canvas: Cell<(u32, u32)>,
     pub(crate) scaling: Cell<crate::Scaling>,
     events: RefCell<Vec<Event>>,
     wake: RefCell<Option<WakeEvent>>,
+    #[cfg(target_os = "android")]
     surface_sink: RefCell<Option<SurfaceSink>>,
     error: RefCell<Option<String>>,
     touch: RefCell<input::Touch>,
@@ -31,16 +48,26 @@ pub struct GameView {
 }
 impl GameView {
     pub fn new(width: u32, height: u32) -> Result<Rc<Self>, String> {
-        if unsafe { libc::gettid() } != unsafe { libc::getpid() } {
+        #[cfg(target_os = "android")]
+        let main = unsafe { libc::gettid() } == unsafe { libc::getpid() };
+        #[cfg(target_os = "ios")]
+        let main = objc2::MainThreadMarker::new().is_some();
+        if !main {
             return Err("the game view must run on the main thread".into());
         }
-        Ok(Rc::new(Self {
+        let view = Rc::new(Self {
+            #[cfg(target_os = "android")]
             window: Cell::new(None),
+            #[cfg(target_os = "ios")]
+            host: RefCell::new(None),
+            #[cfg(target_os = "ios")]
+            vsync: Arc::default(),
             client: Cell::new((width, height)),
             canvas: Cell::new((width.max(1), height.max(1))),
             scaling: Cell::new(crate::Scaling::Fit),
             events: RefCell::new(Vec::new()),
             wake: RefCell::new(None),
+            #[cfg(target_os = "android")]
             surface_sink: RefCell::new(None),
             error: RefCell::new(None),
             touch: RefCell::new(input::Touch::default()),
@@ -51,10 +78,41 @@ impl GameView {
             keys: RefCell::new(Arc::default()),
             ready: Cell::new(false),
             period: Cell::new(16_666_667),
-        }))
+        });
+        #[cfg(target_os = "ios")]
+        {
+            let host = input::HostView::new(Rc::downgrade(&view))?;
+            *view.host.borrow_mut() = Some(host);
+        }
+        Ok(view)
+    }
+    /// The `UIView` for the host to insert below its webview; it stays valid
+    /// while this game view lives.
+    #[cfg(target_os = "ios")]
+    pub fn ui_view(&self) -> *mut std::ffi::c_void {
+        self.host
+            .borrow()
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |host| {
+                objc2::rc::Retained::as_ptr(host).cast_mut().cast()
+            })
+    }
+    #[cfg(target_os = "ios")]
+    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+        if let Some(host) = self.host.borrow().as_ref() {
+            host.place(placement);
+        }
+    }
+    /// The host view's layout: its drawable size in pixels.
+    #[cfg(target_os = "ios")]
+    pub(crate) fn resized(&self, width: u32, height: u32) {
+        if self.client.replace((width, height)) != (width, height) {
+            self.push(Event::Repaint);
+        }
     }
     /// # Safety
     /// The host must keep the native window valid until it calls this with None.
+    #[cfg(target_os = "android")]
     pub unsafe fn set_window(
         &self,
         window: Option<NonNull<ndk_sys::ANativeWindow>>,
@@ -140,10 +198,15 @@ impl GameView {
             lparam,
         });
     }
-    pub(crate) fn bind(&self, keys: Arc<adv_sync::input::KeyState>, sink: SurfaceSink) {
+    pub(crate) fn bind_keys(&self, keys: Arc<adv_sync::input::KeyState>) {
         *self.keys.borrow_mut() = keys;
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn bind(&self, keys: Arc<adv_sync::input::KeyState>, sink: SurfaceSink) {
+        self.bind_keys(keys);
         *self.surface_sink.borrow_mut() = Some(sink);
     }
+    #[cfg(target_os = "android")]
     pub(crate) fn unbind(&self) {
         self.surface_sink.borrow_mut().take();
     }
@@ -152,7 +215,7 @@ impl GameView {
     }
     pub(crate) fn push(&self, event: Event) {
         if self.events.borrow().len() == 4096 {
-            *self.error.borrow_mut() = Some("Android input queue capacity exceeded".into());
+            *self.error.borrow_mut() = Some("mobile input queue capacity exceeded".into());
         } else {
             self.events.borrow_mut().push(event);
         }
@@ -228,11 +291,23 @@ impl GameView {
         &self,
         fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
-        let window = self.window.get().ok_or("the Android view has no surface")?;
+        #[cfg(target_os = "android")]
+        let surface = self
+            .window
+            .get()
+            .ok_or("the Android view has no surface")?
+            .as_ptr();
+        #[cfg(target_os = "ios")]
+        let surface = self
+            .host
+            .borrow()
+            .as_ref()
+            .ok_or("the iOS view is gone")?
+            .metal_layer();
         let size = self.client.get();
         let (gpu, mut presenter) = pollster::block_on(unsafe {
             crate::native_gpu::WindowPresenter::request(
-                window.as_ptr().cast(),
+                surface.cast(),
                 size.0.max(1),
                 size.1.max(1),
                 fallback,
@@ -242,7 +317,7 @@ impl GameView {
         Ok((gpu, presenter))
     }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
-        Ok(if self.window.get().is_some() && !self.paused.get() {
+        Ok(if self.has_surface() && !self.paused.get() {
             self.client.get()
         } else {
             (0, 0)
@@ -276,6 +351,21 @@ impl GameView {
         Instant::now() + refresh_interval(fps)
     }
 }
+impl GameView {
+    #[cfg(target_os = "android")]
+    fn has_surface(&self) -> bool {
+        self.window.get().is_some()
+    }
+    /// The layer persists; a view outside any window has nothing to show.
+    #[cfg(target_os = "ios")]
+    fn has_surface(&self) -> bool {
+        self.host
+            .borrow()
+            .as_ref()
+            .is_some_and(|host| host.window().is_some())
+    }
+}
+#[cfg(target_os = "android")]
 impl Drop for GameView {
     fn drop(&mut self) {
         if let Some(window) = self.window.take() {

@@ -1,0 +1,7 @@
+{
+  "identifier": "mobile-storage",
+  "description": "Game folder import on phones",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": ["storage:default"]
+}

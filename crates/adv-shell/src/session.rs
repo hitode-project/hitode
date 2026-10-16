@@ -31,8 +31,8 @@ pub struct Session {
     timer: CFRetained<CFRunLoopTimer>,
 }
 struct Driver {
-    #[cfg(target_os = "android")]
-    main_loop: RefCell<Option<android::MainLoop>>,
+    #[cfg(mobile)]
+    main_loop: RefCell<Option<platform::MainLoop>>,
     #[cfg(target_os = "macos")]
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     view: View,
@@ -55,10 +55,14 @@ struct Driver {
 use crate::window::{Projection, Window};
 #[cfg(target_os = "macos")]
 type View = Retained<GameView>;
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 type View = Rc<GameView>;
 #[cfg(target_os = "android")]
-mod android;
+#[path = "session/android.rs"]
+mod platform;
+#[cfg(target_os = "ios")]
+#[path = "session/ios.rs"]
+mod platform;
 
 impl Session {
     /// Starts a game in the host view, on the main thread.
@@ -108,11 +112,15 @@ impl Session {
         {
             worker.vsync = Some(view.vsync());
         }
+        #[cfg(target_os = "ios")]
+        {
+            worker.vsync = Some(view.vsync.clone());
+        }
         let service = background.start().map_err(|e| e.to_string())?;
         let completion_wake = ui.wake();
         view.watch(completion_wake.clone());
         let (mut tx, rx) = spsc::channel(1);
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         let view_keys = keys.clone();
         let execution = std::thread::Builder::new()
             .name("adv-execution".into())
@@ -126,7 +134,7 @@ impl Session {
             })
             .map_err(|e| e.to_string())?;
         let driver = Rc::new(Driver {
-            #[cfg(target_os = "android")]
+            #[cfg(mobile)]
             main_loop: RefCell::new(None),
             #[cfg(target_os = "macos")]
             activity: NSProcessInfo::processInfo().beginActivityWithOptions_reason(
@@ -148,9 +156,15 @@ impl Session {
             #[cfg(target_os = "macos")]
             cli: RefCell::new(None),
         });
+        #[cfg(target_os = "ios")]
+        {
+            *driver.main_loop.borrow_mut() = Some(platform::MainLoop::new(&driver)?);
+            driver.view.bind_keys(view_keys);
+            Ok(Self { driver })
+        }
         #[cfg(target_os = "android")]
         {
-            *driver.main_loop.borrow_mut() = Some(android::MainLoop::new(&driver)?);
+            *driver.main_loop.borrow_mut() = Some(platform::MainLoop::new(&driver)?);
             let weak = Rc::downgrade(&driver);
             driver.view.bind(
                 view_keys,
@@ -284,7 +298,7 @@ impl Session {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
     }
     pub fn set_paused(&self, paused: bool) {
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
             ui.pause_input(paused);
         }
@@ -448,7 +462,7 @@ impl Driver {
                 None
             }
         };
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         {
             let result = self
                 .main_loop
@@ -509,10 +523,9 @@ unsafe extern "C-unwind" fn timer_callback(_: *mut CFRunLoopTimer, info: *mut c_
 impl Drop for Session {
     fn drop(&mut self) {
         #[cfg(target_os = "android")]
-        {
-            self.driver.view.unbind();
-            self.driver.main_loop.borrow_mut().take();
-        }
+        self.driver.view.unbind();
+        #[cfg(mobile)]
+        self.driver.main_loop.borrow_mut().take();
         #[cfg(target_os = "macos")]
         {
             self.driver.view.stop_frame_clock();

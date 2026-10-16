@@ -1,29 +1,26 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import Icon from "./Icon.svelte";
-  import { COPY_SIZE, pickFolderIos } from "../lib/fake-import";
+  import { COPY_SIZE } from "../lib/fake-import";
   import { inTauri } from "../lib/bridge";
   import { prepareFolder, requestStoragePermission, storageSize } from "../lib/storage";
   import { nav } from "../lib/nav.svelte";
 
   interface Props {
-    /** iOS picks folders through Files; everything else gets the Android copy. */
+    /** iOS picks folders through Files and needs no permission step. */
     ios: boolean;
     oncancel: () => void;
-    /** A folder was picked (Android): scan it. */
+    /** A folder was picked, and copied if it had to be: scan it. */
     onscan: () => void;
-    /** A single game folder was picked (iOS): confirm it on the import screen. */
-    onimport: () => void;
   }
 
-  let { ios, oncancel, onscan, onimport }: Props = $props();
+  let { ios, oncancel, onscan }: Props = $props();
 
-  type Step = "ask" | "granted" | "copy" | "icloud";
+  type Step = "ask" | "granted" | "copy";
 
   let step = $state<Step>("ask");
   /** The granted step's buttons appear once the system screen has settled. */
   let ready = $state(false);
-  let picked = $state("");
   let busy = $state(false);
   let error = $state("");
   let copySize = $state(inTauri ? "…" : COPY_SIZE);
@@ -84,11 +81,6 @@
     go("ask");
   }
 
-  function pickIos() {
-    picked = pickFolderIos().name;
-    go("icloud");
-  }
-
   // Move focus into the dialog when it opens and on every step.
   $effect(() => {
     void step;
@@ -146,7 +138,7 @@
           <button class="quiet" onclick={cancel} disabled={!ready}>{t("取消")}</button>
         </div>
       </div>
-    {:else if !ios && step === "copy"}
+    {:else if step === "copy"}
       <div class="step">
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"></rect><path d="M12 7.5v7M9 11.5l3 3 3-3"></path></svg>
@@ -161,31 +153,15 @@
           <button class="quiet" onclick={back}>{t("返回")}</button>
         </div>
       </div>
-    {:else if ios && step === "icloud"}
-      <div class="step">
-        <div class="badge" aria-hidden="true">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.2l2 2h8.8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"></path></svg>
-        </div>
-        <h2 id="perm-t" class="ttl" lang="ja">{picked}</h2>
-        <div class="warn" role="status">
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.6 12.5a3 3 0 0 1-.5-5.96 4 4 0 0 1 7.7-.9A3 3 0 0 1 11.4 12.5"></path><path d="M8 8v5.5M6.2 11.8L8 13.5l1.8-1.7"></path></svg>
-          <span>{t("部分文件在 iCloud 中，需要先下载")}</span>
-        </div>
-        <div class="acts" style="margin-top: 22px">
-          <button class="primary" onclick={onimport}>{t("下载并添加")}</button>
-          <button class="secondary" onclick={onimport}>{t("复制到本机")}</button>
-          <button class="quiet" onclick={oncancel}>{t("取消")}</button>
-        </div>
-      </div>
     {:else}
       <div class="step">
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.2l2 2h8.8A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"></path></svg>
         </div>
         <h2 id="perm-t" class="ttl">{t("选择游戏文件夹")}</h2>
-        <p class="line">{t("在“文件”里选中整个游戏文件夹。")}</p>
+        <p class="line">{error || t("在“文件”里选中整个游戏文件夹。")}</p>
         <div class="acts">
-          <button class="primary" onclick={pickIos}>{t("打开“文件”")}</button>
+          <button class="primary" onclick={() => selectFolder(false)} disabled={busy}>{t("打开“文件”")}</button>
           <button class="quiet" onclick={oncancel}>{t("取消")}</button>
         </div>
       </div>
@@ -311,23 +287,6 @@
   }
   .acts .quiet:focus-visible {
     outline-offset: 2px;
-  }
-  .warn {
-    align-self: stretch;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 18px;
-    padding: 12px 14px;
-    border-radius: 14px;
-    background: var(--field);
-    font-size: 14px;
-    line-height: 20px;
-    text-align: left;
-  }
-  .warn svg {
-    flex: 0 0 auto;
-    color: var(--fg2);
   }
   @keyframes up {
     from {

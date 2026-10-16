@@ -2,3 +2,4 @@
 /dist
 /src-tauri/gen/*
 !/src-tauri/gen/android/
+!/src-tauri/gen/apple/

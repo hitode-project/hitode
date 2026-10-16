@@ -117,7 +117,7 @@
   {#if permissionError}
     <div class="status err" role="status">{permissionError}</div>
   {:else if asking && !checking}
-    <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} onimport={() => nav.replace({ name: "import" })} />
+    <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} />
   {/if}
 </PhoneImportPage>
 

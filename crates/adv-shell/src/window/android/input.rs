@@ -57,16 +57,7 @@ pub(crate) fn key(code: i32) -> Option<(u32, u32)> {
         _ => return None,
     })
 }
-pub(crate) fn message(key: u32, scan: u32, down: bool, repeat: bool, alt: bool) -> (u32, u32, u32) {
-    (
-        if down { 0x100 } else { 0x101 } + if alt || key == 0x79 { 4 } else { 0 },
-        key,
-        1 | scan << 16
-            | u32::from(alt) << 29
-            | u32::from(repeat || !down) << 30
-            | u32::from(!down) << 31,
-    )
-}
+pub(crate) use crate::mobile::key_message as message;
 #[cfg(test)]
 mod tests {
     use super::*;
