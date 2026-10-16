@@ -430,6 +430,7 @@ impl Ui {
                 #[cfg(target_os = "macos")]
                 if let Some(placement) = completed.rendered.placement {
                     window.place(Some(placement));
+                    window.shared_frame(completed.rendered.shared.map(|(frame, _)| frame));
                 }
                 window.set_video_cursor_regions(completed.rendered.cursor_regions);
                 if matches!(

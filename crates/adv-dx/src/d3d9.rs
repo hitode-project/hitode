@@ -913,7 +913,7 @@ fn create_device(
         }
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
-        Some(gpu) => gpu.target(
+        Some(gpu) => gpu.presentation_target(
             normalized.BackBufferWidth,
             normalized.BackBufferHeight,
             false,
@@ -1145,7 +1145,7 @@ fn reset(
         Err(_) => return Outcome::Return(UNAVAILABLE),
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
-        Some(g) => g.target(
+        Some(g) => g.presentation_target(
             normalized.BackBufferWidth,
             normalized.BackBufferHeight,
             false,

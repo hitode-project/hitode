@@ -14,6 +14,8 @@ pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,
 };
+#[cfg(target_vendor = "apple")]
+pub use renderer::DisplayCompletion;
 pub use renderer::Submission;
 pub use renderer::validate_program;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
@@ -230,6 +232,7 @@ pub struct Stats {
     pub draws: u64,
     pub vertices: u64,
     pub readbacks: u64,
+    pub image_copy_bytes: u64,
     pub native_frames: u64,
     pub native_frame_allocations: u64,
     pub vertex_buffer_allocations: u64,
