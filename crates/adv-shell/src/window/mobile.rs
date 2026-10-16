@@ -21,6 +21,22 @@ pub use input::GameContainer;
 pub use input::TouchAction;
 #[cfg(target_os = "android")]
 type SurfaceSink = Box<dyn Fn(Option<NonNull<ndk_sys::ANativeWindow>>) -> Result<(), String>>;
+use crate::mobile::{Gesture, Gestures, TouchMode};
+
+/// What the game view tells its host.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewEvent {
+    /// The screen layout changed (AND-APP-16).
+    Layout(crate::mobile::Layout),
+    /// A three-finger tap asked for the keyboard.
+    Keyboard,
+    /// Where the host draws the trackpad cursor, in view pixels; None hides
+    /// it. iOS draws it in the game view itself.
+    Cursor(Option<(f32, f32)>),
+}
+
+/// Trackpad cursor travel per finger travel.
+const TRACKPAD_GAIN: f32 = 1.25;
 pub struct GameView {
     #[cfg(target_os = "android")]
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
@@ -37,7 +53,21 @@ pub struct GameView {
     #[cfg(target_os = "android")]
     surface_sink: RefCell<Option<SurfaceSink>>,
     error: RefCell<Option<String>>,
-    touch: RefCell<input::Touch>,
+    gestures: RefCell<Gestures>,
+    mode: Cell<TouchMode>,
+    /// The mouse position in canvas pixels: the last touch in direct mode,
+    /// the cursor in trackpad mode.
+    cursor: Cell<(f32, f32)>,
+    /// MK_ flags of buttons held through `mouse_button`.
+    buttons: Cell<u32>,
+    listener: RefCell<Option<Box<dyn Fn(ViewEvent)>>>,
+    /// Where the host placed the surface, as a layout whose game is that
+    /// area, with the points-to-pixels scale (AND-APP-16).
+    #[cfg(target_os = "android")]
+    screen: RefCell<Option<(crate::mobile::Layout, f64)>>,
+    #[cfg(target_os = "android")]
+    reported: RefCell<Option<crate::mobile::Layout>>,
+    created: Instant,
     paused: Cell<bool>,
     toggle_control: Cell<bool>,
     control: Cell<bool>,
@@ -70,7 +100,16 @@ impl GameView {
             #[cfg(target_os = "android")]
             surface_sink: RefCell::new(None),
             error: RefCell::new(None),
-            touch: RefCell::new(input::Touch::default()),
+            gestures: RefCell::new(Gestures::default()),
+            mode: Cell::new(TouchMode::Direct),
+            cursor: Cell::new((0.0, 0.0)),
+            buttons: Cell::new(0),
+            listener: RefCell::new(None),
+            #[cfg(target_os = "android")]
+            screen: RefCell::new(None),
+            #[cfg(target_os = "android")]
+            reported: RefCell::new(None),
+            created: Instant::now(),
             paused: Cell::new(false),
             toggle_control: Cell::new(false),
             control: Cell::new(false),
@@ -102,6 +141,13 @@ impl GameView {
         if let Some(host) = self.host.borrow().as_ref() {
             host.place(placement);
         }
+    }
+    /// The presented frame's rectangle in view pixels.
+    pub(crate) fn frame_rectangle(&self) -> [f64; 4] {
+        let (width, height) = self.client.get();
+        self.scaling
+            .get()
+            .rectangle((f64::from(width), f64::from(height)), self.canvas.get())
     }
     /// The host view's layout: its drawable size in pixels.
     #[cfg(target_os = "ios")]
@@ -148,25 +194,212 @@ impl GameView {
             }
         }
         self.push(Event::Repaint);
+        self.report_layout();
+    }
+    /// Where the host placed the surface: `screen.game` is the surface's
+    /// area in the host view's points, `scale` its pixels per point.
+    #[cfg(target_os = "android")]
+    pub fn set_screen(&self, screen: crate::mobile::Layout, scale: f64) {
+        *self.screen.borrow_mut() = Some((screen, scale));
+        self.set_touch_scale(scale as f32);
+        self.report_layout();
+    }
+    /// Tells the host where the frame and the screen's obstructions are,
+    /// when that changed (AND-APP-16).
+    #[cfg(target_os = "android")]
+    fn report_layout(&self) {
+        let Some((screen, scale)) = self.screen.borrow().clone() else {
+            return;
+        };
+        let [x, y, width, height] = self.frame_rectangle();
+        let layout = crate::mobile::Layout {
+            game: crate::mobile::Rect {
+                x: screen.game.x + x / scale,
+                y: screen.game.y + y / scale,
+                width: width / scale,
+                height: height / scale,
+            },
+            ..screen
+        };
+        if self.reported.borrow().as_ref() != Some(&layout) {
+            *self.reported.borrow_mut() = Some(layout.clone());
+            self.notify(ViewEvent::Layout(layout));
+        }
+    }
+    /// Receives the host's view events: layout, keyboard requests and, on
+    /// Android, the trackpad cursor.
+    pub fn set_listener(&self, listener: Box<dyn Fn(ViewEvent)>) {
+        *self.listener.borrow_mut() = Some(listener);
+    }
+    pub(crate) fn notify(&self, event: ViewEvent) {
+        if let Some(listener) = self.listener.borrow().as_ref() {
+            listener(event);
+        }
     }
     pub fn touch(&self, pointer: i32, action: TouchAction, x: f32, y: f32) {
         if self.paused.get() {
             return;
         }
-        let position = input::position(
-            self.client.get(),
-            self.canvas.get(),
-            self.scaling.get(),
-            x,
-            y,
-        );
-        for (message, wparam, lparam) in self.touch.borrow_mut().update(pointer, action, position) {
+        let now = self.now();
+        let gestures = self
+            .gestures
+            .borrow_mut()
+            .update(pointer, action, x, y, now);
+        for gesture in gestures {
+            self.gesture(gesture);
+        }
+    }
+    /// View pixels per point, for the gesture distances.
+    pub(crate) fn set_touch_scale(&self, scale: f32) {
+        self.gestures.borrow_mut().set_scale(scale);
+    }
+    fn now(&self) -> u64 {
+        self.created.elapsed().as_millis() as u64
+    }
+    /// Fires the gesture timers that are due: long presses and the end of
+    /// a click's hold.
+    fn poll_gestures(&self) {
+        if self.paused.get() {
+            return;
+        }
+        let gestures = self.gestures.borrow_mut().tick(self.now());
+        for gesture in gestures {
+            self.gesture(gesture);
+        }
+    }
+    /// When a gesture timer next needs `take_events`.
+    pub(crate) fn input_deadline(&self) -> Option<Instant> {
+        let at = self.gestures.borrow().deadline()?;
+        Some(self.created + std::time::Duration::from_millis(at))
+    }
+    /// Switches between direct touch and the trackpad cursor (AND-APP-14).
+    pub fn set_touch_mode(&self, mode: TouchMode) {
+        let ended = self.gestures.borrow_mut().set_mode(mode);
+        for gesture in ended {
+            self.gesture(gesture);
+        }
+        self.release_buttons();
+        if self.mode.replace(mode) != mode && mode == TouchMode::Trackpad {
+            let (width, height) = self.canvas.get();
+            self.cursor.set((width as f32 / 2.0, height as f32 / 2.0));
+        }
+        self.show_cursor();
+    }
+    /// Presses or releases a mouse button at the mouse position, for the
+    /// overlay's buttons; dragging moves with it held.
+    pub fn mouse_button(&self, right: bool, down: bool) {
+        if self.paused.get() {
+            return;
+        }
+        let flag = if right { 2 } else { 1 };
+        let held = self.buttons.get();
+        if down == (held & flag != 0) {
+            return;
+        }
+        let buttons = if down { held | flag } else { held & !flag };
+        self.buttons.set(buttons);
+        let at = self.cursor_position();
+        let message = match (right, down) {
+            (false, true) => 0x201,
+            (false, false) => 0x202,
+            (true, true) => 0x204,
+            (true, false) => 0x205,
+        };
+        for (message, wparam, lparam) in [(0x200, held, at), (message, buttons, at)] {
             self.push(Event::Input {
                 message,
                 wparam,
                 lparam,
             });
         }
+    }
+    /// Presses or releases a virtual key for the overlay's keys: Enter, Esc,
+    /// Space, Tab and Ctrl.
+    pub fn overlay_key(&self, key: u32, down: bool) {
+        if self.paused.get() {
+            return;
+        }
+        let Some(scan) = crate::mobile::overlay_scan_code(key) else {
+            return;
+        };
+        if key == 0x11 {
+            self.control.set(down);
+        }
+        self.keys.borrow().set(key, down);
+        let (message, wparam, lparam) = input::message(key, scan, down, false, false);
+        self.push(Event::Input {
+            message,
+            wparam,
+            lparam,
+        });
+    }
+    /// Turns the wheel at the mouse position, for the overlay's wheel keys.
+    pub fn wheel(&self, notches: i32) {
+        if !self.paused.get() {
+            self.gesture(Gesture::Scroll(notches));
+        }
+    }
+    fn release_buttons(&self) {
+        for (flag, right) in [(1, false), (2, true)] {
+            if self.buttons.get() & flag != 0 {
+                self.mouse_button(right, false);
+            }
+        }
+    }
+    fn gesture(&self, gesture: Gesture) {
+        let (client, canvas, scaling) = (self.client.get(), self.canvas.get(), self.scaling.get());
+        match gesture {
+            Gesture::Keyboard => return self.notify(ViewEvent::Keyboard),
+            Gesture::Move(dx, dy) if self.mode.get() == TouchMode::Trackpad => {
+                let (sx, sy) = crate::mobile::magnification(client, canvas, scaling);
+                let (x, y) = self.cursor.get();
+                let limit = |v: f32, size: u32| v.clamp(0.0, size.saturating_sub(1) as f32);
+                self.cursor.set((
+                    limit(x + dx * TRACKPAD_GAIN / sx.max(f32::EPSILON), canvas.0),
+                    limit(y + dy * TRACKPAD_GAIN / sy.max(f32::EPSILON), canvas.1),
+                ));
+                self.show_cursor();
+            }
+            Gesture::Point(x, y) => {
+                let at = crate::mobile::position(client, canvas, scaling, x, y);
+                self.cursor.set(((at & 0xffff) as f32, (at >> 16) as f32));
+            }
+            _ => {}
+        }
+        let (buttons, message) =
+            crate::mobile::mouse(gesture, self.cursor_position(), self.buttons.get());
+        self.buttons.set(buttons);
+        if let Some((message, wparam, lparam)) = message {
+            self.push(Event::Input {
+                message,
+                wparam,
+                lparam,
+            });
+        }
+    }
+    /// The mouse position as a packed client lParam.
+    fn cursor_position(&self) -> u32 {
+        let (x, y) = self.cursor.get();
+        (x as u32 & 0xffff) | (y as u32) << 16
+    }
+    /// Shows the trackpad cursor at the mouse position, or hides it.
+    fn show_cursor(&self) {
+        let point = (self.mode.get() == TouchMode::Trackpad).then(|| {
+            let (x, y) = self.cursor.get();
+            crate::mobile::client_point(
+                self.client.get(),
+                self.canvas.get(),
+                self.scaling.get(),
+                x,
+                y,
+            )
+        });
+        #[cfg(target_os = "ios")]
+        if let Some(host) = self.host.borrow().as_ref() {
+            host.set_cursor(point);
+        }
+        #[cfg(target_os = "android")]
+        self.notify(ViewEvent::Cursor(point));
     }
     pub fn key(&self, key_code: i32, mut down: bool) {
         if self.paused.get() {
@@ -235,7 +468,8 @@ impl GameView {
     }
     pub(crate) fn pause(&self, paused: bool) {
         self.paused.set(paused);
-        *self.touch.borrow_mut() = input::Touch::default();
+        self.gestures.borrow_mut().set_mode(self.mode.get());
+        self.buttons.set(0);
         self.events.borrow_mut().retain(|event| {
             !matches!(
                 event,
@@ -324,7 +558,16 @@ impl GameView {
         })
     }
     pub(crate) fn native_canvas(&self, canvas: (u32, u32)) -> Result<bool, String> {
-        Ok(canvas.0 != 0 && canvas.1 != 0 && self.canvas.replace(canvas) != canvas)
+        let changed = canvas.0 != 0 && canvas.1 != 0 && self.canvas.replace(canvas) != canvas;
+        if changed {
+            let (x, y) = self.cursor.get();
+            let limit = |v: f32, size: u32| v.min(size.saturating_sub(1) as f32);
+            self.cursor.set((limit(x, canvas.0), limit(y, canvas.1)));
+            self.show_cursor();
+            #[cfg(target_os = "android")]
+            self.report_layout();
+        }
+        Ok(changed)
     }
     pub(crate) fn presentation(
         &self,
@@ -334,6 +577,7 @@ impl GameView {
         self.error.borrow_mut().take().map_or(Ok(()), Err)
     }
     pub(crate) fn take_events(&self) -> Vec<Event> {
+        self.poll_gestures();
         self.events.borrow_mut().drain(..).collect()
     }
     pub(crate) fn watch(&self, wake: WakeEvent) {

@@ -5,14 +5,15 @@
 //! scales the layer, so no display-resolution pass runs (HOST-VIEW-9).
 use super::GameView;
 pub use crate::mobile::TouchAction;
-pub(crate) use crate::mobile::{Touch, key_message as message, position};
+use crate::mobile::{Insets, Layout, Occlusion, Rect};
+pub(crate) use crate::mobile::{key_message as message, position};
 use crate::overlay::{Router, Target};
 use objc2::Message;
-use objc2::rc::Retained;
-use objc2::runtime::NSObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::rc::{Allocated, Retained};
+use objc2::runtime::{AnyObject, NSObject};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSObjectProtocol, NSSet};
+use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 use objc2_ui_kit::UIViewAutoresizing;
 use objc2_ui_kit::{
@@ -31,6 +32,10 @@ pub struct Ivars {
     /// policy tracks; UIKit reuses one `UITouch` for a finger's lifetime.
     touches: RefCell<Vec<(usize, i32)>>,
     next_pointer: Cell<i32>,
+    /// The trackpad cursor, above the frame.
+    cursor: Retained<UIView>,
+    /// The layout last reported to the game's host.
+    reported: RefCell<Option<Layout>>,
 }
 
 define_class!(
@@ -94,27 +99,38 @@ impl HostView {
     pub(crate) fn new(game: Weak<GameView>) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
         let frame = CAMetalLayer::new();
+        let cursor = cursor_view();
         let this = Self::alloc(mtm).set_ivars(Ivars {
             game,
             frame: frame.clone(),
             placement: Cell::new(None),
             touches: RefCell::new(Vec::new()),
             next_pointer: Cell::new(0),
+            cursor: cursor.clone(),
+            reported: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setMultipleTouchEnabled(true);
         this.setOpaque(true);
         this.setBackgroundColor(Some(&UIColor::blackColor()));
         this.layer().addSublayer(&frame);
+        this.addSubview(&cursor);
         Ok(this)
     }
     /// The frame sublayer the presenter draws into.
     pub(crate) fn metal_layer(&self) -> *mut std::ffi::c_void {
         Retained::as_ptr(&self.ivars().frame).cast_mut().cast()
     }
-    /// Positions the frame layer; None fills the view.
+    /// Positions the frame layer; None fills the view. Each presented frame
+    /// repeats its placement, which then changes nothing.
     pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
-        self.ivars().placement.set(placement);
+        if self.ivars().placement.replace(placement) != placement {
+            self.apply_placement();
+            self.report_layout();
+        }
+    }
+    fn apply_placement(&self) {
+        let placement = self.ivars().placement.get();
         let scale = self.contentScaleFactor();
         let bounds = self.bounds().size;
         let (rectangle, nearest) = match placement {
@@ -146,11 +162,54 @@ impl HostView {
         self.setContentScaleFactor(scale);
         self.layer().setContentsScale(scale);
         self.ivars().frame.setContentsScale(scale);
-        self.place(self.ivars().placement.get());
+        self.apply_placement();
         let size = self.bounds().size;
         let pixels = |points: f64| (points * scale).round().max(0.0) as u32;
         if let Some(game) = self.ivars().game.upgrade() {
             game.resized(pixels(size.width), pixels(size.height));
+            game.set_touch_scale(scale as f32);
+        }
+        self.report_layout();
+    }
+    /// Places the cursor's tip at a point in view pixels, or hides it.
+    pub(crate) fn set_cursor(&self, point: Option<(f32, f32)>) {
+        let cursor = &self.ivars().cursor;
+        cursor.setHidden(point.is_none());
+        if let Some((x, y)) = point {
+            let scale = self.contentScaleFactor();
+            let size = cursor.frame().size;
+            // The arrow's tip sits inset in the symbol's box.
+            let origin = CGPoint::new(f64::from(x) / scale - 4.0, f64::from(y) / scale - 2.0);
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            cursor.setFrame(CGRect::new(origin, size));
+            CATransaction::commit();
+        }
+    }
+    /// Tells the game's host where the frame and the screen's obstructions
+    /// are, in the container's points, when that changed.
+    fn report_layout(&self) {
+        let (Some(game), Some(container)) = (self.ivars().game.upgrade(), self.superview()) else {
+            return;
+        };
+        let scale = self.contentScaleFactor();
+        let origin = self.frame().origin;
+        let [x, y, width, height] = game.frame_rectangle();
+        let bounds = container.bounds().size;
+        let layout = Layout {
+            width: bounds.width,
+            height: bounds.height,
+            game: Rect {
+                x: origin.x + x / scale,
+                y: origin.y + y / scale,
+                width: width / scale,
+                height: height / scale,
+            },
+            occlusion: occlusion(&container),
+        };
+        if self.ivars().reported.borrow().as_ref() != Some(&layout) {
+            *self.ivars().reported.borrow_mut() = Some(layout.clone());
+            game.notify(super::ViewEvent::Layout(layout));
         }
     }
     fn touches(&self, touches: &NSSet<UITouch>) {
@@ -207,6 +266,77 @@ impl HostView {
             }
         }
         handled
+    }
+}
+
+/// The trackpad cursor: the system arrow symbol in white with a dark edge.
+fn cursor_view() -> Retained<UIView> {
+    // SAFETY: UIKit class messages on the main thread with valid arguments.
+    unsafe {
+        let name = NSString::from_str("cursorarrow");
+        let image: *mut AnyObject = msg_send![class!(UIImage), systemImageNamed: &*name];
+        let view: Allocated<UIView> = msg_send![class!(UIImageView), alloc];
+        let view: Retained<UIView> = msg_send![view, initWithImage: image];
+        view.setTintColor(Some(&UIColor::whiteColor()));
+        view.setUserInteractionEnabled(false);
+        view.setHidden(true);
+        let layer = view.layer();
+        let black: *mut AnyObject = msg_send![&*UIColor::blackColor(), CGColor];
+        let _: () = msg_send![&*layer, setShadowColor: black];
+        let _: () = msg_send![&*layer, setShadowOpacity: 1.0f32];
+        let _: () = msg_send![&*layer, setShadowRadius: 1.0f64];
+        let _: () = msg_send![&*layer, setShadowOffset: CGSize::new(0.0, 0.0)];
+        view
+    }
+}
+
+/// The screen's obstructions in `view`'s points (AND-APP-16). iOS exposes
+/// no housing geometry, so an iPhone's comes from its safe area; the screen
+/// reports its corner radius.
+fn occlusion(view: &UIView) -> Occlusion {
+    let insets = view.safeAreaInsets();
+    let Some(window) = view.window() else {
+        return Occlusion::default();
+    };
+    let screen = window.screen();
+    // SAFETY: UIKit messages on the main thread; the coordinate space and
+    // the screen outlive these calls.
+    unsafe {
+        let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
+        let idiom: isize = msg_send![device, userInterfaceIdiom];
+        let fixed: *mut AnyObject = msg_send![&*screen, fixedCoordinateSpace];
+        let portrait: CGRect = msg_send![fixed, bounds];
+        let depth = insets.top.max(insets.left).max(insets.right);
+        let cutouts = (idiom == 0)
+            .then(|| crate::mobile::iphone_housing(portrait.size.width, depth))
+            .flatten()
+            .map(|housing| {
+                let housing = CGRect::new(
+                    CGPoint::new(housing.x, housing.y),
+                    CGSize::new(housing.width, housing.height),
+                );
+                let r: CGRect = msg_send![view, convertRect: housing, fromCoordinateSpace: fixed];
+                Rect {
+                    x: r.origin.x,
+                    y: r.origin.y,
+                    width: r.size.width,
+                    height: r.size.height,
+                }
+            });
+        let responds: bool = msg_send![&*screen, respondsToSelector: sel!(_displayCornerRadius)];
+        let corner_radius: f64 = if responds {
+            msg_send![&*screen, _displayCornerRadius]
+        } else {
+            0.0
+        };
+        Occlusion {
+            cutouts: cutouts.into_iter().collect(),
+            corner_radius,
+            gestures: Insets {
+                bottom: insets.bottom,
+                ..Insets::default()
+            },
+        }
     }
 }
 
@@ -280,6 +410,16 @@ define_class!(
     pub struct GameContainer;
     unsafe impl NSObjectProtocol for GameContainer {}
     impl GameContainer {
+        #[unsafe(method(layoutSubviews))]
+        fn layout_subviews(&self) {
+            unsafe { let _: () = msg_send![super(self), layoutSubviews]; }
+            self.place_game();
+        }
+        #[unsafe(method(safeAreaInsetsDidChange))]
+        fn safe_area_insets_did_change(&self) {
+            unsafe { let _: () = msg_send![super(self), safeAreaInsetsDidChange]; }
+            self.setNeedsLayout();
+        }
         #[unsafe(method_id(hitTest:withEvent:))]
         fn hit_test(&self, point: CGPoint, event: Option<&UIEvent>) -> Option<Retained<UIView>> {
             let hit: Option<Retained<UIView>> =
@@ -337,12 +477,24 @@ impl GameContainer {
         let Some(host) = game.and_then(|game| game.host.borrow().clone()) else {
             return;
         };
-        host.setFrame(self.bounds());
-        host.setAutoresizingMask(
-            UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleHeight,
-        );
         self.insertSubview_belowSubview(&host, &self.ivars().webview);
         host.becomeFirstResponder();
         *self.ivars().game.borrow_mut() = Some(host);
+        self.place_game();
+    }
+
+    /// The game view takes the largest centred area no cutout reaches.
+    fn place_game(&self) {
+        if let Some(game) = self.ivars().game.borrow().as_ref() {
+            let size = self.bounds().size;
+            let area = occlusion(self).content(size.width, size.height);
+            let frame = CGRect::new(
+                CGPoint::new(area.x, area.y),
+                CGSize::new(area.width, area.height),
+            );
+            if game.frame() != frame {
+                game.setFrame(frame);
+            }
+        }
     }
 }

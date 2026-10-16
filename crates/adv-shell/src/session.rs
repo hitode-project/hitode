@@ -294,6 +294,22 @@ impl Session {
     pub fn fps(&self) -> f64 {
         self.driver.ui.borrow().as_ref().map_or(0.0, |ui| ui.fps())
     }
+    /// Whether the game has shown its first frame.
+    pub fn presented(&self) -> bool {
+        self.driver
+            .ui
+            .borrow()
+            .as_ref()
+            .is_some_and(|ui| ui.presented())
+    }
+    /// Milliseconds between the presents of the last second, oldest first.
+    pub fn frame_intervals(&self) -> Vec<f32> {
+        self.driver
+            .ui
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |ui| ui.frame_intervals())
+    }
     pub fn set_volume(&self, percent: u8) {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
     }

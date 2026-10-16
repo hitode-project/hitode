@@ -61,6 +61,9 @@ pub struct Ui {
     paused: bool,
     #[cfg(host_view)]
     frame_times: std::collections::VecDeque<Instant>,
+    /// Whether the game has shown a frame yet; until then it is loading.
+    #[cfg(host_view)]
+    presented: bool,
     #[cfg(host_view)]
     next: Instant,
     #[cfg(host_view)]
@@ -123,6 +126,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             paused: false,
             #[cfg(host_view)]
             frame_times: std::collections::VecDeque::new(),
+            #[cfg(host_view)]
+            presented: false,
             #[cfg(host_view)]
             next: Instant::now(),
             #[cfg(host_view)]
@@ -214,6 +219,25 @@ impl Ui {
             .iter()
             .filter(|at| at.elapsed() < Duration::from_secs(1))
             .count() as f64
+    }
+
+    #[cfg(host_view)]
+    pub(crate) fn presented(&self) -> bool {
+        self.presented
+    }
+
+    /// Milliseconds between the presents of the last second, oldest first.
+    #[cfg(host_view)]
+    pub(crate) fn frame_intervals(&self) -> Vec<f32> {
+        let recent: Vec<_> = self
+            .frame_times
+            .iter()
+            .filter(|at| at.elapsed() < Duration::from_secs(1))
+            .collect();
+        recent
+            .windows(2)
+            .map(|pair| pair[1].duration_since(*pair[0]).as_secs_f32() * 1000.0)
+            .collect()
     }
 
     #[cfg(host_view)]
@@ -419,6 +443,7 @@ impl Ui {
                         self.frame_times.pop_front();
                     }
                     self.frame_times.push_back(now);
+                    self.presented = true;
                     self.metric(Delivery::Present(
                         completed.rendered.serial,
                         completed.elapsed,
@@ -441,15 +466,22 @@ impl Ui {
     }
     #[cfg(host_view)]
     pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {
-        let Some(native) = &self.native else {
-            return Ok(None);
+        let refresh = match &self.native {
+            Some(native) => refresh_deadline(
+                self.next,
+                native.in_flight(),
+                native.has_update() || self.repaint,
+                window.native_client_size()?,
+            ),
+            None => None,
         };
-        Ok(refresh_deadline(
-            self.next,
-            native.in_flight(),
-            native.has_update() || self.repaint,
-            window.native_client_size()?,
-        ))
+        // Touch gestures time long presses and click holds (AND-APP-14).
+        #[cfg(mobile)]
+        let refresh = match (refresh, window.input_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Ok(refresh)
     }
     #[cfg(host_view)]
     pub(crate) fn menu_snapshot(&self) -> &MenuBar {
