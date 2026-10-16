@@ -419,6 +419,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(inherited) $(BUILT_PRODUCTS_DIR)";
 				OTHER_LDFLAGS = "$(inherited) -ladv_jit_helper -liconv -lresolv";
+				DEVELOPMENT_TEAM = "$(APPLE_DEVELOPMENT_TEAM)";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher.JitHelper;
 				PRODUCT_NAME = HitodeJIT;
 				SDKROOT = iphoneos;
@@ -622,6 +623,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(inherited) $(BUILT_PRODUCTS_DIR)";
 				OTHER_LDFLAGS = "$(inherited) -ladv_jit_helper -liconv -lresolv";
+				DEVELOPMENT_TEAM = "$(APPLE_DEVELOPMENT_TEAM)";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher.JitHelper;
 				PRODUCT_NAME = HitodeJIT;
 				SDKROOT = iphoneos;
