@@ -31,7 +31,7 @@ pub struct CodeCache {
     exec: NonNull<u8>,
     len: usize,
     used: usize,
-    _lease: CodeLease,
+    _storage: Storage,
     /// Writes not yet synchronized, as offset and length.
     dirty: Vec<(usize, usize)>,
 }
@@ -42,24 +42,34 @@ impl CodeCache {
             return Err(format!("bad code cache length {len:#x}"));
         }
         let pool = prepared_pool()?;
-        let lease = pool
-            .ranges
-            .lease(len)
-            .ok_or("prepared A64 code pool exhausted")?;
-        let offset = lease.range().start;
-        // SAFETY: this disjoint lease stays inside the process-lifetime pool.
-        let (write, exec) = unsafe {
-            (
-                NonNull::new_unchecked(pool.mapping.write.as_ptr().add(offset)),
-                NonNull::new_unchecked(pool.mapping.exec.as_ptr().add(offset)),
-            )
+        let (write, exec, storage) = match lease(&pool.ranges, len, strict_pool()) {
+            Some(lease) => {
+                let offset = lease.range().start;
+                // SAFETY: this disjoint lease stays inside the process-lifetime pool.
+                unsafe {
+                    (
+                        NonNull::new_unchecked(pool.mapping.write.as_ptr().add(offset)),
+                        NonNull::new_unchecked(pool.mapping.exec.as_ptr().add(offset)),
+                        Storage::Lease(lease),
+                    )
+                }
+            }
+            None if !strict_pool() => {
+                let mapping = backend::Mapping::new(len)?;
+                (mapping.write, mapping.exec, Storage::Own(mapping))
+            }
+            None => return Err("prepared A64 code pool exhausted".into()),
+        };
+        let len = match &storage {
+            Storage::Lease(lease) => lease.range().len(),
+            Storage::Own(_) => len,
         };
         Ok(Self {
             write,
             exec,
             len,
             used: 0,
-            _lease: lease,
+            _storage: storage,
             dirty: Vec::new(),
         })
     }
@@ -148,6 +158,34 @@ impl CodeCache {
     }
 }
 
+/// Owned by one cache; an own mapping unmaps when the cache drops.
+enum Storage {
+    Lease(#[allow(dead_code)] CodeLease),
+    Own(#[allow(dead_code)] backend::Mapping),
+}
+
+/// Strict hosts halve the request down to `MIN_LEASE` before giving up:
+/// a smaller cache only resets more often, while Tier 0 is far slower.
+const MIN_LEASE: usize = 16 << 20;
+fn lease(pool: &CodePool, len: usize, strict: bool) -> Option<CodeLease> {
+    let mut want = len;
+    loop {
+        if let Some(lease) = pool.lease(want) {
+            return Some(lease);
+        }
+        if !strict || want <= MIN_LEASE || !(want / 2).is_multiple_of(pool.alignment()) {
+            return None;
+        }
+        want /= 2;
+    }
+}
+
+/// Only iOS cannot map executable memory after preparation. Other hosts map
+/// an exhausted pool's overflow separately, as before the pool existed.
+fn strict_pool() -> bool {
+    cfg!(target_os = "ios") || cfg!(test) && std::env::var_os("ADV_POOL_EXHAUSTION_CHILD").is_some()
+}
+
 /// Call before creating guest machines (and before a future iOS JIT detach).
 /// The pool is fixed after this first preparation; mapping failure is retained.
 pub fn prepare_code_pool() -> Result<(), String> {
@@ -225,6 +263,17 @@ mod tests {
         assert_eq!(second, first + 8);
         cache.truncate(8);
         assert_eq!(cache.next(), second);
+    }
+
+    // spec: A64-CTL-13
+    #[test]
+    fn strict_pools_shrink_leases_before_giving_up() {
+        let pool = CodePool::new(64 << 20, page_size().unwrap()).unwrap();
+        let _held = pool.lease(40 << 20).unwrap();
+        assert!(lease(&pool, 64 << 20, false).is_none());
+        let small = lease(&pool, 64 << 20, true).unwrap();
+        assert_eq!(small.range().len(), MIN_LEASE);
+        assert!(lease(&pool, 64 << 20, true).is_none());
     }
 
     // spec: A64-CTL-1, A64-CTL-13, A64-ISA-3

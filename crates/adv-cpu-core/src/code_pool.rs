@@ -46,6 +46,12 @@ impl CodePool {
     }
 }
 
+impl CodePool {
+    pub fn alignment(&self) -> usize {
+        self.alignment
+    }
+}
+
 impl CodeLease {
     pub fn range(&self) -> Range<usize> {
         self.range.clone()
