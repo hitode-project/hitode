@@ -189,6 +189,51 @@ impl Harness {
     }
 }
 
+// spec: A64-TR-5, A64-VER-2
+#[test]
+fn resident_pixel_loops_cross_emulated_four_kib_pages_without_reordering_accesses() {
+    let code = bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+        a.paddusb(xmm0, xmm1).unwrap();
+        a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let data: Vec<u8> = (0..0x4000usize).map(|n| (n * 71 + n / 7) as u8).collect();
+    let mut state = initial();
+    state.regs[1] = 4;
+    state.regs[6] = DATA + 4090;
+    state.regs[7] = DATA + 8188;
+    state.xmm[1] = std::array::from_fn(|n| (n * 13) as u8);
+    let mut expected = state.clone();
+    let mut mem = memory(&code, &data);
+    let mut interpreter = Interpreter::new();
+    while expected.eip != CODE + code.len() as u32 {
+        assert_eq!(
+            interpreter.step(&mut expected, &mut mem),
+            adv_cpu_core::interpreter::Step::Executed
+        );
+    }
+    for flagm in [false, true] {
+        let mut h = Harness::new();
+        let (actual, exit, left) = h.run(&code, &data, &state, flagm);
+        assert_eq!(actual.regs, expected.regs);
+        assert_eq!(actual.eflags, expected.eflags);
+        assert_eq!(actual.xmm, expected.xmm);
+        assert_eq!(actual.eip, expected.eip);
+        assert_eq!(exit, Exit::Dispatch);
+        assert_eq!(left, 72);
+        assert_eq!(
+            h.emu.read(WINDOW_BASE + u64::from(DATA), data.len()),
+            mem.read(DATA, data.len()).unwrap()
+        );
+    }
+}
+
 // spec: A64-FLAG-2
 #[test]
 fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
