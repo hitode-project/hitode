@@ -154,3 +154,100 @@ fn committed_text_reaches_the_focus_as_ime_characters_then_def_window_proc_chara
     );
     f.cleanup();
 }
+
+#[test]
+// spec: PERS-INPUT-1
+fn wheel_uses_focus_over_capture_and_default_processing_returns_the_parent_result() {
+    use crate::user32::window::{Rect, WS_CHILD, WS_POPUP, WS_VISIBLE, Window};
+    use adv_machine::{Outcome, Resume};
+    let mut f = Fixture::new("wheel-routing");
+    let (top, focus, captured, child) = (0x10020, 0x10024, 0x10028, 0x1002c);
+    let desktop = f.m.ext.get::<Win32>().user.desktop;
+    let class =
+        f.m.ext
+            .get::<Win32>()
+            .user
+            .windows
+            .get(&f.m.sys.objects, &desktop)
+            .unwrap()
+            .class;
+    for (hwnd, parent, rect) in [
+        (top, 0, Rect::new(100, 50, 640, 480)),
+        (focus, top, Rect::new(20, 30, 100, 100)),
+        (captured, top, Rect::new(40, 50, 100, 100)),
+        (child, focus, Rect::new(0, 0, 20, 20)),
+    ] {
+        let window = Window::new(
+            hwnd,
+            class,
+            0x400100 + hwnd,
+            WS_VISIBLE | if parent == 0 { WS_POPUP } else { WS_CHILD },
+            0,
+            parent,
+            rect,
+            0,
+        );
+        assert!(
+            f.m.ext
+                .get_mut::<Win32>()
+                .user
+                .windows
+                .insert(&mut f.m.sys.objects, hwnd, window)
+        );
+    }
+    let user = &mut f.m.ext.get_mut::<Win32>().user;
+    user.top = vec![top];
+    user.queue(0).focus = focus;
+    user.queue(0).capture = captured;
+    let wp = ((-120i32 as u32) << 16) | 8;
+    let position = make_long(160, 130);
+    for message in [0x20a, 0x20e] {
+        assert!(post(&mut env(&mut f.m), message, wp, make_long(60, 80)));
+        let event =
+            f.m.ext
+                .get_mut::<Win32>()
+                .user
+                .queue(0)
+                .posted
+                .pop_front()
+                .unwrap();
+        assert_eq!(
+            (event.hwnd, event.msg, event.wparam, event.lparam),
+            (focus, message, wp, position)
+        );
+    }
+    for api in ["DefWindowProcA", "DefWindowProcW"] {
+        let Outcome::Call {
+            target,
+            args,
+            then: child_return,
+            ..
+        } = f.invoke("user32.dll", api, &[child, 0x20a, wp, position])
+        else {
+            panic!("wheel must synchronously call the parent");
+        };
+        assert_eq!(target, 0x400100 + focus);
+        assert_eq!(args, [focus, 0x20a, wp, position]);
+        let Outcome::Call {
+            target,
+            args,
+            then: focus_return,
+            ..
+        } = f.invoke("user32.dll", api, &args)
+        else {
+            panic!("unhandled wheel must continue up the parent chain");
+        };
+        assert_eq!(target, 0x400100 + top);
+        assert_eq!(args, [top, 0x20a, wp, position]);
+        assert_eq!(f.call("user32.dll", api, &args), 0);
+        assert!(matches!(
+            focus_return(&mut env(&mut f.m), Resume::Returned(73)),
+            Outcome::Return(73)
+        ));
+        assert!(matches!(
+            child_return(&mut env(&mut f.m), Resume::Returned(73)),
+            Outcome::Return(73)
+        ));
+    }
+    f.cleanup();
+}

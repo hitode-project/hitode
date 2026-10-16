@@ -25,7 +25,7 @@ pub fn mouse_mapping(message: u32, buttons: u32, swapped: bool) -> (u32, u32) {
 }
 
 /// Post input to the foremost visible window's thread. Keyboard messages use
-/// its valid focus window; mouse messages use its valid capture window.
+/// its valid focus window, as do wheel messages; other mouse messages use capture.
 pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
     post_at(env, message, wparam, lparam, std::time::Instant::now())
 }
@@ -196,7 +196,7 @@ fn target(user: &User, objects: &adv_machine::Objects, message: u32) -> Option<(
     })?;
     let thread = user.windows.get(objects, &top).unwrap().thread;
     let queue = user.queues.get(&thread);
-    let candidate = if (0x100..=0x109).contains(&message) {
+    let candidate = if (0x100..=0x109).contains(&message) || matches!(message, 0x20a | 0x20e) {
         queue.map(|q| q.focus)
     } else if (0x200..=0x20e).contains(&message) {
         queue.map(|q| q.capture)

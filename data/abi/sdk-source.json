@@ -211,8 +211,10 @@
   "legacy_directinput": {
     "source": "Microsoft Windows SDK 10.0.26100.0 um/dinput.h",
     "header_sha256": "ff440b043bb853835e6bd3e641ee3bfd11b63fc08af7a935bab2983f2a52070a",
-    "scope": "DirectInputCreateA/W, complete IDirectInputA/W and IDirectInputDeviceA/W declarations only",
-    "target": "x86 WINAPI/STDMETHODCALLTYPE stdcall; HRESULT signed 32 bits, ULONG/DWORD and pointers each one 32-bit word; legacy factories have eight slots and legacy devices eighteen slots",
+    "scope": "DirectInputCreateA/W, complete IDirectInputA/W, IDirectInputDeviceA/W and IDirectInputDevice2A/W declarations only",
+    "target": "x86 WINAPI/STDMETHODCALLTYPE stdcall; HRESULT signed 32 bits, ULONG/DWORD and pointers each one 32-bit word; legacy factories have eight slots and base devices eighteen slots and Device2 twenty-seven slots",
+    "device2_source": "https://raw.githubusercontent.com/microsoft/win32metadata/main/generation/WinSDK/RecompiledIdlHeaders/um/dinput.h",
+    "device2_header_sha256": "d532789ae49c3bdecefa7c8a00a7561a6161453cfebace0805da73ff0c6cf3b8",
     "layouts": "SDK DIDATAFORMAT is six 32-bit fields; DIOBJECTDATAFORMAT four; legacy DIMOUSESTATE is three LONG axes and four BYTE buttons",
     "limitations": "Keyboard and mouse use the runtime's shared input provider; unsupported formats and properties fail explicitly. No host controller or native input device is opened."
   },

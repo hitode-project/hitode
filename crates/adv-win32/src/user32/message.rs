@@ -2377,6 +2377,16 @@ pub(super) fn def_window_proc_encoded(
             }
             0
         }
+        wm::MOUSEWHEEL => {
+            let parent = user(env)
+                .windows
+                .get(&env.sys.objects, &hwnd)
+                .map_or(0, |window| window.parent);
+            if parent != 0 {
+                return send(env, parent, msg, wp, lp, then);
+            }
+            0
+        }
         wm::MOUSEACTIVATE => 1,
         wm::ACTIVATE if wp & 0xffff != 0 => {
             return window::set_focus(env, hwnd, move |env, _| then(env, 0));

@@ -376,7 +376,7 @@ fn sdk_legacy_slots_execute_through_both_guest_vtables_and_preserve_stack() {
                     } else {
                         "IDirectInputDeviceA"
                     },
-                    18,
+                    27,
                 ),
             ] {
                 assert_eq!(
@@ -388,9 +388,14 @@ fn sdk_legacy_slots_execute_through_both_guest_vtables_and_preserve_stack() {
                 );
                 for slot in 0..slots {
                     let entry = m.cpu.read_u32(table + slot * 4).unwrap();
+                    let interface = if slot >= 18 {
+                        interface.replace("Device", "Device2")
+                    } else {
+                        interface.to_owned()
+                    };
                     assert!(m.sys.thunks.iter().any(
                         |(index, thunk)| adv_machine::layout::thunk_addr(index) == entry
-                            && thunk.name.starts_with(interface)
+                            && thunk.name.starts_with(&interface)
                     ));
                 }
             }
@@ -685,4 +690,78 @@ fn queued_key_transitions_survive_newer_live_state_and_immediate_notification() 
     );
     assert_eq!(get_state(&mut env(&mut m), background, 256, data + 3072), 0);
     assert_eq!(m.cpu.read_u8(data + 3072 + 30).unwrap(), 0);
+}
+
+#[test]
+// spec: PERS-INPUT-2
+fn device2_guest_query_release_poll_and_wheel_reads_share_the_base_device() {
+    for jit in [false, true] {
+        for wide in [false, true] {
+            let (mut m, data) = fixture(jit);
+            let before = m.sys.objects.object_count();
+            let (_, device) = make_device(&mut m, data, MOUSE, wide);
+            let fmt = mouse_format(&mut m, data);
+            configure(&mut m, device, fmt);
+            assert_eq!(poll(&mut env(&mut m), device), NOT_ACQUIRED);
+            assert_eq!(acquire(&mut env(&mut m), device), 0);
+            m.ext.get_mut::<Win32>().user.top.clear();
+            assert_eq!(poll(&mut env(&mut m), device), INPUT_LOST);
+            assert_eq!(poll(&mut env(&mut m), device), NOT_ACQUIRED);
+            m.ext.get_mut::<Win32>().user.top.push(HWND);
+            assert_eq!(acquire(&mut env(&mut m), device), 0);
+            post_input(&mut env(&mut m), 0x20a, (-120i32 as u32) << 16, 0);
+            m.cpu
+                .write(data + 32, &if wide { IID_DEVICE2_W } else { IID_DEVICE2_A })
+                .unwrap();
+            let code_address = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RX).unwrap();
+            let mut code = Asm::new(code_address);
+            code.bytes.extend([0x89, 0xe0]);
+            code.mov_mem_eax(data + 128);
+            method(&mut code, data + 4, 0, &[data + 32, data + 8], data + 100);
+            method(&mut code, data + 4, 2, &[], data + 104);
+            method(&mut code, data + 8, 25, &[], data + 108);
+            method(&mut code, data + 8, 9, &[16, data + 3072], data + 112);
+            method(&mut code, data + 8, 25, &[], data + 116);
+            method(&mut code, data + 8, 9, &[16, data + 3104], data + 120);
+            method(&mut code, data + 8, 2, &[], data + 124);
+            method(&mut code, data, 2, &[], data + 140);
+            code.bytes.extend([0x89, 0xe0]);
+            code.mov_mem_eax(data + 132);
+            code.bytes.extend([0x31, 0xc0]);
+            code.ret();
+            m.cpu.write(code_address, &code.bytes).unwrap();
+            if jit {
+                let mut region = Region::new(code_address, code.bytes.len());
+                region.reachable = true;
+                m.cpu.executor_mut().add_region(region).unwrap();
+            }
+            m.spawn("Device2 wheel guest", code_address, &[], 65536)
+                .unwrap();
+            let result = m.run_virtual(1_000_000);
+            assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+            for (offset, expected) in [
+                (100, 0),
+                (104, 1),
+                (108, 1),
+                (112, 0),
+                (116, 1),
+                (120, 0),
+                (124, 0),
+                (140, 0),
+            ] {
+                assert_eq!(
+                    m.cpu.read_u32(data + offset).unwrap(),
+                    expected,
+                    "slot result {offset}"
+                );
+            }
+            assert_eq!(m.cpu.read_u32(data + 3080).unwrap() as i32, -120);
+            assert_eq!(m.cpu.read_u32(data + 3112).unwrap(), 0);
+            assert_eq!(
+                m.cpu.read_u32(data + 128).unwrap(),
+                m.cpu.read_u32(data + 132).unwrap()
+            );
+            assert_eq!(m.sys.objects.object_count(), before + 1);
+        }
+    }
 }
