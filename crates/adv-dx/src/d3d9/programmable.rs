@@ -7,11 +7,13 @@ use adv_device::gpu::{
     VertexStream,
 };
 mod source;
+pub(super) mod warmup;
+pub(super) use warmup::warm;
 #[cfg(test)]
 mod tests;
 // Generational shader identities cover immutable declarations and sampler slots.
 // Only input registers and formats affect the assembled entry points.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ProgramKey {
     vertex: Option<Id>,
     pixel: Option<Id>,
@@ -21,6 +23,9 @@ struct ProgramKey {
 pub(super) struct ProgramCache {
     entries: std::collections::HashMap<ProgramKey, Program>,
     bytes: usize,
+    warming: std::collections::HashMap<ProgramKey, adv_device::gpu::compile::Compile<Program>>,
+    warming_bytes: usize,
+    pub counters: adv_device::gpu::compile::CompileCounters,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(set_clip_plane_ABI);
@@ -144,6 +149,9 @@ fn inputs(env: &Env<'_>, pointer: u32, vs: &Shader) -> Result<Vec<Input>, u32> {
         v.push([255, 0, 0, 0, 17, 0, 0, 0]);
         v
     };
+    declaration_inputs(&elements, vs)
+}
+fn declaration_inputs(elements: &[[u8; 8]], vs: &Shader) -> Result<Vec<Input>, u32> {
     let mut result = Vec::new();
     for e in elements.iter().take_while(|e| e[0] != 255) {
         if e[5] != 0 {
@@ -622,16 +630,25 @@ fn prepare_checked(
     let program = if let Some(program) = cache.entries.get(&key) {
         program.clone()
     } else {
-        let source = source::build(
-            vs.as_ref().map(|s| s.parsed.as_ref()),
-            ps.as_ref().map(|s| s.parsed.as_ref()),
-            vt,
-            pt,
-            &input_spec,
-            &slots,
-        )?;
-        let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
-        program.constants = usage;
+        let prepared = cache
+            .warming
+            .remove(&key)
+            .and_then(|job| job.wait().as_ref().ok().cloned());
+        let program = if let Some(program) = prepared {
+            program
+        } else {
+            let source = source::build(
+                vs.as_ref().map(|s| s.parsed.as_ref()),
+                ps.as_ref().map(|s| s.parsed.as_ref()),
+                vt,
+                pt,
+                &input_spec,
+                &slots,
+            )?;
+            let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
+            program.constants = usage;
+            program
+        };
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if program.source().len() <= MAX_BYTES {
             if cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {

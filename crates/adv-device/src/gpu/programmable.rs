@@ -3,7 +3,7 @@
 use super::{Image, Sampler};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AttributeFormat {
     Float1,
     Float2,
@@ -95,7 +95,7 @@ impl AttributeFormat {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Attribute {
     pub location: u32,
     pub offset: u32,
@@ -128,6 +128,7 @@ pub struct Program {
     pub(super) writes_depth: bool,
     /// Complete validated WGSL with vertex_main and fragment_main entry points.
     pub(super) source: Arc<str>,
+    pub(super) compiled: Option<(u64, wgpu::ShaderModule)>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
     pub textures: Vec<bool>,
     /// External register usage; hand-authored programs default to complete blocks.
@@ -164,6 +165,7 @@ impl Program {
             writes_depth,
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source,
+            compiled: None,
             textures,
             constants: [crate::constants::ConstantUsage::ALL; 2],
         }

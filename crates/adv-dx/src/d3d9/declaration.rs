@@ -206,6 +206,7 @@ pub(super) fn create(
     {
         return OUT_OF_MEMORY;
     }
+    super::programmable::warmup::declaration(env, this.addr(), &elements);
     let payload = Declaration {
         pointer: 0,
         device,

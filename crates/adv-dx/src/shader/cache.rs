@@ -227,4 +227,40 @@ mod tests {
         }
         std::fs::remove_dir(dir).unwrap();
     }
+    #[test]
+    // spec: GFX-CACHE-3
+    fn aggregate_wgsl_eviction_leaves_unrelated_files() {
+        let shader =
+            Shader::parse(&[0xffff0200, 0x02000001, 0x800f0800, 0xa0e40000, 0xffff]).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "adv-wgsl-evict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..2 {
+            std::fs::File::create(dir.join(format!("{n:064x}.wgsl-cache")))
+                .unwrap()
+                .set_len(MAX_CACHE_BYTES)
+                .unwrap();
+        }
+        let unrelated = dir.join("keep.bin");
+        std::fs::File::create(&unrelated)
+            .unwrap()
+            .set_len(MAX_CACHE_BYTES * 2)
+            .unwrap();
+        shader.translate_cached(&dir).unwrap();
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|v| v == "wgsl-cache"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(total <= MAX_CACHE_BYTES);
+        assert!(unrelated.is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -165,7 +165,7 @@ impl Default for ShaderCaps {
 pub fn set_shader_caps(ext: &mut Ext, caps: ShaderCaps) {
     ext.get_mut::<State>().shader_caps = caps;
 }
-/// Opt-in directory for derived WGSL. The frontend bounds and validates its
+/// Host-selected game directory for derived WGSL and pipeline recipes. The frontend bounds and validates its
 /// cache; no guest shader token stream is written here.
 pub fn set_shader_cache(ext: &mut Ext, directory: Option<std::path::PathBuf>) {
     let state = ext.get_mut::<State>();
@@ -199,8 +199,18 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
         live_interfaces: objects.alias_count(state.com.namespace()),
         pending_waits: state.pending.len(),
         pending_readbacks: state.transfers.len(),
-        gpu: state.gpu.as_ref().map(|g| g.stats()),
-        shaders: state.shader_stats,
+        gpu: state.gpu.as_ref().map(|g| {
+            let mut stats = g.stats();
+            let (waits, ns) = state.shader_translations.counters.snapshot();
+            let (program_waits, program_ns) = state.programs.counters.snapshot();
+            stats.compile_waits += waits + program_waits;
+            stats.compile_wait_ns += ns + program_ns;
+            stats
+        }),
+        shaders: ShaderStats {
+            untranslated: state.shader_translations.failures(),
+            ..state.shader_stats
+        },
         frames: state.frames,
     }
 }

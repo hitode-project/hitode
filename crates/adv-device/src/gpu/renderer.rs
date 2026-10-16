@@ -11,6 +11,8 @@ mod attachments;
 mod metal;
 mod pipeline_disk;
 mod program;
+mod recipes;
+mod warmup;
 pub use program::validate_program;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
@@ -77,6 +79,20 @@ pub struct NativeContext {
 }
 
 impl NativeContext {
+    /// Prepare exactly the same source used by demand compilation. The returned
+    /// module is immutable and usable only on this device, including forks.
+    pub fn prepare_program(&self, mut program: Program) -> Result<Program, Error> {
+        validate_program(&program)?;
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("translated shader"),
+                source: wgpu::ShaderSource::Wgsl(program.source.to_string().into()),
+            });
+        self.check()?;
+        program.compiled = Some((self.id, module));
+        Ok(program)
+    }
     pub fn check(&self) -> Result<(), Error> {
         match self.failure.get() {
             Some(error) => Err(Error::Device(error.clone())),
@@ -403,7 +419,7 @@ impl Readback {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 struct PipelineKey {
     topology: Topology,
     cull: Cull,
@@ -724,6 +740,13 @@ impl Gpu {
         stats.backend_switches = batch.backend_switches.load(Ordering::Relaxed);
         stats.ring_bytes = batch.ring_bytes.load(Ordering::Relaxed);
         stats.ring_busy = batch.ring_busy.load(Ordering::Relaxed);
+        let (waits, ns) = self.programmable.warm.counters.snapshot();
+        stats.compile_waits += waits;
+        stats.compile_wait_ns += ns;
+        stats.prebuild_hits = self.programmable.warm.hits;
+        stats.prebuild_misses = self.programmable.warm.misses;
+        stats.persisted_pipelines = self.programmable.warm.persisted();
+        stats.discarded_pipelines = self.programmable.warm.discarded();
         stats
     }
 
@@ -1065,36 +1088,22 @@ impl Gpu {
             self.stats.pipeline_cache_hits += 1;
             return Ok(pipeline.clone());
         }
-        let pipeline = self.context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("adv fixed pipeline"), layout: Some(&self.layout),
-            vertex: wgpu::VertexState { module: &self.shader, entry_point: Some("vertex_main"),
-                compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
-                })] },
-            primitive: wgpu::PrimitiveState {
-                topology: topology(key.topology),
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: match key.cull { Cull::None => None, Cull::Clockwise => Some(wgpu::Face::Back),
-                    Cull::CounterClockwise => Some(wgpu::Face::Front) },
-                ..Default::default()
-            },
-            depth_stencil: key.depth_format.map(|format| wgpu::DepthStencilState {
-                format: format.format(), depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
-                depth_compare: Some(key.depth.map_or(wgpu::CompareFunction::Always, compare)),
-                stencil: key.stencil.map(stencil_state).unwrap_or_default(), bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState { module: &self.shader, entry_point: Some("fragment_main"),
-                compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT, blend: key.color_blend.map(|color| wgpu::BlendState {
-                        color: blend(color), alpha: blend(key.alpha_blend.unwrap_or(color)) }),
-                    write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(key.color_write)),
-                })] }),
-            multiview_mask: None, cache: None,
-        });
-        self.check()?;
+        let pipeline = self
+            .programmable
+            .warm
+            .pipeline(
+                recipes::Recipe::Fixed(key),
+                &self.context,
+                &self.uniform,
+                &self.shader,
+                &self.layout,
+                self.programmable.disk.as_ref().map(|d| &d.cache),
+                None,
+            )?
+            .fixed()?;
+        if let Some(disk) = &mut self.programmable.disk {
+            disk.changed();
+        }
         // Submitted command buffers retain their own pipeline references. A
         // full cache can retire an entry immediately instead of waiting for a
         // capacity wake that could never occur. Hits leave FIFO order intact.
@@ -1989,3 +1998,43 @@ mod metal_interop;
 
 #[cfg(test)]
 mod pass_tests;
+
+fn build_fixed(
+    context: &NativeContext,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    driver: Option<&wgpu::PipelineCache>,
+    key: PipelineKey,
+) -> Result<wgpu::RenderPipeline, Error> {
+    let pipeline = context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("adv fixed pipeline"), layout: Some(layout),
+            vertex: wgpu::VertexState { module: shader, entry_point: Some("vertex_main"),
+                compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+                })] },
+            primitive: wgpu::PrimitiveState {
+                topology: topology(key.topology),
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: match key.cull { Cull::None => None, Cull::Clockwise => Some(wgpu::Face::Back),
+                    Cull::CounterClockwise => Some(wgpu::Face::Front) },
+                ..Default::default()
+            },
+            depth_stencil: key.depth_format.map(|format| wgpu::DepthStencilState {
+                format: format.format(), depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
+                depth_compare: Some(key.depth.map_or(wgpu::CompareFunction::Always, compare)),
+                stencil: key.stencil.map(stencil_state).unwrap_or_default(), bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some("fragment_main"),
+                compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT, blend: key.color_blend.map(|color| wgpu::BlendState {
+                        color: blend(color), alpha: blend(key.alpha_blend.unwrap_or(color)) }),
+                    write_mask: wgpu::ColorWrites::from_bits_truncate(u32::from(key.color_write)),
+                })] }),
+            multiview_mask: None, cache: driver,
+        });
+    context.check()?;
+    Ok(pipeline)
+}
