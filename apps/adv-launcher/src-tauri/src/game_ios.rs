@@ -16,9 +16,13 @@ use objc2::{
     rc::{Allocated, Retained},
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
+use objc2_avf_audio::{
+    AVAudioSession, AVAudioSessionCategoryPlayback, AVAudioSessionInterruptionNotification,
+    AVAudioSessionInterruptionType, AVAudioSessionInterruptionTypeKey,
+};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue};
 use objc2_ui_kit::{
-    UIApplication, UIApplicationDidBecomeActiveNotification,
+    UIApplication, UIApplicationDidBecomeActiveNotification, UIApplicationState,
     UIApplicationWillResignActiveNotification, UIView,
 };
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Mutex, time::Instant};
@@ -103,10 +107,37 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
             });
         }
+        // Audio interruptions are posted off the main thread.
+        if let Some(name) = unsafe { AVAudioSessionInterruptionNotification } {
+            let block = RcBlock::new(|notification: NonNull<NSNotification>| {
+                audio_interruption(unsafe { notification.as_ref() })
+            });
+            let queue = NSOperationQueue::mainQueue();
+            observers.push(unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    None,
+                    Some(&queue),
+                    &block,
+                )
+            });
+        }
         HOST.with_borrow_mut(|host| {
             host.container = Some(container);
             host.observers = observers;
         });
+        // Games sound like other media, whatever the silent switch says.
+        if let Some(playback) = unsafe { AVAudioSessionCategoryPlayback } {
+            let session = unsafe { AVAudioSession::sharedInstance() };
+            if let Err(error) = unsafe { session.setCategory_error(playback) } {
+                log::warn!("audio category: {}", error.localizedDescription());
+            }
+        }
+        // Activation notifications before this point were missed.
+        let mtm = MainThreadMarker::new().unwrap();
+        let active =
+            UIApplication::sharedApplication(mtm).applicationState() == UIApplicationState::Active;
+        lifecycle(active);
     })?;
     let handle = app.handle().clone();
     app.state::<OverlayState>().on_change(move |input, change| {
@@ -126,6 +157,9 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
 }
 
 fn lifecycle(active: bool) {
+    if active {
+        claim_audio();
+    }
     HOST.with_borrow_mut(|host| {
         host.lifecycle.set_resumed(active);
         if let Some(session) = &host.session {
@@ -133,6 +167,42 @@ fn lifecycle(active: bool) {
         }
         host.apply_pause();
     });
+}
+
+/// Activates the audio session; audio focus follows whether it is ours. Its
+/// activation also ends an interruption the system never reported ending,
+/// such as another app's playback.
+fn claim_audio() {
+    let session = unsafe { AVAudioSession::sharedInstance() };
+    let focused = match unsafe { session.setActive_error(true) } {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("audio session: {}", error.localizedDescription());
+            false
+        }
+    };
+    HOST.with_borrow_mut(|host| {
+        host.lifecycle.set_audio_focus(focused);
+        host.apply_pause();
+    });
+}
+
+fn audio_interruption(notification: &NSNotification) {
+    let began = notification
+        .userInfo()
+        .and_then(|info| unsafe { info.objectForKey(AVAudioSessionInterruptionTypeKey?) })
+        .is_some_and(|kind| {
+            let kind: usize = unsafe { msg_send![&*kind, unsignedIntegerValue] };
+            kind == AVAudioSessionInterruptionType::Began.0
+        });
+    if began {
+        HOST.with_borrow_mut(|host| {
+            host.lifecycle.set_audio_focus(false);
+            host.apply_pause();
+        });
+    } else {
+        claim_audio();
+    }
 }
 
 /// Keeps the screen awake and holds landscape while a game runs.
@@ -149,7 +219,7 @@ fn set_game_mode(active: bool) {
 
 /// Limits tao's root view controller to landscape, or to all orientations
 /// but upside down, and asks the scene to rotate now: iOS 16 and later only
-/// rotate when asked.
+/// rotate when asked. A game also hides the status bar and home indicator.
 fn hold_landscape(view: &UIView, landscape: bool) {
     // UIInterfaceOrientationMaskLandscape, or AllButUpsideDown.
     let mask: usize = if landscape { 24 } else { 26 };
@@ -166,6 +236,9 @@ fn hold_landscape(view: &UIView, landscape: bool) {
         };
         let _: () = msg_send![controller, setSupportedInterfaceOrientations: mask];
         let _: () = msg_send![controller, setNeedsUpdateOfSupportedInterfaceOrientations];
+        // tao's setters request the appearance updates themselves.
+        let _: () = msg_send![controller, setPrefersStatusBarHidden: landscape];
+        let _: () = msg_send![controller, setPrefersHomeIndicatorAutoHidden: landscape];
         let scene: *mut AnyObject = msg_send![window, windowScene];
         let Some(scene) = scene.as_ref() else {
             return;

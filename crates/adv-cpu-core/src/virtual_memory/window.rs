@@ -12,12 +12,13 @@
 //! that memory in its upper half. Both views then fit one 4 GiB reservation,
 //! which an iOS app without extended virtual addressing can make. Such an
 //! app has room for one, so the processes of a family share it and each
-//! maps its memory there while it runs (IOS-MEM-2).
+//! maps its memory there while it runs (IOS-MEM-2). An app reserves it
+//! before anything else can take that range and keeps it (IOS-MEM-3).
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 pub const GUARD: usize = 128 << 10;
 const SPAN: usize = 1 << 32;
@@ -35,7 +36,12 @@ pub struct GuestWindow {
     compact: bool,
     /// The memory whose views a compact window holds; 0 when none does.
     tenant: AtomicUsize,
+    /// Kept for the next family when the last memory drops (IOS-MEM-3).
+    preserved: bool,
 }
+
+/// The preserved window while no family holds it.
+static PRESERVED: Mutex<Option<Arc<GuestWindow>>> = Mutex::new(None);
 
 // SAFETY: the window only owns an address range; the views placed in it
 // belong to their memories, and the tenant is atomic.
@@ -72,10 +78,34 @@ impl GuestWindow {
             if let Some(window) = shared.upgrade() {
                 return Ok(window);
             }
-            let window = Arc::new(Self::with_layout(true)?);
+            let window = match Self::take_preserved() {
+                Some(window) => window,
+                None => Arc::new(Self::with_layout(true)?),
+            };
             *shared = Arc::downgrade(&window);
             Ok(window)
         })
+    }
+
+    /// Reserves a compact window for the life of the process (IOS-MEM-3).
+    /// On iOS, call it first thing at launch: WebKit's JavaScript heap then
+    /// reserves 2 GiB at the start of the only free range a window fits in.
+    pub fn preserve() -> Result<(), String> {
+        let mut slot = PRESERVED.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            let mut window = Self::with_layout(true)?;
+            window.preserved = true;
+            *slot = Some(Arc::new(window));
+        }
+        Ok(())
+    }
+
+    /// The preserved window, unless a family holds it.
+    fn take_preserved() -> Option<Arc<Self>> {
+        PRESERVED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// A new tenant identity for `holds` and `claim`.
@@ -140,6 +170,7 @@ impl GuestWindow {
             base: start + GUARD,
             compact: false,
             tenant: AtomicUsize::new(0),
+            preserved: false,
         })
     }
 
@@ -196,6 +227,7 @@ impl GuestWindow {
             base,
             compact: true,
             tenant: AtomicUsize::new(0),
+            preserved: false,
         })
     }
 
@@ -224,6 +256,16 @@ impl GuestWindow {
 
 impl Drop for GuestWindow {
     fn drop(&mut self) {
+        if self.preserved {
+            // The range stays reserved, already inaccessible again, for the
+            // next family.
+            let window = Self {
+                tenant: AtomicUsize::new(0),
+                ..*self
+            };
+            *PRESERVED.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(window));
+            return;
+        }
         // SAFETY: the window owns exactly this range; placed reservations
         // have already been handed back.
         unsafe { libc::munmap(self.start.as_ptr().cast(), self.len) };
@@ -338,6 +380,23 @@ mod tests {
         assert!(!unmapped(address, page));
         let again = Reservation::new_direct_in(&window, 2 * page, page).unwrap();
         assert_eq!(again.alias().unwrap().as_ptr() as usize, address);
+    }
+
+    // spec: IOS-MEM-3
+    #[test]
+    fn a_preserved_window_stays_reserved_for_the_next_family() {
+        GuestWindow::preserve().unwrap();
+        let window = GuestWindow::take_preserved().unwrap();
+        let base = window.base();
+        assert!(GuestWindow::take_preserved().is_none());
+        let page = crate::virtual_memory::os::page_size().unwrap();
+        unsafe { window.claim(GuestWindow::tenant()) };
+        drop(Reservation::new_direct_in(&window, 0, page).unwrap());
+        drop(window);
+        let again = GuestWindow::take_preserved().unwrap();
+        assert_eq!(again.base(), base);
+        assert_eq!(again.tenant.load(Ordering::Relaxed), 0);
+        assert!(!unmapped(base, page));
     }
 
     #[test]

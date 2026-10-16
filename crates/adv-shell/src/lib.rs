@@ -7,7 +7,9 @@ mod frontend;
 mod logging;
 pub mod mobile;
 #[cfg(target_os = "ios")]
-pub use adv_runtime::{prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
+pub use adv_runtime::{
+    prepare_code_pool_after_attach, prepare_code_pool_if_debugged, reserve_guest_window,
+};
 #[cfg(mobile)]
 pub use logging::init_system_log;
 #[cfg(any(host_view, all(windows, feature = "gpu")))]

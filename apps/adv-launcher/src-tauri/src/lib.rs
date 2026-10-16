@@ -60,7 +60,13 @@ pub fn run() {
     #[cfg(mobile)]
     adv_shell::init_system_log();
     #[cfg(target_os = "ios")]
-    game::prepare_jit();
+    {
+        // Before the webview, which would take the only range it fits.
+        if let Err(error) = adv_shell::reserve_guest_window() {
+            log::error!("guest window: {error}");
+        }
+        game::prepare_jit();
+    }
     let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_storage::init());
