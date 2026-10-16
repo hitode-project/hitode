@@ -13,6 +13,7 @@ libc = "0.2"
 log.workspace = true
 thiserror.workspace = true
 sha2 = "0.10"
+rustc-hash = "2.1"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [features]

@@ -6,7 +6,8 @@
 //! and unsupported forms restartable.
 //! Undefined arithmetic flags are preserved rather than borrowed from the host.
 //! GS, segment/control registers and far transfers remain outside the flat model.
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic as M, OpKind,
@@ -128,8 +129,8 @@ impl RepContinuation {
 
 /// Integer interpreter with a bounded cache shared by all entries in a memory.
 pub struct Interpreter {
-    cache: HashMap<u32, Cached>,
-    blocks: HashMap<u32, DecodedBlock>,
+    cache: FxHashMap<u32, Cached>,
+    blocks: FxHashMap<u32, DecodedBlock>,
     capacity: usize,
     decodes: u64,
     pub frame_retired: Option<u64>,
@@ -151,8 +152,8 @@ impl Interpreter {
     /// Zero disables caching. On saturation the cache is cleared as a batch.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            cache: HashMap::new(),
-            blocks: HashMap::new(),
+            cache: FxHashMap::default(),
+            blocks: FxHashMap::default(),
             capacity,
             decodes: 0,
             frame_retired: None,
