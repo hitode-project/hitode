@@ -308,6 +308,7 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
             })
         },
         completed: frame_completed,
+        unpaced: |env| adv_win32::user32::message::frame_cap::published(env, (1, 1)),
     }
 }
 

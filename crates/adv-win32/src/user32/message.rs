@@ -19,7 +19,7 @@ use adv_machine::{Env, Object, Outcome, Wait};
 use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
 use crate::{Win32, stdcall};
-pub(crate) mod frame_cap;
+pub mod frame_cap;
 pub(crate) mod sent;
 
 /// Internal procedure for built-in classes, whose encoding follows the window.

@@ -16,7 +16,7 @@ struct FrameCap {
 }
 
 /// A frame boundary published `damaged` of `total` pixels.
-pub(crate) fn published(env: &mut Env<'_>, (damaged, total): (u64, u64)) {
+pub fn published(env: &mut Env<'_>, (damaged, total): (u64, u64)) {
     // Small updates (loading icons, cursors) never pace the loop.
     if damaged.saturating_mul(4) < total {
         return;

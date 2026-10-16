@@ -85,6 +85,8 @@ pub struct SurfaceProvider {
     pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
     pub device_released: fn(&mut Env<'_>, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
+    /// A completed Present that did not wait for a refresh boundary.
+    pub unpaced: fn(&mut Env<'_>),
 }
 
 type Id = ComIdentity<Payload>;
@@ -1333,6 +1335,11 @@ fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
             return outcome;
         }
         let fast_forward = (provider.fast_forward)(env.ext);
+        // An unpaced Present (IMMEDIATE or occluded) is a whole frame for the
+        // software frame cap: frames above the display rate are never shown.
+        if deadline.is_none() && !fast_forward {
+            (provider.unpaced)(env);
+        }
         // S_PRESENT_OCCLUDED belongs to D3D9Ex. Base Present still succeeds;
         // visibility only suppresses the refresh deadline calculated below.
         return pacing::finish(env, deadline, 0, fast_forward);

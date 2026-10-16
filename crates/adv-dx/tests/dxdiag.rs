@@ -74,6 +74,7 @@ impl Fixture {
                     mode_changed: |_, _, _| panic!("DxDiag never changes display mode"),
                     device_released: |_, _| panic!("DxDiag never creates devices"),
                     completed: |_, _| None,
+                    unpaced: |_| {},
                 },
             )
             .unwrap();
