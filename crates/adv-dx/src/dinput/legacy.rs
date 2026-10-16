@@ -15,6 +15,12 @@ const IID_DEVICE_A: Iid = [
 const IID_DEVICE_W: Iid = [
     0x81, 0xe6, 0x44, 0x59, 0x2e, 0xc9, 0xcf, 0x11, 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0, 0,
 ];
+const IID_DEVICE2_A: Iid = [
+    0x82, 0xe6, 0x44, 0x59, 0x2e, 0xc9, 0xcf, 0x11, 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0, 0,
+];
+const IID_DEVICE2_W: Iid = [
+    0x83, 0xe6, 0x44, 0x59, 0x2e, 0xc9, 0xcf, 0x11, 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0, 0,
+];
 const KEYBOARD: Iid = [
     0x61, 0x2b, 0x1d, 0x6f, 0xa0, 0xd5, 0xcf, 0x11, 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0, 0,
 ];
@@ -126,13 +132,19 @@ fn initialize_legacy(env: &mut Env<'_>) -> bool {
             if slot >= slots {
                 return None;
             }
+            // Device2 inherits the base slots without changing their behavior.
+            let module = if slot < 18 {
+                interface.replace("IDirectInputDevice2", "IDirectInputDevice")
+            } else {
+                interface.to_owned()
+            };
             let entry = env
                 .sys
                 .thunks
                 .publish(
                     env.cpu,
                     "dinput.dll",
-                    &format!("{interface}::{}", signature.name),
+                    &format!("{module}::{}", signature.name),
                 )
                 .ok()?;
             env.cpu.write_u32(table + slot * 4, entry).ok()?;
@@ -143,8 +155,8 @@ fn initialize_legacy(env: &mut Env<'_>) -> bool {
         Some(Tables {
             input: [build("IDirectInputA", 8)?, build("IDirectInputW", 8)?],
             device: [
-                build("IDirectInputDeviceA", 18)?,
-                build("IDirectInputDeviceW", 18)?,
+                build("IDirectInputDevice2A", 27)?,
+                build("IDirectInputDevice2W", 27)?,
             ],
         })
     })();
@@ -210,6 +222,16 @@ fn new_object<T: 'static>(env: &mut Env<'_>, wide: bool, device: bool, value: T)
         free(env, second);
         release_owned::<T>(env, first);
         return None;
+    }
+    if device {
+        // Base and Device2 IIDs share the extended vtable and COM identity.
+        let extended = [IID_DEVICE2_A, IID_DEVICE2_W];
+        if !com.register_interface(&mut env.sys.objects, identity, extended[index], first)
+            || !com.register_interface(&mut env.sys.objects, identity, extended[1 - index], second)
+        {
+            release_owned::<T>(env, first);
+            return None;
+        }
     }
     com.enable_guest(env, identity);
     Some(first)
@@ -607,6 +629,31 @@ fn unacquire(env: &mut Env<'_>, this: u32) -> u32 {
     value.buffer.clear();
     value.overflow = false;
     u32::from(!old)
+}
+fn poll(env: &mut Env<'_>, this: u32) -> u32 {
+    let Some(value) = device(env, this) else {
+        return INVALID;
+    };
+    if !value.acquired {
+        return NOT_ACQUIRED;
+    }
+    let Some((hwnd, flags)) = value.cooperative else {
+        return INVALID;
+    };
+    if snapshot(env, hwnd).is_none_or(|input| flags & 4 != 0 && !input.foreground) {
+        device_mut(env, this).unwrap().acquired = false;
+        return INPUT_LOST;
+    }
+    // Keyboard and mouse input is already updated by the host event path.
+    1 // DI_NOEFFECT
+}
+#[win32(dinput, name="IDirectInputDevice2A::Poll", level=state)]
+fn poll_a(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    poll(env, this.addr())
+}
+#[win32(dinput, name="IDirectInputDevice2W::Poll", level=state)]
+fn poll_w(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    poll(env, this.addr())
 }
 fn get_state(env: &mut Env<'_>, this: u32, size: u32, out: u32) -> u32 {
     let Some(value) = device(env, this) else {
@@ -1047,6 +1094,8 @@ pub(super) fn register(registry: &mut Registry) {
     for api in [
         create_a_ABI,
         create_w_ABI,
+        poll_a_ABI,
+        poll_w_ABI,
         input_query_a_ABI,
         input_add_a_ABI,
         input_release_a_ABI,

@@ -235,11 +235,11 @@ fn cursor_clipping_frontend_messages_use_clipped_screen_and_target_client_coordi
     let mut env = env(&mut machine, 0);
     clip(&mut env, data + 32, Rect::new(120, 230, 30, 10));
     user_mut(&mut env).queue(0).capture = child;
-    for (message, point, screen, lp) in [
-        (0x200, (0, 0), (120, 230), (10, 10)),
-        (0x201, (300, 200), (149, 239), (39, 19)),
-        (0x20a, (300, 200), (149, 239), (149, 239)),
-        (0x20e, (0, 0), (120, 230), (120, 230)),
+    for (message, target, point, screen, lp) in [
+        (0x200, child, (0, 0), (120, 230), (10, 10)),
+        (0x201, child, (300, 200), (149, 239), (39, 19)),
+        (0x20a, top, (300, 200), (149, 239), (149, 239)),
+        (0x20e, top, (0, 0), (120, 230), (120, 230)),
     ] {
         assert!(post(&mut env, message, 0, make_long(point.0, point.1)));
         let state = user(&env);
@@ -247,7 +247,7 @@ fn cursor_clipping_frontend_messages_use_clipped_screen_and_target_client_coordi
         let msg = state.queues[&0].posted.back().unwrap();
         assert_eq!(
             (msg.hwnd, msg.msg, msg.lparam, msg.pt),
-            (child, message, make_long(lp.0, lp.1), screen)
+            (target, message, make_long(lp.0, lp.1), screen)
         );
     }
     user_mut(&mut env).queue(0).capture = 0;
