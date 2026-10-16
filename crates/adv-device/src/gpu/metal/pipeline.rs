@@ -1,7 +1,7 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 use wgpu::naga::{self, back::msl};
-type Pipeline = (
+pub(in super::super) type Pipeline = (
     Object<dyn MTLRenderPipelineState>,
     Object<dyn MTLDepthStencilState>,
 );
@@ -9,9 +9,33 @@ type Pipeline = (
 pub(super) struct Cache {
     pipelines: HashMap<u64, Pipeline>,
     order: VecDeque<u64>,
+    samplers: HashMap<Sampler, Object<dyn MTLSamplerState>>,
+}
+/// Prebuild and first draw share the same device and shader-function cache.
+#[derive(Clone)]
+pub(in super::super) struct Compiler(Arc<Mutex<Builder>>);
+struct Builder {
+    device: Object<dyn MTLDevice>,
     functions: HashMap<u64, (std::sync::Weak<str>, [Object<dyn MTLFunction>; 2])>,
     depth: HashMap<(Option<Compare>, bool, Option<Stencil>), Object<dyn MTLDepthStencilState>>,
-    samplers: HashMap<Sampler, Object<dyn MTLSamplerState>>,
+}
+impl Compiler {
+    pub(super) fn new(device: Object<dyn MTLDevice>) -> Self {
+        Self(Arc::new(Mutex::new(Builder {
+            device,
+            functions: HashMap::new(),
+            depth: HashMap::new(),
+        })))
+    }
+    pub(in super::super) fn build(
+        &self,
+        key: &program::Key,
+        program: &Program,
+    ) -> Result<Pipeline, Error> {
+        let mut builder = self.0.lock().unwrap();
+        let device = builder.device.clone();
+        builder.build(&device, key, program)
+    }
 }
 fn hash(value: &impl Hash) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -67,7 +91,7 @@ fn format(format: AttributeFormat) -> naga_types::VertexFormat {
         AttributeFormat::Float16x4 => F::Float16x4,
     }
 }
-impl Cache {
+impl Builder {
     fn functions(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
@@ -75,7 +99,8 @@ impl Cache {
         program: &Program,
     ) -> Result<[Object<dyn MTLFunction>; 2], Error> {
         let id = hash(&(
-            key.program,
+            &program.source,
+            &program.textures,
             &key.streams,
             key.raster.topology == Topology::Points,
         ));
@@ -225,19 +250,12 @@ impl Cache {
             .insert(id, (Arc::downgrade(&program.source), functions.clone()));
         Ok(functions)
     }
-    pub(super) fn get(
+    fn build(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         key: &program::Key,
         program: &Program,
-        target: &Target,
-        stats: &mut Stats,
     ) -> Result<Pipeline, Error> {
-        let id = hash(key);
-        if let Some(pipeline) = self.pipelines.get(&id) {
-            stats.pipeline_cache_hits += 1;
-            return Ok(pipeline.clone());
-        }
         let functions = self.functions(device, key, program)?;
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&functions[0]));
@@ -265,17 +283,25 @@ impl Cache {
             color.setDestinationAlphaBlendFactor(factor(alpha.destination));
             color.setAlphaBlendOperation(operation(alpha.operation));
         }
-        if let Some(depth) = &target.depth {
-            let format = unsafe {
-                depth
-                    .texture()
-                    .as_hal::<wgpu::hal::api::Metal>()
-                    .unwrap()
-                    .raw_handle()
-                    .pixelFormat()
+        if let Some(depth) = key.raster.depth_format {
+            let format = match depth {
+                DepthFormat::Float32 => MTLPixelFormat::Depth32Float,
+                DepthFormat::Unorm16 => MTLPixelFormat::Depth16Unorm,
+                DepthFormat::Depth24Stencil8 => {
+                    #[cfg(target_os = "macos")]
+                    if device.isDepth24Stencil8PixelFormatSupported() {
+                        MTLPixelFormat::Depth24Unorm_Stencil8
+                    } else {
+                        MTLPixelFormat::Depth32Float_Stencil8
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        MTLPixelFormat::Depth32Float_Stencil8
+                    }
+                }
             };
             descriptor.setDepthAttachmentPixelFormat(format);
-            if depth.format().has_stencil() {
+            if depth.has_stencil() {
                 descriptor.setStencilAttachmentPixelFormat(format);
             }
         }
@@ -316,6 +342,39 @@ impl Cache {
                 .map_err(error)?,
             depth,
         );
+        Ok(pipeline)
+    }
+}
+impl Cache {
+    pub(super) fn get(
+        &mut self,
+        gpu: &mut Gpu,
+        compiler: &Compiler,
+        key: &program::Key,
+        program: &Program,
+    ) -> Result<Pipeline, Error> {
+        let id = hash(key);
+        if let Some(pipeline) = self.pipelines.get(&id) {
+            gpu.stats.pipeline_cache_hits += 1;
+            return Ok(pipeline.clone());
+        }
+        gpu.programmable
+            .warm
+            .metal
+            .get_or_insert_with(|| compiler.clone());
+        let pipeline = gpu
+            .programmable
+            .warm
+            .pipeline(
+                recipes::Recipe::program(key, program),
+                &gpu.context,
+                &gpu.uniform,
+                &gpu.shader,
+                &gpu.layout,
+                None,
+                Some(program),
+            )?
+            .metal()?;
         if self.order.len() == MAX_PIPELINES {
             self.pipelines.remove(&self.order.pop_front().unwrap());
         }

@@ -4,7 +4,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::*;
 use std::sync::atomic::AtomicBool;
-mod pipeline;
+pub(super) mod pipeline;
 mod ring;
 use ring::{CAPACITY, MAX_DRAW, Ring};
 type Object<T> = Retained<ProtocolObject<T>>;
@@ -78,6 +78,7 @@ pub(super) struct State {
     owner: Arc<program::BatchStats>,
     last_metal: bool,
     pipelines: pipeline::Cache,
+    pub(super) compiler: pipeline::Compiler,
 }
 // All encoding and CPU ring writes are serialized by NativeContext::pending.
 unsafe impl Send for State {}
@@ -101,6 +102,7 @@ impl State {
         };
         let ring = Ring::new(&device)?;
         Ok(Self {
+            compiler: pipeline::Compiler::new(device.clone()),
             device,
             queue,
             ring,
@@ -166,6 +168,11 @@ impl State {
         key: &program::Key,
         initialization_target: &Target,
     ) -> Result<(), Error> {
+        if state.scissor.is_some_and(Rect::empty) {
+            self.pipelines
+                .get(gpu, &self.compiler, key, &draw.program)?;
+            return Ok(());
+        }
         let blocks = draw.constant_ranges();
         let same_owner = Arc::ptr_eq(&self.owner, &gpu.programmable.batch_stats);
         // Bootstrap depth before the first native batch so later depth upgrades
@@ -212,9 +219,9 @@ impl State {
                 return Err(error);
             }
         };
-        let pipeline =
-            self.pipelines
-                .get(&self.device, key, &draw.program, target, &mut gpu.stats)?;
+        let pipeline = self
+            .pipelines
+            .get(gpu, &self.compiler, key, &draw.program)?;
         // Admission is complete: Busy has not uploaded, encoded, or flushed work.
         if !same_owner {
             self.flush();

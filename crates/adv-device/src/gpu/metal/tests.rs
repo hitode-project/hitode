@@ -519,3 +519,74 @@ fn unsupported_shader_bindings_return_an_error_without_a_draw() {
     assert_eq!(gpu.stats().ring_bytes, 0);
     assert_eq!(read(&mut gpu, &target), [0, 0, 255, 255].repeat(4));
 }
+
+// spec: GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-10, GFX-METAL-1
+#[test]
+fn native_warm_restart_prebuilds_exact_pipelines_for_all_depth_formats() {
+    let directory = std::env::temp_dir().join(format!(
+        "adv-metal-warm-{}-{}",
+        std::process::id(),
+        NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let formats = [
+        None,
+        Some(DepthFormat::Float32),
+        Some(DepthFormat::Unorm16),
+        Some(DepthFormat::Depth24Stencil8),
+    ];
+    let mut expected = Vec::new();
+    let mut cold = gpu(true);
+    cold.set_pipeline_cache_directory(Some(&directory));
+    let mut command = draw();
+    command.pixel_constants.floats[0] = [0.13, 0.71, 0.29, 0.53];
+    for format in formats {
+        let target = cold
+            .target(4, 4, false)
+            .unwrap()
+            .with_depth(format.map(|f| cold.depth(4, 4, f).unwrap()))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = format.map(|_| Compare::Always);
+        state.depth_write = format.is_some();
+        cold.draw_programmable(&target, &command, &state).unwrap();
+        expected.push(read(&mut cold, &target));
+    }
+    cold.flush_pipeline_cache();
+    assert_eq!(cold.stats().persisted_pipelines, 4);
+    assert_eq!(cold.stats().prebuild_misses, 4);
+    assert!(cold.stats().compile_waits > 0);
+    drop(cold);
+    let mut hot = gpu(true);
+    hot.set_pipeline_cache_directory(Some(&directory));
+    hot.programmable.warm.drain();
+    command.program = Program::new(command.program.source.clone(), vec![]);
+    for (format, pixels) in formats.into_iter().zip(expected) {
+        let target = hot
+            .target(4, 4, false)
+            .unwrap()
+            .with_depth(format.map(|f| hot.depth(4, 4, f).unwrap()))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = format.map(|_| Compare::Always);
+        state.depth_write = format.is_some();
+        hot.set_clip(Some(Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        }));
+        hot.draw_programmable(&target, &command, &state).unwrap();
+        hot.set_clip(None);
+        hot.draw_programmable(&target, &command, &state).unwrap();
+        assert_eq!(read(&mut hot, &target), pixels);
+        command.program = Program::new(command.program.source.clone(), vec![]);
+        hot.draw_programmable(&target, &command, &state).unwrap();
+        assert_eq!(read(&mut hot, &target), pixels);
+    }
+    assert_eq!(hot.stats().metal_draws, 8);
+    assert_eq!(hot.stats().compile_waits, 0);
+    assert_eq!(hot.stats().prebuild_hits, 8);
+    assert_eq!(hot.stats().prebuild_misses, 0);
+    hot.set_pipeline_cache_directory(None);
+    std::fs::remove_dir_all(directory).unwrap();
+}

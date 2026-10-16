@@ -7,8 +7,17 @@ use recipes::{Recipe, Store};
 pub(super) enum Built {
     Fixed(wgpu::RenderPipeline),
     Program(program::Pipeline),
+    #[cfg(target_vendor = "apple")]
+    Metal(metal::pipeline::Pipeline),
 }
 impl Built {
+    #[cfg(target_vendor = "apple")]
+    pub fn metal(self) -> Result<metal::pipeline::Pipeline, Error> {
+        match self {
+            Self::Metal(p) => Ok(p),
+            _ => Err(invalid("wrong pipeline recipe")),
+        }
+    }
     pub fn fixed(self) -> Result<wgpu::RenderPipeline, Error> {
         match self {
             Self::Fixed(p) => Ok(p),
@@ -25,6 +34,8 @@ impl Built {
 #[derive(Default)]
 pub(super) struct Warmup {
     store: Option<Store>,
+    #[cfg(target_vendor = "apple")]
+    pub(super) metal: Option<metal::pipeline::Compiler>,
     jobs: HashMap<[u8; 32], Compile<Built>>,
     batch: Option<Compile<()>>,
     pub counters: CompileCounters,
@@ -42,6 +53,16 @@ impl Warmup {
         driver: Option<&wgpu::PipelineCache>,
     ) -> Self {
         let mut warm = Self::default();
+        #[cfg(target_vendor = "apple")]
+        {
+            warm.metal = context
+                .pending
+                .lock()
+                .unwrap()
+                .metal
+                .as_ref()
+                .map(|m| m.compiler.clone());
+        }
         let recipes = store.entries();
         let bytes = recipes.iter().map(|r| r.encoded().len()).sum();
         for recipe in recipes {
@@ -56,6 +77,8 @@ impl Warmup {
                     layout,
                     driver,
                     warm.counters.clone(),
+                    #[cfg(target_vendor = "apple")]
+                    warm.metal.clone(),
                     None,
                 ),
             );
@@ -78,7 +101,8 @@ impl Warmup {
         prepared: Option<&Program>,
     ) -> Result<Built, Error> {
         let key = recipe.key();
-        let task = if let Some(task) = self.jobs.remove(&key) {
+        // Different live program objects may request the same persisted recipe.
+        let task = if let Some(task) = self.jobs.get(&key).cloned() {
             self.hits += 1;
             task
         } else {
@@ -91,6 +115,8 @@ impl Warmup {
                 layout,
                 driver,
                 self.counters.clone(),
+                #[cfg(target_vendor = "apple")]
+                self.metal.clone(),
                 prepared.cloned(),
             )
         };
@@ -126,6 +152,7 @@ fn job(
     layout: &wgpu::PipelineLayout,
     driver: Option<&wgpu::PipelineCache>,
     counters: CompileCounters,
+    #[cfg(target_vendor = "apple")] metal: Option<metal::pipeline::Compiler>,
     prepared: Option<Program>,
 ) -> Compile<Built> {
     let (context, uniform, shader, layout, driver) = (
@@ -155,6 +182,13 @@ fn job(
                     streams,
                     raster,
                 };
+                #[cfg(target_vendor = "apple")]
+                if let Some(compiler) = metal {
+                    return compiler
+                        .build(&key, &program)
+                        .map(Built::Metal)
+                        .map_err(|e| e.to_string());
+                }
                 program::Pipeline::build(&context, &uniform, driver.as_ref(), &key, &program)
                     .map(Built::Program)
             }
@@ -194,6 +228,8 @@ mod tests {
             &gpu.layout,
             None,
             warm.counters.clone(),
+            #[cfg(target_vendor = "apple")]
+            None,
             None,
         );
         warm.jobs.insert(recipe.key(), task.clone());

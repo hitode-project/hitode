@@ -902,10 +902,6 @@ impl Gpu {
         if index_size > MAX_UPLOAD {
             return Err(invalid("index upload exceeds command limit"));
         }
-        if state.scissor.is_some_and(Rect::empty) {
-            self.program_pipeline(key, &draw.program)?;
-            return Ok(());
-        }
         #[cfg(target_vendor = "apple")]
         if let Some(mut metal) = pending.metal.take() {
             let result = metal.draw(
@@ -919,6 +915,10 @@ impl Gpu {
             );
             pending.metal = Some(metal);
             return result;
+        }
+        if state.scissor.is_some_and(Rect::empty) {
+            self.program_pipeline(key, &draw.program)?;
+            return Ok(());
         }
         let pipeline = self.program_pipeline(key, &draw.program)?;
         pending.select_target(target);
