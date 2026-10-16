@@ -1,6 +1,6 @@
 import { t } from "./i18n.svelte";
 import { untrack } from "svelte";
-import { inTauri, onHostEvent } from "./bridge";
+import { call, inTauri, onHostEvent } from "./bridge";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
@@ -118,6 +118,12 @@ class Runs {
     }
     await quiet(stopGame(), "stop_game");
     if (force) await quiet(stopGame(), "stop_game");
+  }
+
+  /** Mobile: the game stays after a stop request it declined. */
+  keep(gameId: string): void {
+    delete this.stopping[gameId];
+    void call("keep_game", {}, null).catch(() => {});
   }
 
   /** The summary of the game's last run: this session's, else the library's record. */

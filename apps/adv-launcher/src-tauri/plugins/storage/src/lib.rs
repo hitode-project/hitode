@@ -1,5 +1,6 @@
-//! Android storage access and transactional SAF imports, independent of the generated host project.
-#![cfg(target_os = "android")]
+//! Mobile storage access and transactional folder imports, independent of
+//! the generated host projects: SAF on Android, Files on iOS.
+#![cfg(any(target_os = "android", target_os = "ios"))]
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -9,6 +10,9 @@ use tauri::{
     ipc::Channel,
     plugin::{Builder, PluginHandle, TauriPlugin},
 };
+
+#[cfg(target_os = "ios")]
+tauri::ios_plugin_binding!(init_plugin_storage);
 
 type Reply<T> = Result<T, String>;
 
@@ -144,9 +148,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             cancel_copy
         ])
         .setup(|app, api| {
-            app.manage(Storage(
-                api.register_android_plugin("org.hitode.storage", "StoragePlugin")?,
-            ));
+            #[cfg(target_os = "android")]
+            let handle = api.register_android_plugin("org.hitode.storage", "StoragePlugin")?;
+            #[cfg(target_os = "ios")]
+            let handle = api.register_ios_plugin(init_plugin_storage)?;
+            app.manage(Storage(handle));
             Ok(())
         })
         .build()

@@ -82,7 +82,7 @@ pub struct Playback {
     muted: bool,
     toggle: bool,
     /// Android always pauses in the background (AND-APP-3).
-    #[cfg_attr(target_os = "android", allow(dead_code))]
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
     pub(crate) pause_in_background: bool,
     discs: Vec<std::path::PathBuf>,
     font_files: Vec<std::path::PathBuf>,

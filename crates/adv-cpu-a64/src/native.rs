@@ -230,7 +230,7 @@ fn features() -> Features {
             flagm: hwcap & HWCAP_FLAGM != 0,
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of_val(&value);

@@ -579,7 +579,7 @@ public static class AbiMetadata
         if (sdkSupplement != null)
         {
             var seen = new HashSet<string>(com.Skip(1).Select(row => string.Join('\t', row.Split('\t').Take(2))));
-            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXBuffer"] = 0, ["ID3DXMatrixStack"] = 0, ["IDirectInputA"] = 0, ["IDirectInputW"] = 0, ["IDirectInputDeviceA"] = 0, ["IDirectInputDeviceW"] = 0 };
+            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXBuffer"] = 0, ["ID3DXMatrixStack"] = 0, ["IDirectInputA"] = 0, ["IDirectInputW"] = 0, ["IDirectInputDeviceA"] = 0, ["IDirectInputDeviceW"] = 0, ["IDirectInputDevice2A"] = 0, ["IDirectInputDevice2W"] = 0 };
             foreach (var row in File.ReadLines(Path.Combine(Path.GetDirectoryName(sdkSupplement), "sdk-com-input.tsv"))
                 .Where(line => line.Length != 0 && !line.StartsWith('#')))
             {
@@ -607,7 +607,8 @@ public static class AbiMetadata
             if (counts["ID3DXMatrixStack"] != 18)
                 throw new InvalidDataException("Incomplete SDK ID3DXMatrixStack vtable declarations");
             if (counts["IDirectInputA"] != 8 || counts["IDirectInputW"] != 8
-                || counts["IDirectInputDeviceA"] != 18 || counts["IDirectInputDeviceW"] != 18)
+                || counts["IDirectInputDeviceA"] != 18 || counts["IDirectInputDeviceW"] != 18
+                || counts["IDirectInputDevice2A"] != 27 || counts["IDirectInputDevice2W"] != 27)
                 throw new InvalidDataException("Incomplete SDK legacy DirectInput vtable declarations");
         }
         File.WriteAllLines(Path.Combine(output, "com.tsv"), com, new UTF8Encoding(false));

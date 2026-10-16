@@ -159,7 +159,10 @@ pub struct Memory {
     /// The window `reservation` is placed in; declared after it so the
     /// reservation hands its range back first.
     #[cfg(unix)]
-    window: Option<crate::virtual_memory::GuestWindow>,
+    window: Option<Arc<crate::virtual_memory::GuestWindow>>,
+    /// This memory's identity among those sharing a compact window.
+    #[cfg(unix)]
+    tenant: usize,
 }
 
 impl Memory {
@@ -490,6 +493,8 @@ impl Memory {
             native_read_exceptions: 0,
             #[cfg(unix)]
             window: None,
+            #[cfg(unix)]
+            tenant: 0,
         })
     }
 
@@ -538,6 +543,8 @@ impl Memory {
             native_read_exceptions: 0,
             #[cfg(unix)]
             window: None,
+            #[cfg(unix)]
+            tenant: 0,
         })
     }
 
@@ -556,8 +563,27 @@ impl Memory {
         if !len.is_multiple_of(PAGE_SIZE) || len == 0 || u64::from(base) + len as u64 > 1 << 32 {
             return Err("invalid guest window".into());
         }
+        Self::window_in(
+            crate::virtual_memory::GuestWindow::shared()?,
+            base,
+            len,
+            host_size,
+        )
+    }
+
+    #[cfg(unix)]
+    fn window_in(
+        window: Arc<crate::virtual_memory::GuestWindow>,
+        base: u32,
+        len: usize,
+        host_size: usize,
+    ) -> Result<Self, String> {
         let mut memory = Self::reserve(base, PAGE_SIZE)?;
-        let window = crate::virtual_memory::GuestWindow::new()?;
+        memory.tenant = crate::virtual_memory::GuestWindow::tenant();
+        // SAFETY: the family selects this memory's process to build it, so
+        // no other process uses the window now; it maps its views back
+        // before it next touches its memory.
+        unsafe { window.claim(memory.tenant) };
         // The placement starts on a host page; `slack` guest pages below
         // `base` belong to it but never to the guest.
         let slack = base as usize % host_size;
@@ -585,6 +611,34 @@ impl Memory {
         Ok(memory)
     }
 
+    /// Maps this memory's views into a compact window that another memory
+    /// holds (IOS-MEM-2). Rust accesses through `range` and native or
+    /// interpreted execution call it first; others run only inside those.
+    #[inline]
+    pub fn attach(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(window) = &self.window
+            && !window.holds(self.tenant)
+        {
+            return self.reattach(window);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[cold]
+    fn reattach(&self, window: &crate::virtual_memory::GuestWindow) -> Result<(), String> {
+        // SAFETY: the family runs one process at a time; the holder's
+        // execution has returned and its pointers are not used across turns.
+        unsafe { window.claim(self.tenant) };
+        let result = self.reservation.as_ref().unwrap().reattach();
+        if result.is_err() {
+            // SAFETY: nothing uses a partly mapped window.
+            unsafe { window.claim(0) };
+        }
+        result
+    }
+
     /// Host address of guest address 0 for memory made by `window`.
     #[cfg(unix)]
     pub fn window_base(&self) -> Option<usize> {
@@ -606,6 +660,7 @@ impl Memory {
             .ok_or("mapping requires reserved address space")?;
         #[cfg(unix)]
         if self.window.is_some() {
+            self.attach()?;
             return reservation.commit_direct(
                 self.window_slack() + offset,
                 len,
@@ -622,6 +677,7 @@ impl Memory {
             .ok_or("unmapping requires reserved address space")?;
         #[cfg(unix)]
         if self.window.is_some() {
+            self.attach()?;
             return reservation.decommit_direct(self.window_slack() + offset, len);
         }
         reservation.decommit(offset, len)
@@ -634,6 +690,7 @@ impl Memory {
         #[cfg(unix)]
         if self.window.is_some() {
             use crate::virtual_memory::GuestPageProtection;
+            self.attach()?;
             let reservation = self.reservation.as_ref().unwrap();
             let committed =
                 |page: usize| self.mapped[page] && !self.shared_pages.contains_key(&page);
@@ -797,6 +854,7 @@ impl Memory {
     }
 
     pub fn range(&self, addr: u32, len: usize) -> Result<std::ops::Range<usize>, String> {
+        self.attach()?;
         let start = addr
             .checked_sub(self.base)
             .ok_or("address below memory window")? as usize;
@@ -1614,6 +1672,9 @@ impl Drop for Memory {
         // The Reservation release also retires any pin whose host unlock failed.
         // Heap-backed test windows can never acquire a pin.
         let _ = self.retire_page_locks(0..self.len / PAGE_SIZE);
+        // The reservation hands its range back to the window, which must
+        // then hold its views rather than another memory's.
+        let _ = self.attach();
         // Sections outlive their views; give them their bytes back.
         for file in std::mem::take(&mut self.resident).into_values() {
             file.evict();
@@ -2297,6 +2358,53 @@ mod file_page_tests {
 mod window_tests {
     use super::*;
     use crate::virtual_memory::GuestAccess::{Read, Write};
+
+    // spec: IOS-MEM-2
+    #[test]
+    fn memories_sharing_a_compact_window_take_turns_with_their_protection() {
+        let window = Arc::new(crate::virtual_memory::GuestWindow::with_layout(true).unwrap());
+        let host = crate::virtual_memory::host_page_size().unwrap();
+        let base = window.base();
+        let view = |address: usize| {
+            // SAFETY: tests read pages the current tenant left readable.
+            unsafe { std::slice::from_raw_parts((base + address) as *const u8, 5) }
+        };
+        let mut first = Memory::window_in(window.clone(), 0, 1 << 20, host).unwrap();
+        first.map(0x10000, 2 * host, 0).unwrap();
+        first.write(0x10000, b"first").unwrap();
+        first.protect(0x10000, host, 1).unwrap();
+        let mut second = Memory::window_in(window.clone(), 0, 1 << 20, host).unwrap();
+        second.map(0x10000, 2 * host, 3).unwrap();
+        second.write(0x10000 + host as u32, b"other").unwrap();
+        second.protect(0x10000, host, 0).unwrap();
+        for _ in 0..2 {
+            // Each access maps its own memory back, with the window view
+            // protected as that memory's guest pages are.
+            assert_eq!(first.read(0x10000, 5).unwrap(), b"first");
+            assert_eq!(view(0x10000), b"first");
+            assert_eq!(second.read(0x10000 + host as u32, 5).unwrap(), b"other");
+            assert_eq!(view(0x10000 + host), b"other");
+            let reservation = second.reservation.as_ref().unwrap();
+            let fault = reservation.direct_fault_view().unwrap();
+            assert!(!fault.window_allows(0x10000, 1, Read));
+        }
+        // A memory dropped while another holds the window leaves that one's
+        // views alone once the holder maps them back.
+        drop(first);
+        assert_eq!(second.read(0x10000 + host as u32, 5).unwrap(), b"other");
+        assert_eq!(view(0x10000 + host), b"other");
+        let third = Memory::window_in(window, 0, 1 << 20, host).unwrap();
+        drop(third);
+        assert_eq!(second.read(0x10000 + host as u32, 5).unwrap(), b"other");
+        assert!(
+            second
+                .reservation
+                .as_ref()
+                .unwrap()
+                .direct_fault_view()
+                .is_some()
+        );
+    }
 
     // spec: A64-MEM-2, A64-MEM-4
     #[test]

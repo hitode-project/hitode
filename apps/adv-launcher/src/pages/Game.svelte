@@ -13,6 +13,8 @@
   import { nav } from "../lib/nav.svelte";
   import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
+  import { screen, trackScreen } from "../lib/screen.svelte";
+  import TouchControls from "../components/TouchControls.svelte";
 
   /**
    * The in-game overlay. The native game view is under this transparent page;
@@ -56,11 +58,56 @@
     const value = { ...playback(gameId), scale };
     void call("set_game_playback", { playback: value }, null).catch((e) => filterError = String(e));
   });
+  let touchMode = $derived(prefs.touchMode);
+  $effect(() => {
+    if (!gameView || !phone) return;
+    void call("set_touch_mode", { mode: touchMode }, null).catch((e) => filterError = String(e));
+  });
+  /**
+   * Phone: until the game shows its first frame the overlay stays out of the
+   * way and a spinner stands over the black screen. A way out appears if
+   * loading drags on.
+   */
+  let presented = $state(false);
+  let slowLoad = $state(false);
+  $effect(() => {
+    if (!gameView || !phone || presented) return;
+    const timer = setInterval(() => {
+      void call<boolean>("game_presented", {}, true).then((v) => (presented = v));
+    }, 150);
+    const slow = setTimeout(() => (slowLoad = true), 10_000);
+    return () => {
+      clearInterval(timer);
+      clearTimeout(slow);
+    };
+  });
+  const loading = $derived(phone && gameView && !presented);
+
+  /** Milliseconds between the presents of the last second, for the phone HUD. */
+  let frames = $state<number[]>([]);
+  let hudMini = $state(false);
   $effect(() => {
     if (!gameView || !fps) return;
-    const timer = setInterval(() => { void call<number>("game_fps", {}, 0).then((v) => measuredFps = v); }, 500);
+    const hud = phone;
+    const timer = setInterval(() => {
+      if (hud) void call<number[]>("game_frames", {}, []).then((v) => (frames = v));
+      else void call<number>("game_fps", {}, 0).then((v) => (measuredFps = v));
+    }, hud ? 250 : 500);
     return () => clearInterval(timer);
   });
+  const frameStats = $derived.by(() => {
+    if (frames.length === 0) return { fps: 0, avg: 0, p99: 0 };
+    const avg = frames.reduce((a, b) => a + b, 0) / frames.length;
+    const sorted = [...frames].sort((a, b) => a - b);
+    const p99 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99))] ?? avg;
+    return { fps: 1000 / avg, avg, p99 };
+  });
+  /** The graph's top in milliseconds: two 60 Hz frames, or more when frames run long. */
+  const graphTop = $derived(Math.min(100, Math.max(33.4, ...frames.map((v) => v * 1.15))));
+  const graphY = (ms: number) => (30 - (Math.min(ms, graphTop) / graphTop) * 28).toFixed(1);
+  const sparkline = $derived(
+    frames.map((v, i) => `${((i * 148) / Math.max(1, frames.length - 1)).toFixed(1)},${graphY(v)}`).join(" "),
+  );
   function pickScale(value: Scale) {
     scale = value;
     const setup = loadGameSetup(gameId, game?.codepage ?? 932);
@@ -127,6 +174,9 @@
       void call("set_title_bar", { title }, null).catch(() => {});
     }
     const stopPause = onHostEvent("pause", () => togglePause(false));
+    // A three-finger tap on the game asks for the keyboard.
+    const stopKeyboard = onHostEvent("game_keyboard", () => openTextBar());
+    const stopScreen = trackScreen();
     const stopBack = nav.onBack(() => {
       togglePause(true);
       return true;
@@ -135,6 +185,8 @@
       void call("set_pause_available", { available: false }, null).catch(() => {});
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
+      stopKeyboard();
+      stopScreen();
       stopBack();
     };
   });
@@ -168,6 +220,19 @@
   function quit() {
     if (gameView) void runs.stop(gameId);
     else nav.home();
+  }
+
+  /**
+   * Phone: the library button asks the game to quit with no confirmation of
+   * our own. The controls step aside so the game's own prompt can be
+   * answered; only forcing the game asks first.
+   */
+  let forceAsk = $state(false);
+  function leave() {
+    view = "closed";
+    textBar = false;
+    forceAsk = false;
+    quit();
   }
 
   // The game is paused while the pause menu is open; once a quit is
@@ -205,8 +270,46 @@
     </div>
   {/if}
 
-  {#if fps}
+  {#if loading}
+    {@const g = screen.layout?.game}
+    <div class="loading fade" style={g ? `left: ${g.x}px; top: ${g.y}px; width: ${g.width}px; height: ${g.height}px` : "inset: 0"}>
+      <div class="spinner" role="progressbar" aria-label={t("加载中")}></div>
+      {#if slowLoad && !stopping}
+        <button class="quiet" onclick={leave} {@attach region}>{t("退出游戏")}</button>
+      {/if}
+    </div>
+  {:else if fps && phone && screen.layout}
+    {@const g = screen.layout.game}
+    <button class="hud mono fade" style="left: {g.x + 10}px; top: {g.y + 10}px" class:mini={hudMini}
+      aria-label={t("性能")} onclick={() => (hudMini = !hudMini)} {@attach region}>
+      {#if hudMini}
+        {frameStats.fps.toFixed(1)}
+      {:else}
+        <div class="hud-fps"><span>{frameStats.fps.toFixed(1)}</span><small>fps</small></div>
+        <svg width="148" height="30" viewBox="0 0 148 30" aria-hidden="true">
+          <line x1="0" y1={graphY(1000 / 60)} x2="148" y2={graphY(1000 / 60)} stroke="rgba(255,255,255,.18)" stroke-dasharray="2 3" />
+          <polyline points={sparkline} fill="none" stroke="#8fd3a6" stroke-width="1.3" stroke-linejoin="round" />
+        </svg>
+        <div class="hud-row"><span>{t("帧时间")}</span><span>{frames.length ? frameStats.avg.toFixed(1) : "–"} ms</span></div>
+        <div class="hud-row"><span>p99</span><span>{frames.length ? frameStats.p99.toFixed(1) : "–"} ms</span></div>
+      {/if}
+    </button>
+  {:else if fps}
     <div class="fps mono" {@attach shown}>{measuredFps.toFixed(0)} FPS</div>
+  {/if}
+
+  {#if phone && gameView && stopping}
+    <div class="quitting surface fade" role="status" {@attach region}>
+      {#if forceAsk}
+        <span>{t("强制结束游戏？")}</span>
+        <button class="quiet" onclick={() => (forceAsk = false)}>{t("取消")}</button>
+        <button class="danger-btn" onclick={() => void runs.stop(gameId, true)}>{t("强制结束")}</button>
+      {:else}
+        <span>{t("请在游戏内确认退出")}</span>
+        <button class="quiet" onclick={() => runs.keep(gameId)}>{t("返回游戏")}</button>
+        <button class="danger-btn" onclick={() => (forceAsk = true)}>{t("强制结束")}</button>
+      {/if}
+    </div>
   {/if}
 
   {#if view !== "closed"}
@@ -259,6 +362,12 @@
                   </div>
                 </div>
               </div>
+              {#if phone}
+                <div class="prow">
+                  <span>{t("触控板模式")}</span>
+                  <button class="sw" class:on={touchMode === "trackpad"} role="switch" aria-checked={touchMode === "trackpad"} aria-label={t("触控板模式")} onclick={() => { prefs.touchMode = touchMode === "trackpad" ? "direct" : "trackpad"; savePrefs(); }}></button>
+                </div>
+              {/if}
               <div class="prow">
                 <span>{t("帧率显示")}</span>
                 <button class="sw" class:on={fps} role="switch" aria-checked={fps} aria-label={t("帧率显示")} onclick={() => { prefs.showFps = !fps; savePrefs(); }}></button>
@@ -301,6 +410,12 @@
         </div>
       {/if}
     </div>
+  {:else if loading}
+    <!-- The controls wait for the game's first frame. -->
+  {:else if phone && screen.layout}
+    {#if !stopping}
+      <TouchControls layout={screen.layout} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+    {/if}
   {:else if phone}
     <button class="grip fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}><span></span></button>
   {:else if !titleBar}
@@ -877,6 +992,109 @@
     left: calc(10px + var(--safe-left));
     padding: 2px 7px;
     font-size: 11px;
+  }
+  .hud {
+    all: unset;
+    box-sizing: border-box;
+    position: absolute;
+    width: 168px;
+    padding: 9px 10px 10px;
+    border-radius: 8px;
+    background: rgba(8, 8, 10, 0.6);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #f0f0f0;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .hud.mini {
+    width: auto;
+    padding: 4px 9px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .hud svg {
+    display: block;
+    margin: 6px 0;
+  }
+  .hud-fps {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .hud-fps span {
+    font-size: 20px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .hud-fps small,
+  .hud-row span:first-child {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.62);
+  }
+  .hud-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    line-height: 17px;
+    font-variant-numeric: tabular-nums;
+  }
+  .loading {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    pointer-events: none;
+  }
+  .loading button {
+    pointer-events: auto;
+    height: 30px;
+    padding: 0 14px;
+    font-size: 12px;
+  }
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2.5px solid rgba(255, 255, 255, 0.16);
+    border-top-color: rgba(255, 255, 255, 0.8);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation-duration: 2.4s;
+    }
+  }
+  .quitting {
+    position: absolute;
+    top: max(12px, env(safe-area-inset-top));
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 4px 4px 12px;
+    border-radius: 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .quitting span {
+    margin-right: 4px;
+    color: var(--fg2);
+  }
+  .quitting button {
+    height: 28px;
+    padding: 0 12px;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
   }
   .grip {
     all: unset;

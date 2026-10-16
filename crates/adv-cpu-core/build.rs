@@ -3,12 +3,14 @@
 fn main() {
     if matches!(
         std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("linux" | "android" | "macos")
+        Ok("linux" | "android" | "macos" | "ios")
     ) && matches!(
         std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
         Ok("x86_64" | "aarch64")
-    ) && (std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
-        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64"))
+    ) && (!matches!(
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos" | "ios")
+    ) || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64"))
     {
         cc::Build::new()
             .file("src/fault_recovery/posix.c")

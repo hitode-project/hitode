@@ -139,6 +139,7 @@
     overflow: hidden;
   }
   .content {
+    view-transition-name: page;
     flex: 1 1 0;
     min-width: 0;
     display: flex;

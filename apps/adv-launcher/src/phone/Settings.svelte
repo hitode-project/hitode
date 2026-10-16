@@ -110,7 +110,7 @@
           <span class="t">{t("导入时自动搜索 VNDB")}</span>
           <SettingsSwitch touch label={t("导入时自动搜索 VNDB")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
         </div>
-        <p>{t("资料来源：VNDB；封面版权属于原权利人。")}</p>
+        <p class="credit">{t("资料来源：VNDB；封面版权属于原权利人。")}</p>
 
 
       <div class="row">
@@ -395,5 +395,11 @@
     .usage span {
       transition: none;
     }
+  }
+  .credit {
+    margin: 6px 0 4px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--fg3);
   }
 </style>

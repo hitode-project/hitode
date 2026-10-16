@@ -1,7 +1,7 @@
 //! UI presents the native game view. The execution worker owns the guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
-#[cfg(not(any(target_os = "macos", target_os = "android")))]
+#[cfg(not(host_view))]
 use adv_runtime::Snapshot;
 use adv_runtime::{DialogSet, FrameConsumer, FrameProducer, MenuBar, MenuKey};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
@@ -14,7 +14,7 @@ use std::{cell::RefCell, rc::Rc};
 /// Owner of the native menu and dialog projection the sinks are given to.
 #[cfg(target_os = "macos")]
 type SinkTarget = window::Projection;
-#[cfg(not(any(target_os = "macos", target_os = "android")))]
+#[cfg(not(host_view))]
 type SinkTarget = window::Window;
 
 enum Request {
@@ -23,33 +23,25 @@ enum Request {
 }
 enum Delivery {
     Input(window::Event),
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     AndroidInput(crate::window::android_epoch::Stamp, window::Event),
     Present(u64, Duration, Instant),
     Pump(Duration, Instant),
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "android",
-        all(windows, feature = "gpu")
-    ))]
+    #[cfg(any(host_view, all(windows, feature = "gpu")))]
     Native(performance::NativePresentation),
 }
 const INPUT_CAPACITY: usize = 4096;
 const METRIC_LIMIT: usize = 128;
 const RESERVED_INPUT: usize = INPUT_CAPACITY - METRIC_LIMIT;
 pub struct Worker {
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     input_epoch: Arc<window::android_epoch::Generation>,
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     keys: Arc<KeyState>,
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "android",
-        all(windows, feature = "gpu")
-    ))]
+    #[cfg(any(host_view, all(windows, feature = "gpu")))]
     pub(crate) gpu: Option<adv_device::gpu::Gpu>,
     /// The host frame clock's vsync grid, handed to guest refresh pacing.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) vsync: Option<Arc<adv_sync::vsync::Vsync>>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
@@ -63,30 +55,29 @@ pub struct Worker {
     metrics_dropped: Arc<AtomicU64>,
 }
 pub struct Ui {
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     input_epoch: Arc<window::android_epoch::Generation>,
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     paused: bool,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     frame_times: std::collections::VecDeque<Instant>,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    /// Whether the game has shown a frame yet; until then it is loading.
+    #[cfg(host_view)]
+    presented: bool,
+    #[cfg(host_view)]
     next: Instant,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) menu_changed: bool,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) dialog_changed: bool,
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     repaint: bool,
     events: Rc<RefCell<spsc::Producer<Delivery>>>,
     requests: spsc::Consumer<Request>,
     frames: Option<FrameConsumer>,
     menus: adv_sync::mailbox::Consumer<MenuBar>,
     dialogs: adv_sync::mailbox::Consumer<DialogSet>,
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "android",
-        all(windows, feature = "gpu")
-    ))]
+    #[cfg(any(host_view, all(windows, feature = "gpu")))]
     native: Option<crate::native_gpu::UiPresenter>,
     keys: Arc<KeyState>,
     execution_wake: WakeEvent,
@@ -105,21 +96,17 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
         adv_sync::mailbox::channel(std::array::from_fn(|_| DialogSet::default()));
     let stopped = Arc::new(AtomicBool::new(false));
     let metrics_dropped = Arc::new(AtomicU64::new(0));
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     let input_epoch = Arc::new(window::android_epoch::Generation::default());
     Ok((
         Worker {
-            #[cfg(target_os = "android")]
+            #[cfg(mobile)]
             input_epoch: input_epoch.clone(),
-            #[cfg(target_os = "android")]
+            #[cfg(mobile)]
             keys: keys.clone(),
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "android",
-                all(windows, feature = "gpu")
-            ))]
+            #[cfg(any(host_view, all(windows, feature = "gpu")))]
             gpu: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             vsync: None,
             incoming,
             requests: requests_tx,
@@ -133,30 +120,28 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             metrics_dropped: metrics_dropped.clone(),
         },
         Ui {
-            #[cfg(target_os = "android")]
+            #[cfg(mobile)]
             input_epoch,
-            #[cfg(target_os = "android")]
+            #[cfg(mobile)]
             paused: false,
-            #[cfg(any(target_os = "macos", target_os = "android"))]
+            #[cfg(host_view)]
             frame_times: std::collections::VecDeque::new(),
-            #[cfg(any(target_os = "macos", target_os = "android"))]
+            #[cfg(host_view)]
+            presented: false,
+            #[cfg(host_view)]
             next: Instant::now(),
-            #[cfg(any(target_os = "macos", target_os = "android"))]
+            #[cfg(host_view)]
             menu_changed: false,
-            #[cfg(any(target_os = "macos", target_os = "android"))]
+            #[cfg(host_view)]
             dialog_changed: false,
-            #[cfg(any(target_os = "macos", target_os = "android"))]
+            #[cfg(host_view)]
             repaint: false,
             events: Rc::new(RefCell::new(events)),
             requests: requests_rx,
             frames: Some(frames_rx),
             menus: menus_rx,
             dialogs: dialogs_rx,
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "android",
-                all(windows, feature = "gpu")
-            ))]
+            #[cfg(any(host_view, all(windows, feature = "gpu")))]
             native: None,
             keys,
             execution_wake: wake,
@@ -186,7 +171,7 @@ impl Worker {
     pub fn take_frames(&mut self) -> FrameProducer {
         self.frames.take().expect("frame producer installed once")
     }
-    #[cfg(any(not(target_os = "android"), test))]
+    #[cfg(any(not(mobile), test))]
     pub fn pump(&mut self, performance: &mut performance::Performance) -> Vec<window::Event> {
         std::iter::from_fn(|| self.next_input(performance)).collect()
     }
@@ -197,7 +182,7 @@ impl Worker {
         while let Some(delivery) = self.incoming.pop() {
             match delivery {
                 Delivery::Input(event) => return Some(event),
-                #[cfg(target_os = "android")]
+                #[cfg(mobile)]
                 Delivery::AndroidInput(stamp, event) => {
                     if self.input_epoch.current(stamp, &self.keys) {
                         return Some(event);
@@ -205,11 +190,7 @@ impl Worker {
                 }
                 Delivery::Present(serial, elapsed, at) => performance.present(serial, elapsed, at),
                 Delivery::Pump(elapsed, at) => performance.pump(elapsed, at),
-                #[cfg(any(
-                    target_os = "macos",
-                    target_os = "android",
-                    all(windows, feature = "gpu")
-                ))]
+                #[cfg(any(host_view, all(windows, feature = "gpu")))]
                 Delivery::Native(stats) => performance.native(stats),
             }
         }
@@ -232,7 +213,7 @@ impl Worker {
     }
 }
 impl Ui {
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn fps(&self) -> f64 {
         self.frame_times
             .iter()
@@ -240,7 +221,26 @@ impl Ui {
             .count() as f64
     }
 
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
+    pub(crate) fn presented(&self) -> bool {
+        self.presented
+    }
+
+    /// Milliseconds between the presents of the last second, oldest first.
+    #[cfg(host_view)]
+    pub(crate) fn frame_intervals(&self) -> Vec<f32> {
+        let recent: Vec<_> = self
+            .frame_times
+            .iter()
+            .filter(|at| at.elapsed() < Duration::from_secs(1))
+            .collect();
+        recent
+            .windows(2)
+            .map(|pair| pair[1].duration_since(*pair[0]).as_secs_f32() * 1000.0)
+            .collect()
+    }
+
+    #[cfg(host_view)]
     pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
         if let Some(native) = &mut self.native {
             native.set_scaling(value);
@@ -248,7 +248,7 @@ impl Ui {
         self.repaint = true;
         self.wake.signal();
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
         if let Some(native) = &mut self.native {
             native.set_upscaler(value);
@@ -256,11 +256,7 @@ impl Ui {
         self.repaint = true;
         self.wake.signal();
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "android",
-        all(windows, feature = "gpu")
-    ))]
+    #[cfg(any(host_view, all(windows, feature = "gpu")))]
     pub(crate) fn native(
         &mut self,
         presenter: crate::native_gpu::WindowPresenter,
@@ -275,7 +271,7 @@ impl Ui {
             self.wake.clone(),
         ));
     }
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     pub(crate) fn pause_input(&mut self, paused: bool) {
         if paused && !self.paused {
             self.input_epoch.invalidate();
@@ -298,7 +294,7 @@ impl Ui {
         Ok(())
     }
     fn deliver(&mut self, event: Delivery) -> Result<(), String> {
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         let event = match event {
             Delivery::Input(
                 event @ (window::Event::Input { .. }
@@ -344,10 +340,10 @@ impl Ui {
                 window::Event::Input {
                     message, wparam, ..
                 } => {
-                    #[cfg(target_os = "android")]
+                    #[cfg(mobile)]
                     let update =
                         !(*wparam == 0x11 && matches!(*message, 0x100 | 0x101 | 0x104 | 0x105));
-                    #[cfg(not(target_os = "android"))]
+                    #[cfg(not(mobile))]
                     let update = true;
                     if update {
                         update_keys(&self.keys, *message, *wparam);
@@ -358,12 +354,12 @@ impl Ui {
                     repaint = true;
                     continue;
                 }
-                #[cfg(any(target_os = "macos", target_os = "android"))]
+                #[cfg(host_view)]
                 window::Event::AudioSuspended(_)
                 | window::Event::Volume(_)
                 | window::Event::Paused(_)
                 | window::Event::Text(..) => {}
-                #[cfg(any(target_os = "macos", target_os = "android"))]
+                #[cfg(host_view)]
                 window::Event::ForceClose => {
                     self.stopped.store(true, Ordering::Release);
                     self.execution_wake.signal();
@@ -383,9 +379,9 @@ impl Ui {
         }
         Ok(repaint)
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn post_text(&mut self, text: &str) -> usize {
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         if self.paused {
             return 0;
         }
@@ -395,12 +391,12 @@ impl Ui {
         }
         result.recv().unwrap_or(0)
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn input(&mut self, event: window::Event) -> Result<(), String> {
         self.repaint |= self.pump_events(vec![event], Instant::now())?;
         Ok(())
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn tick(&mut self, window: &window::GameView) -> Result<Option<Instant>, String> {
         while let Some(request) = self.requests.pop() {
             match request {
@@ -427,9 +423,10 @@ impl Ui {
             if let Some(completed) = completed {
                 self.metric(Delivery::Native(completed.stats));
                 self.repaint |= window.native_canvas(completed.rendered.canvas)?;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let Some(placement) = completed.rendered.placement {
                     window.place(Some(placement));
+                    #[cfg(target_os = "macos")]
                     window.shared_frame(completed.rendered.shared.map(|(frame, _)| frame));
                 }
                 window.set_video_cursor_regions(completed.rendered.cursor_regions);
@@ -446,6 +443,7 @@ impl Ui {
                         self.frame_times.pop_front();
                     }
                     self.frame_times.push_back(now);
+                    self.presented = true;
                     self.metric(Delivery::Present(
                         completed.rendered.serial,
                         completed.elapsed,
@@ -466,27 +464,34 @@ impl Ui {
         }
         self.deadline(window)
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {
-        let Some(native) = &self.native else {
-            return Ok(None);
+        let refresh = match &self.native {
+            Some(native) => refresh_deadline(
+                self.next,
+                native.in_flight(),
+                native.has_update() || self.repaint,
+                window.native_client_size()?,
+            ),
+            None => None,
         };
-        Ok(refresh_deadline(
-            self.next,
-            native.in_flight(),
-            native.has_update() || self.repaint,
-            window.native_client_size()?,
-        ))
+        // Touch gestures time long presses and click holds (AND-APP-14).
+        #[cfg(mobile)]
+        let refresh = match (refresh, window.input_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Ok(refresh)
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn menu_snapshot(&self) -> &MenuBar {
         self.menus.current()
     }
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     pub(crate) fn dialog_snapshot(&self) -> &DialogSet {
         self.dialogs.current()
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(mobile))]
     pub(crate) fn install_sinks(&self, window: &mut SinkTarget) {
         // Menu modal dispatch still runs on this UI thread. Its callbacks can
         // enqueue events immediately without waiting for the outer paint loop.
@@ -511,7 +516,7 @@ impl Ui {
             Ok(())
         }));
     }
-    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    #[cfg(not(host_view))]
     pub fn run<T>(
         &mut self,
         window: &mut window::Window,
@@ -519,9 +524,9 @@ impl Ui {
     ) -> Result<T, String> {
         self.install_sinks(window);
         let mut next = window.next_refresh();
-        #[cfg(not(any(target_os = "macos", target_os = "android")))]
+        #[cfg(not(host_view))]
         let mut snapshot = Snapshot::default();
-        #[cfg(not(any(target_os = "macos", target_os = "android")))]
+        #[cfg(not(host_view))]
         let mut candidate = Snapshot::default();
         let mut repaint = false;
         loop {
@@ -549,11 +554,7 @@ impl Ui {
             let started = Instant::now();
             let events = window.pump();
             repaint |= self.pump_events(events, started)?;
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "android",
-                all(windows, feature = "gpu")
-            ))]
+            #[cfg(any(host_view, all(windows, feature = "gpu")))]
             if let Some(native) = &mut self.native {
                 let completed = native.poll()?;
                 if let Some(completed) = completed {
@@ -588,7 +589,7 @@ impl Ui {
                 window.wait_with_wake(delay, Some(&self.wake))?;
                 continue;
             }
-            #[cfg(not(any(target_os = "macos", target_os = "android")))]
+            #[cfg(not(host_view))]
             {
                 let frames = self.frames.as_mut().expect("software UI owns its consumer");
                 if Instant::now() >= next && (frames.has_update() || repaint) {
@@ -632,7 +633,7 @@ impl Ui {
         self.wake.clone()
     }
 }
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(host_view)]
 fn refresh_deadline(
     next: Instant,
     in_flight: bool,
@@ -641,7 +642,7 @@ fn refresh_deadline(
 ) -> Option<Instant> {
     (!in_flight && dirty && dimensions.0 != 0 && dimensions.1 != 0).then_some(next)
 }
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(mobile, test))]
 pub(crate) fn request_vsync(next: Option<Instant>, pending: bool) -> bool {
     !pending && next.is_some_and(|next| next <= Instant::now())
 }
@@ -670,7 +671,7 @@ pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
 mod tests {
     use super::*;
     // spec: HOST-SES-2, AND-APP-10
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     #[test]
     fn tick_deadline_is_only_armed_for_a_visible_pending_refresh() {
         let next = Instant::now() + Duration::from_millis(16);
@@ -743,7 +744,7 @@ mod tests {
     }
 
     // spec: HOST-SES-4
-    #[cfg(any(target_os = "macos", target_os = "android"))]
+    #[cfg(host_view)]
     #[test]
     fn post_text_uses_input_delivery_and_returns_the_guest_count() {
         let wake = WakeEvent::new().unwrap();
@@ -776,11 +777,7 @@ mod tests {
             Duration::from_millis(1),
             Instant::now(),
         ));
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "android",
-            all(windows, feature = "gpu")
-        ))]
+        #[cfg(any(host_view, all(windows, feature = "gpu")))]
         ui.metric(Delivery::Native(performance::NativePresentation {
             consumed: 2,
             uploads: 1,
@@ -791,16 +788,12 @@ mod tests {
         assert!(!wake.interrupt_flag().load(Ordering::Acquire));
         let mut performance = performance::Performance::default();
         assert!(worker.pump(&mut performance).is_empty());
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "android",
-            all(windows, feature = "gpu")
-        ))]
+        #[cfg(any(host_view, all(windows, feature = "gpu")))]
         {
             performance.reset(1);
             assert!(performance.json().contains("\"software_uploads\": 1"));
         }
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         keys.set(17, true);
         ui.pump_events(
             vec![window::Event::Input {

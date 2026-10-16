@@ -100,8 +100,9 @@ impl Executor {
     }
 
     fn space() -> Result<Memory, String> {
+        // A compact window holds the 2 GiB user space of 32-bit Windows.
         #[cfg(native)]
-        return Memory::window(0, 1usize << 32);
+        return Memory::window(0, adv_cpu_core::virtual_memory::GuestWindow::guest_span());
         #[cfg(not(native))]
         Memory::reserve(0, 1usize << 32)
     }
@@ -296,6 +297,8 @@ impl Executor {
         budget: u64,
         handler: Option<&mut dyn ExecutionTrap>,
     ) -> Result<RunOutcome, String> {
+        // Another process of the family may have used the shared window.
+        self.memory.attach()?;
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,

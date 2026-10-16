@@ -25,6 +25,10 @@ struct Host {
     lifecycle: adv_shell::mobile::Lifecycle,
     /// The game was asked to close; another request forces it.
     closing: bool,
+    touch_mode: adv_shell::mobile::TouchMode,
+    /// The surface's placement and the screen's occlusion, with the
+    /// view's pixels per point (AND-APP-16).
+    screen: Option<(adv_shell::mobile::Layout, f64)>,
 }
 
 /// The SurfaceView's window, with a reference of our own.
@@ -74,6 +78,30 @@ pub(crate) fn surface(window: Option<NonNull<ANativeWindow>>, width: u32, height
         host.attach();
         drop(previous);
     });
+}
+
+/// Places the game surface clear of the screen's cutouts and returns its
+/// area; `width`, `height` and `occlusion` are in points.
+pub(crate) fn screen(
+    width: f64,
+    height: f64,
+    occlusion: adv_shell::mobile::Occlusion,
+    scale: f64,
+) -> adv_shell::mobile::Rect {
+    let game = occlusion.content(width, height);
+    let layout = adv_shell::mobile::Layout {
+        width,
+        height,
+        game,
+        occlusion,
+    };
+    HOST.with_borrow_mut(|host| {
+        if let Some(view) = &host.view {
+            view.set_screen(layout.clone(), scale);
+        }
+        host.screen = Some((layout, scale));
+    });
+    game
 }
 
 pub(crate) fn touch(pointer: i32, action: i32, x: f32, y: f32) {
@@ -164,6 +192,14 @@ pub async fn start_game(
                 .ok_or("the game surface is not ready")?
                 .size;
             let view = GameView::new(size.0, size.1)?;
+            view.set_listener(crate::mobile_view::listener(
+                host_window.clone(),
+                android::set_cursor,
+            ));
+            view.set_touch_mode(host.touch_mode);
+            if let Some((screen, scale)) = &host.screen {
+                view.set_screen(screen.clone(), *scale);
+            }
             host.view = Some(view.clone());
             host.attach();
             let finished_window = host_window.clone();
@@ -222,6 +258,17 @@ pub async fn stop_game(window: WebviewWindow) -> Result<(), String> {
     .await
 }
 
+/// The game declined to quit, or the player changed their mind: the next
+/// stop asks again instead of forcing.
+#[tauri::command]
+pub async fn keep_game(window: WebviewWindow) -> Result<(), String> {
+    on_ui(&window, || {
+        HOST.with_borrow_mut(|host| host.closing = false);
+        Ok(())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn post_text(window: WebviewWindow, text: String) -> Result<usize, String> {
     on_ui(&window, move || {
@@ -268,6 +315,84 @@ pub async fn set_game_playback(window: WebviewWindow, playback: Playback) -> Res
 pub async fn game_fps(window: WebviewWindow) -> Result<f64, String> {
     on_ui(&window, || {
         Ok(with_session(|_, session| session.fps()).unwrap_or(0.0))
+    })
+    .await
+}
+
+/// Whether the game has shown its first frame; the overlay waits for it.
+#[tauri::command]
+pub async fn game_presented(window: WebviewWindow) -> Result<bool, String> {
+    on_ui(&window, || {
+        Ok(with_session(|_, session| session.presented()).unwrap_or(false))
+    })
+    .await
+}
+
+/// The performance overlay's frame graph: milliseconds between the presents
+/// of the last second.
+#[tauri::command]
+pub async fn game_frames(window: WebviewWindow) -> Result<Vec<f32>, String> {
+    on_ui(&window, || {
+        Ok(with_session(|_, session| session.frame_intervals()).unwrap_or_default())
+    })
+    .await
+}
+
+/// Direct touch or the trackpad cursor, kept for later games (AND-APP-14).
+#[tauri::command]
+pub async fn set_touch_mode(window: WebviewWindow, mode: String) -> Result<(), String> {
+    let mode = crate::mobile_view::touch_mode(&mode)?;
+    on_ui(&window, move || {
+        HOST.with_borrow_mut(|host| {
+            host.touch_mode = mode;
+            if let Some(view) = &host.view {
+                view.set_touch_mode(mode);
+            }
+        });
+        Ok(())
+    })
+    .await
+}
+
+/// The overlay's mouse buttons, pressed at the touch or trackpad cursor.
+#[tauri::command]
+pub async fn game_mouse_button(
+    window: WebviewWindow,
+    right: bool,
+    down: bool,
+) -> Result<(), String> {
+    on_ui(&window, move || {
+        HOST.with_borrow(|host| {
+            let view = host.view.as_ref().ok_or("no game is running")?;
+            view.mouse_button(right, down);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The overlay's keys: Enter, Esc, Space, Tab and Ctrl, as virtual keys.
+#[tauri::command]
+pub async fn game_key(window: WebviewWindow, key: u32, down: bool) -> Result<(), String> {
+    on_ui(&window, move || {
+        HOST.with_borrow(|host| {
+            let view = host.view.as_ref().ok_or("no game is running")?;
+            view.overlay_key(key, down);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The overlay's wheel keys, in whole notches.
+#[tauri::command]
+pub async fn game_wheel(window: WebviewWindow, notches: i32) -> Result<(), String> {
+    on_ui(&window, move || {
+        HOST.with_borrow(|host| {
+            let view = host.view.as_ref().ok_or("no game is running")?;
+            view.wheel(notches);
+            Ok(())
+        })
     })
     .await
 }

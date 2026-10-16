@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import ScanExe from "../components/ScanExe.svelte";
   import Icon from "../components/Icon.svelte";
   import PhoneImportFooter from "../components/PhoneImportFooter.svelte";
   import PhoneImportHeader from "../components/PhoneImportHeader.svelte";
@@ -89,7 +90,13 @@
                 </span>
               </label>
               <div class="sub">
-                <span class="mono ell" style="flex: 1; min-width: 0; color: var(--fg2)">{g.exe}</span>
+                <span style="flex: 1; min-width: 0; display: flex">
+                  {#if locked}
+                    <span class="mono ell" style="color: var(--fg2)">{g.exe}</span>
+                  {:else}
+                    <ScanExe phone name={g.name} exes={g.exes} value={scan.exeOf(g)?.path ?? g.exe} onpick={(v) => scan.setExe(g, v)} />
+                  {/if}
+                </span>
                 {#if !locked}
                   <PhoneImportMini options={SCAN_ENC_OPTIONS} value={scan.encOf(g)} label={t("{0} 的编码", g.name)} onpick={(v) => scan.setEnc(g, v)} />
                 {/if}
@@ -117,7 +124,7 @@
   {#if permissionError}
     <div class="status err" role="status">{permissionError}</div>
   {:else if asking && !checking}
-    <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} onimport={() => nav.replace({ name: "import" })} />
+    <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} />
   {/if}
 </PhoneImportPage>
 

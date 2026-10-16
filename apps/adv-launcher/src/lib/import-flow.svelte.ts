@@ -65,6 +65,8 @@ export interface ScanRow {
   /** Path relative to the scanned folder. */
   path: string;
   exe: string;
+  /** Programs the user can pick instead of the suggested one. */
+  exes: string[];
   inLib: boolean;
   noExe: boolean;
   /** Only an installer was found. */
@@ -78,6 +80,7 @@ function scanRow(f: ScanFound): ScanRow {
     name: f.title,
     path: f.relative || ".",
     exe: f.exe?.path ?? "",
+    exes: f.exes.filter((e) => e.arch === "x86").map((e) => e.path),
     inLib: f.inLibrary !== null,
     noExe: f.exe === null && !f.setup,
     setup: f.setup,
@@ -106,6 +109,8 @@ export class ScanPick {
   off = $state<Record<string, boolean>>({});
   /** Encodings the user changed from the detected one. */
   enc = $state<Record<string, Enc>>({});
+  /** Main programs the user picked over the suggested one. */
+  exe = $state<Record<string, string>>({});
   /** The installer row whose "暂不支持安装" note is showing. */
   installNote = $state<string | null>(null);
   adding = $state(false);
@@ -174,8 +179,18 @@ export class ScanPick {
     return !scanLocked(g) && !this.off[g.id];
   }
 
+  exeOf(g: ScanRow): ExeCandidate | null {
+    const picked = this.exe[g.id];
+    return g.found.exes.find((e) => e.path === picked) ?? g.found.exe;
+  }
+
   encOf(g: ScanRow): Enc {
-    return this.enc[g.id] ?? encOfCodepage(g.found.exe?.codepage ?? 932);
+    return this.enc[g.id] ?? encOfCodepage(this.exeOf(g)?.codepage ?? 932);
+  }
+
+  setExe(g: ScanRow, path: string): void {
+    this.exe[g.id] = path;
+    this.done = false;
   }
 
   setDepth(n: number): void {
@@ -213,7 +228,7 @@ export class ScanPick {
     this.adding = true;
     try {
       for (const g of this.chosen) {
-        const exe = g.found.exe;
+        const exe = this.exeOf(g);
         if (!exe) continue;
         const codepage = CODEPAGES[this.encOf(g)];
         if (inTauri) {

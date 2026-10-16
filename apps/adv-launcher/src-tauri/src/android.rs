@@ -9,16 +9,19 @@
 //! `set_game_mode(app, active)` calls MainActivity on the webview thread.
 
 use crate::overlay::OverlayState;
+use adv_shell::mobile::{Insets, Occlusion, Rect};
 use adv_shell::overlay::Target;
-use jni::JNIEnv;
-use jni::objects::{JObject, JValue};
-use jni::sys::{jboolean, jfloat, jint};
+use jni::objects::{GlobalRef, JFloatArray, JObject, JValue};
+use jni::sys::{jboolean, jfloat, jfloatArray, jint};
+use jni::{JNIEnv, JavaVM};
 use ndk_sys::ANativeWindow;
 use std::ptr::NonNull;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+/// MainActivity, for the trackpad cursor; set by `nativeScreen`.
+static ACTIVITY: Mutex<Option<(JavaVM, GlobalRef)>> = Mutex::new(None);
 
 pub(crate) fn setup(app: AppHandle) {
     let _ = APP.set(app);
@@ -40,6 +43,31 @@ pub fn set_game_mode(app: &AppHandle, active: bool) -> tauri::Result<()> {
                 }
             });
         })
+}
+
+/// Shows the trackpad cursor at a point of the game surface, in pixels, or
+/// hides it. Runs on the UI thread, which the JVM already attached.
+pub(crate) fn set_cursor(point: Option<(f32, f32)>) {
+    let activity = ACTIVITY.lock().unwrap();
+    let Some((vm, activity)) = activity.as_ref() else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let (x, y) = point.unwrap_or_default();
+    if let Err(error) = env.call_method(
+        activity,
+        "setCursor",
+        "(ZFF)V",
+        &[
+            JValue::Bool(point.is_some().into()),
+            JValue::Float(x),
+            JValue::Float(y),
+        ],
+    ) {
+        log::error!("setCursor: {error}");
+    }
 }
 
 fn with_surface(
@@ -94,6 +122,64 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeSurfaceDestro
     height: jint,
 ) {
     with_surface(&env, &surface, width, height, forward_surface_destroyed);
+}
+
+/// The container's size, display cutouts as (x, y, width, height) runs,
+/// largest corner radius and mandatory gesture insets (top, right, bottom,
+/// left), all in dp. Returns where the game surface goes, in dp.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeScreen(
+    mut env: JNIEnv<'_>,
+    activity: JObject<'_>,
+    width: jfloat,
+    height: jfloat,
+    cutouts: JFloatArray<'_>,
+    corner_radius: jfloat,
+    gestures: JFloatArray<'_>,
+    density: jfloat,
+) -> jfloatArray {
+    let floats = |env: &mut JNIEnv<'_>, array: &JFloatArray<'_>| {
+        let mut values = vec![0.0; env.get_array_length(array).unwrap_or(0) as usize];
+        let _ = env.get_float_array_region(array, 0, &mut values);
+        values.into_iter().map(f64::from).collect::<Vec<_>>()
+    };
+    let cutouts = floats(&mut env, &cutouts)
+        .chunks_exact(4)
+        .map(|r| Rect {
+            x: r[0],
+            y: r[1],
+            width: r[2],
+            height: r[3],
+        })
+        .collect();
+    let gestures = match floats(&mut env, &gestures)[..] {
+        [top, right, bottom, left] => Insets {
+            top,
+            right,
+            bottom,
+            left,
+        },
+        _ => Insets::default(),
+    };
+    if let (Ok(vm), Ok(activity)) = (env.get_java_vm(), env.new_global_ref(activity)) {
+        *ACTIVITY.lock().unwrap() = Some((vm, activity));
+    }
+    let area = crate::game::screen(
+        f64::from(width),
+        f64::from(height),
+        Occlusion {
+            cutouts,
+            corner_radius: f64::from(corner_radius),
+            gestures,
+        },
+        f64::from(density),
+    );
+    let values = [area.x, area.y, area.width, area.height].map(|v| v as f32);
+    let Ok(array) = env.new_float_array(4) else {
+        return std::ptr::null_mut();
+    };
+    let _ = env.set_float_array_region(&array, 0, &values);
+    array.into_raw()
 }
 
 #[unsafe(no_mangle)]

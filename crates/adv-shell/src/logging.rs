@@ -16,6 +16,40 @@ pub(crate) fn init() {
     }
 }
 
+/// Mobile apps have no console, so records at info and above go to the
+/// system log: bionic's syslog writes to logcat, and iOS's to the unified
+/// log. Call it first; an embedding host that has a logger keeps it.
+#[cfg(mobile)]
+pub fn init_system_log() {
+    struct SystemLog;
+    impl log::Log for SystemLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let priority = match record.level() {
+                log::Level::Error => libc::LOG_ERR,
+                log::Level::Warn => libc::LOG_WARNING,
+                _ => libc::LOG_NOTICE,
+            };
+            let text = format!("{}: {}", record.target(), record.args()).replace('\0', " ");
+            let text = std::ffi::CString::new(text).unwrap();
+            // SAFETY: a constant format consuming one C string.
+            unsafe { libc::syslog(priority, c"%s".as_ptr(), text.as_ptr()) };
+        }
+
+        fn flush(&self) {}
+    }
+    static LOG: SystemLog = SystemLog;
+    if log::set_logger(&LOG).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
 pub(crate) fn reset_audio_warning() {
     *LOGGER.last_audio_warning.lock().unwrap() = None;
 }

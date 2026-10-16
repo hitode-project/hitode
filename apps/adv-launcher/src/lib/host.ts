@@ -29,7 +29,7 @@ export interface FolderInspection {
 }
 export interface ScanFound {
   folder: string; relative: string; depth: number; title: string;
-  exe: ExeCandidate | null; setup: boolean; inLibrary: string | null;
+  exe: ExeCandidate | null; exes: ExeCandidate[]; setup: boolean; inLibrary: string | null;
 }
 export interface GamePatch {
   title?: string; codepage?: Codepage; favorite?: boolean; nsfw?: boolean;

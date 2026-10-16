@@ -305,6 +305,7 @@ fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
                 depth: level,
                 title: info.title,
                 exe,
+                exes: info.exes,
                 setup,
                 in_library,
             });
@@ -456,7 +457,10 @@ pub struct ScanFound {
     relative: String,
     depth: u8,
     title: String,
+    /// The suggested main program.
     exe: Option<ExeCandidate>,
+    /// Every executable in the folder, so the user can pick another.
+    exes: Vec<ExeCandidate>,
     setup: bool,
     in_library: Option<String>,
 }
@@ -484,7 +488,7 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
 }
 
 #[tauri::command]
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
     use tauri_plugin_storage::StorageExt;
     let storage = app.storage();
@@ -501,12 +505,6 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
         .map(|copy| Some(copy.path))
 }
 
-#[tauri::command]
-#[cfg(target_os = "ios")]
-pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
-    let _ = app;
-    Err("folder selection is not supported on iOS".into())
-}
 #[tauri::command]
 pub fn library_list(state: Store<'_>) -> Reply<Vec<LibraryGame>> {
     let mut library = state.lock().unwrap();
@@ -763,6 +761,10 @@ mod tests {
         assert_eq!(found.suggested, Some(2));
         assert_eq!(found.exes[2].codepage, 936);
         assert_eq!(found.in_library, Some(game.id));
+        // A scan offers every candidate, not only the suggestion.
+        let row = &scan(&lib.known(), dir.clone(), 1).unwrap()[0];
+        assert_eq!(row.exes.len(), found.exes.len());
+        assert_eq!(row.exe.as_ref().map(|e| &e.path), Some(&found.exes[2].path));
         fs::remove_file(dir.join("game_chs.EXE")).unwrap();
         assert!(inspect(&lib.known(), &dir).unwrap().suggested.is_none());
         assert!(scan(&lib.known(), dir.clone(), 1).unwrap()[0].setup);

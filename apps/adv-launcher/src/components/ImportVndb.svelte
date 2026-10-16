@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { slide } from "svelte/transition";
   import { t } from "../lib/i18n.svelte";
   import { call, inTauri } from "../lib/bridge";
   import type { Novel } from "../lib/host";
@@ -27,6 +28,17 @@
 
   /** The chosen work stays listed even when a new search does not return it. */
   const rows = $derived(pick.vndb && !results.some((vn) => vn.id === pick.vndb!.id) ? [pick.vndb, ...results] : results);
+  /** A search first lists its best few; the rest wait for "显示全部". */
+  const FIRST = 5;
+  let expanded = $state(false);
+  /** After a pick only the choice stays, so the page below is in reach. */
+  let collapsed = $state(false);
+  const shown = $derived(collapsed ? rows.filter((vn) => vn.id === pick.vndb?.id) : expanded ? rows : rows.slice(0, FIRST));
+
+  function pickNovel(vn: Novel | null): void {
+    pick.setVndb(vn);
+    collapsed = true;
+  }
 
   async function search(next = false): Promise<void> {
     const text = next ? activeQuery : query.trim();
@@ -35,6 +47,8 @@
     const number = next ? page + 1 : 1;
     busy = true;
     error = "";
+    collapsed = false;
+    if (!next) expanded = false;
     try {
       const found = await call<{ results: Novel[]; more: boolean } | null>("vndb_search", { query: text, page: number }, null);
       if (id !== request || !found) return;
@@ -72,11 +86,16 @@
     <button class="quiet" disabled={!query.trim() || !inTauri}>{t("搜索")}</button>
   </form>
   <div class="stack" aria-busy={busy}>
-    <Row name="vndb" checked={pick.vndb === null} onpick={() => pick.setVndb(null)}>
-      <span class="name">{t("不关联")}</span>
-    </Row>
-    {#each rows as vn (vn.id)}
-      <Row name="vndb" checked={pick.vndb?.id === vn.id} onpick={() => pick.setVndb(vn)}>
+    {#if !collapsed || pick.vndb === null}
+      <div class="item" transition:slide={{ duration: 180 }}>
+        <Row name="vndb" checked={pick.vndb === null} onpick={() => pickNovel(null)}>
+          <span class="name">{t("不关联")}</span>
+        </Row>
+      </div>
+    {/if}
+    {#each shown as vn (vn.id)}
+      <div class="item" transition:slide={{ duration: 180 }}>
+      <Row name="vndb" checked={pick.vndb?.id === vn.id} onpick={() => pickNovel(vn)}>
         <span class="thumb">
           {#if vn.image}<img src={vn.image.thumbnail} alt="" class:blur={prefs.blurAdult && vn.image.sexual >= 1} referrerpolicy="no-referrer" />{/if}
         </span>
@@ -85,14 +104,19 @@
           <span class="meta" lang="ja">{[year(vn), vn.developers.map((d) => d.name).join(" / ")].filter(Boolean).join(" · ")}</span>
         </span>
       </Row>
+      </div>
     {/each}
   </div>
-  {#if busy}
+  {#if collapsed && rows.length > 0}
+    <button class="quiet more" onclick={() => (collapsed = false)}>{t("更换作品")}</button>
+  {:else if busy}
     <div class="note" role="status">{t("正在搜索…")}</div>
   {:else if error}
     <div class="note err" role="alert">{error}</div>
   {:else if searched && results.length === 0}
     <div class="note" role="status">{t("没有找到作品")}</div>
+  {:else if !expanded && rows.length > FIRST}
+    <button class="quiet more" onclick={() => (expanded = true)}>{t("显示全部 {0} 个结果", rows.length)}</button>
   {:else if more}
     <button class="quiet more" onclick={() => void search(true)}>{t("加载更多")}</button>
   {/if}

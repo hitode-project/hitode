@@ -26,6 +26,8 @@ NOREPLY = "@users.noreply.github.com"
 # Third-party code keeps its authors' addresses.
 EMAIL_EXEMPT = ("vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
 EMAIL_ALLOWED_DOMAINS = {"example.com", "example.org", "example.net"}
+# Apple asset scale suffixes such as AppIcon-20x20@2x.png are file names.
+ASSET_SCALE = re.compile(r"[1-9]x(?:-\d+)?\.(?:png|jpe?g|pdf|svg|heic)$")
 # Guest-side profile names the emulator presents; any other C:\Users\<name> is a host path.
 GUEST_USERS = {"player", "public", "default", "all users", "{}"}
 SKIP = {"Cargo.lock"}
@@ -88,7 +90,11 @@ def scan_line(path: str, line: str, terms: list[str]) -> list[str]:
     if not path.startswith(EMAIL_EXEMPT):
         for match in EMAIL.finditer(line):
             domain = match.group(1).lower()
-            if match.group(0).lower().endswith(NOREPLY) or domain in EMAIL_ALLOWED_DOMAINS:
+            if (
+                match.group(0).lower().endswith(NOREPLY)
+                or domain in EMAIL_ALLOWED_DOMAINS
+                or ASSET_SCALE.match(domain)
+            ):
                 continue
             found.append(f"email address {match.group(0)!r}")
     return found

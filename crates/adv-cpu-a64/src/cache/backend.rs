@@ -22,7 +22,7 @@ impl Drop for Mapping {
 }
 
 #[cfg(target_os = "ios")]
-pub(super) use os::finish_preparation;
+pub(super) use os::{debugged, finish_preparation};
 pub(super) use os::{synchronize, writable};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -225,7 +225,7 @@ mod os {
     }
 
     /// A breakpoint without a debugger would kill the process.
-    fn debugged() -> bool {
+    pub fn debugged() -> bool {
         let mut status = 0u32;
         // SAFETY: queries this process's own code-signing status word.
         let result = unsafe {
