@@ -186,7 +186,8 @@ fn strict_pool() -> bool {
     cfg!(target_os = "ios") || cfg!(test) && std::env::var_os("ADV_POOL_EXHAUSTION_CHILD").is_some()
 }
 
-/// Call before creating guest machines (and before a future iOS JIT detach).
+/// Call before creating guest machines; on iOS, while the JIT debugger is
+/// attached, which this preparation then detaches.
 /// The pool is fixed after this first preparation; mapping failure is retained.
 pub fn prepare_code_pool() -> Result<(), String> {
     prepared_pool().map(|_| ())
@@ -209,6 +210,8 @@ fn prepared_pool() -> Result<&'static PreparedPool, String> {
             Ok(value) => value
                 .parse::<usize>()
                 .map_err(|_| "invalid ADV_A64_CODE_POOL_MIB")?,
+            // iOS: the debugger marks every 16 KiB page, so launch time follows the size.
+            Err(std::env::VarError::NotPresent) if cfg!(target_os = "ios") => 128,
             Err(std::env::VarError::NotPresent) => 512,
             Err(_) => return Err("invalid ADV_A64_CODE_POOL_MIB".into()),
         };
@@ -216,8 +219,13 @@ fn prepared_pool() -> Result<&'static PreparedPool, String> {
             .checked_mul(1 << 20)
             .ok_or("A64 code pool size overflow")?;
         let ranges = CodePool::new(len, page_size()?)?;
-        let mapping = backend::Mapping::new(len)?;
-        Ok(PreparedPool { ranges, mapping })
+        let mapping = backend::Mapping::new(len);
+        #[cfg(target_os = "ios")]
+        backend::finish_preparation();
+        Ok(PreparedPool {
+            ranges,
+            mapping: mapping?,
+        })
     })
     .as_ref()
     .map_err(Clone::clone)
