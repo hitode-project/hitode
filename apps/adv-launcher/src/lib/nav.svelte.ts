@@ -1,3 +1,4 @@
+import { flushSync } from "svelte";
 import type { LibraryFilter } from "./types";
 
 /** Every screen of the launcher; the game screen hosts the in-game overlay. */
@@ -32,6 +33,9 @@ export function routeHash(route: Route): string {
   return "gameId" in route ? `#/${route.name}/${encodeURIComponent(route.gameId)}` : `#/${route.name}`;
 }
 
+/** How a screen change moves: a push, a pop, or a crossfade between peers. */
+type Motion = "forward" | "back" | "fade";
+
 /**
  * Screen navigation with a back stack; no router library. The location hash
  * mirrors the current screen so any screen can be opened directly while
@@ -41,6 +45,10 @@ export function routeHash(route: Route): string {
  * `popstate`. While there is somewhere to go back to, or a screen registered
  * with `onBack`, one guard entry sits on top of the browser history so the
  * gesture is caught here instead of leaving the page.
+ *
+ * Screen changes animate through the View Transitions API, styled per
+ * platform in app.css. The game screen changes at once: it is transparent
+ * over the native game view.
  */
 class Navigator {
   route = $state<Route>(typeof location === "undefined" ? HOME : parseHash(location.hash));
@@ -48,6 +56,8 @@ class Navigator {
   #handlers: (() => boolean)[] = [];
   #guarded = false;
   #ignorePop = false;
+  /** The latest screen asked for; `route` follows once a transition captures the old one. */
+  #target: Route = this.route;
 
   constructor() {
     $effect.root(() => {
@@ -57,26 +67,41 @@ class Navigator {
   }
 
   go(route: Route): void {
-    this.#history.push(this.route);
-    this.route = route;
+    this.#history.push(this.#target);
+    this.#show(route, route.name === this.#target.name ? "fade" : "forward");
     this.#sync();
   }
 
   /** Replaces the current screen without adding a back entry (e.g. launch → game). */
   replace(route: Route): void {
-    this.route = route;
+    this.#show(route, "fade");
   }
 
   back(): void {
-    this.route = this.#history.pop() ?? HOME;
+    this.#show(this.#history.pop() ?? HOME, "back");
     this.#sync();
   }
 
   /** Returns to the library and drops the back stack. */
   home(filter: LibraryFilter = "all"): void {
     this.#history = [];
-    this.route = { name: "library", filter };
+    this.#show({ name: "library", filter }, this.#target.name === "library" ? "fade" : "back");
     this.#sync();
+  }
+
+  #show(to: Route, motion: Motion): void {
+    const from = this.#target;
+    this.#target = to;
+    if (typeof document === "undefined" || !document.startViewTransition || from.name === "game" || to.name === "game") {
+      this.route = to;
+      return;
+    }
+    document.documentElement.dataset.motion = motion;
+    // Changes asked for before the old screen is captured land together.
+    document.startViewTransition(() => {
+      this.route = this.#target;
+      flushSync();
+    });
   }
 
   /**
@@ -112,15 +137,15 @@ class Navigator {
   #popped(): void {
     if (this.#ignorePop) {
       this.#ignorePop = false;
-      this.#writeHash(routeHash(this.route));
+      this.#writeHash(routeHash(this.#target));
       return;
     }
     // The guard entry was consumed by the gesture.
     this.#guarded = false;
     const handler = this.#handlers.at(-1);
-    if (!handler?.() && this.#history.length > 0) this.route = this.#history.pop() ?? HOME;
+    if (!handler?.() && this.#history.length > 0) this.#show(this.#history.pop() ?? HOME, "back");
     this.#sync();
-    this.#writeHash(routeHash(this.route));
+    this.#writeHash(routeHash(this.#target));
   }
 }
 
