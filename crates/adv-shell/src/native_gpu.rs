@@ -53,6 +53,8 @@ pub struct WindowPresenter {
     max_configure_ns: u64,
     /// Upscaler runs and the input pixels their last passes recomputed.
     upscaled: (u64, u64),
+    #[cfg(target_os = "macos")]
+    pub(crate) direct_layer: bool,
 }
 
 impl WindowPresenter {
@@ -234,6 +236,8 @@ impl WindowPresenter {
             max_acquire_ns: Cell::new(0),
             max_configure_ns: 0,
             upscaled: (0, 0),
+            #[cfg(target_os = "macos")]
+            direct_layer: false,
         })
     }
 
@@ -1002,6 +1006,8 @@ pub(crate) struct Rendered {
     pub(crate) serial: u64,
     pub(crate) canvas: (u32, u32),
     pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
+    #[cfg(target_os = "macos")]
+    pub(crate) shared: Option<(NativeFrame, adv_device::gpu::DisplayCompletion)>,
 }
 impl Session {
     pub(crate) fn new(presenter: WindowPresenter, frames: FrameConsumer) -> Self {
@@ -1114,6 +1120,7 @@ impl Session {
         width: u32,
         height: u32,
         repaint: bool,
+        _wake: &WakeEvent,
     ) -> Result<Rendered, String> {
         let context = self.presenter.context.clone();
         let submission = context.submission().map_err(|error| error.to_string())?;
@@ -1166,6 +1173,8 @@ impl Session {
                 }
                 if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
+                        #[cfg(target_os = "macos")]
+                        shared: None,
                         result: DrawResult::Skipped,
                         placement: None,
                         serial: self.serial,
@@ -1242,6 +1251,8 @@ impl Session {
             || height == 0
         {
             return Ok(Rendered {
+                #[cfg(target_os = "macos")]
+                shared: None,
                 result: DrawResult::Skipped,
                 placement: None,
                 serial: self.serial,
@@ -1250,6 +1261,30 @@ impl Session {
             });
         }
         let placement = self.placement((width, height));
+        #[cfg(target_os = "macos")]
+        if self.presenter.direct_layer
+            && self.overlays.is_empty()
+            && placement.drawable == canvas
+            && let Some(frame) = self
+                .native
+                .as_ref()
+                .filter(|frame| frame.io_surface().is_some())
+        {
+            let completion = submission
+                .display_completion(_wake.clone())
+                .map_err(|e| e.to_string())?;
+            self.contiguous = true;
+            self.stats.presented += 1;
+            self.stats.direct_presentations += 1;
+            return Ok(Rendered {
+                result: DrawResult::Presented,
+                placement: Some(placement),
+                serial: self.serial,
+                canvas,
+                cursor_regions: self.cursor_regions.clone(),
+                shared: Some((frame.clone(), completion)),
+            });
+        }
         let size = placement.drawable;
         let rectangle = if placement == Placement::client((width, height)) {
             self.viewport((width, height))
@@ -1279,6 +1314,8 @@ impl Session {
         self.contiguous = true;
         self.stats.presented += u64::from(matches!(result, DrawResult::Presented));
         Ok(Rendered {
+            #[cfg(target_os = "macos")]
+            shared: None,
             placement: matches!(result, DrawResult::Presented).then_some(placement),
             result,
             serial: self.serial,
@@ -1318,6 +1355,8 @@ pub(crate) struct UiPresenter {
     wake: WakeEvent,
     job: Option<Job>,
     reconfigure: bool,
+    #[cfg(target_os = "macos")]
+    waiting: Option<Completed>,
     #[cfg(target_os = "android")]
     surface_live: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1338,6 +1377,8 @@ impl UiPresenter {
             wake,
             job: None,
             reconfigure: false,
+            #[cfg(target_os = "macos")]
+            waiting: None,
             #[cfg(target_os = "android")]
             surface_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
@@ -1380,21 +1421,48 @@ impl UiPresenter {
         self.observer.has_update() || self.reconfigure
     }
     pub(crate) fn in_flight(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.waiting.is_some() {
+            return true;
+        }
         self.job.is_some()
     }
     pub(crate) fn poll(&mut self) -> Result<Option<Completed>, String> {
+        #[cfg(target_os = "macos")]
+        if let Some(waiting) = &self.waiting {
+            if !waiting
+                .rendered
+                .shared
+                .as_ref()
+                .unwrap()
+                .1
+                .ready()
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(None);
+            }
+            return Ok(self.waiting.take());
+        }
         if let Some(job) = &mut self.job {
             if let Some(done) = job.completion.pop() {
                 self.session = Some(done.session);
                 self.job = None;
                 let rendered = done.result?;
                 self.reconfigure = matches!(rendered.result, DrawResult::Reconfigure);
-                return Ok(Some(Completed {
+                let completed = Completed {
                     rendered,
                     elapsed: done.elapsed,
                     at: done.at,
                     stats: self.session.as_ref().unwrap().stats,
-                }));
+                };
+                #[cfg(target_os = "macos")]
+                if let Some((_, fence)) = &completed.rendered.shared
+                    && !fence.ready().map_err(|e| e.to_string())?
+                {
+                    self.waiting = Some(completed);
+                    return Ok(None);
+                }
+                return Ok(Some(completed));
             }
             if let Some(ticket) = &job.ticket
                 && matches!(
@@ -1432,7 +1500,7 @@ impl UiPresenter {
         repaint: bool,
     ) -> Result<bool, String> {
         if !can_schedule(
-            self.job.is_some(),
+            self.in_flight(),
             dimensions,
             self.session
                 .as_ref()
@@ -1457,6 +1525,7 @@ impl UiPresenter {
         let mut session = self.session.take().unwrap();
         let (mut output, completion) = spsc::channel(1);
         let scheduled = Instant::now();
+        let wake = self.wake.clone();
         #[cfg(target_os = "android")]
         let surface_live = self.surface_live.clone();
         let task = background::Task::new(move || {
@@ -1484,7 +1553,7 @@ impl UiPresenter {
                     session.stats.configurations += 1;
                     drop(pause);
                 }
-                session.render(dimensions.0, dimensions.1, repaint || configure)
+                session.render(dimensions.0, dimensions.1, repaint || configure, &wake)
             })();
             session.stats.max_job_ns = session.stats.max_job_ns.max(nanoseconds(started.elapsed()));
             session.stats.max_acquire_ns = session.presenter.max_acquire_ns.get();
@@ -1551,6 +1620,10 @@ struct Sampling { source_uv: vec4<f32>, viewport: vec2<f32> }
     return vec4(rgb,1.0);
 }
 "#;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "native_gpu/display_tests.rs"]
+mod display_tests;
 
 #[cfg(test)]
 mod tests {

@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-io-surface", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -34,6 +34,9 @@ bytemuck = { version = "1.23", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 pollster = "0.4"
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "libc", "objc2-core-foundation"] }
 
 # ARMv8 SHA-256 instructions, selected at run time, for the pinned font
 # profile's file hashes; the portable code is several times slower.
@@ -65,7 +68,10 @@ required-features = ["gpu"]
 wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["metal"] }
 
 objc2 = { version = "0.6.4", optional = true }
-objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std"] }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std", "objc2-io-surface"] }
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CGColorSpace"] }
+objc2-io-surface = { version = "0.3.2", optional = true, default-features = false, features = ["std", "IOSurfaceRef", "objc2-core-foundation"] }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSString", "NSRange"] }
 block2 = { version = "0.6.2", optional = true }
 naga-types = { version = "=30.0.1", optional = true }

@@ -4,9 +4,11 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::*;
 use std::sync::atomic::AtomicBool;
+mod display;
 mod pipeline;
 mod ring;
 mod software;
+pub use display::DisplayCompletion;
 use ring::{CAPACITY, MAX_DRAW, Ring};
 pub(super) use software::Software;
 type Object<T> = Retained<ProtocolObject<T>>;
@@ -15,6 +17,7 @@ type Object<T> = Retained<ProtocolObject<T>>;
 pub(super) struct ImageState {
     initialized: Arc<AtomicBool>,
     pub(super) view: Arc<OnceLock<Object<dyn MTLTexture>>>,
+    pub(super) surface: Option<objc2_core_foundation::CFRetained<objc2_io_surface::IOSurfaceRef>>,
 }
 // Texture views are immutable; Metal retains/releases them across threads.
 unsafe impl Send for ImageState {}

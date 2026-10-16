@@ -2235,7 +2235,7 @@ impl<P: Presenter> Surfaces<P> {
         // Prepare every fallible operation before changing the active target.
         let replacement = if reusable.is_none() {
             Some(
-                gpu.target(
+                gpu.presentation_target(
                     native.target.image.width(),
                     native.target.image.height(),
                     native.target.has_depth(),
