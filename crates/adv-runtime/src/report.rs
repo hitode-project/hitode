@@ -164,6 +164,7 @@ impl<B: Backend> Runtime<B> {
             let frames = self.gpu_diagnostics().frames;
             report.push_str(&format!("\nD3D9 recording: commands {}; flushes {:?}; eliminated frames {}; verification mismatches {}; full executions {}; clipped executions {}; clipped area sum {:.4}",
                 frames.recorded_commands,frames.flushes,frames.eliminated_frames,frames.verification_mismatches,frames.full_executions,frames.clipped_executions,frames.clipped_area_sum));
+            report.push_str(&frames.work_report());
         }
         let g = &graphics.stats;
         let seconds = g
