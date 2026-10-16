@@ -692,14 +692,19 @@ fn build_report(context: ReportContext<'_>) -> String {
         scene_gate,
     } = context;
     let frame = runtime.frame();
-    let arena = runtime
-        .machine
-        .ext
-        .get::<adv_runtime::Graphics>()
-        .arena_usage();
+    let graphics = runtime.machine.ext.get::<adv_runtime::Graphics>();
+    let arena = graphics.arena_usage();
+    let g = &graphics.stats;
     let graphics_memory = format!(
-        "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
-        arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
+        "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}, \"software_publications\": {}, \"damaged_pixels\": {}, \"frame_pixels\": {}}}",
+        arena.capacity,
+        arena.free,
+        arena.largest_free,
+        arena.pixel_bytes,
+        arena.live_surfaces,
+        g.presentations,
+        g.damaged_pixels,
+        g.frame_pixels
     );
     #[cfg(any(feature = "gpu", target_os = "macos", target_os = "android"))]
     let gpu_diagnostics = {
@@ -720,12 +725,22 @@ fn build_report(context: ReportContext<'_>) -> String {
             diagnostics.shaders.untranslated
         );
         let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{},\"metal_draws\":{},\"backend_switches\":{},\"ring_bytes\":{},\"ring_busy\":{},\"passes\":{},\"color_loads\":{},\"depth_loads\":{},\"merged_clears\":{},\"compile_waits\":{},\"compile_wait_ns\":{},\"prebuild_hits\":{},\"prebuild_misses\":{},\"persisted_pipelines\":{},\"discarded_pipelines\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits,g.metal_draws,g.backend_switches,g.ring_bytes,g.ring_busy,g.passes,g.color_loads,g.depth_loads,g.merged_clears,g.compile_waits,g.compile_wait_ns,g.prebuild_hits,g.prebuild_misses,g.persisted_pipelines,g.discarded_pipelines));
+        let f = &diagnostics.frames;
+        let frames = format!(
+            "{{\"recorded_commands\":{},\"eliminated_frames\":{},\"full_executions\":{},\"clipped_executions\":{},\"clipped_area_sum\":{:.4}}}",
+            f.recorded_commands,
+            f.eliminated_frames,
+            f.full_executions,
+            f.clipped_executions,
+            f.clipped_area_sum
+        );
         format!(
-            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"shader_versions\":{}}}",
+            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"frames\":{},\"shader_versions\":{}}}",
             diagnostics.live_interfaces,
             diagnostics.pending_waits,
             diagnostics.pending_readbacks,
             commands,
+            frames,
             shader_versions
         )
     };

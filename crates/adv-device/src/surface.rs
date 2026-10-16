@@ -136,6 +136,9 @@ pub struct GraphicsStats {
     pub unlocks: u64,
     /// Growth of the bounded text patch, rather than one allocation per string.
     pub text_scratch_growths: u64,
+    /// Damaged and total pixels summed over software publications.
+    pub damaged_pixels: u64,
+    pub frame_pixels: u64,
 }
 
 #[derive(Clone)]
@@ -543,6 +546,78 @@ fn verify_software() -> bool {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
 }
+/// Content-diff tiles (DEV-FRAME-10).
+const TILE_W: u32 = 64;
+const TILE_H: u32 = 16;
+
+/// Shrinks declared damage to the tiles whose pixels differ from `previous`,
+/// the complete last publication in the same layout. Downstream copies,
+/// uploads, composition and upscaling then follow what actually changed.
+/// A rectangle that mostly changed keeps its declared bounds.
+fn refine_damage(
+    surface: &Surface,
+    memory: &dyn SurfaceMemory,
+    previous: &[u8],
+    declared: &Damage,
+) -> Result<Damage, String> {
+    let format = surface.format;
+    let mut out = Damage::default();
+    for r in declared.iter().copied() {
+        if r.w < TILE_W && r.h < TILE_H {
+            out.add(r);
+            continue;
+        }
+        let total = u64::from(r.w) * u64::from(r.h);
+        let mut changed = 0u64;
+        let mut bands = Damage::default();
+        let mut y = r.y;
+        while y < r.y + r.h && changed * 4 <= total * 3 {
+            let h = TILE_H.min(r.y + r.h - y);
+            let (mut lo, mut hi) = (u32::MAX, 0);
+            for row in y..y + h {
+                let start = format.byte_offset(r.x) as usize;
+                let n = surface.span(r.x, r.w) as usize;
+                let src = memory.read(surface.row(0, row) + start as u32, n)?;
+                let at = row as usize * surface.pitch as usize + start;
+                let old = &previous[at..at + n];
+                if *src == *old {
+                    continue;
+                }
+                let mut x = r.x;
+                while x < r.x + r.w {
+                    let w = TILE_W.min(r.x + r.w - x);
+                    if x < lo || x + w > hi {
+                        let a = (format.byte_offset(x) - format.byte_offset(r.x)) as usize;
+                        let b = a + surface.span(x, w) as usize;
+                        if src[a..b] != old[a..b] {
+                            (lo, hi) = (lo.min(x), hi.max(x + w));
+                        }
+                    }
+                    x += w;
+                }
+            }
+            if lo < hi {
+                changed += u64::from(hi - lo) * u64::from(h);
+                bands.add(Rect {
+                    x: lo,
+                    y,
+                    w: hi - lo,
+                    h,
+                });
+            }
+            y += h;
+        }
+        if changed * 4 > total * 3 {
+            out.add(r);
+        } else {
+            for band in bands.iter().copied() {
+                out.add(band);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn damage_since(history: &DamageHistory, since: u64, serial: u64, full: Rect) -> Damage {
     if since == serial && since != 0 {
         return Damage::default();
@@ -1910,10 +1985,22 @@ impl<P: Presenter> Surfaces<P> {
             .software_started
             .get_or_insert_with(std::time::Instant::now);
         self.software_source = Some(id);
+        // The frame cap measures the guest's drawing, so it keeps the declared area.
         self.software_coverage = (
             damage.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum(),
             u64::from(s.width) * u64::from(s.height),
         );
+        let damage = match latest {
+            Some(previous) if !reset && !s.format.packed() => {
+                refine_damage(s, m, &previous.pixels, &damage)?
+            }
+            _ => damage,
+        };
+        self.stats.damaged_pixels += damage
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h))
+            .sum::<u64>();
+        self.stats.frame_pixels += self.software_coverage.1;
         self.damage_history.push((self.stats.presentations, damage));
         // Retire our latest reference before recycling the writer's private slot.
         self.retained_frame = None;

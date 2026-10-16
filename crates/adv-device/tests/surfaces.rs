@@ -1600,3 +1600,58 @@ fn capture_resize_palette_and_video_flush_pending_pixels_before_the_change() {
     assert_eq!(&out.bgra[48..72], &[0; 24]);
     assert_eq!(s.stats.software_flushes, [0, 0, 0, 4]);
 }
+
+#[test]
+// spec: DEV-FRAME-10
+fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
+    for (format, bottom_up) in [
+        (PixelFormat::Bgra32, false),
+        (PixelFormat::Bgra32, true),
+        (PixelFormat::Rgb565, false),
+        (PixelFormat::Bgr24, true),
+    ] {
+        let mut m = Memory::new(false);
+        let mut s = Surfaces::new(128, 64, 16, 65520, Snapshot::default()).unwrap();
+        let id = s.create(128, 64, bottom_up, format, &mut m).unwrap();
+        let (producer, mut consumer) = frame_mailbox();
+        s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+        let mut publish = |s: &mut Surfaces<Snapshot>, m: &Memory| {
+            s.present(id, m, s[id].rect()).unwrap();
+            s.flush(m, FlushReason::Immediate).unwrap();
+            assert!(consumer.update());
+            let frame = consumer.current();
+            let mut shown = Snapshot::default();
+            frame.snapshot(&mut shown).unwrap();
+            if format == PixelFormat::Bgra32 {
+                assert_eq!(shown.bgra, logical_pixels(s, id, m).concat());
+            }
+            frame.damage().to_vec()
+        };
+        let full = Rect {
+            x: 0,
+            y: 0,
+            w: 128,
+            h: 64,
+        };
+        assert_eq!(publish(&mut s, &m), [full]);
+        let one = Rect {
+            x: 70,
+            y: 20,
+            w: 1,
+            h: 1,
+        };
+        s.fill_raw(id, one, 0x0012_3456, &mut m).unwrap();
+        assert_eq!(
+            publish(&mut s, &m),
+            [Rect {
+                x: 64,
+                y: 16,
+                w: 64,
+                h: 16
+            }]
+        );
+        assert_eq!(publish(&mut s, &m), []);
+        s.fill_raw(id, full, 0x0000_ff00, &mut m).unwrap();
+        assert_eq!(publish(&mut s, &m), [full]);
+    }
+}
