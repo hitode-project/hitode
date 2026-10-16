@@ -1,7 +1,7 @@
 //! lstr* and small arithmetic helpers.
 
 use adv_abi::{GuestPtr, Registry, WideStr, win32};
-use adv_cpu::backend::Guest;
+use adv_cpu::backend::{Guest, Prot};
 use adv_machine::{Env, Outcome};
 use std::borrow::Cow;
 
@@ -150,13 +150,37 @@ fn linguistic(env: &mut Env<'_>, wide: bool, ignore_case: bool) -> Outcome {
     )
 }
 
+fn string_length(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let pointer = env.arg(0);
+    let width = if wide { 2 } else { 1 };
+    let mut length = 0;
+    let mut buffer = [0; 256];
+    while length < crate::util::MAX_STR as u32 {
+        let address = pointer.wrapping_add(length * width);
+        // Read only this page, except for an unaligned UTF-16 boundary unit.
+        let available = (4096 - (address & 4095)).max(width) / width * width;
+        let size = available
+            .min(buffer.len() as u32)
+            .min((crate::util::MAX_STR as u32 - length) * width);
+        if !env.cpu.accessible(address, size, Prot::READ)
+            || env.cpu.read(address, &mut buffer[..size as usize]).is_err()
+        {
+            return Outcome::Return(0);
+        }
+        if let Some(end) = buffer[..size as usize]
+            .chunks_exact(width as usize)
+            .position(|unit| unit.iter().all(|&byte| byte == 0))
+        {
+            return Outcome::Return(length + end as u32);
+        }
+        length += size / width;
+    }
+    Outcome::Return(length)
+}
+
 pub(super) fn register(reg: &mut Registry) {
-    stdcall(reg, K32, "lstrlenA", 1, |e| {
-        Outcome::Return(cstr(e.cpu, e.arg(0)).len() as u32)
-    });
-    stdcall(reg, K32, "lstrlenW", 1, |e| {
-        Outcome::Return(wstr(e.cpu, e.arg(0)).len() as u32)
-    });
+    stdcall(reg, K32, "lstrlenA", 1, |e| string_length(e, false));
+    stdcall(reg, K32, "lstrlenW", 1, |e| string_length(e, true));
     stdcall(reg, K32, "lstrcpyA", 2, |e| {
         let (d, s) = (e.arg(0), e.arg(1));
         let v = cstr(e.cpu, s);

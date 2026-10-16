@@ -12,7 +12,10 @@ use std::collections::{HashMap, HashSet};
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, MemFault};
 
-use crate::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, THUNK_CAP, THUNK_STRIDE, thunk_addr};
+use crate::layout::{
+    GUEST_CODE_BASE, GUEST_CODE_SIZE, GUEST_COUNTS_BASE, GUEST_COUNTS_SIZE, THUNK_CAP,
+    THUNK_STRIDE, thunk_addr,
+};
 use crate::{Env, Outcome};
 
 pub type Handler = fn(&mut Env<'_>) -> Outcome;
@@ -128,6 +131,8 @@ pub struct Thunk {
     /// Address of the pointer the entry jumps through: to the guest code, or to
     /// the trap after it when guest code is off.
     pub guest_slot: Option<u32>,
+    /// Diagnostic entry, ordinary-fallback and linked-fallback counters.
+    guest_counts: Option<(u32, u32)>,
     /// Registered host transport identity, distinct from a numeric system service.
     pub transport_token: Option<TransportToken>,
     pristine: Vec<u8>,
@@ -181,6 +186,8 @@ pub struct ThunkTable {
     /// Next free byte of the guest code arena.
     guest_next: u32,
     guest_code: bool,
+    guest_counting: bool,
+    guest_count_next: u32,
 }
 
 fn unimplemented(env: &mut Env<'_>) -> Outcome {
@@ -219,6 +226,7 @@ impl ThunkTable {
             implemented: true,
             requested: false,
             guest_slot: None,
+            guest_counts: None,
             transport_token: None,
             export_entry: None,
             pristine: {
@@ -249,6 +257,7 @@ impl ThunkTable {
                     implemented: true,
                     requested: false,
                     guest_slot: None,
+                    guest_counts: None,
                     transport_token: None,
                     pristine: Vec::new(),
                     export_entry: None,
@@ -258,6 +267,8 @@ impl ThunkTable {
             by_transport: HashMap::new(),
             guest_next: GUEST_CODE_BASE,
             guest_code: true,
+            guest_counting: false,
+            guest_count_next: GUEST_COUNTS_BASE,
         }
     }
 
@@ -337,7 +348,11 @@ impl ThunkTable {
         for (index, thunk) in self.thunks.iter().enumerate() {
             if let Some(slot) = thunk.guest_slot {
                 let target = if on {
-                    slot + 4
+                    if self.guest_counting {
+                        thunk.guest_counts.unwrap().1
+                    } else {
+                        slot + 4
+                    }
                 } else {
                     Self::trap_addr(index as u32)
                 };
@@ -345,6 +360,48 @@ impl ThunkTable {
             }
         }
         Ok(())
+    }
+
+    /// Diagnostic probes are reached only after switching the existing slot.
+    /// Disabled execution retains the original body and direct fallback jumps.
+    pub fn set_guest_counting(&mut self, cpu: &mut dyn Guest, on: bool) -> Result<(), MemFault> {
+        if self.guest_counting == on {
+            return Ok(());
+        }
+        self.guest_counting = on;
+        for (index, thunk) in self.thunks.iter().enumerate() {
+            let Some((_counts, probes)) = thunk.guest_counts else {
+                continue;
+            };
+            let guest = thunk.f.guest.unwrap();
+            let own = guest
+                .host
+                .iter()
+                .map(|&at| (at, Self::trap_addr(index as u32)));
+            let links = guest.links.iter().map(|&(at, module, name)| {
+                (at, thunk_addr(self.published_index(module, name).unwrap()))
+            });
+            for (i, (at, target)) in own.chain(links).enumerate() {
+                let target = if on {
+                    probes + 21 + i as u32 * 21
+                } else {
+                    target
+                };
+                let next = thunk.guest_slot.unwrap() + 4 + at as u32 + 4;
+                cpu.write(next - 4, &target.wrapping_sub(next).to_le_bytes())?;
+            }
+        }
+        self.set_guest_code(cpu, self.guest_code)
+    }
+
+    pub fn guest_counts(&self, cpu: &dyn Guest, index: u32) -> [u64; 3] {
+        self.get(index).guest_counts.map_or([0; 3], |(address, _)| {
+            std::array::from_fn(|i| {
+                let mut bytes = [0; 8];
+                let _ = cpu.read(address + i as u32 * 8, &mut bytes);
+                u64::from_le_bytes(bytes)
+            })
+        })
     }
 
     /// The `push transport-token; int` pair of a thunk with guest code.
@@ -360,10 +417,14 @@ impl ThunkTable {
         index: u32,
         guest: &GuestCode,
         links: &[u32],
-    ) -> Result<u32, MemFault> {
+    ) -> Result<(u32, (u32, u32)), MemFault> {
         let slot = self.guest_next;
         let body = slot + 4;
-        let end = (body + guest.code.len() as u32 + 15) & !15;
+        let probe_base = (body + guest.code.len() as u32 + 7) & !7;
+        let counts = self.guest_count_next;
+        assert!(counts + 24 <= GUEST_COUNTS_BASE + GUEST_COUNTS_SIZE);
+        let end =
+            (probe_base + (1 + guest.host.len() as u32 + guest.links.len() as u32) * 21 + 15) & !15;
         assert!(
             end <= GUEST_CODE_BASE + GUEST_CODE_SIZE,
             "guest code arena full"
@@ -375,19 +436,42 @@ impl ThunkTable {
             .iter()
             .zip(links)
             .map(|(&(at, ..), &target)| (at, target));
-        for (at, target) in host.chain(links) {
+        let targets: Vec<_> = host.chain(links).collect();
+        let mut probes = probe(counts, body);
+        for (i, &(at, target)) in targets.iter().enumerate() {
+            probes.extend(probe(
+                counts + if i < guest.host.len() { 8 } else { 16 },
+                target,
+            ));
+            let target = if self.guest_counting {
+                probe_base + 21 + i as u32 * 21
+            } else {
+                target
+            };
             let next = body + at as u32 + 4;
             code[at..at + 4].copy_from_slice(&target.wrapping_sub(next).to_le_bytes());
         }
         let target = if self.guest_code {
-            body
+            if self.guest_counting {
+                probe_base
+            } else {
+                body
+            }
         } else {
             Self::trap_addr(index)
         };
         cpu.write(slot, &target.to_le_bytes())?;
         cpu.write(body, &code)?;
+        cpu.write(counts, &[0; 24])?;
+        for (i, code) in probes.chunks_exact_mut(21).enumerate() {
+            let absolute = u32::from_le_bytes(code[17..21].try_into().unwrap());
+            let next = probe_base + (i as u32 + 1) * 21;
+            code[17..21].copy_from_slice(&absolute.wrapping_sub(next).to_le_bytes());
+        }
+        cpu.write(probe_base, &probes)?;
         self.guest_next = end;
-        Ok(slot)
+        self.guest_count_next += 24;
+        Ok((slot, (counts, probe_base)))
     }
 
     /// The resolver as its concrete type, to add implementations after the machine exists.
@@ -507,10 +591,11 @@ impl ThunkTable {
             !audio || (f.leaf.is_none() && f.env_leaf.is_none()),
             "audio bindings cannot be leaf calls"
         );
-        let guest_slot = match f.guest {
+        let placement = match f.guest {
             Some(guest) => Some(self.place(cpu, index, guest, &links)?),
             None => None,
         };
+        let guest_slot = placement.map(|p| p.0);
         let token = TransportToken::for_binding(index);
         let pristine = Self::emit(index, token, f.conv, guest_slot);
         assert!(pristine.len() <= THUNK_STRIDE as usize);
@@ -523,6 +608,7 @@ impl ThunkTable {
             implemented,
             requested,
             guest_slot,
+            guest_counts: placement.map(|p| p.1),
             transport_token: Some(token),
             pristine,
             export_entry: None,
@@ -557,4 +643,15 @@ impl ThunkTable {
     pub fn iter(&self) -> impl Iterator<Item = (u32, &Thunk)> {
         self.thunks.iter().enumerate().map(|(i, t)| (i as u32, t))
     }
+}
+
+fn probe(counter: u32, target: u32) -> Vec<u8> {
+    let mut code = vec![0x9c, 0x83, 0x05];
+    code.extend(counter.to_le_bytes());
+    code.extend([1, 0x83, 0x15]);
+    code.extend((counter + 4).to_le_bytes());
+    code.extend([0, 0x9d, 0xe9]);
+    // The probe's address follows its counter; callers relocate this jump.
+    code.extend(target.to_le_bytes());
+    code
 }

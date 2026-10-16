@@ -2,7 +2,7 @@
 //! switching a target never copies or reinitializes the attachment's contents.
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DepthFormat {
     Float32,
     Unorm16,
@@ -134,7 +134,7 @@ impl Depth {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StencilOp {
     Keep,
     Zero,
@@ -145,14 +145,14 @@ pub enum StencilOp {
     IncrementWrap,
     DecrementWrap,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StencilFace {
     pub compare: Compare,
     pub fail: StencilOp,
     pub depth_fail: StencilOp,
     pub pass: StencilOp,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Stencil {
     pub front: StencilFace,
     pub back: StencilFace,

@@ -118,6 +118,7 @@ struct Device {
     fixed: fixed::Fixed,
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
+    versions: [u64; 15],
     frame: recording::Recording,
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
@@ -164,7 +165,7 @@ impl Default for ShaderCaps {
 pub fn set_shader_caps(ext: &mut Ext, caps: ShaderCaps) {
     ext.get_mut::<State>().shader_caps = caps;
 }
-/// Opt-in directory for derived WGSL. The frontend bounds and validates its
+/// Host-selected game directory for derived WGSL and pipeline recipes. The frontend bounds and validates its
 /// cache; no guest shader token stream is written here.
 pub fn set_shader_cache(ext: &mut Ext, directory: Option<std::path::PathBuf>) {
     let state = ext.get_mut::<State>();
@@ -198,8 +199,18 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
         live_interfaces: objects.alias_count(state.com.namespace()),
         pending_waits: state.pending.len(),
         pending_readbacks: state.transfers.len(),
-        gpu: state.gpu.as_ref().map(|g| g.stats()),
-        shaders: state.shader_stats,
+        gpu: state.gpu.as_ref().map(|g| {
+            let mut stats = g.stats();
+            let (waits, ns) = state.shader_translations.counters.snapshot();
+            let (program_waits, program_ns) = state.programs.counters.snapshot();
+            stats.compile_waits += waits + program_waits;
+            stats.compile_wait_ns += ns + program_ns;
+            stats
+        }),
+        shaders: ShaderStats {
+            untranslated: state.shader_translations.failures(),
+            ..state.shader_stats
+        },
         frames: state.frames,
     }
 }
@@ -300,6 +311,7 @@ pub fn register(registry: &mut Registry) {
     update_texture::register(registry);
     shaders::register(registry);
     programmable::register(registry);
+    crate::refcounts::install(registry, "d3d9.dll");
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -441,7 +453,7 @@ fn object(
     payload: Payload,
 ) -> Option<(u32, Id)> {
     let table = *env.ext.get::<State>().tables.get(interface)?;
-    let pointer = alloc(env, 4)?;
+    let pointer = alloc(env, 8)?;
     if env.cpu.write_u32(pointer, table).is_err() {
         free(env, pointer);
         return None;
@@ -450,6 +462,15 @@ fn object(
         free(env, pointer);
         return None;
     };
+    let container = match com(env).get_identity(&env.sys.objects, id) {
+        Some(Payload::Resource(r)) => r.container,
+        _ => None,
+    };
+    if let Some(parent) = container {
+        com(env).alias_guest(env, id, parent);
+    } else {
+        com(env).enable_guest(env, id);
+    }
     Some((pointer, id))
 }
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
@@ -951,6 +972,7 @@ fn create_device(
         fixed,
         shaders: shaders::Bindings::default(),
         recording: None,
+        versions: [0; 15],
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,

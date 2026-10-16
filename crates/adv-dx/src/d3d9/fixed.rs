@@ -86,7 +86,7 @@ pub(super) struct Draw {
     pub vertices: Vec<Vertex>,
     pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
     pub state: DrawState,
-    pub programmable: Option<adv_device::gpu::ProgrammableDraw>,
+    pub programmable: Option<Box<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
     pub program_key: u128,
 }
@@ -310,7 +310,10 @@ impl Fixed {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
-        set_fvf_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_fvf_ABI
+        },
         get_fvf_ABI,
         set_render_ABI,
         get_render_ABI,
@@ -364,7 +367,18 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     if !valid_fvf(fvf) {
         return UNAVAILABLE;
     }
-    f.fvf = fvf;
+    if f.fvf == fvf
+        && device(env, this.addr())
+            .is_some_and(|d| d.recording.is_none() && d.buffers.declaration.is_none())
+    {
+        return 0;
+    }
+    mutable(env, this.addr()).unwrap().fvf = fvf;
+    super::shaders::stateblocks::mark_fixed(
+        env,
+        this.addr(),
+        super::shaders::stateblocks::FixedKey::Fvf,
+    );
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();

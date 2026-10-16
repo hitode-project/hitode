@@ -293,3 +293,40 @@ fn oversized_fixed_upload_submits_immediately() {
     assert_eq!(gpu.stats().last_flush_buffer_writes, 2);
     assert_eq!(read(&mut gpu, &target), [0, 0, 255, 255]);
 }
+
+#[test]
+// spec: GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-3
+fn warm_restart_uses_content_keys_without_first_draw_compilation() {
+    let dir = std::env::temp_dir().join(format!(
+        "adv-warm-{}-{}",
+        std::process::id(),
+        NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut cold = gpu();
+    cold.set_pipeline_cache_directory(Some(&dir));
+    let target = cold.target(2, 1, false).unwrap();
+    let mut command = draw();
+    command.pixel_constants.floats[0] = [0.3, 0.5, 0.8, 1.];
+    cold.draw_programmable(&target, &command, &DrawState::new(2, 1))
+        .unwrap();
+    let pixels = read(&mut cold, &target);
+    let old_id = command.program.id;
+    cold.flush_pipeline_cache();
+    assert_eq!(cold.stats().persisted_pipelines, 1);
+    drop(target);
+    drop(cold);
+    let mut hot = gpu();
+    hot.set_pipeline_cache_directory(Some(&dir));
+    hot.programmable.warm.drain();
+    let target = hot.target(2, 1, false).unwrap();
+    command.program = Program::new(command.program.source.clone(), vec![]);
+    assert_ne!(command.program.id, old_id);
+    hot.draw_programmable(&target, &command, &DrawState::new(2, 1))
+        .unwrap();
+    assert_eq!(read(&mut hot, &target), pixels);
+    assert_eq!(hot.stats().compile_waits, 0);
+    assert_eq!(hot.stats().prebuild_hits, 1);
+    assert_eq!(hot.stats().prebuild_misses, 0);
+    hot.set_pipeline_cache_directory(None);
+    std::fs::remove_dir_all(dir).unwrap();
+}

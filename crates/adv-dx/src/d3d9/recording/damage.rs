@@ -256,7 +256,7 @@ pub(super) struct Analysis {
     epoch: u64,
 }
 impl Analysis {
-    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &HashMap<Content, u128>) {
+    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &Contents) {
         let Some(image) = image(&p.operation) else {
             return;
         };

@@ -10,10 +10,13 @@ pub(super) fn machine() -> Machine<JitCpu> {
 }
 
 pub(super) fn machine_with_native(native: bool) -> Machine<JitCpu> {
+    machine_with_limits(native, 3)
+}
+fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
     let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, native).unwrap();
     let mut m = Machine::new(cpu, Registry::default(), Clock::virtual_time()).unwrap();
     m.sys.objects = Objects::with_limits(ObjectLimits {
-        references: 3,
+        references,
         ..ObjectLimits::default()
     });
     let mut heaps = Heaps::default();
@@ -140,6 +143,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             fixed: fixed::Fixed::new(16, 12),
             shaders: shaders::Bindings::default(),
             recording: None,
+            versions: [0; 15],
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,
@@ -462,4 +466,42 @@ pub(in crate::d3d9) fn force_recording_limit(env: &mut Env<'_>, pointer: u32) {
         panic!()
     };
     d.frame.force_limit();
+}
+
+// spec: PROC-MACH-8
+#[test]
+fn shared_guest_counts_preserve_real_resource_parent_and_internal_lifetimes() {
+    let mut m = machine_with_limits(false, u32::MAX);
+    let mut env = Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, device_id, resource, id) = setup(&mut env);
+    let count = env.cpu.read_u32(resource + 4).unwrap();
+    assert_ne!(count, 0);
+    assert_eq!(env.cpu.read_u32(count).unwrap(), 0);
+    assert_eq!(add_ref(&mut env, resource), Some(1));
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(2));
+    // A guest AddRef changes the shared word without adding an Objects owner.
+    env.cpu.write_u32(count, 2).unwrap();
+    assert_eq!(release(&mut env, resource), 1);
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(2));
+    assert_eq!(release(&mut env, resource), 0);
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(1));
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
+    let dead = com(&env)
+        .release_internal(&mut env.sys.objects, id)
+        .unwrap()
+        .unwrap();
+    destroy(&mut env, dead);
+    assert!(
+        com(&env)
+            .get::<Payload>(&env.sys.objects, resource)
+            .is_none()
+    );
+    assert_eq!(release(&mut env, device), 0);
+    assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), 1);
 }

@@ -9,7 +9,6 @@
 //! The serial software-checked owner exposes linear COPY reads while retaining
 //! EXEC as a first-store barrier. This never grants guest execute permission.
 use super::{EXEC, READ, SHARED, WRITE};
-use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -82,7 +81,7 @@ impl FastPermissions {
         &mut self,
         permissions: &[u8],
         watched: Option<&[bool]>,
-        private_copies: &BTreeMap<usize, bool>,
+        private_copies: &[Option<bool>],
         window: Option<(usize, &dyn Fn(usize) -> u8)>,
     ) -> Arc<Vec<u8>> {
         debug_assert_eq!(permissions.len(), self.bytes.len());
@@ -108,7 +107,7 @@ impl FastPermissions {
             // original shared-page contract, just like conservative code writes.
             if watched.is_some()
                 && permissions & SHARED != 0
-                && private_copies.get(&page) == Some(&true)
+                && private_copies.get(page) == Some(&Some(true))
             {
                 permissions = (permissions & !SHARED) | EXEC;
             }
@@ -168,14 +167,14 @@ mod tests {
         let mut permissions = vec![READ; 4096];
         let mut table = FastPermissions::new(permissions.len());
         table.invalidate(0..permissions.len());
-        table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        table.snapshot(&permissions, None, &[], None);
         // A stale middle page shows whether the two changes became one range.
         for page in [8, 2048, 4000] {
             permissions[page] = READ | WRITE;
         }
         table.invalidate(8..9);
         table.invalidate(4000..4001);
-        let snapshot = table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        let snapshot = table.snapshot(&permissions, None, &[], None);
         assert_eq!(snapshot[8] & 7, READ | WRITE);
         assert_eq!(snapshot[4000] & 7, READ | WRITE);
         assert_eq!(snapshot[2048] & 7, READ);
@@ -189,7 +188,7 @@ mod tests {
         for protection in 0..8 {
             for watched in [None, Some([false, false].as_slice())] {
                 let permissions = [protection | SHARED, READ | WRITE];
-                let copies = BTreeMap::from([(0, true)]);
+                let copies = [Some(true), None];
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
                 let snapshot = table.snapshot(&permissions, watched, &copies, None);
@@ -295,7 +294,7 @@ mod tests {
             for second in 0..32 {
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&[first, second], None, &BTreeMap::new(), None);
+                let snapshot = table.snapshot(&[first, second], None, &[], None);
                 let readable = [first, second].iter().all(|p| p & (READ | SHARED) == READ);
                 let writable = [first, second]
                     .iter()
@@ -318,15 +317,15 @@ mod tests {
         let mut permissions = [READ | WRITE; 4];
         let mut table = FastPermissions::new(4);
         table.invalidate(0..4);
-        let old = table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        let old = table.snapshot(&permissions, None, &[], None);
         permissions[2] = READ | SHARED | AUDIO;
         table.invalidate(2..3);
         assert_eq!(&**old, &[99, 99, 99, 3]);
-        let new = table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        let new = table.snapshot(&permissions, None, &[], None);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
         permissions[2] = READ;
         table.invalidate(2..3);
-        let promoted = table.snapshot(&permissions, None, &BTreeMap::new(), None);
+        let promoted = table.snapshot(&permissions, None, &[], None);
         assert_eq!(&**promoted, &[99, 35, 33, 3]);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
     }

@@ -2,6 +2,7 @@
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
 use crate::surface::Rect;
 mod clear;
+pub mod compile;
 mod depth;
 mod line;
 mod programmable;
@@ -42,7 +43,7 @@ pub struct Vertex {
     pub color: [f32; 4],
     pub uv: [f32; 2],
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Topology {
     Points,
     Lines,
@@ -50,13 +51,13 @@ pub enum Topology {
     Triangles,
     TriangleStrip,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Cull {
     None,
     Clockwise,
     CounterClockwise,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Factor {
     Zero,
     One,
@@ -70,7 +71,7 @@ pub enum Factor {
     OneMinusDestinationAlpha,
     SourceAlphaSaturated,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlendOp {
     Add,
     Subtract,
@@ -78,13 +79,13 @@ pub enum BlendOp {
     Minimum,
     Maximum,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Blend {
     pub source: Factor,
     pub destination: Factor,
     pub operation: BlendOp,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Compare {
     Never,
     Less,
@@ -95,19 +96,19 @@ pub enum Compare {
     GreaterEqual,
     Always,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Filter {
     Nearest,
     Linear,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Address {
     Clamp,
     Repeat,
     Mirror,
     Border,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Sampler {
     pub min: Filter,
     pub mag: Filter,
@@ -141,7 +142,7 @@ pub fn sampler_parameters(sampler: Sampler) -> [u32; 4] {
             | (u32::from(sampler.mip.is_some()) << 3),
     ]
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TextureOp {
     Color,
     Texture,
@@ -240,6 +241,12 @@ pub struct Stats {
     pub last_flush_buffer_writes: u64,
     pub bind_group_creations: u64,
     pub pipeline_cache_hits: u64,
+    pub compile_waits: u64,
+    pub compile_wait_ns: u64,
+    pub prebuild_hits: u64,
+    pub prebuild_misses: u64,
+    pub persisted_pipelines: u64,
+    pub discarded_pipelines: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

@@ -106,9 +106,13 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
     ))
 }
 fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
     match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => {
             let identity = r.container.unwrap_or(id);
+            #[cfg(feature = "d3d9-counters")]
+            lookup(1);
             let pointer = match com(env).get_identity(&env.sys.objects, identity) {
                 Some(Payload::Resource(r)) => r.pointer,
                 _ => r.pointer,
@@ -119,13 +123,61 @@ fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
     }
 }
 fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
     let count = match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => r.levels.len().max(1),
         _ => 1,
     };
     out.extend((0..count as u32).map(|n| content(env, id, Some(n), 0)));
 }
+pub(super) struct Bindings {
+    signature: (Option<Id>, Option<Id>, u64),
+    output: [Option<Content>; 3],
+    samples: Vec<Content>,
+}
+fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
+        return Err(INVALID);
+    };
+    let signature = (
+        d.render_target.or(d.back_buffer),
+        d.depth_stencil,
+        d.versions[12],
+    );
+    if d.frame
+        .binding_cache
+        .as_ref()
+        .is_some_and(|b| b.signature == signature)
+    {
+        return Ok(());
+    }
+    let mut samples = Vec::new();
+    for id in std::iter::once(d.texture)
+        .chain(d.shaders.textures)
+        .flatten()
+    {
+        sample(env, id, &mut samples);
+    }
+    let output = [
+        signature.0.map(|id| content(env, id, None, 0)),
+        signature.1.map(|id| content(env, id, None, 1)),
+        signature.1.map(|id| content(env, id, None, 2)),
+    ];
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
+    frame(env, owner).binding_cache = Some(Bindings {
+        signature,
+        output,
+        samples,
+    });
+    Ok(())
+}
 pub(super) struct Prepared {
+    #[cfg(feature = "d3d9-counters")]
+    pub lookups: u64,
     pub operation: Operation,
     pub key: u128,
     pub reads: Vec<Content>,
@@ -133,15 +185,25 @@ pub(super) struct Prepared {
     pub bytes: usize,
     pub bounds: adv_device::surface::Rect,
 }
-pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {
+pub(super) fn prepare(
+    env: &mut Env<'_>,
+    owner: Id,
+    mut operation: Operation,
+) -> Result<Prepared, u32> {
+    #[cfg(feature = "d3d9-counters")]
+    let before = {
+        lookup(1);
+        lookups() - 1
+    };
+    bind(env, owner)?;
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Err(INVALID);
     };
+    let bindings = d.frame.binding_cache.as_ref().unwrap();
     validate(&operation)?;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     let (mut reads, mut writes, mut bytes) = (Vec::new(), Vec::new(), 0);
-    let mut write = |id, level, aspect, overwrite| {
-        let c = content(env, id, level, aspect);
+    let mut write = |c: Content, overwrite| {
         c.hash(&mut h);
         writes.push((c, overwrite));
     };
@@ -161,23 +223,18 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                 && rectangle.w == target.image.width()
                 && rectangle.h == target.image.height();
             if color.is_some() {
-                write(
-                    d.render_target.or(d.back_buffer).ok_or(INVALID)?,
-                    None,
-                    0,
-                    full,
-                );
+                write(bindings.output[0].ok_or(INVALID)?, full);
             }
-            if let Some(id) = d.depth_stencil {
+            if d.depth_stencil.is_some() {
                 let full = full
                     && target
                         .depth()
                         .is_some_and(|t| t.width() == rectangle.w && t.height() == rectangle.h);
                 if depth.is_some() {
-                    write(id, None, 1, full);
+                    write(bindings.output[1].unwrap(), full);
                 }
                 if stencil.is_some() {
-                    write(id, None, 2, full);
+                    write(bindings.output[2].unwrap(), full);
                 }
             }
             (
@@ -198,7 +255,7 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
             pitch,
             rectangle,
         } => {
-            write(*resource, *level, 0, true);
+            write(content(env, *resource, *level, 0), true);
             (
                 1u8,
                 target_key(target),
@@ -229,7 +286,7 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                     .map(|n| n as u32),
                 _ => None,
             };
-            write(resources[1], level, 0, false);
+            write(content(env, resources[1], level, 0), false);
             sample(env, resources[0], &mut reads);
             (
                 2u8,
@@ -265,31 +322,21 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                 return Err(INVALID);
             }
             if state.color_write != 0 {
-                write(
-                    d.render_target.or(d.back_buffer).ok_or(INVALID)?,
-                    None,
-                    0,
-                    false,
-                );
+                write(bindings.output[0].ok_or(INVALID)?, false);
             }
-            if let Some(id) = d.depth_stencil {
+            if d.depth_stencil.is_some() {
                 if state.depth.is_some() || state.stencil.is_some() {
-                    reads.push(content(env, id, None, 1));
-                    reads.push(content(env, id, None, 2));
+                    reads.push(bindings.output[1].unwrap());
+                    reads.push(bindings.output[2].unwrap());
                 }
                 if state.depth.is_some() && state.depth_write {
-                    write(id, None, 1, false);
+                    write(bindings.output[1].unwrap(), false);
                 }
                 if state.stencil.is_some_and(|s| s.write_mask != 0) {
-                    write(id, None, 2, false);
+                    write(bindings.output[2].unwrap(), false);
                 }
             }
-            for id in std::iter::once(d.texture)
-                .chain(d.shaders.textures.iter().copied())
-                .flatten()
-            {
-                sample(env, id, &mut reads);
-            }
+            reads.extend_from_slice(&bindings.samples);
             (
                 3u8,
                 target_key(t),
@@ -299,9 +346,11 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                 program_key,
             )
                 .hash(&mut h);
-            bytemuck::cast_slice::<_, u8>(vertices).hash(&mut h);
-            bytes = std::mem::size_of_val(vertices.as_slice());
-            if let Some((count, values)) = texcoords {
+            if programmable.is_none() {
+                bytemuck::cast_slice::<_, u8>(vertices).hash(&mut h);
+                bytes = std::mem::size_of_val(vertices.as_slice());
+            }
+            if let Some((count, values)) = texcoords.as_ref().filter(|_| programmable.is_none()) {
                 count.hash(&mut h);
                 bytemuck::cast_slice::<_, u8>(values).hash(&mut h);
                 bytes += std::mem::size_of_val(values.as_slice());
@@ -315,7 +364,7 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
                     vertex_count,
                     textures,
                     ..
-                } = p;
+                } = p.as_ref();
                 program.textures.hash(&mut h);
                 for s in streams {
                     (s.stride, &s.attributes, &s.bytes).hash(&mut h);
@@ -336,7 +385,17 @@ pub(super) fn prepare(env: &Env<'_>, owner: Id, operation: Operation) -> Result<
         _ => return Err(INVALID),
     }
     let bounds = super::damage::bounds(env, d, &operation);
+    // Programmable streams already own these exact inputs; bounds have consumed
+    // the neutral representation and backend execution only reads the streams.
+    if let Operation::Draw(d) = &mut operation
+        && d.programmable.is_some()
+    {
+        d.vertices = Vec::new();
+        d.texcoords = None;
+    }
     Ok(Prepared {
+        #[cfg(feature = "d3d9-counters")]
+        lookups: lookups() - before,
         bounds,
         operation,
         key: h.digest128(),

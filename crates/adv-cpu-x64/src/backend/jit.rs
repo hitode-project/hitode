@@ -235,6 +235,17 @@ impl Guest for View<'_> {
             read_alias,
         })
     }
+    fn map_shared_counters(
+        &mut self,
+        addr: u32,
+        len: u32,
+    ) -> Result<std::rc::Rc<dyn crate::backend::CounterStorage>, MemFault> {
+        let storage = self
+            .memory
+            .map_shared_audio(addr, len as usize)
+            .map_err(|_| fault(addr, len as usize))?;
+        Ok(std::rc::Rc::new(storage))
+    }
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
         let len32 = u32::try_from(len).map_err(|_| fault(src, len))?;
         if !self.accessible(src, len32, Prot::READ) {
@@ -371,6 +382,13 @@ impl Guest for JitCpu {
         len: u32,
     ) -> Result<crate::backend::SharedRegion, MemFault> {
         self.view(|g| g.map_shared_audio(addr, len))
+    }
+    fn map_shared_counters(
+        &mut self,
+        addr: u32,
+        len: u32,
+    ) -> Result<std::rc::Rc<dyn crate::backend::CounterStorage>, MemFault> {
+        self.view(|g| g.map_shared_counters(addr, len))
     }
     fn cpuid_features(&self) -> u32 {
         crate::cpu_profile::cpuid(1, 0)[3]

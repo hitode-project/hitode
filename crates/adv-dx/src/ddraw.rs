@@ -171,6 +171,7 @@ const NOT_LOCKED: u32 = 0x88760248;
 pub struct DirectDraw {
     pub(super) context: u32,
     com: Option<CommonCom>,
+    pending_guest: Vec<ComIdentity<ComState>>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
     surface_objects: BTreeMap<u32, ComIdentity<ComState>>,
     dd_vtable: Option<u32>,
@@ -193,6 +194,7 @@ impl DirectDraw {
         Self {
             context: 0,
             com: None,
+            pending_guest: Vec::new(),
             surface_objects: BTreeMap::new(),
             dd_vtable: None,
             old_dd_vtable: None,
@@ -385,6 +387,7 @@ impl DirectDraw {
             let result = surfaces.alloc(16, m).and_then(|p| {
                 pointers.push(p);
                 m.put_u32(p, *table)?;
+                m.put_u32(p + 4, 0)?;
                 Ok(p)
             });
             match result {
@@ -441,6 +444,7 @@ impl DirectDraw {
         if let Kind::Surface(sid) = kind {
             self.surface_objects.insert(sid, identity);
         }
+        self.pending_guest.push(identity);
         Ok(Some(canonical))
     }
     /// COM activation exposes the same device identity before Initialize.

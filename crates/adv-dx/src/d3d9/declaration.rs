@@ -24,7 +24,10 @@ pub(super) fn register(registry: &mut Registry) {
         declaration_device_ABI,
         declaration_elements_ABI,
         create_ABI,
-        set_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_ABI
+        },
         get_ABI,
     ] {
         registry.register(api);
@@ -203,6 +206,7 @@ pub(super) fn create(
     {
         return OUT_OF_MEMORY;
     }
+    super::programmable::warmup::declaration(env, this.addr(), &elements);
     let payload = Declaration {
         pointer: 0,
         device,
@@ -281,12 +285,16 @@ pub(super) fn bind(env: &mut Env<'_>, device: Id, new: Option<Id>) -> u32 {
         return INVALID;
     };
     let old = d.buffers.declaration;
+    if old == new && d.fixed.fvf == 0 {
+        return 0;
+    }
     if new != old && new.is_some_and(|id| !com(env).retain_internal(&mut env.sys.objects, id)) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
+    d.versions[7] += 1;
     d.buffers.declaration = new;
     d.fixed.clear_fvf();
     if new != old

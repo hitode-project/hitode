@@ -180,8 +180,8 @@ fn new_object<T: 'static>(env: &mut Env<'_>, wide: bool, device: bool, value: T)
     if !initialize_legacy(env) {
         return None;
     }
-    let first = alloc(env, 4)?;
-    let Some(second) = alloc(env, 4) else {
+    let first = alloc(env, 8)?;
+    let Some(second) = alloc(env, 8) else {
         free(env, first);
         return None;
     };
@@ -211,6 +211,7 @@ fn new_object<T: 'static>(env: &mut Env<'_>, wide: bool, device: bool, value: T)
         release_owned::<T>(env, first);
         return None;
     }
+    com.enable_guest(env, identity);
     Some(first)
 }
 fn create_legacy(

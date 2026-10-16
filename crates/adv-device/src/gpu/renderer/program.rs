@@ -8,7 +8,7 @@ pub(super) struct Key {
     pub(super) raster: PipelineKey,
 }
 #[derive(Clone)]
-struct Pipeline {
+pub(super) struct Pipeline {
     pipeline: wgpu::RenderPipeline,
     constants: wgpu::BindGroup,
     textures: wgpu::BindGroupLayout,
@@ -22,6 +22,7 @@ pub(super) struct Cache {
     texture_bindings: HashMap<TextureKey, TextureBinding>,
     texture_clock: u64,
     pub(super) disk: Option<super::pipeline_disk::DiskCache>,
+    pub(super) warm: super::warmup::Warmup,
 }
 const CONSTANT_SIZE: u64 = std::mem::size_of::<ConstantBlock>() as u64;
 const PARAMETER_SIZE: u64 = 640;
@@ -531,8 +532,44 @@ impl Gpu {
             self.stats.pipeline_cache_hits += 1;
             return Ok(p.clone());
         }
+        let result = self
+            .programmable
+            .warm
+            .pipeline(
+                recipes::Recipe::program(&key, program),
+                &self.context,
+                &self.uniform,
+                &self.shader,
+                &self.layout,
+                self.programmable.disk.as_ref().map(|d| &d.cache),
+                Some(program),
+            )?
+            .program()?;
+        self.stats.bind_group_creations += 1;
+        if self.programmable.entries.len() >= self.pipeline_limit
+            && let Some(old) = self.programmable.order.pop_front()
+        {
+            self.programmable.entries.remove(&old);
+        }
+        self.programmable.order.push_back(key.clone());
+        self.programmable.entries.insert(key, result.clone());
+        if let Some(disk) = &mut self.programmable.disk {
+            disk.changed();
+        }
+        Ok(result)
+    }
+}
+
+impl Pipeline {
+    pub(super) fn build(
+        context: &NativeContext,
+        uniform: &wgpu::Buffer,
+        driver: Option<&wgpu::PipelineCache>,
+        key: &Key,
+        program: &Program,
+    ) -> Result<Pipeline, Error> {
         validate_program(program)?;
-        let device = &self.context.device;
+        let device = &context.device;
         let buffer_entry = |binding, size, visibility| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -592,10 +629,14 @@ impl Gpu {
             bind_group_layouts: &[Some(&constants), Some(&textures)],
             immediate_size: 0,
         });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("translated shader"),
-            source: wgpu::ShaderSource::Wgsl(program.source.to_string().into()),
-        });
+        let prepared;
+        let module = match &program.compiled {
+            Some((id, module)) if *id == context.id => module,
+            _ => {
+                prepared = context.prepare_program(program.clone())?;
+                &prepared.compiled.as_ref().unwrap().1
+            }
+        };
         let attributes: Vec<Vec<_>> = key
             .streams
             .iter()
@@ -668,10 +709,10 @@ impl Gpu {
                 })],
             }),
             multiview_mask: None,
-            cache: self.programmable.disk.as_ref().map(|d| &d.cache),
+            cache: driver,
         });
-        self.check()?;
-        let uniform = &self.uniform;
+        context.check()?;
+        let uniform = uniform;
         let entry = |binding, offset, size| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -689,24 +730,15 @@ impl Gpu {
                 entry(2, CONSTANT_SIZE * 2, PARAMETER_SIZE),
             ],
         });
-        self.stats.bind_group_creations += 1;
         let result = Pipeline {
             pipeline,
             constants,
             textures,
         };
-        if self.programmable.entries.len() >= self.pipeline_limit
-            && let Some(old) = self.programmable.order.pop_front()
-        {
-            self.programmable.entries.remove(&old);
-        }
-        self.programmable.order.push_back(key.clone());
-        self.programmable.entries.insert(key, result.clone());
-        if let Some(disk) = &mut self.programmable.disk {
-            disk.changed();
-        }
         Ok(result)
     }
+}
+impl Gpu {
     pub fn draw_programmable(
         &mut self,
         target: &Target,

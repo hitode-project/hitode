@@ -95,6 +95,49 @@ fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     ] {
         api_from(&mut machine, &mut code, module, name, &args, offset);
     }
+    let desktop = machine.ext.get::<adv_win32::Win32>().user.desktop;
+    for (module, name, args, output) in [
+        ("user32.dll", "GetFocus", vec![], 96),
+        ("user32.dll", "GetActiveWindow", vec![], 100),
+        ("user32.dll", "GetSystemMetrics", vec![0], 104),
+        ("user32.dll", "GetCursorPos", vec![DATA + 768], 108),
+        ("user32.dll", "GetClipCursor", vec![DATA + 784], 112),
+        (
+            "user32.dll",
+            "ScreenToClient",
+            vec![desktop, DATA + 816],
+            116,
+        ),
+        (
+            "user32.dll",
+            "GetWindowRect",
+            vec![desktop, DATA + 832],
+            120,
+        ),
+        ("kernel32.dll", "GetLocalTime", vec![DATA + 900], 124),
+        ("kernel32.dll", "GetSystemTime", vec![DATA + 920], 148),
+        (
+            "kernel32.dll",
+            "GetSystemTimeAsFileTime",
+            vec![DATA + 944],
+            152,
+        ),
+        ("kernel32.dll", "lstrlenA", vec![DATA + 512], 156),
+        (
+            "kernel32.dll",
+            "lstrcpyA",
+            vec![DATA + 960, DATA + 512],
+            160,
+        ),
+        (
+            "kernel32.dll",
+            "lstrcmpA",
+            vec![DATA + 960, DATA + 512],
+            164,
+        ),
+    ] {
+        api_from(&mut machine, &mut code, module, name, &args, output);
+    }
     code.pop_ecx().dec_ecx().jnz(again);
     code.mov_ecx_imm(2050);
     let poll = code.here();
@@ -124,7 +167,7 @@ fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     assert_eq!(machine.cpu.read_u32(DATA + 72).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA + 80).unwrap(), 0);
     assert_eq!(machine.sys.stats.leaf_abandons, if traced { 0 } else { 15 });
-    let mut output = vec![0; 520];
+    let mut output = vec![0; 1024];
     machine.cpu.read(DATA, &mut output).unwrap();
     (output, machine.sys.stats.leaf_calls, machine.sys.host_calls)
 }

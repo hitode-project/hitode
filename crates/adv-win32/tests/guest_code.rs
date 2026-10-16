@@ -5,7 +5,7 @@
 use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::asm::Asm;
-use adv_cpu::backend::{Backend, GuestExt, Prot};
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
 #[cfg(not(target_arch = "aarch64"))]
 use adv_machine::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE};
@@ -458,4 +458,198 @@ fn contended_critical_sections_hand_over_between_guest_code_and_host() {
         contend(JitCpu::new(PARK_ADDR, false).unwrap(), guest_code, false);
         contend(jit(), guest_code, false);
     }
+}
+
+fn atomics<B: Backend>(cpu: B, guest: bool) -> Vec<u8> {
+    let mut m = machine(cpu, guest);
+    let names = [
+        "InterlockedIncrement",
+        "InterlockedDecrement",
+        "InterlockedExchange",
+        "InterlockedExchangeAdd",
+        "InterlockedCompareExchange",
+        "InterlockedCompareExchange",
+    ];
+    let targets: Vec<_> = names
+        .iter()
+        .map(|n| m.resolve_import("kernel32.dll", n).unwrap())
+        .collect();
+    let values = [0, 1, u32::MAX, i32::MAX as u32, i32::MIN as u32, 0xdeadbeef];
+    let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let saved = run_loop(&mut m, |a| {
+        a.push_imm(0x12345678).call(set_error);
+        for (kind, &target) in targets.iter().enumerate() {
+            for (i, &value) in values.iter().enumerate() {
+                let p = DATA + 0x800 + 4 * (kind * values.len() + i) as u32;
+                raw(a, &[0xc7, 0x05], p);
+                a.bytes.extend_from_slice(&value.to_le_bytes());
+                if kind >= 4 {
+                    a.push_imm(if kind == 4 { value } else { value ^ 1 });
+                }
+                if kind >= 2 {
+                    a.push_imm(0x87654321);
+                }
+                a.push_imm(p).call(target);
+                raw(a, &[0xa3], RESULTS + 4 * (kind * values.len() + i) as u32);
+            }
+        }
+        a.call(get_error);
+        raw(a, &[0xa3], RESULTS + 0x200);
+    });
+    assert_eq!(saved[..4], SENTINELS);
+    assert_eq!(saved[4], 0);
+    let mut bytes = vec![0; 0x5000];
+    m.cpu.read(DATA, &mut bytes).unwrap();
+    bytes
+}
+
+// spec: WIN32-API-16, PROC-MACH-2, PROC-MACH-3
+#[test]
+fn interlocked_guest_entries_match_host_wraparound_memory_and_abi() {
+    assert_eq!(
+        atomics(UnicornCpu::new(PARK_ADDR).unwrap(), true),
+        atomics(UnicornCpu::new(PARK_ADDR).unwrap(), false)
+    );
+    assert_eq!(
+        atomics(JitCpu::new(PARK_ADDR, false).unwrap(), true),
+        atomics(JitCpu::new(PARK_ADDR, false).unwrap(), false)
+    );
+}
+
+fn atomic_fault(guest: bool, name: &str, pointer: u32) -> (String, u32, bool) {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), guest);
+    m.cpu.protect(DATA + 0xf000, 4096, Prot::READ).unwrap();
+    let target = m.resolve_import("kernel32.dll", name).unwrap();
+    let mut code = Asm::new(CODE);
+    if name == "InterlockedCompareExchange" {
+        code.push_imm(0);
+    }
+    if !["InterlockedIncrement", "InterlockedDecrement"].contains(&name) {
+        code.push_imm(17);
+    }
+    code.push_imm(pointer).call(target).ret();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    let context = m.spawn("faulting atomic", CODE, &[], 65536).unwrap();
+    let error = m.sys.context(context).teb + adv_machine::layout::teb::LAST_ERROR;
+    m.cpu.write_u32(error, 0x12345678).unwrap();
+    let result = m.run_virtual(1_000_000);
+    assert!(
+        !matches!(result, RunResult::Exited(0)),
+        "invalid atomic must fault"
+    );
+    let mut tail = vec![0; 4096];
+    m.cpu.read(DATA + 0xf000, &mut tail).unwrap();
+    let failure = match result {
+        RunResult::Failed(error) => format!("{}: {}", error.pc, error.message),
+        other => panic!("expected access failure, got {other:?}"),
+    };
+    (
+        failure,
+        m.cpu.read_u32(error).unwrap(),
+        tail.iter().all(|&v| v == 0),
+    )
+}
+// spec: WIN32-API-16, WIN32-EXC-2
+#[test]
+fn invalid_and_readonly_atomic_words_deliver_the_same_guest_faults() {
+    for name in [
+        "InterlockedIncrement",
+        "InterlockedDecrement",
+        "InterlockedExchange",
+        "InterlockedExchangeAdd",
+        "InterlockedCompareExchange",
+    ] {
+        for pointer in [0, DATA + 0xf000, DATA + 0xffff] {
+            let accelerated = atomic_fault(true, name, pointer);
+            assert_eq!(accelerated, atomic_fault(false, name, pointer), "{name}");
+            assert_eq!(accelerated.1, 0x12345678);
+            assert!(accelerated.2);
+        }
+    }
+}
+
+fn atomic_workers(guest: bool) -> (Vec<u32>, u64) {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), guest);
+    let targets: Vec<_> = [
+        "InterlockedIncrement",
+        "InterlockedDecrement",
+        "InterlockedExchange",
+        "InterlockedExchangeAdd",
+        "InterlockedCompareExchange",
+        "Sleep",
+    ]
+    .iter()
+    .map(|name| m.resolve_import("kernel32.dll", name).unwrap())
+    .collect();
+    for thread in 0..4 {
+        let base = CODE + thread * 0x1000;
+        let mut code = Asm::new(base);
+        code.bytes
+            .extend_from_slice(&[0x53, 0x56, 0xbe, 64, 0, 0, 0]); // preserve ebx/esi; rounds
+        let again = code.here();
+        code.push_imm(DATA + 0x800).call(targets[0]);
+        code.push_imm(DATA + 0x804).call(targets[1]);
+        code.push_imm(thread + 1)
+            .push_imm(DATA + 0x808)
+            .call(targets[2]);
+        code.bytes.push(0x50); // old exchanged word
+        code.push_imm(DATA + 0x814).call(targets[3]);
+        code.push_imm(2).push_imm(DATA + 0x80c).call(targets[3]);
+        let retry = code.here();
+        code.mov_eax_mem(DATA + 0x810);
+        code.bytes
+            .extend_from_slice(&[0x89, 0xc3, 0x50, 0x40, 0x50]); // expected=ebx; push old/new
+        code.push_imm(DATA + 0x810).call(targets[4]);
+        code.bytes.extend_from_slice(&[0x39, 0xd8]); // cmp eax,ebx
+        code.jnz(retry);
+        code.push_imm(0).call(targets[5]);
+        code.bytes.push(0x4e); // dec esi
+        code.jnz(again);
+        code.bytes.extend_from_slice(&[0x5e, 0x5b, 0x31, 0xc0]);
+        code.ret();
+        m.cpu.write(base, &code.bytes).unwrap();
+        let ctx = m.spawn("atomic worker", base, &[], 65536).unwrap();
+        m.cpu
+            .write_u32(
+                m.sys.context(ctx).teb + adv_machine::layout::teb::LAST_ERROR,
+                0x12345678,
+            )
+            .unwrap();
+    }
+    let result = m.run_virtual(10_000_000);
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    let words: Vec<_> = (0..6)
+        .map(|i| m.cpu.read_u32(DATA + 0x800 + 4 * i).unwrap())
+        .collect();
+    assert_eq!(words[0], 256);
+    assert_eq!(words[1], 0u32.wrapping_sub(256));
+    assert_eq!(words[3], 512);
+    assert_eq!(words[4], 256);
+    assert_eq!(
+        words[2] + words[5],
+        640,
+        "exchange old returns account for every update"
+    );
+    for ctx in &m.sys.contexts {
+        assert_eq!(
+            m.cpu
+                .read_u32(ctx.teb + adv_machine::layout::teb::LAST_ERROR)
+                .unwrap(),
+            0x12345678
+        );
+    }
+    (
+        vec![words[0], words[1], words[3], words[4], words[2] + words[5]],
+        m.sys.host_calls,
+    )
+}
+// spec: WIN32-API-16
+#[test]
+fn interlocked_guest_workers_preserve_all_atomic_updates_and_old_returns() {
+    let (guest, after) = atomic_workers(true);
+    let (host, before) = atomic_workers(false);
+    assert_eq!(guest, host);
+    assert_eq!(before - after, 1536);
+    eprintln!("synthetic atomic workers: non-leaf calls {before} -> {after}");
 }

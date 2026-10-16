@@ -339,6 +339,7 @@ pub fn register(registry: &mut Registry) {
         Conv::Stdcall { argc: 1 },
         stream::thread_entry,
     );
+    crate::refcounts::install(registry, "quartz.dll");
 }
 
 /// Register the classes; vtables are built on first activation.
@@ -417,8 +418,8 @@ pub(crate) fn create(env: &mut Env<'_>, faces: &[Face], value: Obj) -> Result<Ve
         log::warn!("DirectShow: {error}");
         E_OUTOFMEMORY
     })?;
-    let block = alloc(env, faces.len() as u32 * 4).ok_or(E_OUTOFMEMORY)?;
-    let pointers: Vec<u32> = (0..faces.len() as u32).map(|i| block + i * 4).collect();
+    let block = alloc(env, faces.len() as u32 * 8).ok_or(E_OUTOFMEMORY)?;
+    let pointers: Vec<u32> = (0..faces.len() as u32).map(|i| block + i * 8).collect();
     for (&face, &pointer) in faces.iter().zip(&pointers) {
         let table = state(env).tables[&face];
         if env.cpu.write_u32(pointer, table).is_err() {
@@ -439,6 +440,7 @@ pub(crate) fn create(env: &mut Env<'_>, faces: &[Face], value: Obj) -> Result<Ve
             }
         }
     }
+    com.enable_guest(env, id);
     Ok(pointers)
 }
 

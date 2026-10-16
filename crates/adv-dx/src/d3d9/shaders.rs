@@ -3,6 +3,7 @@
 //! queryable objects and carry a diagnostic for the draw frontend.
 use super::*;
 use crate::shader::Stage;
+use adv_device::gpu::compile::{Compile, CompileCounters};
 use std::sync::Arc;
 pub(super) mod stateblocks;
 #[cfg(test)]
@@ -15,41 +16,82 @@ const IID_PIXEL: Iid = [
     0xdc, 0xdb, 0x3b, 0x6d, 0x02, 0x5b, 0x15, 0x44, 0xb8, 0x52, 0xce, 0x5e, 0x8b, 0xcc, 0xb2, 0x89,
 ];
 
+#[derive(Clone)]
+pub(super) struct TranslationJob(pub Compile<Arc<crate::shader::Translation>>);
+impl TranslationJob {
+    pub fn as_ref(&self) -> Result<&Arc<crate::shader::Translation>, &String> {
+        self.0.wait().as_ref()
+    }
+}
 #[derive(Default)]
 pub(super) struct TranslationCache {
-    entries: BTreeMap<Vec<u32>, Arc<crate::shader::Translation>>,
+    entries: BTreeMap<Vec<u32>, TranslationJob>,
     bytes: usize,
+    pub counters: CompileCounters,
+    failures: Arc<std::sync::atomic::AtomicU64>,
 }
 impl TranslationCache {
-    fn translate(
+    fn start(
         &mut self,
         shader: &crate::shader::Shader,
         directory: Option<&std::path::Path>,
-    ) -> Result<Arc<crate::shader::Translation>, String> {
+    ) -> TranslationJob {
         if let Some(translation) = self.entries.get(shader.bytecode()) {
-            return Ok(Arc::clone(translation));
+            return translation.clone();
         }
-        let translation = Arc::new(
-            match directory {
-                Some(directory) => shader.translate_cached(directory),
-                None => shader.translate(),
+        self.bytes = self
+            .entries
+            .iter()
+            .map(|(tokens, job)| {
+                tokens.len() * 4
+                    + job.0.ready().and_then(|r| r.as_ref().ok()).map_or(
+                        crate::shader::MAX_TRANSLATION_BYTES,
+                        |t| {
+                            t.source.len()
+                                + t.samplers.len()
+                                    * std::mem::size_of::<crate::shader::SamplerBinding>()
+                        },
+                    )
+            })
+            .sum();
+        let bytes = shader.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES;
+        let parsed = shader.clone();
+        let directory = directory.map(std::path::Path::to_owned);
+        let failures = self.failures.clone();
+        let job = TranslationJob(Compile::spawn(bytes, self.counters.clone(), move || {
+            let result = match directory {
+                Some(directory) => parsed.translate_cached(&directory),
+                None => parsed.translate(),
             }
-            .map_err(|error| error.to_string())?,
-        );
-        let bytes = shader.bytecode().len() * 4
-            + translation.source.len()
-            + translation.samplers.len() * std::mem::size_of::<crate::shader::SamplerBinding>();
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+            if result.is_err() {
+                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result
+        }));
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if bytes <= MAX_BYTES {
             if self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
                 self.entries.clear();
                 self.bytes = 0;
             }
-            self.entries
-                .insert(shader.bytecode().to_vec(), Arc::clone(&translation));
+            self.entries.insert(shader.bytecode().to_vec(), job.clone());
             self.bytes += bytes;
         }
-        Ok(translation)
+        job
+    }
+    #[cfg(test)]
+    fn translate(
+        &mut self,
+        shader: &crate::shader::Shader,
+        directory: Option<&std::path::Path>,
+    ) -> Result<Arc<crate::shader::Translation>, String> {
+        let job = self.start(shader, directory);
+        job.0.wait().clone()
+    }
+    pub fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -57,7 +99,7 @@ pub(super) struct Shader {
     pub pointer: u32,
     pub device: Id,
     pub parsed: Arc<crate::shader::Shader>,
-    pub translation: Result<Arc<crate::shader::Translation>, String>,
+    pub translation: TranslationJob,
 }
 #[derive(Clone)]
 pub(super) struct Constants {
@@ -118,9 +160,15 @@ pub(super) fn register(registry: &mut Registry) {
         pixel_function_ABI,
         create_vertex_ABI,
         create_pixel_ABI,
-        set_vertex_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_vertex_ABI
+        },
         get_vertex_ABI,
-        set_pixel_ABI,
+        adv_abi::Api {
+            env_leaf: Some(super::leaf_calls::binding),
+            ..set_pixel_ABI
+        },
         get_pixel_ABI,
         set_vertex_f_ABI,
         get_vertex_f_ABI,
@@ -222,22 +270,13 @@ fn create_shader(
     let state = env.ext.get_mut::<State>();
     let translation = state
         .shader_translations
-        .translate(&parsed, state.shader_cache.as_deref());
-    let translated = translation.is_ok();
+        .start(&parsed, state.shader_cache.as_deref());
     let model = match (parsed.version.major, parsed.version.minor) {
         (1, minor) => minor as usize - 1,
         (2, minor) => 4 + minor as usize,
         (3, 0) => 6,
         _ => return INVALID,
     };
-    if let Err(reason) = &translation {
-        log::warn!(
-            "D3D9 {:?} shader {}.{} translation unavailable: {reason}",
-            stage,
-            parsed.version.major,
-            parsed.version.minor
-        );
-    }
     log::debug!(
         "D3D9 created {:?} shader {}.{} ({} tokens)",
         stage,
@@ -281,7 +320,7 @@ fn create_shader(
         Stage::Vertex => stats.vertex[model] += 1,
         Stage::Pixel => stats.pixel[model] += 1,
     };
-    stats.untranslated += u64::from(!translated);
+    super::programmable::warm(env, this.addr(), Some((stage, id)));
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::CreateVertexShader",level=implement)]
@@ -388,14 +427,20 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     let new = if pointer.is_null() {
         None
     } else {
-        let Some(s) =
-            shader(env, pointer.addr()).filter(|s| s.device == id && s.parsed.stage == stage)
-        else {
+        let Some(new) = com(env).identity::<Payload>(&env.sys.objects, pointer.addr()) else {
             return INVALID;
         };
-        let _ = s;
-        com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
+        Some(new)
     };
+    let d = device(env, this.addr()).unwrap();
+    if d.recording.is_none() && d.shaders.binding(stage) == new {
+        return 0;
+    }
+    if new.is_some_and(|new| {
+        bound(env, new).is_none_or(|s| s.device != id || s.parsed.stage != stage)
+    }) {
+        return INVALID;
+    }
     if let Some(code) = stateblocks::record_shader(env, id, stage, new) {
         return code;
     }
@@ -406,6 +451,7 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
+    d.versions[8 + usize::from(stage == Stage::Pixel)] += 1;
     match stage {
         Stage::Vertex => d.shaders.vertex = new,
         Stage::Pixel => d.shaders.pixel = new,
@@ -413,6 +459,7 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     if new != old {
         release_binding(env, old);
     }
+    super::programmable::warm(env, this.addr(), None);
     0
 }
 fn get_shader(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>, stage: Stage) -> u32 {
@@ -472,6 +519,9 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, id: Id) {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return;
     };
+    for v in &mut d.versions {
+        *v += 1;
+    }
     let old = std::mem::take(&mut d.shaders);
     let recording = d.recording.take();
     release_bindings(env, old);
@@ -532,6 +582,7 @@ fn constants_set(
         recording.mark_constants(stage, kind, range.clone());
         recording.shaders.constants_mut(stage)
     } else {
+        d.versions[13 + usize::from(stage == Stage::Pixel)] += 1;
         d.shaders.constants_mut(stage)
     };
     for (register, bytes) in range.zip(data.chunks_exact(width as usize)) {

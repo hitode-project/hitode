@@ -144,7 +144,7 @@ pub struct Memory {
     shared_pages: BTreeMap<usize, SharedPage>,
     /// Owned snapshots have no external alias. SHARED is only their first-store
     /// barrier, retired by the same transactional store preparation as COPY.
-    private_copy_pages: BTreeMap<usize, bool>,
+    private_copy_pages: Vec<Option<bool>>,
     /// Advances whenever an owned snapshot page takes its first write or is
     /// unmapped, so callers can tell that every unwritten page stayed so.
     private_copy_epoch: u64,
@@ -480,7 +480,7 @@ impl Memory {
             dirty_ranges: Some(Vec::new()),
             reservation: None,
             shared_pages: BTreeMap::new(),
-            private_copy_pages: BTreeMap::new(),
+            private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
@@ -528,7 +528,7 @@ impl Memory {
             dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
-            private_copy_pages: BTreeMap::new(),
+            private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
             locked_pages: BTreeSet::new(),
@@ -575,6 +575,7 @@ impl Memory {
         // SAFETY: the alias spans `slack + len` bytes.
         memory.ptr = unsafe { alias.add(slack) };
         memory.perms = Arc::new(vec![0; len / PAGE_SIZE]);
+        memory.private_copy_pages = vec![None; len / PAGE_SIZE];
         memory.fast = FastPermissions::new(len / PAGE_SIZE);
         memory.versions = vec![origin; len / PAGE_SIZE];
         memory.watched = vec![false; len / PAGE_SIZE];
@@ -642,7 +643,7 @@ impl Memory {
                 let perms = self.perms[page];
                 if perms & SHARED == 0 {
                     GuestPageProtection::new(perms & 7, self.watched[page])
-                } else if self.private_copy_pages.get(&page) == Some(&true) {
+                } else if self.private_copy_pages.get(page) == Some(&Some(true)) {
                     GuestPageProtection::new(perms & (READ | EXEC), self.watched[page])
                 } else {
                     Ok(GuestPageProtection::NONE)
@@ -752,7 +753,7 @@ impl Memory {
                 self.native_read_exceptions -= 1;
             }
             self.shared_pages.remove(&page);
-            if self.private_copy_pages.remove(&page).is_some() {
+            if self.private_copy_pages[page].take().is_some() {
                 self.private_copy_epoch += 1;
             }
         }
@@ -914,7 +915,7 @@ impl Memory {
     /// shared, or it is an owned private copy, whose SHARED bit is only a
     /// store barrier (as `native_permissions` treats it).
     fn linear(&self, page: usize) -> bool {
-        self.perms[page] & SHARED == 0 || self.private_copy_pages.get(&page) == Some(&true)
+        self.perms[page] & SHARED == 0 || self.private_copy_pages.get(page) == Some(&Some(true))
     }
 
     /// Like `read`, but owned private copies are read too.
@@ -1133,7 +1134,7 @@ impl Memory {
             return Err(error);
         }
         for page in pages.clone() {
-            self.private_copy_pages.insert(page, true);
+            self.private_copy_pages[page] = Some(true);
             #[cfg(windows)]
             if Self::native_read_exception(self.perms[page]) {
                 self.native_read_exceptions -= 1;
@@ -1153,7 +1154,7 @@ impl Memory {
         let range = self.committed(addr, len)?;
         if pages
             .clone()
-            .any(|page| !self.private_copy_pages.contains_key(&page))
+            .any(|page| self.private_copy_pages[page].is_none())
         {
             return Err("only owned private snapshots can be privatized".into());
         }
@@ -1166,10 +1167,10 @@ impl Memory {
         }
         let begin = range.start / PAGE_SIZE;
         let end = (range.end - 1) / PAGE_SIZE + 1;
-        let changed: Vec<_> = self
-            .private_copy_pages
-            .range(begin..end)
-            .filter_map(|(&page, &copy)| copy.then_some(page))
+        let changed: Vec<_> = self.private_copy_pages[begin..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, copy)| (*copy == Some(true)).then_some(begin + offset))
             .collect();
         // Restore hardware permissions before removing the execution barrier.
         // A failure leaves all COPY state and inline grants unchanged.
@@ -1192,7 +1193,7 @@ impl Memory {
         }
         self.private_copy_epoch += changed.len() as u64;
         for &page in &changed {
-            *self.private_copy_pages.get_mut(&page).unwrap() = false;
+            self.private_copy_pages[page] = Some(false);
             Arc::make_mut(&mut self.perms)[page] &= !SHARED;
             #[cfg(windows)]
             if Self::native_read_exception(self.perms[page]) {
@@ -1288,7 +1289,7 @@ impl Memory {
     }
     pub fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         let page = addr.checked_sub(self.base)? as usize / PAGE_SIZE;
-        if let Some(copy) = self.private_copy_pages.get(&page) {
+        if let Some(copy) = self.private_copy_pages.get(page).and_then(Option::as_ref) {
             return Some(*copy);
         }
         if self.resident.contains_key(&page) {

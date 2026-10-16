@@ -248,6 +248,20 @@ pub(crate) fn leave_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
 fn interlocked(env: &mut Env<'_>, f: impl Fn(u32, u32, u32) -> (u32, u32)) -> Outcome {
     env.cpu.quiesce_memory();
     let (p, a, b) = (env.arg(0), env.arg(1), env.arg(2));
+    if !env.cpu.accessible(p, 4, adv_cpu::backend::Prot::RW) {
+        // Execute the same faulting instruction even with guest acceleration
+        // disabled, preserving native SEH delivery and its resumable context.
+        let Some(body) = env.sys.thunks.get(env.thunk).guest_body() else {
+            return Outcome::Fail("Interlocked guest body missing".into());
+        };
+        return match env.checkpoint() {
+            Ok(mut checkpoint) => {
+                checkpoint.state.eip = body;
+                Outcome::ResumeExecution(checkpoint)
+            }
+            Err(error) => Outcome::Fail(error.to_string()),
+        };
+    }
     let old = env.cpu.read_u32(p).unwrap_or(0);
     let (new, ret) = f(old, a, b);
     let _ = env.cpu.write_u32(p, new);

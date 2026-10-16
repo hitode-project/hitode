@@ -152,11 +152,19 @@ impl<B: Backend> Runtime<B> {
             std::any::type_name::<B>(),
             self.missing_apis().join(", ")
         );
+        report.push_str(&format!(
+            "\nnon-leaf host calls: {}",
+            self.machine
+                .sys
+                .host_calls
+                .saturating_sub(self.machine.sys.stats.leaf_calls)
+        ));
         #[cfg(any(feature = "gpu", target_os = "macos"))]
         if self.machine.ext.try_get::<adv_dx::d3d9::State>().is_some() {
             let frames = self.gpu_diagnostics().frames;
             report.push_str(&format!("\nD3D9 recording: commands {}; flushes {:?}; eliminated frames {}; verification mismatches {}; full executions {}; clipped executions {}; clipped area sum {:.4}",
                 frames.recorded_commands,frames.flushes,frames.eliminated_frames,frames.verification_mismatches,frames.full_executions,frames.clipped_executions,frames.clipped_area_sum));
+            report.push_str(&frames.work_report());
         }
         let g = &graphics.stats;
         let seconds = g

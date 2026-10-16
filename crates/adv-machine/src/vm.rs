@@ -81,6 +81,11 @@ impl Vm {
         Some(addr)
     }
 
+    /// Roll back a reservation whose mapping failed, without touching CPU pages.
+    pub(crate) fn cancel_reservation(&mut self, addr: u32) {
+        self.used.remove(&addr);
+    }
+
     /// Reserve exactly `size` bytes at a free granule-aligned address. Like a
     /// Windows section view, the rest of the last granule is neither part of the
     /// region nor available to later reservations.

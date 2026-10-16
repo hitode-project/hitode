@@ -7,8 +7,9 @@
 //! acquire a reference. Anonymous references and alias references are counted
 //! separately, so releasing a borrowed token cannot destroy an open alias.
 
+use rustc_hash::FxHashMap as HashMap;
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -141,18 +142,21 @@ impl Default for Objects {
 }
 
 impl Objects {
+    pub fn reference_limit(&self) -> u32 {
+        self.limits.references
+    }
     pub fn with_limits(limits: ObjectLimits) -> Self {
         let table = NEXT_TABLE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("object table identity space exhausted");
         Self {
             table,
-            entries: HashMap::new(),
-            targets: HashMap::new(),
-            kernel_identities: HashMap::new(),
+            entries: HashMap::default(),
+            targets: HashMap::default(),
+            kernel_identities: HashMap::default(),
             timer_deadlines: BTreeSet::new(),
             handle_flags: BTreeMap::new(),
-            namespaces: HashMap::from([(0, NamespaceState::default())]),
+            namespaces: [(0, NamespaceState::default())].into_iter().collect(),
             next_object: 0,
             next_namespace: 0,
             limits,
