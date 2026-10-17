@@ -44,6 +44,9 @@ ndk-sys = "0.6"
 log.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
+# Video needs the static iOS FFmpeg from `tools/macos/build.py --ios`; build.rs
+# bundles it into the staticlib that Xcode links.
+adv-shell = { path = "../../../crates/adv-shell", features = ["media"] }
 log.workspace = true
 plist = "1.8"
 objc2 = "0.6.4"
