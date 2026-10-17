@@ -201,6 +201,7 @@ bd4004a0	ldr s0, [x5, #4]
 9acf0e11	sdiv x17, x16, x15
 9b06c22f	msub x15, x17, x6, x16
 9ba67e70	umull x16, w19, w6
+9bc27c10	umulh x16, x0, x2
 5ac00ad3	rev w19, w22
 dac01231	clz x17, x17
 d53b4431	mrs x17, fpsr

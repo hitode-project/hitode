@@ -1,8 +1,12 @@
 //! FLS for the thread contexts of the no-fiber profile. TLS retains its TEB
 //! owner in sync; FLS has independent indices and guest cleanup callbacks.
+//! Each value change is copied to the owner's TEB for the guest-code
+//! FlsGetValue; a zero there always defers to these banks.
 use std::collections::{BTreeMap, VecDeque};
 
 use adv_abi::{GuestPtr, Registry, win32};
+use adv_cpu::backend::GuestExt;
+use adv_machine::layout::teb::{FLS_SLOT_COUNT, FLS_SLOTS};
 use adv_machine::{CtxId, Env, Outcome, outcome::DeferredContinuation};
 
 use crate::util::{err, set_last_error};
@@ -22,6 +26,29 @@ struct Slot {
     generation: u64,
     callback: u32,
     freeing: bool,
+}
+
+/// Copies `value` of `index` to the TEB of `owner`.
+fn publish(env: &mut Env<'_>, owner: CtxId, index: u32, value: u32) {
+    if index < FLS_SLOT_COUNT {
+        let teb = env.sys.context(owner).teb;
+        let _ = env.cpu.write_u32(teb + FLS_SLOTS + 4 * index, value);
+    }
+}
+
+/// Removes `index` from every bank and its TEB copy, returning the values.
+fn remove_everywhere(env: &mut Env<'_>, index: u32) -> VecDeque<u32> {
+    let removed: Vec<_> = env
+        .ext
+        .get_mut::<LocalStorage>()
+        .values
+        .iter_mut()
+        .filter_map(|(&owner, values)| Some((owner, values.remove(&index)?)))
+        .collect();
+    for &(owner, _) in &removed {
+        publish(env, owner, index, 0);
+    }
+    removed.into_iter().map(|(_, value)| value).collect()
 }
 
 #[win32(kernel32, name = "FlsAlloc", level = implement)]
@@ -90,6 +117,7 @@ fn set(env: &mut Env<'_>, index: u32, value: GuestPtr<()>) -> i32 {
     } else {
         values.insert(index, value.addr());
     }
+    publish(env, env.context, index, value.addr());
     1
 }
 
@@ -105,13 +133,7 @@ fn run_free(
             // A callback may assign a new value. Windows processes that value
             // again during FlsFree; an endlessly rearming callback remains
             // guest execution subject to the normal watchdog and scheduling.
-            values = env
-                .ext
-                .get_mut::<LocalStorage>()
-                .values
-                .values_mut()
-                .filter_map(|values| values.remove(&index))
-                .collect();
+            values = remove_everywhere(env, index);
         }
         if let Some(value) = values.pop_front() {
             return Outcome::call(callback, vec![value], move |env, _| {
@@ -119,15 +141,12 @@ fn run_free(
             });
         }
     }
-    let storage = env.ext.get_mut::<LocalStorage>();
-    if storage.slots[index as usize]
+    if env.ext.get_mut::<LocalStorage>().slots[index as usize]
         .as_ref()
         .is_some_and(|slot| slot.generation == generation)
     {
-        for values in storage.values.values_mut() {
-            values.remove(&index);
-        }
-        storage.slots[index as usize] = None;
+        remove_everywhere(env, index);
+        env.ext.get_mut::<LocalStorage>().slots[index as usize] = None;
     }
     Outcome::Return(1)
 }
@@ -151,11 +170,7 @@ fn free(env: &mut Env<'_>, index: u32) -> Outcome {
     let (generation, callback) = (slot.generation, slot.callback);
     // Clear all banks before any guest call. FlsFree invokes these callbacks
     // on the freeing context, including values owned by another live thread.
-    let values = storage
-        .values
-        .values_mut()
-        .filter_map(|values| values.remove(&index))
-        .collect();
+    let values = remove_everywhere(env, index);
     run_free(env, index, generation, callback, values)
 }
 
@@ -191,14 +206,19 @@ fn run_detach(
                 && let Some(values) = storage.values.get_mut(&env.context)
             {
                 values.remove(&index);
+                publish(env, env.context, index, 0);
             }
             run_detach(env, slots, then)
         });
     }
-    env.ext
+    let left = env
+        .ext
         .get_mut::<LocalStorage>()
         .values
         .remove(&env.context);
+    for index in left.into_iter().flat_map(|values| values.into_keys()) {
+        publish(env, env.context, index, 0);
+    }
     then(env)
 }
 

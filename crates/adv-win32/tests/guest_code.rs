@@ -357,6 +357,71 @@ fn last_error_and_tls_guest_code_keep_their_teb_contract() {
     assert_eq!(run(jit(), true), host);
 }
 
+#[test]
+fn fls_guest_code_reads_published_values_and_defers_the_rest_to_the_host() {
+    fn run<B: Backend>(cpu: B, guest_code: bool) -> (Vec<u32>, u64) {
+        let mut m = machine(cpu, guest_code);
+        let f = |m: &mut Machine<B>, name: &str| m.resolve_import("kernel32.dll", name).unwrap();
+        let (set, get, alloc, free, set_fls, get_fls) = (
+            f(&mut m, "SetLastError"),
+            f(&mut m, "GetLastError"),
+            f(&mut m, "FlsAlloc"),
+            f(&mut m, "FlsFree"),
+            f(&mut m, "FlsSetValue"),
+            f(&mut m, "FlsGetValue"),
+        );
+        let slot = DATA + 0x100;
+        let out = RESULTS;
+        let saved = run_loop(&mut m, |a| {
+            let mut n = 0;
+            let mut read = |a: &mut Asm, index: Option<u32>| {
+                a.push_imm(0x1234);
+                a.call(set);
+                match index {
+                    Some(index) => a.push_imm(index),
+                    None => a.mov_eax_mem(slot).push_eax(),
+                };
+                a.call(get_fls);
+                raw(a, &[0xa3], out + 4 * n);
+                a.call(get);
+                raw(a, &[0xa3], out + 4 * n + 4);
+                n += 2;
+            };
+            a.push_imm(0);
+            a.call(alloc);
+            raw(a, &[0xa3], slot);
+            // Unset, set, out of the copied range, then freed.
+            read(a, None);
+            a.push_imm(0xabc);
+            a.mov_eax_mem(slot).push_eax();
+            a.call(set_fls);
+            read(a, None);
+            read(a, Some(300));
+            a.mov_eax_mem(slot).push_eax();
+            a.call(free);
+            read(a, None);
+        });
+        assert_eq!(saved[..4], SENTINELS);
+        assert_eq!(saved[4], 0);
+        let results = (0..8)
+            .map(|i| m.cpu.read_u32(out + 4 * i).unwrap())
+            .collect();
+        (results, m.sys.host_calls)
+    }
+    let (host, calls) = run(UnicornCpu::new(PARK_ADDR).unwrap(), false);
+    assert_eq!(host, [0, 0, 0xabc, 0, 0, 87, 0, 87]);
+    // Guest code takes the four SetLastError calls, the four GetLastError
+    // calls and the one read of a published value.
+    for (results, guest_calls) in [
+        run(UnicornCpu::new(PARK_ADDR).unwrap(), true),
+        run(JitCpu::new(PARK_ADDR, false).unwrap(), true),
+        run(jit(), true),
+    ] {
+        assert_eq!(results, host);
+        assert_eq!(calls - guest_calls, 9 * u64::from(ITERATIONS));
+    }
+}
+
 const CS: u32 = DATA + 0x200;
 const COUNTER: u32 = DATA + 0x240;
 const TRIES: u32 = DATA + 0x244;

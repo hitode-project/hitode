@@ -45,6 +45,7 @@ pub(crate) fn install(reg: &mut Registry) {
         ("kernel32.dll", "SetLastError", &SET_LAST_ERROR),
         ("kernel32.dll", "DebugBreak", &DEBUG_BREAK),
         ("kernel32.dll", "TlsGetValue", &TLS_GET_VALUE),
+        ("kernel32.dll", "FlsGetValue", &FLS_GET_VALUE),
         (
             "kernel32.dll",
             "EnterCriticalSection",
@@ -340,6 +341,29 @@ pub(crate) static TLS_GET_VALUE: GuestCode = GuestCode {
         0x00, 0x00, 0xc2, 0x04, 0x00,
     ],
     host: &[9],
+    links: &[],
+};
+
+/// `kernel32.dll!FlsGetValue`: the TEB copy holds only nonzero values of
+/// allocated low indices; a zero takes the host for the right LastError.
+/// ```text
+///     mov ecx, dword ptr [esp+4]
+///     cmp ecx, 256
+///     jae HOST
+///     mov eax, dword ptr fs:[0x200+ecx*4]
+///     test eax, eax
+///     jz HOST
+///     mov dword ptr fs:[0x34], 0
+///     ret 4
+/// ```
+pub(crate) static FLS_GET_VALUE: GuestCode = GuestCode {
+    code: &[
+        0x8b, 0x4c, 0x24, 0x04, 0x81, 0xf9, 0x00, 0x01, 0x00, 0x00, 0x0f, 0x83, 0x00, 0x00, 0x00,
+        0x00, 0x64, 0x8b, 0x04, 0x8d, 0x00, 0x02, 0x00, 0x00, 0x85, 0xc0, 0x0f, 0x84, 0x00, 0x00,
+        0x00, 0x00, 0x64, 0xc7, 0x05, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc2, 0x04,
+        0x00,
+    ],
+    host: &[12, 28],
     links: &[],
 };
 

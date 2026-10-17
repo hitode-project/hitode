@@ -504,30 +504,34 @@ impl Translator<'_> {
         if !matches!(source, Source::St(_)) {
             self.memory_operand(source, V1, Some(range), slow);
         }
-        // Masked exceptions, round to nearest, excluding reserved precision.
-        self.emit_all(&[and_imm(W, X16, X8, 0x3f), cmp_imm(W, X16, 0x3f, false)]);
-        self.asm.b_cond(Cond::Ne, slow);
-        self.emit(ubfx(W, X16, X8, 10, 2));
-        self.asm.cbz(W, true, X16, slow);
+        // Reserved precision takes the interpreter. Precision 64, directed
+        // rounding and operands that are not exact doubles in range take
+        // the integer path.
+        let wide = self.asm.label();
+        let end = self.asm.label();
         self.emit_all(&[ubfx(W, X16, X8, 8, 2), cmp_imm(W, X16, 1, false)]);
         self.asm.b_cond(Cond::Eq, slow);
+        self.emit(cmp_imm(W, X16, 3, false));
+        self.asm.b_cond(Cond::Eq, wide);
+        self.emit(ubfx(W, X16, X8, 10, 2));
+        self.asm.cbz(W, true, X16, wide);
         let target = self.slot(dest, X2);
         self.read_slot(target, X0, X1, slow);
-        self.double(X0, X1, V0, Take::Exact(range), slow);
+        self.double(X0, X1, V0, Take::Exact(range), wide);
         if let Source::St(index) = source {
             self.read(index, X0, X1, slow);
-            self.double(X0, X1, V1, Take::Exact(range), slow);
+            self.double(X0, X1, V1, Take::Exact(range), wide);
         }
-        let wide = self.asm.label();
-        self.asm.tbz(true, X8, 9, wide);
+        let full = self.asm.label();
+        self.asm.tbz(true, X8, 9, full);
         self.emit_all(&[
             fmov_from_v(X, X16, V0),
             fmov_from_v(X, X17, V1),
             orr(X, X16, X16, X17, Lsl, 0),
             and_imm(X, X16, X16, fast::SINGLE_TAIL),
         ]);
-        self.asm.cbz(X, true, X16, slow);
-        self.asm.bind(wide);
+        self.asm.cbz(X, true, X16, wide);
+        self.asm.bind(full);
         let (a, b) = if reverse { (V1, V0) } else { (V0, V1) };
         // d2 the result; x16 the bits of the error, whose sign is that of
         // exact - rounded.
@@ -578,7 +582,7 @@ impl Translator<'_> {
                     sub_imm(W, X17, X17, 1023 - range, false),
                     cmp_imm(W, X17, 2 * range, false),
                 ]);
-                self.asm.b_cond(Cond::Hi, slow);
+                self.asm.b_cond(Cond::Hi, wide);
                 self.asm.bind(zero);
             }
         }
@@ -586,8 +590,8 @@ impl Translator<'_> {
         let flagged = self.asm.label();
         self.emit(lsl_imm(X, X17, X16, 1));
         self.asm.cbz(X, false, X17, exact);
-        // Precision 64 takes only exact results.
-        self.asm.tbz(true, X8, 8, slow);
+        // Inexact needs PE masked.
+        self.asm.tbz(false, X8, 5, slow);
         self.emit_all(&[
             orr_imm(W, X13, X13, u64::from(PE)),
             fmov_from_v(X, X17, V2),
@@ -625,6 +629,398 @@ impl Translator<'_> {
         if pop {
             self.pop();
         }
+        self.asm.b(end);
+        self.asm.bind(wide);
+        self.x87_wide(op, dest, source, reverse, pop, slow);
+        self.asm.bind(end);
+    }
+
+    /// Arithmetic on the 64-bit significands in integers, rounded once to
+    /// the precision and rounding control. Each operation leaves the
+    /// significand in x0 with its top bit set, the bits below it in x7
+    /// (any lost bits ORed into bit 0), the biased exponent in w17 and the
+    /// sign in bit 15 of w1, or x1 the sign of a zero result.
+    fn x87_wide(
+        &mut self,
+        op: Arith,
+        dest: u8,
+        source: Source,
+        reverse: bool,
+        pop: bool,
+        slow: Label,
+    ) {
+        match source {
+            Source::St(index) => self.read(index, X2, X3, slow),
+            _ => self.extended(V1, X2, X3),
+        }
+        self.ordinary(X2, X3, slow);
+        let target = self.slot(dest, X7);
+        self.read_slot(target, X0, X1, slow);
+        self.ordinary(X0, X1, slow);
+        if reverse {
+            for (a, b) in [(X0, X2), (X1, X3)] {
+                self.emit_all(&[mov(X, X16, a), mov(X, a, b), mov(X, b, X16)]);
+            }
+        }
+        let round = self.asm.label();
+        let zero = self.asm.label();
+        let store = self.asm.label();
+        match op {
+            Arith::Add | Arith::Sub => self.wide_add(op == Arith::Sub, round, zero),
+            Arith::Mul => self.wide_mul(round, zero),
+            Arith::Div => self.wide_div(round, zero, slow),
+        }
+        self.asm.bind(round);
+        self.wide_round(slow);
+        self.asm.b(store);
+        self.asm.bind(zero);
+        self.emit(movz(X, X0, 0, 0));
+        self.clear_c1();
+        self.asm.bind(store);
+        let target = self.slot(dest, X2);
+        self.commit_value(target, X0, X1);
+        if pop {
+            self.pop();
+        }
+    }
+
+    /// x0 + x2, or x0 - x2: the operands are aligned in a 128-bit window
+    /// with the larger magnitude first, so a subtraction never borrows out.
+    fn wide_add(&mut self, subtract: bool, round: Label, zero: Label) {
+        if subtract {
+            self.emit(eor_imm(W, X3, X3, 0x8000));
+        }
+        let (b_zero, a_zero, both) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.asm.cbz(X, false, X2, b_zero);
+        self.asm.cbz(X, false, X0, a_zero);
+        let (ordered, swap) = (self.asm.label(), self.asm.label());
+        self.emit_all(&[
+            and_imm(W, X16, X1, 0x7fff),
+            and_imm(W, X17, X3, 0x7fff),
+            cmp(W, X16, X17, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Hi, ordered);
+        self.asm.b_cond(Cond::Lo, swap);
+        self.emit(cmp(X, X0, X2, Lsl, 0));
+        self.asm.b_cond(Cond::Hs, ordered);
+        self.asm.bind(swap);
+        for (a, b) in [(X0, X2), (X1, X3)] {
+            self.emit_all(&[mov(X, X16, a), mov(X, a, b), mov(X, b, X16)]);
+        }
+        self.asm.bind(ordered);
+        // w16 the exponent difference, at most 127: beyond it the smaller
+        // operand only makes the sum inexact. w8 bit 15 a subtraction.
+        self.emit_all(&[
+            and_imm(W, X16, X1, 0x7fff),
+            and_imm(W, X17, X3, 0x7fff),
+            sub(W, X16, X16, X17, Lsl, 0),
+            movz(W, X17, 127, 0),
+            cmp(W, X16, X17, Lsl, 0),
+            csel(W, X16, X16, X17, Cond::Ls),
+            eor(W, X8, X1, X3, Lsl, 0),
+        ]);
+        // x2:x3 the smaller significand shifted right by w16.
+        let (same, far, aligned) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.asm.cbz(W, false, X16, same);
+        self.emit(cmp_imm(W, X16, 64, false));
+        self.asm.b_cond(Cond::Hs, far);
+        self.emit_all(&[
+            movz(W, X17, 64, 0),
+            sub(W, X17, X17, X16, Lsl, 0),
+            shiftv(X, Shift::Lsl, X3, X2, X17),
+            shiftv(X, Shift::Lsr, X2, X2, X16),
+        ]);
+        self.asm.b(aligned);
+        self.asm.bind(far);
+        self.emit_all(&[
+            sub_imm(W, X16, X16, 64, false),
+            shiftv(X, Shift::Lsr, X3, X2, X16),
+            shiftv(X, Shift::Lsl, X17, X3, X16),
+            cmp(X, X17, X2, Lsl, 0),
+            cset(W, X17, Cond::Ne),
+            orr(X, X3, X3, X17, Lsl, 0),
+            movz(X, X2, 0, 0),
+        ]);
+        self.asm.b(aligned);
+        self.asm.bind(same);
+        self.emit(movz(X, X3, 0, 0));
+        self.asm.bind(aligned);
+        self.emit_all(&[and_imm(W, X17, X1, 0x7fff), and_imm(W, X1, X1, 0x8000)]);
+        let difference = self.asm.label();
+        self.asm.tbz(true, X8, 15, difference);
+        // A carry out shifts right, keeping the lost bit.
+        self.emit_all(&[mov(X, X7, X3), adds(X, X0, X0, X2, Lsl, 0)]);
+        self.asm.b_cond(Cond::Lo, round);
+        self.emit_all(&[
+            and_imm(X, X16, X7, 1),
+            orr(X, X7, X16, X7, Shift::Lsr, 1),
+            orr(X, X7, X7, X0, Lsl, 63),
+            lsr_imm(X, X0, X0, 1),
+            orr_imm(X, X0, X0, 1 << 63),
+            add_imm(W, X17, X17, 1, false),
+        ]);
+        self.asm.b(round);
+        self.asm.bind(difference);
+        let (high, cancel) = (self.asm.label(), self.asm.label());
+        self.emit_all(&[subs(X, X7, Reg::ZR, X3, Lsl, 0), sbcs(X, X0, X0, X2)]);
+        self.asm.cbz(X, true, X0, high);
+        self.asm.cbz(X, false, X7, cancel);
+        self.emit_all(&[
+            mov(X, X0, X7),
+            movz(X, X7, 0, 0),
+            sub_imm(W, X17, X17, 64, false),
+        ]);
+        self.asm.bind(high);
+        self.emit(clz(X, X16, X0));
+        self.asm.cbz(W, false, X16, round);
+        self.emit_all(&[
+            shiftv(X, Shift::Lsl, X0, X0, X16),
+            movz(W, X2, 64, 0),
+            sub(W, X2, X2, X16, Lsl, 0),
+            shiftv(X, Shift::Lsr, X2, X7, X2),
+            orr(X, X0, X0, X2, Lsl, 0),
+            shiftv(X, Shift::Lsl, X7, X7, X16),
+            sub(W, X17, X17, X16, Lsl, 0),
+        ]);
+        self.asm.b(round);
+        // An exact cancellation is +0, or -0 rounding down.
+        self.asm.bind(cancel);
+        self.emit_all(&[
+            ldrh(X8, X5, runtime::X87_CONTROL),
+            ubfx(W, X16, X8, 10, 2),
+            cmp_imm(W, X16, 1, false),
+            cset(W, X1, Cond::Eq),
+            lsl_imm(W, X1, X1, 15),
+        ]);
+        self.asm.b(zero);
+        // A zero operand leaves the other one, still to round.
+        self.asm.bind(b_zero);
+        self.asm.cbz(X, false, X0, both);
+        self.emit_all(&[
+            and_imm(W, X17, X1, 0x7fff),
+            and_imm(W, X1, X1, 0x8000),
+            movz(X, X7, 0, 0),
+        ]);
+        self.asm.b(round);
+        self.asm.bind(a_zero);
+        self.emit_all(&[
+            mov(X, X0, X2),
+            and_imm(W, X17, X3, 0x7fff),
+            and_imm(W, X1, X3, 0x8000),
+            movz(X, X7, 0, 0),
+        ]);
+        self.asm.b(round);
+        // Two zeros: negative only if both are, or either rounding down.
+        self.asm.bind(both);
+        self.emit_all(&[
+            ldrh(X8, X5, runtime::X87_CONTROL),
+            ubfx(W, X16, X8, 10, 2),
+            and(W, X17, X1, X3, Lsl, 0),
+            orr(W, X2, X1, X3, Lsl, 0),
+            cmp_imm(W, X16, 1, false),
+            csel(W, X1, X2, X17, Cond::Eq),
+            and_imm(W, X1, X1, 0x8000),
+        ]);
+        self.asm.b(zero);
+    }
+
+    /// x0 * x2: the 128-bit product, normalized by at most one bit.
+    fn wide_mul(&mut self, round: Label, zero: Label) {
+        self.emit_all(&[
+            and_imm(W, X17, X1, 0x7fff),
+            and_imm(W, X16, X3, 0x7fff),
+            add(W, X17, X17, X16, Lsl, 0),
+            eor(W, X1, X1, X3, Lsl, 0),
+            and_imm(W, X1, X1, 0x8000),
+        ]);
+        self.asm.cbz(X, false, X0, zero);
+        self.asm.cbz(X, false, X2, zero);
+        self.emit_all(&[
+            mul(X, X7, X0, X2),
+            umulh(X0, X0, X2),
+            // e_a + e_b - bias + 1, for a product of 2^127 or more.
+            sub_imm(W, X17, X17, 0x3ffe >> 12, true),
+            sub_imm(W, X17, X17, 0x3ffe & 0xfff, false),
+        ]);
+        self.asm.tbz(true, X0, 63, round);
+        self.emit_all(&[
+            lsl_imm(X, X0, X0, 1),
+            orr(X, X0, X0, X7, Shift::Lsr, 63),
+            lsl_imm(X, X7, X7, 1),
+            sub_imm(W, X17, X17, 1, false),
+        ]);
+        self.asm.b(round);
+    }
+
+    /// x0 / x2 by long division in 32-bit digits (Hacker's Delight
+    /// `divlu`), the remainder reduced to the bits `wide_round` reads.
+    fn wide_div(&mut self, round: Label, zero: Label, slow: Label) {
+        // A zero divisor raises ZE or IE.
+        self.asm.cbz(X, false, X2, slow);
+        self.emit_all(&[
+            and_imm(W, X17, X1, 0x7fff),
+            and_imm(W, X16, X3, 0x7fff),
+            sub(W, X17, X17, X16, Lsl, 0),
+            // e_a - e_b + bias - 1, for a quotient below 1.
+            add_imm(W, X17, X17, 0x3ffe >> 12, true),
+            add_imm(W, X17, X17, 0x3ffe & 0xfff, false),
+            eor(W, X1, X1, X3, Lsl, 0),
+            and_imm(W, X1, X1, 0x8000),
+        ]);
+        self.asm.cbz(X, false, X0, zero);
+        // The dividend x0 * 2^(63 + s) as x0:x1 with s = (a >= b), which
+        // keeps the high half below the divisor; x3 the divisor's high digit.
+        self.emit_all(&[
+            cmp(X, X0, X2, Lsl, 0),
+            cset(W, X16, Cond::Hs),
+            add(W, X17, X17, X16, Lsl, 0),
+            fmov_to_v(X, V2, X17),
+            fmov_to_v(X, V3, X1),
+            and(X, X1, X0, X16, Lsl, 0),
+            lsl_imm(X, X1, X1, 31),
+            shiftv(X, Shift::Lsr, X0, X0, X16),
+            lsr_imm(X, X3, X2, 32),
+        ]);
+        // x7 the high quotient digit; x16 its remainder digit.
+        self.emit_all(&[udiv(X, X7, X0, X3), msub(X, X16, X7, X3, X0)]);
+        self.wide_digit(X7, X1);
+        self.emit_all(&[
+            orr(X, X8, X1, X0, Lsl, 32),
+            mul(X, X17, X7, X2),
+            sub(X, X0, X8, X17, Lsl, 0),
+            lsl_imm(X, X7, X7, 32),
+            udiv(X, X1, X0, X3),
+            msub(X, X16, X1, X3, X0),
+        ]);
+        self.wide_digit(X1, Reg::ZR);
+        // x16 the remainder, then x8 the bits below the quotient: 0, 1
+        // below half, 2^63 at half or 2^63 + 1 above it.
+        let tail = self.asm.label();
+        self.emit_all(&[
+            orr(X, X7, X7, X1, Lsl, 0),
+            lsl_imm(X, X8, X0, 32),
+            mul(X, X17, X1, X2),
+            sub(X, X16, X8, X17, Lsl, 0),
+            sub(X, X17, X2, X16, Lsl, 0),
+            movz(X, X8, 0, 0),
+        ]);
+        self.asm.cbz(X, false, X16, tail);
+        self.emit_all(&[movz(X, X8, 1, 0), cmp(X, X16, X17, Lsl, 0)]);
+        self.asm.b_cond(Cond::Lo, tail);
+        self.emit(movz(X, X8, 0x8000, 48));
+        self.asm.b_cond(Cond::Eq, tail);
+        self.emit(orr_imm(X, X8, X8, 1));
+        self.asm.bind(tail);
+        self.emit_all(&[
+            mov(X, X0, X7),
+            mov(X, X7, X8),
+            fmov_from_v(X, X17, V2),
+            fmov_from_v(X, X1, V3),
+        ]);
+        self.asm.b(round);
+    }
+
+    /// Corrects the quotient digit `q`, whose remainder digit is x16, by
+    /// the divisor x2 (high digit x3) and the next dividend digit `next`.
+    fn wide_digit(&mut self, q: Reg, next: Reg) {
+        let (again, lower, done) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.asm.bind(again);
+        self.emit(lsr_imm(X, X17, q, 32));
+        self.asm.cbz(X, true, X17, lower);
+        self.emit_all(&[
+            mov(W, X17, X2),
+            mul(X, X17, q, X17),
+            orr(X, X8, next, X16, Lsl, 32),
+            cmp(X, X17, X8, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Ls, done);
+        self.asm.bind(lower);
+        self.emit_all(&[
+            sub_imm(X, q, q, 1, false),
+            add(X, X16, X16, X3, Lsl, 0),
+            lsr_imm(X, X17, X16, 32),
+        ]);
+        self.asm.cbz(X, false, X17, again);
+        self.asm.bind(done);
+    }
+
+    /// Rounds x0:x7 to the precision and rounding control, sets PE and C1,
+    /// and packs the result into x0 and x1; slow when PE is unmasked or
+    /// the exponent leaves the normal range.
+    fn wide_round(&mut self, slow: Label) {
+        // w2 the bits below the precision: 40, 11 or 0. Below 64 bits,
+        // x7 becomes the dropped bits with the old x7 ORed into bit 0.
+        let full = self.asm.label();
+        self.emit_all(&[
+            ldrh(X8, X5, runtime::X87_CONTROL),
+            ubfx(W, X16, X8, 8, 2),
+            movz(W, X2, 0, 0),
+            cmp_imm(W, X16, 3, false),
+        ]);
+        self.asm.b_cond(Cond::Eq, full);
+        self.emit_all(&[
+            movz(W, X2, 40, 0),
+            movz(W, X3, 11, 0),
+            cmp_imm(W, X16, 2, false),
+            csel(W, X2, X3, X2, Cond::Eq),
+            cmp_imm(X, X7, 0, false),
+            cset(W, X3, Cond::Ne),
+            movz(W, X16, 64, 0),
+            sub(W, X16, X16, X2, Lsl, 0),
+            shiftv(X, Shift::Lsl, X7, X0, X16),
+            orr(X, X7, X7, X3, Lsl, 0),
+            shiftv(X, Shift::Lsr, X0, X0, X2),
+        ]);
+        self.asm.bind(full);
+        let (exact, directed, decided, ranged) = (
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+        );
+        self.asm.cbz(X, false, X7, exact);
+        self.asm.tbz(false, X8, 5, slow);
+        // w3 whether to round the magnitude up.
+        self.emit(ubfx(W, X16, X8, 10, 2));
+        self.asm.cbz(W, true, X16, directed);
+        self.emit_all(&[
+            movz(X, X3, 0x8000, 48),
+            cmp(X, X7, X3, Lsl, 0),
+            cset(W, X3, Cond::Hi),
+        ]);
+        self.asm.b_cond(Cond::Ne, decided);
+        self.emit(and_imm(W, X3, X0, 1));
+        self.asm.b(decided);
+        // Down rounds negative magnitudes up, up positive ones; chop none.
+        self.asm.bind(directed);
+        self.emit_all(&[ubfx(W, X3, X1, 15, 1), cmp_imm(W, X16, 1, false)]);
+        self.asm.b_cond(Cond::Eq, decided);
+        self.emit_all(&[eor_imm(W, X3, X3, 1), cmp_imm(W, X16, 2, false)]);
+        self.asm.b_cond(Cond::Eq, decided);
+        self.emit(movz(W, X3, 0, 0));
+        self.asm.bind(decided);
+        // A carry out of the significand carries into the exponent.
+        self.emit_all(&[
+            orr_imm(W, X13, X13, u64::from(PE)),
+            bfi(W, X13, X3, 9, 1),
+            add(X, X0, X0, X3, Lsl, 0),
+            shiftv(X, Shift::Lsl, X0, X0, X2),
+        ]);
+        self.asm.cbz(X, true, X0, ranged);
+        self.emit_all(&[movz(X, X0, 0x8000, 48), add_imm(W, X17, X17, 1, false)]);
+        self.asm.b(ranged);
+        self.asm.bind(exact);
+        self.clear_c1();
+        self.emit(shiftv(X, Shift::Lsl, X0, X0, X2));
+        self.asm.bind(ranged);
+        // Underflow and overflow take the interpreter.
+        self.emit_all(&[
+            sub_imm(W, X16, X17, 1, false),
+            movz(W, X3, 0x7ffd, 0),
+            cmp(W, X16, X3, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Hi, slow);
+        self.emit(orr(W, X1, X1, X17, Lsl, 0));
     }
 
     fn x87_compare(&mut self, source: Source, pops: u8, slow: Label) {
@@ -641,18 +1037,36 @@ impl Translator<'_> {
             self.ordinary(X0, X1, slow);
             self.double(X0, X1, V1, Take::Sticky(X7), slow);
         }
-        let ordered = self.asm.label();
+        // w16 whether the values are equal, w17 whether ST(0) is less.
+        let (ordered, tie, join) = (self.asm.label(), self.asm.label(), self.asm.label());
         self.emit_all(&[orr(W, X16, X3, X7, Lsl, 0), fcmp(V0, V1)]);
         self.asm.b_cond(Cond::Ne, ordered);
-        self.asm.cbz(W, true, X16, slow);
+        self.asm.cbz(W, true, X16, tie);
         self.asm.bind(ordered);
+        self.emit_all(&[cset(W, X16, Cond::Eq), cset(W, X17, Cond::Mi)]);
+        self.asm.b(join);
+        // Equal doubles that lost bits share sign and exponent: the
+        // significands order the magnitudes.
+        self.asm.bind(tie);
+        self.read(0, X0, X1, slow);
+        match source {
+            Source::St(index) => self.read(index, X2, X3, slow),
+            _ => self.extended(V1, X2, X3),
+        }
         self.emit_all(&[
-            movz(W, X16, (C0 | C1 | C2 | C3) as u16, 0),
-            bic(W, X13, X13, X16, Lsl, 0),
+            cmp(X, X0, X2, Lsl, 0),
             cset(W, X16, Cond::Eq),
+            cset(W, X17, Cond::Lo),
+            cset(W, X2, Cond::Hi),
+            tst_imm(W, X1, 0x8000),
+            csel(W, X17, X2, X17, Cond::Ne),
+        ]);
+        self.asm.bind(join);
+        self.emit_all(&[
+            movz(W, X2, (C0 | C1 | C2 | C3) as u16, 0),
+            bic(W, X13, X13, X2, Lsl, 0),
             orr(W, X13, X13, X16, Lsl, 14),
-            cset(W, X16, Cond::Mi),
-            orr(W, X13, X13, X16, Lsl, 8),
+            orr(W, X13, X13, X17, Lsl, 8),
         ]);
         if pops == 2 {
             let second = self.slot(1, X7);

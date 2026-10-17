@@ -78,6 +78,10 @@ pub mod teb {
     pub const LAST_ERROR: u32 = 0x34;
     pub const TLS_SLOTS: u32 = 0xe10;
     pub const TLS_SLOT_COUNT: u32 = 64;
+    /// Synthetic: nonzero FLS values of the low indices, for the guest-code
+    /// FlsGetValue, in the GdiTebBatch buffer that host GDI never uses.
+    pub const FLS_SLOTS: u32 = 0x200;
+    pub const FLS_SLOT_COUNT: u32 = 256;
     /// Synthetic private extension after modeled Windows fields.
     pub const AUDIO_GUEST: u32 = 0xffc;
 }
