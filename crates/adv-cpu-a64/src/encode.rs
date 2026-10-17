@@ -901,7 +901,7 @@ pub const fn vsame(op: Same, arr: Arr, rd: VReg, rn: VReg, rm: VReg) -> u32 {
         arr.log2() < 3
             || matches!(
                 op,
-                Same::Add | Same::Sub | Same::Sshl | Same::Ushl | Same::Uqsub
+                Same::Add | Same::Sub | Same::Sshl | Same::Ushl | Same::Uqsub | Same::Cmeq
             )
     );
     0x0E20_0400

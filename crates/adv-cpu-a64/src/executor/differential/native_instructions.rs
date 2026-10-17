@@ -944,3 +944,58 @@ fn sse_loop_status_matches_interpreter_across_budgets_exceptions_and_observers()
         }
     }
 }
+
+/// With PE set, SSE arithmetic and conversions run without FPSR: zero
+/// operands that make a zero product or quotient stay native, and an
+/// underflowing, overflowing, invalid or saturating value takes the slow
+/// path, whose result and MXCSR match the owner's with PE set or clear.
+// spec: A64F-FP-5
+#[test]
+fn sse_values_choose_between_the_fast_and_the_slow_path() {
+    let tiny = f64::MIN_POSITIVE.to_bits();
+    // (dst, src, whether every form stays native with PE set).
+    let pairs: [(u64, u64, bool); 7] = [
+        (1.5f64.to_bits(), 2.25f64.to_bits(), true),
+        (0, 3.0f64.to_bits(), true),
+        (3.0f64.to_bits(), (-0.0f64).to_bits(), false),
+        (tiny, 0.25f64.to_bits(), false),
+        (f64::MAX.to_bits(), 4.0f64.to_bits(), false),
+        (3e9f64.to_bits(), 1.0f64.to_bits(), false),
+        (0x7ff8_0000_0000_0001, 1.0f64.to_bits(), false),
+    ];
+    for form in 0..7 {
+        for &(dst, src, clean) in &pairs {
+            for mxcsr in [0x1fa0, 0x1f80] {
+                let mut program = fixture(|a| {
+                    a.add(eax, ecx).unwrap();
+                    match form {
+                        0 => a.mulsd(xmm0, xmm1),
+                        1 => a.divsd(xmm0, xmm1),
+                        2 => a.mulpd(xmm0, xmm1),
+                        3 => a.addsd(xmm0, xmm1),
+                        4 => a.cvtsd2ss(xmm2, xmm0),
+                        5 => a.cvttsd2si(edx, xmm0),
+                        _ => a.mulps(xmm0, xmm1),
+                    }
+                    .unwrap();
+                });
+                for (x, value) in [(0, dst), (1, src)] {
+                    for lane in program.state.xmm[x].chunks_mut(8) {
+                        lane.copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+                program.state.mxcsr = mxcsr;
+                let config = (Features { flagm: false }, false, Checks::Adaptive);
+                let mut native = executor(&program, config, false);
+                let mut oracle = executor(&program, config, true);
+                let outcome = native.run(program.stop, 100).unwrap();
+                assert_eq!(outcome, oracle.run(program.stop, 100).unwrap());
+                same(&native, &oracle);
+                // Single precision reads these as other, rarely clean, values.
+                if clean && mxcsr == 0x1fa0 && form != 6 {
+                    assert_eq!(native.stats.interpreter_entries, 0, "form={form}");
+                }
+            }
+        }
+    }
+}

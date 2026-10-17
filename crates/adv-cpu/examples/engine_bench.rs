@@ -8,7 +8,7 @@
 //! engine, `a64` on AArch64 hosts and `cranelift` elsewhere; default both)
 //! and `ADV_ENGINE_BENCH_WORKLOADS` (comma list of workload names, default
 //! all: alu, memory, call_shallow, call_deep, dispatch, x87_pc64, x87_pc53,
-//! cold).
+//! sse, cold).
 //! Output: CSV rows of first-run milliseconds on a fresh CPU and steady-state
 //! nanoseconds per dynamic guest instruction. Workloads are self-authored; no
 //! game code or addresses are involved. Every engine's first run must match
@@ -463,6 +463,48 @@ fn measure_cold<E: Engine>(
     first.unwrap()
 }
 
+/// SSE2 scalar math as compilers emit it with `/arch:SSE2`: an integer to
+/// double, multiply-adds with memory constants, a single-precision step,
+/// and `_ftol2_sse`'s truncating conversion back to an integer.
+fn sse(n: u32) -> Workload {
+    const K: u32 = DATA;
+    const HALF: u32 = DATA + 8;
+    const GAIN: u32 = DATA + 16;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(ecx, n).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(esi, ecx).unwrap();
+    a.and(esi, 1023).unwrap();
+    a.cvtsi2sd(xmm0, esi).unwrap();
+    a.mulsd(xmm0, qword_ptr(K)).unwrap();
+    a.addsd(xmm0, qword_ptr(HALF)).unwrap();
+    a.movapd(xmm1, xmm0).unwrap();
+    a.mulsd(xmm1, xmm0).unwrap();
+    a.divsd(xmm1, qword_ptr(K)).unwrap();
+    a.cvtsd2ss(xmm2, xmm1).unwrap();
+    a.mulss(xmm2, dword_ptr(GAIN)).unwrap();
+    a.cvttss2si(edi, xmm2).unwrap();
+    a.cvttsd2si(eax, xmm0).unwrap();
+    a.add(edx, eax).unwrap();
+    a.add(edx, edi).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.int(0x2e).unwrap();
+    let mut constants = Vec::new();
+    for value in [0.37f64, 0.5] {
+        constants.extend_from_slice(&value.to_le_bytes());
+    }
+    constants.extend_from_slice(&0.75f32.to_le_bytes());
+    Workload {
+        name: "sse",
+        code: assemble(&mut a).0,
+        data: vec![(K, constants)],
+        instructions: 3 + 17 * u64::from(n),
+    }
+}
+
 fn main() {
     let samples: usize = std::env::args()
         .nth(1)
@@ -494,6 +536,7 @@ fn main() {
         dispatch(n(8_000)),
         x87("x87_pc64", 0x133f, n(200_000)),
         x87("x87_pc53", 0x027f, n(200_000)),
+        sse(n(400_000)),
     ];
     let cold = cold(n(4_000));
     let name = if cfg!(target_arch = "aarch64") {

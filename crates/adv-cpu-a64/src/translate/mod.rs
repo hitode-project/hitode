@@ -321,6 +321,8 @@ enum Cold {
     /// The `interpret` helper asked to leave with the exit + 1 in w0, at
     /// the EIP in `CpuState`, after refunding the countdown.
     Helper { label: Label, refund: u32 },
+    /// The slow path of an SSE floating instruction.
+    Floating(simd::Slow),
     /// The cold paths of a cached x87 instruction.
     X87(x87::Cold),
     /// Publishes a cached x87 run as it was before the instruction of a
@@ -515,7 +517,6 @@ impl Translator<'_> {
         self.mark(inst.pc, Part::Body);
         self.checking = (self.checked)(inst.pc);
         if self.checking && inst.effects.site {
-            self.vector.fp_clean = false;
             self.vector.fp_default = false;
         }
         self.out = trace.live_out[index];
@@ -550,7 +551,6 @@ impl Translator<'_> {
             self.state = State::CANONICAL;
         }
         if !steady {
-            self.floating_loop_start(index);
             self.asm.bind(self.labels[index]);
             self.pixel_start(index);
             self.channel_batch(index);
@@ -1219,6 +1219,7 @@ impl Translator<'_> {
                 }
                 self.asm.b(resume);
             }
+            Cold::Floating(slow) => self.floating_cold(slow),
             Cold::X87(cold) => self.x87_cold(cold),
             Cold::X87Fault {
                 label,

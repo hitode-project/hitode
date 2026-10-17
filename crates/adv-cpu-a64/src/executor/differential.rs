@@ -830,7 +830,8 @@ fn floating(
             .unwrap()
         };
     }
-    match rng.below(24) {
+    match rng.below(32) {
+        24.. => doubles(a, rng, mem),
         0..=3 => {
             a.mov(eax, rng.pick(&SPECIAL)).unwrap();
             a.movd(x, eax).unwrap();
@@ -892,6 +893,129 @@ fn floating(
                 _ => a.movhps(qword_ptr(p), x),
             }
             .unwrap()
+        }
+    }
+}
+
+/// SSE2 double-precision arithmetic and compares, and the conversions
+/// between integers, binary32 and binary64, over special doubles.
+fn doubles(
+    a: &mut CodeAssembler,
+    rng: &mut Rng,
+    mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
+) {
+    let (x, x2, w, r) = (
+        rng.pick(&XMM),
+        rng.pick(&XMM),
+        rng.pick(&WRITABLE),
+        rng.pick(&READABLE),
+    );
+    // Scratch doubles below the x87 ones.
+    let slot = ebx + 0x780 + 8 * rng.below(8) as i32;
+    let aligned = |rng: &mut Rng| ebx + 16 * rng.below(0x7f) as i32;
+    macro_rules! scalar {
+        ($op:ident) => {
+            match rng.below(3) {
+                0 => a.$op(x, x2),
+                1 => a.$op(x, qword_ptr(slot)),
+                _ => {
+                    let p = mem(a, rng);
+                    a.$op(x, qword_ptr(p))
+                }
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! packed {
+        ($op:ident) => {
+            if rng.below(2) == 0 {
+                a.$op(x, x2)
+            } else {
+                let p = aligned(rng);
+                a.$op(x, xmmword_ptr(p))
+            }
+            .unwrap()
+        };
+    }
+    match rng.below(16) {
+        0..=2 => {
+            let value = rng.pick(&DOUBLES);
+            a.mov(dword_ptr(slot), value as u32).unwrap();
+            a.mov(dword_ptr(slot + 4), (value >> 32) as u32).unwrap();
+            if rng.below(2) == 0 {
+                a.movsd_2(x, qword_ptr(slot)).unwrap();
+            } else {
+                a.movhps(x, qword_ptr(slot)).unwrap();
+            }
+        }
+        3 => scalar!(addsd),
+        4 => scalar!(subsd),
+        5 => scalar!(mulsd),
+        6 => scalar!(divsd),
+        7 => match rng.below(3) {
+            0 => packed!(addpd),
+            1 => packed!(subpd),
+            _ => packed!(mulpd),
+        },
+        8 => match rng.below(4) {
+            0 => a.cvttsd2si(w, x2),
+            1 => a.cvtsd2si(w, x2),
+            2 => a.cvttsd2si(w, qword_ptr(slot)),
+            _ => a.cvtsd2si(w, qword_ptr(slot)),
+        }
+        .unwrap(),
+        9 => match rng.below(3) {
+            0 => a.cvttss2si(w, x2),
+            1 => a.cvtss2si(w, x2),
+            _ => {
+                let p = mem(a, rng);
+                a.cvttss2si(w, dword_ptr(p))
+            }
+        }
+        .unwrap(),
+        10 => match rng.below(3) {
+            0 => a.cvtsi2sd(x, r),
+            1 => a.cvtsi2ss(x, r),
+            _ => {
+                let p = mem(a, rng);
+                a.cvtsi2ss(x, dword_ptr(p))
+            }
+        }
+        .unwrap(),
+        11 => match rng.below(3) {
+            0 => a.cvtsd2ss(x, x2),
+            1 => a.cvtsd2ss(x, qword_ptr(slot)),
+            _ => a.cvtss2sd(x, x2),
+        }
+        .unwrap(),
+        12 => match rng.below(3) {
+            0 => a.cvtps2pd(x, x2),
+            1 => a.cvtdq2ps(x, x2),
+            _ => a.cvtdq2pd(x, x2),
+        }
+        .unwrap(),
+        13 => match rng.below(4) {
+            0 => a.comisd(x, x2),
+            1 => a.ucomisd(x, qword_ptr(slot)),
+            2 => a.comiss(x, x2),
+            _ => a.ucomiss(x, x2),
+        }
+        .unwrap(),
+        14 => {
+            let imm = rng.below(8) as i32;
+            match rng.below(3) {
+                0 => a.cmpsd_3(x, x2, imm),
+                1 => a.cmppd(x, x2, imm),
+                _ => a.cmpss(x, x2, imm),
+            }
+            .unwrap()
+        }
+        _ => {
+            // Integer values that convert exactly, inexact fractions.
+            a.mov(w, rng.imm()).unwrap();
+            a.cvtsi2sd(x, w).unwrap();
+            a.mulsd(x, x2).unwrap();
+            a.cvttsd2si(w, x).unwrap();
         }
     }
 }

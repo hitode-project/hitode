@@ -24,15 +24,23 @@
 //!
 //! SSE arithmetic and conversions run in NEON while MXCSR is the default:
 //! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
-//! result is the x86 one whenever FPSR reports nothing but inexact: a quiet
-//! NaN operand propagates as the first source, as on x86. Invalid, divide
-//! by zero, overflow and underflow leave for the interpreter before the
-//! destination changes, which also settles x86's negative default NaN and
-//! its tininess after rounding. Inexact sets PE, and a denormal operand,
-//! which A64 does not report without FZ, sets DE from a check of the bits.
-//! Single- and double-precision comparisons use the same guard. Scalar
-//! forms ignore upper lanes; NaN signaling follows each x86 predicate.
-//! EFLAGS comparisons leave for the interpreter on any NaN.
+//! result is the x86 one whenever the operation raises nothing but
+//! inexact: a quiet NaN operand propagates as the first source, as on x86.
+//! Translated code never touches FPSR on the fast path, since its accesses
+//! serialize: an instruction runs there once PE is set (PE is sticky, so
+//! inexact needs no tracking), or when it cannot be inexact, with no
+//! denormal operand, and its values rule out every other exception: no
+//! infinite or NaN result, no zero or subnormal product or quotient that
+//! zero operands do not explain, no NaN compared or widened, no saturated
+//! integer. Anything else takes a slow path that redoes the instruction
+//! between a cleared and a read FPSR: invalid, divide by zero, overflow and
+//! underflow leave for the interpreter before the destination changes,
+//! which also settles x86's negative default NaN and its tininess after
+//! rounding; inexact sets PE, and a denormal operand, which A64 does not
+//! report without FZ, sets DE from a check of the bits. A false alarm only
+//! costs the slow path. Scalar forms ignore upper lanes; NaN signaling
+//! follows each x86 predicate. EFLAGS comparisons leave for the
+//! interpreter on any NaN.
 
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -42,6 +50,8 @@ use crate::runtime::{self, Exit};
 
 use super::decode::{Mem, memory};
 use super::flags::Operand;
+use crate::asm::Label;
+
 use super::{Cold, RUNTIME, Translator, WINDOW, X5, X13, X14, X16, X17, host};
 
 const V0: VReg = VReg::new(0);
@@ -165,10 +175,68 @@ impl Simd {
         )
     }
 
+    /// Whether a `floating` instruction can be inexact.
+    fn inexact(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Float(..)
+                | Kind::Double(..)
+                | Kind::ScalarFromInt(false)
+                | Kind::ScalarToInt(..)
+                | Kind::FromInt(false)
+                | Kind::Narrow
+                | Kind::ToInt(_)
+        )
+    }
+
+    /// Whether a `floating` instruction reads binary64 operands.
+    fn double(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Compare(_, true)
+                | Kind::Double(..)
+                | Kind::FlagCompare(true)
+                | Kind::Narrow
+                | Kind::ScalarToInt(true, _)
+        )
+    }
+
+    /// Whether a `floating` instruction reads only the low lane.
+    fn scalar(&self) -> bool {
+        match self.kind {
+            Kind::Float(_, scalar)
+            | Kind::Double(_, scalar)
+            | Kind::Compare(scalar, _)
+            | Kind::MinMax(_, scalar)
+            | Kind::Widen(scalar) => scalar,
+            Kind::FlagCompare(_) | Kind::Narrow | Kind::ScalarToInt(..) => true,
+            _ => false,
+        }
+    }
+
     /// Whether the destination is 128 bits wide.
     fn full(&self) -> bool {
         matches!(self.dst, Loc::Xmm(_))
     }
+}
+
+/// The operands of a `floating` instruction in host registers: the source
+/// and the inputs it computes from.
+#[derive(Clone, Copy, Debug)]
+pub struct Operands {
+    s: VReg,
+    inputs: [Option<VReg>; 2],
+}
+
+/// The slow path of a `floating` instruction.
+pub struct Slow {
+    simd: Simd,
+    operands: Operands,
+    slow: Label,
+    /// Checks a zero or subnormal result, then goes on or takes `slow`.
+    tiny: Option<Label>,
+    resume: Label,
+    bail: Label,
 }
 
 const NO_MEM: Mem = Mem {
@@ -436,8 +504,6 @@ pub struct Vector {
     ready: bool,
     /// x5 holds the `CpuState` pointer.
     pub cpu: bool,
-    /// FPSR has no exceptional status, and its inexact bit is already in MXCSR.
-    pub fp_clean: bool,
     /// MXCSR's control bits have passed the native SSE guard.
     pub fp_default: bool,
 }
@@ -452,71 +518,6 @@ fn vmem(bytes: u8) -> VMem {
 }
 
 impl Translator<'_> {
-    /// Clear host status on entry, before a simple SSE loop's backedge label.
-    /// Every arithmetic instruction still publishes MXCSR and checks exceptions.
-    pub(super) fn floating_loop_start(&mut self, start: usize) {
-        use super::decode::Op;
-        use super::trace::{Edge, Mode, Next};
-
-        if !self.trace.merge[start] {
-            return;
-        }
-        let mut floating = false;
-        for end in start..self.trace.len() {
-            let inst = self.trace.insts[end];
-            if (end != start && (self.trace.head(end) || self.trace.merge[end]))
-                || inst.mode != Mode::Plain
-                || inst.leaf.is_some()
-                || (inst.effects.site && (self.checked)(inst.pc))
-            {
-                return;
-            }
-            match inst.op {
-                Op::Simd(s) => floating |= s.floating(),
-                Op::Nop
-                | Op::Mov(..)
-                | Op::Lea(..)
-                | Op::Alu(..)
-                | Op::Step(..)
-                | Op::Neg(_)
-                | Op::Not(_)
-                | Op::Extend(..)
-                | Op::Cdq
-                | Op::Jmp(_)
-                | Op::Jcc(..)
-                | Op::Setcc(..)
-                | Op::Cmov(..)
-                | Op::Shift(..)
-                | Op::Imul(..)
-                | Op::Carry(..)
-                | Op::Narrow(..)
-                | Op::Direction(_) => {}
-                _ => return,
-            }
-            if inst.taken == Some(Edge::Internal(start))
-                || inst.next == Next::Edge(Edge::Internal(start))
-            {
-                // Any other incoming edge could skip the entry reset.
-                if floating
-                    && !self.trace.insts.iter().enumerate().any(|(i, inst)| {
-                        i != end
-                            && (inst.taken == Some(Edge::Internal(start))
-                                || inst.next == Next::Edge(Edge::Internal(start)))
-                    })
-                {
-                    self.emit(msr_fpsr(Reg::ZR));
-                    self.vector.fp_clean = true;
-                }
-                return;
-            }
-            if inst.next != Next::Fall
-                || matches!(inst.taken, Some(Edge::Internal(_) | Edge::Interpret(_)))
-            {
-                return;
-            }
-        }
-    }
-
     pub(super) fn simd(&mut self, simd: Simd) {
         if self.checking && simd.memory() {
             self.helper(simd.helper);
@@ -876,14 +877,21 @@ impl Translator<'_> {
     }
 
     /// Arithmetic, conversions and binary32/64 compares under the default
-    /// MXCSR, leaving for the interpreter on any exception but inexact.
-    /// Uses x13, x14 and v0-v6.
+    /// MXCSR. The fast path never touches FPSR: it runs once PE is set, or
+    /// for operations that cannot be inexact, with no denormal operand, and
+    /// sends values that could raise anything else to the slow path, which
+    /// redoes the operation between a cleared and a read FPSR and leaves
+    /// for the interpreter on any exception but inexact. Uses x13, x14 and
+    /// v0-v6.
     fn floating(&mut self, simd: Simd, address: Reg) {
-        let (v4, v5, v6) = (VReg::new(4), VReg::new(5), VReg::new(6));
         self.cpu();
         let bail = self.bail();
+        let (slow, resume) = (self.asm.label(), self.asm.label());
+        let inexact = simd.inexact();
+        if inexact || !self.vector.fp_default {
+            self.emit(ldr(W, X13, X5, runtime::MXCSR));
+        }
         // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
-        self.emit(ldr(W, X13, X5, runtime::MXCSR));
         if !self.vector.fp_default {
             self.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
             self.asm.cbz(W, true, X17, bail);
@@ -901,185 +909,29 @@ impl Translator<'_> {
             }
             loc => self.register(loc),
         };
-        let double = matches!(
-            simd.kind,
-            Kind::Compare(_, true)
-                | Kind::Double(..)
-                | Kind::FlagCompare(true)
-                | Kind::Narrow
-                | Kind::ScalarToInt(true, _)
-        );
-        let (scalar, inputs) = match simd.kind {
-            Kind::Float(_, scalar)
-            | Kind::Double(_, scalar)
-            | Kind::Compare(scalar, _)
-            | Kind::MinMax(_, scalar) => (scalar, [Some(self.register(simd.dst)), Some(s)]),
-            Kind::FlagCompare(_) => (true, [Some(self.register(simd.dst)), Some(s)]),
-            Kind::Widen(scalar) => (scalar, [None, Some(s)]),
-            Kind::Narrow | Kind::ScalarToInt(..) => (true, [None, Some(s)]),
-            _ => (false, [None, Some(s)]),
+        let inputs = match simd.kind {
+            Kind::Float(..)
+            | Kind::Double(..)
+            | Kind::Compare(..)
+            | Kind::MinMax(..)
+            | Kind::FlagCompare(_) => [Some(self.register(simd.dst)), Some(s)],
+            _ => [None, Some(s)],
         };
-        // DE: after shifting away the sign, a nonzero subnormal is below
-        // 2^24 (binary32) or 2^53 (binary64). Scalar upper lanes are ignored.
-        let arr = match simd.kind {
-            Kind::ToInt(_) | Kind::Widen(false) => Arr::S2,
-            _ if double => Arr::D2,
-            _ => Arr::S4,
-        };
-        if !matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) && scalar {
-            for input in inputs.into_iter().flatten() {
-                let clean = self.asm.label();
-                let size = if double { X } else { W };
-                let fraction = if double { 52 } else { 23 };
-                let exponent = if double { 11 } else { 8 };
-                self.emit_all(&[
-                    fmov_from_v(size, X16, input),
-                    ubfx(size, X17, X16, fraction, exponent),
-                ]);
-                self.asm.cbz(size, true, X17, clean);
-                self.emit(lsl_imm(size, X16, X16, exponent + 1));
-                self.asm.cbz(size, false, X16, clean);
-                self.emit(orr_imm(W, X13, X13, 2));
-                self.asm.bind(clean);
-            }
-        } else if !matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) {
-            self.emit_all(&[
-                movz(X, X16, 1, 0),
-                vdup(arr, v4, X16),
-                movz(W, X16, 0xffff, 0),
-            ]);
-            if double {
-                self.emit_all(&[
-                    movk(X, X16, 0xffff, 16),
-                    movk(X, X16, 0xffff, 32),
-                    movk(X, X16, 0x001f, 48),
-                ]);
-            } else {
-                self.emit(movk(W, X16, 0x00ff, 16));
-            }
-            self.emit(vdup(arr, v5, X16));
-            for (n, input) in inputs.into_iter().flatten().enumerate() {
-                let target = if n == 0 { v6 } else { V0 };
-                self.emit_all(&[
-                    vshift(ShiftImm::Shl, arr, target, input, 1),
-                    vsame(Same::Sub, arr, target, target, v4),
-                    vsame(Same::Uqsub, arr, target, v5, target),
-                ]);
-                if n != 0 {
-                    self.emit(vlogic(Logic::Orr, true, v6, v6, V0));
-                }
-            }
-            // The 64-bit forms clear the high half.
-            let clean = self.asm.label();
-            if double {
-                self.emit_all(&[
-                    vumov(3, X14, v6, 0),
-                    vumov(3, X17, v6, 1),
-                    orr(X, X17, X17, X14, Shift::Lsl, 0),
-                ]);
-            } else {
-                self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X17, v6)]);
-            }
-            self.asm.cbz(X, false, X17, clean);
-            self.emit(orr_imm(W, X13, X13, 2));
-            self.asm.bind(clean);
+        let operands = Operands { s, inputs };
+        if inexact {
+            self.asm.tbz(false, X13, 5, slow);
         }
-        self.remark(crate::jit_map::Part::FpStatus);
-        if !self.vector.fp_clean {
-            self.emit(msr_fpsr(Reg::ZR));
-        }
-        match simd.kind {
-            Kind::ScalarFromInt(double) => {
-                self.emit_all(&[fmov_from_v(W, X16, s), scvtf(W, V0, X16)]);
-                if !double {
-                    self.emit(unary(Unary::Narrow, V0, V0));
-                }
-            }
-            Kind::ScalarToInt(double, truncate) => {
-                let source = if double {
-                    s
-                } else {
-                    self.emit(unary(Unary::Widen, V0, s));
-                    V0
-                };
-                self.emit_all(&[fcvt_int(W, truncate, X16, source), fmov_to_v(W, V0, X16)]);
-            }
-            Kind::Double(op, true) => self.emit(dfloat(op, V0, inputs[0].unwrap(), s)),
-            Kind::Double(op, false) => {
-                self.emit(vfloat(op, true, V0, inputs[0].unwrap(), s) | 1 << 22)
-            }
-            Kind::FromInt(false) => self.emit(vfromint(V0, s)),
-            Kind::FromInt(true) => self.emit_all(&[
-                vumov(2, X16, s, 0),
-                scvtf(W, V0, X16),
-                vumov(2, X16, s, 1),
-                scvtf(W, V2, X16),
-                vins(3, V0, 1, V2, 0),
-            ]),
-            Kind::Widen(false) => self.emit(vwiden(V0, s)),
-            Kind::Widen(true) => self.emit(unary(Unary::Widen, V0, s)),
-            Kind::Narrow => self.emit(unary(Unary::Narrow, V0, s)),
-            Kind::FlagCompare(double) => {
-                let d = inputs[0].unwrap();
-                // Relational comparisons send every NaN to the original helper,
-                // which distinguishes COMIS from UCOMIS exception behavior.
-                self.emit_all(&[
-                    vcompare(Float::Fcmeq, true, double, V0, d, s),
-                    vcompare(Float::Fcmgt, true, double, V2, s, d),
-                ]);
-            }
-            Kind::Float(op, false) => self.emit(vfloat(op, true, V0, inputs[0].unwrap(), s)),
-            Kind::Float(op, true) => self.emit(sfloat(op, V0, inputs[0].unwrap(), s)),
-            Kind::Compare(scalar, double) => {
-                let d = inputs[0].unwrap();
-                // ARM equality is quiet for QNaN; relational comparisons signal.
-                // x86 negated predicates include unordered lanes, so invert the
-                // corresponding ordered test rather than reverse its operands.
-                match simd.imm & 7 {
-                    0 | 4 => self.emit(vcompare(Float::Fcmeq, scalar, double, V0, d, s)),
-                    1 | 5 => self.emit(vcompare(Float::Fcmgt, scalar, double, V0, s, d)),
-                    2 | 6 => self.emit(vcompare(Float::Fcmge, scalar, double, V0, s, d)),
-                    3 | 7 => self.emit_all(&[
-                        vcompare(Float::Fcmeq, scalar, double, V0, d, d),
-                        vcompare(Float::Fcmeq, scalar, double, V2, s, s),
-                        vlogic(Logic::And, true, V0, V0, V2),
-                    ]),
-                    _ => unreachable!(),
-                }
-                if matches!(simd.imm & 7, 3..=6) {
-                    self.emit(vnot(true, V0, V0));
-                }
-            }
-            Kind::MinMax(max, scalar) => {
-                let d = inputs[0].unwrap();
-                // The first source where it compares above (max) or
-                // below (min) the second, else the second; any NaN is
-                // invalid for the compare.
-                let (a, b) = if max { (d, s) } else { (s, d) };
-                self.emit_all(&[
-                    if scalar {
-                        sfcmgt(V0, a, b)
-                    } else {
-                        vfloat(Float::Fcmgt, true, V0, a, b)
-                    },
-                    vlogic(Logic::Bsl, true, V0, d, s),
-                ]);
-            }
-            Kind::ToInt(truncate) => self.emit(vtoint(truncate, false, V0, s)),
-            _ => unreachable!(),
-        }
-        // Successful SSE operations can retain sticky inexact across the next
-        // operation: MXCSR has already recorded it. Observers reset this fact.
-        self.vector.fp_clean = true;
-        // Anything but inexact leaves; inexact sets PE.
-        self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
-        self.asm.cbz(X, true, X14, bail);
-        self.remark(crate::jit_map::Part::Body);
-        self.emit_all(&[
-            ubfx(W, X17, X17, 4, 1),
-            orr(W, X13, X13, X17, Shift::Lsl, 5),
-            str(W, X13, X5, runtime::MXCSR),
-        ]);
+        self.denormals(simd, operands, Some(slow));
+        let tiny = self.floating_fast(simd, operands, slow);
+        self.asm.bind(resume);
+        self.push_cold(Cold::Floating(Slow {
+            simd,
+            operands,
+            slow,
+            tiny,
+            resume,
+            bail,
+        }));
         if matches!(simd.kind, Kind::ScalarToInt(..)) {
             let Loc::Gpr(index) = simd.dst else {
                 unreachable!()
@@ -1124,6 +976,359 @@ impl Translator<'_> {
             _ => vmov(true, d, V0),
         });
         self.written(simd.dst);
+    }
+
+    /// The fast path of `floating` into v0 (and v2), with the checks around
+    /// it; the label of the cold check of a zero or subnormal result that
+    /// zero operands may make exact.
+    fn floating_fast(&mut self, simd: Simd, operands: Operands, slow: Label) -> Option<Label> {
+        let (v3, v4, v5, v6) = (VReg::new(3), VReg::new(4), VReg::new(5), VReg::new(6));
+        let double = simd.double();
+        let scalar = simd.scalar();
+        let [a, _] = operands.inputs;
+        let s = operands.s;
+        match simd.kind {
+            // Rare: always exact through FPSR.
+            Kind::ToInt(_) => {
+                self.asm.b(slow);
+                return None;
+            }
+            // Any NaN may raise IE: the slow path tells.
+            Kind::MinMax(..)
+            | Kind::Compare(..)
+            | Kind::FlagCompare(_)
+            | Kind::Widen(_)
+            | Kind::ScalarToInt(..) => {
+                let inputs: Vec<VReg> = operands.inputs.into_iter().flatten().collect();
+                if simd.kind == Kind::Widen(false) {
+                    // Two binary32 lanes in the low half.
+                    self.emit_all(&[
+                        vfloat(Float::Fcmeq, false, v3, s, s),
+                        fmov_from_v(X, X16, v3),
+                        add_imm(X, X16, X16, 1, false),
+                    ]);
+                    self.asm.cbz(X, true, X16, slow);
+                } else {
+                    for (n, &input) in inputs.iter().enumerate() {
+                        let target = if n == 0 { v3 } else { v4 };
+                        self.emit(vcompare(Float::Fcmeq, scalar, double, target, input, input));
+                    }
+                    if inputs.len() == 2 {
+                        self.emit(vlogic(Logic::And, true, v3, v3, v4));
+                    }
+                    if scalar {
+                        self.emit(fmov_from_v(X, X16, v3));
+                        self.asm.cbz(W, false, X16, slow);
+                    } else {
+                        self.emit_all(&[
+                            vnot(true, v3, v3),
+                            umaxv(v3, v3),
+                            fmov_from_v(W, X16, v3),
+                        ]);
+                        self.asm.cbz(W, true, X16, slow);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.floating_op(simd, operands);
+        match simd.kind {
+            Kind::Float(op, _) | Kind::Double(op, _) if scalar => {
+                let sum = matches!(op, Float::Fadd | Float::Fsub);
+                let tiny = self.result_bits(double, V0, !sum);
+                if sum {
+                    // A tiny sum is exact: only infinities and NaNs.
+                    self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
+                    return None;
+                }
+                let label = self.asm.label();
+                self.asm.cbz(W, false, tiny, label);
+                Some(label)
+            }
+            Kind::Float(op, _) | Kind::Double(op, _) => {
+                let arr = if double { Arr::D2 } else { Arr::S4 };
+                // v6 lanes with an infinity or NaN, v5 zeros and subnormals.
+                if double {
+                    self.emit(movz(X, X16, 0x7ff0, 48));
+                } else {
+                    self.emit(movz(W, X16, 0x7f80, 16));
+                }
+                self.emit_all(&[
+                    vdup(arr, v4, X16),
+                    vlogic(Logic::And, true, v5, V0, v4),
+                    vsame(Same::Cmeq, arr, v6, v5, v4),
+                ]);
+                if !matches!(op, Float::Fadd | Float::Fsub) {
+                    // A product with a zero factor, or a zero dividend, is
+                    // an exact zero.
+                    self.emit_all(&[
+                        vzero(true, V2),
+                        vsame(Same::Cmeq, arr, v5, v5, V2),
+                        vcompare(Float::Fcmeq, false, double, v3, a.unwrap(), V2),
+                    ]);
+                    if op == Float::Fmul {
+                        self.emit_all(&[
+                            vcompare(Float::Fcmeq, false, double, v4, s, V2),
+                            vlogic(Logic::Orr, true, v3, v3, v4),
+                        ]);
+                    }
+                    self.emit_all(&[
+                        vlogic(Logic::Bic, true, v5, v5, v3),
+                        vlogic(Logic::Orr, true, v6, v6, v5),
+                    ]);
+                }
+                self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X16, v6)]);
+                self.asm.cbz(W, true, X16, slow);
+                None
+            }
+            Kind::Narrow => {
+                let tiny = self.result_bits(false, V0, true);
+                let label = self.asm.label();
+                self.asm.cbz(W, false, tiny, label);
+                Some(label)
+            }
+            Kind::ScalarToInt(..) => {
+                // fcvtzs and fcvtns saturate: both limits leave, with the
+                // NaNs already gone.
+                self.emit_all(&[
+                    eor(W, X17, X16, X16, Shift::Asr, 31),
+                    add_imm(W, X17, X17, 1, false),
+                ]);
+                self.asm.tbz(true, X17, 31, slow);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The biased exponent + 1 of the scalar result in `v`, in w17, and if
+    /// `tiny`, in w14 a register that is zero for a zero, subnormal,
+    /// infinite or NaN result; uses x16.
+    fn result_bits(&mut self, double: bool, v: VReg, tiny: bool) -> Reg {
+        let (size, fraction, exponent) = if double { (X, 52, 11) } else { (W, 23, 8) };
+        self.emit_all(&[
+            fmov_from_v(size, X16, v),
+            ubfx(size, X17, X16, fraction, exponent),
+            add_imm(W, X17, X17, 1, false),
+        ]);
+        if tiny {
+            self.emit(and_imm(W, X14, X17, (1 << exponent) - 2));
+        }
+        X14
+    }
+
+    /// Branches to `to`, or sets DE in w13 without one, when an operand
+    /// `floating` reads is a nonzero subnormal. Scalar upper lanes are
+    /// ignored. Uses x16, x17 and v0 and v4-v6.
+    fn denormals(&mut self, simd: Simd, operands: Operands, to: Option<Label>) {
+        if matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) {
+            return;
+        }
+        let (v4, v5, v6) = (VReg::new(4), VReg::new(5), VReg::new(6));
+        let double = simd.double();
+        let inputs = operands.inputs;
+        // After shifting away the sign, a nonzero subnormal is below 2^24
+        // (binary32) or 2^53 (binary64).
+        if simd.scalar() {
+            for input in inputs.into_iter().flatten() {
+                let clean = self.asm.label();
+                let size = if double { X } else { W };
+                let fraction = if double { 52 } else { 23 };
+                let exponent = if double { 11 } else { 8 };
+                self.emit_all(&[
+                    fmov_from_v(size, X16, input),
+                    ubfx(size, X17, X16, fraction, exponent),
+                ]);
+                self.asm.cbz(size, true, X17, clean);
+                self.emit(lsl_imm(size, X16, X16, exponent + 1));
+                match to {
+                    Some(to) => self.asm.cbz(size, true, X16, to),
+                    None => {
+                        self.asm.cbz(size, false, X16, clean);
+                        self.emit(orr_imm(W, X13, X13, 2));
+                    }
+                }
+                self.asm.bind(clean);
+            }
+            return;
+        }
+        let arr = match simd.kind {
+            Kind::ToInt(_) | Kind::Widen(false) => Arr::S2,
+            _ if double => Arr::D2,
+            _ => Arr::S4,
+        };
+        self.emit_all(&[
+            movz(X, X16, 1, 0),
+            vdup(arr, v4, X16),
+            movz(W, X16, 0xffff, 0),
+        ]);
+        if double {
+            self.emit_all(&[
+                movk(X, X16, 0xffff, 16),
+                movk(X, X16, 0xffff, 32),
+                movk(X, X16, 0x001f, 48),
+            ]);
+        } else {
+            self.emit(movk(W, X16, 0x00ff, 16));
+        }
+        self.emit(vdup(arr, v5, X16));
+        for (n, input) in inputs.into_iter().flatten().enumerate() {
+            let target = if n == 0 { v6 } else { V0 };
+            self.emit_all(&[
+                vshift(ShiftImm::Shl, arr, target, input, 1),
+                vsame(Same::Sub, arr, target, target, v4),
+                vsame(Same::Uqsub, arr, target, v5, target),
+            ]);
+            if n != 0 {
+                self.emit(vlogic(Logic::Orr, true, v6, v6, V0));
+            }
+        }
+        // The 64-bit forms clear the high half.
+        if double {
+            self.emit_all(&[
+                vumov(3, X14, v6, 0),
+                vumov(3, X17, v6, 1),
+                orr(X, X17, X17, X14, Shift::Lsl, 0),
+            ]);
+        } else {
+            self.emit_all(&[umaxv(v6, v6), fmov_from_v(W, X17, v6)]);
+        }
+        match to {
+            Some(to) => self.asm.cbz(X, true, X17, to),
+            None => {
+                let clean = self.asm.label();
+                self.asm.cbz(X, false, X17, clean);
+                self.emit(orr_imm(W, X13, X13, 2));
+                self.asm.bind(clean);
+            }
+        }
+    }
+
+    /// The operation of `floating`, into v0 (v2 also for EFLAGS compares,
+    /// x16 also for integer results).
+    fn floating_op(&mut self, simd: Simd, operands: Operands) {
+        let s = operands.s;
+        let d = operands.inputs[0];
+        match simd.kind {
+            Kind::ScalarFromInt(double) => {
+                self.emit_all(&[fmov_from_v(W, X16, s), scvtf(W, V0, X16)]);
+                if !double {
+                    self.emit(unary(Unary::Narrow, V0, V0));
+                }
+            }
+            Kind::ScalarToInt(double, truncate) => {
+                let source = if double {
+                    s
+                } else {
+                    self.emit(unary(Unary::Widen, V0, s));
+                    V0
+                };
+                self.emit_all(&[fcvt_int(W, truncate, X16, source), fmov_to_v(W, V0, X16)]);
+            }
+            Kind::Double(op, true) => self.emit(dfloat(op, V0, d.unwrap(), s)),
+            Kind::Double(op, false) => self.emit(vfloat(op, true, V0, d.unwrap(), s) | 1 << 22),
+            Kind::FromInt(false) => self.emit(vfromint(V0, s)),
+            Kind::FromInt(true) => self.emit_all(&[
+                vumov(2, X16, s, 0),
+                scvtf(W, V0, X16),
+                vumov(2, X16, s, 1),
+                scvtf(W, V2, X16),
+                vins(3, V0, 1, V2, 0),
+            ]),
+            Kind::Widen(false) => self.emit(vwiden(V0, s)),
+            Kind::Widen(true) => self.emit(unary(Unary::Widen, V0, s)),
+            Kind::Narrow => self.emit(unary(Unary::Narrow, V0, s)),
+            Kind::FlagCompare(double) => {
+                let d = d.unwrap();
+                // Relational comparisons send every NaN to the original helper,
+                // which distinguishes COMIS from UCOMIS exception behavior.
+                self.emit_all(&[
+                    vcompare(Float::Fcmeq, true, double, V0, d, s),
+                    vcompare(Float::Fcmgt, true, double, V2, s, d),
+                ]);
+            }
+            Kind::Float(op, false) => self.emit(vfloat(op, true, V0, d.unwrap(), s)),
+            Kind::Float(op, true) => self.emit(sfloat(op, V0, d.unwrap(), s)),
+            Kind::Compare(scalar, double) => {
+                let d = d.unwrap();
+                // ARM equality is quiet for QNaN; relational comparisons signal.
+                // x86 negated predicates include unordered lanes, so invert the
+                // corresponding ordered test rather than reverse its operands.
+                match simd.imm & 7 {
+                    0 | 4 => self.emit(vcompare(Float::Fcmeq, scalar, double, V0, d, s)),
+                    1 | 5 => self.emit(vcompare(Float::Fcmgt, scalar, double, V0, s, d)),
+                    2 | 6 => self.emit(vcompare(Float::Fcmge, scalar, double, V0, s, d)),
+                    3 | 7 => self.emit_all(&[
+                        vcompare(Float::Fcmeq, scalar, double, V0, d, d),
+                        vcompare(Float::Fcmeq, scalar, double, V2, s, s),
+                        vlogic(Logic::And, true, V0, V0, V2),
+                    ]),
+                    _ => unreachable!(),
+                }
+                if matches!(simd.imm & 7, 3..=6) {
+                    self.emit(vnot(true, V0, V0));
+                }
+            }
+            Kind::MinMax(max, scalar) => {
+                let d = d.unwrap();
+                // The first source where it compares above (max) or
+                // below (min) the second, else the second; any NaN is
+                // invalid for the compare.
+                let (a, b) = if max { (d, s) } else { (s, d) };
+                self.emit_all(&[
+                    if scalar {
+                        sfcmgt(V0, a, b)
+                    } else {
+                        vfloat(Float::Fcmgt, true, V0, a, b)
+                    },
+                    vlogic(Logic::Bsl, true, V0, d, s),
+                ]);
+            }
+            Kind::ToInt(truncate) => self.emit(vtoint(truncate, false, V0, s)),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The slow path of a `floating` instruction, and its tiny-result check.
+    pub(super) fn floating_cold(&mut self, cold: Slow) {
+        let Slow {
+            simd,
+            operands,
+            slow,
+            tiny,
+            resume,
+            bail,
+        } = cold;
+        if let Some(tiny) = tiny {
+            self.asm.bind(tiny);
+            let double = simd.double();
+            self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
+            let zeros = match simd.kind {
+                Kind::Float(Float::Fmul, _) | Kind::Double(Float::Fmul, _) => operands.inputs,
+                Kind::Narrow => [Some(operands.s), None],
+                _ => [operands.inputs[0], None],
+            };
+            for zero in zeros.into_iter().flatten() {
+                let size = if double { X } else { W };
+                self.emit_all(&[fmov_from_v(size, X16, zero), lsl_imm(size, X16, X16, 1)]);
+                self.asm.cbz(size, false, X16, resume);
+            }
+        }
+        self.asm.bind(slow);
+        self.remark(crate::jit_map::Part::FpStatus);
+        self.emit(ldr(W, X13, X5, runtime::MXCSR));
+        self.denormals(simd, operands, None);
+        self.emit(msr_fpsr(Reg::ZR));
+        self.floating_op(simd, operands);
+        // Anything but inexact leaves; inexact sets PE.
+        self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
+        self.asm.cbz(X, true, X14, bail);
+        self.emit_all(&[
+            ubfx(W, X17, X17, 4, 1),
+            orr(W, X13, X13, X17, Shift::Lsl, 5),
+            str(W, X13, X5, runtime::MXCSR),
+        ]);
+        self.asm.b(resume);
     }
 
     /// The host register of an MMX or XMM operand, loaded if the unit has
