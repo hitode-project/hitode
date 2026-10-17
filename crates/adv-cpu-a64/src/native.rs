@@ -522,8 +522,11 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 
 pub(crate) struct Native {
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
-    // Source entry, guest target, host slot and original shared stub.
-    rows: Vec<(u32, u32, usize, usize)>,
+    /// Switch-table slots by guest target: source entry, host slot and
+    /// original shared stub. Dispatch looks targets up on every miss.
+    rows: FxHashMap<u32, Vec<(u32, usize, usize)>>,
+    /// Entries of units that own switch tables.
+    table_sources: FxHashSet<u32>,
     bridge: *mut std::ffi::c_void,
     pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     cache: CodeCache,
@@ -607,7 +610,8 @@ impl Native {
         runtime.shadow = shadow.top();
         Ok(Self {
             images: Default::default(),
-            rows: Vec::new(),
+            rows: FxHashMap::default(),
+            table_sources: FxHashSet::default(),
             bridge: std::ptr::null_mut(),
             interrupt: None,
             stub_len: cache.used(),
@@ -829,7 +833,7 @@ impl Native {
     }
 
     fn resolve_tables(&mut self, memory: &Memory, eip: u32, unit: usize) {
-        if self.rows.iter().all(|row| row.1 != eip)
+        if !self.rows.contains_key(&eip)
             || self.stops.contains(&eip)
             || !translate::tables::image(&self.images.borrow(), eip, 1)
         {
@@ -851,11 +855,9 @@ impl Native {
         {
             return;
         }
-        for &(_, target, point, _) in &self.rows {
-            if target == eip {
-                self.cache.patch(point, unit as u32);
-                self.cache.patch(point + 4, ((unit as u64) >> 32) as u32);
-            }
+        for &(_, point, _) in &self.rows[&eip] {
+            self.cache.patch(point, unit as u32);
+            self.cache.patch(point + 4, ((unit as u64) >> 32) as u32);
         }
     }
 
@@ -881,12 +883,15 @@ impl Native {
     /// Drops the unit at `eip`, if any, and restores the link points that
     /// branch to it; the caller forgets dynamic targets.
     fn drop_unit(&mut self, eip: u32) -> bool {
-        self.rows.retain(|&(source, _, _, _)| source != eip);
-        for &(_, target, point, stub) in &self.rows {
-            if target == eip {
-                self.cache.patch(point, stub as u32);
-                self.cache.patch(point + 4, ((stub as u64) >> 32) as u32);
-            }
+        if self.table_sources.remove(&eip) {
+            self.rows.retain(|_, slots| {
+                slots.retain(|&(source, _, _)| source != eip);
+                !slots.is_empty()
+            });
+        }
+        for &(_, point, stub) in self.rows.get(&eip).into_iter().flatten() {
+            self.cache.patch(point, stub as u32);
+            self.cache.patch(point + 4, ((stub as u64) >> 32) as u32);
         }
         let mut next = self.links.remove(&eip).unwrap_or(u32::MAX);
         while let Some(&(point, word, after)) = self.linked.get(next as usize) {
@@ -904,10 +909,11 @@ impl Native {
     #[cfg(test)]
     pub(crate) fn switch_counts(&self) -> (usize, usize) {
         (
-            self.rows.len(),
+            self.rows.values().map(Vec::len).sum(),
             self.rows
-                .iter()
-                .filter(|&&(_, _, point, stub)| {
+                .values()
+                .flatten()
+                .filter(|&&(_, point, stub)| {
                     let value = u64::from(self.cache.word(point))
                         | (u64::from(self.cache.word(point + 4)) << 32);
                     value != stub as u64
@@ -1015,6 +1021,7 @@ impl Native {
         self.cache.truncate(self.stub_len);
         self.units.clear();
         self.rows.clear();
+        self.table_sources.clear();
         self.channels = false;
         self.pages.clear();
         self.links.clear();
@@ -1121,10 +1128,13 @@ impl Native {
         let entry = self.place(eip, work.words(), work.sites(), work.retired());
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
+            if !work.tables.is_empty() {
+                self.table_sources.insert(eip);
+            }
             for table in &work.tables {
                 for (index, &target) in table.targets.iter().enumerate() {
-                    self.rows
-                        .push((eip, target, at + table.offset + index * 8, at + table.stub));
+                    let slot = (eip, at + table.offset + index * 8, at + table.stub);
+                    self.rows.entry(target).or_default().push(slot);
                 }
             }
             let mut targets: Vec<_> = work
