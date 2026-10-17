@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import { jit } from "../lib/jit.svelte";
   import { LaunchFlow } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -27,6 +28,18 @@
             <div class="msg">{t("正在启动")}</div>
             <div class="track" role="progressbar" aria-label={t("正在启动")}><span class="fill"></span></div>
           </div>
+        {:else if flow.view === "jit-wait"}
+          <div class="state fade">
+            <div class="msg">{t("正在启用 JIT")}</div>
+            <div class="track" role="progressbar" aria-label={t("正在启用 JIT")}><span class="fill"></span></div>
+            <div class="hint">{jit.note}</div>
+          </div>
+        {:else if flow.view === "jit"}
+          <div class="state fade">
+            <div class="msg">{t("强烈建议启用 JIT")}</div>
+            <div class="hint">{t("未启用时，这次游戏会全程以解释模式运行，速度会慢很多。")}</div>
+            {#if jit.status?.error || jit.requestError}<div class="chip mono">{jit.note}</div>{/if}
+          </div>
         {:else if flow.view === "failed"}
           <div class="state fade">
             <div class="msg">{t("游戏已停止")}</div>
@@ -47,6 +60,21 @@
       <div class="acts"><button class="btn primary" onclick={() => nav.home()}>{t("返回")}</button></div>
     {:else if flow.view === "prepare"}
       <div class="acts"><button class="btn quiet" onclick={() => flow.cancel()}>{t("取消")}</button></div>
+    {:else if flow.view === "jit-wait"}
+      <div class="acts fade">
+        <button class="btn quiet" onclick={() => flow.withoutJit()}>{t("不等了，直接开始")}</button>
+        <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+      </div>
+    {:else if flow.view === "jit"}
+      <div class="acts fade">
+        {#if jit.configured || jit.status?.liveContainer}
+          <button class="btn primary" onclick={() => flow.enableJit()}>{jit.status?.liveContainer ? t("用 StikDebug 启用") : t("启用 JIT")}</button>
+        {:else}
+          <button class="btn primary" onclick={() => nav.replace({ name: "settings" })}>{t("设置方法")}</button>
+        {/if}
+        <button class="btn quiet" onclick={() => flow.withoutJit()}>{t("仍然开始")}</button>
+        <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+      </div>
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
@@ -166,6 +194,14 @@
     to {
       transform: translateX(290%);
     }
+  }
+  .hint {
+    margin-top: 12px;
+    max-width: 280px;
+    font-size: 12px;
+    line-height: 1.5;
+    text-align: center;
+    color: var(--fg3);
   }
   .chip {
     margin-top: 18px;

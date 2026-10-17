@@ -3,6 +3,7 @@
   import { call, onHostEvent } from "./lib/bridge";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
+  import { jit } from "./lib/jit.svelte";
   import { nav } from "./lib/nav.svelte";
   import { setGameActive } from "./lib/overlay";
   import { prefs } from "./lib/prefs.svelte";
@@ -55,6 +56,10 @@
   });
 
   $effect(() => setGameActive(route.name === "game"));
+  // A game started before JIT is ready runs interpreted to its end.
+  $effect(() => {
+    if (jit.active) jit.start();
+  });
   $effect(() => {
     void call("set_tracking", { enabled: prefs.trackPlayTime }, null).catch(console.error);
   });

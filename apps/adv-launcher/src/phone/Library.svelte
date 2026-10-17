@@ -3,6 +3,7 @@
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import JitBanner from "../components/JitBanner.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
@@ -83,6 +84,7 @@
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
   </header>
+  <JitBanner />
   <main class="empty">
     <div aria-hidden="true" class="stack">
       <div class="ghost-card" style="transform: rotate(-6deg) translateY(6px); opacity: .6"></div>
@@ -113,6 +115,7 @@
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
   </header>
+  <JitBanner />
 
   {#if searching}
     <label class="field search">

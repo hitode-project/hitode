@@ -6,6 +6,7 @@
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
   import JitRow from "../components/JitRow.svelte";
+  import { jit } from "../lib/jit.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
   import { reportContents } from "../lib/fake-settings";
@@ -61,7 +62,7 @@
 
     <section class="sec" aria-labelledby="p-play">
       <h2 id="p-play">{t("游戏中")}</h2>
-      {#if device.platform === "ios" && device.gameView}
+      {#if jit.active}
         <JitRow />
       {/if}
       {#if device.gameView || preview}
