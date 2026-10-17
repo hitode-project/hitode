@@ -39,7 +39,7 @@
 //! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
-//! x12 DF. x87 state stays in `CpuState` (A64-FP-1).
+//! x12 DF. x87 state stays in `CpuState` outside x87 runs (A64F-FP-1, A64F-FP-7).
 
 use std::mem::offset_of;
 

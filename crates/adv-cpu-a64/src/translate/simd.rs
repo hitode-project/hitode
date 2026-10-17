@@ -1,4 +1,4 @@
-//! MMX and SSE instructions in NEON (A64-REG-5, A64-FP-4, A64-FP-5).
+//! MMX and SSE instructions in NEON (A64-REG-5, A64F-FP-4, A64F-FP-5).
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it.
@@ -1274,7 +1274,7 @@ mod tests {
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
     }
 
-    // spec: A64-FP-4
+    // spec: A64F-FP-4
     #[test]
     fn mixed_mmx_scaling_loop_instruction_count() {
         use crate::translate::{Features, Stubs, Workspace, translate};
@@ -1323,6 +1323,7 @@ mod tests {
                 ret_miss: 0,
                 access: 0,
                 interpret: 0,
+                fault: 0,
             },
             &|_, _| false,
         );

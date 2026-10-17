@@ -262,7 +262,7 @@ fn cached_leaf_can_return_to_ordinary_dispatch() {
     assert_eq!(executor.state.regs[0], WORD);
 }
 
-// spec: A64-FP-4, A64-CTL-12, A64-VER-1
+// spec: A64F-FP-4, A64-CTL-12, A64-VER-1
 #[test]
 fn leaf_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
     use iced_x86::code_asm::*;

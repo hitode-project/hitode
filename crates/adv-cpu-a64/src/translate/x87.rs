@@ -8,7 +8,8 @@
 //! outside the range or precision the rule admits) the instruction's
 //! interpreter helper runs it in place and the unit goes on. Nothing is
 //! stored before every check has passed, and memory is accessed only with
-//! the guest flags in NZCV.
+//! the guest flags in NZCV. Runs of such instructions keep the stack in
+//! host registers instead (see `cache`).
 //!
 //! Arithmetic needs exact doubles within `2^±fast::RANGE`, masked
 //! exceptions, round to nearest and precision 24, 53 or 64; it rounds once in
@@ -35,6 +36,9 @@ use crate::runtime;
 use super::decode::{Mem, memory};
 use super::flags::Operand;
 use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+
+mod cache;
+pub(super) use cache::{Cache, Cold, Model};
 
 const X7: Reg = Reg::new(7);
 const X8: Reg = Reg::new(8);
@@ -101,6 +105,9 @@ enum Take {
 /// tag word, w15 TOP; x7, x16 and x17 are scratch.
 impl Translator<'_> {
     pub(super) fn x87(&mut self, x: X87) {
+        if self.x87_cached(x) {
+            return;
+        }
         self.flush_simd();
         if self.checking && x.mem.is_some() {
             self.helper(x.helper);
@@ -128,105 +135,7 @@ impl Translator<'_> {
                 ldrh(X8, X5, runtime::X87_CONTROL),
             ]);
         }
-        let mut dp = x.mem.is_some();
-        let mut metadata = true;
-        match x.fast {
-            Fast::Wait => metadata = false,
-            Fast::Round => self.x87_round(slow),
-            Fast::Scale => self.x87_scale(slow),
-            Fast::Examine => {
-                self.x87_examine();
-                metadata = false;
-            }
-            Fast::Load(source) => self.x87_load(source, slow),
-            Fast::Constant(one) => {
-                let target = self.push_target(slow);
-                if one {
-                    self.emit_all(&[movz(X, X0, 0x8000, 48), movz(W, X1, 0x3fff, 0)]);
-                } else {
-                    self.emit_all(&[movz(X, X0, 0, 0), movz(W, X1, 0, 0)]);
-                }
-                self.commit_value(target, X0, X1);
-                self.emit(mov(W, X15, target));
-                self.clear_c1();
-            }
-            Fast::Store {
-                width,
-                integer,
-                pop,
-            } => self.x87_store(width, integer, pop, slow),
-            Fast::StoreSt { index, pop } => {
-                self.read(0, X0, X1, slow);
-                self.ordinary(X0, X1, slow);
-                let to = self.slot(index, X2);
-                self.commit_value(to, X0, X1);
-                self.clear_c1();
-                if pop {
-                    self.pop();
-                }
-            }
-            Fast::Arith {
-                op,
-                dest,
-                source,
-                reverse,
-                pop,
-            } => self.x87_arith(op, dest, source, reverse, pop, slow),
-            Fast::Compare { source, pops } => self.x87_compare(source, pops, slow),
-            Fast::Exchange(index) => {
-                self.read(0, X0, X1, slow);
-                self.ordinary(X0, X1, slow);
-                self.read(index, X2, X3, slow);
-                self.ordinary(X2, X3, slow);
-                let other = self.slot(index, X7);
-                self.commit_value(X15, X2, X3);
-                self.commit_value(other, X0, X1);
-                self.clear_c1();
-            }
-            Fast::Negate | Fast::Absolute => {
-                self.read(0, X0, X1, slow);
-                self.ordinary(X0, X1, slow);
-                self.emit(if x.fast == Fast::Negate {
-                    eor_imm(W, X1, X1, 0x8000)
-                } else {
-                    and_imm(W, X1, X1, 0x7fff)
-                });
-                // The tag follows the value, as on every write.
-                self.commit_value(X15, X0, X1);
-                self.clear_c1();
-            }
-            Fast::LoadControl => {
-                self.site();
-                self.emit(ldr_narrow(Narrow::Half, X0, WINDOW, X6));
-                // Unmasking a pending exception takes the interpreter.
-                self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
-                self.asm.cbz(W, true, X16, slow);
-                self.emit_all(&[
-                    strh(X0, X5, runtime::X87_CONTROL),
-                    movz(W, X16, 0x8080, 0),
-                    bic(W, X13, X13, X16, Lsl, 0),
-                ]);
-                (dp, metadata) = (false, false);
-            }
-            Fast::StoreControl | Fast::StoreStatus => {
-                let value = if x.fast == Fast::StoreControl {
-                    X8
-                } else {
-                    X13
-                };
-                match x.mem {
-                    Some(_) => {
-                        self.site();
-                        self.emit(str_narrow(Narrow::Half, value, WINDOW, X6));
-                    }
-                    None => {
-                        self.clobber(Operand::Guest(0));
-                        self.emit(bfi(W, super::host(0), value, 0, 16));
-                    }
-                }
-                (dp, metadata) = (false, false);
-            }
-        }
+        let (dp, metadata) = self.x87_body(x, slow);
         if x.fast != Fast::Wait {
             self.emit_all(&[
                 bfi(W, X13, X15, 11, 3),
@@ -257,6 +166,128 @@ impl Translator<'_> {
         self.vector.cpu = true;
     }
 
+    /// What instruction `x` does once its checks have run; whether it
+    /// records the data pointer and the instruction pointer and opcode.
+    fn x87_body(&mut self, x: X87, slow: Label) -> (bool, bool) {
+        let cached = self.x87.active;
+        let mut dp = x.mem.is_some();
+        let mut metadata = true;
+        match x.fast {
+            Fast::Wait => metadata = false,
+            Fast::Round => self.x87_round(slow),
+            Fast::Scale => self.x87_scale(slow),
+            Fast::Examine => {
+                self.x87_examine();
+                metadata = false;
+            }
+            Fast::Load(Source::St(index)) if cached => {
+                self.x87_push_copy(index);
+                self.clear_c1();
+            }
+            Fast::Load(source) => self.x87_load(source, slow),
+            Fast::Constant(one) => {
+                if one {
+                    self.emit_all(&[movz(X, X0, 0x8000, 48), movz(W, X1, 0x3fff, 0)]);
+                } else {
+                    self.emit_all(&[movz(X, X0, 0, 0), movz(W, X1, 0, 0)]);
+                }
+                self.st_push(X0, X1, slow);
+                self.clear_c1();
+            }
+            Fast::Store {
+                width,
+                integer,
+                pop,
+            } => self.x87_store(width, integer, pop, slow),
+            Fast::StoreSt { index, pop } if cached => {
+                self.x87_copy(index, 0);
+                self.clear_c1();
+                if pop {
+                    self.pop();
+                }
+            }
+            Fast::StoreSt { index, pop } => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                let to = self.slot(index, X2);
+                self.commit_value(to, X0, X1);
+                self.clear_c1();
+                if pop {
+                    self.pop();
+                }
+            }
+            Fast::Arith {
+                op,
+                dest,
+                source,
+                reverse,
+                pop,
+            } => self.x87_arith(op, dest, source, reverse, pop, slow),
+            Fast::Compare { source, pops } => self.x87_compare(source, pops, slow),
+            Fast::Exchange(index) if cached => {
+                self.x87_exchange(index);
+                self.clear_c1();
+            }
+            Fast::Exchange(index) => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                self.read(index, X2, X3, slow);
+                self.ordinary(X2, X3, slow);
+                let other = self.slot(index, X7);
+                self.commit_value(X15, X2, X3);
+                self.commit_value(other, X0, X1);
+                self.clear_c1();
+            }
+            Fast::Negate | Fast::Absolute => {
+                self.read(0, X0, X1, slow);
+                self.ordinary(X0, X1, slow);
+                self.emit(if x.fast == Fast::Negate {
+                    eor_imm(W, X1, X1, 0x8000)
+                } else {
+                    and_imm(W, X1, X1, 0x7fff)
+                });
+                // The tag follows the value, as on every write.
+                self.st_write(0, X0, X1);
+                self.clear_c1();
+            }
+            Fast::LoadControl => {
+                self.site();
+                self.emit(ldr_narrow(Narrow::Half, X0, WINDOW, X6));
+                // Unmasking a pending exception takes the interpreter.
+                self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
+                self.asm.cbz(W, true, X16, slow);
+                self.emit_all(&[
+                    strh(X0, X5, runtime::X87_CONTROL),
+                    movz(W, X16, 0x8080, 0),
+                    bic(W, X13, X13, X16, Lsl, 0),
+                ]);
+                (dp, metadata) = (false, false);
+            }
+            Fast::StoreControl | Fast::StoreStatus => {
+                if cached && x.fast == Fast::StoreStatus {
+                    self.x87_status();
+                }
+                let value = if x.fast == Fast::StoreControl {
+                    X8
+                } else {
+                    X13
+                };
+                match x.mem {
+                    Some(_) => {
+                        self.site();
+                        self.emit(str_narrow(Narrow::Half, value, WINDOW, X6));
+                    }
+                    None => {
+                        self.clobber(Operand::Guest(0));
+                        self.emit(bfi(W, super::host(0), value, 0, 16));
+                    }
+                }
+                (dp, metadata) = (false, false);
+            }
+        }
+        (dp, metadata)
+    }
+
     fn x87_round(&mut self, slow: Label) {
         self.emit(and_imm(W, X16, X8, 0x3f));
         self.emit(cmp_imm(W, X16, 0x3f, false));
@@ -279,7 +310,7 @@ impl Translator<'_> {
         self.asm.bind(rounded);
         self.grew(V1, V0);
         self.extended(V1, X0, X1);
-        self.commit_value(X15, X0, X1);
+        self.st_write(0, X0, X1);
         self.emit_all(&[orr(W, X13, X13, X3, Lsl, 5), bfi(W, X13, X7, 9, 1)]);
     }
 
@@ -301,7 +332,7 @@ impl Translator<'_> {
         self.asm.b_cond(Cond::Hi, slow);
         self.emit(bfi(W, X1, X16, 0, 15));
         self.asm.bind(commit);
-        self.commit_value(X15, X0, X1);
+        self.st_write(0, X0, X1);
         self.clear_c1();
     }
 
@@ -359,9 +390,7 @@ impl Translator<'_> {
                 self.extended(V0, X0, X1);
             }
         }
-        let target = self.push_target(slow);
-        self.commit_value(target, X0, X1);
-        self.emit(mov(W, X15, target));
+        self.st_push(X0, X1, slow);
         self.clear_c1();
     }
 
@@ -469,7 +498,10 @@ impl Translator<'_> {
         self.asm.bind(exact);
         self.clear_c1();
         self.asm.bind(flagged);
-        self.emit(msr_nzcv(X4));
+        if !self.x87.active {
+            // A cached run's fault stub restores the flags itself.
+            self.emit(msr_nzcv(X4));
+        }
         self.site();
         let size = if width == 8 { X } else { W };
         self.emit(str_reg(size, X2, WINDOW, X6, false));
@@ -515,8 +547,7 @@ impl Translator<'_> {
         self.asm.b_cond(Cond::Eq, wide);
         self.emit(ubfx(W, X16, X8, 10, 2));
         self.asm.cbz(W, true, X16, wide);
-        let target = self.slot(dest, X2);
-        self.read_slot(target, X0, X1, slow);
+        self.read(dest, X0, X1, slow);
         self.double(X0, X1, V0, Take::Exact(range), wide);
         if let Source::St(index) = source {
             self.read(index, X0, X1, slow);
@@ -625,37 +656,28 @@ impl Translator<'_> {
         ]);
         self.asm.bind(rounded);
         self.extended(V2, X0, X1);
-        self.commit_value(target, X0, X1);
+        self.asm.b(end);
+        self.asm.bind(wide);
+        self.x87_wide(op, dest, source, reverse, slow);
+        self.asm.bind(end);
+        self.st_write(dest, X0, X1);
         if pop {
             self.pop();
         }
-        self.asm.b(end);
-        self.asm.bind(wide);
-        self.x87_wide(op, dest, source, reverse, pop, slow);
-        self.asm.bind(end);
     }
 
     /// Arithmetic on the 64-bit significands in integers, rounded once to
-    /// the precision and rounding control. Each operation leaves the
-    /// significand in x0 with its top bit set, the bits below it in x7
-    /// (any lost bits ORed into bit 0), the biased exponent in w17 and the
-    /// sign in bit 15 of w1, or x1 the sign of a zero result.
-    fn x87_wide(
-        &mut self,
-        op: Arith,
-        dest: u8,
-        source: Source,
-        reverse: bool,
-        pop: bool,
-        slow: Label,
-    ) {
+    /// the precision and rounding control, into x0 and x1. Each operation
+    /// leaves the significand in x0 with its top bit set, the bits below
+    /// it in x7 (any lost bits ORed into bit 0), the biased exponent in w17
+    /// and the sign in bit 15 of w1, or x1 the sign of a zero result.
+    fn x87_wide(&mut self, op: Arith, dest: u8, source: Source, reverse: bool, slow: Label) {
         match source {
             Source::St(index) => self.read(index, X2, X3, slow),
             _ => self.extended(V1, X2, X3),
         }
         self.ordinary(X2, X3, slow);
-        let target = self.slot(dest, X7);
-        self.read_slot(target, X0, X1, slow);
+        self.read(dest, X0, X1, slow);
         self.ordinary(X0, X1, slow);
         if reverse {
             for (a, b) in [(X0, X2), (X1, X3)] {
@@ -677,11 +699,6 @@ impl Translator<'_> {
         self.emit(movz(X, X0, 0, 0));
         self.clear_c1();
         self.asm.bind(store);
-        let target = self.slot(dest, X2);
-        self.commit_value(target, X0, X1);
-        if pop {
-            self.pop();
-        }
     }
 
     /// x0 + x2, or x0 - x2: the operands are aligned in a 128-bit window
@@ -1068,6 +1085,15 @@ impl Translator<'_> {
             orr(W, X13, X13, X16, Lsl, 14),
             orr(W, X13, X13, X17, Lsl, 8),
         ]);
+        if self.x87.active {
+            if pops == 2 {
+                self.x87_free(1);
+            }
+            for _ in 0..pops {
+                self.x87_pop();
+            }
+            return;
+        }
         if pops == 2 {
             let second = self.slot(1, X7);
             self.free(second);
@@ -1159,8 +1185,34 @@ impl Translator<'_> {
     /// Loads stack slot `index`, which must not be empty; uses x7, x16
     /// and x17.
     fn read(&mut self, index: u8, sig: Reg, sexp: Reg, slow: Label) {
+        if self.x87.active {
+            self.x87_get(index, sig, sexp);
+            return;
+        }
         let p = self.slot(index, X7);
         self.read_slot(p, sig, sexp, slow);
+    }
+
+    /// Writes an ordinary value to stack slot `index`; uses x7, x16 and
+    /// x17.
+    fn st_write(&mut self, index: u8, sig: Reg, sexp: Reg) {
+        if self.x87.active {
+            self.x87_put(index, sig, sexp);
+            return;
+        }
+        let p = self.slot(index, X7);
+        self.commit_value(p, sig, sexp);
+    }
+
+    /// Pushes an ordinary value; uses x2, x16 and x17.
+    fn st_push(&mut self, sig: Reg, sexp: Reg, slow: Label) {
+        if self.x87.active {
+            self.x87_push(sig, sexp);
+            return;
+        }
+        let target = self.push_target(slow);
+        self.commit_value(target, sig, sexp);
+        self.emit(mov(W, X15, target));
     }
 
     /// Loads physical register `p`, which must not be empty; uses x16 and
@@ -1194,6 +1246,10 @@ impl Translator<'_> {
     /// Rejects extended encodings other than zeros and normals; uses x16
     /// and x17.
     fn ordinary(&mut self, sig: Reg, sexp: Reg, slow: Label) {
+        if self.x87.active {
+            // A cached run holds only zeros and normals.
+            return;
+        }
         let zero = self.asm.label();
         let ok = self.asm.label();
         self.emit(and_imm(W, X16, sexp, 0x7fff));
@@ -1316,6 +1372,10 @@ impl Translator<'_> {
     }
 
     fn pop(&mut self) {
+        if self.x87.active {
+            self.x87_pop();
+            return;
+        }
         self.free(X15);
         self.emit_all(&[add_imm(W, X15, X15, 1, false), and_imm(W, X15, X15, 7)]);
     }
@@ -1337,7 +1397,7 @@ mod tests {
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
     }
 
-    // spec: A64-FP-2
+    // spec: A64F-FP-2
     #[test]
     fn plans_take_the_fast_forms_with_their_operands() {
         let load = plan(

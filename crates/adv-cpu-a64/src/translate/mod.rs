@@ -13,7 +13,7 @@
 //! the flags canonical, an internal edge only those its target reads, and
 //! every fault site records sense, carry, recipe and the SIMD dirty mask for
 //! the owner. MMX values are published before control edges and observers
-//! (A64-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
+//! (A64F-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
 //! remain immediate outside those loops.
 //!
 //! Memory accesses go straight to the window, where a host fault at a
@@ -33,7 +33,8 @@
 //! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
 //! x5, which are free inside units; a run of SIMD instructions keeps the
 //! `CpuState` pointer in x5, MMX registers in d8-d15 and XMM registers in
-//! v16-v23, with v0-v6 as scratch.
+//! v16-v23, with v0-v6 as scratch; an x87 run keeps its stack values in
+//! v24-v31.
 
 mod channels;
 mod decode;
@@ -90,6 +91,10 @@ pub struct Site {
     pub checked: bool,
     /// Unpublished MMX (bits 0–7) and XMM (bits 8–15) values in host SIMD.
     pub simd_dirty: u16,
+    /// Where a fault here resumes, relative to the site, when x87 values
+    /// cached in host registers must be published first; 0 for the fault
+    /// stub itself.
+    pub resume: i32,
 }
 
 /// The last unit translated, in buffers the next translation reuses.
@@ -169,6 +174,8 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
+    /// Where a faulting site leaves.
+    pub fault: usize,
 }
 
 const X0: Reg = Reg::new(0);
@@ -306,6 +313,15 @@ enum Cold {
     /// The `interpret` helper asked to leave with the exit + 1 in w0, at
     /// the EIP in `CpuState`, after refunding the countdown.
     Helper { label: Label, refund: u32 },
+    /// The cold paths of a cached x87 instruction.
+    X87(x87::Cold),
+    /// Publishes a cached x87 run as it was before the instruction of a
+    /// faulting site, then leaves through the fault stub.
+    X87Fault {
+        label: Label,
+        model: x87::Model,
+        saved: bool,
+    },
 }
 
 struct Translator<'a> {
@@ -338,6 +354,10 @@ struct Translator<'a> {
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
     channels: &'a mut bool,
+    /// The x87 run whose stack lives in host registers, if any.
+    x87: x87::Cache,
+    /// Sites inside such runs and the stubs that publish before faulting.
+    x87_sites: Vec<(usize, Label)>,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -406,6 +426,8 @@ pub fn translate(
         pixel: None,
         pixel_copies: Vec::new(),
         channels,
+        x87: x87::Cache::default(),
+        x87_sites: Vec::new(),
     };
     if trace.len() == 0 {
         // Nothing to translate: other units may still link here.
@@ -697,8 +719,10 @@ impl Translator<'_> {
                 recipe: self.state.recipe,
                 checked: self.checking,
                 simd_dirty: self.vector.dirty,
+                resume: 0,
             },
         ));
+        self.x87_site();
     }
 
     /// Whether `convert(flags)` would emit anything.
@@ -1158,6 +1182,12 @@ impl Translator<'_> {
                 }
                 self.asm.b(resume);
             }
+            Cold::X87(cold) => self.x87_cold(cold),
+            Cold::X87Fault {
+                label,
+                model,
+                saved,
+            } => self.x87_fault(label, model, saved),
             Cold::Helper { label, refund } => {
                 self.asm.bind(label);
                 if refund != 0 {
@@ -1178,6 +1208,10 @@ impl Translator<'_> {
         self.cold.sort_by_key(|c| !matches!(c, Cold::Table { .. }));
         while let Some(cold) = self.cold.pop() {
             self.cold(cold, at);
+        }
+        for &(index, label) in &self.x87_sites {
+            let (at, site) = &mut self.sites[index];
+            site.resume = (self.asm.position(label) - *at) as i32;
         }
         self.asm.resolve();
         let words = self.asm.words_mut();

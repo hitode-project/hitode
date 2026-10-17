@@ -122,7 +122,7 @@ fn narrow_steps_cross_pages_fault_without_commits_and_retry() {
     }
 }
 
-// spec: A64-FP-4, A64-REG-5, A64-VER-1
+// spec: A64F-FP-4, A64-REG-5, A64-VER-1
 #[test]
 fn byte_sign_masks_cover_both_register_classes_and_biased_destinations() {
     for mask in [0, 0xaaaa, 0x5555, 0xffff]
@@ -152,7 +152,7 @@ fn byte_sign_masks_cover_both_register_classes_and_biased_destinations() {
     }
 }
 
-// spec: A64-FP-5, A64-REG-5, A64-VER-1
+// spec: A64F-FP-5, A64-REG-5, A64-VER-1
 #[test]
 fn packed_doubles_check_both_lanes_exceptions_and_mxcsr() {
     for form in 0..3 {
@@ -209,7 +209,7 @@ fn packed_doubles_check_both_lanes_exceptions_and_mxcsr() {
     }
 }
 
-// spec: A64-FP-1, A64-FP-2, A64-FP-3, A64-VER-1
+// spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-VER-1
 #[test]
 fn x87_round_scale_and_examine_match_all_rounding_modes_and_specials() {
     use adv_cpu_core::X87Register as Ext;
@@ -307,7 +307,7 @@ fn x87_round_scale_and_examine_match_all_rounding_modes_and_specials() {
     }
 }
 
-// spec: A64-FP-4, A64-VER-1
+// spec: A64F-FP-4, A64-VER-1
 #[test]
 fn mmx_byte_masks_deliver_pending_x87_exceptions_before_state_changes() {
     let mut program = fixture(|a| {

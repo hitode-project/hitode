@@ -49,7 +49,7 @@ fn cuts(program: &Program, budgets: &[u64]) {
     }
 }
 
-// spec: A64-FP-4, A64-REG-5, A64-CTL-7, A64-VER-1
+// spec: A64F-FP-4, A64-REG-5, A64-CTL-7, A64-VER-1
 #[test]
 fn mmx_prefix_survives_side_links_merges_calls_backedges_and_budget_refunds() {
     for taken in [0, 1] {
@@ -95,7 +95,7 @@ fn mmx_prefix_survives_side_links_merges_calls_backedges_and_budget_refunds() {
     }
 }
 
-// spec: A64-FP-4, A64-TR-4, A64-VER-1
+// spec: A64F-FP-4, A64-TR-4, A64-VER-1
 #[test]
 fn mmx_prefix_is_visible_to_helpers_x87_emms_and_saved_contexts() {
     for observer in 0..7 {
@@ -118,7 +118,7 @@ fn mmx_prefix_is_visible_to_helpers_x87_emms_and_saved_contexts() {
     }
 }
 
-// spec: A64-FP-4, A64-FLAG-4, A64-MEM-5, A64-VER-1
+// spec: A64F-FP-4, A64-FLAG-4, A64-MEM-5, A64-VER-1
 #[test]
 fn mmx_dirty_subset_recovers_direct_and_checked_faults_and_reexecutes_memory_forms() {
     for kind in 0..5 {
@@ -169,7 +169,7 @@ fn mmx_dirty_subset_recovers_direct_and_checked_faults_and_reexecutes_memory_for
     }
 }
 
-// spec: A64-FP-4, A64-TR-4, A64-VER-1
+// spec: A64F-FP-4, A64-TR-4, A64-VER-1
 #[test]
 fn mmx_prefix_survives_fast_paths_with_conditional_helpers() {
     for kind in 0..5 {

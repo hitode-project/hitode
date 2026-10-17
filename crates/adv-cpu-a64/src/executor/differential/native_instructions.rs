@@ -202,7 +202,7 @@ fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retr
     }
 }
 
-// spec: A64-FP-5 A64-FLAG-6
+// spec: A64F-FP-5 A64-FLAG-6
 #[test]
 fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
     for form in 0..13 {
@@ -333,7 +333,7 @@ fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
     }
 }
 
-// spec: A64-FP-5
+// spec: A64F-FP-5
 #[test]
 fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {
     for scalar in [false, true] {
@@ -569,7 +569,7 @@ fn checked_ordinary_pages_avoid_helpers_and_follow_permission_changes() {
     }
 }
 
-// spec: A64-FP-5 A64-MEM-5
+// spec: A64F-FP-5 A64-MEM-5
 #[test]
 fn scalar_integer_conversions_preserve_flags_upper_lanes_and_fault_boundaries() {
     for form in 0..6 {
@@ -710,7 +710,7 @@ fn narrow_shifts_and_negation_keep_undefined_flags_and_register_halves() {
     }
 }
 
-// spec: A64-FP-4 A64-MEM-5
+// spec: A64F-FP-4 A64-MEM-5
 #[test]
 fn simd_lane_insertion_byte_shifts_and_control_stores_match_the_owner() {
     for count in [0, 1, 7, 8, 15, 16, 17, 255] {
@@ -749,7 +749,7 @@ fn simd_lane_insertion_byte_shifts_and_control_stores_match_the_owner() {
     }
 }
 
-// spec: A64-FP-1 A64-FP-2 A64-FP-3
+// spec: A64F-FP-1 A64F-FP-2 A64F-FP-3
 #[test]
 fn x87_single_precision_rounding_keeps_extended_exponents_and_exception_state() {
     let cases = [
@@ -853,7 +853,7 @@ fn cmpxchg8b_matches_interpreter_flags_faults_and_native_commits() {
     }
 }
 
-// spec: A64-FP-5, A64-VER-1
+// spec: A64F-FP-5, A64-VER-1
 #[test]
 fn sse_status_reuse_keeps_sticky_precision_and_restarts_after_mxcsr_and_x87() {
     let p = fixture(|a| {
@@ -896,7 +896,7 @@ fn sse_status_reuse_keeps_sticky_precision_and_restarts_after_mxcsr_and_x87() {
     }
 }
 
-// spec: A64-FP-5, A64-CTL-7, A64-VER-1
+// spec: A64F-FP-5, A64-CTL-7, A64-VER-1
 #[test]
 fn sse_loop_status_matches_interpreter_across_budgets_exceptions_and_observers() {
     for observer in 0..3 {

@@ -1655,7 +1655,7 @@ fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     native
 }
 
-// spec: A64-ISA-4, A64-REG-5, A64-FLAG-2, A64-FLAG-3, A64-FLAG-4, A64-FLAG-5, A64-MEM-7, A64-CTL-4, A64-CTL-7, A64-CTL-9, A64-FP-2, A64-FP-3, A64-FP-4, A64-TR-4, A64-VER-1
+// spec: A64-ISA-4, A64-REG-5, A64-FLAG-2, A64-FLAG-3, A64-FLAG-4, A64-FLAG-5, A64-MEM-7, A64-CTL-4, A64-CTL-7, A64-CTL-9, A64F-FP-2, A64F-FP-3, A64F-FP-4, A64F-FP-7, A64-TR-4, A64-VER-1
 #[cfg(native)]
 #[test]
 fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
@@ -1684,7 +1684,7 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
 /// MSVC control word with `ftol`'s switch to chop: it matches the
 /// interpreter, and none of its x87 instructions leaves translated code
 /// or calls a helper.
-// spec: A64-FLAG-6, A64-FP-1, A64-FP-3
+// spec: A64-FLAG-6, A64F-FP-1, A64F-FP-3, A64F-FP-7
 #[cfg(native)]
 #[test]
 fn x87_loops_run_natively() {
@@ -1835,6 +1835,64 @@ fn stores_to_data_on_a_code_page_stop_faulting() {
     assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
 }
 
+/// A fault in the middle of an x87 run, with results only in host
+/// registers and renamed slots: the state it leaves is the interpreter's
+/// before the faulting instruction, for a store and for an operand.
+// spec: A64F-FP-7
+#[cfg(native)]
+#[test]
+fn x87_runs_publish_their_state_at_a_fault() {
+    for store in [true, false] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(dword_ptr(ebx + 0x710), 2.5f32.to_bits()).unwrap();
+        a.mov(eax, HOLE).unwrap();
+        a.fninit().unwrap();
+        a.fld1().unwrap();
+        a.fld(dword_ptr(ebx + 0x710)).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fld(st0).unwrap();
+        a.fxch(st0, st2).unwrap();
+        a.fstp(st1).unwrap();
+        if store {
+            a.fstp(dword_ptr(eax)).unwrap();
+        } else {
+            a.fmul(dword_ptr(eax)).unwrap();
+        }
+        a.nop().unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[3] = DATA;
+        state.regs[4] = STACK_TOP;
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code,
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+            ),
+            "{outcome:?}"
+        );
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
+        assert_eq!(executor.state.eip, state.eip);
+        assert_eq!(executor.state.x87, state.x87, "store {store}");
+        assert_eq!(executor.state.mmx, state.mmx, "store {store}");
+        assert!(snapshot(executor.memory()) == memory);
+        assert!(executor.native.as_ref().unwrap().unchecked_faults > 0);
+    }
+}
+
 #[test]
 fn random_programs_assemble_and_reach_the_stop_or_a_fault() {
     let mut faults = 0;
@@ -1912,6 +1970,7 @@ fn first_divergence() {
                 b.x87 == state.x87,
                 m == memory
             );
+            println!("x87 {:x?}\n vs {:x?}", b.x87, state.x87);
             let (_, prev, _) = reference(&program, budget - 1);
             println!("previous eip {:#x}", prev.eip);
             return;

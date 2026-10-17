@@ -70,7 +70,7 @@ fn program(xmm: bool, side: bool) -> Program {
     }))
 }
 
-// spec: A64-TR-5, A64-VER-1, A64-CTL-7, A64-REG-5, A64-FP-4
+// spec: A64-TR-5, A64-VER-1, A64-CTL-7, A64-REG-5, A64F-FP-4
 #[test]
 fn pixel_blends_preserve_every_state_at_budget_cuts_overlap_and_side_exits() {
     for xmm in [false, true] {
@@ -319,7 +319,7 @@ fn mixed_register_banks_and_adjacent_pixel_loops_publish_the_same_architecture()
     }
 }
 
-// spec: A64-REG-5, A64-FP-4, A64-VER-1
+// spec: A64-REG-5, A64F-FP-4, A64-VER-1
 #[test]
 fn pixel_weight_broadcasts_preserve_every_lane_and_both_register_widths() {
     for lane in 0..4 {

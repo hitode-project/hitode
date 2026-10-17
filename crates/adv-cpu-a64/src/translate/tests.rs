@@ -65,6 +65,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         ret_miss: HOST_CODE as usize,
         access: HOST_CODE as usize,
         interpret: HOST_CODE as usize,
+        fault: HOST_CODE as usize,
     };
     translate(
         &mut work,
@@ -256,6 +257,7 @@ impl Harness {
                 ret_miss: addr(self.forbidden),
                 access: addr(self.forbidden),
                 interpret: addr(self.forbidden),
+                fault: addr(self.forbidden),
             },
             &|_, _| false,
         );
@@ -477,7 +479,7 @@ fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
     }
 }
 
-// spec: A64-FP-6
+// spec: A64F-FP-6
 #[test]
 fn comparisons_with_identical_operands_ignore_scalar_upper_snan_lanes() {
     let mut h = Harness::new();
@@ -541,7 +543,7 @@ fn cmp_code(scalar: bool, double: bool, memory: bool, predicate: i32) -> Vec<u8>
     })
 }
 
-// spec: A64-FP-6
+// spec: A64F-FP-6
 #[test]
 fn floating_comparison_masks_cover_predicates_lanes_nan_and_denormal_inputs() {
     let mut h = Harness::new();
@@ -627,7 +629,7 @@ fn floating_comparison_masks_cover_predicates_lanes_nan_and_denormal_inputs() {
     }
 }
 
-// spec: A64-FP-5
+// spec: A64F-FP-5
 #[test]
 fn floating_guard_and_snan_bail_before_destination_or_mxcsr_commit() {
     let mut h = Harness::new();
@@ -699,6 +701,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
             ret_miss: HOST_CODE as usize,
             access: HOST_CODE as usize,
             interpret: HOST_CODE as usize,
+            fault: HOST_CODE as usize,
         };
         for writable_tail in [false, true] {
             if writable_tail {

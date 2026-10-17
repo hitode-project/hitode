@@ -7,7 +7,8 @@
 //! `ADV_ENGINE_BENCH_ENGINES` (comma list of `interpreter` and the platform's
 //! engine, `a64` on AArch64 hosts and `cranelift` elsewhere; default both)
 //! and `ADV_ENGINE_BENCH_WORKLOADS` (comma list of workload names, default
-//! all).
+//! all: alu, memory, call_shallow, call_deep, dispatch, x87_pc64, x87_pc53,
+//! cold).
 //! Output: CSV rows of first-run milliseconds on a fresh CPU and steady-state
 //! nanoseconds per dynamic guest instruction. Workloads are self-authored; no
 //! game code or addresses are involved. Every engine's first run must match
@@ -80,6 +81,73 @@ fn alu(n: u32) -> Workload {
         code: assemble(&mut a).0,
         data: Vec::new(),
         instructions: 7 + 9 * u64::from(n),
+    }
+}
+
+/// An x87 loop in the style of compiled per-pixel colour math: loads from
+/// tables, add/sub/mul/div, a compare through `fnstsw`/`test ah`, `fxch`,
+/// stack copies and an integer store, under control word `cw` (0x133f is
+/// precision 64, 0x027f precision 53, both round to nearest, all masked).
+fn x87(name: &'static str, cw: u16, n: u32) -> Workload {
+    const A: u32 = DATA;
+    const B: u32 = DATA + 0x800;
+    const HALF: u32 = DATA + 0x1000;
+    const K: u32 = DATA + 0x1008;
+    const SCALE: u32 = DATA + 0x1010;
+    const CW: u32 = DATA + 0x1018;
+    const OUT: u32 = DATA + 0x1020;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    let mut ordered = a.create_label();
+    a.fldcw(word_ptr(CW)).unwrap();
+    a.mov(ecx, n).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(esi, ecx).unwrap();
+    a.and(esi, 255).unwrap();
+    a.fld(qword_ptr(esi * 8 + A)).unwrap();
+    a.fld(qword_ptr(esi * 8 + B)).unwrap();
+    a.fcom_2(st0, st1).unwrap();
+    a.fnstsw(ax).unwrap();
+    a.test(ah, 0x41).unwrap();
+    a.jne(ordered).unwrap();
+    a.fxch(st0, st1).unwrap();
+    a.set_label(&mut ordered).unwrap();
+    a.fld(st1).unwrap();
+    a.fadd_2(st0, st1).unwrap();
+    a.fmul(qword_ptr(HALF)).unwrap();
+    a.fld(st1).unwrap();
+    a.fsub_2(st0, st3).unwrap();
+    a.fdiv(qword_ptr(K)).unwrap();
+    a.faddp(st1, st0).unwrap();
+    a.fmul(qword_ptr(SCALE)).unwrap();
+    a.fistp(dword_ptr(OUT)).unwrap();
+    a.fstp(st0).unwrap();
+    a.fstp(st0).unwrap();
+    a.add(edx, dword_ptr(OUT)).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.int(0x2e).unwrap();
+    // B > A everywhere, so the compare never branches and fxch always runs.
+    let table = |f: &dyn Fn(f64) -> f64| -> Vec<u8> {
+        (0..256)
+            .flat_map(|i| f(f64::from(i)).to_le_bytes())
+            .collect()
+    };
+    let mut constants = Vec::new();
+    for value in [0.5f64, 3.0, 255.0] {
+        constants.extend_from_slice(&value.to_le_bytes());
+    }
+    constants.extend_from_slice(&cw.to_le_bytes());
+    Workload {
+        name,
+        code: assemble(&mut a).0,
+        data: vec![
+            (A, table(&|i| 0.37 * i + 1.0)),
+            (B, table(&|i| 0.37 * i + 1.7 + i / 300.0)),
+            (HALF, constants),
+        ],
+        instructions: 4 + 23 * u64::from(n),
     }
 }
 
@@ -424,6 +492,8 @@ fn main() {
         call_shallow(n(1_000_000)),
         call_deep(n(40_000)),
         dispatch(n(8_000)),
+        x87("x87_pc64", 0x133f, n(200_000)),
+        x87("x87_pc53", 0x027f, n(200_000)),
     ];
     let cold = cold(n(4_000));
     let name = if cfg!(target_arch = "aarch64") {

@@ -30,7 +30,7 @@ fn operand(rng: &mut Rng, other: (u64, u16)) -> (u64, u16) {
     }
 }
 
-// spec: A64-FP-1 A64-FP-2 A64-FP-3
+// spec: A64F-FP-1 A64F-FP-2 A64F-FP-3
 #[test]
 fn x87_arithmetic_and_compares_take_full_significands_under_every_control() {
     let mut rng = Rng(0x5eed_87a1_7b3c_9d01);

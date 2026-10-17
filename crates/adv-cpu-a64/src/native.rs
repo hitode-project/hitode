@@ -137,13 +137,17 @@ unsafe fn on_fault(
                 unsafe { faults.resume.write(pc as u64) };
                 return faults.reset;
             }
-            if faults.site(pc).is_none() {
+            let Some(site) = faults.site(pc) else {
                 return 0;
-            }
+            };
             faults
                 .simd
                 .set(std::array::from_fn(|n| snapshot.simd[8 + n]));
             faults.pc.set(pc);
+            if site.resume != 0 {
+                // The unit publishes its cached x87 state, then faults.
+                return pc.wrapping_add_signed(site.resume as isize);
+            }
             faults.stub
         })
         .unwrap_or(0)
@@ -637,6 +641,7 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
+                fault: base + stubs.fault,
             },
             units: FxHashMap::default(),
             pages: FxHashMap::default(),
@@ -1261,6 +1266,7 @@ mod tests {
             recipe: Recipe::Canonical,
             checked: false,
             simd_dirty: 0,
+            resume: 0,
         };
         let words = [
             load,
@@ -1370,6 +1376,7 @@ mod tests {
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
                 checked: false,
                 simd_dirty: 0,
+                resume: 0,
             },
             [0; 2],
         );
