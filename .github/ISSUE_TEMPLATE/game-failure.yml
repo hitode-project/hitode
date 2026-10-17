@@ -1,0 +1,42 @@
+name: Game does not run / 游戏跑不起来
+description: Report a game that fails, with the report the launcher saved.
+title: "<failing API or symptom>"
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues track causes, not games. Search for the failing API from your report first; if an issue has it, add your report there.
+        问题按失败原因跟踪，不按游戏。提交前先搜一下报告里失败的 API，已有同样的问题就在那里回复。
+  - type: textarea
+    id: report
+    attributes:
+      label: Report / 报告
+      description: Paste the anonymous report the launcher saved.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game / 游戏
+      description: Title, and its VNDB link if you have it.
+    validations:
+      required: true
+  - type: input
+    id: patch
+    attributes:
+      label: Patch / 补丁
+      description: Localization or other patches applied, or "none".
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform / 平台
+      options: [macOS, iOS / iPadOS, Android]
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happened / 发生了什么
+      description: Optional. Where it stopped and what you saw.
