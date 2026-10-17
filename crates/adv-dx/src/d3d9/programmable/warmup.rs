@@ -57,6 +57,7 @@ fn schedule(
         vertex: ids[0],
         pixel: ids[1],
         inputs: inputs.iter().map(|i| (i.register, i.format)).collect(),
+        second: false,
     };
     let state = env.ext.get_mut::<State>();
     let Some(context) = state.gpu.as_ref().map(|gpu| gpu.context().clone()) else {
@@ -108,6 +109,7 @@ fn schedule(
             translations[1].as_deref(),
             &inputs,
             &slots,
+            false,
         )
         .map_err(|_| "warm source unavailable")?;
         if source.len() > RESERVATION {
@@ -219,6 +221,7 @@ mod tests {
                 register: 0,
             }],
             &[],
+            false,
         )
         .unwrap();
         let cache = &env.ext.get::<State>().programs;

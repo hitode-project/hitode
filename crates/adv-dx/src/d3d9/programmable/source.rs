@@ -13,6 +13,12 @@ struct DrawParameters { values:array<vec4<u32>,40> }
 fn adv_combine(op:u32,c:vec4<f32>,t:vec4<f32>)->vec4<f32> {
   switch op {case 0u:{return c;}case 1u:{return t;}case 2u:{return c*t;}case 3u:{return clamp(c+t,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return clamp(c-t,vec4<f32>(0.0),vec4<f32>(1.0));}}
 }
+fn adv_argument(a:u32,diffuse:vec4<f32>,current:vec4<f32>,texel:vec4<f32>)->vec4<f32> {
+  switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}
+}
+fn adv_stage(op:u32,a1:vec4<f32>,a2:vec4<f32>,current:vec4<f32>)->vec4<f32> {
+  switch op {case 2u:{return a1;}case 3u:{return a2;}case 4u:{return a1*a2;}case 7u:{return clamp(a1+a2,vec4<f32>(0.0),vec4<f32>(1.0));}case 10u:{return clamp(a1-a2,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return current;}}
+}
 fn adv_alpha(a:f32)->bool {
  let r=bitcast<f32>(draw_parameters.values[1].w);
  switch draw_parameters.values[1].z {case 0u:{return false;}case 1u:{return a<r;}case 2u:{return a==r;}case 3u:{return a<=r;}case 4u:{return a>r;}case 5u:{return a!=r;}case 6u:{return a>=r;}default:{return true;}}
@@ -34,6 +40,7 @@ pub(super) fn build(
     pt: Option<&Translation>,
     inputs: &[Input],
     slots: &[(bool, u8)],
+    second: bool,
 ) -> Result<String, u32> {
     let mut s = TYPES.to_owned();
     s.push_str(adv_device::gpu::BORDER_WGSL);
@@ -230,6 +237,10 @@ pub(super) fn build(
         s.push_str("let result=ps_run(registers);var color=result.colors[0];\n");
     } else {
         s.push_str("var texel=ps_sample_0(input.t0,0u);if draw_parameters.values[2].x!=0u {texel.a=1.0;}\nlet rgb=adv_combine(draw_parameters.values[1].x,input.c0,texel).rgb;let alpha=adv_combine(draw_parameters.values[1].y,input.c0,texel).a;var color=vec4<f32>(rgb,alpha);\n");
+        if second {
+            // Stage one: operation, arguments and coordinate set as D3D values.
+            s.push_str("{let stage=draw_parameters.values[13];var coords=array<vec4<f32>,8>(input.t0,input.t1,input.t2,input.t3,input.t4,input.t5,input.t6,input.t7);let texel=ps_sample_1(coords[stage.w&7u],0u);\nlet rgb=adv_stage(stage.x,adv_argument(stage.y&255u,input.c0,color,texel),adv_argument(stage.y>>8u,input.c0,color,texel),color).rgb;\nlet alpha=adv_stage(stage.z&255u,adv_argument((stage.z>>8u)&255u,input.c0,color,texel),adv_argument(stage.z>>16u,input.c0,color,texel),color).a;color=vec4<f32>(rgb,alpha);}\n");
+        }
     }
     s.push_str("if !adv_alpha(color.a) {discard;}\n");
     if ps.is_none_or(|p| p.version.major < 3) {

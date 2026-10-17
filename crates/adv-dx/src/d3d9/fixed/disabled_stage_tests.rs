@@ -24,7 +24,12 @@ mod disabled_stage_tests {
                 assert_eq!(set_stage(&mut env, this, stage, kind, value), 0);
                 assert_eq!(get_stage(&mut env, this, stage, kind, output), 0);
                 assert_eq!(output.read(env.cpu).unwrap(), value);
-                let unsupported = if matches!(kind, 1 | 4) { 4 } else { 7 };
+                // Stage one combines; MODULATE2X stays unavailable there.
+                let unsupported = match (kind, stage) {
+                    (1 | 4, 1) => 5,
+                    (1 | 4, _) => 4,
+                    _ => 7,
+                };
                 let error = if matches!(kind, 1 | 4) {
                     UNAVAILABLE
                 } else {
@@ -41,6 +46,10 @@ mod disabled_stage_tests {
                 }
             }
         }
+        for stage in 1..8 {
+            assert_eq!(get_stage(&mut env, this, stage, 11, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), stage);
+        }
         assert_eq!(set_stage(&mut env, this, 8, 1, 1), INVALID);
         output.write(env.cpu, 0x12345678).unwrap();
         assert_eq!(get_stage(&mut env, this, 8, 1, output), INVALID);
@@ -54,6 +63,50 @@ mod disabled_stage_tests {
         assert_eq!(current(&env, pointer).unwrap().stage, original);
         assert_eq!(current(&env, pointer).unwrap().render[&128], 0);
         assert!(env.ext.get::<State>().pending.is_empty());
+    }
+
+    #[test]
+    fn second_stage_combines_supported_operations_and_arguments() {
+        let mut m = crate::d3d9::tests::machine();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let second =
+            |env: &Env<'_>| second_stage(current(env, pointer).unwrap()).map_err(|e| e.code);
+        assert_eq!(second(&env), Ok(None));
+        for op in [2, 3, 4, 7, 10] {
+            assert_eq!(set_stage(&mut env, this, 1, 1, op), 0);
+            assert_eq!(set_stage(&mut env, this, 1, 4, op), 0);
+            assert_eq!(set_stage(&mut env, this, 2, 1, op), UNAVAILABLE);
+        }
+        assert_eq!(set_stage(&mut env, this, 1, 11, 3), 0);
+        assert_eq!(set_stage(&mut env, this, 1, 11, 0x10001), UNAVAILABLE);
+        assert_eq!(set_stage(&mut env, this, 1, 11, 8), INVALID);
+        // Defaults: TEXTURE and CURRENT for both color and alpha.
+        assert_eq!(
+            second(&env),
+            Ok(Some([10, 2 | 1 << 8, 10 | 2 << 8 | 1 << 16, 3]))
+        );
+        assert!(programmable::active(&env, pointer));
+        // A disabled first stage ends the cascade before stage one.
+        assert_eq!(set_stage(&mut env, this, 0, 1, 1), 0);
+        assert_eq!(second(&env), Ok(None));
+        assert!(!programmable::active(&env, pointer));
+        assert_eq!(set_stage(&mut env, this, 0, 1, 4), 0);
+        // Specular, temporary and modified arguments are not combined.
+        for value in [4, 5, 0x12, 0x21] {
+            assert_eq!(set_stage(&mut env, this, 1, 2, value), 0);
+            assert_eq!(second(&env), Err(UNAVAILABLE));
+            assert!(programmable::active(&env, pointer));
+        }
+        assert_eq!(set_stage(&mut env, this, 1, 2, 0), 0);
+        assert_eq!(second(&env).unwrap().unwrap()[1], 1 << 8);
     }
 
     #[test]

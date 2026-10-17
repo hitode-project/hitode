@@ -150,6 +150,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             None,
             &inputs,
             &[(false, 0)],
+            false,
         )
         .unwrap();
         let program = Program::new(source.into(), vec![false]);
@@ -236,5 +237,91 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
 fn declaration_fixtures_match_native_metal_and_wgpu_exactly() {
     compare_metal_fixture(
         "every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults",
+    );
+}
+
+// spec: GFX-INPUT-1
+#[test]
+fn fixed_pixel_stages_combine_a_second_texture_stage() {
+    let mut gpu = pollster::block_on(Gpu::request_backend(
+        !cfg!(any(target_os = "macos", target_os = "android")),
+        GpuBackend::Automatic,
+    ))
+    .unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    let texel = |bgra: [u8; 4]| {
+        let image = gpu.image(1, 1).unwrap();
+        let whole = adv_device::surface::Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+        gpu.upload(&image, whole, 4, &bgra).unwrap();
+        image
+    };
+    // Stage zero texel (0.5, 1, 1, 1), stage one (1, 0.5, 0.25, 0.5).
+    let images = [texel([255, 255, 128, 255]), texel([64, 128, 255, 128])];
+    let source =
+        source::build(None, None, None, None, &[], &[(false, 0), (false, 1)], true).unwrap();
+    let program = Program::new(source.into(), vec![false, false]);
+    validate_program(&program).unwrap();
+    let state = DrawState::new(8, 8);
+    let mut parameters = [[0; 4]; 40];
+    parameters[0] = [8f32.to_bits(), 8f32.to_bits(), 0, 0];
+    // Stage zero modulates diffuse by its texel; alpha always passes.
+    parameters[1] = [2, 2, 7, 0];
+    // Stage one: MODULATE(CURRENT, TEXTURE) for color, SELECTARG1(TEXTURE)
+    // for alpha, from coordinate set zero.
+    parameters[13] = [4, 1 | 2 << 8, 2 | 2 << 8 | 1 << 16, 0];
+    for ordinal in 0..2 {
+        parameters[16 + ordinal] = sampler_parameters(state.sampler);
+    }
+    let mut vertices = Vec::new();
+    for position in [[-1f32, 1.], [-1., -3.], [3., 1.]] {
+        let diffuse = [1f32, 1., 0.5, 1.];
+        vertices.extend([position[0], position[1], 0.5, 1.]);
+        vertices.extend(diffuse);
+        vertices.extend([0.5, 0.5]);
+    }
+    let draw = ProgrammableDraw {
+        program,
+        streams: vec![VertexStream {
+            bytes: bytemuck::cast_slice(&vertices).to_vec(),
+            stride: 40,
+            attributes: [
+                (0, 0, AttributeFormat::Float4),
+                (1, 16, AttributeFormat::Float4),
+                (2, 32, AttributeFormat::Float2),
+            ]
+            .map(|(location, offset, format)| Attribute {
+                location,
+                offset,
+                format,
+            })
+            .to_vec(),
+        }],
+        indices: None,
+        vertex_count: 3,
+        vertex_constants: ConstantBlock::default(),
+        pixel_constants: ConstantBlock::default(),
+        textures: images
+            .map(|image| ProgramTexture {
+                image: Some(image),
+                sampler: state.sampler,
+            })
+            .to_vec(),
+        parameters,
+    };
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    let mut read = gpu.readback(&target.image, None).unwrap();
+    read.take_completion_job().unwrap()();
+    let pixels = read.poll().unwrap().unwrap();
+    let got = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
+    // Current (0.5, 1, 0.5, 1) times (1, 0.5, 0.25): (0.5, 0.5, 0.125), alpha 0.5.
+    let want = [32u8, 128, 128, 128];
+    assert!(
+        got.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 2),
+        "{got:?} expected {want:?}"
     );
 }

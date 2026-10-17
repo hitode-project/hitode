@@ -18,6 +18,8 @@ struct ProgramKey {
     vertex: Option<Id>,
     pixel: Option<Id>,
     inputs: Vec<(u32, AttributeFormat)>,
+    /// Whether the fixed pixel stages combine a second texture stage.
+    second: bool,
 }
 #[derive(Default)]
 pub(super) struct ProgramCache {
@@ -71,8 +73,14 @@ fn get_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
         .map_or(INVALID, |()| 0)
 }
 
+/// Whether a draw takes this path: a shader is bound, or the fixed pixel
+/// stages combine a second stage, which only the assembled program draws.
 pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
-    device(env, pointer).is_some_and(|d| d.shaders.vertex.is_some() || d.shaders.pixel.is_some())
+    device(env, pointer).is_some_and(|d| {
+        d.shaders.vertex.is_some()
+            || d.shaders.pixel.is_some()
+            || !matches!(fixed::second_stage(&d.fixed), Ok(None))
+    })
 }
 fn format(kind: u8) -> Result<AttributeFormat, u32> {
     use AttributeFormat::*;
@@ -537,13 +545,21 @@ fn prepare_checked(
             }
         }
     }
-    if ps.is_none() {
+    let second = if ps.is_none() {
         slots.push((false, 0));
         bindings.push(ProgramTexture {
             image: draw.image.clone(),
             sampler: draw.state.sampler,
         });
-    }
+        let second = fixed::second_stage(&d.fixed).map_err(|e| e.code)?;
+        if second.is_some() {
+            slots.push((false, 1));
+            bindings.push(texture(env, pointer, 1, &draw.state)?);
+        }
+        second
+    } else {
+        None
+    };
 
     let v = draw.state.viewport;
     let mut parameters = [[0; 4]; 40];
@@ -565,6 +581,7 @@ fn prepare_checked(
             .is_some_and(|i| i.alpha_mode() == adv_device::gpu::AlphaMode::Opaque),
     );
     parameters[2][3] = u32::from(kind == 1);
+    parameters[13] = second.unwrap_or_default();
     parameters[3] = [
         d.fixed.render[&152],
         d.fixed.render[&28],
@@ -624,6 +641,7 @@ fn prepare_checked(
         vertex: vs.as_ref().map(|s| s.id),
         pixel: ps.as_ref().map(|s| s.id),
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
+        second: second.is_some(),
     };
     draw.program_key = recording::hash(&key);
     let cache = &mut env.ext.get_mut::<State>().programs;
@@ -644,6 +662,7 @@ fn prepare_checked(
                 pt,
                 &input_spec,
                 &slots,
+                second.is_some(),
             )?;
             let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
             program.constants = usage;

@@ -274,6 +274,8 @@ impl Fixed {
                     BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
                 if stage != 0 {
                     states.extend([(1, 1), (2, 2), (3, 1), (4, 1), (5, 2), (6, 1)]);
+                    // TEXCOORDINDEX defaults to the stage's own coordinate set.
+                    states.insert(11, stage as u32);
                 }
                 states
             }),
@@ -580,15 +582,21 @@ fn set_stage(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, kind: i32, value
         return 0;
     }
     if stage != 0 {
-        // The fixed renderer stops at disabled stages. Store their arguments
-        // for Get/state blocks, but reject enabling an unimplemented combiner.
+        // Stage one combines like stage zero; later stages stay disabled.
+        // Arguments are stored for Get and state blocks and checked at draw.
         let valid = match kind {
             1 | 4 => match value {
                 1 => true,
+                2 | 3 | 4 | 7 | 10 if stage == 1 => true,
                 2..=26 => return UNAVAILABLE,
                 _ => false,
             },
             2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 6,
+            11 => match (value & 0xffff, value >> 16) {
+                (0..=7, 0) => true,
+                (0..=7, 1..=4) => return UNAVAILABLE,
+                _ => false,
+            },
             _ => return UNAVAILABLE,
         };
         if !valid {
@@ -869,6 +877,28 @@ fn get_transform(
     } else {
         INVALID
     }
+}
+/// The enabled second stage as `[color op, color arguments, alpha op and
+/// arguments, coordinate set]`, each argument a byte; `None` when the first
+/// or second stage is disabled.
+pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
+    let s = &f.stage_slots[1];
+    if f.stage[&1] == 1 || s[&1] == 1 {
+        return Ok(None);
+    }
+    // Diffuse, current and texture, without modifiers.
+    if [2, 3, 5, 6].iter().any(|k| s[k] > 2) {
+        return Err(rejected(
+            UNAVAILABLE,
+            "texture stage 1 arguments other than diffuse, current and texture are unavailable",
+        ));
+    }
+    Ok(Some([
+        s[&1],
+        s[&2] | s[&3] << 8,
+        s[&4] | s[&5] << 8 | s[&6] << 16,
+        s[&11],
+    ]))
 }
 fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
     let arg = |v| match v {
