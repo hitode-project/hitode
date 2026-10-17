@@ -5,7 +5,7 @@
 pub(super) fn bytes(format: u32) -> Option<u32> {
     match format {
         21 | 22 => Some(4),
-        26 => Some(2),
+        23 | 26 => Some(2),
         28 => Some(1),
         _ => None,
     }
@@ -38,7 +38,7 @@ pub(super) fn upload(
     if width == 0 || pitch < row || pixels.len() < required as usize {
         return None;
     }
-    if matches!(format, 26 | 28) {
+    if matches!(format, 23 | 26 | 28) {
         let output_pitch = width.checked_mul(4)?;
         let mut output = vec![0; output_pitch.checked_mul(height)? as usize];
         for y in 0..height as usize {
@@ -48,6 +48,19 @@ pub(super) fn upload(
                     // D3DFMT_A8 is the documented undefined-channel exception:
                     // sampled RGB is zero, and the one guest byte is alpha.
                     output[destination + 3] = pixels[y * pitch as usize + x];
+                } else if format == 23 {
+                    // R5G6B5 replicates high bits into the low ones, so a
+                    // readback truncates to the same bytes; alpha is one.
+                    let at = y * pitch as usize + x * 2;
+                    let packed = u16::from_le_bytes(pixels[at..at + 2].try_into().ok()?);
+                    for (channel, (shift, bits)) in
+                        [(0, 5), (5, 6), (11, 5)].into_iter().enumerate()
+                    {
+                        let value = (packed >> shift) as u8 & ((1 << bits) - 1);
+                        output[destination + channel] =
+                            value << (8 - bits) | value >> (2 * bits - 8);
+                    }
+                    output[destination + 3] = 255;
                 } else {
                     let at = y * pitch as usize + x * 2;
                     let packed = u16::from_le_bytes(pixels[at..at + 2].try_into().ok()?);
@@ -86,6 +99,16 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
                 .collect(),
         );
     }
+    if format == 23 {
+        let mut output = Vec::with_capacity(pixels.len() / 2);
+        for pixel in pixels.chunks_exact(4) {
+            let packed = u16::from(pixel[0] >> 3)
+                | u16::from(pixel[1] >> 2) << 5
+                | u16::from(pixel[2] >> 3) << 11;
+            output.extend_from_slice(&packed.to_le_bytes());
+        }
+        return Some(output);
+    }
     if format != 26 {
         return Some(pixels);
     }
@@ -120,5 +143,18 @@ mod tests {
         assert_eq!(length(21, 3, 2), Some(24));
         assert!(length(26, u32::MAX, 2).is_none());
         assert!(length(26, 0, 2).is_none());
+    }
+
+    #[test]
+    fn r5g6b5_expands_opaque_and_round_trips_every_value() {
+        let packed: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let (expanded, pitch) = upload(23, packed.clone(), 512, 256, 256).unwrap();
+        assert_eq!(pitch, 1024);
+        // 0xf81f: red and blue full, green zero.
+        assert_eq!(&expanded[0xf81f * 4..0xf81f * 4 + 4], &[255, 0, 255, 255]);
+        // 0x0841: the lowest step of each channel.
+        assert_eq!(&expanded[0x0841 * 4..0x0841 * 4 + 4], &[8, 8, 8, 255]);
+        assert_eq!(readback(23, expanded).unwrap(), packed);
+        assert_eq!(length(23, 3, 2), Some(12));
     }
 }

@@ -99,7 +99,7 @@ fn requirements(
         let format = match format {
             0 | -1 => 21,
             21 | 22 => format as u32,
-            26 | 28 if usage & 1 == 0 => format as u32,
+            23 | 26 | 28 if usage & 1 == 0 => format as u32,
             20 | 23 | 24 | 30 | 33 | 41 => 22,
             25 | 26 | 28 | 29 | 31 | 32 | 35 | 40 => 21,
             _ => {
