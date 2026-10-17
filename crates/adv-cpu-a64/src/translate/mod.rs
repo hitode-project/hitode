@@ -68,6 +68,7 @@ use crate::jit_map::{Mark, Part};
 use crate::runtime::Exit;
 use decode::{EBP, ESP};
 use flags::FlagSet;
+use std::collections::VecDeque;
 use trace::{Edge, Next, Trace};
 
 /// Host features that change what the translator emits (A64-ISA-4).
@@ -1281,9 +1282,23 @@ impl Translator<'_> {
 
     fn finish(mut self, at: usize) {
         self.pixel_copies();
-        self.cold
-            .sort_by_key(|(_, c)| !matches!(c, Cold::Table { .. }));
-        while let Some((pc, cold)) = self.cold.pop() {
+        // Cold code goes in the order it was asked for, so a tbz anywhere
+        // in the body is no farther from its target than the body or the
+        // short cold code is long. Long x87 paths, reached only by wider
+        // branches, follow, and tables come last.
+        let rank = |cold: &Cold| match cold {
+            Cold::Table { .. } => 2,
+            Cold::X87(_) => 1,
+            _ => 0,
+        };
+        let mut queues: [VecDeque<(u32, Cold)>; 3] = Default::default();
+        loop {
+            for (pc, cold) in self.cold.drain(..) {
+                queues[rank(&cold)].push_back((pc, cold));
+            }
+            let Some((pc, cold)) = queues.iter_mut().find_map(VecDeque::pop_front) else {
+                break;
+            };
             self.mark(pc, Part::Cold);
             self.cold(cold, at);
         }

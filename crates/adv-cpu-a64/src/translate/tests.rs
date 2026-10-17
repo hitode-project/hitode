@@ -39,6 +39,63 @@ fn initial() -> CpuState {
     }
 }
 
+// spec: A64F-FP-7
+#[test]
+fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
+    // A whole trace of x87 divisions gives every instruction a long generic
+    // path; the parity edge and the backedge refusal still use tbz.
+    for parity in [false, true] {
+        let code = bytes(|a| {
+            let mut top = a.create_label();
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.set_label(&mut top).unwrap();
+            for _ in 0..90 {
+                a.fdiv_2(st0, st1).unwrap();
+            }
+            a.dec(ecx).unwrap();
+            if parity {
+                a.jp(top).unwrap();
+            } else {
+                a.jne(top).unwrap();
+            }
+        });
+        let mut mem = memory(&code, &[]);
+        let mut work = Workspace::default();
+        let host = HOST_CODE as usize;
+        let stubs = Stubs {
+            leaf: host,
+            exit: host,
+            dispatch: host,
+            lookup: host,
+            lookup_slow: host,
+            ret_miss: host,
+            access: host,
+            interpret: host,
+            fault: host,
+        };
+        let features = Features { flagm: false };
+        let leaf = |_, _| false;
+        translate(
+            &mut work,
+            &mut mem,
+            CODE + 4,
+            &[],
+            &|_| false,
+            0,
+            features,
+            host,
+            stubs,
+            &leaf,
+            0x037f,
+        );
+        assert!(
+            work.words().len() * 4 > 1 << 15,
+            "the unit outgrows tbz reach"
+        );
+    }
+}
+
 // spec: A64-CTL-6
 #[test]
 fn bytecode_vm_dispatch_instruction_gate() {

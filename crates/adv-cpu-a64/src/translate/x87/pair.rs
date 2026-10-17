@@ -779,7 +779,9 @@ impl Translator<'_> {
         let (zero, done) = (self.asm.label(), self.asm.label());
         self.emit(and_imm(W, X17, sexp, 0x7fff));
         self.asm.cbz(X, false, sig, zero);
-        self.asm.tbz(false, sig, 63, fail);
+        // Callers fail to cold code, beyond tbz reach.
+        self.emit(tst_imm(X, sig, 1 << 63));
+        self.asm.b_cond(Cond::Eq, fail);
         // The scale 2^(e - 63) with the value's sign, as a double.
         let below = 0x3fff - 1023 + LOW;
         self.emit_all(&[
