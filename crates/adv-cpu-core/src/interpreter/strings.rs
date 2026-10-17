@@ -506,4 +506,47 @@ mod tests {
         m.protect(0x4000, PAGE_SIZE, READ | WRITE).unwrap();
         assert_eq!(batch(&mut state, &mut m, op, 16), 16);
     }
+    // spec: EXEC-CORE-5
+    #[test]
+    fn forward_multi_page_bulk_copy_and_pattern_fill_match_scalar_progress() {
+        for kind in [StringKind::Movs, StringKind::Stos] {
+            for width in [1, 2, 4] {
+                let op = StringOp {
+                    kind,
+                    width,
+                    word: false,
+                    fs: false,
+                    repeat: true,
+                    unequal: false,
+                };
+                let count = (3 * PAGE_SIZE) as u32 / u32::from(width) + 17;
+                let mut actual = CpuState {
+                    eip: 0x18000,
+                    eflags: 0xad7,
+                    ..Default::default()
+                };
+                actual.regs[0] = 0x817f32af;
+                actual.regs[1] = count;
+                actual.regs[6] = 0x2fd9;
+                actual.regs[7] = 0x8fbb;
+                let mut expected = actual.clone();
+                let mut a = memory();
+                let mut b = memory();
+                // Exercise a real prevalidated batch, then finish across several
+                // pages, including unaligned elements that need scalar access.
+                let first = batch(&mut actual, &mut a, op, count);
+                assert!(first > 1 && first < count);
+                let got = execute::<true>(&mut actual, &mut a, op, 0x18002, count - first, false);
+                let want = execute::<false>(&mut expected, &mut b, op, 0x18002, count, false);
+                assert_eq!(got.step, want.step);
+                assert_eq!(got.units + first, want.units);
+                assert_eq!(want.units, count);
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    a.read_data(0, 0x20000).unwrap(),
+                    b.read_data(0, 0x20000).unwrap()
+                );
+            }
+        }
+    }
 }

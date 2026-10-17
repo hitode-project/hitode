@@ -6,7 +6,10 @@
 //! and unsupported forms restartable.
 //! Undefined arithmetic flags are preserved rather than borrowed from the host.
 //! GS, segment/control registers and far transfers remain outside the flat model.
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic as M, OpKind,
@@ -126,10 +129,58 @@ impl RepContinuation {
     }
 }
 
+/// A pointer into this interpreter's stable, exclusively owned block boxes.
+#[derive(Clone, Copy)]
+struct BlockPointer(NonNull<DecodedBlock>);
+
+// SAFETY: only the owning Interpreter dereferences these pointers, under its
+// exclusive borrow. Moving/sharing the owner does not move its boxed blocks.
+// The owning storage retains DecodedBlock's Send/Sync requirements.
+unsafe impl Send for BlockPointer {}
+unsafe impl Sync for BlockPointer {}
+
+/// Own the allocation as a raw pointer so moving/borrowing map entries never
+/// retags a Box pointee behind an incoming cached link.
+struct BlockStorage {
+    pointer: BlockPointer,
+    _owner: PhantomData<Box<DecodedBlock>>,
+}
+
+impl BlockStorage {
+    fn new(block: DecodedBlock) -> Self {
+        Self {
+            pointer: BlockPointer(NonNull::new(Box::into_raw(Box::new(block))).unwrap()),
+            _owner: PhantomData,
+        }
+    }
+
+    fn pointer(&self) -> BlockPointer {
+        self.pointer
+    }
+}
+
+impl Drop for BlockStorage {
+    fn drop(&mut self) {
+        // SAFETY: this storage owns the allocation, never moves its pointee,
+        // and drops it once. Cache clearing revokes links before dropping it.
+        unsafe { drop(Box::from_raw(self.pointer.0.as_ptr())) };
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlockLink {
+    pc: u32,
+    block: BlockPointer,
+    generation: u64,
+}
+
 /// Integer interpreter with a bounded cache shared by all entries in a memory.
 pub struct Interpreter {
-    cache: HashMap<u32, Cached>,
-    blocks: HashMap<u32, DecodedBlock>,
+    cache: FxHashMap<u32, Cached>,
+    blocks: FxHashMap<u32, BlockStorage>,
+    cache_generation: u64,
+    /// The last executed block; learn its edge on the next cache lookup.
+    previous: Option<BlockPointer>,
     capacity: usize,
     decodes: u64,
     pub frame_retired: Option<u64>,
@@ -151,8 +202,10 @@ impl Interpreter {
     /// Zero disables caching. On saturation the cache is cleared as a batch.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            cache: HashMap::new(),
-            blocks: HashMap::new(),
+            cache: FxHashMap::default(),
+            blocks: FxHashMap::default(),
+            cache_generation: 0,
+            previous: None,
             capacity,
             decodes: 0,
             frame_retired: None,
@@ -162,6 +215,12 @@ impl Interpreter {
 
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.clear_blocks();
+    }
+
+    fn clear_blocks(&mut self) {
+        self.previous = None;
+        self.cache_generation = self.cache_generation.wrapping_add(1);
         self.blocks.clear();
     }
 
@@ -204,6 +263,8 @@ impl Interpreter {
             if self.capacity != 0 {
                 if self.cache.len() >= self.capacity {
                     self.cache.clear();
+                    self.cache_generation = self.cache_generation.wrapping_add(1);
+                    self.previous = None;
                 }
                 self.cache.insert(pc, entry);
             }
@@ -237,39 +298,78 @@ impl Interpreter {
         }
         let pc = state.eip;
         let revision = native.map(|(_, revision)| revision);
-        if let Some(block) = self
-            .blocks
-            .get_mut(&pc)
-            .filter(|block| block.revision == revision)
-            .and_then(|block| block.valid(memory).then_some(block))
-        {
-            return block.execute_observed(
-                state,
-                memory,
-                max_units,
-                stop,
-                self.frame_retired.as_mut(),
-                self.observe_transfers,
-            );
+        if let Some(previous) = self.previous {
+            // SAFETY: allocations never move; replacement keeps storage and a batch
+            // clear resets previous before freeing any allocation.
+            let successor = unsafe { previous.0.as_ref() }.successor;
+            if let Some(link) = successor
+                && link.pc == pc
+                && link.generation == self.cache_generation
+            {
+                let mut pointer = link.block;
+                // SAFETY: the generation check precedes dereferencing a link.
+                // Entries are replaced in place, and clearing advances the
+                // generation before freeing boxes. The source borrow ended.
+                let block = unsafe { pointer.0.as_mut() };
+                if block.revision == revision && block.valid(memory) {
+                    self.previous = Some(pointer);
+                    return block.execute_observed(
+                        state,
+                        memory,
+                        max_units,
+                        stop,
+                        self.frame_retired.as_mut(),
+                        self.observe_transfers,
+                    );
+                }
+            }
         }
-        let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
-        if self.capacity == 0 {
-            return block.execute_observed(
-                state,
-                memory,
-                max_units,
-                stop,
-                self.frame_retired.as_mut(),
-                self.observe_transfers,
-            );
+        let mut pointer = if let Some(pointer) = self.blocks.get(&pc).and_then(|entry| {
+            let mut pointer = entry.pointer();
+            // SAFETY: the owner's exclusive borrow grants access to this live
+            // box. No other block reference remains live during validation.
+            let block = unsafe { pointer.0.as_mut() };
+            (block.revision == revision && block.valid(memory)).then_some(pointer)
+        }) {
+            pointer
+        } else {
+            let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
+            if self.capacity == 0 {
+                return block.execute_observed(
+                    state,
+                    memory,
+                    max_units,
+                    stop,
+                    self.frame_retired.as_mut(),
+                    self.observe_transfers,
+                );
+            }
+            // Preserve independent capacity limits and whole-cache saturation.
+            if self.blocks.len() >= self.capacity {
+                self.clear_blocks();
+            }
+            if let Some(entry) = self.blocks.get(&pc) {
+                // SAFETY: keep the allocation and all incoming pointers alive;
+                // only its contents change, under this exclusive owner borrow.
+                unsafe { *entry.pointer.0.as_ptr() = block };
+            } else {
+                self.blocks.insert(pc, BlockStorage::new(block));
+            }
+            self.blocks[&pc].pointer()
+        };
+        if let Some(mut previous) = self.previous {
+            // SAFETY: previous still points to its live box, and no mutable
+            // reference to the target (which may be the source) is live yet.
+            unsafe { previous.0.as_mut() }.successor = Some(BlockLink {
+                pc,
+                block: pointer,
+                generation: self.cache_generation,
+            });
         }
-        // Bound each independent cache in entries. A larger block working set
-        // avoids flushing hot floating fallback sequences during discovery.
-        if self.blocks.len() >= self.capacity {
-            self.blocks.clear();
-        }
-        self.blocks.insert(pc, block);
-        self.blocks.get_mut(&pc).unwrap().execute_observed(
+        self.previous = Some(pointer);
+        // SAFETY: resolved above from a live box; the source borrow ended, and
+        // execute_observed cannot mutate the owning cache or free this block.
+        unsafe { pointer.0.as_mut() }.execute_observed(
             state,
             memory,
             max_units,
@@ -791,7 +891,7 @@ const BLOCK_INSTRUCTIONS: usize = 64;
 const BLOCK_BYTES: usize = 512;
 
 /// A contiguous decode window with local branch targets indexed by byte offset.
-/// Validate bytes and all page dependencies at each entry. A store changing the
+/// Validate changed page dependencies at entry. A store changing the
 /// code epoch ends execution before the cached suffix can run.
 struct DecodedBlock {
     pc: u32,
@@ -802,22 +902,39 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
+    /// SHARED dependencies never qualify for the owner-generation shortcut.
+    generation: Option<u64>,
+    successor: Option<BlockLink>,
 }
 
 impl DecodedBlock {
-    /// As `Cached::valid`: watch and compare bytes only after a page changed.
+    /// Keep the generation hit inlined even with multiple dispatch callers.
+    #[inline]
     fn valid(&mut self, memory: &mut Memory) -> bool {
-        if self.pages.iter().all(|page| page.current(memory)) {
-            return true;
+        self.generation == Some(memory.code_generation) || self.validate_changed_generation(memory)
+    }
+
+    #[cold]
+    fn validate_changed_generation(&mut self, memory: &mut Memory) -> bool {
+        if !self.pages.iter().all(|page| page.current(memory)) {
+            memory.watch_code(self.pc, self.bytes.len());
+            if !self.revalidate(memory) {
+                return false;
+            }
+            for page in &mut self.pages {
+                *page = Page::at(memory, page.address);
+            }
         }
-        memory.watch_code(self.pc, self.bytes.len());
-        if !self.revalidate(memory) {
-            return false;
-        }
-        for page in &mut self.pages {
-            *page = Page::at(memory, page.address);
-        }
+        self.stamp_generation(memory);
         true
+    }
+
+    fn stamp_generation(&mut self, memory: &Memory) {
+        self.generation = self
+            .pages
+            .iter()
+            .all(|page| page.permissions & crate::memory::SHARED == 0)
+            .then_some(memory.code_generation);
     }
 
     fn revalidate(&self, memory: &Memory) -> bool {
@@ -839,6 +956,8 @@ impl DecodedBlock {
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
+            generation: None,
+            successor: None,
         };
         let mut pc = start;
         let mut furthest_target = start;
@@ -931,6 +1050,7 @@ impl DecodedBlock {
             }
             pc = next;
         }
+        block.stamp_generation(memory);
         block
     }
 
