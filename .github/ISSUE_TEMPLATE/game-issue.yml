@@ -1,6 +1,6 @@
-name: Game does not run / 游戏跑不起来
-description: Tell us which game has a problem and what happened.
-title: "<game>: <what happened>"
+name: Game issue / 游戏问题
+description: A game fails to start, freezes, crashes, stutters, drains power or misbehaves.
+title: "<game>: <symptom>"
 labels: [compatibility]
 body:
   - type: markdown
@@ -27,11 +27,35 @@ body:
       options: [macOS, iOS / iPadOS, Android]
     validations:
       required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and Hitode version / 设备与 Hitode 版本
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom / 现象
+      multiple: true
+      options:
+        - Does not start / 无法启动
+        - Freezes / 卡死（画面不动、没有响应）
+        - Crashes or quits / 闪退
+        - Stutters or runs slowly / 卡顿、掉帧
+        - Graphics wrong / 画面异常
+        - Sound or video wrong / 声音或视频异常
+        - Input wrong / 操作异常
+        - Saving or loading wrong / 存档读档异常
+        - Heat or battery drain / 发热、耗电异常
+        - Other / 其他
+    validations:
+      required: true
   - type: textarea
     id: details
     attributes:
       label: What happened / 发生了什么
-      description: Where it stopped or went wrong, and what you saw.
+      description: Where it happened, how often, and what you saw.
     validations:
       required: true
   - type: textarea
