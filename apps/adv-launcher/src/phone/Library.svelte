@@ -506,12 +506,11 @@
     height: 36px;
     padding: 0 14px;
     border-radius: 18px;
-    background: rgba(20, 20, 20, 0.6);
+    background: rgba(20, 20, 20, 0.74);
     color: #fff;
     font-size: 13px;
     white-space: nowrap;
     cursor: pointer;
-    backdrop-filter: blur(6px);
   }
   .rehide {
     all: unset;
@@ -524,10 +523,9 @@
     display: grid;
     place-items: center;
     border-radius: 16px;
-    background: rgba(20, 20, 20, 0.5);
+    background: rgba(20, 20, 20, 0.66);
     color: #fff;
     cursor: pointer;
-    backdrop-filter: blur(6px);
   }
   .reveal:focus-visible,
   .rehide:focus-visible {
