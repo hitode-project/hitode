@@ -1,10 +1,11 @@
 //! Enumerate only the installed emulated default that DirectSoundCreate(NULL)
-//! can open. The front never queries host hardware or invents device GUIDs.
+//! can open. Its one fixed identity is what GetDeviceID gives the default
+//! playback aliases; the front never queries host hardware.
 use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{Prot, Reg};
 use adv_machine::{Env, Outcome};
 
-use super::{INVALID, OUT_OF_MEMORY, Sound};
+use super::{INVALID, NO_DRIVER, OUT_OF_MEMORY, Sound};
 
 const SCRATCH: u32 = 64;
 const CALLBACK_STACK: u32 = 20; // Four arguments plus return address.
@@ -123,47 +124,60 @@ fn unavailable_w(env: &mut Env<'_>, callback: GuestPtr<()>, context: GuestPtr<()
     start(env, callback.addr(), context.addr(), true, false)
 }
 
-const DSDEVID_DEFAULT_PLAYBACK: [u8; 16] = [
-    0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+/// `DSDEVID_DefaultPlayback` and `DSDEVID_DefaultVoicePlayback`.
+const DEFAULT_PLAYBACK: [[u8; 16]; 2] = [
+    [
+        0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c,
+        0x03,
+    ],
+    [
+        0x02, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c,
+        0x03,
+    ],
 ];
-const DSDEVID_DEFAULT_CAPTURE: [u8; 16] = [
-    0x01, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+/// {2270EAF5-ED98-4C2D-AE2B-97007FF345C1}, the emulated default playback
+/// device.
+const PLAYBACK_DEVICE: [u8; 16] = [
+    0xf5, 0xea, 0x70, 0x22, 0x98, 0xed, 0x2d, 0x4c, 0xae, 0x2b, 0x97, 0x00, 0x7f, 0xf3, 0x45, 0xc1,
 ];
-const DSDEVID_DEFAULT_VOICE_PLAYBACK: [u8; 16] = [
-    0x02, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
-];
-const DSDEVID_DEFAULT_VOICE_CAPTURE: [u8; 16] = [
-    0x03, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
-];
+
+/// Whether `guid` names the default playback device, by alias or identity.
+pub(super) fn playback(guid: &[u8; 16]) -> bool {
+    *guid == PLAYBACK_DEVICE || DEFAULT_PLAYBACK.contains(guid)
+}
+
+/// Reads the GUID at `address`, or `None` when it is unreadable.
+pub(super) fn read_guid(env: &mut Env<'_>, address: u32) -> Option<[u8; 16]> {
+    let mut guid = [0; 16];
+    check_range(env.cpu, address, 16, Prot::READ).ok()?;
+    env.cpu.read(address, &mut guid).ok()?;
+    Some(guid)
+}
 
 #[win32(dsound, name = "GetDeviceID", level = implement)]
 fn get_device_id(env: &mut Env<'_>, src: GuestPtr<()>, dest: GuestPtr<()>) -> u32 {
-    if dest.is_null() || check_range(env.cpu, dest.addr(), 16, Prot::WRITE).is_err() {
+    if src.is_null() || dest.is_null() {
         return INVALID;
     }
-    let guid = if src.is_null() {
-        DSDEVID_DEFAULT_PLAYBACK
-    } else {
-        if check_range(env.cpu, src.addr(), 16, Prot::READ).is_err() {
-            return INVALID;
-        }
-        let mut g = [0u8; 16];
-        if env.cpu.read(src.addr(), &mut g).is_err() {
-            return INVALID;
-        }
-        g
+    let Some(guid) = read_guid(env, src.addr()) else {
+        return INVALID;
     };
-    let resolved = match guid {
-        DSDEVID_DEFAULT_PLAYBACK => DSDEVID_DEFAULT_PLAYBACK,
-        DSDEVID_DEFAULT_CAPTURE => DSDEVID_DEFAULT_CAPTURE,
-        DSDEVID_DEFAULT_VOICE_PLAYBACK => DSDEVID_DEFAULT_VOICE_PLAYBACK,
-        DSDEVID_DEFAULT_VOICE_CAPTURE => DSDEVID_DEFAULT_VOICE_CAPTURE,
-        other => other,
-    };
-    if env.cpu.write(dest.addr(), &resolved).is_err() {
+    if check_range(env.cpu, dest.addr(), 16, Prot::WRITE).is_err() {
+        return INVALID;
+    }
+    // Capture and other devices do not exist.
+    if !env.ext.get::<Sound>().enabled || !playback(&guid) {
+        return NO_DRIVER;
+    }
+    if env.cpu.write(dest.addr(), &PLAYBACK_DEVICE).is_err() {
         return INVALID;
     }
     0
+}
+
+#[win32(dsound, name = "GetDeviceID", level = safe_fail)]
+fn unavailable_device_id(_env: &mut Env<'_>, _src: GuestPtr<()>, _dest: GuestPtr<()>) -> u32 {
+    NO_DRIVER
 }
 
 pub(super) fn register(registry: &mut Registry, installed: bool) {
@@ -177,5 +191,9 @@ pub(super) fn register(registry: &mut Registry, installed: bool) {
     } else {
         unavailable_w_ABI
     });
-    registry.register(get_device_id_ABI);
+    registry.register(if installed {
+        get_device_id_ABI
+    } else {
+        unavailable_device_id_ABI
+    });
 }

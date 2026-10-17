@@ -344,28 +344,69 @@ fn enumeration_descriptors_match_installed_and_unavailable_registration() {
         assert!(registry.dynamic_available("dsound.dll", "GetDeviceID"));
         assert_eq!(
             registry.level("dsound.dll", "GetDeviceID"),
-            Some(ImplementationLevel::Implement)
+            Some(if installed {
+                ImplementationLevel::Implement
+            } else {
+                ImplementationLevel::SafeFail
+            })
         );
     }
 }
 
-#[test]
 // spec: PERS-EXPORT-1
-fn get_device_id_resolves_default_playback_and_rejects_invalid_pointers() {
-    let mut m = machine(false, true, true, 932);
-    let target = m.resolve_import("dsound.dll", "GetDeviceID").unwrap();
-    let mut code = Asm::new(CODE);
-    code.push_imm(DATA).push_imm(0).call(target);
-    code.ret();
-    let (res, _, _) = run(&mut m, code);
-    assert!(matches!(res, RunResult::Exited(0)));
-    let mut guid = [0u8; 16];
-    m.cpu.read(DATA, &mut guid).unwrap();
-    assert_eq!(
-        guid,
-        [
+#[test]
+fn device_ids_name_one_playback_device_that_create_opens() {
+    const SOURCE: u32 = DATA + 0x300;
+    const ID: u32 = DATA + 0x340;
+    const RESULTS: u32 = DATA + 0x380;
+    let default = |index: u8| {
+        let mut guid = [
             0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b,
             0x5c, 0x03,
+        ];
+        guid[0] = index;
+        guid
+    };
+    for jit in [false, true] {
+        let mut m = machine(jit, true, true, 932);
+        // DSDEVID_DefaultPlayback, then DSDEVID_DefaultCapture.
+        m.cpu.write(SOURCE, &default(0)).unwrap();
+        m.cpu.write(SOURCE + 16, &default(1)).unwrap();
+        let get = m.resolve_import("dsound.dll", "GetDeviceID").unwrap();
+        let create = m.resolve_import("dsound.dll", "DirectSoundCreate").unwrap();
+        let mut code = Asm::new(CODE);
+        // The alias, the identity itself, a capture device and no source.
+        for (n, (source, dest)) in [
+            (SOURCE, ID),
+            (ID, ID + 16),
+            (SOURCE + 16, ID + 32),
+            (0, ID + 32),
         ]
-    );
+        .into_iter()
+        .enumerate()
+        {
+            code.push_imm(dest)
+                .push_imm(source)
+                .call(get)
+                .mov_mem_eax(RESULTS + 4 * n as u32);
+        }
+        code.push_imm(0)
+            .push_imm(DEVICE)
+            .push_imm(ID)
+            .call(create)
+            .mov_mem_eax(RESULTS + 16);
+        code.ret();
+        let (res, _, _) = run(&mut m, code);
+        assert!(matches!(res, RunResult::Exited(_)), "{res:?}");
+        let results: Vec<u32> = (0..5)
+            .map(|n| m.cpu.read_u32(RESULTS + 4 * n).unwrap())
+            .collect();
+        assert_eq!(results, [0, 0, 0x8878_0078, 0x8007_0057, 0]);
+        let mut ids = [0; 32];
+        m.cpu.read(ID, &mut ids).unwrap();
+        assert_eq!(ids[..16], ids[16..]);
+        assert_ne!(ids[..16], default(0));
+        assert_ne!(ids[..16], [0; 16]);
+        assert_ne!(m.cpu.read_u32(DEVICE).unwrap(), 0);
+    }
 }

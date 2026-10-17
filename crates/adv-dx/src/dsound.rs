@@ -16,6 +16,7 @@ const UNSUPPORTED: u32 = 0x80004001;
 const NO_INTERFACE: u32 = 0x80004002;
 const OUT_OF_MEMORY: u32 = 0x8007000e;
 const INVALID_CALL: u32 = 0x88780032;
+const NO_DRIVER: u32 = 0x88780078;
 const CONTROL_UNAVAILABLE: u32 = 0x8878001e;
 const OBJECT_NOT_FOUND: u32 = 0x88781161;
 const CLASS_NOT_REGISTERED: u32 = 0x80040154;
@@ -808,10 +809,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     if matches!(name, "#1" | "DirectSoundCreate" | "DirectSoundCreate8") {
         e.cpu.write_u32(b, 0).map_err(|e| e.to_string())?;
         if !e.ext.get::<Sound>().enabled {
-            return Ok(0x88780078);
+            return Ok(NO_DRIVER);
         }
         if a != 0 {
-            return Ok(0x88780078);
+            match enumeration::read_guid(e, a) {
+                None => return Ok(INVALID),
+                Some(guid) if !enumeration::playback(&guid) => return Ok(NO_DRIVER),
+                Some(_) => {}
+            }
         }
         if c != 0 {
             return Ok(0x80040110);
