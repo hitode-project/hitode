@@ -141,6 +141,100 @@ impl<B: Backend> Runtime<B> {
             .collect()
     }
 
+    /// Guest threads: state, wait, the host call a blocked one is in, its
+    /// caller, and its message queue.
+    pub fn contexts_report(&self) -> String {
+        let user = &self.machine.ext.get::<Win32>().user;
+        let mut report = String::new();
+        let now = self.machine.sys.clock.now_us();
+        report.push_str(&format!("Guest contexts (clock {now} us):"));
+        for context in &self.machine.sys.contexts {
+            report.push_str(&format!(
+                "\n  [{}] {:?} tid {:#x}: {}",
+                context.id,
+                context.name,
+                context.tid,
+                context.state_name()
+            ));
+            if let Some(wait) = context.waiting_on() {
+                report.push_str(&format!(" {wait:?}"));
+                let deadline = match wait {
+                    adv_machine::Wait::Until(deadline) => Some(*deadline),
+                    adv_machine::Wait::Object { deadline, .. }
+                    | adv_machine::Wait::Objects { deadline, .. } => *deadline,
+                    adv_machine::Wait::Yield => None,
+                };
+                if let Some(deadline) = deadline {
+                    report.push_str(&format!(
+                        " (in {:.3} ms)",
+                        deadline.saturating_sub(now) as f64 / 1000.0
+                    ));
+                }
+                if let adv_machine::Wait::Object { handle, .. } = wait {
+                    report.push_str(&format!(
+                        " object {:?}",
+                        self.machine.sys.objects.get(*handle)
+                    ));
+                }
+                if let adv_machine::Wait::Objects { handles, .. } = wait {
+                    for handle in handles.iter().take(8) {
+                        report.push_str(&format!(
+                            "\n    handle {handle:#x} {:?}",
+                            self.machine.sys.objects.get(*handle)
+                        ));
+                    }
+                }
+            }
+            if let Some(thunk) = context.blocked_thunk() {
+                let call = self.machine.sys.thunks.get(thunk);
+                report.push_str(&format!(" in {}!{}", call.module, call.name));
+            }
+            if let Some(caller) = context.blocked_stack().and_then(|stack| {
+                adv_cpu::backend::GuestExt::read_u32(&self.machine.cpu, stack).ok()
+            }) {
+                let place = adv_os::modules(&self.machine.ext)
+                    .iter()
+                    .find(|(_, module)| module.contains(caller))
+                    .map_or_else(
+                        || format!("{caller:#010x}"),
+                        |(_, module)| {
+                            format!(
+                                "{}+{:#x} ({caller:#010x})",
+                                module.name,
+                                caller - module.base
+                            )
+                        },
+                    );
+                report.push_str(&format!(" from {place}"));
+            }
+            if let Some(args) = context.blocked_args() {
+                report.push_str(&format!(
+                    " args [{}]",
+                    args.iter()
+                        .map(|a| format!("{a:x}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            if let Some(exit) = context.exit_code() {
+                report.push_str(&format!(" exit {exit}"));
+            }
+            if let Some(queue) = user.queues.get(&context.id) {
+                report.push_str(&format!("\n    queue event {:#x} {:?}; posted {}; quit {:?}; focus {:#x}; active {:#x}; capture {:#x}",queue.event,self.machine.sys.objects.get(queue.event),queue.posted.len(),queue.quit,queue.focus,queue.active,queue.capture));
+                for message in queue.posted.iter().take(8) {
+                    report.push_str(&format!(
+                        "\n      posted hwnd {:#x} msg {:#x} wp {:#x} lp {:#x}",
+                        message.hwnd, message.msg, message.wparam, message.lparam
+                    ));
+                }
+                for timer in &queue.timers {
+                    report.push_str(&format!("\n      timer hwnd {:#x} id {:#x} interval {:.3} ms due in {:.3} ms proc {:#x}",timer.hwnd,timer.id,timer.interval_us as f64/1000.0,timer.due_us.saturating_sub(now)as f64/1000.0,timer.proc));
+                }
+            }
+        }
+        report
+    }
+
     pub fn report(&self) -> String {
         let graphics = self.machine.ext.get::<Graphics<Snapshot>>();
         let mut report = format!(
@@ -337,84 +431,7 @@ impl<B: Backend> Runtime<B> {
                 last.elapsed().as_secs_f64() * 1000.0
             ));
         }
-        let now = self.machine.sys.clock.now_us();
-        report.push_str(&format!("\nGuest contexts (clock {now} us):"));
-        for context in &self.machine.sys.contexts {
-            report.push_str(&format!(
-                "\n  [{}] {:?} tid {:#x}: {}",
-                context.id,
-                context.name,
-                context.tid,
-                context.state_name()
-            ));
-            if let Some(wait) = context.waiting_on() {
-                report.push_str(&format!(" {wait:?}"));
-                let deadline = match wait {
-                    adv_machine::Wait::Until(deadline) => Some(*deadline),
-                    adv_machine::Wait::Object { deadline, .. }
-                    | adv_machine::Wait::Objects { deadline, .. } => *deadline,
-                    adv_machine::Wait::Yield => None,
-                };
-                if let Some(deadline) = deadline {
-                    report.push_str(&format!(
-                        " (in {:.3} ms)",
-                        deadline.saturating_sub(now) as f64 / 1000.0
-                    ));
-                }
-                if let adv_machine::Wait::Object { handle, .. } = wait {
-                    report.push_str(&format!(
-                        " object {:?}",
-                        self.machine.sys.objects.get(*handle)
-                    ));
-                }
-            }
-            if let Some(thunk) = context.blocked_thunk() {
-                let call = self.machine.sys.thunks.get(thunk);
-                report.push_str(&format!(" in {}!{}", call.module, call.name));
-            }
-            if let Some(caller) = context.blocked_stack().and_then(|stack| {
-                adv_cpu::backend::GuestExt::read_u32(&self.machine.cpu, stack).ok()
-            }) {
-                let place = adv_os::modules(&self.machine.ext)
-                    .iter()
-                    .find(|(_, module)| module.contains(caller))
-                    .map_or_else(
-                        || format!("{caller:#010x}"),
-                        |(_, module)| {
-                            format!(
-                                "{}+{:#x} ({caller:#010x})",
-                                module.name,
-                                caller - module.base
-                            )
-                        },
-                    );
-                report.push_str(&format!(" from {place}"));
-            }
-            if let Some(args) = context.blocked_args() {
-                report.push_str(&format!(
-                    " args [{}]",
-                    args.iter()
-                        .map(|a| format!("{a:x}"))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ));
-            }
-            if let Some(exit) = context.exit_code() {
-                report.push_str(&format!(" exit {exit}"));
-            }
-            if let Some(queue) = user.queues.get(&context.id) {
-                report.push_str(&format!("\n    queue event {:#x} {:?}; posted {}; quit {:?}; focus {:#x}; active {:#x}; capture {:#x}",queue.event,self.machine.sys.objects.get(queue.event),queue.posted.len(),queue.quit,queue.focus,queue.active,queue.capture));
-                for message in queue.posted.iter().take(8) {
-                    report.push_str(&format!(
-                        "\n      posted hwnd {:#x} msg {:#x} wp {:#x} lp {:#x}",
-                        message.hwnd, message.msg, message.wparam, message.lparam
-                    ));
-                }
-                for timer in &queue.timers {
-                    report.push_str(&format!("\n      timer hwnd {:#x} id {:#x} interval {:.3} ms due in {:.3} ms proc {:#x}",timer.hwnd,timer.id,timer.interval_us as f64/1000.0,timer.due_us.saturating_sub(now)as f64/1000.0,timer.proc));
-                }
-            }
-        }
+        report.push_str(&self.contexts_report());
         report.push_str("\nVisible windows:");
         report.push_str(&format!(
             "\nActive time skips: {}; skipped guest microseconds: {}",

@@ -1,6 +1,7 @@
 //! Native presentation and deadline-driven input for a guest PE process.
 mod audio;
 mod control;
+mod debug;
 mod frame_pacer;
 mod frontend;
 #[cfg(any(host_view, windows))]
@@ -91,6 +92,8 @@ pub struct Options {
     self_test_input: bool,
     profile: bool,
     control_stdin: bool,
+    /// Serve `tools/debug/hitode_debug.py`; also `ADV_DEBUG=1`.
+    pub debug: bool,
     frame_budget: bool,
     pub audio: bool,
     codec: adv_runtime::vorbis::Policy,
@@ -140,6 +143,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
   --frame-budget          opt-in bounded per-frame accounting (headless, one worker)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
+  --debug                 serve the interactive debugger (tools/debug/hitode_debug.py)\n\
   --help                  show this help\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
 
@@ -182,6 +186,7 @@ impl Options {
             self_test_input: false,
             profile: false,
             control_stdin: false,
+            debug: false,
             frame_budget: false,
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
@@ -279,6 +284,7 @@ impl Options {
                 "--self-test-input" => options.self_test_input = true,
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
+                "--debug" => options.debug = true,
                 "--frame-budget" => options.frame_budget = true,
                 "--audio" => options.audio = true,
                 "--codec" => {
@@ -352,6 +358,29 @@ impl Options {
         }
         Ok(Some(options))
     }
+}
+
+/// Ctrl+Shift+F12 asks the debugger for a mark and snapshot.
+fn debug_hotkey(keys: &adv_sync::input::KeyState, message: u32, key: u32) -> bool {
+    let held = |codes: &[u32]| codes.iter().any(|&code| keys.get(code) & 0x80 != 0);
+    message == 0x100 && key == 0x7b && held(&[0x11, 0xa2, 0xa3]) && held(&[0x10, 0xa0, 0xa1])
+}
+
+/// What `info` reports about this session; fixed for its lifetime.
+fn debug_info(options: &Options, windowed: bool) -> String {
+    format!(
+        "pid={}\nbuild={}\nplatform={}-{}\nmedia={}\ngpu={}\nwindow={}\nexe={}\ndata_dir={}\nstarted_unix_us={}",
+        std::process::id(),
+        env!("ADV_SHELL_BUILD"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "media"),
+        cfg!(any(host_view, feature = "gpu")),
+        windowed,
+        options.exe.display(),
+        options.data_dir.display(),
+        debug::unix_us()
+    )
 }
 
 fn json(s: &str) -> String {
@@ -1337,6 +1366,20 @@ fn run_execution(
 ) -> Result<Finished, String> {
     window::initialize_dpi()?;
     let started = Instant::now();
+    // Before any translation, so the sampler can attribute every unit.
+    let mut debugger = debug::requested(options.debug)
+        .then(|| {
+            debug::Debugger::start(
+                debug_info(&options, window.is_some()),
+                &options.data_dir,
+                wake.clone(),
+            )
+        })
+        .and_then(|started| {
+            started
+                .map_err(|error| eprintln!("warning: debugger unavailable: {error}"))
+                .ok()
+        });
     if let Some(install) = &options.install_dir {
         std::fs::create_dir_all(install)
             .map_err(|e| format!("install folder {}: {e}", install.display()))?;
@@ -1571,6 +1614,12 @@ fn run_execution(
                         wparam,
                         lparam,
                     } => {
+                        if let Some(debugger) = debugger.as_mut()
+                            && debug_hotkey(&keys, message, wparam)
+                        {
+                            debugger.hotkey(&mut runtime);
+                            continue;
+                        }
                         inputs += u64::from(runtime.post_input(message, wparam, lparam));
                     }
                     #[cfg(host_view)]
@@ -1945,6 +1994,9 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
+        if let Some(debugger) = debugger.as_mut() {
+            debugger.serve(&mut runtime);
+        }
         let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
@@ -2043,6 +2095,9 @@ fn run_execution(
         audio.update();
         let presented = runtime.presented_frames();
         performance.step(step_elapsed, presented);
+        if let Some(debugger) = debugger.as_mut() {
+            debugger.after_step(step_elapsed, presented, &runtime);
+        }
         if matches!(
             &outcome,
             SliceResult::Complete(RunResult::Exited(_) | RunResult::Failed(_))

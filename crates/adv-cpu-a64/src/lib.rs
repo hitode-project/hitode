@@ -16,7 +16,7 @@ mod cpu;
 pub mod encode;
 mod executor;
 #[cfg(native)]
-mod jit_map;
+pub mod jit_map;
 #[cfg(native)]
 mod native;
 pub mod runtime;

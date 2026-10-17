@@ -10,4 +10,26 @@ fn main() {
     if matches!(os.as_str(), "android" | "ios") {
         println!("cargo::rustc-cfg=mobile");
     }
+    // The debugger's `info`: the commit this was built from, and whether
+    // tracked files differed. Reruns when HEAD or the index moves.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    for path in ["logs/HEAD", "index"] {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", path]) {
+            println!("cargo::rerun-if-changed={path}");
+        }
+    }
+    let commit = git(&["rev-parse", "--short=8", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|status| !status.is_empty());
+    println!(
+        "cargo::rustc-env=ADV_SHELL_BUILD={commit}{}",
+        if dirty { "+dirty" } else { "" }
+    );
 }
