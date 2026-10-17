@@ -1059,7 +1059,8 @@ const STS: [AsmRegisterSt; 8] = [st0, st1, st2, st3, st4, st5, st6, st7];
 
 /// A short run of x87 instructions over the stack the program left,
 /// sometimes after `fninit`: loads of special and random values, stores,
-/// arithmetic in every form, compares, exchanges and control words.
+/// arithmetic in every form, compares, exchanges, control words, and
+/// compares that branch on the status word as compilers emit them.
 fn x87(
     a: &mut CodeAssembler,
     rng: &mut Rng,
@@ -1073,11 +1074,55 @@ fn x87(
     for _ in 0..1 + rng.below(4) {
         let i = STS[rng.below(8)];
         let near = STS[rng.below(3)];
-        match rng.below(30) {
+        match rng.below(34) {
             0 | 1 => {
                 let at = slot(rng);
                 a.mov(dword_ptr(at), rng.pick(&SPECIAL)).unwrap();
                 a.fld(dword_ptr(at)).unwrap();
+            }
+            30..=33 => {
+                // fcom, fnstsw ax, test ah and a jcc over an arm, or to an
+                // arm the trace leaves for, both arms joining again.
+                let (mut other, mut join) = (a.create_label(), a.create_label());
+                let skip = rng.below(2) == 0;
+                match rng.below(3) {
+                    0 => a.fcom_2(st0, near).unwrap(),
+                    1 => a.fcomp_2(st0, near).unwrap(),
+                    _ => a.fucom(st0, near).unwrap(),
+                }
+                a.fnstsw(ax).unwrap();
+                match rng.below(4) {
+                    0 => a.fstp(st1).unwrap(),
+                    1 => a.mov(edx, eax).unwrap(),
+                    _ => {}
+                }
+                a.test(ah, rng.pick(&[0x05, 0x41, 0x44, 0x01, 0x45]))
+                    .unwrap();
+                match rng.below(4) {
+                    0 => a.jp(other).unwrap(),
+                    1 => a.jnp(other).unwrap(),
+                    2 => a.jne(other).unwrap(),
+                    _ => a.je(other).unwrap(),
+                }
+                let arm = |a: &mut CodeAssembler, rng: &mut Rng| match rng.below(5) {
+                    0 => a.fld(STS[rng.below(3)]).unwrap(),
+                    1 => a.fadd_2(st0, STS[rng.below(3)]).unwrap(),
+                    2 => a.fmul_2(STS[rng.below(3)], st0).unwrap(),
+                    3 => a.fld1().unwrap(),
+                    _ => a.fxch(st0, STS[1 + rng.below(2)]).unwrap(),
+                };
+                arm(a, rng);
+                if !skip {
+                    a.jmp(join).unwrap();
+                }
+                a.set_label(&mut other).unwrap();
+                if skip {
+                    a.nop().unwrap();
+                } else {
+                    arm(a, rng);
+                }
+                a.set_label(&mut join).unwrap();
+                a.nop().unwrap();
             }
             2 | 3 => {
                 let at = slot(rng);

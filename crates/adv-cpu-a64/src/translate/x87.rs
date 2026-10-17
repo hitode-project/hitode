@@ -39,7 +39,8 @@ use super::flags::Operand;
 use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
 
 mod cache;
-pub(super) use cache::{Cache, Cold, Model};
+mod pair;
+pub(super) use cache::{Arrive, Cache, Cold, Leave, Model};
 
 const X7: Reg = Reg::new(7);
 const X8: Reg = Reg::new(8);
@@ -170,7 +171,6 @@ impl Translator<'_> {
     /// What instruction `x` does once its checks have run; whether it
     /// records the data pointer and the instruction pointer and opcode.
     fn x87_body(&mut self, x: X87, slow: Label) -> (bool, bool) {
-        let cached = self.x87.active;
         let mut dp = x.mem.is_some();
         let mut metadata = true;
         match x.fast {
@@ -180,10 +180,6 @@ impl Translator<'_> {
             Fast::Examine => {
                 self.x87_examine();
                 metadata = false;
-            }
-            Fast::Load(Source::St(index)) if cached => {
-                self.x87_push_copy(index);
-                self.clear_c1();
             }
             Fast::Load(source) => self.x87_load(source, slow),
             Fast::Constant(one) => {
@@ -200,13 +196,6 @@ impl Translator<'_> {
                 integer,
                 pop,
             } => self.x87_store(width, integer, pop, slow),
-            Fast::StoreSt { index, pop } if cached => {
-                self.x87_copy(index, 0);
-                self.clear_c1();
-                if pop {
-                    self.pop();
-                }
-            }
             Fast::StoreSt { index, pop } => {
                 self.read(0, X0, X1, slow);
                 self.ordinary(X0, X1, slow);
@@ -225,10 +214,6 @@ impl Translator<'_> {
                 pop,
             } => self.x87_arith(op, dest, source, reverse, pop, slow),
             Fast::Compare { source, pops } => self.x87_compare(source, pops, slow),
-            Fast::Exchange(index) if cached => {
-                self.x87_exchange(index);
-                self.clear_c1();
-            }
             Fast::Exchange(index) => {
                 self.read(0, X0, X1, slow);
                 self.ordinary(X0, X1, slow);
@@ -265,9 +250,6 @@ impl Translator<'_> {
                 (dp, metadata) = (false, false);
             }
             Fast::StoreControl | Fast::StoreStatus => {
-                if cached && x.fast == Fast::StoreStatus {
-                    self.x87_status();
-                }
                 let value = if x.fast == Fast::StoreControl {
                     X8
                 } else {
@@ -398,64 +380,10 @@ impl Translator<'_> {
     fn x87_store(&mut self, width: u8, integer: bool, pop: bool, slow: Label) {
         self.read(0, X0, X1, slow);
         self.ordinary(X0, X1, slow);
-        // Round to nearest, or toward zero for integers.
-        self.emit(ubfx(W, X17, X8, 10, 2));
-        if integer {
-            let nearest = self.asm.label();
-            self.asm.cbz(W, false, X17, nearest);
-            self.emit(cmp_imm(W, X17, 3, false));
-            self.asm.b_cond(Cond::Ne, slow);
-            self.asm.bind(nearest);
-        } else {
-            self.asm.cbz(W, true, X17, slow);
-        }
-        // x2 the bits, w3 whether they are inexact, w7 whether rounding
-        // grew the magnitude.
-        if integer {
-            // w7 the rounding control.
-            self.emit(mov(W, X7, X17));
+        self.store_rounding(integer, slow);
+        if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
-            // Below 2^63, and below 2^51 when bits were lost.
-            let whole = self.asm.label();
-            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
-            self.asm.cbz(W, false, X3, whole);
-            self.emit(cmp_imm(W, X16, 1023 + 50, false));
-            self.asm.b_cond(Cond::Hi, slow);
-            self.asm.bind(whole);
-            self.emit(cmp_imm(W, X16, 1023 + 62, false));
-            self.asm.b_cond(Cond::Hi, slow);
-            let rounded = self.asm.label();
-            self.emit(unary(Unary::Frintn, V1, V0));
-            self.asm.cbz(W, false, X7, rounded);
-            self.emit(unary(Unary::Frintz, V1, V0));
-            self.asm.bind(rounded);
-            self.emit(fcvt_int(X, true, X2, V1));
-            if width == 4 {
-                self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
-                self.asm.b_cond(Cond::Ne, slow);
-            }
-            self.grew(V1, V0);
-        } else if width == 4 {
-            self.double(X0, X1, V0, Take::Sticky(X3), slow);
-            // A normal input and output: no underflow or overflow.
-            let zero = self.asm.label();
-            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
-            self.asm.cbz(W, false, X16, zero);
-            self.emit_all(&[
-                sub_imm(W, X16, X16, 1023 - 126, false),
-                cmp_imm(W, X16, 253, false),
-            ]);
-            self.asm.b_cond(Cond::Hi, slow);
-            self.asm.bind(zero);
-            self.emit_all(&[
-                unary(Unary::Narrow, V1, V0),
-                fmov_from_v(W, X2, V1),
-                ubfx(W, X16, X2, 23, 8),
-                cmp_imm(W, X16, 0xff, false),
-            ]);
-            self.asm.b_cond(Cond::Eq, slow);
-            self.emit(unary(Unary::Widen, V1, V1));
-            self.grew(V1, V0);
+            self.store_sticky(width, integer, slow);
         } else {
             // Round the significand to 53 bits, nearest even, in integers.
             let zero = self.asm.label();
@@ -489,26 +417,93 @@ impl Translator<'_> {
             self.asm.b_cond(Cond::Eq, slow);
             self.asm.bind(zero);
         }
-        // Inexact needs PE masked; it sets PE, and C1 when rounded up.
-        let exact = self.asm.label();
-        let flagged = self.asm.label();
-        self.asm.cbz(W, false, X3, exact);
-        self.asm.tbz(false, X8, 5, slow);
-        self.emit_all(&[orr_imm(W, X13, X13, u64::from(PE)), bfi(W, X13, X7, 9, 1)]);
-        self.asm.b(flagged);
-        self.asm.bind(exact);
-        self.clear_c1();
-        self.asm.bind(flagged);
-        if !self.x87.active {
-            // A cached run's fault stub restores the flags itself.
-            self.emit(msr_nzcv(X4));
-        }
+        self.store_flags(slow);
+        self.emit(msr_nzcv(X4));
         self.site();
         let size = if width == 8 { X } else { W };
         self.emit(str_reg(size, X2, WINDOW, X6, false));
         if pop {
             self.pop();
         }
+    }
+
+    /// Takes the interpreter unless the rounding control is to nearest, or
+    /// toward zero for integers, whose control it leaves in w7. Uses w17.
+    fn store_rounding(&mut self, integer: bool, slow: Label) {
+        self.emit(ubfx(W, X17, X8, 10, 2));
+        if integer {
+            let nearest = self.asm.label();
+            self.asm.cbz(W, false, X17, nearest);
+            self.emit(cmp_imm(W, X17, 3, false));
+            self.asm.b_cond(Cond::Ne, slow);
+            self.asm.bind(nearest);
+            self.emit(mov(W, X7, X17));
+        } else {
+            self.asm.cbz(W, true, X17, slow);
+        }
+    }
+
+    /// The bits of an integer or binary32 store in x2 from the value's
+    /// sticky double in d0 (w3 whether it lost bits), w3 whether they are
+    /// inexact and w7 whether rounding grew the magnitude.
+    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label) {
+        if integer {
+            // Below 2^63, and below 2^51 when bits were lost.
+            let whole = self.asm.label();
+            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+            self.asm.cbz(W, false, X3, whole);
+            self.emit(cmp_imm(W, X16, 1023 + 50, false));
+            self.asm.b_cond(Cond::Hi, slow);
+            self.asm.bind(whole);
+            self.emit(cmp_imm(W, X16, 1023 + 62, false));
+            self.asm.b_cond(Cond::Hi, slow);
+            let rounded = self.asm.label();
+            self.emit(unary(Unary::Frintn, V1, V0));
+            self.asm.cbz(W, false, X7, rounded);
+            self.emit(unary(Unary::Frintz, V1, V0));
+            self.asm.bind(rounded);
+            self.emit(fcvt_int(X, true, X2, V1));
+            if width == 4 {
+                self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
+                self.asm.b_cond(Cond::Ne, slow);
+            }
+            self.grew(V1, V0);
+        } else {
+            // A normal input and output: no underflow or overflow.
+            let zero = self.asm.label();
+            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+            self.asm.cbz(W, false, X16, zero);
+            self.emit_all(&[
+                sub_imm(W, X16, X16, 1023 - 126, false),
+                cmp_imm(W, X16, 253, false),
+            ]);
+            self.asm.b_cond(Cond::Hi, slow);
+            self.asm.bind(zero);
+            self.emit_all(&[
+                unary(Unary::Narrow, V1, V0),
+                fmov_from_v(W, X2, V1),
+                ubfx(W, X16, X2, 23, 8),
+                cmp_imm(W, X16, 0xff, false),
+            ]);
+            self.asm.b_cond(Cond::Eq, slow);
+            self.emit(unary(Unary::Widen, V1, V1));
+            self.grew(V1, V0);
+        }
+    }
+
+    /// The flags of a store whose w3 says it is inexact and w7 that it
+    /// grew: inexact needs PE masked, sets PE, and C1 when rounded up.
+    fn store_flags(&mut self, slow: Label) {
+        let exact = self.asm.label();
+        let flagged = self.asm.label();
+        self.asm.cbz(W, false, X3, exact);
+        self.emit(and_imm(W, X16, X8, u64::from(PE)));
+        self.asm.cbz(W, false, X16, slow);
+        self.emit_all(&[orr_imm(W, X13, X13, u64::from(PE)), bfi(W, X13, X7, 9, 1)]);
+        self.asm.b(flagged);
+        self.asm.bind(exact);
+        self.clear_c1();
+        self.asm.bind(flagged);
     }
 
     /// w3 whether `rounded` differs from `value`, w7 whether it is larger
@@ -682,6 +677,12 @@ impl Translator<'_> {
         self.ordinary(X2, X3, slow);
         self.read(dest, X0, X1, slow);
         self.ordinary(X0, X1, slow);
+        self.wide_ops(op, reverse, slow);
+    }
+
+    /// `x87_wide` on the destination in x0 and x1 and the source in x2
+    /// and x3, both zeros or normals.
+    fn wide_ops(&mut self, op: Arith, reverse: bool, slow: Label) {
         if reverse {
             for (a, b) in [(X0, X2), (X1, X3)] {
                 self.emit_all(&[mov(X, X16, a), mov(X, a, b), mov(X, b, X16)]);
@@ -1088,15 +1089,6 @@ impl Translator<'_> {
             orr(W, X13, X13, X16, Lsl, 14),
             orr(W, X13, X13, X17, Lsl, 8),
         ]);
-        if self.x87.active {
-            if pops == 2 {
-                self.x87_free(1);
-            }
-            for _ in 0..pops {
-                self.x87_pop();
-            }
-            return;
-        }
         if pops == 2 {
             let second = self.slot(1, X7);
             self.free(second);
@@ -1114,6 +1106,16 @@ impl Translator<'_> {
     /// than zeros and normals and doubles outside `2^±range`. Uses x16
     /// and x17.
     fn memory_operand(&mut self, source: Source, d: VReg, range: Option<u32>, slow: Label) {
+        let bounds = match range {
+            Some(range) => (1023 - range, 2 * range),
+            None => (1, 2045),
+        };
+        self.memory_bounded(source, d, bounds, slow);
+    }
+
+    /// `memory_operand` with a binary64 operand's biased exponent minus
+    /// `bounds.0` at most `bounds.1`, unless it is a zero.
+    fn memory_bounded(&mut self, source: Source, d: VReg, bounds: (u32, u32), slow: Label) {
         self.site();
         match source {
             Source::F32 => {
@@ -1142,10 +1144,7 @@ impl Translator<'_> {
                     lsl_imm(X, X17, X16, 1),
                 ]);
                 self.asm.cbz(X, false, X17, ok);
-                let (low, span) = match range {
-                    Some(range) => (1023 - range, 2 * range),
-                    None => (1, 2045),
-                };
+                let (low, span) = bounds;
                 self.emit_all(&[
                     ubfx(X, X17, X16, 52, 11),
                     sub_imm(W, X17, X17, low, false),
@@ -1188,10 +1187,6 @@ impl Translator<'_> {
     /// Loads stack slot `index`, which must not be empty; uses x7, x16
     /// and x17.
     fn read(&mut self, index: u8, sig: Reg, sexp: Reg, slow: Label) {
-        if self.x87.active {
-            self.x87_get(index, sig, sexp);
-            return;
-        }
         let p = self.slot(index, X7);
         self.read_slot(p, sig, sexp, slow);
     }
@@ -1199,20 +1194,12 @@ impl Translator<'_> {
     /// Writes an ordinary value to stack slot `index`; uses x7, x16 and
     /// x17.
     fn st_write(&mut self, index: u8, sig: Reg, sexp: Reg) {
-        if self.x87.active {
-            self.x87_put(index, sig, sexp);
-            return;
-        }
         let p = self.slot(index, X7);
         self.commit_value(p, sig, sexp);
     }
 
     /// Pushes an ordinary value; uses x2, x16 and x17.
     fn st_push(&mut self, sig: Reg, sexp: Reg, slow: Label) {
-        if self.x87.active {
-            self.x87_push(sig, sexp);
-            return;
-        }
         let target = self.push_target(slow);
         self.commit_value(target, sig, sexp);
         self.emit(mov(W, X15, target));
@@ -1249,10 +1236,6 @@ impl Translator<'_> {
     /// Rejects extended encodings other than zeros and normals; uses x16
     /// and x17.
     fn ordinary(&mut self, sig: Reg, sexp: Reg, slow: Label) {
-        if self.x87.active {
-            // A cached run holds only zeros and normals.
-            return;
-        }
         let zero = self.asm.label();
         let ok = self.asm.label();
         self.emit(and_imm(W, X16, sexp, 0x7fff));
@@ -1375,10 +1358,6 @@ impl Translator<'_> {
     }
 
     fn pop(&mut self) {
-        if self.x87.active {
-            self.x87_pop();
-            return;
-        }
         self.free(X15);
         self.emit_all(&[add_imm(W, X15, X15, 1, false), and_imm(W, X15, X15, 7)]);
     }

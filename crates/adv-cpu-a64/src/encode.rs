@@ -983,6 +983,36 @@ pub const fn fnmsub(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
     0x1F60_8000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
 }
 
+/// `fmadd dd, dn, dm, da`: da + dn * dm, rounded once.
+pub const fn fmadd(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
+    0x1F40_0000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `fmsub dd, dn, dm, da`: da - dn * dm, rounded once.
+pub const fn fmsub(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
+    0x1F40_8000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `fneg vd.2d, vn.2d`.
+pub const fn vfneg2d(rd: VReg, rn: VReg) -> u32 {
+    0x6EE0_F800 | rn.number() << 5 | rd.number()
+}
+
+/// `ucvtf dd, xn`.
+pub const fn ucvtf(rd: VReg, rn: Reg) -> u32 {
+    0x9E63_0000 | rn.number() << 5 | rd.number()
+}
+
+/// `fcvtzu xd, dn`.
+pub const fn fcvtzu(rd: Reg, rn: VReg) -> u32 {
+    0x9E79_0000 | rn.number() << 5 | rd.number()
+}
+
+/// `mov dd, vn.d[1]`: the high lane as a scalar, the rest cleared.
+pub const fn dup_high(rd: VReg, rn: VReg) -> u32 {
+    0x5E18_0400 | rn.number() << 5 | rd.number()
+}
+
 /// `fcmp dn, dm`.
 pub const fn fcmp(rn: VReg, rm: VReg) -> u32 {
     0x1E60_2000 | rm.number() << 16 | rn.number() << 5
@@ -1538,6 +1568,12 @@ mod tests {
             (dfloat(Float::Fmul, v(0), v(1), v(2)), "fmul d0, d1, d2"),
             (dfloat(Float::Fdiv, v(0), v(1), v(2)), "fdiv d0, d1, d2"),
             (fnmsub(v(4), v(1), v(2), v(3)), "fnmsub d4, d1, d2, d3"),
+            (fmadd(v(2), v(3), v(4), v(5)), "fmadd d2, d3, d4, d5"),
+            (fmsub(v(2), v(3), v(4), v(5)), "fmsub d2, d3, d4, d5"),
+            (vfneg2d(v(2), v(3)), "fneg v2.2d, v3.2d"),
+            (ucvtf(v(2), r(16)), "ucvtf d2, x16"),
+            (fcvtzu(r(16), v(2)), "fcvtzu x16, d2"),
+            (dup_high(v(2), v(3)), "mov d2, v3.d[1]"),
             (fcmp(v(1), v(2)), "fcmp d1, d2"),
             (fcmp_zero(v(1)), "fcmp d1, #0.0"),
             (unary(Unary::Fabs, v(0), v(1)), "fabs d0, d1"),

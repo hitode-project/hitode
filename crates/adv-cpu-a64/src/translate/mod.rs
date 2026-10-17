@@ -271,6 +271,8 @@ enum Cold {
         exit: Exit,
         eip: u32,
         link: bool,
+        /// What an x87 run inside which it leaves does first.
+        x87: Option<x87::Leave>,
     },
     /// A forward internal edge that converts flags or settles the budget.
     Edge {
@@ -278,6 +280,8 @@ enum Cold {
         state: State,
         from: usize,
         to: usize,
+        /// What an x87 run it leaves from does first.
+        x87: Option<x87::Arrive>,
     },
     /// A backward edge whose check failed: undo it, then leave if the
     /// branch is taken.
@@ -369,12 +373,15 @@ struct Translator<'a> {
     x87: x87::Cache,
     /// Sites inside such runs and the stubs that publish before faulting.
     x87_sites: Vec<(usize, Label)>,
+    /// The x87 control word when translating, which runs specialize for.
+    control: u16,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
 /// `at`. Units end before any of `stops`, the accesses of instructions
 /// `checked` accepts check their page first, and the unit's helpers are
-/// numbered from `helpers`. Each translated byte is
+/// numbered from `helpers`. x87 arithmetic runs natively under the
+/// control word `control`, the guest's at translation. Each translated byte is
 /// registered with `watch_code`, so a store to it reaches the owner.
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
@@ -388,6 +395,7 @@ pub fn translate(
     at: usize,
     stubs: Stubs,
     leaf: &dyn Fn(u32, u32) -> bool,
+    control: u16,
 ) {
     work.trace.build(memory, eip, stops, leaf);
     tables::prepare(work, memory);
@@ -442,6 +450,7 @@ pub fn translate(
         channels,
         x87: x87::Cache::default(),
         x87_sites: Vec::new(),
+        control,
     };
     if trace.len() == 0 {
         // Nothing to translate: other units may still link here.
@@ -522,6 +531,9 @@ impl Translator<'_> {
         self.out = trace.live_out[index];
         self.keep = self.out.minus(inst.effects.writes);
         let steady = self.pixel.is_some_and(|p| p.steady);
+        if self.x87.active && trace.merge[index] {
+            self.x87_merge(index);
+        }
         if !steady && (trace.head(index) || trace.merge[index]) {
             // Control may arrive from elsewhere.
             self.flush_simd();
@@ -544,6 +556,7 @@ impl Translator<'_> {
                 exit: Exit::Dispatch,
                 eip: inst.pc,
                 link: false,
+                x87: None,
             });
             self.state = State::CANONICAL;
         } else if !steady && trace.merge[index] {
@@ -554,6 +567,9 @@ impl Translator<'_> {
             self.asm.bind(self.labels[index]);
             self.pixel_start(index);
             self.channel_batch(index);
+        }
+        if self.x87.active && !matches!(inst.op, decode::Op::X87(_)) {
+            self.x87_integer();
         }
         self.op(inst);
         if self.pixel_end() {
@@ -568,7 +584,12 @@ impl Translator<'_> {
     fn follow(&mut self, edge: Edge) {
         let unused = self.trace.unused(self.index);
         match edge {
-            Edge::Internal(to) => self.jump(to),
+            Edge::Internal(to) => {
+                if let Some(x87) = self.x87_arriving(to) {
+                    self.x87_arrive(x87, self.index, to);
+                }
+                self.jump(to)
+            }
             Edge::Exit(eip) => self.leave(Exit::Dispatch, eip, unused, true, true),
             Edge::Interpret(eip) => self.leave(Exit::Interpret, eip, unused, false, false),
         }
@@ -591,6 +612,7 @@ impl Translator<'_> {
                 exit: Exit::Dispatch,
                 eip: self.trace.insts[to].pc,
                 link: false,
+                x87: None,
             });
         } else if net < 0 {
             self.emit(add_imm(X, X9, X9, (-net) as u32, false));
@@ -642,6 +664,7 @@ impl Translator<'_> {
                         exit: Exit::Dispatch,
                         eip: self.trace.insts[to].pc,
                         link: false,
+                        x87: None,
                     });
                 } else if net == 0 {
                     self.jump_if(test, target);
@@ -653,12 +676,17 @@ impl Translator<'_> {
                         state: self.state,
                         from,
                         to,
+                        x87: None,
                     });
                 }
             }
             Edge::Internal(to) => {
                 let test = self.test(cc);
-                if self.trace.net(from, to) == 0 && !self.needs(self.trace.live_in[to]) {
+                let x87 = self.x87_arriving(to);
+                if self.trace.net(from, to) == 0
+                    && !self.needs(self.trace.live_in[to])
+                    && x87.is_none()
+                {
                     self.jump_if(test, self.labels[to]);
                 } else {
                     let label = self.asm.label();
@@ -668,6 +696,7 @@ impl Translator<'_> {
                         state: self.state,
                         from,
                         to,
+                        x87,
                     });
                 }
             }
@@ -683,6 +712,7 @@ impl Translator<'_> {
                     exit: Exit::Dispatch,
                     eip,
                     link: true,
+                    x87: self.x87_leaving(),
                 });
             }
             Edge::Interpret(_) => unreachable!("a jcc target dispatches"),
@@ -1133,10 +1163,14 @@ impl Translator<'_> {
                 exit,
                 eip,
                 link,
+                x87,
             } => {
                 self.asm.bind(label);
                 self.state = state;
                 self.vector.dirty = simd_dirty;
+                if let Some(x87) = x87 {
+                    self.x87_leave(x87);
+                }
                 self.leave(exit, eip, refund, link, false);
             }
             Cold::Edge {
@@ -1144,10 +1178,14 @@ impl Translator<'_> {
                 state,
                 from,
                 to,
+                x87,
             } => {
                 self.asm.bind(label);
                 self.state = state;
                 self.index = from;
+                if let Some(x87) = x87 {
+                    self.x87_arrive(x87, from, to);
+                }
                 self.jump(to);
             }
             Cold::Refuse {

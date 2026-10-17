@@ -78,6 +78,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         HOST_CODE as usize,
         stubs,
         &|_, _| false,
+        0x037f,
     );
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
     let target_load = work.sites().last().unwrap().0 / 4;
@@ -100,6 +101,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         HOST_CODE as usize,
         stubs,
         &|_, _| false,
+        0x037f,
     );
     assert_eq!(work.tables.len(), 1);
     let hot = work.words().iter().position(|&w| w == br(X17)).unwrap();
@@ -260,6 +262,7 @@ impl Harness {
                 fault: addr(self.forbidden),
             },
             &|_, _| false,
+            0x037f,
         );
         assert!(
             !work
@@ -718,6 +721,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 HOST_CODE as usize,
                 stubs,
                 &|_, _| false,
+                0x037f,
             );
             let count = work.tables.first().map_or(0, |t| t.targets.len());
             assert_eq!(

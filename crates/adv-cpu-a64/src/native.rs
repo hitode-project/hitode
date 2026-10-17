@@ -593,6 +593,8 @@ pub(crate) struct Native {
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
+    /// The x87 control word of the CPU a run starts on.
+    control: u16,
 }
 
 impl Native {
@@ -690,6 +692,7 @@ impl Native {
             stops: Vec::new(),
             features: features(),
             runtime,
+            control: 0,
         })
     }
 
@@ -706,6 +709,7 @@ impl Native {
         bridge: *mut std::ffi::c_void,
     ) -> Result<Option<Run>, String> {
         self.bridge = bridge;
+        self.control = cpu.x87.control;
         self.invalidate(memory);
         self.observe_stop(stop);
         let (entry, translated) = match self.units.get(&cpu.eip).copied() {
@@ -1123,6 +1127,13 @@ impl Native {
         let mut work = std::mem::take(&mut self.work);
         work.images.clone_from(&self.images.borrow());
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
+        let control = if self.runtime.cpu.is_null() {
+            self.control
+        } else {
+            // SAFETY: during a run the runtime points at its live CPU, which
+            // nothing writes while the owner translates.
+            unsafe { (*self.runtime.cpu).x87.control }
+        };
         translate::translate(
             &mut work,
             memory,
@@ -1143,6 +1154,7 @@ impl Native {
                     .as_ref()
                     .is_some_and(|handler| handler.leaf_call(pc, word))
             },
+            control,
         );
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;

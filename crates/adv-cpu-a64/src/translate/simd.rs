@@ -1464,6 +1464,7 @@ impl Translator<'_> {
             exit: Exit::Interpret,
             eip: inst.pc,
             link: false,
+            x87: None,
         });
         label
     }
@@ -1533,6 +1534,7 @@ mod tests {
                 fault: 0,
             },
             &|_, _| false,
+            0x037f,
         );
         println!(
             "mixed MMX loop: {} guest instructions, {} A64 instructions",

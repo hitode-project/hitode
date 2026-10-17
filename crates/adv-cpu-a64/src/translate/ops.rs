@@ -506,6 +506,7 @@ impl Translator<'_> {
                 exit,
                 eip,
                 link: false,
+                x87: None,
             });
         }
     }
