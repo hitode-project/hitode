@@ -7,6 +7,12 @@
 //! the socket thread, so they work while the guest is wedged. Commands that
 //! read guest state wait for the execution loop's next boundary and report a
 //! timeout instead of blocking. Nothing here changes guest execution.
+//!
+//! A frame gap of at least [`STALL_US`] that the execution thread spent
+//! mostly in guest steps takes a snapshot by itself once [`STALL_SETTLE_US`]
+//! has passed, so a felt stall is kept without the hotkey. Gaps spent
+//! waiting are not: engines that present only on change leave those on
+//! every still screen.
 use crate::window::WakeEvent;
 use adv_runtime::Engine;
 use adv_runtime::boot::Runtime;
@@ -26,6 +32,13 @@ const TIMELINE_CAPACITY: usize = 36_000;
 /// What a snapshot looks back over.
 const SNAPSHOT_WINDOW_US: u64 = 30_000_000;
 const SNAPSHOTS_KEPT: usize = 8;
+/// A busy frame gap at least this long snapshots itself.
+const STALL_US: u64 = 250_000;
+/// How long after a stall its snapshot waits, so the window shows the
+/// frames after it and nearby stalls share one snapshot.
+const STALL_SETTLE_US: u64 = 2_000_000;
+/// Stall snapshots one session writes at most.
+const STALL_SNAPSHOTS: usize = 32;
 /// Host functions where a sampled execution thread is waiting, not working.
 const IDLE: &[&str] = &[
     "poll",
@@ -99,6 +112,11 @@ pub(crate) struct Debugger {
     busy_us: u64,
     last: FrameRow,
     slow_baseline: HashMap<u32, [u64; 3]>,
+    /// Slow-path counts at the previous snapshot.
+    snapshot_baseline: HashMap<u32, [u64; 3]>,
+    /// The longest busy gap waiting for its snapshot, and when it ended.
+    stall: Option<(u64, u64)>,
+    stall_snapshots: usize,
 }
 
 impl Debugger {
@@ -108,7 +126,7 @@ impl Debugger {
         adv_runtime::jit_map_enable();
         let (sender, receiver) = mpsc::channel();
         let shared = Arc::new(Shared {
-            info,
+            info: format!("{info}\n{}", host_image()),
             timeline: Mutex::new(VecDeque::with_capacity(1024)),
             marks: Mutex::default(),
             snapshots: Mutex::default(),
@@ -136,6 +154,9 @@ impl Debugger {
                 interpreter_entries: 0,
             },
             slow_baseline: HashMap::new(),
+            snapshot_baseline: HashMap::new(),
+            stall: None,
+            stall_snapshots: 0,
         })
     }
 
@@ -144,6 +165,18 @@ impl Debugger {
         while let Ok(request) = self.receiver.try_recv() {
             let result = self.execute(&request.line, runtime);
             let _ = request.reply.send(result);
+        }
+        if let Some((gap_us, ended)) = self.stall
+            && unix_us() >= ended + STALL_SETTLE_US
+        {
+            self.stall = None;
+            self.stall_snapshots += 1;
+            let label = format!("stall-{}ms", gap_us / 1000);
+            mark(&self.shared, label.clone());
+            match self.snapshot(&label, runtime) {
+                Ok(name) => eprintln!("debug: snapshot {name}"),
+                Err(error) => eprintln!("debug: snapshot failed: {error}"),
+            }
         }
     }
 
@@ -169,6 +202,16 @@ impl Debugger {
                 - self.last.interpreter_entries.min(row.interpreter_entries),
             ..row
         };
+        let gap_us = row.unix_us.saturating_sub(self.last.unix_us);
+        // The wait for the first frame is loading, not a stall.
+        if self.last.frame != 0
+            && gap_us >= STALL_US
+            && delta.busy_us * 2 >= gap_us
+            && self.stall_snapshots < STALL_SNAPSHOTS
+        {
+            let longest = self.stall.map_or(0, |(gap, _)| gap).max(gap_us);
+            self.stall = Some((longest, row.unix_us));
+        }
         self.last = row;
         let mut timeline = self
             .shared
@@ -311,12 +354,16 @@ impl Debugger {
             runtime.machine.sys.recent_calls_tail(256).join("\n"),
         );
         section("gaps", runtime.api_gaps_report());
-        section("slow paths (whole session)", {
-            let baseline = std::mem::take(&mut self.slow_baseline);
-            let slow = self.slow(runtime, false);
-            self.slow_baseline = baseline;
-            slow
-        });
+        let reset = std::mem::take(&mut self.slow_baseline);
+        self.slow_baseline = std::mem::take(&mut self.snapshot_baseline);
+        section(
+            "slow paths (since previous snapshot)",
+            self.slow(runtime, false),
+        );
+        self.slow_baseline = HashMap::new();
+        section("slow paths (whole session)", self.slow(runtime, false));
+        self.slow(runtime, true);
+        self.snapshot_baseline = std::mem::replace(&mut self.slow_baseline, reset);
         section("modules", runtime.modules_report());
         section("report", runtime.report());
         std::fs::create_dir_all(&self.snapshot_dir).map_err(|e| e.to_string())?;
@@ -481,6 +528,26 @@ fn symbol(pc: usize) -> Option<(String, String)> {
         let _ = pc;
         None
     }
+}
+
+/// `host_image=PATH` and `host_base=ADDRESS` of the runner, so a client can
+/// symbolize samples after the process has ended.
+fn host_image() -> String {
+    #[cfg(unix)]
+    {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr only reads loader tables.
+        if unsafe { libc::dladdr(host_image as *const libc::c_void, &mut info) } != 0
+            && !info.dli_fname.is_null()
+        {
+            let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+            return format!(
+                "host_image={path}\nhost_base={:#x}",
+                info.dli_fbase as usize
+            );
+        }
+    }
+    String::new()
 }
 
 fn samples_text(shared: &Shared, since: u64) -> String {

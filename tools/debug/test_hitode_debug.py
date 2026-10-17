@@ -1,9 +1,10 @@
 import unittest
 
 import tempfile
+from collections import Counter
 from pathlib import Path
 
-from hitode_debug import Snapshot, frame_gaps, parse_modules, place, readable, slices, table
+from hitode_debug import Snapshot, analyze, explain_stall, frame_gaps, parse_slow, regions, parse_modules, place, readable, slices, table
 
 
 class ReplyShapeTests(unittest.TestCase):
@@ -48,6 +49,40 @@ class ReplyShapeTests(unittest.TestCase):
             self.assertEqual(parse_modules(snapshot.text("modules"))[0][2], "aqua.exe")
             with self.assertRaises(RuntimeError):
                 snapshot.text("timeline 30")
+
+    def test_nearby_units_of_one_module_merge_into_regions(self):
+        modules = parse_modules("0x00400000 0x00100000 Image    aqua.exe\n"
+                                "0x14f80000 0x00010000 Image    layer.dll\n")
+        units = Counter({0x14f81887: 5, 0x14f8176c: 4, 0x14f89000: 1, 0x0043df90: 2})
+        self.assertEqual([(c, label) for c, label, _, _ in regions(units, modules)],
+                         [(9, "layer.dll+0x176c..0x1887"), (2, "aqua.exe+0x3df90"), (1, "layer.dll+0x9000")])
+
+    def test_slow_rows_parse_with_their_form(self):
+        rows = parse_slow(["   total interpreted  faulted   helper  eip        place / form",
+                           "  709444           0        0   709444  0x0043df90 aqua.exe+0x3df90 Some(Shr_rm32_CL)"])
+        self.assertEqual(rows, [(709444, 0, 0, 709444, 0x43df90, "aqua.exe+0x3df90 Some(Shr_rm32_CL)")])
+
+    def test_verdicts_name_the_dominant_cause(self):
+        shares = {"Guest": 0.7, "HostFromGuest": 0.1, "Host": 0.2, "Idle": 0.0}
+        verdicts = explain_stall(4500, 99, shares, [(30, "layer.dll+0x176c..0x1887", 0, 0)], [],
+                                 [("adv_cpu_a64::translate::Trace::build", 9)])
+        self.assertEqual(verdicts, ["generated code: layer.dll+0x176c..0x1887 holds 30 samples",
+                                    "translation: adv_cpu_a64::translate::Trace::build (9 samples)"])
+        self.assertTrue(explain_stall(500, 10, {"Guest": 0, "HostFromGuest": 0, "Host": 0, "Idle": 0.9},
+                                      [], [], [])[0].startswith("waiting"))
+
+    def test_analysis_attributes_a_stall_to_its_samples(self):
+        snapshot = Snapshot(text="\n".join([
+            "== timeline (last 30 s)",
+            "unix_us\tframe\tbusy_us\thost_calls\tnative_entries\tinterpreter_entries",
+            "1000000\t1\t1000\t1\t1\t0", "1050000\t2\t1000\t1\t1\t0", "3050000\t3\t1990000\t5\t9\t0",
+            "== samples (last 30 s)", "unix_us\tkind\teip\tpc\timage\tsymbol",
+            *[f"{2000000 + i}\tGuest\t0x00401000\t-\t\t" for i in range(8)],
+            "2000100\tHost\t-\t0x10\tlibsystem_kernel.dylib\tread",
+            "== modules", "0x00400000 0x00100000 Image    aqua.exe"]))
+        report = analyze(snapshot)
+        self.assertIn("stall t=0.05..2.05s frame 3: 2000 ms, busy 100%", report)
+        self.assertIn("=> generated code: aqua.exe+0x1000 holds 8 samples", report)
 
 
 if __name__ == "__main__":

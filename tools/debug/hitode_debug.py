@@ -5,7 +5,7 @@ launcher / adv-run started with ADV_DEBUG=1).
 Usage:
   python3 tools/debug/hitode_debug.py list
   python3 tools/debug/hitode_debug.py [--pid PID | --socket PATH] [COMMAND ...]
-  python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof [OPTIONS]
+  python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof|analyze [OPTIONS]
 
 Without COMMAND it opens a prompt. Session commands (see `help`) go to the
 runner as they are; these are shaped here:
@@ -14,9 +14,14 @@ runner as they are; these are shaped here:
                             sampled execution thread by slice, hottest guest
                             units (module+offset) and host functions
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
-Ctrl+Shift+F12 in the game window marks the moment and keeps a snapshot;
-`snaps` lists them and `pull` fetches one; `--snapshot` runs `tl` and `prof`
-over a pulled snapshot after the session has ended. Output stays local: snapshots hold
+  analyze [--gap MS]        snapshot now and explain each stall in it
+  watch [--gap MS]          pull, save and analyze every new snapshot until
+                            the session ends; reports go to stdout and
+                            target/investigations/debug/<pid>-analysis.txt
+Ctrl+Shift+F12 in the game window marks the moment and keeps a snapshot; a
+busy frame gap of 250 ms or more keeps one by itself 2 s later. `snaps`
+lists them and `pull` fetches one; `--snapshot` runs `tl`, `prof` and
+`analyze` over a pulled snapshot after the session has ended. Output stays local: snapshots hold
 game text and must not enter the repository.
 """
 
@@ -30,6 +35,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "target" / "investigations" / "debug"
@@ -71,16 +77,17 @@ class Snapshot:
     SECTIONS = {"timeline": "timeline (last 30 s)", "samples": "samples (last 30 s)",
                 "modules": "modules", "marks": "marks", "info": "info"}
 
-    def __init__(self, path):
+    def __init__(self, path=None, text=None):
         self.sections, title = {}, None
-        for line in path.read_text(encoding="utf-8").splitlines():
+        text = path.read_text(encoding="utf-8") if text is None else text
+        for line in text.splitlines():
             if line.startswith("== "):
                 title = line[3:]
                 self.sections[title] = []
             elif title is not None:
                 self.sections[title].append(line)
-        info = dict(line.split("=", 1) for line in self.sections.get("info", []) if "=" in line)
-        self.pid = int(info.get("pid", 0))
+        self.info = dict(line.split("=", 1) for line in self.sections.get("info", []) if "=" in line)
+        self.pid = int(self.info.get("pid", 0))
 
     def text(self, line):
         title = self.SECTIONS.get(line.split()[0])
@@ -171,16 +178,192 @@ def readable(name):
     return "::".join(parts) or name
 
 
-def symbolize(pid, addresses):
-    """Host addresses to names through atos on macOS; empty elsewhere."""
+def symbolize(pid, addresses, image=None):
+    """Host addresses to names through atos on macOS; empty elsewhere. With
+    image=(path, base) it reads the binary, so the process may have ended."""
     if sys.platform != "darwin" or not addresses:
         return {}
+    target = ["-o", image[0], "-l", image[1]] if image else ["-p", str(pid)]
     try:
-        out = subprocess.run(["atos", "-p", str(pid), *addresses], capture_output=True,
+        out = subprocess.run(["atos", *target, *addresses], capture_output=True,
                              text=True, timeout=60).stdout.splitlines()
     except (OSError, subprocess.TimeoutExpired):
         return {}
-    return {address: readable(name.split(" (in ")[0]) for address, name in zip(addresses, out)}
+    return {address: readable(name.split(" (in ")[0]) for address, name in zip(addresses, out)
+            if not name.startswith("0x")}
+
+
+def host_names(session, samples):
+    """pc -> readable name for the host pcs among samples."""
+    pcs = Counter(s["pc"] for s in samples if s["kind"] in ("Host", "HostFromGuest"))
+    info = getattr(session, "info", {})
+    image = (info["host_image"], info["host_base"]) if "host_base" in info else None
+    names = symbolize(session.pid, [pc for pc, _ in pcs.most_common(200)], image)
+    for sample in samples:
+        pc = sample["pc"]
+        if pc != "-" and pc not in names:
+            names[pc] = f"{sample['image']}!{readable(sample['symbol']) or pc}"
+    return names
+
+
+def regions(units, modules, span=0x400):
+    """Counter of guest unit EIPs -> [(count, label, lo, hi)], units of one
+    module within `span` of each other merged, busiest first."""
+    ranked = []
+    current = None
+    for eip in sorted(units):
+        module = next(((base, name) for base, size, name in modules if base <= eip < base + size), None)
+        if current and current[0] == module and eip - current[3] <= span:
+            current[1] += units[eip]
+            current[3] = eip
+        else:
+            if current:
+                ranked.append(current)
+            current = [module, units[eip], eip, eip]
+    if current:
+        ranked.append(current)
+    out = []
+    for module, count, lo, hi in ranked:
+        if module:
+            base, name = module
+            label = f"{name}+{lo - base:#x}" + (f"..{hi - base:#x}" if hi != lo else "")
+        else:
+            label = f"{lo:#010x}" + (f"..{hi:#010x}" if hi != lo else "")
+        out.append((count, label, lo, hi))
+    return sorted(out, key=lambda r: -r[0])
+
+
+def parse_slow(lines):
+    """Rows of a `slow` table: (total, interpreted, faulted, helper, eip, rest)."""
+    rows = []
+    for line in lines:
+        parts = line.split(None, 5)
+        if len(parts) >= 5 and parts[0].isdigit():
+            rows.append((*map(int, parts[:4]), int(parts[4], 16), parts[5] if len(parts) > 5 else ""))
+    return rows
+
+
+def explain_stall(gap, busy, shares, guest, host_from_guest, host_only):
+    """One-line verdicts from a stall's shares (fractions of its samples)."""
+    verdicts = []
+    if busy < 50:
+        verdicts.append(f"waiting: the execution thread was in guest steps only {busy:.0f}% of the gap; "
+                        "see the waits under `threads`")
+    if shares["Idle"] >= 0.5:
+        verdicts.append("sampled idle: blocked in the host (wait or sleep)")
+    if shares["Guest"] >= 0.4 and guest:
+        verdicts.append(f"generated code: {guest[0][1]} holds {guest[0][0]} samples")
+    if shares["HostFromGuest"] >= 0.2 and host_from_guest:
+        name, count = host_from_guest[0]
+        verdicts.append(f"host calls from guest code: {name} ({count} samples)")
+    if shares["Host"] >= 0.2 and host_only:
+        name, count = host_only[0]
+        kind = "translation" if "translate" in name else "host work outside guest code"
+        verdicts.append(f"{kind}: {name} ({count} samples)")
+    return verdicts or ["no dominant cause in the samples"]
+
+
+def analyze(snapshot, gap_ms=100.0, top=6):
+    """Report text explaining each frame gap of at least gap_ms in a snapshot."""
+    rows = table(snapshot.text("timeline"))
+    samples = table(snapshot.text("samples")) if "samples (last 30 s)" in snapshot.sections else []
+    modules = parse_modules(snapshot.text("modules"))
+    slow = parse_slow(snapshot.sections.get("slow paths (since previous snapshot)")
+                      or snapshot.sections.get("slow paths (whole session)", []))
+    names = host_names(snapshot, samples)
+    out = []
+    if len(rows) < 2:
+        return "fewer than two frames in the snapshot"
+    first = int(rows[0]["unix_us"])
+    intervals = sorted((int(b["unix_us"]) - int(a["unix_us"])) / 1000 for a, b in zip(rows, rows[1:]))
+    out.append(f"{len(rows)} frames over {(int(rows[-1]['unix_us']) - first) / 1e6:.1f} s; interval p50 "
+               f"{intervals[len(intervals) // 2]:.1f} ms, p95 {intervals[int(len(intervals) * 0.95)]:.1f} ms, "
+               f"max {intervals[-1]:.1f} ms; {len(samples)} samples")
+    marks = [line.split("\t") for line in snapshot.sections.get("marks", []) if "\t" in line]
+    for at, label in marks:
+        if int(at) >= first:
+            out.append(f"mark t={(int(at) - first) / 1e6:.2f}s {label}")
+    gaps = frame_gaps(rows, gap_ms)
+    if not gaps:
+        out.append(f"no frame gap of {gap_ms:.0f} ms or more")
+    for end, gap, busy, row in sorted(gaps, key=lambda g: -g[1])[:8]:
+        start = end - gap * 1000
+        inside = [s for s in samples if start <= int(s["unix_us"]) <= end]
+        kinds = Counter(s["kind"] for s in inside)
+        total = max(len(inside), 1)
+        shares = {k: kinds[k] / total for k in ("Guest", "HostFromGuest", "Host", "Idle")}
+        out.append("")
+        out.append(f"stall t={(start - first) / 1e6:.2f}..{(end - first) / 1e6:.2f}s frame {row['frame']}: "
+                   f"{gap:.0f} ms, busy {busy:.0f}%, host_calls {row['host_calls']}, "
+                   f"native {row['native_entries']}, interpreted {row['interpreter_entries']}")
+        out.append("  samples: " + ", ".join(f"{k} {100 * v:.0f}%" for k, v in shares.items())
+                   + f" of {len(inside)}")
+        busy_samples = [s for s in inside if s["kind"] != "Idle"]
+        guest = regions(Counter(int(s["eip"], 16) for s in busy_samples if s["eip"] != "-"), modules)
+        for count, label, _, _ in guest[:top]:
+            out.append(f"  guest   {count:6} {100 * count / total:5.1f}% {label}")
+        from_guest = Counter(names[s["pc"]] for s in inside if s["kind"] == "HostFromGuest")
+        callers = defaultdict(Counter)
+        for s in inside:
+            if s["kind"] == "HostFromGuest":
+                callers[names[s["pc"]]][place(int(s["eip"], 16), modules)] += 1
+        for name, count in from_guest.most_common(top):
+            caller = callers[name].most_common(1)[0][0]
+            out.append(f"  called  {count:6} {100 * count / total:5.1f}% {name[:90]} from {caller}")
+        host_only = Counter(names[s["pc"]] for s in inside if s["kind"] == "Host")
+        for name, count in host_only.most_common(top):
+            out.append(f"  host    {count:6} {100 * count / total:5.1f}% {name[:110]}")
+        for count, label, lo, hi in guest[:3]:
+            near = [r for r in slow if lo - 0x40 <= r[4] <= hi + 0x400]
+            for total_runs, interpreted, faulted, helper, eip, rest in near[:4]:
+                out.append(f"  slow    {total_runs:8} at {rest} (interpreted {interpreted}, "
+                           f"helper {helper}) near {label}")
+        if not inside:
+            out.append("  => no samples in this gap (sampler off, or a snapshot from before samples were kept)"
+                       + ("; waiting" if busy < 50 else "; busy"))
+            continue
+        for verdict in explain_stall(gap, busy, shares, guest, from_guest.most_common(1),
+                                     host_only.most_common(1)):
+            out.append(f"  => {verdict}")
+    return "\n".join(out)
+
+
+def show_analysis(session, args):
+    parser = argparse.ArgumentParser(prog="analyze")
+    parser.add_argument("--gap", type=float, default=100.0, help="smallest frame gap in ms")
+    options = parser.parse_args(args)
+    if not isinstance(session, Snapshot):
+        name, _, body = session.text("snap analyze").partition("\n")
+        write(name, body)
+        session = Snapshot(text=body)
+    print(analyze(session, options.gap))
+
+
+def watch(session, args):
+    """Pulls each new snapshot, saves it and prints its analysis."""
+    parser = argparse.ArgumentParser(prog="watch")
+    parser.add_argument("--gap", type=float, default=100.0)
+    options = parser.parse_args(args)
+    report = OUTPUT / f"{session.pid}-analysis.txt"
+    seen = set()
+    print(f"watching session {session.pid}; reports also go to {report}", flush=True)
+    while True:
+        try:
+            names = [n for n in session.text("snaps").splitlines() if n]
+        except (ConnectionError, OSError):
+            print("session ended", flush=True)
+            return
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            _, _, body = session.text(f"pull {name}").partition("\n")
+            path = write(name, body)
+            text = f"== {name} ({path})\n{analyze(Snapshot(text=body), options.gap)}\n"
+            print(text, flush=True)
+            with report.open("a", encoding="utf-8") as file:
+                file.write(text + "\n")
+        time.sleep(2)
 
 
 def show_timeline(session, args):
@@ -249,11 +432,16 @@ def show_profile(session, args):
         print(f"  {count:6} {100 * count / len(busy):5.1f}% {name[:140]}")
 
 
+def write(name, body):
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT / f"{name}.txt"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
 def save(text, fallback):
     name, _, body = text.partition("\n")
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    path = OUTPUT / f"{name or fallback}.txt"
-    path.write_text(body, encoding="utf-8")
+    path = write(name or fallback, body)
     print(f"saved {path}")
     for line in body.splitlines()[:12]:
         print(f"  {line}")
@@ -268,6 +456,10 @@ def run(session, line):
         show_timeline(session, args)
     elif command == "prof":
         show_profile(session, args)
+    elif command == "analyze":
+        show_analysis(session, args)
+    elif command == "watch":
+        watch(session, args)
     elif command in ("snap", "pull"):
         save(session.text(line), command)
     else:
@@ -289,7 +481,7 @@ def main():
     if options.snapshot is not None:
         snapshot = Snapshot(options.snapshot)
         command, args = options.command[0], options.command[1:]
-        {"tl": show_timeline, "prof": show_profile}[command](snapshot, args)
+        {"tl": show_timeline, "prof": show_profile, "analyze": show_analysis}[command](snapshot, args)
         return
     path = options.socket
     if path is None:
