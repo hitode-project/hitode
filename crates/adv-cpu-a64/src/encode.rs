@@ -244,6 +244,11 @@ pub const fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9BA0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
 }
 
+/// `umulh xd, xn, xm`: the high 64 bits of the unsigned 128-bit product.
+pub const fn umulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9BC0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
 /// `mul rd, rn, rm`: the low half of the product.
 pub const fn mul(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x1B00_7C00 | size.sf() | rm.number() << 16 | rn.number() << 5 | rd.number()
@@ -1524,6 +1529,7 @@ mod tests {
             (sdiv(X, r(17), r(16), r(15)), "sdiv x17, x16, x15"),
             (msub(X, r(15), r(17), r(6), r(16)), "msub x15, x17, x6, x16"),
             (umull(r(16), r(19), r(6)), "umull x16, w19, w6"),
+            (umulh(r(16), r(0), r(2)), "umulh x16, x0, x2"),
             (mrs_fpsr(r(17)), "mrs x17, fpsr"),
             (mul(X, r(0), r(1), r(2)), "mul x0, x1, x2"),
             (mul(W, r(0), r(1), r(2)), "mul w0, w1, w2"),

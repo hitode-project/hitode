@@ -6,6 +6,7 @@ mod helper_gaps;
 mod jump_tables;
 mod mmx_lazy;
 mod pixel_loops;
+mod x87_wide;
 
 fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {
     let mut a = CodeAssembler::new(32).unwrap();
