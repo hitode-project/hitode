@@ -341,5 +341,31 @@ fn enumeration_descriptors_match_installed_and_unavailable_registration() {
                 })
             );
         }
+        assert!(registry.dynamic_available("dsound.dll", "GetDeviceID"));
+        assert_eq!(
+            registry.level("dsound.dll", "GetDeviceID"),
+            Some(ImplementationLevel::Implement)
+        );
     }
+}
+
+#[test]
+// spec: PERS-EXPORT-1
+fn get_device_id_resolves_default_playback_and_rejects_invalid_pointers() {
+    let mut m = machine(false, true, true, 932);
+    let target = m.resolve_import("dsound.dll", "GetDeviceID").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(DATA).push_imm(0).call(target);
+    code.ret();
+    let (res, _, _) = run(&mut m, code);
+    assert!(matches!(res, RunResult::Exited(0)));
+    let mut guid = [0u8; 16];
+    m.cpu.read(DATA, &mut guid).unwrap();
+    assert_eq!(
+        guid,
+        [
+            0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b,
+            0x5c, 0x03,
+        ]
+    );
 }

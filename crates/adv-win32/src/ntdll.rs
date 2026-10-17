@@ -101,16 +101,75 @@ fn set_information_thread(env: &mut Env<'_>) -> Outcome {
 
 /// The virtual process has no guest debugger. Keep the debug port, debug
 /// object, and debug flags consistent with the Win32 debugger queries.
+/// ProcessBasicInformation (0) reports the process PEB address, PID, and exit code.
 fn query_information_process(env: &mut Env<'_>) -> Outcome {
     let (process, class, out, size, returned) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    if !matches!(class, 7 | 30 | 31) {
+    if !matches!(class, 0 | 7 | 30 | 31) {
         adv_abi::warn_unavailable(
             env,
             "ntdll.dll!NtQueryInformationProcess",
             &format!("process information class {class} is not modeled"),
         );
         return Outcome::Return(0xc000_0002); // STATUS_NOT_IMPLEMENTED
+    }
+    if class == 0 {
+        if size < 24 {
+            return Outcome::Return(0xc000_0004); // STATUS_INFO_LENGTH_MISMATCH
+        }
+        let target = if current_process(env, process) {
+            env.sys.process_identity.clone()
+        } else {
+            match crate::kernel32::child_process::process_target(
+                env, process, 0x0400, // PROCESS_QUERY_INFORMATION
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    let status = match error.code {
+                        5 => 0xc000_0022, // STATUS_ACCESS_DENIED
+                        6 => 0xc000_0008, // STATUS_INVALID_HANDLE
+                        _ => 0xc000_0008,
+                    };
+                    return Outcome::Return(status);
+                }
+            }
+        };
+        let pid = target.pid;
+        let parent_pid = env
+            .ext
+            .try_get::<adv_os::processes::Services>()
+            .map(|services| {
+                services
+                    .live_processes()
+                    .iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, parent)| *parent)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let exit_status = target.completion.exit_code().map_or(0x0000_0103u32, |c| c); // STATUS_PENDING or exit code
+        if returned != 0 {
+            if adv_abi::guest::check_range(env.cpu, returned, 4, adv_cpu::backend::Prot::WRITE)
+                .is_err()
+                || env.cpu.write_u32(returned, 24).is_err()
+            {
+                return Outcome::Return(0xc000_0005);
+            }
+        }
+        if adv_abi::guest::check_range(env.cpu, out, 24, adv_cpu::backend::Prot::WRITE).is_err() {
+            return Outcome::Return(0xc000_0005);
+        }
+        let mut pbi = [0u8; 24];
+        pbi[0..4].copy_from_slice(&exit_status.to_le_bytes());
+        pbi[4..8].copy_from_slice(&adv_machine::layout::PEB_ADDR.to_le_bytes());
+        pbi[8..12].copy_from_slice(&1u32.to_le_bytes()); // AffinityMask
+        pbi[12..16].copy_from_slice(&8i32.to_le_bytes()); // BasePriority (NORMAL_PRIORITY_CLASS)
+        pbi[16..20].copy_from_slice(&pid.to_le_bytes());
+        pbi[20..24].copy_from_slice(&parent_pid.to_le_bytes());
+        if env.cpu.write(out, &pbi).is_err() {
+            return Outcome::Return(0xc000_0005);
+        }
+        return Outcome::Return(STATUS_SUCCESS);
     }
     if size != 4 {
         return Outcome::Return(0xc000_0004); // STATUS_INFO_LENGTH_MISMATCH
@@ -312,5 +371,85 @@ pub fn register(reg: &mut Registry) {
             .name;
         reg.register_export_alias(NTDLL, export.name, target)
             .expect("user-mode Nt/Zw declarations share the complete ABI");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, Prot, Reg},
+    };
+    use adv_machine::{
+        Clock, Machine,
+        layout::{PAGE, PARK_ADDR},
+    };
+
+    const DATA: u32 = 0x410000;
+
+    fn test_machine() -> Machine<JitCpu> {
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        let cpu = JitCpu::new(PARK_ADDR, false).unwrap();
+        let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        machine.sys.set_process_identity(0x1234).unwrap();
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/nt-query-tests");
+        crate::Win32::install(
+            &mut machine,
+            crate::Win32Config::new(&root, "test.exe", &root),
+        )
+        .unwrap();
+        machine.spawn("main", PARK_ADDR, &[], 65536).unwrap();
+        machine.cpu.map(DATA, PAGE, Prot::RW).unwrap();
+        machine
+    }
+
+    #[test]
+    // spec: PERS-PROFILE-1
+    fn query_information_process_basic_information() {
+        let mut m = test_machine();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let stack = 0x5a0000;
+        env.cpu.map(stack, PAGE, Prot::RW).unwrap();
+        env.cpu.set_reg(Reg::Esp, stack);
+        env.cpu.write_u32(stack + 4, u32::MAX).unwrap();
+        env.cpu.write_u32(stack + 8, 0).unwrap();
+        env.cpu.write_u32(stack + 12, DATA).unwrap();
+        env.cpu.write_u32(stack + 16, 24).unwrap();
+        env.cpu.write_u32(stack + 20, DATA + 32).unwrap();
+        let Outcome::Return(res) = query_information_process(&mut env) else {
+            panic!("expected return");
+        };
+        assert_eq!(res, 0);
+        assert_eq!(env.cpu.read_u32(DATA + 32).unwrap(), 24);
+        assert_eq!(env.cpu.read_u32(DATA).unwrap(), 0x0000_0103);
+        assert_eq!(
+            env.cpu.read_u32(DATA + 4).unwrap(),
+            adv_machine::layout::PEB_ADDR
+        );
+        assert_eq!(env.cpu.read_u32(DATA + 8).unwrap(), 1);
+        assert_eq!(env.cpu.read_u32(DATA + 12).unwrap() as i32, 8);
+        assert_eq!(env.cpu.read_u32(DATA + 16).unwrap(), 0x1234);
+
+        env.cpu.write_u32(stack + 16, 20).unwrap();
+        let Outcome::Return(res) = query_information_process(&mut env) else {
+            panic!("expected return");
+        };
+        assert_eq!(res, 0xc000_0004);
+
+        env.cpu.write_u32(stack + 4, 12345).unwrap();
+        env.cpu.write_u32(stack + 16, 24).unwrap();
+        let Outcome::Return(res) = query_information_process(&mut env) else {
+            panic!("expected return");
+        };
+        assert_eq!(res, 0xc000_0008);
     }
 }

@@ -903,11 +903,21 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
             return Outcome::Return(0);
         }
     };
+    write_module_file_name(env, buf, cap, &path, wide)
+}
+
+fn write_module_file_name(
+    env: &mut Env<'_>,
+    buf: u32,
+    cap: u32,
+    path: &str,
+    wide: bool,
+) -> Outcome {
     let r = if wide {
         let u: Vec<u16> = path.encode_utf16().collect();
         put_wstr(env.cpu, buf, cap, &u)
     } else {
-        let b = env.ext.get::<Win32>().codec.encode(&path);
+        let b = env.ext.get::<Win32>().codec.encode(path);
         put_cstr(env.cpu, buf, cap, &b)
     };
     match r {
@@ -917,6 +927,142 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
             Outcome::Return(cap)
         }
     }
+}
+
+pub(crate) fn k32_get_module_file_name_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let (h_process, h_module, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if crate::ntdll::current_process(env, h_process) {
+        let Some(id) = module_of(env, h_module) else {
+            set_last_error(env, err::MOD_NOT_FOUND);
+            return Outcome::Return(0);
+        };
+        if !adv_os::modules(env.ext).get(id).executable_visible() {
+            set_last_error(env, err::MOD_NOT_FOUND);
+            return Outcome::Return(0);
+        }
+        let path = match module_path(env, id) {
+            Ok(path) => path,
+            Err(_) => {
+                set_last_error(env, 998);
+                return Outcome::Return(0);
+            }
+        };
+        return write_module_file_name(env, buf, cap, &path, wide);
+    }
+    let target = match crate::kernel32::child_process::process_target(
+        env, h_process, 0x0410, // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(env, e.code);
+            return Outcome::Return(0);
+        }
+    };
+    adv_os::processes::visit(
+        env,
+        target.pid,
+        None,
+        move |e| {
+            let Some(id) = module_of(e, h_module) else {
+                return Err(adv_os::processes::Error::new(
+                    err::MOD_NOT_FOUND,
+                    "module not found",
+                ));
+            };
+            if !adv_os::modules(e.ext).get(id).executable_visible() {
+                return Err(adv_os::processes::Error::new(
+                    err::MOD_NOT_FOUND,
+                    "module not visible",
+                ));
+            }
+            module_path(e, id).map_err(|_| adv_os::processes::Error::new(998, "path unreadable"))
+        },
+        move |e, result| match result {
+            Ok(path) => write_module_file_name(e, buf, cap, &path, wide),
+            Err(err) => {
+                set_last_error(e, err.code);
+                Outcome::Return(0)
+            }
+        },
+    )
+}
+
+fn collect_executable_modules(modules: &Modules) -> Vec<u32> {
+    let mut handles = Vec::new();
+    let mut others = Vec::new();
+    for (_, m) in modules.iter().filter(|(_, m)| m.executable_visible()) {
+        if m.kind == ModuleKind::Image {
+            handles.push(m.handle());
+        } else {
+            others.push(m.handle());
+        }
+    }
+    handles.extend(others);
+    handles
+}
+
+fn write_modules(
+    env: &mut Env<'_>,
+    lph_module: u32,
+    cb: u32,
+    lpcb_needed: u32,
+    handles: &[u32],
+) -> Outcome {
+    let needed = (handles.len() as u32).saturating_mul(4);
+    if lpcb_needed != 0 {
+        if adv_abi::guest::check_range(env.cpu, lpcb_needed, 4, Prot::WRITE).is_err()
+            || env.cpu.write_u32(lpcb_needed, needed).is_err()
+        {
+            set_last_error(env, 998); // ERROR_NOACCESS
+            return Outcome::Return(0);
+        }
+    }
+    let count = (cb / 4).min(handles.len() as u32) as usize;
+    if count > 0 && lph_module != 0 {
+        if adv_abi::guest::check_range(env.cpu, lph_module, (count * 4) as u32, Prot::WRITE)
+            .is_err()
+        {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+        for (i, &h) in handles[..count].iter().enumerate() {
+            if env.cpu.write_u32(lph_module + (i as u32 * 4), h).is_err() {
+                set_last_error(env, 998);
+                return Outcome::Return(0);
+            }
+        }
+    }
+    Outcome::Return(1)
+}
+
+pub(crate) fn k32_enum_process_modules(env: &mut Env<'_>) -> Outcome {
+    let (h_process, lph_module, cb, lpcb_needed) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if crate::ntdll::current_process(env, h_process) {
+        let handles = collect_executable_modules(adv_os::modules(env.ext));
+        return write_modules(env, lph_module, cb, lpcb_needed, &handles);
+    }
+    let target = match crate::kernel32::child_process::process_target(
+        env, h_process, 0x0410, // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(env, e.code);
+            return Outcome::Return(0);
+        }
+    };
+    adv_os::processes::visit(
+        env,
+        target.pid,
+        None,
+        move |e| Ok(collect_executable_modules(adv_os::modules(e.ext))),
+        move |e, result| match result {
+            Ok(handles) => write_modules(e, lph_module, cb, lpcb_needed, &handles),
+            Err(err) => {
+                set_last_error(e, err.code);
+                Outcome::Return(0)
+            }
+        },
+    )
 }
 
 fn get_proc_address(env: &mut Env<'_>) -> Outcome {
@@ -1371,4 +1517,24 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "LockResource", 1, |e| Outcome::Return(e.arg(0)));
     reg.register(sizeof_resource_ABI);
     stdcall(reg, K32, "FreeResource", 1, |_| Outcome::Return(0));
+    stdcall(
+        reg,
+        K32,
+        "K32EnumProcessModules",
+        4,
+        k32_enum_process_modules,
+    );
+    stdcall(
+        reg,
+        K32,
+        "K32EnumProcessModulesEx",
+        5,
+        k32_enum_process_modules,
+    );
+    stdcall(reg, K32, "K32GetModuleFileNameExA", 4, |e| {
+        k32_get_module_file_name_ex(e, false)
+    });
+    stdcall(reg, K32, "K32GetModuleFileNameExW", 4, |e| {
+        k32_get_module_file_name_ex(e, true)
+    });
 }

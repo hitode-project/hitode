@@ -1281,11 +1281,32 @@ impl Translator<'_> {
 
     fn finish(mut self, at: usize) {
         self.pixel_copies();
-        self.cold
-            .sort_by_key(|(_, c)| !matches!(c, Cold::Table { .. }));
-        while let Some((pc, cold)) = self.cold.pop() {
-            self.mark(pc, Part::Cold);
-            self.cold(cold, at);
+        let mut tables = std::collections::VecDeque::new();
+        let mut queue = std::collections::VecDeque::new();
+        for item in self.cold.drain(..) {
+            if matches!(item.1, Cold::Table { .. }) {
+                tables.push_back(item);
+            } else {
+                queue.push_back(item);
+            }
+        }
+        loop {
+            if let Some((pc, cold)) = queue.pop_front() {
+                self.mark(pc, Part::Cold);
+                self.cold(cold, at);
+            } else if let Some((pc, cold)) = tables.pop_front() {
+                self.mark(pc, Part::Cold);
+                self.cold(cold, at);
+            } else {
+                break;
+            }
+            for item in self.cold.drain(..) {
+                if matches!(item.1, Cold::Table { .. }) {
+                    tables.push_back(item);
+                } else {
+                    queue.push_back(item);
+                }
+            }
         }
         for &(index, label) in &self.x87_sites {
             let (at, site) = &mut self.sites[index];

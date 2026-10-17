@@ -689,3 +689,50 @@ fn toolhelp_flags_empty_native_outputs_threads_and_unsupported_profiles_are_expl
         assert_eq!(wstring(&m, w + 32, NAME_UNITS), "é".repeat(128));
     }
 }
+
+#[test]
+// spec: PERS-BRIDGE-3
+fn k32_enum_process_modules_and_file_name() {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+    m.spawn("main", CODE, &[], 65536).unwrap();
+    let entry = m.resolve_import(K32, "K32EnumProcessModules").unwrap();
+
+    let stack = 0x5a0000;
+    m.cpu.map(stack, 4096, Prot::RW).unwrap();
+    m.cpu.set_reg(adv_cpu::backend::Reg::Esp, stack);
+    m.cpu.write_u32(stack + 4, u32::MAX).unwrap();
+    m.cpu.write_u32(stack + 8, DATA).unwrap();
+    m.cpu.write_u32(stack + 12, 1024).unwrap();
+    m.cpu.write_u32(stack + 16, DATA + 512).unwrap();
+    let mut e = env(&mut m, entry);
+    let outcome = crate::kernel32::module::k32_enum_process_modules(&mut e);
+    assert_eq!(returned(outcome), 1);
+    let needed = m.cpu.read_u32(DATA + 512).unwrap();
+    assert!(needed >= 8);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), MAIN);
+    assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), DLL);
+
+    m.cpu.write_u32(stack + 4, u32::MAX).unwrap();
+    m.cpu.write_u32(stack + 8, MAIN).unwrap();
+    m.cpu.write_u32(stack + 12, DATA + 1024).unwrap();
+    m.cpu.write_u32(stack + 16, 260).unwrap();
+    let mut e = env(&mut m, entry);
+    let outcome = crate::kernel32::module::k32_get_module_file_name_ex(&mut e, false);
+    assert!(returned(outcome) > 0);
+    assert_eq!(astring(&m, DATA + 1024, 260), MAIN_PATH.as_bytes());
+
+    m.cpu.write_u32(stack + 4, u32::MAX).unwrap();
+    m.cpu.write_u32(stack + 8, MAIN).unwrap();
+    m.cpu.write_u32(stack + 12, DATA + 1024).unwrap();
+    m.cpu.write_u32(stack + 16, 260).unwrap();
+    let mut e = env(&mut m, entry);
+    let outcome = crate::kernel32::module::k32_get_module_file_name_ex(&mut e, true);
+    assert!(returned(outcome) > 0);
+    assert_eq!(wstring(&m, DATA + 1024, 260), MAIN_PATH);
+
+    m.cpu.write_u32(stack + 4, 0x1234).unwrap();
+    let mut e = env(&mut m, entry);
+    let outcome = crate::kernel32::module::k32_enum_process_modules(&mut e);
+    assert_eq!(returned(outcome), 0);
+    assert_eq!(crate::util::last_error(&e), 6);
+}

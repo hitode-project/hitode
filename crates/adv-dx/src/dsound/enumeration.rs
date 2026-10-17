@@ -123,6 +123,49 @@ fn unavailable_w(env: &mut Env<'_>, callback: GuestPtr<()>, context: GuestPtr<()
     start(env, callback.addr(), context.addr(), true, false)
 }
 
+const DSDEVID_DEFAULT_PLAYBACK: [u8; 16] = [
+    0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+];
+const DSDEVID_DEFAULT_CAPTURE: [u8; 16] = [
+    0x01, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+];
+const DSDEVID_DEFAULT_VOICE_PLAYBACK: [u8; 16] = [
+    0x02, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+];
+const DSDEVID_DEFAULT_VOICE_CAPTURE: [u8; 16] = [
+    0x03, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03,
+];
+
+#[win32(dsound, name = "GetDeviceID", level = implement)]
+fn get_device_id(env: &mut Env<'_>, src: GuestPtr<()>, dest: GuestPtr<()>) -> u32 {
+    if dest.is_null() || check_range(env.cpu, dest.addr(), 16, Prot::WRITE).is_err() {
+        return INVALID;
+    }
+    let guid = if src.is_null() {
+        DSDEVID_DEFAULT_PLAYBACK
+    } else {
+        if check_range(env.cpu, src.addr(), 16, Prot::READ).is_err() {
+            return INVALID;
+        }
+        let mut g = [0u8; 16];
+        if env.cpu.read(src.addr(), &mut g).is_err() {
+            return INVALID;
+        }
+        g
+    };
+    let resolved = match guid {
+        DSDEVID_DEFAULT_PLAYBACK => DSDEVID_DEFAULT_PLAYBACK,
+        DSDEVID_DEFAULT_CAPTURE => DSDEVID_DEFAULT_CAPTURE,
+        DSDEVID_DEFAULT_VOICE_PLAYBACK => DSDEVID_DEFAULT_VOICE_PLAYBACK,
+        DSDEVID_DEFAULT_VOICE_CAPTURE => DSDEVID_DEFAULT_VOICE_CAPTURE,
+        other => other,
+    };
+    if env.cpu.write(dest.addr(), &resolved).is_err() {
+        return INVALID;
+    }
+    0
+}
+
 pub(super) fn register(registry: &mut Registry, installed: bool) {
     registry.register(if installed {
         enumerate_a_ABI
@@ -134,4 +177,5 @@ pub(super) fn register(registry: &mut Registry, installed: bool) {
     } else {
         unavailable_w_ABI
     });
+    registry.register(get_device_id_ABI);
 }

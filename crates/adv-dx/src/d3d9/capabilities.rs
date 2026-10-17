@@ -319,8 +319,8 @@ pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         // Do not advertise general modulation/add/subtract until all argument
         // combinations work. Selected textured-quad combinations already draw.
         TextureOpCaps: 1 | 2 | 4,
-        MaxTextureBlendStages: 1,
-        MaxSimultaneousTextures: 1,
+        MaxTextureBlendStages: 8,
+        MaxSimultaneousTextures: 8,
         MaxPointSize: if shader { 64.0 } else { 1.0 },
         MaxPrimitiveCount: 131072,
         MaxStreams: 16,
