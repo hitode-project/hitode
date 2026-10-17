@@ -259,7 +259,7 @@ impl Memory {
                 .any(|page| self.perms[page] & EXEC != 0);
         }
         page_spans(range.clone()).any(|(page, bytes)| {
-            self.perms[page] & EXEC != 0
+            self.watched[page]
                 && self
                     .code
                     .get(&page)
@@ -2543,6 +2543,36 @@ mod window_tests {
             }
             memory.privatize_copy_pages(0x10000, host).unwrap();
             assert!(allows(&memory, 0x10000, Write), "{host}");
+        }
+    }
+
+    // spec: A64-CTL-6, A64-CTL-10, A64-VER-2
+    #[cfg(unix)]
+    #[test]
+    fn readonly_switch_table_watches_survive_writable_protection_on_both_host_sizes() {
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(0x10000, 0x10000, host).unwrap();
+            memory.map(0x10000, 0x10000, READ | WRITE).unwrap();
+            let table = 0x13ff0;
+            memory.write(table, &[0; 4096]).unwrap();
+            memory.protect(0x10000, 0x10000, READ).unwrap();
+            memory.watch_code(table, 4096);
+            memory.dirty_pages.clear();
+            memory.protect(0x13000, 8192, READ | WRITE).unwrap();
+            assert!(memory.dirty_pages.contains_key(&0x13000));
+            assert!(memory.dirty_pages.contains_key(&0x14000));
+            memory.dirty_pages.clear();
+            memory.write(table, &[1; 4]).unwrap();
+            memory.write(table + 4092, &[2; 4]).unwrap();
+            assert!(memory.dirty_pages.contains_key(&0x13000));
+            assert!(memory.dirty_pages.contains_key(&0x14000));
+            memory.dirty_pages.clear();
+            memory.write(0x13000, &[3; 4]).unwrap();
+            assert!(
+                memory.dirty_pages.is_empty(),
+                "unwatched data stays ordinary"
+            );
         }
     }
 }

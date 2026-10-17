@@ -35,6 +35,7 @@
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
 
+use iced_x86::Code;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -337,6 +338,7 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
             return 0;
         }
     };
+    native.resolve_tables(memory, eip, unit);
     if point == 0 {
         native.table[runtime::table_slot(eip)] = [u64::from(eip), unit as u64];
     }
@@ -519,6 +521,12 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 }
 
 pub(crate) struct Native {
+    pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
+    /// Switch-table slots by guest target: source entry, host slot and
+    /// original shared stub. Dispatch looks targets up on every miss.
+    rows: FxHashMap<u32, Vec<(u32, usize, usize)>>,
+    /// Entries of units that own switch tables.
+    table_sources: FxHashSet<u32>,
     bridge: *mut std::ffi::c_void,
     pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     cache: CodeCache,
@@ -601,6 +609,9 @@ impl Native {
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {
+            images: Default::default(),
+            rows: FxHashMap::default(),
+            table_sources: FxHashSet::default(),
             bridge: std::ptr::null_mut(),
             interrupt: None,
             stub_len: cache.used(),
@@ -821,6 +832,35 @@ impl Native {
         self.linked.push((point, word, next.unwrap_or(u32::MAX)));
     }
 
+    fn resolve_tables(&mut self, memory: &Memory, eip: u32, unit: usize) {
+        if !self.rows.contains_key(&eip)
+            || self.stops.contains(&eip)
+            || !translate::tables::image(&self.images.borrow(), eip, 1)
+        {
+            return;
+        }
+        // Import trampolines and transport thunks remain patch-sensitive.
+        let Ok(bytes) = memory.read(eip, 15) else {
+            return;
+        };
+        let mut decoder =
+            iced_x86::Decoder::with_ip(32, bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        if matches!(
+            instruction.flow_control(),
+            iced_x86::FlowControl::UnconditionalBranch
+                | iced_x86::FlowControl::IndirectBranch
+                | iced_x86::FlowControl::Interrupt
+        ) || matches!(instruction.code(), Code::Pushd_imm32 | Code::Pushd_imm8)
+        {
+            return;
+        }
+        for &(_, point, _) in &self.rows[&eip] {
+            self.cache.patch(point, unit as u32);
+            self.cache.patch(point + 4, ((unit as u64) >> 32) as u32);
+        }
+    }
+
     /// Drops units whose guest code changed, and restores the link points
     /// that branch to them.
     fn invalidate(&mut self, memory: &mut Memory) {
@@ -843,6 +883,16 @@ impl Native {
     /// Drops the unit at `eip`, if any, and restores the link points that
     /// branch to it; the caller forgets dynamic targets.
     fn drop_unit(&mut self, eip: u32) -> bool {
+        if self.table_sources.remove(&eip) {
+            self.rows.retain(|_, slots| {
+                slots.retain(|&(source, _, _)| source != eip);
+                !slots.is_empty()
+            });
+        }
+        for &(_, point, stub) in self.rows.get(&eip).into_iter().flatten() {
+            self.cache.patch(point, stub as u32);
+            self.cache.patch(point + 4, ((stub as u64) >> 32) as u32);
+        }
         let mut next = self.links.remove(&eip).unwrap_or(u32::MAX);
         while let Some(&(point, word, after)) = self.linked.get(next as usize) {
             self.cache.patch(point, word);
@@ -854,6 +904,28 @@ impl Native {
     /// Whether the run's deadline has passed.
     pub(crate) fn past(&self) -> bool {
         self.deadline.is_some_and(|at| ticks() >= at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn switch_counts(&self) -> (usize, usize) {
+        (
+            self.rows.values().map(Vec::len).sum(),
+            self.rows
+                .values()
+                .flatten()
+                .filter(|&&(_, point, stub)| {
+                    let value = u64::from(self.cache.word(point))
+                        | (u64::from(self.cache.word(point + 4)) << 32);
+                    value != stub as u64
+                })
+                .count(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discard_switch_target(&mut self, eip: u32) {
+        assert!(self.drop_unit(eip));
+        self.forget_dynamic();
     }
 
     #[cfg(test)]
@@ -948,6 +1020,8 @@ impl Native {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
         self.units.clear();
+        self.rows.clear();
+        self.table_sources.clear();
         self.channels = false;
         self.pages.clear();
         self.links.clear();
@@ -1025,6 +1099,7 @@ impl Native {
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
         let mut work = std::mem::take(&mut self.work);
+        work.images.clone_from(&self.images.borrow());
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
         translate::translate(
             &mut work,
@@ -1053,6 +1128,27 @@ impl Native {
         let entry = self.place(eip, work.words(), work.sites(), work.retired());
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
+            if !work.tables.is_empty() {
+                self.table_sources.insert(eip);
+            }
+            for table in &work.tables {
+                for (index, &target) in table.targets.iter().enumerate() {
+                    let slot = (eip, at + table.offset + index * 8, at + table.stub);
+                    self.rows.entry(target).or_default().push(slot);
+                }
+            }
+            let mut targets: Vec<_> = work
+                .tables
+                .iter()
+                .flat_map(|t| t.targets.iter().copied())
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            for target in targets {
+                if let Some(entry) = self.units.get(&target) {
+                    self.resolve_tables(memory, target, entry.unit);
+                }
+            }
             self.helpers.extend(work.helpers());
             self.helper_counts.resize(self.helpers.len(), 0);
             let points = work
