@@ -22,6 +22,7 @@ adv-win32 = { path = "../adv-win32" }
 adv-device = { path = "../adv-device" }
 adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
 [dev-dependencies]
 encoding_rs.workspace = true

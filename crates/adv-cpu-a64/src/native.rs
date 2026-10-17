@@ -1194,6 +1194,7 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
+        crate::jit_map::record(unit, words.len() * 4, eip, retired);
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)

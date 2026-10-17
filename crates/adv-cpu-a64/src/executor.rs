@@ -259,6 +259,36 @@ impl Executor {
         String::new()
     }
 
+    /// Slow-path runs by EIP: interpreted after an exit, after a fault, and
+    /// run by helpers. Counts only grow, so callers diff two readings.
+    pub fn slow_path_sites(&self) -> Vec<(u32, [u64; 3])> {
+        let mut sites = rustc_hash::FxHashMap::<u32, [u64; 3]>::default();
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            for (eip, count) in native.helper_histogram() {
+                sites.entry(eip).or_default()[2] += count;
+            }
+        }
+        for (which, histogram) in [&self.histogram, &self.faults].into_iter().enumerate() {
+            for (&eip, &count) in histogram {
+                sites.entry(eip).or_default()[which] += count;
+            }
+        }
+        sites.into_iter().collect()
+    }
+
+    /// The form of the instruction at `eip` as the code there decodes now.
+    pub fn instruction_form(&self, eip: u32) -> Option<iced_x86::Code> {
+        let mut bytes = [0; 15];
+        let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
+        if self.memory.read_into(eip, &mut bytes).is_err() {
+            self.memory.read_into(eip, &mut bytes[..page]).ok()?;
+        }
+        let mut decoder =
+            iced_x86::Decoder::with_ip(32, &bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
+        Some(decoder.decode().code())
+    }
+
     /// Instructions by form, most frequent first, as the code at their
     /// EIPs decodes now: those interpreted after an exit, after a fault, or
     /// (`which` 2) run by helpers.

@@ -176,6 +176,14 @@ impl RecentCalls {
     pub fn iter(&self) -> impl Iterator<Item = &(CtxId, u32, u32)> {
         self.buf.iter()
     }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
 }
 
 /// What a handler sees.
@@ -556,8 +564,16 @@ impl Sys {
 
     /// Human-readable list of the most recent host calls.
     pub fn recent_calls(&self) -> Vec<String> {
+        self.recent_calls_tail(32)
+    }
+
+    /// The last `count` host calls, oldest first, from the larger ring a
+    /// debugger reads.
+    pub fn recent_calls_tail(&self, count: usize) -> Vec<String> {
+        let skip = self.recent.len().saturating_sub(count);
         self.recent
             .iter()
+            .skip(skip)
             .map(|&(ctx, thunk, caller)| {
                 let t = self.thunks.get(thunk);
                 format!("[{ctx}] {}!{} from {caller:#010x}", t.module, t.name)
@@ -1757,7 +1773,7 @@ impl<B: Backend> Machine<B> {
             guest_failure_code: None,
             checkpoint_identity: std::sync::Arc::new(()),
             next_frame_id: 0,
-            recent: RecentCalls::new(32),
+            recent: RecentCalls::new(256),
             host_calls: 0,
             call_limit: None,
             stats: Stats::new(),
