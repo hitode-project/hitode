@@ -360,10 +360,15 @@ impl Options {
     }
 }
 
-/// Ctrl+Shift+F12 asks the debugger for a mark and snapshot.
+/// Alt+Shift+F12 (Option on a Mac) asks the debugger for a mark and
+/// snapshot. Ctrl is left alone: visual novels skip text while it is held.
 fn debug_hotkey(keys: &adv_sync::input::KeyState, message: u32, key: u32) -> bool {
     let held = |codes: &[u32]| codes.iter().any(|&code| keys.get(code) & 0x80 != 0);
-    message == 0x100 && key == 0x7b && held(&[0x11, 0xa2, 0xa3]) && held(&[0x10, 0xa0, 0xa1])
+    // With Alt held the key arrives as WM_SYSKEYDOWN.
+    matches!(message, 0x100 | 0x104)
+        && key == 0x7b
+        && held(&[0x12, 0xa4, 0xa5])
+        && held(&[0x10, 0xa0, 0xa1])
 }
 
 /// What `info` reports about this session; fixed for its lifetime.

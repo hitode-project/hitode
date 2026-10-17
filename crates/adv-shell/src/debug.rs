@@ -224,7 +224,7 @@ impl Debugger {
         timeline.push_back(delta);
     }
 
-    /// Ctrl+Shift+F12: mark the moment and keep a snapshot of it.
+    /// Alt+Shift+F12: mark the moment and keep a snapshot of it.
     pub(crate) fn hotkey(&mut self, runtime: &mut Runtime) {
         mark(&self.shared, "hotkey".into());
         match self.snapshot("hotkey", runtime) {

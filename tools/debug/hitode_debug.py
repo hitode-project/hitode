@@ -18,7 +18,7 @@ runner as they are; these are shaped here:
   watch [--gap MS]          pull, save and analyze every new snapshot until
                             the session ends; reports go to stdout and
                             target/investigations/debug/<pid>-analysis.txt
-Ctrl+Shift+F12 in the game window marks the moment and keeps a snapshot; a
+Alt+Shift+F12 in the game window marks the moment and keeps a snapshot; a
 busy frame gap of 250 ms or more keeps one by itself 2 s later. `snaps`
 lists them and `pull` fetches one; `--snapshot` runs `tl`, `prof` and
 `analyze` over a pulled snapshot after the session has ended. Output stays local: snapshots hold
