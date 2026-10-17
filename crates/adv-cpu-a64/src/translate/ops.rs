@@ -184,7 +184,7 @@ impl Translator<'_> {
                         self.emit(sub(W, X17, X16, X17, Lsl, 0));
                         let label = self.asm.label();
                         self.asm.cbz(W, true, X17, label);
-                        self.cold.push(Cold::Lookup {
+                        self.push_cold(Cold::Lookup {
                             label,
                             state: self.state,
                             refund: self.trace.unused(self.index),
@@ -300,7 +300,7 @@ impl Translator<'_> {
                 let (point, stub) = (self.asm.label(), self.asm.label());
                 self.asm.bind(point);
                 self.asm.bl(stub);
-                self.cold.push(Cold::Call {
+                self.push_cold(Cold::Call {
                     label: stub,
                     target,
                     point,
@@ -477,7 +477,7 @@ impl Translator<'_> {
         self.state = State::CANONICAL;
         let leave = self.asm.label();
         self.asm.cbz(W, true, X0, leave);
-        self.cold.push(Cold::Helper {
+        self.push_cold(Cold::Helper {
             label: leave,
             refund: self.trace.unused(self.index),
         });
@@ -498,7 +498,7 @@ impl Translator<'_> {
         ] {
             let label = self.asm.label();
             self.asm.tbz(true, X0, bit, label);
-            self.cold.push(Cold::Leave {
+            self.push_cold(Cold::Leave {
                 label,
                 state: State::CANONICAL,
                 simd_dirty: self.vector.dirty,
@@ -567,7 +567,7 @@ impl Translator<'_> {
         // Keep the access width and extension; only replace its base register.
         self.emit((direct & !(31 << 5)) | (X3.number() << 5));
         self.asm.bind(resume);
-        self.cold.push(Cold::Access {
+        self.push_cold(Cold::Access {
             label: slow,
             resume,
             site,

@@ -28,6 +28,7 @@ use crate::asm::Label;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::jit_map::Part;
 use crate::runtime;
 
 use super::super::decode::Op;
@@ -431,7 +432,7 @@ impl Translator<'_> {
             let (_, need) = self.plan(index + 1, model).expect("a planned run");
             (self.x87.hot[offset + 1], self.x87.help[offset + 1], need)
         });
-        self.cold.push(UnitCold::X87(Cold {
+        self.push_cold(UnitCold::X87(Cold {
             index,
             helper: x.helper,
             before: self.x87.before,
@@ -457,6 +458,7 @@ impl Translator<'_> {
         let Some((end, need)) = self.plan(start, Model::default()) else {
             return false;
         };
+        self.remark(Part::X87Entry);
         self.flush_simd();
         self.canonicalize();
         self.cpu();
@@ -471,6 +473,7 @@ impl Translator<'_> {
         self.emit(mrs_nzcv(X4));
         let help = self.x87.help[0];
         self.x87_checks(Model::default(), need, help);
+        self.remark(Part::Body);
         true
     }
 
@@ -717,10 +720,12 @@ impl Translator<'_> {
     /// Ends the run after its last instruction.
     fn x87_close(&mut self) {
         let model = self.x87.model;
+        self.remark(Part::X87Publish);
         self.x87_publish(model, X13);
         self.emit(msr_nzcv(X4));
         let done = self.x87.done.take().expect("an open run");
         self.asm.bind(done);
+        self.remark(Part::Body);
         self.x87.active = false;
         // The stack may have changed under the MMX registers.
         self.vector = super::super::simd::Vector::default();
@@ -735,7 +740,7 @@ impl Translator<'_> {
         }
         let label = self.asm.label();
         self.x87_sites.push((self.sites.len() - 1, label));
-        self.cold.push(UnitCold::X87Fault {
+        self.push_cold(UnitCold::X87Fault {
             label,
             model: self.x87.before,
             saved: self.x87.saved,
@@ -744,6 +749,7 @@ impl Translator<'_> {
 
     pub(in super::super) fn x87_fault(&mut self, label: Label, model: Model, saved: bool) {
         self.asm.bind(label);
+        self.remark(Part::X87Publish);
         self.x87_publish(model, if saved { X14 } else { X13 });
         self.emit(msr_nzcv(X4));
         self.far(self.stubs.fault);
@@ -751,8 +757,10 @@ impl Translator<'_> {
 
     pub(in super::super) fn x87_cold(&mut self, cold: Cold) {
         self.asm.bind(cold.bail);
+        self.remark(Part::X87Publish);
         self.x87_publish(cold.before, if cold.saved { X14 } else { X13 });
         self.asm.bind(cold.help);
+        self.remark(Part::Cold);
         self.index = cold.index;
         self.state = State::CANONICAL;
         self.vector = super::super::simd::Vector::default();

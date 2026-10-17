@@ -459,35 +459,76 @@ struct Classified {
     kind: Kind,
     /// Guest unit start of the innermost generated-code frame.
     eip: Option<u32>,
+    /// The guest instruction there, and what its code was doing: a part of
+    /// the unit, `host` below it, or the shared stub the sample was in.
+    inst: Option<u32>,
+    part: String,
     /// Innermost host frame, if the sample was in host code.
     host: Option<usize>,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn locate(pc: usize, at_ns: u128) -> Option<adv_runtime::JitLocation> {
+    adv_runtime::jit_map_locate(pc, at_ns)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn locate(_: usize, _: u128) -> Option<adv_runtime::JitLocation> {
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+fn stub(pc: usize) -> Option<&'static str> {
+    adv_runtime::jit_map_stub(pc)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn stub(_: usize) -> Option<&'static str> {
+    None
+}
+
+fn part_name(part: adv_runtime::JitPart) -> &'static str {
+    match part {
+        adv_runtime::JitPart::Body => "body",
+        adv_runtime::JitPart::Cold => "cold",
+        adv_runtime::JitPart::X87Entry => "x87-entry",
+        adv_runtime::JitPart::X87Publish => "x87-publish",
+    }
 }
 
 fn classify(sample: &profile::Sample) -> Classified {
     let frames = &sample.frames[..usize::from(sample.depth)];
     let at_ns = u128::from(sample.unix_us) * 1000;
-    let guest = |pc: usize| {
-        #[cfg(target_arch = "aarch64")]
-        {
-            adv_runtime::jit_map_lookup(pc, at_ns)
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (pc, at_ns);
-            None
-        }
-    };
     let pc = frames.first().copied().unwrap_or_default();
-    if let Some(eip) = guest(pc) {
+    let outer = || {
+        frames
+            .iter()
+            .skip(1)
+            .find_map(|&frame| locate(frame, at_ns))
+    };
+    if let Some(location) = locate(pc, at_ns) {
         return Classified {
             unix_us: sample.unix_us,
             kind: Kind::Guest,
-            eip: Some(eip),
+            eip: Some(location.unit),
+            inst: location.eip,
+            part: part_name(location.part).into(),
             host: None,
         };
     }
-    let eip = frames.iter().skip(1).find_map(|&frame| guest(frame));
-    let kind = match eip {
+    if let Some(name) = stub(pc) {
+        let caller = outer();
+        return Classified {
+            unix_us: sample.unix_us,
+            kind: Kind::Guest,
+            eip: caller.map(|location| location.unit),
+            inst: caller.and_then(|location| location.eip),
+            part: format!("stub:{name}"),
+            host: None,
+        };
+    }
+    let caller = outer();
+    let kind = match caller {
         Some(_) => Kind::HostFromGuest,
         None if symbol(pc).is_some_and(|(_, name)| IDLE.contains(&name.as_str())) => Kind::Idle,
         None => Kind::Host,
@@ -495,14 +536,28 @@ fn classify(sample: &profile::Sample) -> Classified {
     Classified {
         unix_us: sample.unix_us,
         kind,
-        eip,
+        eip: caller.map(|location| location.unit),
+        inst: caller.and_then(|location| location.eip),
+        part: if caller.is_some() {
+            "host".into()
+        } else {
+            "-".into()
+        },
         host: Some(pc),
     }
 }
 
 /// Image file name and dynamic symbol for a host address. Symbols of the
-/// runner itself are usually not dynamic, so the client symbolizes those.
+/// runner itself are usually not dynamic, so the client symbolizes those,
+/// and its addresses skip `dladdr`, which scans its whole symbol table and
+/// would stall the execution thread writing a snapshot.
 fn symbol(pc: usize) -> Option<(String, String)> {
+    #[cfg(target_vendor = "apple")]
+    if let Some(&(base, end, ref name)) = runner_text()
+        && (base..end).contains(&pc)
+    {
+        return Some((name.clone(), String::new()));
+    }
     #[cfg(unix)]
     {
         let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
@@ -530,6 +585,61 @@ fn symbol(pc: usize) -> Option<(String, String)> {
     }
 }
 
+/// The runner's `__TEXT` range and file name.
+#[cfg(target_vendor = "apple")]
+fn runner_text() -> Option<&'static (usize, usize, String)> {
+    // The leading fields of `mach_header_64` and `segment_command_64`.
+    #[repr(C)]
+    struct Header {
+        magic: u32,
+        cputype: i32,
+        cpusubtype: i32,
+        filetype: u32,
+        ncmds: u32,
+        sizeofcmds: u32,
+        flags: u32,
+        reserved: u32,
+    }
+    #[repr(C)]
+    struct Segment {
+        cmd: u32,
+        cmdsize: u32,
+        segname: [u8; 16],
+        vmaddr: u64,
+        vmsize: u64,
+    }
+    const LC_SEGMENT_64: u32 = 0x19;
+    static TEXT: std::sync::OnceLock<Option<(usize, usize, String)>> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr only reads loader tables.
+        if unsafe { libc::dladdr(runner_text as *const libc::c_void, &mut info) } == 0
+            || info.dli_fbase.is_null()
+        {
+            return None;
+        }
+        let header = info.dli_fbase as *const Header;
+        let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        let file = path.rsplit('/').next().unwrap_or_default().to_owned();
+        // SAFETY: dli_fbase is the loaded Mach-O header of this image, and
+        // its load commands follow it.
+        unsafe {
+            let mut command = header.add(1) as *const u8;
+            for _ in 0..(*header).ncmds {
+                let segment = command as *const Segment;
+                if (*segment).cmd == LC_SEGMENT_64 && (*segment).segname.starts_with(b"__TEXT\0") {
+                    // The header sits at the start of __TEXT.
+                    let base = header as usize;
+                    return Some((base, base + (*segment).vmsize as usize, file));
+                }
+                command = command.add((*segment).cmdsize as usize);
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
 /// `host_image=PATH` and `host_base=ADDRESS` of the runner, so a client can
 /// symbolize samples after the process has ended.
 fn host_image() -> String {
@@ -551,16 +661,18 @@ fn host_image() -> String {
 }
 
 fn samples_text(shared: &Shared, since: u64) -> String {
-    let mut text = vec!["unix_us\tkind\teip\tpc\timage\tsymbol".to_owned()];
+    let mut text = vec!["unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol".to_owned()];
+    let hex = |eip: Option<u32>| eip.map_or_else(|| "-".into(), |eip| format!("{eip:#010x}"));
     for sample in shared.profiler.since(since) {
         let row = classify(&sample);
         let (image, name) = row.host.and_then(symbol).unwrap_or_default();
         text.push(format!(
-            "{}\t{:?}\t{}\t{}\t{image}\t{name}",
+            "{}\t{:?}\t{}\t{}\t{}\t{}\t{image}\t{name}",
             row.unix_us,
             row.kind,
-            row.eip
-                .map_or_else(|| "-".into(), |eip| format!("{eip:#010x}")),
+            hex(row.eip),
+            hex(row.inst),
+            row.part,
             row.host.map_or_else(|| "-".into(), |pc| format!("{pc:#x}")),
         ));
     }
@@ -574,11 +686,15 @@ fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
     }
     let mut kinds: HashMap<Kind, usize> = HashMap::new();
     let mut units: HashMap<u32, usize> = HashMap::new();
+    let mut insts: HashMap<(Option<u32>, &str), usize> = HashMap::new();
     let mut hosts: HashMap<String, usize> = HashMap::new();
     for sample in &samples {
         *kinds.entry(sample.kind).or_default() += 1;
         if let Some(eip) = sample.eip {
             *units.entry(eip).or_default() += 1;
+        }
+        if sample.eip.is_some() || sample.part.starts_with("stub:") {
+            *insts.entry((sample.inst, &sample.part)).or_default() += 1;
         }
         if let (Some(pc), Kind::Host | Kind::HostFromGuest) = (sample.host, sample.kind) {
             let (image, name) = symbol(pc).unwrap_or_default();
@@ -602,6 +718,17 @@ fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
             "  {n:>6} {:5.1}% {eip:#010x} {}",
             share(n),
             runtime.guest_place(eip)
+        ));
+    }
+    let mut insts: Vec<_> = insts.into_iter().collect();
+    insts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    text.push("guest instructions and the part of their code:".into());
+    for ((eip, part), n) in insts.into_iter().take(25) {
+        let place = eip.map_or_else(|| "-".into(), |eip| runtime.guest_place(eip));
+        text.push(format!(
+            "  {n:>6} {:5.1}% {:>10} {part:<12} {place}",
+            share(n),
+            eip.map_or_else(|| "-".into(), |eip| format!("{eip:#010x}")),
         ));
     }
     let mut hosts: Vec<_> = hosts.into_iter().collect();

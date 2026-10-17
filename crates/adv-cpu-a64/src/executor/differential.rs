@@ -1893,6 +1893,63 @@ fn x87_runs_publish_their_state_at_a_fault() {
     }
 }
 
+/// Samplers see which guest instruction and which part of its code a
+/// host address of a unit is in: an x87 run's entry checks, its body, its
+/// publication and its out-of-line paths.
+#[cfg(native)]
+#[test]
+fn units_map_host_code_to_instructions_and_parts() {
+    use crate::jit_map::{Location, Part, enable_memory, locate, units_of};
+    enable_memory();
+    let mut a = CodeAssembler::new(32).unwrap();
+    a.mov(dword_ptr(ebx + 0x710), 2.5f32.to_bits()).unwrap();
+    a.fninit().unwrap();
+    a.fld1().unwrap();
+    a.fld(dword_ptr(ebx + 0x710)).unwrap();
+    a.fadd_2(st0, st1).unwrap();
+    a.fstp(dword_ptr(ebx + 0x714)).unwrap();
+    a.fstp(st0).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let mut state = CpuState {
+        eip: CODE,
+        ..CpuState::default()
+    };
+    state.regs[3] = DATA;
+    state.regs[4] = STACK_TOP;
+    let program = Program {
+        stop: CODE + code.len() as u32 - 1,
+        code,
+        data: vec![0; DATA_LEN],
+        state,
+    };
+    let mut executor = Executor::new(BASE, LEN).unwrap();
+    executor.native.as_mut().unwrap().first_visits = false;
+    load(executor.memory_mut(), &program);
+    executor.state = program.state.clone();
+    executor.run(program.stop, u64::MAX >> 1).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let (base, marks) = units_of(CODE).pop().expect("the unit was recorded");
+    let parts: Vec<_> = marks.iter().map(|mark| mark.part).collect();
+    for part in [Part::Body, Part::X87Entry, Part::X87Publish, Part::Cold] {
+        assert!(parts.contains(&part), "{part:?} in {marks:?}");
+    }
+    for mark in &marks {
+        assert!((CODE..program.stop + 1).contains(&mark.eip), "{mark:?}");
+        assert_eq!(
+            locate(base + mark.offset as usize, now),
+            Some(Location {
+                unit: CODE,
+                eip: Some(mark.eip),
+                part: mark.part,
+            })
+        );
+    }
+}
+
 #[test]
 fn random_programs_assemble_and_reach_the_stop_or_a_fault() {
     let mut faults = 0;

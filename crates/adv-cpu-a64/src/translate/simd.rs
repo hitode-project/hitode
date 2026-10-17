@@ -1249,7 +1249,7 @@ impl Translator<'_> {
     fn bail(&mut self) -> crate::asm::Label {
         let label = self.asm.label();
         let inst = self.trace.insts[self.index];
-        self.cold.push(Cold::Leave {
+        self.push_cold(Cold::Leave {
             label,
             state: self.state,
             simd_dirty: self.vector.dirty,

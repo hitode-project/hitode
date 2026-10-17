@@ -233,6 +233,25 @@ def regions(units, modules, span=0x400):
     return sorted(out, key=lambda r: -r[0])
 
 
+def code_parts(samples):
+    """Counter of what generated code was doing: a part of a unit (body,
+    cold, x87-entry, x87-publish), a shared stub (stub:NAME) or host code
+    called from a unit (host). Snapshots without the column give nothing."""
+    return Counter(s["part"] for s in samples if s.get("part", "-") != "-")
+
+
+def instructions(samples, modules):
+    """Counter of (guest instruction as module+offset, part) over samples
+    that carry the instruction or a stub."""
+    counts = Counter()
+    for s in samples:
+        inst, part = s.get("inst", "-"), s.get("part", "-")
+        if inst == "-" and not part.startswith("stub:"):
+            continue
+        counts[(place(int(inst, 16), modules) if inst != "-" else "-", part)] += 1
+    return counts
+
+
 def parse_slow(lines):
     """Rows of a `slow` table: (total, interpreted, faulted, helper, eip, rest)."""
     rows = []
@@ -243,8 +262,9 @@ def parse_slow(lines):
     return rows
 
 
-def explain_stall(gap, busy, shares, guest, host_from_guest, host_only):
-    """One-line verdicts from a stall's shares (fractions of its samples)."""
+def explain_stall(gap, busy, shares, guest, host_from_guest, host_only, parts=None):
+    """One-line verdicts from a stall's shares (fractions of its samples)
+    and the parts of generated code its samples were in."""
     verdicts = []
     if busy < 50:
         verdicts.append(f"waiting: the execution thread was in guest steps only {busy:.0f}% of the gap; "
@@ -253,6 +273,13 @@ def explain_stall(gap, busy, shares, guest, host_from_guest, host_only):
         verdicts.append("sampled idle: blocked in the host (wait or sleep)")
     if shares["Guest"] >= 0.4 and guest:
         verdicts.append(f"generated code: {guest[0][1]} holds {guest[0][0]} samples")
+    if parts:
+        total = sum(parts.values())
+        overhead = [(part, count) for part, count in parts.most_common()
+                    if part not in ("body", "host") and count >= 0.1 * total]
+        for part, count in overhead:
+            verdicts.append(f"generated-code overhead: {part} takes {100 * count / total:.0f}% "
+                            "of the samples in generated code")
     if shares["HostFromGuest"] >= 0.2 and host_from_guest:
         name, count = host_from_guest[0]
         verdicts.append(f"host calls from guest code: {name} ({count} samples)")
@@ -302,6 +329,13 @@ def analyze(snapshot, gap_ms=100.0, top=6):
         guest = regions(Counter(int(s["eip"], 16) for s in busy_samples if s["eip"] != "-"), modules)
         for count, label, _, _ in guest[:top]:
             out.append(f"  guest   {count:6} {100 * count / total:5.1f}% {label}")
+        parts = code_parts(busy_samples)
+        if parts:
+            coded = sum(parts.values())
+            out.append("  parts:  " + ", ".join(f"{part} {100 * count / coded:.0f}%"
+                                                 for part, count in parts.most_common(8)))
+            for (where, part), count in instructions(busy_samples, modules).most_common(top * 2):
+                out.append(f"  inst    {count:6} {100 * count / total:5.1f}% {where} {part}")
         from_guest = Counter(names[s["pc"]] for s in inside if s["kind"] == "HostFromGuest")
         callers = defaultdict(Counter)
         for s in inside:
@@ -323,7 +357,7 @@ def analyze(snapshot, gap_ms=100.0, top=6):
                        + ("; waiting" if busy < 50 else "; busy"))
             continue
         for verdict in explain_stall(gap, busy, shares, guest, from_guest.most_common(1),
-                                     host_only.most_common(1)):
+                                     host_only.most_common(1), parts):
             out.append(f"  => {verdict}")
     return "\n".join(out)
 
@@ -421,6 +455,14 @@ def show_profile(session, args):
     print(f"guest units (start EIP) in {len(busy)} busy samples:")
     for eip, count in units.most_common(options.top):
         print(f"  {count:6} {100 * count / len(busy):5.1f}% {eip} {place(int(eip, 16), modules)}")
+    parts = code_parts(busy)
+    if parts:
+        coded = sum(parts.values())
+        print("generated code by part: " + ", ".join(f"{part} {100 * count / coded:.1f}%"
+                                                      for part, count in parts.most_common()))
+        print("guest instructions (module+offset, part):")
+        for (where, part), count in instructions(busy, modules).most_common(options.top * 2):
+            print(f"  {count:6} {100 * count / len(busy):5.1f}% {where} {part}")
     hosts = Counter(s["pc"] for s in busy if s["kind"] in ("Host", "HostFromGuest"))
     names = symbolize(session.pid, [pc for pc, _ in hosts.most_common(200)])
     by_name = Counter()

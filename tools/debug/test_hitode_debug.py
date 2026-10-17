@@ -4,7 +4,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from hitode_debug import Snapshot, analyze, explain_stall, frame_gaps, parse_slow, regions, parse_modules, place, readable, slices, table
+from hitode_debug import Snapshot, analyze, code_parts, explain_stall, frame_gaps, instructions, parse_slow, regions, parse_modules, place, readable, slices, table
 
 
 class ReplyShapeTests(unittest.TestCase):
@@ -70,6 +70,19 @@ class ReplyShapeTests(unittest.TestCase):
                                     "translation: adv_cpu_a64::translate::Trace::build (9 samples)"])
         self.assertTrue(explain_stall(500, 10, {"Guest": 0, "HostFromGuest": 0, "Host": 0, "Idle": 0.9},
                                       [], [], [])[0].startswith("waiting"))
+
+    def test_samples_rank_instructions_and_overhead_parts(self):
+        modules = parse_modules("0x14f80000 0x00010000 Image    layer.dll\n")
+        samples = [{"inst": "0x14f81c10", "part": "body"}] * 5 + \
+            [{"inst": "0x14f81c10", "part": "x87-publish"}] * 3 + \
+            [{"inst": "-", "part": "stub:lookup"}] * 2 + [{"unix_us": "1"}]
+        self.assertEqual(code_parts(samples), Counter({"body": 5, "x87-publish": 3, "stub:lookup": 2}))
+        self.assertEqual(instructions(samples, modules).most_common(2),
+                         [(("layer.dll+0x1c10", "body"), 5), (("layer.dll+0x1c10", "x87-publish"), 3)])
+        verdicts = explain_stall(4000, 99, {"Guest": 0.9, "HostFromGuest": 0, "Host": 0.1, "Idle": 0},
+                                 [], [], [], code_parts(samples))
+        self.assertEqual(verdicts, ["generated-code overhead: x87-publish takes 30% of the samples in generated code",
+                                    "generated-code overhead: stub:lookup takes 20% of the samples in generated code"])
 
     def test_analysis_attributes_a_stall_to_its_samples(self):
         snapshot = Snapshot(text="\n".join([

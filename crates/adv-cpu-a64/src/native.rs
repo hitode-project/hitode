@@ -603,6 +603,23 @@ impl Native {
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
         let stubs = runtime::stubs();
         let base = cache.append(&stubs.code).ok_or("stubs do not fit")?;
+        crate::jit_map::record_stubs(
+            base,
+            base + 4 * stubs.code.len(),
+            &[
+                (stubs.enter, "enter"),
+                (stubs.exit, "exit"),
+                (stubs.fault, "fault"),
+                (stubs.dispatch, "dispatch"),
+                (stubs.lookup, "lookup"),
+                (stubs.lookup_slow, "lookup_slow"),
+                (stubs.ret_miss, "ret_miss"),
+                (stubs.shadow_reset, "shadow_reset"),
+                (stubs.access, "access"),
+                (stubs.interpret, "interpret"),
+                (stubs.leaf, "leaf"),
+            ],
+        );
         // SAFETY: `enter` follows the C calling convention with the
         // signature of `Enter`; see `runtime::emit_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
@@ -1130,7 +1147,13 @@ impl Native {
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;
         }
-        let entry = self.place(eip, work.words(), work.sites(), work.retired());
+        let entry = self.place(
+            eip,
+            work.words(),
+            work.sites(),
+            work.retired(),
+            work.marks(),
+        );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
             if !work.tables.is_empty() {
@@ -1189,6 +1212,7 @@ impl Native {
         words: &[u32],
         sites: &[(usize, Site)],
         retired: u32,
+        marks: &[crate::jit_map::Mark],
     ) -> Option<Entry> {
         let unit = self.cache.append(words)?;
         let from = self.faults.sites.len().saturating_sub(1);
@@ -1199,7 +1223,7 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
-        crate::jit_map::record(unit, words.len() * 4, eip, retired);
+        crate::jit_map::record(unit, words.len() * 4, eip, retired, marks);
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
@@ -1276,7 +1300,7 @@ mod tests {
             movk(W, Reg::new(1), (next >> 16) as u16, 16),
             b((native.stubs.exit as i64 - (at + 20) as i64) as i32),
         ];
-        native.place(eip, &words, &[(0, site)], 1).unwrap();
+        native.place(eip, &words, &[(0, site)], 1, &[]).unwrap();
     }
 
     fn cpu(eip: u32, esp: u32, ecx: u32) -> CpuState {

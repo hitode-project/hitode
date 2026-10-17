@@ -119,7 +119,7 @@ impl Translator<'_> {
         self.asm.adr(X17, table);
         let load = ldr_reg(X, X17, X17, host(reg), true) | if biased(reg) { 0 } else { 1 << 13 };
         self.emit_all(&[load, br(X17)]);
-        self.cold.push(Cold::Table { index, table, stub });
+        self.push_cold(Cold::Table { index, table, stub });
         true
     }
 

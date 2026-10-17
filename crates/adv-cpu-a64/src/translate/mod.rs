@@ -64,6 +64,7 @@ use crate::encode::Extend::Uxtw;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::jit_map::{Mark, Part};
 use crate::runtime::Exit;
 use decode::{EBP, ESP};
 use flags::FlagSet;
@@ -106,9 +107,11 @@ pub struct Workspace {
     asm: Asm,
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
-    cold: Vec<Cold>,
+    /// Out-of-line paths with the guest instruction they serve.
+    cold: Vec<(u32, Cold)>,
     far: Vec<(usize, usize)>,
     links: Vec<Link>,
+    marks: Vec<Mark>,
     retired: u32,
     pub(crate) channels: bool,
 }
@@ -149,6 +152,11 @@ impl Workspace {
 
     pub fn links(&self) -> &[Link] {
         &self.links
+    }
+
+    /// Where each stretch of the unit starts, for samplers.
+    pub fn marks(&self) -> &[Mark] {
+        &self.marks
     }
 
     /// What the unit's `interpret` calls run, from the base index
@@ -331,7 +339,8 @@ struct Translator<'a> {
     /// The position of each instruction, after any countdown check.
     labels: &'a mut Vec<Label>,
     sites: &'a mut Vec<(usize, Site)>,
-    cold: &'a mut Vec<Cold>,
+    cold: &'a mut Vec<(u32, Cold)>,
+    marks: &'a mut Vec<Mark>,
     /// Branches to stubs: word index and target address.
     far: &'a mut Vec<(usize, usize)>,
     links: &'a mut Vec<Link>,
@@ -391,6 +400,7 @@ pub fn translate(
         cold,
         far,
         links,
+        marks,
         retired,
         channels,
         tables,
@@ -404,6 +414,7 @@ pub fn translate(
     cold.clear();
     far.clear();
     links.clear();
+    marks.clear();
     let mut t = Translator {
         asm,
         features,
@@ -411,6 +422,7 @@ pub fn translate(
         labels,
         sites,
         cold,
+        marks,
         far,
         links,
         tables,
@@ -472,10 +484,35 @@ impl Translator<'_> {
         scratch
     }
 
+    /// Queues an out-of-line path of the current instruction.
+    fn push_cold(&mut self, cold: Cold) {
+        let pc = self.trace.insts.get(self.index).map_or(0, |inst| inst.pc);
+        self.cold.push((pc, cold));
+    }
+
+    /// Code from here on does `part` for the guest instruction at `eip`.
+    fn mark(&mut self, eip: u32, part: Part) {
+        let offset = self.asm.offset() as u32;
+        if let Some(last) = self.marks.last_mut()
+            && last.offset == offset
+        {
+            *last = Mark { offset, eip, part };
+            return;
+        }
+        self.marks.push(Mark { offset, eip, part });
+    }
+
+    /// Code from here on does `part` for the instruction marked last.
+    fn remark(&mut self, part: Part) {
+        let eip = self.marks.last().map_or(0, |mark| mark.eip);
+        self.mark(eip, part);
+    }
+
     fn instruction(&mut self, index: usize) {
         let trace = self.trace;
         let inst = trace.insts[index];
         self.index = index;
+        self.mark(inst.pc, Part::Body);
         self.checking = (self.checked)(inst.pc);
         if self.checking && inst.effects.site {
             self.vector.fp_clean = false;
@@ -498,7 +535,7 @@ impl Translator<'_> {
             let refuse = self.asm.label();
             self.emit(sub_imm(X, X9, X9, prepaid, false));
             self.asm.tbz(true, X9, 63, refuse);
-            self.cold.push(Cold::Leave {
+            self.push_cold(Cold::Leave {
                 label: refuse,
                 state: State::CANONICAL,
                 simd_dirty: self.vector.dirty,
@@ -546,7 +583,7 @@ impl Translator<'_> {
             let refuse = self.asm.label();
             self.emit(sub_imm(X, X9, X9, net as u32, false));
             self.asm.tbz(true, X9, 63, refuse);
-            self.cold.push(Cold::Leave {
+            self.push_cold(Cold::Leave {
                 label: refuse,
                 state: self.state,
                 simd_dirty: self.vector.dirty,
@@ -590,14 +627,14 @@ impl Translator<'_> {
                     self.jump_if(test, target);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
-                    self.cold.push(Cold::Refuse {
+                    self.push_cold(Cold::Refuse {
                         label: refuse,
                         net,
                         test,
                         leave,
                         resume,
                     });
-                    self.cold.push(Cold::Leave {
+                    self.push_cold(Cold::Leave {
                         label: leave,
                         state: self.state,
                         simd_dirty: self.vector.dirty,
@@ -611,7 +648,7 @@ impl Translator<'_> {
                 } else {
                     let label = self.asm.label();
                     self.jump_if(test, label);
-                    self.cold.push(Cold::Edge {
+                    self.push_cold(Cold::Edge {
                         label,
                         state: self.state,
                         from,
@@ -626,7 +663,7 @@ impl Translator<'_> {
                 } else {
                     let label = self.asm.label();
                     self.jump_if(test, label);
-                    self.cold.push(Cold::Edge {
+                    self.push_cold(Cold::Edge {
                         label,
                         state: self.state,
                         from,
@@ -638,7 +675,7 @@ impl Translator<'_> {
                 let test = self.test(cc);
                 let label = self.asm.label();
                 self.jump_if(test, label);
-                self.cold.push(Cold::Leave {
+                self.push_cold(Cold::Leave {
                     label,
                     state: self.state,
                     simd_dirty: self.vector.dirty,
@@ -1071,7 +1108,7 @@ impl Translator<'_> {
         let label = self.asm.label();
         self.asm.cbz(Size::X, true, rt, label);
         let branch = self.indirect(kind);
-        self.cold.push(Cold::Miss { label, to, branch });
+        self.push_cold(Cold::Miss { label, to, branch });
     }
 
     /// `Runtime::branch` for an indirect transfer of `kind` from here.
@@ -1205,8 +1242,10 @@ impl Translator<'_> {
 
     fn finish(mut self, at: usize) {
         self.pixel_copies();
-        self.cold.sort_by_key(|c| !matches!(c, Cold::Table { .. }));
-        while let Some(cold) = self.cold.pop() {
+        self.cold
+            .sort_by_key(|(_, c)| !matches!(c, Cold::Table { .. }));
+        while let Some((pc, cold)) = self.cold.pop() {
+            self.mark(pc, Part::Cold);
             self.cold(cold, at);
         }
         for &(index, label) in &self.x87_sites {
