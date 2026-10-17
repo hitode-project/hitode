@@ -39,6 +39,8 @@ tauri-plugin-opener = "=2.7.1"
 tauri-plugin-storage = { path = "plugins/storage" }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# Video needs the static Android FFmpeg from `tools/macos/build.py --android`.
+adv-shell = { path = "../../../crates/adv-shell", features = ["media"] }
 jni = "0.21.1"
 ndk-sys = "0.6"
 log.workspace = true

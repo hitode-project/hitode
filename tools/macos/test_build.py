@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+import unittest.mock
 
 spec = importlib.util.spec_from_file_location('build', Path(__file__).with_name('build.py'))
 build = importlib.util.module_from_spec(spec)
@@ -23,6 +24,16 @@ class BuildTests(unittest.TestCase):
         self.assertIn('mpeg4video', profile['parsers'])
         self.assertFalse(any('--enable-lib' in arg or '--enable-encoder=' in arg for arg in args))
         self.assertEqual(len(profile['sha256']), 64)
+
+    # spec: HOST-PKG-1
+    def test_android_configuration_cross_compiles_with_the_ndk(self):
+        profile = json.loads(build.PROFILE.read_text())
+        with unittest.mock.patch.dict(build.os.environ, {'ANDROID_NDK_HOME': '/ndk'}):
+            args = build.configure(profile, Path('/build/install'), 'android')
+        self.assertIn('--target-os=android', args)
+        self.assertIn('--cc=/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/'
+                      f"aarch64-linux-android{profile['minimum_android']}-clang", args)
+        self.assertIn('--disable-shared', args)
 
 
 if __name__ == '__main__':
