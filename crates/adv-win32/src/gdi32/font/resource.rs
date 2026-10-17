@@ -18,6 +18,8 @@ pub(super) fn register(registry: &mut Registry) {
         add_ex_w_ABI,
         remove_ex_a_ABI,
         remove_ex_w_ABI,
+        add_memory_ABI,
+        remove_memory_ABI,
     ] {
         registry.register(api);
     }
@@ -60,6 +62,54 @@ fn remove_ex_a(env: &mut Env<'_>, path: AnsiStr, flags: u32, _reserved: GuestPtr
 #[win32(gdi32, name = "RemoveFontResourceExW", level = implement)]
 fn remove_ex_w(env: &mut Env<'_>, path: WideStr, flags: u32, _reserved: GuestPtr<()>) -> i32 {
     wide(env, path).map_or(0, |path| remove(env, &path, flags))
+}
+/// Memory fonts are private to the process and never enumerated
+/// (WIN32-GDI-15). Each call is one registration that its handle names.
+#[win32(gdi32, name = "AddFontMemResourceEx", level = implement)]
+fn add_memory(
+    env: &mut Env<'_>,
+    font: GuestPtr<()>,
+    size: u32,
+    _reserved: GuestPtr<()>,
+    count: GuestPtr<u32>,
+) -> Handle {
+    let length = size as usize;
+    if font.is_null() || count.is_null() || length == 0 || length > text::MAX_FONT_RESOURCE_BYTES {
+        set_last_error(env, 87);
+        return Handle(0);
+    }
+    let mut bytes = vec![0; length];
+    if env.cpu.read(font.addr(), &mut bytes).is_err()
+        || adv_abi::guest::check_range(env.cpu, count.addr(), 4, adv_cpu::backend::Prot::WRITE)
+            .is_err()
+    {
+        set_last_error(env, 87);
+        return Handle(0);
+    }
+    let fonts = env.ext.get_mut::<Fonts>();
+    let Some(handle) = fonts.next_memory.checked_add(1) else {
+        return Handle(0);
+    };
+    let Ok((id, faces)) = fonts.text.add_resource(&bytes) else {
+        return Handle(0);
+    };
+    fonts.next_memory = handle;
+    fonts.memory.insert(handle, id);
+    let _ = env.cpu.write(count.addr(), &faces.to_le_bytes());
+    Handle(handle)
+}
+#[win32(gdi32, name = "RemoveFontMemResourceEx", level = implement)]
+fn remove_memory(env: &mut Env<'_>, handle: Handle) -> i32 {
+    let fonts = env.ext.get_mut::<Fonts>();
+    let Some(&id) = fonts.memory.get(&handle.0) else {
+        set_last_error(env, 6);
+        return 0;
+    };
+    if fonts.text.remove_resource(id).ok() != Some(true) {
+        return 0;
+    }
+    fonts.memory.remove(&handle.0);
+    1
 }
 const FR_PRIVATE: u32 = 0x10;
 const FR_NOT_ENUM: u32 = 0x20;

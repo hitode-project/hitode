@@ -548,3 +548,77 @@ mod windows {
         assert_eq!(glyph(&mut machine).data, fallback.data);
     }
 }
+
+// spec: WIN32-GDI-15
+#[test]
+fn memory_fonts_register_copies_under_distinct_handles_until_removed() {
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, GuestExt, Prot},
+    };
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+    const FONT: &[u8] =
+        include_bytes!("../../../../../adv-device/tests/fixtures/font-resource.ttf");
+    const COLLECTION: &[u8] =
+        include_bytes!("../../../../../adv-device/tests/fixtures/font-resource.ttc");
+    const DATA: u32 = 0x410000;
+    const COUNT: u32 = 0x40f000;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/memory-font-tests/{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut registry = Registry::default();
+    crate::register(&mut registry);
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    crate::Win32::install(
+        &mut machine,
+        crate::Win32Config::new(&root, "fixture.exe", root.join("data")),
+    )
+    .unwrap();
+    machine.spawn("fonts", PARK_ADDR, &[], 65536).unwrap();
+    machine.cpu.map(COUNT, 0x1000, Prot::RW).unwrap();
+    machine.cpu.map(DATA, 0x2000, Prot::RW).unwrap();
+    fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
+        Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        }
+    }
+    let add = |machine: &mut Machine<JitCpu>, bytes: &[u8], count: u32| {
+        machine.cpu.write(DATA, bytes).unwrap();
+        machine.cpu.write_u32(COUNT, 0xdead).unwrap();
+        let handle = add_memory(
+            &mut env(machine),
+            GuestPtr::new(DATA),
+            bytes.len() as u32,
+            GuestPtr::default(),
+            GuestPtr::new(count),
+        );
+        (handle.0, machine.cpu.read_u32(COUNT).unwrap())
+    };
+    let (single, faces) = add(&mut machine, FONT, COUNT);
+    assert_ne!(single, 0);
+    assert_eq!(faces, 1);
+    let (collection, faces) = add(&mut machine, COLLECTION, COUNT);
+    assert!(collection != 0 && collection != single);
+    assert!(faces > 1, "{faces}");
+    // A null count pointer is rejected before anything is registered.
+    assert_eq!(add(&mut machine, FONT, 0), (0, 0xdead));
+    assert_eq!(machine.ext.get::<Fonts>().memory.len(), 2);
+    assert_eq!(remove_memory(&mut env(&mut machine), Handle(single)), 1);
+    assert_eq!(remove_memory(&mut env(&mut machine), Handle(single)), 0);
+    assert_eq!(machine.ext.get::<Fonts>().memory.len(), 1);
+    super::super::detach_process(&mut env(&mut machine)).unwrap();
+    assert!(machine.ext.get::<Fonts>().memory.is_empty());
+    drop(machine);
+    let _ = std::fs::remove_dir_all(root);
+}

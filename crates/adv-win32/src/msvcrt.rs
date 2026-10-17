@@ -225,6 +225,13 @@ pub fn register(r: &mut Registry) {
         ("wcsncpy_s", 4),
         ("wcscpy_s", 3),
         ("wcscat_s", 3),
+        // MinGW-built DLLs import these from the system msvcrt (WIN32-API-18).
+        ("_stricmp", 2),
+        ("_strcmpi", 2),
+        ("_strnicmp", 3),
+        ("__p__iob", 0),
+        ("abort", 0),
+        ("_amsg_exit", 1),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
     }
@@ -459,7 +466,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     let arg = |i| e.arg(i);
     let (a, b, c) = (arg(0), arg(1), arg(2));
     let value = match name.as_str() {
-        "__set_app_type" | "__p__fmode" | "__p__commode" | "__iob_func" => {
+        "__set_app_type" | "__p__fmode" | "__p__commode" | "__iob_func" | "__p__iob" => {
             if e.ext.try_get::<CrtState>().is_none() {
                 e.ext.insert(CrtState::default());
             }
@@ -467,7 +474,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 e.sys.thunks.get(e.thunk).module.clone(),
                 if name == "__set_app_type" {
                     "app_type"
-                } else if name == "__iob_func" {
+                } else if name == "__iob_func" || name == "__p__iob" {
                     "iob"
                 } else {
                     name.trim_start_matches("__p__")
@@ -478,7 +485,11 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let pointer = if let Some(pointer) = existing {
                 pointer
             } else {
-                let size = if name == "__iob_func" { 128 } else { 4 };
+                let size = if name == "__iob_func" || name == "__p__iob" {
+                    128
+                } else {
+                    4
+                };
                 let pointer = allocate(e, size, true);
                 if pointer == 0 {
                     return Outcome::Fail("CRT global allocation failed".into());
@@ -1061,6 +1072,28 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 p2 = p2.wrapping_add(2);
             }
         }
+        // The "C" locale folds only ASCII letters and returns the byte difference.
+        "_stricmp" | "_strcmpi" | "_strnicmp" => {
+            let limit = if name == "_strnicmp" { c } else { u32::MAX };
+            let mut offset = 0;
+            while offset < limit {
+                let (Ok(l), Ok(r)) = (
+                    e.cpu.read_u8(a.wrapping_add(offset)),
+                    e.cpu.read_u8(b.wrapping_add(offset)),
+                ) else {
+                    return Outcome::Fail(format!("CRT {name} unmapped"));
+                };
+                let (l, r) = (l.to_ascii_lowercase(), r.to_ascii_lowercase());
+                if l != r || l == 0 {
+                    return Outcome::Return((i32::from(l) - i32::from(r)) as u32);
+                }
+                offset += 1;
+            }
+            0
+        }
+        // abort exits with 3 and _amsg_exit with 255, as msvcrt does.
+        "abort" => return crate::kernel32::exit_process(e, 3),
+        "_amsg_exit" => return crate::kernel32::exit_process(e, 255),
         "_wcsnicmp" => {
             let n = c as usize;
             if n == 0 {
@@ -1608,6 +1641,60 @@ mod tests {
         .unwrap();
         install(&mut m).unwrap();
         m
+    }
+    // spec: WIN32-API-18
+    #[test]
+    fn mingw_crt_imports_compare_ascii_keep_streams_and_exit_with_msvcrt_codes() {
+        let mut m = machine(false);
+        let (code, data) = (0x400000, 0x500000);
+        m.cpu.map(code, 4096, Prot::RX).unwrap();
+        m.cpu.map(data, 4096, Prot::RW).unwrap();
+        let strings = ["ABC", "abd", "Hello", "hELLO", "A[", "a{", "abcX", "ABCy"];
+        let mut addresses = Vec::new();
+        for (index, text) in strings.iter().enumerate() {
+            let address = data + 0x100 + index as u32 * 16;
+            m.cpu
+                .write(address, format!("{text}\0").as_bytes())
+                .unwrap();
+            addresses.push(address);
+        }
+        let api = |m: &mut Machine<JitCpu>, name| m.resolve_import("msvcrt.dll", name).unwrap();
+        let (stricmp, strcmpi) = (api(&mut m, "_stricmp"), api(&mut m, "_strcmpi"));
+        let (strnicmp, p_iob) = (api(&mut m, "_strnicmp"), api(&mut m, "__p__iob"));
+        let abort = api(&mut m, "abort");
+        let calls: [(u32, &[u32]); 6] = [
+            (stricmp, &[addresses[0], addresses[1]]),
+            (strcmpi, &[addresses[2], addresses[3]]),
+            (stricmp, &[addresses[4], addresses[5]]),
+            (strnicmp, &[addresses[6], addresses[7], 3]),
+            (p_iob, &[]),
+            (p_iob, &[]),
+        ];
+        let mut a = CodeAssembler::new(32).unwrap();
+        for (index, (function, arguments)) in calls.iter().enumerate() {
+            for &argument in arguments.iter().rev() {
+                a.push(argument as i32).unwrap();
+            }
+            a.call(u64::from(*function)).unwrap();
+            a.add(esp, 4 * arguments.len() as i32).unwrap();
+            a.mov(dword_ptr((data + 4 * index as u32) as i32), eax)
+                .unwrap();
+        }
+        a.call(u64::from(abort)).unwrap();
+        m.cpu
+            .write(code, &a.assemble(u64::from(code)).unwrap())
+            .unwrap();
+        m.spawn("mingw-crt", code, &[], 65536).unwrap();
+        let result = m.run();
+        assert!(matches!(result, RunResult::Exited(3)), "{result:?}");
+        let value =
+            |m: &Machine<JitCpu>, index: u32| m.cpu.read_u32(data + 4 * index).unwrap() as i32;
+        assert_eq!(value(&m, 0), -1, "c - d after folding");
+        assert_eq!(value(&m, 1), 0);
+        assert_eq!(value(&m, 2), 0x5b - 0x7b, "only letters fold");
+        assert_eq!(value(&m, 3), 0, "the limit stops before X/y");
+        assert_ne!(value(&m, 4), 0);
+        assert_eq!(value(&m, 4), value(&m, 5));
     }
     #[test]
     fn vcruntime_memset_fills_only_the_requested_bytes_returns_destination_and_is_cdecl() {

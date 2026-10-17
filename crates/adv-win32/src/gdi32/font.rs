@@ -32,6 +32,9 @@ const GDI_ERROR: u32 = u32::MAX;
 struct Fonts {
     text: Text,
     resources: std::collections::BTreeMap<(String, u32), resource::Reference>,
+    /// AddFontMemResourceEx handles and the last one issued.
+    memory: std::collections::BTreeMap<u32, text::FontResourceId>,
+    next_memory: u32,
 }
 
 pub fn register(registry: &mut Registry) {
@@ -101,6 +104,16 @@ pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
             return Err("font resource owner missing during process cleanup".into());
         }
         fonts.resources.remove(&path);
+    }
+    while let Some((&handle, &id)) = fonts.memory.first_key_value() {
+        if !fonts
+            .text
+            .remove_resource(id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("memory font owner missing during process cleanup".into());
+        }
+        fonts.memory.remove(&handle);
     }
     Ok(())
 }
