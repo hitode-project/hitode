@@ -11,7 +11,7 @@ mod cpu;
 const CODE: u32 = 0xe0421001;
 
 #[test]
-// spec: WIN32-EXC-7
+// spec: EXC-SEH-7
 fn second_chance_terminates_without_reentering_handlers_like_native() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = root.join("target/investigations/exception-chance-tests");

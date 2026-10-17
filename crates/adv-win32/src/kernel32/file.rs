@@ -1657,7 +1657,17 @@ fn get_logical_drive_strings_w(env: &mut Env<'_>) -> Outcome {
     get_logical_drive_strings(env, cap, buf, true)
 }
 
+/// DefineDosDeviceA/W(flags, device, target): drive letters stay fixed, as
+/// for a process without the right to change them (WIN32-API-17). Patch DLLs
+/// that alias the game folder to a free letter fall back to its real path.
+fn define_dos_device(env: &mut Env<'_>) -> Outcome {
+    set_last_error(env, err::ACCESS_DENIED);
+    Outcome::Return(0)
+}
+
 pub(super) fn register(reg: &mut Registry) {
+    stdcall(reg, K32, "DefineDosDeviceA", 3, define_dos_device);
+    stdcall(reg, K32, "DefineDosDeviceW", 3, define_dos_device);
     stdcall(reg, K32, "GetLogicalDrives", 0, |env| {
         Outcome::Return(
             drive_letters(env)

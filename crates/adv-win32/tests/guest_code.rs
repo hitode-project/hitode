@@ -550,7 +550,7 @@ fn atomic_fault(guest: bool, name: &str, pointer: u32) -> (String, u32, bool) {
         tail.iter().all(|&v| v == 0),
     )
 }
-// spec: WIN32-API-16, WIN32-EXC-2
+// spec: WIN32-API-16, EXC-SEH-2
 #[test]
 fn invalid_and_readonly_atomic_words_deliver_the_same_guest_faults() {
     for name in [

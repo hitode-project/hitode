@@ -736,3 +736,29 @@ fn set_file_pointer_reports_last_error_only_for_ambiguous_and_failed_seeks() {
     }
     machine.sys.objects.close(handle);
 }
+
+#[test]
+// spec: WIN32-API-17
+fn define_dos_device_is_denied_and_leaves_drives_unchanged() {
+    let (mut machine, root) = fixture("define-dos-device");
+    let drives = |machine: &mut Machine<JitCpu>| drive_letters(&env(machine));
+    let before = drives(&mut machine);
+    // DDD_RAW_TARGET_PATH, L"Y:", L"\\??\\C:\\game", as a GBK patch DLL issues it.
+    let (device, target) = (0x410100, 0x410200);
+    for (address, text) in [(device, "Y:"), (target, "\\??\\C:\\game")] {
+        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        crate::util::write_units(&mut machine.cpu, address, &units);
+    }
+    args(&mut machine, &[1, device, target]);
+    set_last_error(&mut env(&mut machine), 0);
+    assert_eq!(returned(define_dos_device(&mut env(&mut machine))), 0);
+    assert_eq!(
+        crate::util::last_error(&env(&mut machine)),
+        err::ACCESS_DENIED
+    );
+    assert_eq!(drives(&mut machine), before);
+    args(&mut machine, &[device, 0x410300, 64]);
+    assert_eq!(returned(query_dos_device_w(&mut env(&mut machine))), 0);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
