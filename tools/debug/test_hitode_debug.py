@@ -1,6 +1,9 @@
 import unittest
 
-from hitode_debug import frame_gaps, parse_modules, place, readable, slices, table
+import tempfile
+from pathlib import Path
+
+from hitode_debug import Snapshot, frame_gaps, parse_modules, place, readable, slices, table
 
 
 class ReplyShapeTests(unittest.TestCase):
@@ -33,6 +36,18 @@ class ReplyShapeTests(unittest.TestCase):
         self.assertEqual(readable("_RNvCs9QuqQGgVFFA_9adv_shell13run_execution"),
                          "adv_shell::run_execution")
         self.assertEqual(readable("mach_absolute_time"), "mach_absolute_time")
+
+    def test_snapshot_answers_from_its_sections(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "snap.txt"
+            path.write_text("== info\npid=42\n\n== samples (last 30 s)\nunix_us\tkind\n7\tGuest\n\n"
+                            "== modules\n0x00400000 0x00100000 Image    aqua.exe\n")
+            snapshot = Snapshot(path)
+            self.assertEqual(snapshot.pid, 42)
+            self.assertEqual(table(snapshot.text("samples 60")), [{"unix_us": "7", "kind": "Guest"}])
+            self.assertEqual(parse_modules(snapshot.text("modules"))[0][2], "aqua.exe")
+            with self.assertRaises(RuntimeError):
+                snapshot.text("timeline 30")
 
 
 if __name__ == "__main__":

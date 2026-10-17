@@ -304,6 +304,7 @@ impl Debugger {
             "profile (last 30 s)",
             profile_summary(&self.shared, since, runtime),
         );
+        section("samples (last 30 s)", samples_text(&self.shared, since));
         section("threads", threads(runtime));
         section(
             "calls",

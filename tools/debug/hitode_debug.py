@@ -5,16 +5,18 @@ launcher / adv-run started with ADV_DEBUG=1).
 Usage:
   python3 tools/debug/hitode_debug.py list
   python3 tools/debug/hitode_debug.py [--pid PID | --socket PATH] [COMMAND ...]
+  python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof [OPTIONS]
 
 Without COMMAND it opens a prompt. Session commands (see `help`) go to the
 runner as they are; these are shaped here:
   tl [SECONDS] [--gap MS]   frame gaps of the timeline, busy or waiting
-  prof [SECONDS] [--slice MS] [--mark N] [--window S]
+  prof [SECONDS] [--slice MS] [--mark N] [--window S] [--range A:B]
                             sampled execution thread by slice, hottest guest
                             units (module+offset) and host functions
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
 Ctrl+Shift+F12 in the game window marks the moment and keeps a snapshot;
-`snaps` lists them and `pull` fetches one. Output stays local: snapshots hold
+`snaps` lists them and `pull` fetches one; `--snapshot` runs `tl` and `prof`
+over a pulled snapshot after the session has ended. Output stays local: snapshots hold
 game text and must not enter the repository.
 """
 
@@ -61,6 +63,30 @@ class Session:
         if not ok:
             raise RuntimeError(text)
         return text
+
+
+class Snapshot:
+    """A pulled snapshot answering the requests `tl` and `prof` make."""
+
+    SECTIONS = {"timeline": "timeline (last 30 s)", "samples": "samples (last 30 s)",
+                "modules": "modules", "marks": "marks", "info": "info"}
+
+    def __init__(self, path):
+        self.sections, title = {}, None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("== "):
+                title = line[3:]
+                self.sections[title] = []
+            elif title is not None:
+                self.sections[title].append(line)
+        info = dict(line.split("=", 1) for line in self.sections.get("info", []) if "=" in line)
+        self.pid = int(info.get("pid", 0))
+
+    def text(self, line):
+        title = self.SECTIONS.get(line.split()[0])
+        if title not in self.sections:
+            raise RuntimeError(f"the snapshot has no {title or line!r} section")
+        return "\n".join(self.sections[title])
 
 
 def sessions():
@@ -183,6 +209,7 @@ def show_profile(session, args):
     parser.add_argument("--slice", type=int, default=250, help="slice in ms")
     parser.add_argument("--mark", type=int, help="centre on mark N (from `marks`, newest is -1)")
     parser.add_argument("--window", type=float, default=10.0, help="seconds around the mark")
+    parser.add_argument("--range", help="A:B seconds from the window start, e.g. a stall from `tl`")
     parser.add_argument("--top", type=int, default=20)
     options = parser.parse_args(args)
     samples = table(session.text(f"samples {options.seconds if options.mark is None else 60}"))
@@ -191,6 +218,10 @@ def show_profile(session, args):
         at = int(marks[options.mark][0])
         half = options.window * 1e6 / 2
         samples = [s for s in samples if abs(int(s["unix_us"]) - at) <= half]
+    if options.range and samples:
+        start = int(samples[0]["unix_us"])
+        low, high = (start + float(edge) * 1e6 for edge in options.range.split(":"))
+        samples = [s for s in samples if low <= int(s["unix_us"]) <= high]
     if not samples:
         print("no samples in that window (`profile` shows the sampler rate)")
         return
@@ -248,11 +279,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pid", type=int)
     parser.add_argument("--socket", type=Path)
+    parser.add_argument("--snapshot", type=Path, help="read a pulled snapshot instead of a session")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
     if options.command[:1] == ["list"]:
         for path, alive in sessions():
             print(f"{'live' if alive else 'dead'}  {path}")
+        return
+    if options.snapshot is not None:
+        snapshot = Snapshot(options.snapshot)
+        command, args = options.command[0], options.command[1:]
+        {"tl": show_timeline, "prof": show_profile}[command](snapshot, args)
         return
     path = options.socket
     if path is None:
