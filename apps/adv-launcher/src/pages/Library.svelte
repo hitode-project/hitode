@@ -379,11 +379,10 @@
     gap: 5px;
     padding: 4px 9px;
     border-radius: 999px;
-    background: rgba(20, 20, 20, 0.55);
+    background: rgba(20, 20, 20, 0.72);
     color: #fff;
     font-size: 11px;
     white-space: nowrap;
-    backdrop-filter: blur(6px);
   }
   .badge {
     position: absolute;
@@ -394,12 +393,11 @@
     gap: 4px;
     padding: 3px 8px 3px 6px;
     border-radius: 999px;
-    background: rgba(20, 20, 20, 0.66);
+    background: rgba(20, 20, 20, 0.78);
     color: #fff;
     font-size: 11px;
     line-height: 14px;
     white-space: nowrap;
-    backdrop-filter: blur(6px);
   }
 
   .detail {
@@ -410,15 +408,16 @@
     contain: paint;
     background: var(--panel);
     border-left: 1px solid var(--line);
+    /* The panel is its own layer, so a hovered card does not repaint the blur
+       below; the blur itself stays painted into it once. A layer of its own
+       would make the compositor redo the 60px blur on every window frame. */
+    will-change: transform;
   }
   .dbd {
     position: absolute;
     inset: -25%;
     filter: blur(60px) saturate(1.2);
     opacity: 0.75;
-    /* Its own layer, so WebKit does not re-rasterize the blur when a hovered card recomposites. */
-    transform: translateZ(0);
-    will-change: transform;
   }
   .dscrim {
     position: absolute;
@@ -470,15 +469,14 @@
     height: 36px;
     padding: 0 14px;
     border-radius: 18px;
-    background: rgba(20, 20, 20, 0.6);
+    background: rgba(20, 20, 20, 0.74);
     color: #fff;
     font-size: 13px;
     white-space: nowrap;
     cursor: pointer;
-    backdrop-filter: blur(6px);
   }
   .reveal:hover {
-    background: rgba(20, 20, 20, 0.75);
+    background: rgba(20, 20, 20, 0.86);
   }
   .rehide {
     all: unset;
@@ -491,13 +489,12 @@
     display: grid;
     place-items: center;
     border-radius: 16px;
-    background: rgba(20, 20, 20, 0.5);
+    background: rgba(20, 20, 20, 0.66);
     color: #fff;
     cursor: pointer;
-    backdrop-filter: blur(6px);
   }
   .rehide:hover {
-    background: rgba(20, 20, 20, 0.7);
+    background: rgba(20, 20, 20, 0.8);
   }
   .reveal:focus-visible,
   .rehide:focus-visible {

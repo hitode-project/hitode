@@ -299,9 +299,48 @@ fn swap_mouse_button(env: &mut Env<'_>, swap: i32) -> u32 {
         swap != 0,
     ))
 }
+#[win32(user32, name = "keybd_event", level = state)]
+fn keybd_event(env: &mut Env<'_>, b_vk: u32, b_scan: u32, dw_flags: u32, _dw_extra_info: u32) {
+    let vk = (b_vk & 0xff) as usize;
+    let up = dw_flags & 2 != 0;
+    let extended = dw_flags & 1 != 0;
+    let user = &mut env.ext.get_mut::<crate::Win32>().user;
+    let alt_down = if vk < 256 {
+        user.keys[0x12] & 0x80 != 0
+    } else {
+        false
+    };
+    if vk < 256 {
+        if up {
+            user.keys[vk] &= 0x7f;
+        } else {
+            user.keys[vk] |= 0x80;
+            if matches!(vk, 0x14 | 0x90 | 0x91) {
+                user.keys[vk] ^= 1;
+            }
+        }
+    }
+    let sys = alt_down || vk == 0x12 || vk == 0x79;
+    let message = match (sys, up) {
+        (false, false) => 0x100,
+        (false, true) => 0x101,
+        (true, false) => 0x104,
+        (true, true) => 0x105,
+    };
+    let lparam = 1
+        | ((b_scan & 0xff) << 16)
+        | if extended { 1 << 24 } else { 0 }
+        | if alt_down && vk != 0x12 { 1 << 29 } else { 0 }
+        | if up { (1 << 30) | (1 << 31) } else { 0 };
+    let hwnd = super::host_input::target(user, &env.sys.objects, message)
+        .map_or(0, |(_top, target)| target);
+    super::message::post_input(env, hwnd, message, b_vk, lparam);
+}
+
 pub(super) fn register(registry: &mut Registry) {
     key_names::register(registry);
     for api in [
+        keybd_event_ABI,
         set_keyboard_state_ABI,
         get_cursor_info_ABI,
         get_cursor_ABI,
@@ -512,5 +551,51 @@ mod tests {
         assert_eq!(&bytes[..], expected);
         assert_eq!(get_keyboard_layout(&mut env, u32::MAX), Handle(0));
         assert_eq!(layout_name(&mut env, u32::MAX - 1, true), 0);
+    }
+    #[test]
+    // spec: PERS-SCOPE-10
+    fn keybd_event_updates_state_and_posts_input_messages() {
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        crate::Win32::install(
+            &mut m,
+            crate::Win32Config::new(".", "input-tests.exe", "target/input-contract-tests"),
+        )
+        .unwrap();
+        m.spawn("input", adv_machine::layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        // Key down: Esc (0x1b)
+        keybd_event(&mut env, 0x1b, 1, 0, 0);
+        let state = user(&env);
+        assert_eq!(state.keys[0x1b] & 0x80, 0x80);
+        let msg = state.queues[&0].posted.back().unwrap();
+        assert_eq!((msg.msg, msg.wparam), (0x100, 0x1b));
+        assert_eq!(msg.lparam, 1 | (1 << 16));
+
+        // Key up: Esc (0x1b)
+        keybd_event(&mut env, 0x1b, 1, 2, 0);
+        let state = user(&env);
+        assert_eq!(state.keys[0x1b] & 0x80, 0);
+        let msg = state.queues[&0].posted.back().unwrap();
+        assert_eq!((msg.msg, msg.wparam), (0x101, 0x1b));
+        assert_eq!(msg.lparam, 1 | (1 << 16) | (1 << 30) | (1 << 31));
+
+        // CapsLock toggle (0x14)
+        assert_eq!(state.keys[0x14] & 1, 0);
+        keybd_event(&mut env, 0x14, 0, 0, 0);
+        let state = user(&env);
+        assert_eq!(state.keys[0x14] & 1, 1);
+        keybd_event(&mut env, 0x14, 0, 0, 0);
+        let state = user(&env);
+        assert_eq!(state.keys[0x14] & 1, 0);
     }
 }

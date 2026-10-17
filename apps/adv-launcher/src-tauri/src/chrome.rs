@@ -6,9 +6,11 @@
 //! pause button, which then never covers the game. Full screen hides the bar
 //! until the pointer reaches the top of the screen.
 //!
-//! The window itself turns opaque too: a transparent window is blended with
-//! the desktop behind it, and WindowServer redid that for every game frame
-//! (about half a core for AQUA's title screen).
+//! The window itself stays opaque on every screen: a transparent window is
+//! blended with the desktop behind it, and WindowServer redid that for every
+//! game frame (about half a core for AQUA's title screen) and kept the GPU
+//! awake over an idle library. Only the webview is transparent, for the game
+//! overlay; the library paints its own background.
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -47,6 +49,27 @@ thread_local! {
     static PAUSE: RefCell<Option<Accessory>> = const { RefCell::new(None) };
 }
 
+/// Makes the main window opaque from launch; the config's `transparent` is
+/// for the webview.
+pub fn setup(app: &tauri::App) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        let native = window.ns_window()?;
+        // SAFETY: Tauri keeps the NSWindow alive while its WebviewWindow exists.
+        paint(unsafe { &*native.cast::<NSWindow>() }, false);
+    }
+    Ok(())
+}
+
+fn paint(native: &NSWindow, game: bool) {
+    native.setOpaque(true);
+    let background = if game {
+        NSColor::blackColor()
+    } else {
+        NSColor::windowBackgroundColor()
+    };
+    native.setBackgroundColor(Some(&background));
+}
+
 /// `title` is the game's while the game screen is shown, null after it.
 #[tauri::command]
 pub fn set_title_bar(window: WebviewWindow, title: Option<String>) -> Result<(), String> {
@@ -59,13 +82,7 @@ pub fn set_title_bar(window: WebviewWindow, title: Option<String>) -> Result<(),
     mask.set(NSWindowStyleMask::FullSizeContentView, !game);
     native.setStyleMask(mask);
     native.setTitlebarAppearsTransparent(!game);
-    native.setOpaque(game);
-    let background = if game {
-        NSColor::blackColor()
-    } else {
-        NSColor::clearColor()
-    };
-    native.setBackgroundColor(Some(&background));
+    paint(native, game);
     native.setTitleVisibility(if game {
         NSWindowTitleVisibility::Visible
     } else {

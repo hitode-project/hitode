@@ -88,6 +88,8 @@ pub fn run() {
                 app.set_menu(menu)?;
             }
         }
+        #[cfg(target_os = "macos")]
+        chrome::setup(app)?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         game::setup(app)?;
         #[cfg(target_os = "ios")]
