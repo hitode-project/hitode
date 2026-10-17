@@ -69,7 +69,16 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
     let before = gpu.stats();
     gpu.clear_with_stencil(&small, Some([1., 0., 0., 0.5]), Some(0.25), Some(7))
         .unwrap();
-    assert_eq!(gpu.stats().submissions, before.submissions + 1);
+    // Resolving the old clear initializes a first native depth draw as well.
+    let initialization = if gpu.stats().metal_draws > before.metal_draws {
+        3
+    } else {
+        0
+    };
+    assert_eq!(
+        gpu.stats().submissions,
+        before.submissions + 1 + initialization
+    );
     assert_eq!(gpu.stats().readbacks, before.readbacks);
     assert!(
         read(&mut gpu, &small)

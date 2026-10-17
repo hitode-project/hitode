@@ -238,6 +238,8 @@ pub struct Stats {
     pub vertex_buffer_allocations: u64,
     pub metal_draws: u64,
     pub backend_switches: u64,
+    /// Partial clear, copy, upload, fixed draw, readback, other (including entry to Metal).
+    pub backend_switches_by_reason: [u64; 6],
     pub ring_bytes: u64,
     pub ring_busy: u64,
     pub buffer_writes: u64,

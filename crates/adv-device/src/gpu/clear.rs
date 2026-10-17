@@ -119,7 +119,17 @@ impl Gpu {
         ];
         // The full-target viewport has depth range 0..1. The caller's viewport
         // supplies only the scissor, so its MinZ/MaxZ cannot remap the clear value.
-        self.draw(target, &vertices, None, state)
+        #[cfg(target_vendor = "apple")]
+        if let Some(result) = self.clear_metal(target, &vertices, state) {
+            return result;
+        }
+        self.draw_fixed(
+            target,
+            &vertices,
+            None,
+            state,
+            renderer::SwitchReason::PartialClear,
+        )
     }
 }
 

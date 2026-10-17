@@ -590,3 +590,336 @@ fn native_warm_restart_prebuilds_exact_pipelines_for_all_depth_formats() {
     hot.set_pipeline_cache_directory(None);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+// spec: GFX-METAL-1
+#[test]
+fn backend_switch_reasons_partition_the_total() {
+    let mut gpu = gpu(true);
+    let target = gpu.target(4, 4, false).unwrap();
+    let image = gpu.image(4, 4).unwrap();
+    let region = Rect {
+        x: 0,
+        y: 0,
+        w: 2,
+        h: 2,
+    };
+    let state = DrawState::new(4, 4);
+    let mut command = draw();
+    command.pixel_constants.floats[0] = [1.; 4];
+    for reason in [
+        SwitchReason::PartialClear,
+        SwitchReason::Copy,
+        SwitchReason::Upload,
+        SwitchReason::FixedDraw,
+        SwitchReason::Readback,
+        SwitchReason::Other,
+    ] {
+        gpu.draw_programmable(&target, &command, &state).unwrap();
+        let before = gpu.stats();
+        match reason {
+            SwitchReason::PartialClear => gpu
+                .clear_region(&target, region, Some([0.; 4]), None, None)
+                .unwrap(),
+            SwitchReason::Copy => gpu.copy(&target.image, region, &image, 0, 0).unwrap(),
+            SwitchReason::Upload => gpu.upload(&image, region, 8, &[255; 16]).unwrap(),
+            SwitchReason::FixedDraw => gpu
+                .draw(
+                    &target,
+                    &[Vertex {
+                        position: [0., 0., 0., 1.],
+                        color: [1.; 4],
+                        uv: [0.; 2],
+                    }; 3],
+                    None,
+                    state,
+                )
+                .unwrap(),
+            SwitchReason::Readback => {
+                read(&mut gpu, &target);
+            }
+            SwitchReason::Other => {
+                gpu.context.submission().unwrap().submit([]);
+            }
+        }
+        let after = gpu.stats();
+        assert_eq!(
+            after.backend_switches_by_reason[reason as usize],
+            before.backend_switches_by_reason[reason as usize]
+                + u64::from(!matches!(
+                    reason,
+                    SwitchReason::PartialClear | SwitchReason::Copy
+                ))
+        );
+        assert_eq!(
+            after.backend_switches_by_reason.iter().sum::<u64>(),
+            after.backend_switches
+        );
+    }
+}
+
+// spec: GFX-METAL-1, GFX-PASS-1, GFX-PASS-2, GFX-PASS-3
+#[test]
+fn native_bounded_clears_match_wgpu_without_switching_or_submitting() {
+    let mut native = gpu(true);
+    let mut reference = gpu(false);
+    for alpha in [AlphaMode::Stored, AlphaMode::Opaque] {
+        for format in [
+            None,
+            Some(DepthFormat::Float32),
+            Some(DepthFormat::Unorm16),
+            Some(DepthFormat::Depth24Stencil8),
+        ] {
+            let targets = [&mut native, &mut reference].map(|gpu| {
+                let mut target = gpu.target(8, 6, false).unwrap();
+                target.image.alpha = alpha;
+                target
+                    .with_depth(format.map(|f| gpu.depth(8, 6, f).unwrap()))
+                    .unwrap()
+            });
+            let mut command = draw();
+            let positions = [
+                [-1f32, -1., 0.5, 1.],
+                [3., -1., 0.5, 1.],
+                [-1., 3., 0.5, 1.],
+            ];
+            command.streams[0].bytes = bytemuck::cast_slice(&positions).to_vec();
+            command.pixel_constants.floats[0] = [0.8, 0.2, 0.4, 0.6];
+            let mut state = DrawState::new(8, 6);
+            state.depth = format.map(|_| Compare::Always);
+            state.depth_write = format.is_some();
+            for (gpu, target) in [(&mut native, &targets[0]), (&mut reference, &targets[1])] {
+                gpu.draw_programmable(target, &command, &state).unwrap();
+                let before = gpu.stats();
+                gpu.clear_region(
+                    target,
+                    Rect {
+                        x: 1,
+                        y: 2,
+                        w: 4,
+                        h: 3,
+                    },
+                    Some([0.13, 0.71, 0.29, 0.53]),
+                    format.map(|_| 0.25),
+                    format.filter(|f| f.has_stencil()).map(|_| 42),
+                )
+                .unwrap();
+                assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+                if gpu.stats().metal_draws > before.metal_draws {
+                    assert_eq!(gpu.stats().submissions, before.submissions);
+                }
+                state.scissor = format.is_none().then_some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                });
+                state.depth = format.map(|_| Compare::LessEqual);
+                command.pixel_constants.floats[0] = [0.2, 0.4, 0.8, 1.];
+                gpu.draw_programmable(target, &command, &state).unwrap();
+                command.pixel_constants.floats[0] = [0.8, 0.2, 0.4, 0.6];
+                state.depth = format.map(|_| Compare::Always);
+                state.scissor = None;
+            }
+            assert_eq!(
+                read(&mut native, &targets[0]),
+                read(&mut reference, &targets[1]),
+                "{alpha:?} {format:?}"
+            );
+        }
+    }
+    assert_eq!(
+        native.stats().prebuild_misses,
+        reference.stats().prebuild_misses
+    );
+}
+
+// spec: GFX-METAL-1, GFX-CACHE-8, GFX-CACHE-10
+#[test]
+fn bounded_clear_pipelines_prebuild_from_persistent_recipes() {
+    let directory = std::env::temp_dir().join(format!(
+        "adv-metal-clear-{}-{}",
+        std::process::id(),
+        NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let render = |gpu: &mut Gpu| {
+        let target = gpu.target(4, 4, false).unwrap();
+        gpu.draw_programmable(&target, &draw(), &DrawState::new(4, 4))
+            .unwrap();
+        gpu.clear_region(
+            &target,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            Some([0.13, 0.71, 0.29, 0.53]),
+            None,
+            None,
+        )
+        .unwrap();
+        read(gpu, &target)
+    };
+    let mut cold = gpu(true);
+    cold.set_pipeline_cache_directory(Some(&directory));
+    let expected = render(&mut cold);
+    cold.flush_pipeline_cache();
+    assert_eq!(cold.stats().prebuild_misses, 2);
+    assert_eq!(cold.stats().persisted_pipelines, 2);
+    drop(cold);
+    let mut hot = gpu(true);
+    hot.set_pipeline_cache_directory(Some(&directory));
+    hot.programmable.warm.drain();
+    assert_eq!(render(&mut hot), expected);
+    assert_eq!(hot.stats().compile_waits, 0);
+    assert_eq!(hot.stats().prebuild_misses, 0);
+    hot.set_pipeline_cache_directory(None);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+// spec: GFX-METAL-1, GFX-PASS-1
+#[test]
+fn native_mip_copies_preserve_clipping_pixels_and_the_open_batch() {
+    let render = |native| {
+        let mut gpu = gpu(native);
+        let source = gpu.target_levels(8, 8, 3).unwrap();
+        let destination = gpu.target_levels(8, 8, 3).unwrap();
+        let state = DrawState::new(8, 8);
+        let command = draw();
+        for target in [&source, &destination] {
+            gpu.draw_programmable(target, &command, &state).unwrap();
+        }
+        let src = source.image.mip_level(1).unwrap();
+        let dst = destination.image.mip_level(1).unwrap();
+        let bytes: Vec<u8> = (0..80).map(|i| (i * 19) as u8).collect();
+        gpu.upload(
+            &src,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            20,
+            &bytes,
+        )
+        .unwrap();
+        gpu.draw_programmable(&source, &command, &state).unwrap();
+        let before = gpu.stats();
+        gpu.set_clip(Some(Rect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 2,
+        }));
+        gpu.copy(
+            &src,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            &dst,
+            0,
+            1,
+        )
+        .unwrap();
+        gpu.set_clip(None);
+        gpu.draw_programmable(&source, &command, &state).unwrap();
+        if native {
+            assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+            assert_eq!(gpu.stats().submissions, before.submissions);
+        }
+        read(
+            &mut gpu,
+            &Target {
+                image: dst,
+                depth: None,
+            },
+        )
+    };
+    let actual = render(true);
+    assert_eq!(actual, render(false));
+    assert_eq!(&actual[(4 + 1) * 4..(4 + 2) * 4], &[20, 39, 58, 77]);
+}
+
+// spec: GFX-METAL-1, GFX-PASS-1, GFX-PASS-2, GFX-PASS-3
+#[test]
+fn native_padded_attachment_copies_reopen_without_switches_or_submissions() {
+    let render = |native| {
+        let mut gpu = gpu(native);
+        let target = gpu
+            .target(4, 4, false)
+            .unwrap()
+            .with_depth(Some(gpu.depth(8, 6, DepthFormat::Depth24Stencil8).unwrap()))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Always);
+        state.depth_write = true;
+        let mut command = draw();
+        gpu.draw_programmable(&target, &command, &state).unwrap();
+        read(&mut gpu, &target);
+        gpu.draw_programmable(&target, &command, &state).unwrap();
+        let before = gpu.stats();
+        command.pixel_constants.floats[0] = [0.13, 0.71, 0.29, 0.53];
+        gpu.draw_programmable(&target, &command, &state).unwrap();
+        if native {
+            assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+            assert_eq!(gpu.stats().submissions, before.submissions);
+        }
+        read(&mut gpu, &target)
+    };
+    assert_eq!(render(true), render(false));
+}
+
+// spec: GFX-METAL-1, GFX-PASS-1
+#[test]
+fn native_copy_into_a_fresh_image_initializes_untouched_mips() {
+    let render = |native| {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, false).unwrap();
+        let mut command = draw();
+        command.pixel_constants.floats[0] = [0.13, 0.71, 0.29, 0.53];
+        gpu.draw_programmable(&target, &command, &DrawState::new(4, 4))
+            .unwrap();
+        let fresh = gpu.image_levels(4, 4, 3).unwrap();
+        let before = gpu.stats();
+        gpu.copy(
+            &target.image,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            &fresh,
+            1,
+            1,
+        )
+        .unwrap();
+        if native {
+            assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+            assert_eq!(gpu.stats().submissions, before.submissions);
+        }
+        let last = fresh.mip_level(2).unwrap();
+        assert_eq!(
+            read(
+                &mut gpu,
+                &Target {
+                    image: last,
+                    depth: None
+                }
+            ),
+            [0; 4]
+        );
+        read(
+            &mut gpu,
+            &Target {
+                image: fresh.mip_level(0).unwrap(),
+                depth: None,
+            },
+        )
+    };
+    assert_eq!(render(true), render(false));
+}

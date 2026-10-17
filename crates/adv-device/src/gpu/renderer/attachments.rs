@@ -11,6 +11,42 @@ pub(super) struct AttachmentColor {
     padded: bool,
 }
 impl AttachmentColor {
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn load_metal(&self, metal: &mut metal::State, gpu: &Gpu, logical: &Image) {
+        if self.padded {
+            metal.copy(
+                gpu,
+                logical,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: logical.width,
+                    h: logical.height,
+                },
+                &self.image,
+                0,
+                0,
+            );
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn store_metal(&self, metal: &mut metal::State, gpu: &Gpu, logical: &Image) {
+        if self.padded {
+            metal.copy(
+                gpu,
+                &self.image,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: logical.width,
+                    h: logical.height,
+                },
+                logical,
+                0,
+                0,
+            );
+        }
+    }
     pub(super) fn load(&self, encoder: &mut wgpu::CommandEncoder, logical: &Image) {
         if self.padded {
             copy(encoder, logical, &self.image, logical.width, logical.height);
