@@ -18,8 +18,9 @@ pub use adv_abi::{ApiDiagnostics, DynamicLookupFailure, MessageBoxCall, RunMode}
 /// The in-process JIT address map, for the debugger's sampler.
 #[cfg(target_arch = "aarch64")]
 pub use adv_cpu::jit_map::{
-    Location as JitLocation, Part as JitPart, enable_memory as jit_map_enable,
-    locate as jit_map_locate, lookup as jit_map_lookup, stub as jit_map_stub,
+    Location as JitLocation, Part as JitPart, code_of as jit_map_code_of,
+    enable_memory as jit_map_enable, locate as jit_map_locate, lookup as jit_map_lookup,
+    stub as jit_map_stub,
 };
 pub use adv_cpu::{CompileStrategy, Engine, EngineOptions, HostFeatures};
 #[cfg(target_os = "ios")]

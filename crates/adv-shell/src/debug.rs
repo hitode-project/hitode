@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 mod profile;
 
+/// Guest instructions a snapshot describes by form and code size.
+const HOT_INSTRUCTIONS: usize = 60;
 /// How long a socket request waits for a guest boundary.
 const BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames the timeline keeps: ten minutes at 60 fps.
@@ -348,6 +350,10 @@ impl Debugger {
             profile_summary(&self.shared, since, runtime),
         );
         section("samples (last 30 s)", samples_text(&self.shared, since));
+        section(
+            "hot instructions (last 30 s)",
+            hot_text(&self.shared, since, runtime),
+        );
         section("threads", threads(runtime));
         section(
             "calls",
@@ -493,6 +499,8 @@ fn part_name(part: adv_runtime::JitPart) -> &'static str {
         adv_runtime::JitPart::Cold => "cold",
         adv_runtime::JitPart::X87Entry => "x87-entry",
         adv_runtime::JitPart::X87Publish => "x87-publish",
+        adv_runtime::JitPart::X87Wide => "x87-wide",
+        adv_runtime::JitPart::FpStatus => "fp-status",
     }
 }
 
@@ -674,6 +682,78 @@ fn samples_text(shared: &Shared, since: u64) -> String {
             hex(row.inst),
             row.part,
             row.host.map_or_else(|| "-".into(), |pc| format!("{pc:#x}")),
+        ));
+    }
+    text.join("\n")
+}
+
+/// The guest instructions most samples were in: their form, samples by
+/// part of their code, and host code bytes by part in the newest unit, so
+/// a client can group scattered instructions by mechanism.
+fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
+    const PARTS: [&str; 8] = [
+        "body",
+        "cold",
+        "x87-entry",
+        "x87-publish",
+        "x87-wide",
+        "fp-status",
+        "host",
+        "stub",
+    ];
+    let mut counts: HashMap<u32, [usize; 8]> = HashMap::new();
+    for sample in shared.profiler.since(since).iter().map(classify) {
+        let Some(inst) = sample.inst else { continue };
+        let part = if sample.part.starts_with("stub:") {
+            "stub"
+        } else {
+            sample.part.as_str()
+        };
+        if let Some(at) = PARTS.iter().position(|&name| name == part) {
+            counts.entry(inst).or_default()[at] += 1;
+        }
+    }
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by_key(|&(eip, parts)| (std::cmp::Reverse(parts.iter().sum::<usize>()), eip));
+    let mut text = vec![format!(
+        "samples\teip\tplace\tform\t{}\t{}",
+        PARTS.join("\t"),
+        ["body", "cold", "x87-entry", "x87-publish"]
+            .map(|part| format!("{part}_bytes"))
+            .join("\t")
+    )];
+    for (eip, parts) in rows.into_iter().take(HOT_INSTRUCTIONS) {
+        #[cfg(target_arch = "aarch64")]
+        let (form, sizes) = (
+            runtime
+                .machine
+                .cpu
+                .executor()
+                .instruction_form(eip)
+                .map_or_else(|| "-".into(), |code| format!("{code:?}")),
+            adv_runtime::jit_map_code_of(eip),
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        let (form, sizes): (String, Vec<(adv_runtime::JitPart, usize)>) = ("-".into(), Vec::new());
+        let bytes = [
+            adv_runtime::JitPart::Body,
+            adv_runtime::JitPart::Cold,
+            adv_runtime::JitPart::X87Entry,
+            adv_runtime::JitPart::X87Publish,
+        ]
+        .map(|part| {
+            sizes
+                .iter()
+                .find(|&&(at, _)| at == part)
+                .map_or(0, |&(_, bytes)| bytes)
+                .to_string()
+        });
+        text.push(format!(
+            "{}\t{eip:#010x}\t{}\t{form}\t{}\t{}",
+            parts.iter().sum::<usize>(),
+            runtime.guest_place(eip),
+            parts.map(|n| n.to_string()).join("\t"),
+            bytes.join("\t"),
         ));
     }
     text.join("\n")

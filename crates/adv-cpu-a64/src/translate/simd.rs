@@ -984,6 +984,7 @@ impl Translator<'_> {
             self.emit(orr_imm(W, X13, X13, 2));
             self.asm.bind(clean);
         }
+        self.remark(crate::jit_map::Part::FpStatus);
         if !self.vector.fp_clean {
             self.emit(msr_fpsr(Reg::ZR));
         }
@@ -1073,6 +1074,7 @@ impl Translator<'_> {
         // Anything but inexact leaves; inexact sets PE.
         self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
         self.asm.cbz(X, true, X14, bail);
+        self.remark(crate::jit_map::Part::Body);
         self.emit_all(&[
             ubfx(W, X17, X17, 4, 1),
             orr(W, X13, X13, X17, Shift::Lsl, 5),

@@ -25,6 +25,11 @@ pub enum Part {
     X87Entry,
     /// An x87 run writing its state back to `CpuState`.
     X87Publish,
+    /// x87 arithmetic on 64-bit significands in integers, for precision 64
+    /// or operands that are not exact doubles.
+    X87Wide,
+    /// An SSE operation from clearing FPSR to reading its exceptions back.
+    FpStatus,
 }
 
 /// Where a stretch starts: byte offset in the unit, guest instruction.
@@ -101,6 +106,36 @@ pub fn locate(pc: usize, at_ns: u128) -> Option<Location> {
         }
     }
     None
+}
+
+/// Host code bytes by part for the guest instruction at `eip`, in the
+/// newest unit that holds it: what one pass through it may run.
+pub fn code_of(eip: u32) -> Vec<(Part, usize)> {
+    let units = UNITS.lock().unwrap_or_else(|poison| poison.into_inner());
+    for generation in units.0.iter().rev() {
+        for unit in generation.units.iter().rev() {
+            if !unit.marks.iter().any(|mark| mark.eip == eip) {
+                continue;
+            }
+            let mut sizes: Vec<(Part, usize)> = Vec::new();
+            for (n, mark) in unit.marks.iter().enumerate() {
+                if mark.eip != eip {
+                    continue;
+                }
+                let end = unit
+                    .marks
+                    .get(n + 1)
+                    .map_or(unit.end - unit.base, |next| next.offset as usize);
+                let bytes = end - mark.offset as usize;
+                match sizes.iter_mut().find(|(part, _)| *part == mark.part) {
+                    Some((_, total)) => *total += bytes,
+                    None => sizes.push((mark.part, bytes)),
+                }
+            }
+            return sizes;
+        }
+    }
+    Vec::new()
 }
 
 /// The shared stub holding host `pc`.
@@ -224,6 +259,11 @@ mod tests {
             location(0x401000, Some(0x401004), Part::Cold)
         );
         assert_eq!(locate(0x1044, first), location(0x401100, None, Part::Body));
+        assert_eq!(
+            code_of(0x401004),
+            vec![(Part::Cold, 0x20)],
+            "the last stretch runs to the unit's end"
+        );
         // A cleared cache places again from its bottom.
         std::thread::sleep(std::time::Duration::from_millis(2));
         record(0x1000, 0x30, 0x402000, 1, &[]);

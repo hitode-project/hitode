@@ -75,6 +75,7 @@ class Snapshot:
     """A pulled snapshot answering the requests `tl` and `prof` make."""
 
     SECTIONS = {"timeline": "timeline (last 30 s)", "samples": "samples (last 30 s)",
+                "hot": "hot instructions (last 30 s)",
                 "modules": "modules", "marks": "marks", "info": "info"}
 
     def __init__(self, path=None, text=None):
@@ -252,6 +253,40 @@ def instructions(samples, modules):
     return counts
 
 
+def forms(samples, hot):
+    """Samples grouped by the form of their guest instruction, from the
+    snapshot's `hot instructions` rows: family (mnemonic) -> (samples,
+    {form: samples}, instructions, mean host body bytes). Instructions
+    outside the table count under `other`."""
+    by_eip = {int(row["eip"], 16): row for row in hot}
+    groups = {}
+    for s in samples:
+        inst = s.get("inst", "-")
+        if inst == "-":
+            continue
+        row = by_eip.get(int(inst, 16))
+        form = row["form"] if row else "other"
+        family = form.split("_")[0]
+        entry = groups.setdefault(family, [0, Counter(), set(), []])
+        entry[0] += 1
+        entry[1][form] += 1
+        if row and inst not in entry[2]:
+            entry[2].add(inst)
+            entry[3].append(int(row["body_bytes"]) // 4)
+    return {family: (count, forms_, len(eips), sum(sizes) / len(sizes) if sizes else 0)
+            for family, (count, forms_, eips, sizes) in groups.items()}
+
+
+def form_lines(samples, hot, total, top=12):
+    lines = []
+    ranked = sorted(forms(samples, hot).items(), key=lambda item: -item[1][0])
+    for family, (count, by_form, eips, words) in ranked[:top]:
+        detail = ", ".join(f"{form} {n}" for form, n in by_form.most_common(3))
+        lines.append(f"{count:6} {100 * count / total:5.1f}% {family:<10} {eips:3} insts, "
+                     f"{words:5.0f} host words/inst  ({detail})")
+    return lines
+
+
 def parse_slow(lines):
     """Rows of a `slow` table: (total, interpreted, faulted, helper, eip, rest)."""
     rows = []
@@ -336,6 +371,10 @@ def analyze(snapshot, gap_ms=100.0, top=6):
                                                  for part, count in parts.most_common(8)))
             for (where, part), count in instructions(busy_samples, modules).most_common(top * 2):
                 out.append(f"  inst    {count:6} {100 * count / total:5.1f}% {where} {part}")
+        hot = table("\n".join(snapshot.sections.get("hot instructions (last 30 s)", [])))
+        if hot:
+            for line in form_lines(busy_samples, hot, total):
+                out.append(f"  form  {line}")
         from_guest = Counter(names[s["pc"]] for s in inside if s["kind"] == "HostFromGuest")
         callers = defaultdict(Counter)
         for s in inside:
@@ -460,6 +499,12 @@ def show_profile(session, args):
         coded = sum(parts.values())
         print("generated code by part: " + ", ".join(f"{part} {100 * count / coded:.1f}%"
                                                       for part, count in parts.most_common()))
+        hot = table(session.text("hot")) if isinstance(session, Snapshot) and \
+            "hot instructions (last 30 s)" in session.sections else []
+        if hot:
+            print("instruction families (samples, distinct instructions, host words per instruction):")
+            for line in form_lines(busy, hot, len(busy)):
+                print(f"  {line}")
         print("guest instructions (module+offset, part):")
         for (where, part), count in instructions(busy, modules).most_common(options.top * 2):
             print(f"  {count:6} {100 * count / len(busy):5.1f}% {where} {part}")

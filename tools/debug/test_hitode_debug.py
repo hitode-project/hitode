@@ -4,7 +4,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from hitode_debug import Snapshot, analyze, code_parts, explain_stall, frame_gaps, instructions, parse_slow, regions, parse_modules, place, readable, slices, table
+from hitode_debug import Snapshot, analyze, code_parts, form_lines, forms, explain_stall, frame_gaps, instructions, parse_slow, regions, parse_modules, place, readable, slices, table
 
 
 class ReplyShapeTests(unittest.TestCase):
@@ -83,6 +83,19 @@ class ReplyShapeTests(unittest.TestCase):
                                  [], [], [], code_parts(samples))
         self.assertEqual(verdicts, ["generated-code overhead: x87-publish takes 30% of the samples in generated code",
                                     "generated-code overhead: stub:lookup takes 20% of the samples in generated code"])
+
+    def test_samples_group_by_instruction_family(self):
+        hot = table("samples\teip\tplace\tform\tbody\tcold\tx87-entry\tx87-publish\thost\tstub\t"
+                    "body_bytes\tcold_bytes\tx87-entry_bytes\tx87-publish_bytes\n"
+                    "6\t0x00401000\ta+0x1000\tFdiv_m64fp\t6\t0\t0\t0\t0\t0\t400\t0\t0\t0\n"
+                    "2\t0x00401010\ta+0x1010\tFdivrp_sti_st0\t2\t0\t0\t0\t0\t0\t200\t0\t0\t0\n")
+        samples = [{"inst": "0x00401000"}] * 6 + [{"inst": "0x00401010"}] * 2 + [{"inst": "0x00402000"}]
+        grouped = forms(samples, hot)
+        self.assertEqual(grouped["Fdiv"][0], 6)
+        self.assertEqual(grouped["Fdivrp"][:3], (2, Counter({"Fdivrp_sti_st0": 2}), 1))
+        self.assertEqual(grouped["other"][0], 1)
+        self.assertEqual(grouped["Fdiv"][3], 100)
+        self.assertTrue(form_lines(samples, hot, 9)[0].startswith("     6  66.7% Fdiv"))
 
     def test_analysis_attributes_a_stall_to_its_samples(self):
         snapshot = Snapshot(text="\n".join([

@@ -1895,7 +1895,7 @@ fn x87_runs_publish_their_state_at_a_fault() {
 
 /// Samplers see which guest instruction and which part of its code a
 /// host address of a unit is in: an x87 run's entry checks, its body, its
-/// publication and its out-of-line paths.
+/// integer arithmetic path, its publication and its out-of-line paths.
 #[cfg(native)]
 #[test]
 fn units_map_host_code_to_instructions_and_parts() {
@@ -1934,7 +1934,13 @@ fn units_map_host_code_to_instructions_and_parts() {
         .as_nanos();
     let (base, marks) = units_of(CODE).pop().expect("the unit was recorded");
     let parts: Vec<_> = marks.iter().map(|mark| mark.part).collect();
-    for part in [Part::Body, Part::X87Entry, Part::X87Publish, Part::Cold] {
+    for part in [
+        Part::Body,
+        Part::X87Entry,
+        Part::X87Publish,
+        Part::X87Wide,
+        Part::Cold,
+    ] {
         assert!(parts.contains(&part), "{part:?} in {marks:?}");
     }
     for mark in &marks {

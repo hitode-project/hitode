@@ -31,6 +31,7 @@ use crate::asm::Label;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::jit_map::Part;
 use crate::runtime;
 
 use super::decode::{Mem, memory};
@@ -658,8 +659,10 @@ impl Translator<'_> {
         self.extended(V2, X0, X1);
         self.asm.b(end);
         self.asm.bind(wide);
+        self.remark(Part::X87Wide);
         self.x87_wide(op, dest, source, reverse, slow);
         self.asm.bind(end);
+        self.remark(Part::Body);
         self.st_write(dest, X0, X1);
         if pop {
             self.pop();
