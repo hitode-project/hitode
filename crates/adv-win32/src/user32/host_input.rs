@@ -188,7 +188,11 @@ pub fn release(env: &mut Env<'_>) -> usize {
 }
 
 /// (top-level window, target window) for `message`.
-fn target(user: &User, objects: &adv_machine::Objects, message: u32) -> Option<(u32, u32)> {
+pub(super) fn target(
+    user: &User,
+    objects: &adv_machine::Objects,
+    message: u32,
+) -> Option<(u32, u32)> {
     let top = user.top.iter().copied().find(|h| {
         user.windows
             .get(objects, h)
