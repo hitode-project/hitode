@@ -68,6 +68,7 @@ use crate::jit_map::{Mark, Part};
 use crate::runtime::Exit;
 use decode::{EBP, ESP};
 use flags::FlagSet;
+use std::collections::VecDeque;
 use trace::{Edge, Next, Trace};
 
 /// Host features that change what the translator emits (A64-ISA-4).
@@ -1281,32 +1282,25 @@ impl Translator<'_> {
 
     fn finish(mut self, at: usize) {
         self.pixel_copies();
-        let mut tables = std::collections::VecDeque::new();
-        let mut queue = std::collections::VecDeque::new();
-        for item in self.cold.drain(..) {
-            if matches!(item.1, Cold::Table { .. }) {
-                tables.push_back(item);
-            } else {
-                queue.push_back(item);
-            }
-        }
+        // Cold code goes in the order it was asked for, so a tbz anywhere
+        // in the body is no farther from its target than the body or the
+        // short cold code is long. Long x87 paths, reached only by wider
+        // branches, follow, and tables come last.
+        let rank = |cold: &Cold| match cold {
+            Cold::Table { .. } => 2,
+            Cold::X87(_) => 1,
+            _ => 0,
+        };
+        let mut queues: [VecDeque<(u32, Cold)>; 3] = Default::default();
         loop {
-            if let Some((pc, cold)) = queue.pop_front() {
-                self.mark(pc, Part::Cold);
-                self.cold(cold, at);
-            } else if let Some((pc, cold)) = tables.pop_front() {
-                self.mark(pc, Part::Cold);
-                self.cold(cold, at);
-            } else {
+            for (pc, cold) in self.cold.drain(..) {
+                queues[rank(&cold)].push_back((pc, cold));
+            }
+            let Some((pc, cold)) = queues.iter_mut().find_map(VecDeque::pop_front) else {
                 break;
-            }
-            for item in self.cold.drain(..) {
-                if matches!(item.1, Cold::Table { .. }) {
-                    tables.push_back(item);
-                } else {
-                    queue.push_back(item);
-                }
-            }
+            };
+            self.mark(pc, Part::Cold);
+            self.cold(cold, at);
         }
         for &(index, label) in &self.x87_sites {
             let (at, site) = &mut self.sites[index];
