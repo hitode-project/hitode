@@ -4712,7 +4712,6 @@ impl Emitter<'_> {
         });
         let recovery = contract::RecoveryExit::new(&mut self.b);
         let draft = fault::Draft::capture(
-            &mut self.b,
             &self.fault_seeds,
             self.state,
             outputs,

@@ -78,7 +78,6 @@ pub(super) struct Pending {
 
 impl Draft {
     pub(super) fn capture(
-        b: &mut FunctionBuilder<'_>,
         seeds: &[(Value, Input)],
         state: Value,
         outputs: [Value; 18],
@@ -87,7 +86,6 @@ impl Draft {
         width: usize,
         recovery: contract::RecoveryExit,
     ) -> Option<Pending> {
-        let _ = b;
         Some(Pending {
             seeds: seeds.to_vec(),
             state,
@@ -146,7 +144,7 @@ impl Draft {
         self.recipe.valid().then_some((
             FaultSite {
                 host_pc: base.checked_add(offset as usize)?,
-                recovery_pc: base.checked_add(recovery as usize)?,
+                recovery_pc: base.checked_add(recovery)?,
                 guest_pc: self.pc,
                 width: self.width,
                 access: Access::Read,
