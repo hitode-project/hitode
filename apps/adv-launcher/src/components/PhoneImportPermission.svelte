@@ -288,6 +288,34 @@
   .acts .quiet:focus-visible {
     outline-offset: 2px;
   }
+  /* Beside the sidebar of a wide window, the sheet becomes a centered dialog
+     whose scrim covers the whole window, not just the page's column. */
+  :global(.column) .layer {
+    position: fixed;
+    z-index: 50;
+    display: grid;
+    place-items: center;
+  }
+  :global(.column) .sheet {
+    position: relative;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    width: min(440px, calc(100% - 48px));
+    padding: 32px 28px 20px;
+    border-radius: 24px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.22);
+    animation: rise 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  :global(.column) .grab {
+    display: none;
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+  }
   @keyframes up {
     from {
       transform: translateY(100%);

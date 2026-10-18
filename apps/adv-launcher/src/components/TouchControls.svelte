@@ -131,10 +131,14 @@
   });
 
   const bars = $derived(arrangement.kind === "side" ? arrangement : null);
-  const keys = $derived(arrangement.kind === "side" && !arrangement.wide ? compact : full);
+  /** Two columns of keys fit a tablet's letterbox even without labels. */
+  const two = $derived(!!bars && (bars.wide || bars.right.width >= 96));
+  const keys = $derived(bars && !two ? compact : full);
   const keyH = $derived(
-    bars ? keyHeight(Math.min(bars.left.height, bars.right.height), bars.wide ? 5 : keys.length, 50) : 44,
+    bars ? keyHeight(Math.min(bars.left.height, bars.right.height), two ? 5 : keys.length, 50) : 44,
   );
+  /** A tablet's tall letterbox: the groups sit where the thumbs rest, not at the top. */
+  const tall = $derived(!!bars && Math.min(bars.left.height, bars.right.height) >= 560);
   const style = (a: { x: number; y: number; width: number; height: number }) =>
     `left: ${a.x}px; top: ${a.y}px; width: ${a.width}px; height: ${a.height}px`;
 </script>
@@ -167,7 +171,7 @@
 
 {#if bars}
   {#if open}
-    <div class="column fade" class:tight={bars.left.width < 44} style={style(bars.left)}>
+    <div class="column fade" class:tight={bars.left.width < 44} class:middle={tall && !trackpad} style={style(bars.left)}>
       <div class="group" class:labels={bars.wide && !trackpad} {@attach region}>
         {#if trackpad}
           <button class="side-icon" aria-label={t("游戏库")} onclick={onlibrary}>{@render icon("library")}</button>
@@ -181,14 +185,14 @@
         <button class="big" {@attach region} {...hold({ kind: "mouse", right: false })}>{t("左键")}</button>
       {/if}
     </div>
-    <div class="column fade" class:tight={bars.right.width < 44} style={style(bars.right)}>
+    <div class="column fade" class:tight={bars.right.width < 44} class:middle={tall && !trackpad} style={style(bars.right)}>
       <div class="group" {@attach region}>
         <button class="hide" aria-label={t("收起")} onclick={toggleOpen}>{@render icon("hide")}</button>
         {#if trackpad}
           <button class="side-icon on" aria-label={t("触控板模式")} aria-pressed="true" onclick={toggleTrackpad}>{@render icon("pad")}</button>
           <button class="side-icon" aria-label={t("键盘")} onclick={onkeyboard}>{@render icon("keyboard")}</button>
         {:else}
-          <div class="keys" class:two={bars.wide}>
+          <div class="keys" class:two>
             {#each keys as key (key.label)}{@render keyButton(key, keyH)}{/each}
           </div>
         {/if}
@@ -263,6 +267,9 @@
     flex-direction: column;
     align-items: center;
     gap: 6px;
+  }
+  .column.middle {
+    justify-content: center;
   }
   .row {
     align-items: center;
