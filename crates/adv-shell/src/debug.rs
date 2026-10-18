@@ -17,6 +17,7 @@ use crate::window::WakeEvent;
 use adv_runtime::Engine;
 use adv_runtime::boot::Runtime;
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,7 @@ mod profile;
 /// Guest instructions a snapshot describes by form and code size.
 const HOT_INSTRUCTIONS: usize = 60;
 /// How long a socket request waits for a guest boundary.
+#[cfg(unix)]
 const BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames the timeline keeps: ten minutes at 60 fps.
 const TIMELINE_CAPACITY: usize = 36_000;
@@ -101,7 +103,9 @@ struct Shared {
     marks: Mutex<Vec<(u64, String)>>,
     snapshots: Mutex<VecDeque<(String, String)>>,
     profiler: Arc<profile::Profiler>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     requests: Mutex<mpsc::Sender<Request>>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     wake: WakeEvent,
     stopped: AtomicBool,
 }
@@ -588,13 +592,13 @@ fn symbol(pc: usize) -> Option<(String, String)> {
             return None;
         }
         let text = |p: *const libc::c_char| {
-            (!p.is_null())
-                .then(|| {
-                    unsafe { std::ffi::CStr::from_ptr(p) }
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default()
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
         };
         let image = text(info.dli_fname);
         let image = image.rsplit('/').next().unwrap_or_default().to_owned();
@@ -836,6 +840,7 @@ fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
 }
 
 /// Answers what this module records without the execution thread.
+#[cfg(unix)]
 fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<String, String>> {
     let seconds_back = |default: u64| {
         let seconds = args
@@ -909,6 +914,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
     })
 }
 
+#[cfg(unix)]
 const HELP: &str = "\
 answered at once: ping, help, info, timeline [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
@@ -976,6 +982,7 @@ fn connection(stream: std::os::unix::net::UnixStream, shared: &Shared) {
     }
 }
 
+#[cfg(unix)]
 fn answer(shared: &Shared, line: &str) -> Result<String, String> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or_default();

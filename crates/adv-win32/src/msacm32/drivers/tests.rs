@@ -247,7 +247,9 @@ fn driver_details_queries_sizes_encoding_and_protected_outputs() {
                 if written >= full as usize {
                     let name = if wide {
                         actual[40..104]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|b| u16::from_le_bytes([b[0], b[1]]))
                             .take_while(|u| *u != 0)
                             .map(|u| char::from_u32(u32::from(u)).unwrap())

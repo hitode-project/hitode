@@ -696,6 +696,10 @@ impl<'a> Loader<'a> {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "image placement and identity are passed together to the loader"
+    )]
     fn populate_image(
         &mut self,
         key: String,

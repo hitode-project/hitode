@@ -76,14 +76,18 @@ fn arrays(env: &Env<'_>, pointer: u32, count: u32, stride: u32) -> Result<Option
 }
 fn units(bytes: Vec<u8>) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect()
 }
 fn words(bytes: Vec<u8>) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect()
 }
 
@@ -122,8 +126,8 @@ fn placement(
         let Ok(bytes) = read(env, output, 36, true) else {
             return failure(env);
         };
-        for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(4)) {
-            *field = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (field, bytes) in fields.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
+            *field = u32::from_le_bytes(*bytes);
         }
         if fields[0] != 36 || fields[7] > 65536 {
             return failure(env);

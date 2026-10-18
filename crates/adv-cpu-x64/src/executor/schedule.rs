@@ -195,13 +195,12 @@ impl Executor {
             .iter()
             .filter(|(_, s)| pc.wrapping_sub(s.region.start) < s.region.len as u32)
             .min_by_key(|(start, _)| self.schedule.deferred.get(start).map(|w| w.born))
+            && let Some(waiting) = self.schedule.deferred.get_mut(&start)
         {
-            if let Some(waiting) = self.schedule.deferred.get_mut(&start) {
-                self.stats.compile_wait_stage_ns[0] += elapsed_ns;
-                waiting.units = waiting.units.saturating_add(u64::from(units));
-                self.stats.compilation_schedule.phases[phase(input.region.compile_strategy)]
-                    .interpreter_units[0] += u64::from(units);
-            }
+            self.stats.compile_wait_stage_ns[0] += elapsed_ns;
+            waiting.units = waiting.units.saturating_add(u64::from(units));
+            self.stats.compilation_schedule.phases[phase(input.region.compile_strategy)]
+                .interpreter_units[0] += u64::from(units);
         }
     }
     /// Fixed-size aggregates only. Live ages include unfinished requests rather

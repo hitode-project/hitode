@@ -208,13 +208,13 @@ impl Trace {
                         }
                     }
                 }
-                if let Ok(watch) = std::env::var("ADV_INTERP_TRACE_WATCH_DWORD") {
-                    if let Err(error) = config.set_watch(&watch) {
-                        eprintln!(
-                            "warning: interpreter instruction trace disabled: invalid watch DWORD: {error}"
-                        );
-                        return None;
-                    }
+                if let Ok(watch) = std::env::var("ADV_INTERP_TRACE_WATCH_DWORD")
+                    && let Err(error) = config.set_watch(&watch)
+                {
+                    eprintln!(
+                        "warning: interpreter instruction trace disabled: invalid watch DWORD: {error}"
+                    );
+                    return None;
                 }
                 Some(Box::new(Self::new(config)))
             }

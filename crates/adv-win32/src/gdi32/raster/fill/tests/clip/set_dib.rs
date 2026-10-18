@@ -1,6 +1,7 @@
 //! Authored native memory-DC oracle for scan-band uploads, origins and clips.
 use super::*;
 
+#[cfg(windows)]
 fn header(width: u32, height: i32) -> [u32; 10] {
     [40, width, height as u32, 0x0020_0001, 0, 0, 0, 0, 0, 0]
 }
@@ -373,7 +374,7 @@ fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_stora
         let pixels = m.cpu.read_u32(output).unwrap();
         let surface = m.ext.get::<SurfaceStore>().get(bitmap).unwrap().clone();
         assert_eq!(surface.format.bits(), bpp);
-        assert_eq!(surface.pitch, ((9 * bpp + 31) / 32) * 4);
+        assert_eq!(surface.pitch, (9 * bpp).div_ceil(32) * 4);
         let old = call(&mut m, data, "gdi32.dll!SelectObject", &[dc, bitmap]);
         assert_eq!(
             call(
@@ -450,12 +451,12 @@ fn indexed_dib_creation_tables_upload_readback_and_clipped_bits_share_real_stora
         m.cpu.read(pixels, &mut original).unwrap();
         if !(9 * bpp).is_multiple_of(8) {
             for y in 0..2 {
-                original[y * surface.pitch as usize + ((9 * bpp + 7) / 8) as usize - 1] &=
+                original[y * surface.pitch as usize + (9 * bpp).div_ceil(8) as usize - 1] &=
                     255 << (8 - (9 * bpp) % 8);
             }
         }
         // Padding is not part of the returned pixel range.
-        let bytes = ((9 * bpp + 7) / 8) as usize;
+        let bytes = (9 * bpp).div_ceil(8) as usize;
         for y in 0..2 {
             assert_eq!(
                 &actual[y * surface.pitch as usize..y * surface.pitch as usize + bytes],

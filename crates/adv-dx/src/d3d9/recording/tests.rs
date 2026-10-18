@@ -219,7 +219,7 @@ fn authored_recording_work_counts() {
     assert_eq!(f.finish(result), 0);
     let image = f.target(f.back).image;
     let pixels = f.pixels(&image);
-    assert!(pixels.chunks_exact(4).any(|p| p[0] != 0));
+    assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[0] != 0));
 }
 fn stats(f: &Fixture) -> Stats {
     f.m.ext.get::<State>().gpu.as_ref().unwrap().stats()
@@ -269,7 +269,13 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
     let locked = f.lock(system, 0, 0);
     let mut bytes = vec![0; 16 * 12 * 4];
     f.m.cpu.read(locked.pBits, &mut bytes).unwrap();
-    assert!(bytes.chunks_exact(4).any(|v| v[..3] == [64, 64, 64]));
+    assert!(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|v| v[..3] == [64, 64, 64])
+    );
     f.okay("IDirect3DSurface9::UnlockRect", &[system]);
     let default = f.surface(16, 12, 21, 0);
     let target = f.target(default);

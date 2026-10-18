@@ -469,6 +469,7 @@ impl FrameDamage {
     pub fn publication(&self) -> u64 {
         self.publication
     }
+    #[cfg(any(feature = "gpu", test))]
     fn push(&mut self, surface: u32, damage: Option<Rect>) {
         self.publication += 1;
         self.recent[(self.publication % 8) as usize] = (self.publication, surface, damage);
@@ -2779,7 +2780,9 @@ impl<P: Presenter> Surfaces<P> {
                 match (s.format, d.format) {
                     (PixelFormat::Bgr24, PixelFormat::Bgra32) => {
                         for (src, dst) in input
-                            .chunks_exact(3)
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
                             .zip(self.blit_row.as_chunks_mut::<4>().0)
                         {
                             *dst = [src[0], src[1], src[2], 0];

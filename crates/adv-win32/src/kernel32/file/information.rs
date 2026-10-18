@@ -130,7 +130,10 @@ fn get_file_information(env: &mut Env<'_>, handle: Handle, output: GuestPtr<u8>)
         }
     };
     let mut bytes = [0; INFORMATION_SIZE as usize];
-    for (field, output) in information.iter().zip(bytes.chunks_exact_mut(4)) {
+    for (field, output) in information
+        .iter()
+        .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
+    {
         output.copy_from_slice(&field.to_le_bytes());
     }
     if env.cpu.write(output.addr(), &bytes).is_err() {

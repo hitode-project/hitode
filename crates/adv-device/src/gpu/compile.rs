@@ -8,6 +8,7 @@ use std::sync::{
 use std::time::Instant;
 
 type Task = Box<dyn FnOnce() + Send>;
+type CompileTask<T> = Box<dyn FnOnce() -> Result<T, String> + Send>;
 const BYTES: usize = 32 * 1024 * 1024;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,7 +24,7 @@ impl CompileCounters {
 }
 struct Job<T> {
     result: OnceLock<Result<T, String>>,
-    run: Mutex<Option<Box<dyn FnOnce() -> Result<T, String> + Send>>>,
+    run: Mutex<Option<CompileTask<T>>>,
     counters: CompileCounters,
 }
 pub struct Compile<T>(Arc<Job<T>>);

@@ -1,6 +1,8 @@
 //! Authored private buffers; host Locked bits prove physical pins, not residency.
 use adv_abi::{ApiDiagnostics, Registry};
-use adv_cpu::backend::{Backend, Guest, GuestExt, Prot, asm::Asm};
+#[cfg(windows)]
+use adv_cpu::backend::Guest;
+use adv_cpu::backend::{Backend, GuestExt, Prot, asm::Asm};
 use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};

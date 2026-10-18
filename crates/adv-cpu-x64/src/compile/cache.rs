@@ -357,6 +357,7 @@ struct Declaration {
 struct Blob {
     id: usize,
     bytes: Vec<u8>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     unwind_end: u8,
     relocations: Vec<ModuleReloc>,
 }
@@ -768,10 +769,11 @@ fn kernel_index(name: &str) -> Option<usize> {
 
 fn finalize(module: &mut JITModule) -> Result<(), String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        module.finalize_definitions()
+        module
+            .finalize_definitions()
+            .map_err(|error| error.to_string())
     }))
     .map_err(|_| "native cache relocation publication rejected".to_string())?
-    .map_err(|error| error.to_string())
 }
 struct OwnedModule(Option<JITModule>);
 impl Drop for OwnedModule {

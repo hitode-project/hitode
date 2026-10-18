@@ -130,7 +130,9 @@ fn create(env: &mut Env<'_>, pointer: u32, count: i32, wide: bool) -> u32 {
         return error(env, 87);
     }
     let entries = bytes
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|bytes| {
             let flags = bytes[0] & 0x7f;
             let key = u16::from_le_bytes([bytes[2], bytes[3]]);
@@ -255,7 +257,9 @@ fn load(env: &mut Env<'_>, instance: u32, pointer: u32, wide: bool) -> u32 {
         return error(env, 13);
     }
     let entries = bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|bytes| Entry {
             flags: bytes[0] & 0x7f,
             key: u16::from_le_bytes([bytes[2], bytes[3]]),

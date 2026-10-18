@@ -6,13 +6,16 @@ use adv_os::{
     Heaps,
     com::{Com, Iid, QueryError},
 };
+#[cfg(feature = "gpu")]
 const IID: Iid = [
     8, 0xfb, 0xa5, 0x8b, 0x95, 0x51, 0xe2, 0x40, 0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 1, 2,
 ];
+#[cfg(feature = "gpu")]
 const INVALID: u32 = 0x8876086c;
 const OOM: u32 = 0x8007000e;
 struct Store {
     com: Com,
+    #[cfg(feature = "gpu")]
     table: u32,
 }
 struct Buffer {
@@ -38,6 +41,7 @@ pub(super) fn register(registry: &mut Registry) {
         });
     }
 }
+#[cfg(feature = "gpu")]
 fn alloc(env: &mut Env<'_>, bytes: &[u8]) -> Option<u32> {
     let h = env.ext.try_get_mut::<Heaps>()?;
     let p = h.alloc(
@@ -57,6 +61,7 @@ fn free(env: &mut Env<'_>, p: u32) {
     let h = env.ext.get_mut::<Heaps>();
     h.free(env.cpu, &mut env.sys.vm, h.process_heap, p);
 }
+#[cfg(feature = "gpu")]
 fn initialize(env: &mut Env<'_>) -> Option<()> {
     if env.ext.try_get::<Store>().is_some() {
         return Some(());
@@ -76,6 +81,7 @@ fn initialize(env: &mut Env<'_>) -> Option<()> {
 fn com(env: &Env<'_>) -> Option<Com> {
     Some(env.ext.try_get::<Store>()?.com)
 }
+#[cfg(feature = "gpu")]
 pub(super) fn create(env: &mut Env<'_>, bytes: &[u8], output: GuestPtr<u32>) -> u32 {
     if bytes.len() > 64 * 1024 * 1024 || initialize(env).is_none() {
         return OOM;

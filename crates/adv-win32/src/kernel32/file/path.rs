@@ -335,13 +335,11 @@ fn get_temp_file_name(
         format!("{norm_dir}\\{filename}")
     };
     let mut created = false;
-    if create_file {
-        if let Some(host) = w.vfs.write_path(&full) {
-            if let Some(parent) = host.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            created = std::fs::write(host, b"").is_ok();
+    if create_file && let Some(host) = w.vfs.write_path(&full) {
+        if let Some(parent) = host.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        created = std::fs::write(host, b"").is_ok();
     }
     if wide {
         let u: Vec<u16> = full.encode_utf16().collect();
@@ -396,11 +394,11 @@ fn create_a(
     attributes: GuestPtr<u8>,
 ) -> Result<Outcome, MemFault> {
     let path = ansi(env, path)?;
-    if !attributes.is_null() {
-        if let Err(code) = super::super::handle::security_inherit(env, attributes.addr()) {
-            set_last_error(env, code);
-            return Ok(Outcome::Return(0));
-        }
+    if !attributes.is_null()
+        && let Err(code) = super::super::handle::security_inherit(env, attributes.addr())
+    {
+        set_last_error(env, code);
+        return Ok(Outcome::Return(0));
     }
     Ok(create_directory(env, path))
 }
@@ -411,11 +409,11 @@ fn create_w(
     attributes: GuestPtr<u8>,
 ) -> Result<Outcome, MemFault> {
     let path = wide(env, path)?;
-    if !attributes.is_null() {
-        if let Err(code) = super::super::handle::security_inherit(env, attributes.addr()) {
-            set_last_error(env, code);
-            return Ok(Outcome::Return(0));
-        }
+    if !attributes.is_null()
+        && let Err(code) = super::super::handle::security_inherit(env, attributes.addr())
+    {
+        set_last_error(env, code);
+        return Ok(Outcome::Return(0));
     }
     Ok(create_directory(env, path))
 }

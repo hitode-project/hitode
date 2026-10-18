@@ -159,7 +159,7 @@ fn result(result: Result<Reply, i32>) -> Outcome {
     Outcome::Return(result.map_or_else(|v| v as u32, |_| 0))
 }
 fn units(env: &Env<'_>, pointer: u32, length: i32) -> Result<Vec<u16>, i32> {
-    if pointer == 0 || length < -1 || length > 16384 {
+    if pointer == 0 || !(-1..=16384).contains(&length) {
         return Err(INVALID);
     }
     if length == -1 {
@@ -172,16 +172,18 @@ fn units(env: &Env<'_>, pointer: u32, length: i32) -> Result<Vec<u16>, i32> {
         return Err(INVALID);
     }
     Ok(bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect())
 }
 fn rectangle(env: &Env<'_>, pointer: u32) -> Result<[f32; 4], i32> {
     let mut bytes = [0; 16];
     env.cpu.read(pointer, &mut bytes).map_err(|_| INVALID)?;
     let mut r = [0.; 4];
-    for (i, b) in bytes.chunks_exact(4).enumerate() {
-        r[i] = f32::from_le_bytes(b.try_into().unwrap());
+    for (i, b) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        r[i] = f32::from_le_bytes(*b);
     }
     if r.iter().any(|x| !x.is_finite()) {
         return Err(INVALID);
@@ -233,11 +235,7 @@ fn image_pixels(env: &Env<'_>, width: u32, height: u32, scan: Scan) -> Result<Ve
             if scan.format == 0xe200b {
                 let a = u32::from(dst[3]);
                 for v in &mut dst[..3] {
-                    *v = if a == 0 {
-                        0
-                    } else {
-                        (u32::from(*v) * 255 / a).min(255) as u8
-                    };
+                    *v = (u32::from(*v) * 255).checked_div(a).unwrap_or(0).min(255) as u8;
                 }
             }
         }

@@ -14,10 +14,13 @@ pub(super) struct Cache {
 /// Prebuild and first draw share the same device and shader-function cache.
 #[derive(Clone)]
 pub(in super::super) struct Compiler(Arc<Mutex<Builder>>);
+type ShaderFunctions = (std::sync::Weak<str>, [Object<dyn MTLFunction>; 2]);
+type DepthKey = (Option<Compare>, bool, Option<Stencil>);
+
 struct Builder {
     device: Object<dyn MTLDevice>,
-    functions: HashMap<u64, (std::sync::Weak<str>, [Object<dyn MTLFunction>; 2])>,
-    depth: HashMap<(Option<Compare>, bool, Option<Stencil>), Object<dyn MTLDepthStencilState>>,
+    functions: HashMap<u64, ShaderFunctions>,
+    depth: HashMap<DepthKey, Object<dyn MTLDepthStencilState>>,
 }
 impl Compiler {
     pub(super) fn new(device: Object<dyn MTLDevice>) -> Self {

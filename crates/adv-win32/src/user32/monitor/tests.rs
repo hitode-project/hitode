@@ -93,15 +93,19 @@ fn base_and_ex_layouts_share_screen_workarea_and_device_name_without_overwriting
         assert_eq!(last_error(&mut machine, None), 0x76543210);
         let raw = bytes(&machine, output);
         let words: Vec<_> = raw[..40]
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(words, [size, 0, 0, 1280, 720, 0, 0, 1280, 680, 1]);
         if size != 40 {
             if wide {
                 let name = raw[40..104]
-                    .chunks_exact(2)
-                    .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| u16::from_le_bytes(*bytes))
                     .take_while(|unit| *unit != 0)
                     .collect::<Vec<_>>();
                 assert_eq!(String::from_utf16(&name).unwrap(), r"\\.\DISPLAY1");

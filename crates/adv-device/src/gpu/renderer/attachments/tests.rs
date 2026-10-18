@@ -82,8 +82,10 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
     assert_eq!(gpu.stats().readbacks, before.readbacks);
     assert!(
         read(&mut gpu, &small)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [0, 0, 255, 128])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [0, 0, 255, 128])
     );
     // Deferred depth clears allocate no scratch before a draw attaches depth.
     assert!(gpu.attachment_scratch.is_none());
@@ -122,8 +124,10 @@ fn larger_depth_clear_preserves_outside_depth_and_stencil_across_target_switches
     assert_eq!(gpu.attachment_scratch.as_ref().map(|image| image.id), cache);
     assert!(
         read(&mut gpu, &small)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 255, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [255, 255, 0, 255])
     );
 }
 
@@ -168,8 +172,10 @@ fn padded_mip_draw_preserves_colour_reads_current_storage_and_reuses_one_scratch
     }
     assert!(
         read(&mut gpu, &base)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [0, 0, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [0, 0, 255, 255])
     );
     assert_eq!(gpu.attachment_scratch.as_ref().unwrap().id, id);
     let before = gpu.stats();
@@ -207,15 +213,19 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
     gpu.draw_programmable(&target, &draw, &state).unwrap();
     assert!(
         read(&mut gpu, &target)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [0, 255, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [0, 255, 0, 255])
     );
     gpu.clear(&target, None, Some(0.75)).unwrap();
     gpu.draw_programmable(&target, &draw, &state).unwrap();
     assert!(
         read(&mut gpu, &target)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 0, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [255, 0, 255, 255])
     );
     let id = gpu.attachment_scratch.as_ref().unwrap().id;
     let other = gpu
@@ -231,15 +241,19 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
     gpu.draw_programmable(&other, &draw, &other_state).unwrap();
     assert!(
         read(&mut gpu, &other)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 0, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [255, 0, 255, 255])
     );
     assert_ne!(gpu.attachment_scratch.as_ref().unwrap().id, id);
     assert_eq!(gpu.attachment_scratch.as_ref().unwrap().width, 10);
     assert!(
         read(&mut gpu, &target)
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 0, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&pixel| pixel == [255, 0, 255, 255])
     );
 }
 
@@ -289,7 +303,7 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     assert_eq!(gpu.stats().bind_group_creations, 2);
     assert_eq!(gpu.stats().pipeline_cache_hits, 63);
     let pixels = read(&mut gpu, &target);
-    for (i, pixel) in pixels.chunks_exact(4).enumerate() {
+    for (i, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
         let red = (i % 4) as f32 / 3.;
         let expected = [
             0.,
@@ -337,7 +351,9 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     assert_eq!(child.stats().submissions, 1);
     assert!(
         read(&mut gpu, &target)
-            .chunks_exact(4)
-            .all(|p| p == [0, 255, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&p| p == [0, 255, 0, 255])
     );
 }

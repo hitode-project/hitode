@@ -21,6 +21,10 @@ fn suspend(env: &mut Env<'_>, thread: Handle, previous: GuestPtr<u32>) -> Outcom
     crate::kernel32::native_suspend_thread(env, thread.0, previous.addr())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the guest API"
+)]
 fn create(
     env: &mut Env<'_>,
     output: GuestPtr<u32>,
@@ -61,6 +65,10 @@ fn exit(env: &mut Env<'_>, status: i32) -> Outcome {
     crate::kernel32::exit_thread(env, status as u32)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the guest API"
+)]
 fn rtl_create(
     env: &mut Env<'_>,
     process: Handle,

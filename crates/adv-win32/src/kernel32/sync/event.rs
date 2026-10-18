@@ -82,7 +82,9 @@ pub(super) fn attributes(env: &mut Env<'_>, pointer: u32, api: &str) -> Result<A
         .read(buffer, &mut bytes)
         .map_err(|_| ACCESS_VIOLATION)?;
     let units: Vec<_> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|word| u16::from_le_bytes([word[0], word[1]]))
         .collect();
     // These absolute directories are the supported virtual session's existing
@@ -227,7 +229,7 @@ pub(super) fn marshal(
         24,
         0,
         if key.is_some() { buffer + 32 } else { 0 },
-        u32::from(inherit) * 2 | u32::from(open_if) * 0x80,
+        (u32::from(inherit) * 2) | (u32::from(open_if) * 0x80),
         0,
         0,
     ];

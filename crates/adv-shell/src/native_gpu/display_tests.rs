@@ -129,7 +129,13 @@ fn shared_layer_preserves_rgb_independently_of_guest_alpha_and_output_color_spac
             } else {
                 reference = Some(output);
             }
-            assert!(output.chunks_exact(4).all(|pixel| pixel[3] == 255));
+            assert!(
+                output
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255)
+            );
         }
     }
 }

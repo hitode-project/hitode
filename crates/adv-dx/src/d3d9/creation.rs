@@ -86,7 +86,7 @@ fn set_dialogs(env: &mut Env<'_>, this: GuestPtr<()>, enable_dialogs: i32) -> u3
         && (p.Flags & 1 == 0
             || p.MultiSampleType != 0
             || p.SwapEffect != 1
-            || !matches!(p.BackBufferFormat, 22 | 24 | 23))
+            || !matches!(p.BackBufferFormat, 22..=24))
     {
         return INVALID;
     }

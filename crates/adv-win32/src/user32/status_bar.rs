@@ -158,16 +158,15 @@ fn proc(env: &mut Env<'_>) -> Outcome {
                 };
                 text
             };
-            if part == 0 {
-                if let Some(window) = env
+            if part == 0
+                && let Some(window) = env
                     .ext
                     .get::<Win32>()
                     .user
                     .windows
                     .get_mut(&mut env.sys.objects, &hwnd)
-                {
-                    window.text = text.clone();
-                }
+            {
+                window.text = text.clone();
             }
             if let Some(status) = state(env, hwnd) {
                 status.texts.insert(part, (text, kind));
@@ -207,8 +206,10 @@ fn proc(env: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(0);
             }
             let edges = bytes
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             if let Some(status) = state(env, hwnd) {
                 status.edges = edges;

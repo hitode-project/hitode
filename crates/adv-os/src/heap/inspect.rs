@@ -67,6 +67,10 @@ impl Heaps {
         Some(entries)
     }
     /// Encode the next x86 PROCESS_HEAP_ENTRY, including arena and free entries.
+    #[allow(
+        clippy::result_unit_err,
+        reason = "the guest API only distinguishes invalid heap from end of enumeration"
+    )]
     pub fn walk(
         &self,
         cpu: &dyn Guest,

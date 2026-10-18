@@ -138,8 +138,10 @@ fn packet(bytes: &[u8]) -> Result<Packet, (&'static str, i32, u32)> {
         return Err(invalid);
     }
     let name: Vec<_> = bytes[94..94 + length]
-        .chunks_exact(2)
-        .map(|unit| u16::from_le_bytes(unit.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|unit| u16::from_le_bytes(*unit))
         .collect();
     if String::from_utf16(&name).is_err() {
         return Err(("native directory name contains unpaired UTF-16", 42, 1113));

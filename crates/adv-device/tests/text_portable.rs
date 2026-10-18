@@ -353,7 +353,7 @@ fn authored_outline_gray_levels_mono_packing_and_transforms_are_real() {
             panic!("missing raster");
         };
         assert_eq!(bytes.len(), 12 * 28, "DWORD-aligned byte rows");
-        for row in bytes.chunks_exact(12) {
+        for row in bytes.as_chunks::<12>().0 {
             assert!(row[..10].iter().all(|&n| n == max));
             assert_eq!(row[10..], [0, 0]);
         }
@@ -366,7 +366,13 @@ fn authored_outline_gray_levels_mono_packing_and_transforms_are_real() {
         panic!("missing monochrome raster");
     };
     assert_eq!(bytes.len(), 4 * 28);
-    assert!(bytes.chunks_exact(4).all(|row| row == [0xff, 0xc0, 0, 0]));
+    assert!(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&row| row == [0xff, 0xc0, 0, 0])
+    );
     for format in [GlyphFormat::QuadraticOutline, GlyphFormat::CubicOutline] {
         let result = text.glyph(&font, glyph(b, format)).unwrap();
         let GlyphData::Outline(contours) = &result.data else {
@@ -1280,7 +1286,9 @@ fn host_smoothing_changes_paint_without_changing_outline_requests() {
         )
         .unwrap();
         let partial = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[0] > 0 && pixel[0] < 255);
         assert_eq!(partial, smooth);
         images.push(

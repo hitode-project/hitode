@@ -241,7 +241,7 @@ fn user_and_calendar_queries_match_handlers_and_decline_before_partial_writes() 
 fn string_length_leaves_return_zero_after_access_failure_and_preserve_last_error() {
     let (mut leaf, mut trap) = (machine(), machine());
     for m in [&mut leaf, &mut trap] {
-        m.cpu.write(DATA + 8190, &[b'x', b'y']).unwrap();
+        m.cpu.write(DATA + 8190, b"xy").unwrap();
         let mut env = Env {
             context: m.sys.current,
             cpu: &mut m.cpu,

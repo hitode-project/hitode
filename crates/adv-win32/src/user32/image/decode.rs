@@ -230,7 +230,7 @@ fn bitmap_size(bytes: &[u8], target_width: u32, target_height: u32) -> Option<Ic
             } else {
                 let index = match bits {
                     1 => (bytes[row + sx / 8] >> (7 - sx % 8)) & 1,
-                    4 => (bytes[row + sx / 2] >> if sx % 2 == 0 { 4 } else { 0 }) & 15,
+                    4 => (bytes[row + sx / 2] >> if sx.is_multiple_of(2) { 4 } else { 0 }) & 15,
                     _ => bytes[row + sx],
                 } as usize;
                 if index >= colors {

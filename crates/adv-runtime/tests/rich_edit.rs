@@ -48,8 +48,10 @@ fn rich_edit_classes_and_text_follow_module_references() {
         let actual = std::fs::read(data.join("overlay/rich-edit.bin")).unwrap();
         assert_eq!(actual.len(), expected.len(), "{backend}");
         for (index, (actual, expected)) in actual
-            .chunks_exact(4)
-            .zip(expected.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<4>().0.iter())
             .enumerate()
         {
             assert_eq!(actual, expected, "{backend}: scalar {index}");

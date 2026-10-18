@@ -507,9 +507,9 @@ fn strings(a: &mut CodeAssembler, rng: &mut Rng) {
     };
     let width = rng.below(3);
     match (rng.below(3), compare, width) {
-        (_, true, 0) if prefix % 2 == 0 => a.cmpsb(),
-        (_, true, 1) if prefix % 2 == 0 => a.cmpsw(),
-        (_, true, _) if prefix % 2 == 0 => a.cmpsd(),
+        (_, true, 0) if prefix.is_multiple_of(2) => a.cmpsb(),
+        (_, true, 1) if prefix.is_multiple_of(2) => a.cmpsw(),
+        (_, true, _) if prefix.is_multiple_of(2) => a.cmpsd(),
         (_, true, 0) => a.scasb(),
         (_, true, 1) => a.scasw(),
         (_, true, _) => a.scasd(),

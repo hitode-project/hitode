@@ -164,6 +164,10 @@ impl<'a> Arguments<'a> {
     pub fn new(cpu: &'a dyn Guest) -> Self {
         Self { cpu, word: 0 }
     }
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "each argument can have a different decoded type"
+    )]
     pub fn next<T: GuestArg>(&mut self) -> Result<T, MemFault> {
         T::decode(self)
     }

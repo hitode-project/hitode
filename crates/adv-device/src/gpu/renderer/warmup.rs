@@ -90,6 +90,10 @@ impl Warmup {
         warm.store = Some(store);
         warm
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     pub fn pipeline(
         &mut self,
         recipe: Recipe,
@@ -144,6 +148,10 @@ impl Warmup {
         }
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the operation takes explicit image layout and draw parameters"
+)]
 fn job(
     recipe: Recipe,
     context: &NativeContext,

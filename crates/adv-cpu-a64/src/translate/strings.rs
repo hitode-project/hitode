@@ -38,6 +38,7 @@ pub enum Kind {
 pub enum Rep {
     None,
     /// `rep`, or `repe` before a compare.
+    #[allow(clippy::enum_variant_names)] // The x86 prefix name.
     Rep,
     /// `repne` before a compare.
     Repne,

@@ -269,6 +269,10 @@ impl WindowPresenter {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     fn draw_view(
         &mut self,
         source: &wgpu::TextureView,
@@ -455,6 +459,10 @@ impl Compositor {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     fn compose_frame(
         &self,
         source: &wgpu::TextureView,
@@ -636,6 +644,10 @@ impl Compositor {
             submission,
         )
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     fn compose_view_region_sampled(
         &self,
         source: &wgpu::TextureView,
@@ -1977,9 +1989,9 @@ mod tests {
             let mut transfer = gpu.readback(&destination, None).unwrap();
             transfer.take_completion_job().unwrap()();
             let result = transfer.poll().unwrap().unwrap();
-            assert!(result.chunks_exact(4).all(|p| p[3] == 255));
-            assert!(result.chunks_exact(4).any(|p| p[0] > 100));
-            assert!(result.chunks_exact(4).any(|p| p[0] < 80));
+            assert!(result.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+            assert!(result.as_chunks::<4>().0.iter().any(|p| p[0] > 100));
+            assert!(result.as_chunks::<4>().0.iter().any(|p| p[0] < 80));
             assert_ne!(
                 &result[..4],
                 &result[result.len() - 4..],

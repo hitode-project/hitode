@@ -175,8 +175,10 @@ fn glyphs(
         }
         Some(
             bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes(pair.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect::<Vec<_>>(),
         )
     };

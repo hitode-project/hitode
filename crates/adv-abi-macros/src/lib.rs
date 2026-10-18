@@ -284,6 +284,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         (quote!(), quote!(None))
     };
     Ok(quote! {
+        #[allow(clippy::too_many_arguments, reason = "the parameters match the guest ABI")]
         #function
         #leaf_function
         const _: () = {

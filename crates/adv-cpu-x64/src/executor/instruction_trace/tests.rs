@@ -1,3 +1,6 @@
+// These vectors contain address ranges, not the elements of each range.
+#![allow(clippy::single_range_in_vec_init)]
+
 use super::*;
 use crate::{Executor, WRITE};
 use serde_json::Value;

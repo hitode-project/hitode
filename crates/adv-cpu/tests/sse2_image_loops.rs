@@ -111,7 +111,7 @@ fn words(values: [i16; 8]) -> [u8; 16] {
 
 #[test]
 fn psrad_counts_use_the_full_low_quadword_and_saturate_at_31() {
-    let values = [i32::MIN, -0x1234_567, 0x7654_3210, i32::MAX];
+    let values = [i32::MIN, -0x0123_4567, 0x7654_3210, i32::MAX];
     let counts = [0u64, 1, 31, 32, 255, 256, 1 << 32, u64::MAX];
     for strategy in STRATEGIES {
         for form in 0..3 {

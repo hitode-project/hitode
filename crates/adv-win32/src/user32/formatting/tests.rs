@@ -108,8 +108,10 @@ fn result<B: Backend>(machine: &Machine<B>, count: usize, unicode: bool) -> Stri
     if unicode {
         String::from_utf16(
             &bytes
-                .chunks_exact(2)
-                .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| u16::from_le_bytes(*bytes))
                 .collect::<Vec<_>>(),
         )
         .unwrap()

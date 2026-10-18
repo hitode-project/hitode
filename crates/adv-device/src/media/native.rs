@@ -385,8 +385,10 @@ impl Native {
             }
             let count = pcm.samples() * usize::from(channels);
             let samples = pcm.data(0)[skip * usize::from(channels) * 4..count * 4]
-                .chunks_exact(4)
-                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_ne_bytes(*v))
                 .collect();
             self.audio_out.push(AudioFrame {
                 pts_us: pts + skip as u64 * 1_000_000 / u64::from(rate),

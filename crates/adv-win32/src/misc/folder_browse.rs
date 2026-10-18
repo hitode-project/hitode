@@ -394,10 +394,10 @@ fn browse(env: &mut Env<'_>, info: u32, wide: bool) -> Outcome {
     let current = root
         .clone()
         .unwrap_or_else(|| super::special_folder(env.ext.get::<Win32>(), 0).unwrap());
-    if root.is_none() {
-        if let Some(host) = env.ext.get::<Win32>().vfs.write_path(&current) {
-            let _ = std::fs::create_dir_all(host);
-        }
+    if root.is_none()
+        && let Some(host) = env.ext.get::<Win32>().vfs.write_path(&current)
+    {
+        let _ = std::fs::create_dir_all(host);
     }
     let mut b = Browse {
         ticket: 0,

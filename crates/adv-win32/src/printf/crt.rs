@@ -450,10 +450,10 @@ fn render<T: Unit>(
                         _ => magnitude.to_string(),
                     }
                 };
-                if let Some(p) = precision {
-                    if digits.len() < p {
-                        digits = "0".repeat(p - digits.len()) + &digits;
-                    }
+                if let Some(p) = precision
+                    && digits.len() < p
+                {
+                    digits = "0".repeat(p - digits.len()) + &digits;
                 }
                 if alternate && conversion == b'o' && !digits.starts_with('0') {
                     digits.insert(0, '0');

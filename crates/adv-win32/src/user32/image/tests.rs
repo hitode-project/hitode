@@ -29,7 +29,10 @@ fn dib(size: u32, pixel: [u8; 4]) -> Vec<u8> {
     put32(&mut bytes, 8, size * 2);
     put16(&mut bytes, 12, 1);
     put16(&mut bytes, 14, 32);
-    for p in bytes[40..(40 + size * size * 4) as usize].chunks_exact_mut(4) {
+    for p in bytes[40..(40 + size * size * 4) as usize]
+        .as_chunks_mut::<4>()
+        .0
+    {
         p.copy_from_slice(&pixel);
     }
     bytes
@@ -655,7 +658,14 @@ fn load_icon_module_decodes_default_size_shares_resource_cache_and_checks_names_
             let image = test.image(result);
             // Guest SM_CXICON/SM_CYICON are 32; native host DPI is independent.
             assert_eq!((image.width, image.height), (32, 32));
-            assert!(image.pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+            assert!(
+                image
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|&p| p == [255, 0, 0, 255])
+            );
             assert!(image.mask.iter().all(|&p| p == 0));
         }
         for (result, last_error, expected) in failures {

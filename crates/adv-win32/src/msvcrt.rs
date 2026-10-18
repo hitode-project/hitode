@@ -681,10 +681,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "time" | "_time32" => {
             let ft = crate::kernel32::filetime_now(e);
             let unix_sec = (ft.saturating_sub(116_444_736_000_000_000) / 10_000_000) as u32;
-            if a != 0 {
-                if let Err(error) = e.cpu.write_u32(a, unix_sec) {
-                    return Outcome::Fail(error.to_string());
-                }
+            if a != 0
+                && let Err(error) = e.cpu.write_u32(a, unix_sec)
+            {
+                return Outcome::Fail(error.to_string());
             }
             unix_sec
         }
@@ -1299,11 +1299,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write(dest, &[0, 0]);
                 return Outcome::Return(34);
             }
-            for i in 0..copy_len {
-                let _ = e.cpu.write(
-                    dest.wrapping_add((i * 2) as u32),
-                    &src_units[i].to_le_bytes(),
-                );
+            for (i, unit) in src_units.iter().take(copy_len).enumerate() {
+                let _ = e
+                    .cpu
+                    .write(dest.wrapping_add((i * 2) as u32), &unit.to_le_bytes());
             }
             let _ = e
                 .cpu
@@ -1334,11 +1333,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write(dest, &[0, 0]);
                 return Outcome::Return(34);
             }
-            for i in 0..src_units.len() {
-                let _ = e.cpu.write(
-                    dest.wrapping_add((i * 2) as u32),
-                    &src_units[i].to_le_bytes(),
-                );
+            for (i, unit) in src_units.iter().enumerate() {
+                let _ = e
+                    .cpu
+                    .write(dest.wrapping_add((i * 2) as u32), &unit.to_le_bytes());
             }
             let _ = e
                 .cpu
@@ -1378,10 +1376,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write(dest, &[0, 0]);
                 return Outcome::Return(34);
             }
-            for i in 0..src_units.len() {
+            for (i, unit) in src_units.iter().enumerate() {
                 let _ = e.cpu.write(
                     dest.wrapping_add(((dest_len + i) * 2) as u32),
-                    &src_units[i].to_le_bytes(),
+                    &unit.to_le_bytes(),
                 );
             }
             let _ = e.cpu.write(

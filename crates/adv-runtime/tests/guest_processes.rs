@@ -91,8 +91,10 @@ fn isolated_processes_match_windows_and_survive_loader_exit() {
                 .unwrap_or_else(|e| panic!("{name} {file}: {e}; {:?}", runtime.process_statuses()));
             let words = |bytes: &[u8]| {
                 bytes
-                    .chunks_exact(4)
-                    .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| u32::from_le_bytes(*v))
                     .collect::<Vec<_>>()
             };
             assert_eq!(words(&actual), words(expected), "{name} {file}");

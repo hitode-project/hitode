@@ -58,11 +58,11 @@ fn inside(env: &Env<'_>, track: Tracking) -> bool {
     }
     let (x, y) = u.client_origin(&env.sys.objects, track.hwnd);
     let (width, height) = w.client_size();
-    let client = i64::from(u.cursor_pos.0) >= i64::from(x)
+
+    i64::from(u.cursor_pos.0) >= i64::from(x)
         && i64::from(u.cursor_pos.1) >= i64::from(y)
         && i64::from(u.cursor_pos.0) < i64::from(x) + i64::from(width)
-        && i64::from(u.cursor_pos.1) < i64::from(y) + i64::from(height);
-    client
+        && i64::from(u.cursor_pos.1) < i64::from(y) + i64::from(height)
 }
 
 fn leave(env: &mut Env<'_>, track: Tracking) {
@@ -102,10 +102,10 @@ pub(super) fn poll(env: &mut Env<'_>) {
             if track.due_us.is_some_and(|due| now >= due) {
                 let u = user(env);
                 let buttons = u32::from(u.keys[1] & 0x80 != 0)
-                    | u32::from(u.keys[2] & 0x80 != 0) * 2
-                    | u32::from(u.keys[0x10] & 0x80 != 0) * 4
-                    | u32::from(u.keys[0x11] & 0x80 != 0) * 8
-                    | u32::from(u.keys[4] & 0x80 != 0) * 16;
+                    | (u32::from(u.keys[2] & 0x80 != 0) * 2)
+                    | (u32::from(u.keys[0x10] & 0x80 != 0) * 4)
+                    | (u32::from(u.keys[0x11] & 0x80 != 0) * 8)
+                    | (u32::from(u.keys[4] & 0x80 != 0) * 16);
                 let (x, y) = u.client_origin(&env.sys.objects, track.hwnd);
                 track.flags &= !HOVER;
                 track.due_us = None;

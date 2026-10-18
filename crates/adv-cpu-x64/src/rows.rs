@@ -359,12 +359,12 @@ fn admission(
     {
         return false;
     }
-    for index in 0..8 {
+    for (index, &delta) in deltas.iter().enumerate() {
         if descriptor.inductions & (1 << index) == 0 || index == descriptor.inner_counter {
             continue;
         }
         let first = i128::from(state.regs[index]);
-        let last = first + i128::from(deltas[index]) * i128::from(rows - 1);
+        let last = first + i128::from(delta) * i128::from(rows - 1);
         let inner = i128::from(descriptor.inner_steps[index]) * i128::from(width);
         if [first, last, first + inner, last + inner]
             .iter()
@@ -1301,8 +1301,10 @@ mod tests {
 
     #[test]
     fn deferred_emms_is_cleared_by_an_early_mmx_row_in_both_completion_orders() {
-        let mut initial = CpuState::default();
-        initial.mmx_mode = 2;
+        let initial = CpuState {
+            mmx_mode: 2,
+            ..CpuState::default()
+        };
         let mut early = initial.clone();
         early.mmx[0] = 7;
         early.mmx_mode = 5 | (1 << 8);

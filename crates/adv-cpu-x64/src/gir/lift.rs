@@ -549,6 +549,8 @@ impl Builder<'_> {
             );
         }
     }
+    // The arguments are the fields of the GIR Flags operation.
+    #[allow(clippy::too_many_arguments)]
     fn flags(
         &mut self,
         kind: FlagKind,

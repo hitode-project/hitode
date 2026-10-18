@@ -867,7 +867,9 @@ pub(super) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFaul
     let mut bytes = vec![0; length as usize];
     env.cpu.read(address, &mut bytes)?;
     let words: Vec<_> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     if words.contains(&0) {
@@ -1009,13 +1011,12 @@ fn write_modules(
     handles: &[u32],
 ) -> Outcome {
     let needed = (handles.len() as u32).saturating_mul(4);
-    if lpcb_needed != 0 {
-        if adv_abi::guest::check_range(env.cpu, lpcb_needed, 4, Prot::WRITE).is_err()
-            || env.cpu.write_u32(lpcb_needed, needed).is_err()
-        {
-            set_last_error(env, 998); // ERROR_NOACCESS
-            return Outcome::Return(0);
-        }
+    if lpcb_needed != 0
+        && (adv_abi::guest::check_range(env.cpu, lpcb_needed, 4, Prot::WRITE).is_err()
+            || env.cpu.write_u32(lpcb_needed, needed).is_err())
+    {
+        set_last_error(env, 998); // ERROR_NOACCESS
+        return Outcome::Return(0);
     }
     let count = (cb / 4).min(handles.len() as u32) as usize;
     if count > 0 && lph_module != 0 {

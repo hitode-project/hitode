@@ -30,6 +30,8 @@ pub struct Session {
     #[cfg(target_os = "macos")]
     timer: CFRetained<CFRunLoopTimer>,
 }
+type OnFinished = Box<dyn FnOnce(Result<Finished, String>)>;
+
 struct Driver {
     #[cfg(mobile)]
     main_loop: RefCell<Option<platform::MainLoop>>,
@@ -41,7 +43,7 @@ struct Driver {
     pending: RefCell<Option<Result<Finished, String>>>,
     execution: RefCell<Option<std::thread::JoinHandle<()>>>,
     service: RefCell<adv_sync::background::Service>,
-    on_finished: RefCell<Option<Box<dyn FnOnce(Result<Finished, String>)>>>,
+    on_finished: RefCell<Option<OnFinished>>,
     #[cfg(target_os = "macos")]
     timer: RefCell<Option<CFRetained<CFRunLoopTimer>>>,
     wake: WakeEvent,
@@ -462,10 +464,10 @@ impl Driver {
         // Retires guest menus and dialogs unless a nested loop still holds them.
         #[cfg(target_os = "macos")]
         drop(self.projection.borrow_mut().take());
-        if let Some(execution) = self.execution.borrow_mut().take() {
-            if execution.join().is_err() {
-                result = Err("execution worker panicked".into());
-            }
+        if let Some(execution) = self.execution.borrow_mut().take()
+            && execution.join().is_err()
+        {
+            result = Err("execution worker panicked".into());
         }
         self.service.borrow_mut().shutdown();
         if let Some(callback) = self.on_finished.borrow_mut().take() {
@@ -499,14 +501,14 @@ impl Driver {
             other => other,
         };
         #[cfg(target_os = "macos")]
-        if let Some(timer) = self.timer.borrow().as_ref() {
-            if timer.is_valid() {
-                let date = next.map_or(f64::MAX, |next| {
-                    CFAbsoluteTimeGetCurrent()
-                        + next.saturating_duration_since(Instant::now()).as_secs_f64()
-                });
-                timer.set_next_fire_date(date);
-            }
+        if let Some(timer) = self.timer.borrow().as_ref()
+            && timer.is_valid()
+        {
+            let date = next.map_or(f64::MAX, |next| {
+                CFAbsoluteTimeGetCurrent()
+                    + next.saturating_duration_since(Instant::now()).as_secs_f64()
+            });
+            timer.set_next_fire_date(date);
         }
     }
 }

@@ -83,7 +83,10 @@ fn main() {
             .unwrap();
         let rect = surfaces[src].rect();
         let source = surfaces[src].pixels as usize;
-        for p in memory.0[source..source + (w * h * 4) as usize].chunks_exact_mut(4) {
+        for p in memory.0[source..source + (w * h * 4) as usize]
+            .as_chunks_mut::<4>()
+            .0
+        {
             p.copy_from_slice(&[255, 0, 255, 0]);
         }
         let (ms, allocations) = measure(
@@ -126,8 +129,10 @@ fn main() {
             surfaces
                 .presenter
                 .bgra
-                .chunks_exact(4)
-                .all(|p| p == [255, 0, 255, 0])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|&p| p == [255, 0, 255, 0])
         );
         println!("present_565,{w}x{h},{ms:.4},{allocations}");
         surfaces.set_deferred_presentation(true).unwrap();
@@ -147,8 +152,10 @@ fn main() {
             surfaces
                 .presenter
                 .bgra
-                .chunks_exact(4)
-                .all(|p| p == [255, 0, 255, 0])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|&p| p == [255, 0, 255, 0])
         );
         println!("defer_565,{w}x{h},{ms:.4},{allocations}");
     }

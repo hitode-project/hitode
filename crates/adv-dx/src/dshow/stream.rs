@@ -434,11 +434,11 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
         let deadline = env.sys.clock.now_us() + POLL_US;
         return wait(env, id, Some(deadline));
     }
-    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>()) {
-        if !sound.audio.end_pcm(stream) {
-            let deadline = env.sys.clock.now_us() + POLL_US;
-            return wait(env, id, Some(deadline));
-        }
+    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
+        && !sound.audio.end_pcm(stream)
+    {
+        let deadline = env.sys.clock.now_us() + POLL_US;
+        return wait(env, id, Some(deadline));
     }
     let s = session(env, id);
     s.ending = false;

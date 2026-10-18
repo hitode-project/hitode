@@ -77,13 +77,15 @@ enum Phase {
     Spent,
 }
 
+type Pointer = (i32, (f32, f32), (f32, f32));
+
 #[derive(Default)]
 pub struct Gestures {
     mode: TouchMode,
     /// View pixels per point; zero means one.
     scale: f32,
     /// Live pointers with their landing and latest positions.
-    pointers: Vec<(i32, (f32, f32), (f32, f32))>,
+    pointers: Vec<Pointer>,
     phase: Phase,
     /// When the long press fires.
     long_press: Option<u64>,

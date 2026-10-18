@@ -377,15 +377,13 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
         && let Operation::Upload {
             resource, level, ..
         } = &p.operation
-    {
-        if let Some(Payload::Resource(r)) =
+        && let Some(Payload::Resource(r)) =
             com(env).get_identity_mut(&mut env.sys.objects, *resource)
-        {
-            if let Some(n) = level {
-                r.levels[*n as usize].lock = None
-            } else {
-                r.lock = None
-            }
+    {
+        if let Some(n) = level {
+            r.levels[*n as usize].lock = None
+        } else {
+            r.lock = None
         }
     }
     if lost {
@@ -640,30 +638,29 @@ pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
 pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
     if let Operation::Flush { owner, token, .. } | Operation::Present { owner, token, .. } =
         operation
-    {
-        if matches!(
+        && matches!(
             com(env).get_identity(&env.sys.objects, *owner),
             Some(Payload::Device(_))
-        ) {
-            let f = frame(env, *owner);
-            if f.active == Some(*token) {
-                f.active = None;
-                f.partial = true;
-                f.passes.truncate(f.commands.len());
-                f.last = None;
-                f.damage.invalidate();
-                f.rotate = false;
-                f.verify_image = None;
-                f.verdict = None;
-                f.presented = None;
-                if let Some(ticket) = f.readback.take() {
-                    ticket.cancel();
-                }
-                f.job = None;
-                let held = std::mem::take(&mut f.held_uploads);
-                for (resource, level) in held {
-                    clear_upload_lock(env, resource, level, true);
-                }
+        )
+    {
+        let f = frame(env, *owner);
+        if f.active == Some(*token) {
+            f.active = None;
+            f.partial = true;
+            f.passes.truncate(f.commands.len());
+            f.last = None;
+            f.damage.invalidate();
+            f.rotate = false;
+            f.verify_image = None;
+            f.verdict = None;
+            f.presented = None;
+            if let Some(ticket) = f.readback.take() {
+                ticket.cancel();
+            }
+            f.job = None;
+            let held = std::mem::take(&mut f.held_uploads);
+            for (resource, level) in held {
+                clear_upload_lock(env, resource, level, true);
             }
         }
     }
@@ -872,8 +869,10 @@ fn verify_pixels(
             && previous.1 == pixels.1
             && pixels
                 .2
-                .chunks_exact(4)
-                .zip(previous.2.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(previous.2.as_chunks::<4>().0.iter())
                 .enumerate()
                 .any(|(n, (a, b))| {
                     let (x, y) = (n as u32 % pixels.0, n as u32 / pixels.0);

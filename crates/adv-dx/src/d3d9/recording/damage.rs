@@ -139,10 +139,12 @@ fn vertex_input(
             for (component, bytes) in stream
                 .bytes
                 .get(start..start + a.format.size() as usize)?
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
             {
-                v[component] = f32::from_le_bytes(bytes.try_into().ok()?);
+                v[component] = f32::from_le_bytes(*bytes);
             }
             *input.v.get_mut(a.location as usize)? = v;
         }

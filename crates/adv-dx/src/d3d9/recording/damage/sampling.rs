@@ -129,9 +129,9 @@ fn coordinates(shader: &Shader, vertex: Option<&Shader>) -> Option<Vec<(usize, [
             });
         }
     }
-    for n in 0..2 {
-        for c in 0..4 {
-            inputs[n][c] = Some(Coordinate {
+    for (n, input) in inputs.iter_mut().take(2).enumerate() {
+        for (c, component) in input.iter_mut().enumerate() {
+            *component = Some(Coordinate {
                 varying: n,
                 component: c,
             });
@@ -368,7 +368,7 @@ fn vertices(
             .as_ref()
             .map_or(0, |p| p.vertex_count as usize)
     });
-    if count < 3 || count > 64 {
+    if !(3..=64).contains(&count) {
         return None;
     }
     let mut result = Vec::new();
@@ -429,21 +429,22 @@ fn vertices(
                 output.texcoords[i - 2]
             }
         });
-        if let (Some(vertex), Some(pixel)) = (vertex, pixel) {
-            if vertex.version.major == 3 && pixel.version.major == 3 {
-                for input in pixel
-                    .inputs
+        if let (Some(vertex), Some(pixel)) = (vertex, pixel)
+            && vertex.version.major == 3
+            && pixel.version.major == 3
+        {
+            for input in pixel
+                .inputs
+                .iter()
+                .filter(|d| d.register.kind == RegisterKind::Input)
+            {
+                let output_register = vertex
+                    .outputs
                     .iter()
-                    .filter(|d| d.register.kind == RegisterKind::Input)
-                {
-                    let output_register = vertex
-                        .outputs
-                        .iter()
-                        .find(|o| o.usage == input.usage && o.index == input.index)?;
-                    *varyings.get_mut(usize::from(input.register.index))? = *output
-                        .generic
-                        .get(usize::from(output_register.register.index))?;
-                }
+                    .find(|o| o.usage == input.usage && o.index == input.index)?;
+                *varyings.get_mut(usize::from(input.register.index))? = *output
+                    .generic
+                    .get(usize::from(output_register.register.index))?;
             }
         }
         result.push(Vertex { position, varyings });

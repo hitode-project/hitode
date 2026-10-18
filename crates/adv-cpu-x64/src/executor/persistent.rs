@@ -11,106 +11,6 @@ pub(super) struct Pending {
     next_try: Instant,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{EXEC, Memory, READ, Region, RunOutcome, WRITE};
-    use iced_x86::code_asm::{CodeAssembler, eax};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn fixture(value: u32) -> (Executor, Region) {
-        let mut code = CodeAssembler::new(32).unwrap();
-        code.mov(eax, value).unwrap();
-        code.jmp(0x3000u64).unwrap();
-        let bytes = code.assemble(0x1000).unwrap();
-        let mut memory = Memory::reserve(0, 0x4000).unwrap();
-        memory.map(0x1000, 4096, READ | WRITE | EXEC).unwrap();
-        memory.write(0x1000, &bytes).unwrap();
-        let mut executor = Executor::create(memory).unwrap();
-        executor.enable_auto_jit(true);
-        executor.set_async_compilation(true);
-        executor.set_tiered_compilation(false);
-        executor.register_code_cache_module(0x1000, 4096, crate::AotImage::identity(&bytes), true);
-        executor.state.eip = 0x1000;
-        let mut region = Region::new(0x1000, bytes.len());
-        region.compile_strategy = CompileStrategy::Fast;
-        (executor, region)
-    }
-
-    #[test]
-    fn persistent_hit_avoids_compilation_and_smc_invalidates_the_restored_entry() {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "adv-native-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("jit-code.bin");
-        let (mut first, region) = fixture(7);
-        let mut input = compile::Snapshot::capture(&region, &mut first.memory).unwrap();
-        first.locate_cache_input(&mut input);
-        let compiled = compile::compile_snapshot(&input).unwrap();
-        let cache = crate::code_cache::Cache::open(&path);
-        cache.store(&input, &compiled);
-        assert!(
-            cache.regions().is_empty(),
-            "unobserved AOT must remain private after restart"
-        );
-        cache.witness(&input);
-        cache.save().unwrap();
-        cache.save().unwrap(); // Atomic replacement also works with an existing file.
-        drop(compiled);
-        drop(first);
-
-        let (mut second, _) = fixture(7);
-        second.set_persistent_code_cache(&path).unwrap();
-        assert_eq!(second.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(second.state.regs[0], 7);
-        assert_eq!(second.stats.compilations, 0);
-        assert_eq!(second.stats.compile_requests, 0);
-        assert!(second.persistent_code_cache_json().contains("\"hits\":1"));
-        assert_eq!(second.stats.native_entries, 1);
-
-        let (mut full, cached_region) = fixture(7);
-        full.set_persistent_code_cache(&path).unwrap();
-        for index in 0..crate::compiler::CAPACITY {
-            full.pending_regions
-                .insert(0x2000 + index as u32, index as u64);
-        }
-        assert!(full.queue_region(cached_region).unwrap());
-        assert_eq!(full.stats.compile_requests, 0);
-        assert_eq!(full.pending_regions.len(), crate::compiler::CAPACITY);
-        assert!(full.code.compiled.contains_key(&region.start));
-        drop(full);
-
-        let (changed, _) = fixture(9);
-        let bytes = changed.memory.read(0x1000, region.len).unwrap().to_vec();
-        second.write(0x1000, &bytes).unwrap();
-        second.state.eip = 0x1000;
-        assert_eq!(second.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(second.state.regs[0], 9);
-        assert_eq!(second.stats.invalidations, 1);
-
-        let (mut mismatch, _) = fixture(9);
-        mismatch.set_persistent_code_cache(&path).unwrap();
-        assert_eq!(mismatch.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(mismatch.stats.native_entries, 0);
-        assert_eq!(mismatch.state.regs[0], 9);
-        std::fs::write(&path, b"interrupted archive").unwrap();
-        let (mut corrupted, _) = fixture(7);
-        corrupted.set_persistent_code_cache(&path).unwrap();
-        assert_eq!(corrupted.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
-        assert!(
-            corrupted
-                .persistent_code_cache_json()
-                .contains("\"corrupt\":1")
-        );
-        drop((cache, second, mismatch, corrupted));
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
-
 impl Executor {
     /// Enable a local cache before compilation starts. No environment selector
     /// is implicit in the CPU API; the frontend supplies its writable data root.
@@ -241,5 +141,105 @@ impl Executor {
             };
             self.cached_pending = Some(pending);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EXEC, Memory, READ, Region, RunOutcome, WRITE};
+    use iced_x86::code_asm::{CodeAssembler, eax};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn fixture(value: u32) -> (Executor, Region) {
+        let mut code = CodeAssembler::new(32).unwrap();
+        code.mov(eax, value).unwrap();
+        code.jmp(0x3000u64).unwrap();
+        let bytes = code.assemble(0x1000).unwrap();
+        let mut memory = Memory::reserve(0, 0x4000).unwrap();
+        memory.map(0x1000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x1000, &bytes).unwrap();
+        let mut executor = Executor::create(memory).unwrap();
+        executor.enable_auto_jit(true);
+        executor.set_async_compilation(true);
+        executor.set_tiered_compilation(false);
+        executor.register_code_cache_module(0x1000, 4096, crate::AotImage::identity(&bytes), true);
+        executor.state.eip = 0x1000;
+        let mut region = Region::new(0x1000, bytes.len());
+        region.compile_strategy = CompileStrategy::Fast;
+        (executor, region)
+    }
+
+    #[test]
+    fn persistent_hit_avoids_compilation_and_smc_invalidates_the_restored_entry() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "adv-native-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("jit-code.bin");
+        let (mut first, region) = fixture(7);
+        let mut input = compile::Snapshot::capture(&region, &mut first.memory).unwrap();
+        first.locate_cache_input(&mut input);
+        let compiled = compile::compile_snapshot(&input).unwrap();
+        let cache = crate::code_cache::Cache::open(&path);
+        cache.store(&input, &compiled);
+        assert!(
+            cache.regions().is_empty(),
+            "unobserved AOT must remain private after restart"
+        );
+        cache.witness(&input);
+        cache.save().unwrap();
+        cache.save().unwrap(); // Atomic replacement also works with an existing file.
+        drop(compiled);
+        drop(first);
+
+        let (mut second, _) = fixture(7);
+        second.set_persistent_code_cache(&path).unwrap();
+        assert_eq!(second.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(second.state.regs[0], 7);
+        assert_eq!(second.stats.compilations, 0);
+        assert_eq!(second.stats.compile_requests, 0);
+        assert!(second.persistent_code_cache_json().contains("\"hits\":1"));
+        assert_eq!(second.stats.native_entries, 1);
+
+        let (mut full, cached_region) = fixture(7);
+        full.set_persistent_code_cache(&path).unwrap();
+        for index in 0..crate::compiler::CAPACITY {
+            full.pending_regions
+                .insert(0x2000 + index as u32, index as u64);
+        }
+        assert!(full.queue_region(cached_region).unwrap());
+        assert_eq!(full.stats.compile_requests, 0);
+        assert_eq!(full.pending_regions.len(), crate::compiler::CAPACITY);
+        assert!(full.code.compiled.contains_key(&region.start));
+        drop(full);
+
+        let (changed, _) = fixture(9);
+        let bytes = changed.memory.read(0x1000, region.len).unwrap().to_vec();
+        second.write(0x1000, &bytes).unwrap();
+        second.state.eip = 0x1000;
+        assert_eq!(second.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(second.state.regs[0], 9);
+        assert_eq!(second.stats.invalidations, 1);
+
+        let (mut mismatch, _) = fixture(9);
+        mismatch.set_persistent_code_cache(&path).unwrap();
+        assert_eq!(mismatch.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(mismatch.stats.native_entries, 0);
+        assert_eq!(mismatch.state.regs[0], 9);
+        std::fs::write(&path, b"interrupted archive").unwrap();
+        let (mut corrupted, _) = fixture(7);
+        corrupted.set_persistent_code_cache(&path).unwrap();
+        assert_eq!(corrupted.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert!(
+            corrupted
+                .persistent_code_cache_json()
+                .contains("\"corrupt\":1")
+        );
+        drop((cache, second, mismatch, corrupted));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

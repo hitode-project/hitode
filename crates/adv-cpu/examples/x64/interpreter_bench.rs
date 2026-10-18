@@ -89,7 +89,7 @@ fn workload(name: &str, n: u32) -> Workload {
             a.dec(ecx).unwrap();
             a.jnz(top).unwrap();
             a.ret().unwrap();
-            let pixel = |i: u32| (u32::from(source[(i & 1023) as usize]) * 257 >> 3) ^ 0x12345678;
+            let pixel = |i: u32| ((u32::from(source[(i & 1023) as usize]) * 257) >> 3) ^ 0x12345678;
             output.resize(4096, 0);
             for i in 0..n.min(1024) {
                 output[i as usize * 4..i as usize * 4 + 4].copy_from_slice(&pixel(i).to_le_bytes());
@@ -123,7 +123,7 @@ fn workload(name: &str, n: u32) -> Workload {
             output = (0..width)
                 .map(|i| source[i].wrapping_add(source[i + width]) ^ source[i + 2 * width])
                 .collect();
-            for pair in output.chunks_exact_mut(2) {
+            for pair in output.as_chunks_mut::<2>().0 {
                 let value = u16::from_le_bytes([pair[0], pair[1]]) >> 1;
                 pair.copy_from_slice(&value.to_le_bytes());
             }

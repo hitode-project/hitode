@@ -265,7 +265,7 @@ impl Executor {
         // Every executor run calls this; read the clock on a fraction of them.
         let calls = self.aot.calls;
         self.aot.calls = calls.wrapping_add(1);
-        if calls % CLOCK_CALLS != 0 {
+        if !calls.is_multiple_of(CLOCK_CALLS) {
             return Ok(());
         }
         let now = Instant::now();

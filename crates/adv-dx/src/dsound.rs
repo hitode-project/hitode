@@ -1728,13 +1728,11 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                     } else {
                         false
                     };
-                    if should_free {
-                        if let Some(record) = s.storage_records.remove(&storage_id) {
-                            m.sys
-                                .vm
-                                .free(&mut m.cpu, record.addr)
-                                .map_err(|error| error.to_string())?;
-                        }
+                    if should_free && let Some(record) = s.storage_records.remove(&storage_id) {
+                        m.sys
+                            .vm
+                            .free(&mut m.cpu, record.addr)
+                            .map_err(|error| error.to_string())?;
                     }
                 }
             }

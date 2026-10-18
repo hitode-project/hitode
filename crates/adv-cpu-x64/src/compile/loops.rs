@@ -1275,7 +1275,8 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         };
-        let cases: [(Close, Result<(usize, i64, Bound, bool), &str>); 15] = [
+        type Expected = Result<(usize, i64, Bound, bool), &'static str>;
+        let cases: [(Close, Expected); 15] = [
             (
                 |a, top| {
                     a.inc(ebx).unwrap();

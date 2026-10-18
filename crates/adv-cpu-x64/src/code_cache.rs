@@ -183,10 +183,10 @@ impl Cache {
     }
 
     pub(crate) fn witness(&self, input: &Snapshot) {
-        if let Ok(key) = input.cache_key() {
-            if let Some(record) = self.records.lock().unwrap().get(&key) {
-                record.witnessed = true;
-            }
+        if let Ok(key) = input.cache_key()
+            && let Some(record) = self.records.lock().unwrap().get(&key)
+        {
+            record.witnessed = true;
         }
     }
 

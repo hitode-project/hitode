@@ -781,7 +781,7 @@ fn poll(e: &mut Env<'_>, id: u32, generation: u32, waiting: bool) -> Outcome {
             }
             if hr == 0 {
                 let event = e.cpu.read_u32(d.block + PARAMS).unwrap_or(0);
-                if matches!(event, 1 | 2 | 3) {
+                if matches!(event, 1..=3) {
                     let reason = if event == 1 {
                         1
                     } else if event == 2 {

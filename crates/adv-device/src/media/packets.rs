@@ -410,8 +410,10 @@ fn convert_audio(
         .map_or(pts, |clock| clock.stamp(pts, pcm.samples(), rate));
     let count = pcm.samples() * usize::from(channels);
     let samples = pcm.data(0)[..count * 4]
-        .chunks_exact(4)
-        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| f32::from_ne_bytes(*v))
         .collect();
     Ok(Some(AudioFrame {
         pts_us: pts,

@@ -486,8 +486,10 @@ fn surround(
         return Outcome::Return(2);
     }
     let colors: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     match object(env, handle.addr()).and_then(|o| o.execute(Op::Surround(&colors))) {
         Ok(Reply::Count(n)) => Outcome::Return(if count.write(env.cpu, n).is_ok() {

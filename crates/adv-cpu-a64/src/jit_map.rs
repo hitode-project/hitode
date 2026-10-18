@@ -7,6 +7,9 @@
 //! stretch of a unit and the names of the shared stubs. A cleared cache
 //! reuses addresses, so attribution takes the newest unit placed before the
 //! sample.
+// The translator needs these types on every host; native execution records units.
+#![cfg_attr(not(native), allow(dead_code))]
+
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};

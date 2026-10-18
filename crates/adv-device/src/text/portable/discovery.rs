@@ -29,7 +29,9 @@ fn metadata(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
     let count = u16::from_be_bytes([header[4], header[5]]) as usize;
     let directory = read(file, offset + 12, count * 16)?;
     let tables: Vec<_> = directory
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .filter(|entry| matches!(&entry[..4], b"name" | b"OS/2" | b"post"))
         .collect();
     if tables.len() > 3 {
@@ -68,7 +70,9 @@ fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
             12,
             count.checked_mul(4).ok_or(io::ErrorKind::InvalidData)?,
         )?
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|bytes| u32_at(bytes, 0))
         .collect()
     } else {

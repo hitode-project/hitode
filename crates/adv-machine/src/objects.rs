@@ -760,8 +760,10 @@ mod tests {
         assert_eq!(objects.strong_count(id), Some(u32::MAX));
         assert_eq!(objects.alias_count(Namespace::DEFAULT), 0);
 
-        let mut objects = Objects::default();
-        objects.next_object = u64::MAX;
+        let mut objects = Objects {
+            next_object: u64::MAX,
+            ..Objects::default()
+        };
         assert!(objects.insert_owned(1_u32).is_none());
         assert_eq!(objects.insert_host(2_u32), 0);
         assert_eq!(objects.object_count(), 0);

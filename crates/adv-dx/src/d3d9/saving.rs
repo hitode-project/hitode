@@ -59,7 +59,7 @@ pub(crate) fn image(
 
 fn encode_png(width: u32, height: u32, bgra: &[u8], alpha: bool) -> Option<Vec<u8>> {
     let mut pixels = Vec::with_capacity(bgra.len());
-    for p in bgra.chunks_exact(4) {
+    for p in bgra.as_chunks::<4>().0 {
         pixels.extend_from_slice(&[p[2], p[1], p[0]]);
         if alpha {
             pixels.push(p[3]);

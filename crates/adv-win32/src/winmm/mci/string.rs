@@ -174,7 +174,7 @@ fn plan(text: &str) -> Result<Plan, u32> {
         }
         "play" => {
             plan.message = 0x806;
-            plan.flags |= u32::from(from.is_some()) * 4 | u32::from(to.is_some()) * 8;
+            plan.flags |= (u32::from(from.is_some()) * 4) | (u32::from(to.is_some()) * 8);
             plan.fields = vec![Field::Word(from.unwrap_or(0)), Field::Word(to.unwrap_or(0))];
         }
         "stop" => plan.message = 0x808,

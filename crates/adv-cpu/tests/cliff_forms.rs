@@ -404,7 +404,7 @@ fn stack_all_faults_commit_no_partial_registers_or_bytes_then_restart() {
 
 #[test]
 fn release_integration_tests_enable_the_verifier_feature() {
-    assert!(cfg!(feature = "jit-verifier"));
+    const { assert!(cfg!(feature = "jit-verifier")) };
 }
 
 #[test]

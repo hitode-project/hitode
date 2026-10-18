@@ -40,8 +40,10 @@ fn iosurface_target_shares_completed_gpu_pixels_without_readback_or_copy() {
         for row in bytes.chunks_exact(surface.bytes_per_row()) {
             assert!(
                 row[..37 * 4]
-                    .chunks_exact(4)
-                    .all(|p| p == [255, 128, 64, 0])
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| *p == [255, 128, 64, 0])
             );
         }
         assert_eq!(

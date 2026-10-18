@@ -17,6 +17,8 @@ pub struct CodeLease {
 }
 
 impl CodePool {
+    // One free range that spans the whole pool.
+    #[allow(clippy::single_range_in_vec_init)]
     pub fn new(len: usize, alignment: usize) -> Result<Self, String> {
         if !alignment.is_power_of_two() || len == 0 || !len.is_multiple_of(alignment) {
             return Err("code pool size must be nonzero and aligned".into());

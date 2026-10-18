@@ -39,6 +39,7 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<ImageInfo> {
     image::inspect(bytes).map(api_info)
 }
 
+#[cfg(feature = "gpu")]
 pub(super) fn decode(bytes: &[u8], image: ImageInfo) -> Result<Vec<u8>> {
     let file_format = match image.file_format {
         0 => FileFormat::Bmp,

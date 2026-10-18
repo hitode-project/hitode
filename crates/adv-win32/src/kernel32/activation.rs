@@ -245,12 +245,11 @@ fn query(
     bytes: u32,
     required: GuestPtr<u32>,
 ) -> i32 {
-    if required.addr() != 0 {
-        if check_range(env.cpu, required.addr(), 4, Prot::WRITE).is_err()
-            || env.cpu.write_u32(required.addr(), 0).is_err()
-        {
-            return fail(env, 998);
-        }
+    if required.addr() != 0
+        && (check_range(env.cpu, required.addr(), 4, Prot::WRITE).is_err()
+            || env.cpu.write_u32(required.addr(), 0).is_err())
+    {
+        return fail(env, 998);
     }
     let image = flags & 24;
     // Native x86 additionally accepts the legacy process-default bit 1.

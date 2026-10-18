@@ -2620,9 +2620,10 @@ mod tests {
             memory
         }
         fn state() -> CpuState {
-            let mut state = CpuState::default();
-            state.eip = CODE;
-            state
+            CpuState {
+                eip: CODE,
+                ..CpuState::default()
+            }
         }
         fn watched(memory: &mut Memory) {
             let permissions = memory.native_permissions();

@@ -412,14 +412,13 @@ impl GameView {
         }
         input.display.setHidden(frame.is_none());
         input.frame.setHidden(frame.is_some());
-        if let Some(old) = std::mem::replace(&mut input.displayed, frame) {
-            if input
+        if let Some(old) = std::mem::replace(&mut input.displayed, frame)
+            && input
                 .displayed
                 .as_ref()
                 .is_none_or(|next| !next.image.shares_storage(&old.image))
-            {
-                input.retired.push(old);
-            }
+        {
+            input.retired.push(old);
         }
         CATransaction::commit();
         if !input.retired.is_empty() && input.retirement.is_none() {
@@ -698,7 +697,10 @@ impl Input {
             && view.window().is_some_and(|window| {
                 window.isKeyWindow()
                     && window.firstResponder().is_some_and(|responder| {
-                        Retained::as_ptr(&responder) as usize == view as *const GameView as usize
+                        std::ptr::eq(
+                            Retained::as_ptr(&responder).cast::<()>(),
+                            std::ptr::from_ref(view).cast::<()>(),
+                        )
                     })
             })
             && !self.cursor_visible_at(view, point);

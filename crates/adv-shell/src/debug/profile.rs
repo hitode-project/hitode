@@ -42,6 +42,7 @@ impl Profiler {
         profiler
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_hz(&self, hz: u32) {
         self.hz.store(hz.min(2000), Ordering::Release);
     }

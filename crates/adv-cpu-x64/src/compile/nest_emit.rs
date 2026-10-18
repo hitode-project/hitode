@@ -188,10 +188,10 @@ impl Emitter<'_> {
         // A first serial row can mutate a glue parameter before moving away
         // from it. Future rectangles alone cannot validate that old sample.
         let mut stable = self.b.ins().iconst(types::I8, 1);
-        for r in 0..8 {
+        for (r, &value) in current.iter().enumerate() {
             if hook.nest.invariant & (1 << r) != 0 {
                 let previous = self.b.use_var(hook.previous[r]);
-                let same = self.b.ins().icmp(IntCC::Equal, current[r], previous);
+                let same = self.b.ins().icmp(IntCC::Equal, value, previous);
                 stable = self.b.ins().band(stable, same);
             }
         }

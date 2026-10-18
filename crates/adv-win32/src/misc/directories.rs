@@ -19,7 +19,8 @@ fn prefixes(env: &Env<'_>, path: &str) -> Vec<String> {
     };
     let mut result: Vec<_> = full
         .char_indices()
-        .filter_map(|(at, c)| (c == '\\' && at > start).then(|| full[..at].to_owned()))
+        .filter(|&(at, c)| c == '\\' && at > start)
+        .map(|(at, _c)| full[..at].to_owned())
         .collect();
     let final_path = full.trim_end_matches('\\');
     if final_path.len() > start && result.last().is_none_or(|p| p != final_path) {

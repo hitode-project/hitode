@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 const CODE: u32 = 0x400000;
 const STACK: u32 = 0x550000;
+type Snapshot = (u128, Vec<u128>, adv_cpu::ArchitecturalState, Vec<u8>, u64);
+
 #[derive(Default)]
 struct Evidence {
     device: u32,
     ranges: Vec<(u32, usize)>,
-    snapshots: Vec<(u128, Vec<u128>, adv_cpu::ArchitecturalState, Vec<u8>, u64)>,
+    snapshots: Vec<Snapshot>,
     frames: Vec<adv_device::gpu::NativeFrame>,
 }
 fn capture(env: &mut Env<'_>) -> Outcome {

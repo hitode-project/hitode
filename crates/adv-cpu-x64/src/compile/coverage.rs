@@ -52,14 +52,6 @@ pub(super) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("ADV_LOOP_COVERAGE").is_some())
 }
 
-#[cfg(test)]
-pub(super) mod testing {
-    use std::cell::Cell;
-    thread_local! {
-        pub(in crate::compile) static FORCE: Cell<bool> = const { Cell::new(false) };
-    }
-}
-
 /// Records the loops of one compiled region and returns the address of each
 /// one's counters by header and latch.
 pub(super) fn record(
@@ -224,5 +216,13 @@ impl Emitter<'_> {
     pub(super) fn plan_counters(&self, index: usize) -> Option<usize> {
         let plan = &self.plans[index];
         self.coverage.get(&(plan.header, plan.latch)).copied()
+    }
+}
+
+#[cfg(test)]
+pub(super) mod testing {
+    use std::cell::Cell;
+    thread_local! {
+        pub(in crate::compile) static FORCE: Cell<bool> = const { Cell::new(false) };
     }
 }

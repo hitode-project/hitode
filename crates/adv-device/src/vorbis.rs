@@ -195,7 +195,7 @@ impl Stream {
         if count == 0 {
             return;
         }
-        assert!(count <= self.pcm.len() - self.pcm_at && count % self.channels == 0);
+        assert!(count <= self.pcm.len() - self.pcm_at && count.is_multiple_of(self.channels));
         self.pcm_at += count;
         self.pcm_offset += (count / self.channels) as u64;
     }

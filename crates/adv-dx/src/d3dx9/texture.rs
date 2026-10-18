@@ -3,12 +3,15 @@ use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 mod decode;
+#[cfg(any(feature = "gpu", test))]
 mod resize;
 
 const INVALID: u32 = 0x8876086c;
 const INVALID_DATA: u32 = 0x88760b59;
 const UNAVAILABLE: u32 = 0x8876086a;
+#[cfg(feature = "gpu")]
 const DEFAULT: u32 = u32::MAX;
+#[cfg(feature = "gpu")]
 const NONPOW2: u32 = u32::MAX - 1;
 
 #[repr(C)]

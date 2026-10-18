@@ -835,7 +835,7 @@ fn set_di_bits(
     let Some(src_row_bits) = src_w.checked_mul(src_bpp as u32) else {
         return Outcome::Return(0);
     };
-    let src_pitch = (src_row_bits + 31) / 32 * 4;
+    let src_pitch = src_row_bits.div_ceil(32) * 4;
     let Some(src_bytes) = src_pitch.checked_mul(count) else {
         return Outcome::Return(0);
     };
@@ -853,7 +853,7 @@ fn set_di_bits(
         let pal_addr = info.addr() + bi_size;
         let mut pal_bytes = vec![0u8; num_colors * 4];
         if env.cpu.read(pal_addr, &mut pal_bytes).is_ok() {
-            for (entry, chunk) in palette.iter_mut().zip(pal_bytes.chunks_exact(4)) {
+            for (entry, chunk) in palette.iter_mut().zip(pal_bytes.as_chunks::<4>().0.iter()) {
                 *entry = [chunk[0], chunk[1], chunk[2], chunk[3]];
             }
         }
@@ -920,8 +920,10 @@ fn set_di_bits(
             if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
                 for (s_pix, d_pix) in src_pixels
-                    .chunks_exact(3)
-                    .zip(dst_pixels.chunks_exact_mut(4))
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(dst_pixels.as_chunks_mut::<4>().0.iter_mut())
                 {
                     d_pix[0] = s_pix[0];
                     d_pix[1] = s_pix[1];
@@ -936,7 +938,10 @@ fn set_di_bits(
             let mut src_indices = vec![0u8; copy_w as usize];
             if env.cpu.read(src_line_addr, &mut src_indices).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
-                for (idx, d_pix) in src_indices.iter().zip(dst_pixels.chunks_exact_mut(4)) {
+                for (idx, d_pix) in src_indices
+                    .iter()
+                    .zip(dst_pixels.as_chunks_mut::<4>().0.iter_mut())
+                {
                     let pal = palette[*idx as usize];
                     d_pix[0] = pal[0];
                     d_pix[1] = pal[1];
@@ -953,8 +958,10 @@ fn set_di_bits(
                 let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
                 let is_565 = bi_compression == 3;
                 for (s_pix, d_pix) in src_words
-                    .chunks_exact(2)
-                    .zip(dst_pixels.chunks_exact_mut(4))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(dst_pixels.as_chunks_mut::<4>().0.iter_mut())
                 {
                     let w = u16::from_le_bytes([s_pix[0], s_pix[1]]);
                     let (r, g, b) = if is_565 {
@@ -984,8 +991,10 @@ fn set_di_bits(
             if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 3) as usize];
                 for (s_pix, d_pix) in src_pixels
-                    .chunks_exact(4)
-                    .zip(dst_pixels.chunks_exact_mut(3))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst_pixels.as_chunks_mut::<3>().0.iter_mut())
                 {
                     d_pix[0] = s_pix[0];
                     d_pix[1] = s_pix[1];
@@ -997,10 +1006,10 @@ fn set_di_bits(
         }
     }
 
-    if let Some(store) = env.ext.try_get_mut::<SurfaceStore>() {
-        if let Some(surf) = store.get_mut(hbm.0) {
-            surf.version = surf.version.wrapping_add(1);
-        }
+    if let Some(store) = env.ext.try_get_mut::<SurfaceStore>()
+        && let Some(surf) = store.get_mut(hbm.0)
+    {
+        surf.version = surf.version.wrapping_add(1);
     }
 
     Outcome::Return(actual_lines)

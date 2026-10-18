@@ -6,8 +6,11 @@ use adv_cpu::{
     backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
 };
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
+#[cfg(windows)]
 use adv_os::{Loader, Modules};
+#[cfg(windows)]
 use adv_pe::ImportName;
+#[cfg(windows)]
 use adv_unicorn::UnicornCpu;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -410,6 +413,7 @@ fn closed(env: &mut Env<'_>) -> Outcome {
         Outcome::Return(if override_status { 0xc0000022 } else { status })
     })
 }
+#[cfg(windows)]
 fn native<B: Backend>(machine: &mut Machine<B>, name: &str) -> u32 {
     let (win32, modules) = machine.ext.get2_mut::<Win32, Modules>();
     let id = modules.by_name("ntdll.dll").unwrap();

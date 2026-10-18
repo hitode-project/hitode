@@ -1400,7 +1400,7 @@ impl Gpu {
                 Some(line::Inclusive::List) => {
                     // Keep endpoint blending/depth/stencil in each segment's
                     // original order, including intersections with later lines.
-                    for (index, pair) in vertices.chunks_exact(2).enumerate() {
+                    for (index, pair) in vertices.as_chunks::<2>().0.iter().enumerate() {
                         let first = index as u32 * 2;
                         pass.set_pipeline(&pipeline);
                         pass.draw(first..first + 2, 0..1);
@@ -1584,13 +1584,12 @@ impl Gpu {
                 pending.flush_metal(SwitchReason::Copy);
                 pending.flush(&context.queue);
             }
-            if let Some(metal) = &mut pending.metal {
-                if metal.active() {
-                    metal.copy(self, source, rectangle, destination, x, y);
-                    self.stats.image_copy_bytes +=
-                        u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
-                    return self.check();
-                }
+            if let Some(metal) = &mut pending.metal
+                && metal.active()
+            {
+                metal.copy(self, source, rectangle, destination, x, y);
+                self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
+                return self.check();
             }
         }
         let mut encoder = self
