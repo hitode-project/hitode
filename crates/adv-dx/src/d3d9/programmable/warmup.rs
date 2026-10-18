@@ -1,5 +1,5 @@
 //! Speculative modules use the exact draw source builder. Unknown layouts are
-//! provisional; declarations and binding changes schedule their exact variants.
+//! provisional; declaration creation schedules its exact variant.
 use super::*;
 use adv_device::gpu::compile::Compile;
 
@@ -186,14 +186,20 @@ mod tests {
             assert_eq!(status, 0);
             pointers.push(output.read(env.cpu).unwrap());
         }
-        assert_eq!(
-            shaders::set_vertex(&mut env, GuestPtr::new(device), GuestPtr::new(pointers[0])),
-            0
-        );
-        assert_eq!(
-            shaders::set_pixel(&mut env, GuestPtr::new(device), GuestPtr::new(pointers[1])),
-            0
-        );
+        let prepared = env.ext.get::<State>().programs.warming.len();
+        for _ in 0..20 {
+            for (vertex, pixel) in [(0, 0), (pointers[0], 0), (pointers[0], pointers[1])] {
+                assert_eq!(
+                    shaders::set_vertex(&mut env, GuestPtr::new(device), GuestPtr::new(vertex)),
+                    0
+                );
+                assert_eq!(
+                    shaders::set_pixel(&mut env, GuestPtr::new(device), GuestPtr::new(pixel)),
+                    0
+                );
+            }
+        }
+        assert_eq!(env.ext.get::<State>().programs.warming.len(), prepared);
         let elements = [[0, 0, 0, 0, 2, 0, 0, 0], [255, 0, 0, 0, 17, 0, 0, 0]];
         let input = alloc(&mut env, 16).unwrap();
         env.cpu.write(input, &elements.concat()).unwrap();

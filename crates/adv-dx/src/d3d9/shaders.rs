@@ -459,7 +459,6 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     if new != old {
         release_binding(env, old);
     }
-    super::programmable::warm(env, this.addr(), None);
     0
 }
 fn get_shader(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>, stage: Stage) -> u32 {
