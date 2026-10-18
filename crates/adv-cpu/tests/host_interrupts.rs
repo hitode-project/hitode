@@ -1,5 +1,6 @@
 use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use iced_x86::{Decoder, DecoderOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -59,6 +60,7 @@ fn pending_notification_preserves_cpu_and_fuel_until_owner_clears_it() {
     }
 }
 
+// spec: A64-CTL-7, A64-CTL-8
 #[test]
 fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
     for mode in 0..3 {
@@ -83,6 +85,9 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
             a.emms().unwrap();
             a.ret().unwrap();
         });
+        let instructions = Decoder::with_ip(32, &first, u64::from(CODE), DecoderOptions::NONE)
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut programs = vec![(CODE, first)];
         if mode == 2 {
             programs.push((
@@ -115,13 +120,29 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
         support::x64_shape!(assert_eq!(m.state.fuel + m.stats.native_blocks, budget));
         support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
         let completed = m.state.regs[0];
-        assert_eq!(m.state.regs[1], 100_000_000 - completed);
-        assert_eq!(m.state.mmx[0].to_le_bytes(), [completed as u8; 8]);
+        // An instruction budget can stop between the loop's inc, paddb and dec.
+        let pc = u64::from(m.state.eip);
+        let pending_decrement =
+            u32::from([instructions[0].next_ip(), instructions[1].next_ip()].contains(&pc));
+        let pending_mmx = u32::from(pc == instructions[0].next_ip());
+        assert_eq!(m.state.regs[1], 100_000_000 - completed + pending_decrement);
+        assert_eq!(
+            m.state.mmx[0].to_le_bytes(),
+            [(completed - pending_mmx) as u8; 8]
+        );
         let context = m.save_context().unwrap();
         assert_eq!(context.cpu().x87.regs[0].significand(), m.state.mmx[0]);
-        assert!(m.state.eip == CODE || (mode == 2 && m.state.eip == TARGET));
+        support::x64_shape!(assert!(
+            m.state.eip == CODE || (mode == 2 && m.state.eip == TARGET)
+        ));
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| instruction.ip() == pc)
+                || (mode == 2 && m.state.eip == TARGET)
+        );
         flag.store(false, Ordering::Release);
-        m.state.regs[1] = 10;
+        m.state.regs[1] = 10 + pending_decrement;
         assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], completed + 10);
         assert_eq!(m.state.mmx[0].to_le_bytes(), [(completed + 10) as u8; 8]);
