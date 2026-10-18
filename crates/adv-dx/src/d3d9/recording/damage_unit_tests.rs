@@ -19,6 +19,12 @@ fn sequence(slot: u128, key: u128, r: Rect) -> Sequence {
             w: 100,
             h: 100,
         },
+        view: Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 100,
+        },
         shape: 1,
         slot,
         independent: true,
@@ -65,7 +71,7 @@ fn ordered_differences_include_old_new_and_removed_bounds_and_buffer_ages() {
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]
-fn missing_slots_overflow_shape_changes_and_area_threshold_force_full() {
+fn missing_slots_and_shape_changes_need_full_but_large_damage_keeps_its_bounds() {
     let r = Rect {
         x: 2,
         y: 3,
@@ -82,8 +88,9 @@ fn missing_slots_overflow_shape_changes_and_area_threshold_force_full() {
     h.next = sequence(1, 11, r);
     h.next.shape = 2;
     assert_eq!(h.advance(false).1.w, 100);
+    step(&mut h, 1, 11, r);
     let large = Rect { w: 80, h: 80, ..r };
-    assert_eq!(step(&mut h, 1, 12, large).1.w, 100);
+    assert_eq!(step(&mut h, 1, 12, large).1, large);
     let mut d = Damage::default();
     for x in 0..5 {
         d.add(Rect {

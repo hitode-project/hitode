@@ -185,6 +185,32 @@ pub(super) struct Prepared {
     pub bytes: usize,
     pub bounds: adv_device::surface::Rect,
 }
+impl Prepared {
+    pub(super) fn write_key(&self, content: Content, command: u128) -> u128 {
+        let Operation::Clear {
+            target,
+            rectangle,
+            color,
+            depth,
+            stencil,
+        } = &self.operation
+        else {
+            return command;
+        };
+        let component = match content.2 {
+            0 => hash((image(&target.image), color.map(|c| c.map(f64::to_bits)))),
+            1 => hash((
+                target.depth().map(|d| (d.width(), d.height(), d.format())),
+                depth.map(f32::to_bits),
+            )),
+            _ => hash((
+                target.depth().map(|d| (d.width(), d.height(), d.format())),
+                stencil,
+            )),
+        };
+        hash((content, rect(*rectangle), component))
+    }
+}
 pub(super) fn prepare(
     env: &mut Env<'_>,
     owner: Id,
@@ -226,7 +252,8 @@ pub(super) fn prepare(
                 write(bindings.output[0].ok_or(INVALID)?, full);
             }
             if d.depth_stencil.is_some() {
-                let full = full
+                let full = rectangle.x == 0
+                    && rectangle.y == 0
                     && target
                         .depth()
                         .is_some_and(|t| t.width() == rectangle.w && t.height() == rectangle.h);
@@ -325,8 +352,10 @@ pub(super) fn prepare(
                 write(bindings.output[0].ok_or(INVALID)?, false);
             }
             if d.depth_stencil.is_some() {
-                if state.depth.is_some() || state.stencil.is_some() {
+                if state.depth.is_some() {
                     reads.push(bindings.output[1].unwrap());
+                }
+                if state.stencil.is_some() {
                     reads.push(bindings.output[2].unwrap());
                 }
                 if state.depth.is_some() && state.depth_write {

@@ -217,7 +217,7 @@ pub(super) fn execute(
     }
     // This callback snapshots, never rotates the front: future partial COPYs
     // must retain pixels outside their destination rectangle.
-    (provider.present_copy)(env.ext, front, gpu)
+    (provider.present_copy)(env.ext, front, None, gpu)
 }
 
 pub(super) fn release(env: &mut Env<'_>, front: Option<u32>) {

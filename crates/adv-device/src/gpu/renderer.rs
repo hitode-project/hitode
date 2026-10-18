@@ -1110,11 +1110,7 @@ impl Gpu {
             image: target.image.clone(),
         };
         while let Err(old) = attachment.defer_clear(clear.clone()) {
-            let old_target = Target {
-                image: old.image,
-                depth: Some(attachment.clone()),
-            };
-            self.bounded_clear(&old_target, old.region, None, old.depth, old.stencil)?;
+            self.execute_depth_clear(attachment, old)?;
         }
         self.context
             .pending
@@ -1129,13 +1125,26 @@ impl Gpu {
             return Ok(());
         };
         if let Some(old) = attachment.take_partial_clear() {
-            let old_target = Target {
-                image: old.image,
-                depth: Some(attachment.clone()),
-            };
-            self.bounded_clear(&old_target, old.region, None, old.depth, old.stencil)?;
+            self.execute_depth_clear(attachment, old)?;
         }
         Ok(())
+    }
+
+    fn execute_depth_clear(
+        &mut self,
+        attachment: &Depth,
+        clear: DeferredClear,
+    ) -> Result<(), Error> {
+        let target = Target {
+            image: clear.image,
+            depth: Some(attachment.clone()),
+        };
+        // The queued region already includes the clip at admission. A later
+        // draw's smaller damage must not discard the older attachment writes.
+        let clip = self.clip.take();
+        let result = self.bounded_clear(&target, clear.region, None, clear.depth, clear.stencil);
+        self.clip = clip;
+        result
     }
 
     fn pipeline(&mut self, key: PipelineKey) -> Result<wgpu::RenderPipeline, Error> {

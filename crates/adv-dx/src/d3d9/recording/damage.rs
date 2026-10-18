@@ -175,6 +175,7 @@ impl Damage {
 struct Sequence {
     entries: Vec<(u128, Rect)>,
     full: Rect,
+    view: Rect,
     shape: u128,
     slot: u128,
     independent: bool,
@@ -228,16 +229,7 @@ impl History {
                 redraw.extend(d);
             }
         }
-        // Bounding-box replay is deliberately conservative, including its area threshold.
-        let limit = |r: Rect| {
-            if u64::from(r.w) * u64::from(r.h) * 2 > u64::from(next.full.w) * u64::from(next.full.h)
-            {
-                next.full
-            } else {
-                r
-            }
-        };
-        let result = (limit(changed.bound()), limit(redraw.bound()));
+        let result = (changed.bound(), redraw.bound());
         self.slots.insert(next.slot, self.serial);
         self.slots.retain(|_, n| self.serial - *n <= 8);
         std::mem::swap(&mut self.previous, &mut self.next);
@@ -265,18 +257,45 @@ impl Analysis {
             self.unsafe_order |= self.reads.contains(&k);
             let s = &mut self.histories.entry(k).or_default().next;
             self.unsafe_order |= !s.entries.is_empty() && s.slot != slot;
-            s.full = full(image);
-            s.shape = hash((rect(s.full), image.alpha_mode() as u8));
-            s.slot = slot;
-            if s.entries.is_empty() {
-                s.independent = overwrite && p.bounds == s.full;
-            }
-            // Preserve destination dependencies for accumulating blends/partial writes.
-            let key = hash((
-                command,
-                (!overwrite && !s.independent).then(|| contents.get(&k).copied().unwrap_or(0)),
+            let depth = match &p.operation {
+                Operation::Draw(d) => d.target.depth(),
+                Operation::Clear { target, .. } => target.depth(),
+                _ => None,
+            };
+            let bounds = if k.2 == 0 {
+                full(image)
+            } else {
+                let depth = depth.unwrap();
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: depth.width(),
+                    h: depth.height(),
+                }
+            };
+            s.full = bounds;
+            s.view = full(image);
+            s.shape = hash((
+                rect(bounds),
+                if k.2 == 0 {
+                    image.alpha_mode() as u8
+                } else {
+                    depth.unwrap().format() as u8
+                },
             ));
-            s.entries.push((key, p.bounds));
+            s.slot = slot;
+            let bounds = p.bounds.clipped(bounds);
+            if s.entries.is_empty() {
+                s.independent = overwrite && bounds == s.full;
+            }
+            // Only drawing can depend on the old values inside its write bounds.
+            // Clears and copies overwrite that region even when the attachment is larger.
+            let key = hash((
+                p.write_key(k, command),
+                (matches!(p.operation, Operation::Draw(_)) && !s.independent)
+                    .then(|| contents.get(&k).copied().unwrap_or(0)),
+            ));
+            s.entries.push((key, bounds));
         }
         self.reads
             .extend(p.reads.iter().copied().filter(|k| k.2 == 0));
@@ -286,29 +305,27 @@ impl Analysis {
             return;
         }
         self.epoch += 1;
-        for h in self
+        for (content, h) in self
             .histories
-            .values_mut()
-            .filter(|h| !h.next.entries.is_empty())
+            .iter_mut()
+            .filter(|(_, h)| !h.next.entries.is_empty())
         {
             let slot = h.next.slot;
-            let full = h.next.full;
+            let full = h.next.view;
             let (changed, redraw) =
                 h.advance(force || self.unsafe_order || h.seen + 1 != self.epoch);
+            let redraw = redraw.clipped(full);
             h.seen = self.epoch;
             self.clips
                 .entry(slot)
-                .and_modify(|r| {
-                    *r = r.union(redraw);
-                    if u64::from(r.w) * u64::from(r.h) * 2 > u64::from(full.w) * u64::from(full.h) {
-                        *r = full;
-                    }
-                })
+                .and_modify(|r| *r = r.union(redraw))
                 .or_insert(redraw);
-            self.changed
-                .entry(slot)
-                .and_modify(|r| *r = r.union(changed))
-                .or_insert(changed);
+            if content.2 == 0 {
+                self.changed
+                    .entry(slot)
+                    .and_modify(|r| *r = r.union(changed))
+                    .or_insert(changed);
+            }
         }
         self.planned = true;
     }

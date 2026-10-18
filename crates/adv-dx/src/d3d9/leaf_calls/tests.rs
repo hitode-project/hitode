@@ -36,7 +36,7 @@ fn capture(env: &mut Env<'_>) -> Outcome {
 fn fixture(traced: bool) -> Fixture {
     let mut f = Fixture::with_native(ObjectLimits::default(), true);
     let state = f.m.ext.get_mut::<State>();
-    state.provider.present_copy = |ext, surface, gpu| {
+    state.provider.present_copy = |ext, surface, _, gpu| {
         let image = (ext.get::<State>().provider.target)(ext, surface)
             .unwrap()
             .image;
@@ -47,7 +47,7 @@ fn fixture(traced: bool) -> Fixture {
     };
     state.provider.present = |ext, surface, _, gpu| {
         let copy = ext.get::<State>().provider.present_copy;
-        copy(ext, surface, gpu)
+        copy(ext, surface, None, gpu)
     };
     state.provider.presentation_serial = |_| None;
     let registry = f.m.sys.thunks.resolver_mut::<Registry>().unwrap();

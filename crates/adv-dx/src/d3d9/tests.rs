@@ -32,7 +32,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         remove: |_, _, _| Ok(()),
         replace: |_, _, _| unreachable!(),
         present: |_, _, _, _| unreachable!(),
-        present_copy: |_, _, _| unreachable!(),
+        present_copy: |_, _, _, _| unreachable!(),
         repeat: |_, _| unreachable!(),
         presentation_serial: |_| Some(0),
         vsync: |_| None,

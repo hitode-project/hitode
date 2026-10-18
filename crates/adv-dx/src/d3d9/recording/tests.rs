@@ -27,6 +27,7 @@ struct Presents {
     latest: Option<NativeFrame>,
     fail: bool,
     detached: bool,
+    damage: Vec<Option<Rect>>,
 }
 fn fixture() -> Fixture {
     fixture_with_limits(adv_machine::ObjectLimits::default())
@@ -35,7 +36,7 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
     let mut f = Fixture::with_limits(limits);
     f.m.ext.insert(Presents::default());
     let state = f.m.ext.get_mut::<State>();
-    state.provider.present_copy = |ext, surface, gpu| {
+    state.provider.present_copy = |ext, surface, damage, gpu| {
         if ext.get::<Presents>().fail {
             return Err(Error::Device("authored presentation failure".into()));
         }
@@ -45,6 +46,7 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
         let serial = ext.get::<Presents>().serial + 1;
         let frame = gpu.present(&image, serial)?;
         let p = ext.get_mut::<Presents>();
+        p.damage.push(damage);
         p.serial = serial;
         if !p.detached {
             p.published.push(serial);
@@ -52,9 +54,9 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
         p.latest = Some(frame);
         Ok(serial)
     };
-    state.provider.present = |ext, surface, _, gpu| {
+    state.provider.present = |ext, surface, damage, gpu| {
         let copy = ext.get::<State>().provider.present_copy;
-        copy(ext, surface, gpu)
+        copy(ext, surface, damage, gpu)
     };
     state.provider.repeat = |ext, _| {
         let p = ext.get_mut::<Presents>();

@@ -68,7 +68,8 @@ pub struct SurfaceProvider {
     pub present:
         fn(&mut Ext, u32, Option<adv_device::surface::Rect>, &mut Gpu) -> Result<u64, Error>,
     /// Snapshot a preserved COPY front without rotating its writable target.
-    pub present_copy: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
+    pub present_copy:
+        fn(&mut Ext, u32, Option<adv_device::surface::Rect>, &mut Gpu) -> Result<u64, Error>,
     /// Complete a guest Present without publishing or executing a GPU command.
     pub repeat: fn(&mut Ext, u32) -> Result<u64, Error>,
     /// Shared serial includes other devices, GDI, DirectDraw and video fronts.
@@ -1271,21 +1272,21 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {
-                let rotate = match operation {
+                let (rotate, damage) = match operation {
                     Operation::Present { owner, .. } => {
                         match com(env).get_identity(&env.sys.objects, *owner) {
-                            Some(Payload::Device(d)) if d.frame.rotate => {
-                                Some(recording::changed(&d.frame))
+                            Some(Payload::Device(d)) => {
+                                (d.frame.rotate, recording::changed(&d.frame))
                             }
-                            _ => None,
+                            _ => (false, None),
                         }
                     }
-                    _ => None,
+                    _ => (false, None),
                 };
-                if let Some(damage) = rotate {
+                if rotate {
                     (provider.present)(env.ext, *surface, damage, &mut gpu)
                 } else {
-                    (provider.present_copy)(env.ext, *surface, &mut gpu)
+                    (provider.present_copy)(env.ext, *surface, damage, &mut gpu)
                 }
             };
             result.map(|serial| Completion::Presented(serial, *deadline))

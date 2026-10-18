@@ -412,6 +412,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     let command = command.digest128();
     f.damage.record(&p, command, &f.contents);
     for &(k, overwrite) in &p.writes {
+        let command = p.write_key(k, command);
         let slot = f.contents.resolve(k);
         let old = f.contents.slots[slot].1.unwrap_or(0);
         if f.contents.slots[slot].2.is_none() {

@@ -372,6 +372,250 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     assert_eq!(counts.clipped_executions, 1);
     assert!((counts.clipped_area_sum - (1. + 16. / 192.)).abs() < 1e-9);
 }
+
+fn bind_depth(f: &mut Fixture, width: u32, height: u32) -> u32 {
+    let output = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateDepthStencilSurface",
+        &[f.device, width, height, 75, 0, 0, 0, output, 0],
+    );
+    let pointer = f.m.cpu.read_u32(output).unwrap();
+    f.okay(
+        "IDirect3DDevice9::SetDepthStencilSurface",
+        &[f.device, pointer],
+    );
+    pointer
+}
+
+// spec: GFX-REC-2, GFX-REC-3, GFX-REC-4, GFX-REC-5
+#[test]
+fn padded_depth_and_stencil_clears_keep_local_redraw_pixel_exact() {
+    for mode in 0..3 {
+        let mut outputs = Vec::new();
+        for verify in [false, true] {
+            let mut f = fixture();
+            bind_depth(&mut f, 32, 24);
+            f.m.ext.get_mut::<State>().verify_frames = verify;
+            let mut frames = Vec::new();
+            for n in 0..8 {
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 7, 0xff112233, 0.75f32.to_bits(), 3],
+                );
+                // These are full color-view clears, but only partial writes to Z/S.
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 6, 0, 0.75f32.to_bits(), 3],
+                );
+                for index in 0..3 {
+                    let mut d = quad(
+                        &mut f,
+                        2. + index as f32 * 4.,
+                        [1., if index == 0 { n as f32 / 8. } else { 0. }, 0., 1.],
+                    );
+                    let device = f.device;
+                    d.target = depth::attach(&env(&mut f), device, d.target).unwrap();
+                    if mode == 1 {
+                        d.state.depth = Some(Compare::Less);
+                        d.state.depth_write = true;
+                    } else if mode == 2 {
+                        let face = StencilFace {
+                            compare: Compare::Equal,
+                            fail: StencilOp::Keep,
+                            depth_fail: StencilOp::Keep,
+                            pass: StencilOp::Keep,
+                        };
+                        d.state.stencil = Some(Stencil {
+                            front: face,
+                            back: face,
+                            read_mask: 255,
+                            write_mask: 0,
+                        });
+                        d.state.stencil_reference = 3;
+                    }
+                    record_draw(&mut f, d);
+                }
+                present(&mut f);
+                frames.push(latest(&mut f));
+            }
+            let counts = f.m.ext.get::<State>().frames;
+            assert_eq!(counts.verification_mismatches, 0);
+            if !verify {
+                assert!(counts.clipped_executions >= 7, "mode {mode}");
+                assert!(counts.clipped_area_sum <= 8.);
+            }
+            outputs.push(frames);
+        }
+        assert_eq!(outputs[0], outputs[1], "mode {mode}");
+    }
+}
+
+// spec: GFX-REC-4, GFX-REC-5, GFX-PASS-3
+#[test]
+fn clipped_partial_attachment_clears_preserve_values_seen_by_a_larger_target() {
+    let mut outputs = Vec::new();
+    for verify in [true, false] {
+        let mut f = fixture();
+        bind_depth(&mut f, 32, 24);
+        f.m.ext.get_mut::<State>().verify_frames = verify;
+        let large = f.render_target(32, 24, 21);
+        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, large]);
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 7, 0xff000000, 0.25f32.to_bits(), 7],
+        );
+        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, f.back]);
+        present(&mut f);
+        for n in 0..4 {
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 7, 0xff000000, 0.75f32.to_bits(), 3],
+            );
+            let d = quad(&mut f, 2., [1., n as f32 / 4., 0., 1.]);
+            record_draw(&mut f, d);
+            present(&mut f);
+        }
+        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, large]);
+        clear(&mut f, 0xff000000);
+        let target = f.target(large);
+        let device = f.device;
+        let target = depth::attach(&env(&mut f), device, target).unwrap();
+        for stencil in [false, true] {
+            let mut d = draw(&mut f);
+            d.target = target.clone();
+            d.state = DrawState::new(32, 24);
+            d.vertices = [
+                (-1., 1.),
+                (-1., -1.),
+                (1., 1.),
+                (1., 1.),
+                (-1., -1.),
+                (1., -1.),
+            ]
+            .map(|(x, y)| Vertex {
+                position: [x, y, 0.5, 1.],
+                color: if stencil {
+                    [0., 0., 1., 1.]
+                } else {
+                    [0., 1., 0., 1.]
+                },
+                uv: [0.; 2],
+            })
+            .to_vec();
+            if stencil {
+                let face = StencilFace {
+                    compare: Compare::Equal,
+                    fail: StencilOp::Keep,
+                    depth_fail: StencilOp::Keep,
+                    pass: StencilOp::Keep,
+                };
+                d.state.stencil = Some(Stencil {
+                    front: face,
+                    back: face,
+                    read_mask: 255,
+                    write_mask: 0,
+                });
+                d.state.stencil_reference = 7;
+            } else {
+                d.state.depth = Some(Compare::Less);
+            }
+            record_draw(&mut f, d);
+        }
+        present(&mut f);
+        let actual = pixels(&mut f, &target.image);
+        for (n, pixel) in actual.chunks_exact(4).enumerate() {
+            assert_eq!(
+                pixel,
+                if n % 32 < 16 && n / 32 < 12 {
+                    &[0, 255, 0, 255]
+                } else {
+                    &[255, 0, 0, 255]
+                },
+                "pixel {n}, verify {verify}"
+            );
+        }
+        outputs.push(actual);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
+
+// spec: GFX-REC-2, GFX-REC-4, GFX-REC-5
+#[test]
+fn attachment_only_changes_do_not_publish_color_damage() {
+    let mut f = fixture();
+    bind_depth(&mut f, 32, 24);
+    let colors = [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]];
+    scene(&mut f, colors);
+    present(&mut f);
+    let expected = latest(&mut f);
+    for n in 0..3 {
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 6, 0, (n as f32 / 4.).to_bits(), n],
+        );
+        present(&mut f);
+        assert_eq!(latest(&mut f), expected);
+        assert_eq!(
+            f.m.ext.get::<Presents>().damage.last().copied().flatten(),
+            Some(Rect::default())
+        );
+    }
+}
+
+// spec: GFX-REC-4, GFX-REC-5
+#[test]
+fn repeated_partial_clear_overwrites_its_region_without_accumulating_damage() {
+    let mut outputs = Vec::new();
+    for verify in [false, true] {
+        let mut f = fixture();
+        f.m.ext.get_mut::<State>().verify_frames = verify;
+        clear(&mut f, 0xff112233);
+        present(&mut f);
+        let mut frames = Vec::new();
+        for (x, color) in [
+            (2, 0xffff0000u32),
+            (2, 0xffff0000),
+            (6, 0xff00ff00),
+            (6, 0xff00ff00),
+        ] {
+            let owner = id(&mut f);
+            let target = f.target(f.back);
+            let outcome = record(
+                &mut env(&mut f),
+                owner,
+                Operation::Clear {
+                    target,
+                    rectangle: Rect {
+                        x,
+                        y: 3,
+                        w: 2,
+                        h: 2,
+                    },
+                    color: Some([
+                        f64::from((color >> 16) & 255) / 255.,
+                        f64::from((color >> 8) & 255) / 255.,
+                        f64::from(color & 255) / 255.,
+                        1.,
+                    ]),
+                    depth: None,
+                    stencil: None,
+                },
+            );
+            assert_eq!(f.finish(outcome), 0);
+            present(&mut f);
+            frames.push(latest(&mut f));
+        }
+        assert_eq!(frames[0], frames[1]);
+        assert_eq!(frames[2], frames[3]);
+        if !verify {
+            let damage = &f.m.ext.get::<Presents>().damage;
+            assert_eq!(damage[2], Some(Rect::default()));
+            assert_eq!(damage[4], Some(Rect::default()));
+        }
+        outputs.push(frames);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
 #[derive(Default)]
 struct Rotation {
     targets: Vec<Target>,
