@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "Permissions of the launcher's main window",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-start-dragging"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://vndb.org/*" }, { "url": "https://github.com/hitode-project/*" }]
+    }
+  ]
 }

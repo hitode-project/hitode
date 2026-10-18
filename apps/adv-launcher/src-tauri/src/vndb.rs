@@ -71,7 +71,7 @@ fn identifier(value: &str) -> Result<Option<String>, String> {
     }
     Ok(None)
 }
-fn client() -> Result<Client, String> {
+pub(crate) fn client() -> Result<Client, String> {
     let builder = Client::builder()
         .timeout(Duration::from_secs(25))
         .user_agent(concat!("Hitode/", env!("CARGO_PKG_VERSION")))
