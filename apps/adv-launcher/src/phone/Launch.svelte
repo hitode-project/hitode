@@ -216,6 +216,10 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    /* A phone's width, centered on a tablet or an unfolded phone. */
+    width: 100%;
+    max-width: 420px;
+    align-self: center;
   }
   /* The phone launch board's buttons: a 50px primary and 48px quiet rows. */
   .btn.primary {

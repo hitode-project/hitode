@@ -84,14 +84,35 @@
   });
 </script>
 
+{#snippet categories()}
+  <div class="chips" role="group" aria-label={t("分类")}>
+    {#each chips as c (c.filter)}
+      <button
+        class="chip"
+        class:on={filter === c.filter}
+        aria-pressed={filter === c.filter}
+        onclick={() => nav.replace({ name: "library", filter: c.filter })}
+      >
+        {c.label}{filter === c.filter ? ` ${items.length}` : ""}
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
 {#if library.games.length === 0}
+  <!-- The same categories and records as the sidebar, so shrinking a window
+       to this layout keeps them in reach. -->
   <header class="top">
     <h1>{t("游戏库")}</h1>
+    <button class="icon-btn" aria-label={t("游玩统计")} onclick={() => nav.go({ name: "stats" })}>
+      <Icon name="chart" size={20} stroke={1.5} />
+    </button>
     <button class="icon-btn" aria-label={t("设置")} onclick={() => nav.go({ name: "settings" })}>
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
   </header>
   <JitBanner />
+  {@render categories()}
   <main class="empty">
     <div aria-hidden="true" class="stack">
       <div class="ghost-card" style="transform: rotate(-6deg) translateY(6px); opacity: .6"></div>
@@ -131,18 +152,7 @@
       <input type="search" placeholder={t("搜索标题或品牌")} bind:this={searchInput} bind:value={query} />
     </label>
   {:else}
-    <div class="chips" role="group" aria-label={t("分类")}>
-      {#each chips as c (c.filter)}
-        <button
-          class="chip"
-          class:on={filter === c.filter}
-          aria-pressed={filter === c.filter}
-          onclick={() => nav.replace({ name: "library", filter: c.filter })}
-        >
-          {c.label}{filter === c.filter ? ` ${items.length}` : ""}
-        </button>
-      {/each}
-    </div>
+    {@render categories()}
   {/if}
 
   <main class="grid-wrap">

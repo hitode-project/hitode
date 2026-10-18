@@ -66,6 +66,11 @@
   :global(:root[data-touch]) .side {
     padding: calc(var(--safe-top) + 16px) 12px calc(var(--safe-bottom) + 16px) calc(var(--safe-left) + 12px);
   }
+  /* Finger-sized rows, whichever page sits beside the sidebar. */
+  :global(:root[data-touch]) .nav {
+    height: 44px;
+    font-size: 15px;
+  }
   :global(:root[data-touch]) .drag {
     display: none;
   }

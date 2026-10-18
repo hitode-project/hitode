@@ -39,13 +39,14 @@
 
   const route = $derived(nav.route);
   /** Screens drawn without the library sidebar. */
-  const fullscreen = $derived(route.name === "launch" || route.name === "game" || route.name === "report");
+  const fullscreen = $derived(route.name === "launch" || route.name === "report");
   /**
    * Flows that keep the phone screens on touch at any width, so resizing the
    * window mid-flow restyles them instead of starting them over.
    */
   const flow = $derived(route.name === "launch" || route.name === "report" || route.name === "scan" || route.name === "import");
-  const phoneScreens = $derived(device.phone || (device.touch && flow));
+  const phonePage = $derived(device.phone || (device.touch && flow));
+  const sidebar = $derived(!device.phone && !fullscreen);
 
   $effect(() => {
     const root = document.documentElement;
@@ -54,7 +55,7 @@
     root.dataset.accent = prefs.accent;
     root.dataset.screen = route.name;
     root.dataset.platform = device.platform;
-    root.dataset.device = phoneScreens ? "phone" : "desktop";
+    root.dataset.device = phonePage ? "phone" : "desktop";
     if (device.touch) root.dataset.touch = "";
     else delete root.dataset.touch;
     if (device.simulated) root.dataset.simulated = "";
@@ -79,56 +80,37 @@
 {#key locale()}
 {#if route.name === "game"}
   <Game gameId={route.gameId} gameView={device.gameView} phone={device.touch} />
-{:else if phoneScreens}
-  <!-- Phone screens fill the window; there is no sidebar. In a wide window
-       the forms keep a centered column; launch is already centered over its
-       full-bleed backdrop. -->
-  <div class="phone" class:column={!device.phone && route.name !== "launch"}>
-    {#if route.name === "library"}
-      <PhoneLibrary filter={route.filter} />
-    {:else if route.name === "stats"}
-      <PhoneStats />
-    {:else if route.name === "import"}
-      <PhoneImport />
-    {:else if route.name === "scan"}
-      <PhoneScan />
-    {:else if route.name === "install"}
-      <PhoneLibrary filter="all" />
-    {:else if route.name === "settings"}
-      <PhoneSettings />
-    {:else if route.name === "game-settings"}
-      <PhoneGameSettings gameId={route.gameId} />
-    {:else if route.name === "launch"}
-      <PhoneLaunch gameId={route.gameId} />
-    {:else if route.name === "report"}
-      <PhoneReport gameId={route.gameId} />
-    {/if}
-  </div>
-{:else if fullscreen}
-  {#if route.name === "launch"}
-    <Launch gameId={route.gameId} />
-  {:else if route.name === "report"}
-    <Report gameId={route.gameId} />
-  {/if}
 {:else}
-  <div class="shell">
-    <Sidebar />
-    <div class="content">
-      <JitBanner />
-      {#if route.name === "library"}
-        <Library filter={route.filter} />
+  <!-- One tree for every layout: the sidebar comes and goes around the page,
+       so a page both layouts share stays mounted when the window resizes.
+       Phone pages in a wide window keep a centered column; launch is already
+       centered over its full-bleed backdrop. -->
+  <div class="shell" class:phone={!sidebar}>
+    {#if sidebar}<Sidebar />{/if}
+    <div
+      class="content"
+      class:page={sidebar}
+      class:column={phonePage && !device.phone && route.name !== "launch"}
+      class:inset={device.touch && !phonePage}
+    >
+      {#if !phonePage}<JitBanner />{/if}
+      {#if route.name === "library" || route.name === "install"}
+        {@const filter = route.name === "library" ? route.filter : "all"}
+        {#if phonePage}<PhoneLibrary {filter} />{:else}<Library {filter} />{/if}
       {:else if route.name === "stats"}
-        <Stats />
+        {#if phonePage}<PhoneStats />{:else}<Stats />{/if}
       {:else if route.name === "import"}
-        <Import />
+        {#if phonePage}<PhoneImport />{:else}<Import />{/if}
       {:else if route.name === "scan"}
-        <Scan />
-      {:else if route.name === "install"}
-        <Library filter="all" />
+        {#if phonePage}<PhoneScan />{:else}<Scan />{/if}
       {:else if route.name === "settings"}
-        <Settings />
+        {#if phonePage}<PhoneSettings />{:else}<Settings />{/if}
       {:else if route.name === "game-settings"}
-        <GameSettings gameId={route.gameId} />
+        {#if phonePage}<PhoneGameSettings gameId={route.gameId} />{:else}<GameSettings gameId={route.gameId} />{/if}
+      {:else if route.name === "launch"}
+        {#if phonePage}<PhoneLaunch gameId={route.gameId} />{:else}<Launch gameId={route.gameId} />{/if}
+      {:else if route.name === "report"}
+        {#if phonePage}<PhoneReport gameId={route.gameId} />{:else}<Report gameId={route.gameId} />{/if}
       {/if}
     </div>
   </div>
@@ -146,31 +128,29 @@
     color: var(--fg);
     overflow: hidden;
   }
-  .phone {
-    position: relative;
-    height: 100%;
+  .shell.phone {
+    flex-direction: column;
+  }
+  .content {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg);
-    color: var(--fg);
-    overflow: hidden;
+  }
+  .page {
+    view-transition-name: page;
   }
   .column {
     align-items: center;
   }
   .column > :global(*) {
     width: 100%;
-    max-width: 640px;
+    max-width: 720px;
   }
-  .content {
-    view-transition-name: page;
-    flex: 1 1 0;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  /* A tablet or an unfolded phone: the status bar and home indicator. */
-  :global(:root[data-touch]) .content {
+  /* Desktop pages on a tablet or an unfolded phone: the status bar and home
+     indicator. */
+  .inset {
     padding: var(--safe-top) var(--safe-right) var(--safe-bottom) 0;
   }
 </style>

@@ -85,7 +85,6 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 
 /* Touch in the sidebar layout (a tablet or an unfolded phone): the desktop
    controls grow to finger-sized targets. */
-:root[data-touch][data-device="desktop"] .nav { height: 44px; font-size: 15px; }
 :root[data-touch][data-device="desktop"] .icon-btn { width: 44px; height: 44px; }
 :root[data-touch][data-device="desktop"] :is(.field, .pill) { height: 40px; }
 :root[data-touch][data-device="desktop"] .field input { font-size: 15px; }
