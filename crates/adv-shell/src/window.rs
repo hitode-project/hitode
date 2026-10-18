@@ -1535,6 +1535,12 @@ mod tests {
 
 #[cfg(mobile)]
 pub(crate) mod mobile;
+/// The guest dialog and menu data a mobile host's overlay draws and answers.
+#[cfg(mobile)]
+pub use adv_runtime::{
+    DialogControl, DialogEvent, DialogSet, DialogTarget, DialogWindow, MenuBar, MenuCommand,
+    MenuEvent, MenuItem,
+};
 #[cfg(target_os = "ios")]
 pub use mobile::GameContainer;
 #[cfg(mobile)]

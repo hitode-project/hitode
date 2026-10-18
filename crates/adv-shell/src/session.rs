@@ -363,6 +363,9 @@ impl Session {
                 .push(Event::Menu(MenuEvent::Command(command)));
         }
     }
+    pub fn menu_event(&self, event: MenuEvent) {
+        self.driver.view.hub().push(Event::Menu(event));
+    }
     pub fn dialog_event(&self, event: DialogEvent) {
         self.driver.view.hub().push(Event::Dialog(event));
     }

@@ -33,6 +33,12 @@ pub enum ViewEvent {
     /// Where the host draws the trackpad cursor, in view pixels; None hides
     /// it. iOS draws it in the game view itself.
     Cursor(Option<(f32, f32)>),
+    /// The guest's dialogs changed; the overlay draws them and answers
+    /// through `Session::dialog_event`, as the macOS projection does.
+    Dialogs(adv_runtime::DialogSet),
+    /// The guest's menu bar or tracked popup changed; the overlay lists it
+    /// and answers through `Session::menu_event`.
+    Menu(adv_runtime::MenuBar),
 }
 
 /// Trackpad cursor travel per finger travel.
@@ -61,6 +67,9 @@ pub struct GameView {
     /// MK_ flags of buttons held through `mouse_button`.
     buttons: Cell<u32>,
     listener: RefCell<Option<Box<dyn Fn(ViewEvent)>>>,
+    /// The dialogs last sent to the listener.
+    dialogs: RefCell<adv_runtime::DialogSet>,
+    menu: RefCell<adv_runtime::MenuBar>,
     /// Where the host placed the surface, as a layout whose game is that
     /// area, with the points-to-pixels scale (AND-APP-16).
     #[cfg(target_os = "android")]
@@ -105,6 +114,8 @@ impl GameView {
             cursor: Cell::new((0.0, 0.0)),
             buttons: Cell::new(0),
             listener: RefCell::new(None),
+            dialogs: RefCell::default(),
+            menu: RefCell::default(),
             #[cfg(target_os = "android")]
             screen: RefCell::new(None),
             #[cfg(target_os = "android")]
@@ -571,9 +582,19 @@ impl GameView {
     }
     pub(crate) fn presentation(
         &self,
-        _: &adv_runtime::MenuBar,
-        _: &adv_runtime::DialogSet,
+        menu: &adv_runtime::MenuBar,
+        dialogs: &adv_runtime::DialogSet,
     ) -> Result<(), String> {
+        // A dialog can come before the first frame (a startup prompt), so
+        // the overlay hears about it whether or not the game has drawn.
+        if *self.dialogs.borrow() != *dialogs {
+            *self.dialogs.borrow_mut() = dialogs.clone();
+            self.notify(ViewEvent::Dialogs(dialogs.clone()));
+        }
+        if *self.menu.borrow() != *menu {
+            *self.menu.borrow_mut() = menu.clone();
+            self.notify(ViewEvent::Menu(menu.clone()));
+        }
         self.error.borrow_mut().take().map_or(Ok(()), Err)
     }
     pub(crate) fn take_events(&self) -> Vec<Event> {

@@ -385,6 +385,38 @@ pub async fn keep_game(window: WebviewWindow) -> Result<(), String> {
     .await
 }
 
+/// Answers a guest menu the overlay listed from `game_menu`.
+#[tauri::command]
+pub async fn game_menu(
+    window: WebviewWindow,
+    input: crate::mobile_view::MenuInput,
+) -> Result<(), String> {
+    on_ui(window.app_handle(), move || {
+        with_session(|_, session| {
+            for event in crate::mobile_view::menu_events(input) {
+                session.menu_event(event);
+            }
+        })
+    })
+    .await
+}
+
+/// Answers a guest dialog the overlay drew from `game_dialogs`.
+#[tauri::command]
+pub async fn game_dialog(
+    window: WebviewWindow,
+    input: crate::mobile_view::DialogInput,
+) -> Result<(), String> {
+    on_ui(window.app_handle(), move || {
+        with_session(|_, session| {
+            for event in crate::mobile_view::dialog_events(input) {
+                session.dialog_event(event);
+            }
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn post_text(window: WebviewWindow, text: String) -> Result<usize, String> {
     on_ui(window.app_handle(), move || {

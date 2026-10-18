@@ -15,6 +15,8 @@
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
   import { screen, trackScreen } from "../lib/screen.svelte";
   import TouchControls from "../components/TouchControls.svelte";
+  import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
+  import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
 
   /**
    * The in-game overlay. The native game view is under this transparent page;
@@ -82,6 +84,15 @@
     };
   });
   const loading = $derived(phone && gameView && !presented);
+
+  /**
+   * Mobile: the game's dialogs and menus, which the overlay draws in place
+   * of a native projection. A dialog can come before the first frame.
+   */
+  let dialogs = $state<GuestDialog[]>([]);
+  let guestMenu = $state<GuestMenu | null>(null);
+  /** The menu bar opens from the pause menu; a popup opens by itself. */
+  let menuOpen = $state(false);
 
   /** Milliseconds between the presents of the last second, for the phone HUD. */
   let frames = $state<number[]>([]);
@@ -176,6 +187,11 @@
     const stopPause = onHostEvent("pause", () => togglePause(false));
     // A three-finger tap on the game asks for the keyboard.
     const stopKeyboard = onHostEvent("game_keyboard", () => openTextBar());
+    const stopDialogs = onHostEvent<GuestDialog[]>("game_dialogs", (value) => (dialogs = value));
+    const stopMenu = onHostEvent<GuestMenu | null>("game_menu", (value) => {
+      guestMenu = value;
+      if (!value) menuOpen = false;
+    });
     const stopScreen = trackScreen();
     const stopBack = nav.onBack(() => {
       togglePause(true);
@@ -186,6 +202,8 @@
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
       stopKeyboard();
+      stopDialogs();
+      stopMenu();
       stopScreen();
       stopBack();
     };
@@ -376,6 +394,9 @@
             <div class="sep"></div>
           {/if}
           <div class="group">
+            {#if guestMenu && !guestMenu.popup}
+              <button class="qrow" onclick={() => { view = "closed"; menuOpen = true; }}>{t("游戏菜单…")}</button>
+            {/if}
             <button class="qrow" onclick={openTextBar}>
               <span>{t("输入文字…")}</span>
               <span class="end"><Icon name="keyboard" /></span>
@@ -410,8 +431,8 @@
         </div>
       {/if}
     </div>
-  {:else if loading}
-    <!-- The controls wait for the game's first frame. -->
+  {:else if loading || dialogs.length}
+    <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
   {:else if phone && screen.layout}
     {#if !stopping}
       <TouchControls layout={screen.layout} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
@@ -422,6 +443,14 @@
     <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
       <Icon name="pause" />
     </button>
+  {/if}
+
+  {#if guestMenu && (menuOpen || guestMenu.popup) && view === "closed"}
+    <GuestMenuSheet menu={guestMenu} onclose={() => (menuOpen = false)} />
+  {/if}
+
+  {#if dialogs.length && view === "closed"}
+    <GuestDialogs {dialogs} />
   {/if}
 
   {#if backHint}
