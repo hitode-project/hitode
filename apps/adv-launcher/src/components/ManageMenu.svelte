@@ -1,11 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
-  import Vndb from "./Vndb.svelte";
-  let metadata = $state(false);
-  import EditTitle from "./EditTitle.svelte";
-  let editing = $state(false);
   import Icon from "./Icon.svelte";
-  import { reveal } from "../lib/reveal";
+  import { canReveal, reveal } from "../lib/reveal";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game } from "../lib/types";
@@ -15,10 +11,13 @@
     game: Game;
     onclose: () => void;
     onsaves: () => void;
+    /** The dialogs open from the page, so the menu can close under them. */
+    onvndb: () => void;
+    onrename: () => void;
     onremove: () => void;
   }
 
-  let { game, onclose, onsaves, onremove }: Props = $props();
+  let { game, onclose, onsaves, onvndb, onrename, onremove }: Props = $props();
 
   let confirming = $state(false);
   let menu = $state<HTMLElement>();
@@ -59,18 +58,18 @@
   }
 </script>
 
-{#if metadata}<Vndb {game} {onclose} />{/if}
 
-{#if editing}<EditTitle {game} {onclose} />{/if}
 
 <div class="menu" role="menu" aria-label={t("更多操作")} tabindex="-1" bind:this={menu} {onkeydown}>
   {#if !confirming}
-    <button class="mi" role="menuitem" onclick={() => go(() => reveal(game.path))}>
-      <span class="ic"><Icon name="folder" /></span>
-      <span>{t("打开所在文件夹")}</span>
-    </button>
-    <button class="mi" role="menuitem" onclick={() => metadata = true}><span>VNDB</span><span>{t("搜索／关联资料…")}</span></button>
-    <button class="mi" role="menuitem" onclick={() => (editing = true)}>
+    {#if canReveal(game.path)}
+      <button class="mi" role="menuitem" onclick={() => go(() => reveal(game.path))}>
+        <span class="ic"><Icon name="folder" /></span>
+        <span>{t("打开所在文件夹")}</span>
+      </button>
+    {/if}
+    <button class="mi" role="menuitem" aria-haspopup="dialog" onclick={onvndb}><span>VNDB</span><span>{t("搜索／关联资料…")}</span></button>
+    <button class="mi" role="menuitem" aria-haspopup="dialog" onclick={onrename}>
       <svg class="ic" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M10.6 2.6l2.8 2.8-7.7 7.7-3.4.6.6-3.4z"></path></svg>
       <span>{t("编辑标题…")}</span>
     </button>

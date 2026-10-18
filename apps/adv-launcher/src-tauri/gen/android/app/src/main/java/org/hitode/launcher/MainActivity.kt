@@ -1,5 +1,7 @@
 package org.hitode.launcher
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.media.AudioAttributes
@@ -8,6 +10,7 @@ import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -126,6 +129,30 @@ class MainActivity : TauriActivity() {
     external fun nativeSurfaceChanged(surface: Surface, width: Int, height: Int)
     external fun nativeSurfaceDestroyed(surface: Surface, width: Int, height: Int)
     /** Called by the native trackpad cursor (AND-APP-14). */
+    /**
+     * Opens a primary-storage folder in the system Files app (DocumentsUI),
+     * asked for by name so file-handling apps do not offer themselves.
+     * `relative` is the folder below the storage root.
+     */
+    fun revealFolder(relative: String): Boolean {
+        val uri = DocumentsContract.buildDocumentUri(
+            "com.android.externalstorage.documents",
+            "primary:$relative"
+        )
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+        val files = packageManager.queryIntentActivities(intent, 0)
+            .firstOrNull { it.activityInfo.packageName.endsWith(".documentsui") }
+            ?: return false
+        intent.setClassName(files.activityInfo.packageName, files.activityInfo.name)
+        return try {
+            startActivity(intent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        }
+    }
+
     fun setCursor(shown: Boolean, x: Float, y: Float) {
         container?.setCursor(shown, x, y)
     }

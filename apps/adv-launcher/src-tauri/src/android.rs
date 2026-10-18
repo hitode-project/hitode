@@ -6,7 +6,8 @@
 //! DOWN (0), UP (1), MOVE (2), CANCEL (3), with coordinates in view pixels.
 //! Kotlin captures one Router target for the whole gesture. Before Tauri setup,
 //! new gestures belong to the webview; afterwards they use its OverlayState.
-//! `set_game_mode(app, active)` calls MainActivity on the webview thread.
+//! `set_game_mode(app, active)` and `reveal_folder` call MainActivity on the
+//! webview thread.
 
 use crate::overlay::OverlayState;
 use adv_shell::mobile::{Insets, Occlusion, Rect};
@@ -43,6 +44,37 @@ pub fn set_game_mode(app: &AppHandle, active: bool) -> tauri::Result<()> {
                 }
             });
         })
+}
+
+/// Opens `folder`, below the primary storage root, in the system Files app.
+pub fn reveal_folder(app: &AppHandle, folder: &std::path::Path) -> Result<(), String> {
+    let relative = folder
+        .strip_prefix("/storage/emulated/0")
+        .map_err(|_| "only folders in shared storage can be shown")?
+        .to_str()
+        .ok_or("the folder name is not valid Unicode")?
+        .to_owned();
+    app.get_webview_window("main")
+        .ok_or("no main window")?
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _| {
+                let shown = env.new_string(&relative).and_then(|name| {
+                    env.call_method(
+                        activity,
+                        "revealFolder",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&name)],
+                    )?
+                    .z()
+                });
+                match shown {
+                    Ok(true) => {}
+                    Ok(false) => log::error!("revealFolder: no system Files app"),
+                    Err(error) => log::error!("revealFolder: {error}"),
+                }
+            });
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Shows the trackpad cursor at a point of the game surface, in pixels, or

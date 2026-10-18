@@ -24,7 +24,7 @@ mod vndb;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 mod chrome;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod saves;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 use game::{post_text, start_game, stop_game};
@@ -179,6 +179,9 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_dialog,
+        saves::save_info,
+        saves::save_policy,
+        saves::save_action,
         game::game_menu,
         game::game_wheel,
         overlay::set_overlay_input,
@@ -217,6 +220,9 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_dialog,
+        saves::save_info,
+        saves::save_policy,
+        saves::save_action,
         game::game_menu,
         game::game_wheel,
         jit_ios::jit_status,

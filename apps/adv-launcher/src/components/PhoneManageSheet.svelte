@@ -6,7 +6,7 @@
   let editing = $state(false);
   import Icon from "./Icon.svelte";
   import ManageSaves from "./ManageSaves.svelte";
-  import { reveal } from "../lib/reveal";
+  import { canReveal, reveal } from "../lib/reveal";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game } from "../lib/types";
@@ -68,10 +68,12 @@
       {#if view === "menu"}
         <div lang="ja" class="name">{game.title}</div>
         <div role="menu" aria-label={t("更多操作")} class="items">
-          <button class="si" role="menuitem" onclick={() => go(() => reveal(game.path))}>
-            <span class="ic"><Icon name="folder" size={20} stroke={1.3} /></span>
-            <span>{t("打开所在文件夹")}</span>
-          </button>
+          {#if canReveal(game.path)}
+            <button class="si" role="menuitem" onclick={() => go(() => reveal(game.path))}>
+              <span class="ic"><Icon name="folder" size={20} stroke={1.3} /></span>
+              <span>{t("打开所在文件夹")}</span>
+            </button>
+          {/if}
           <button class="si" role="menuitem" onclick={() => metadata = true}><span>VNDB</span><span>{t("搜索／关联资料…")}</span></button>
     <button class="si" role="menuitem" onclick={() => (editing = true)}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M10.6 2.6l2.8 2.8-7.7 7.7-3.4.6.6-3.4z"></path></svg>

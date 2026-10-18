@@ -298,9 +298,7 @@ pub async fn start_game(
                             host.exit.take().flatten()
                         });
                         let elapsed = started_at.elapsed();
-                        if let Err(error) = crate::saves::automatic(&backup_data) {
-                            let _ = finished_window.emit("backup_failed", error.to_string());
-                        }
+                        crate::saves::after_game(&finished_window, &backup_data);
                         crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);

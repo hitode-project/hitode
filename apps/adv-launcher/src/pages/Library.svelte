@@ -7,6 +7,8 @@
   import Icon from "../components/Icon.svelte";
   import ManageMenu from "../components/ManageMenu.svelte";
   import ManageSaves from "../components/ManageSaves.svelte";
+  import Vndb from "../components/Vndb.svelte";
+  import EditTitle from "../components/EditTitle.svelte";
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -37,7 +39,7 @@
   /** The detail panel is a sheet over the grid on narrow windows. */
   let sheet = $state(false);
   /** The "更多操作" menu or the saves dialog it opens. */
-  let popup = $state<"none" | "menu" | "saves">("none");
+  let popup = $state<"none" | "menu" | "saves" | "vndb" | "rename">("none");
   let moreButton = $state<HTMLButtonElement | null>(null);
 
   const items = $derived.by(() => {
@@ -243,7 +245,8 @@
                 <Icon name="more" />
               </button>
               {#if popup === "menu"}
-                <ManageMenu {game} onclose={closePopup} onsaves={() => (popup = "saves")} onremove={() => remove(game)} />
+                <ManageMenu {game} onclose={closePopup} onsaves={() => (popup = "saves")}
+                  onvndb={() => (popup = "vndb")} onrename={() => (popup = "rename")} onremove={() => remove(game)} />
               {/if}
             </div>
           </div>
@@ -279,6 +282,10 @@
       </aside>
       {#if popup === "saves"}
         <ManageSaves {game} onclose={closePopup} />
+      {:else if popup === "vndb"}
+        <Vndb {game} onclose={closePopup} />
+      {:else if popup === "rename"}
+        <EditTitle {game} onclose={closePopup} />
       {/if}
     {/if}
   </div>

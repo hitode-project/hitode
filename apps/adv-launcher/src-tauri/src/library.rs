@@ -116,8 +116,8 @@ impl Library {
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&value)?).and_then(|()| fs::rename(tmp, &self.path))
     }
-    /// Save management (`saves.rs`) exists only on macOS.
-    #[cfg(target_os = "macos")]
+    /// Save management (`saves.rs`) exists on the platforms that run games.
+    #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
     pub(crate) fn data_dir(&self, id: &str) -> io::Result<PathBuf> {
         self.game(id)?;
         Ok(self.path.parent().unwrap().join("games").join(id))
@@ -352,7 +352,7 @@ pub fn reveal_path(path: PathBuf) -> Reply<()> {
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string())
 }
 
-#[cfg(any(mobile, test))]
+#[cfg(any(target_os = "ios", test))]
 fn mobile_reveal_path() -> Reply<()> {
     Err("revealing paths is not supported on mobile".into())
 }
@@ -366,8 +366,24 @@ fn mobile_reveal_is_unsupported() {
     );
 }
 
+/// Android opens shared-storage folders in the system Files app; a game
+/// copied into private storage has no folder another app can show.
 #[tauri::command]
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
+pub fn reveal_path(app: AppHandle, path: PathBuf) -> Reply<()> {
+    let folder = if path.is_dir() {
+        path.as_path()
+    } else {
+        path.parent().unwrap_or(&path)
+    };
+    if !folder.is_dir() {
+        return Err("path does not exist".into());
+    }
+    crate::android::reveal_folder(&app, folder)
+}
+
+#[tauri::command]
+#[cfg(target_os = "ios")]
 pub fn reveal_path(path: PathBuf) -> Reply<()> {
     let _ = path;
     mobile_reveal_path()

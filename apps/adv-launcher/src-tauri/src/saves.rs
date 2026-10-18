@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tauri::{Manager, State, WebviewWindow};
+use tauri::{Emitter, Manager, State, WebviewWindow};
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 pub(crate) fn busy() -> bool {
@@ -174,6 +174,13 @@ pub(crate) fn automatic(data: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+/// The automatic backup after a game exits; a failure is reported to the
+/// page as `backup_failed`.
+pub(crate) fn after_game(window: &WebviewWindow, data: &Path) {
+    if let Err(error) = automatic(data) {
+        let _ = window.emit("backup_failed", error.to_string());
+    }
 }
 #[tauri::command]
 pub fn save_info(state: State<'_, Mutex<Library>>, id: String) -> Result<Info, String> {

@@ -2,7 +2,7 @@
   import { t } from "../lib/i18n.svelte";
   import { untrack } from "svelte";
   import { Saves } from "../lib/saves.svelte";
-  import { reveal } from "../lib/reveal";
+  import { canReveal, reveal } from "../lib/reveal";
   import type { Game } from "../lib/types";
   let { game, onclose }: { game: Game; onclose: () => void } = $props();
   const saves = new Saves(untrack(() => game.id));
@@ -14,7 +14,7 @@
     <header><h2>{t("存档")}</h2><button class="quiet" onclick={onclose} disabled={saves.busy}>{t("关闭")}</button></header>
     <p>{game.title}</p>
     <p>{t("备份包含此游戏的数据目录和注册表。恢复或导入会替换当前数据，请先退出游戏。")}</p>
-    {#if saves.info.path}<p class="path">{saves.info.path} <button class="quiet" onclick={() => reveal(saves.info.path)}>{t("打开")}</button></p>{/if}
+    {#if saves.info.path}<p class="path">{saves.info.path} {#if canReveal(saves.info.path)}<button class="quiet" onclick={() => reveal(saves.info.path)}>{t("打开")}</button>{/if}</p>{/if}
     {#if saves.error}<p role="alert">{saves.error}</p>{/if}
     {#if saves.status}<p role="status">{saves.status}</p>{/if}
     <fieldset disabled={saves.busy || !saves.info.path}>
