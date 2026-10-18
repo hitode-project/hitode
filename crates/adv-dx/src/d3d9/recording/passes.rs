@@ -6,6 +6,7 @@ use std::collections::HashSet;
 struct Effects {
     pass: u128,
     barrier: bool,
+    draw_bounds: Option<adv_device::surface::Rect>,
     reads: Vec<Content>,
     writes: Vec<(Content, bool)>,
 }
@@ -21,10 +22,12 @@ impl Plan {
         operation: &Operation,
         reads: Vec<Content>,
         writes: Vec<(Content, bool)>,
+        bounds: adv_device::surface::Rect,
     ) {
         self.effects.push(Effects {
             pass: damage::image(operation).map_or(0, |i| hash(i.view())),
             barrier: matches!(operation, Operation::Upload { .. }),
+            draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
             reads,
             writes,
         });
@@ -42,6 +45,11 @@ impl Plan {
     }
     pub fn skip(&self, n: usize) -> bool {
         self.skipped.get(n).copied().unwrap_or(false)
+    }
+    pub fn outside_damage(&self, n: usize, clip: adv_device::surface::Rect) -> bool {
+        self.effects[n]
+            .draw_bounds
+            .is_some_and(|r| r.clipped(clip).empty())
     }
     pub fn plan(&mut self) -> u64 {
         self.skipped.clear();
@@ -126,6 +134,7 @@ mod tests {
             reads,
             writes,
             barrier,
+            draw_bounds: None,
         };
         for (effects, skipped) in [
             (

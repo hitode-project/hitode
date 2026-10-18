@@ -28,11 +28,12 @@ fn sequence(slot: u128, key: u128, r: Rect) -> Sequence {
         shape: 1,
         slot,
         independent: true,
+        ..Default::default()
     }
 }
 fn step(h: &mut History, slot: u128, key: u128, r: Rect) -> (Rect, Rect) {
     h.next = sequence(slot, key, r);
-    h.advance(false)
+    h.advance(false, &HashMap::new())
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]
@@ -64,7 +65,7 @@ fn ordered_differences_include_old_new_and_removed_bounds_and_buffer_ages() {
     h.next = sequence(2, 5, b);
     h.next.entries.pop();
     assert_eq!(
-        h.advance(false).0,
+        h.advance(false, &HashMap::new()).0,
         b,
         "removed commands retain their old bounds"
     );
@@ -87,7 +88,7 @@ fn missing_slots_and_shape_changes_need_full_but_large_damage_keeps_its_bounds()
     assert_eq!(step(&mut h, 1, 11, r).1.w, 100);
     h.next = sequence(1, 11, r);
     h.next.shape = 2;
-    assert_eq!(h.advance(false).1.w, 100);
+    assert_eq!(h.advance(false, &HashMap::new()).1.w, 100);
     step(&mut h, 1, 11, r);
     let large = Rect { w: 80, h: 80, ..r };
     assert_eq!(step(&mut h, 1, 12, large).1, large);

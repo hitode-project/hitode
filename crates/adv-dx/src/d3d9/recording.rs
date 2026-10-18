@@ -461,7 +461,7 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let f = frame(env, owner);
     f.bytes += p.bytes;
-    f.passes.record(&p.operation, p.reads, p.writes);
+    f.passes.record(&p.operation, p.reads, p.writes, p.bounds);
     f.commands.push(p.operation);
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     env.ext.get_mut::<State>().frames.recorded_commands += 1;
@@ -551,6 +551,13 @@ pub(super) fn flush(
                     .filter(|r| r.w < i.width() || r.h < i.height())
             })
         };
+        if clip.is_some_and(|r| {
+            let f = frame(env, owner);
+            f.passes.outside_damage(f.head, r)
+        }) {
+            frame(env, owner).head += 1;
+            continue;
+        }
         env.ext
             .get_mut::<State>()
             .gpu

@@ -365,8 +365,14 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     scene(&mut f, colors);
     present(&mut f);
     colors[0] = [1., 1., 0., 1.];
+    let before = stats(&f).draws;
     scene(&mut f, colors);
     present(&mut f);
+    assert_eq!(
+        stats(&f).draws - before,
+        2,
+        "one bounded clear and the intersecting quad"
+    );
     assert_eq!(latest(&mut f), reference(&mut f, colors));
     let counts = f.m.ext.get::<State>().frames;
     assert_eq!(counts.clipped_executions, 1);
@@ -989,4 +995,211 @@ fn verification_busy_readback_retains_the_presented_allocation() {
         latest(&mut f),
         reference(&mut f, [[0.5, 0., 0., 1.], colors[1], colors[2]])
     );
+}
+
+fn sample_binding(f: &mut Fixture, surface: Option<u32>) {
+    let resource = surface.map(|s| {
+        let e = env(f);
+        com(&e).identity::<Payload>(&e.sys.objects, s).unwrap()
+    });
+    let owner = id(f);
+    let e = env(f);
+    let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) else {
+        unreachable!()
+    };
+    d.texture = resource;
+    d.versions[12] += 1;
+}
+
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn local_damage_crosses_scaled_copy_and_fixed_or_shader_composition_exactly() {
+    for shader in [false, true] {
+        for flipped in [false, true] {
+            let mut outputs = Vec::new();
+            for verify in [false, true] {
+                let mut f = fixture();
+                f.m.ext.get_mut::<State>().verify_frames = verify;
+                rotate(&mut f, 3);
+                let source = f.render_target(16, 12, 21);
+                let middle = f.render_target(32, 24, 21);
+                let target =
+                    f.m.ext
+                        .get::<State>()
+                        .gpu
+                        .as_ref()
+                        .unwrap()
+                        .target_levels(32, 24, 6)
+                        .unwrap()
+                        .with_alpha_mode(f.image(middle).alpha_mode());
+                let surface = {
+                    let e = env(&mut f);
+                    let identity = com(&e).identity::<Payload>(&e.sys.objects, middle).unwrap();
+                    let Some(Payload::Resource(r)) = com(&e).get_identity(&e.sys.objects, identity)
+                    else {
+                        unreachable!()
+                    };
+                    r.surface.unwrap()
+                };
+                (f.m.ext.get::<State>().provider.replace)(&mut f.m.ext, surface, target).unwrap();
+                let output = f.packet(0u32);
+                // POSITIONT must bypass this bound shader, whose output has w=0.
+                let words = f.packet([0xfffe0200u32, 0x02000001, 0xc00f0000, 0xa0e40000, 0xffff]);
+                f.okay(
+                    "IDirect3DDevice9::CreateVertexShader",
+                    &[f.device, words, output],
+                );
+                let unused_vertex = f.m.cpu.read_u32(output).unwrap();
+                let mut frames = Vec::new();
+                let ps = if shader {
+                    let output = f.packet(0u32);
+                    let words = f.packet([
+                        0xffff0200u32,
+                        0x0200001f,
+                        0x90000000,
+                        0xa00f0800,
+                        0x03000042,
+                        0x800f0000,
+                        0xb0e40000,
+                        0xa0e40800,
+                        0x02000001,
+                        0x800f0800,
+                        0x80e40000,
+                        0xffff,
+                    ]);
+                    f.okay(
+                        "IDirect3DDevice9::CreatePixelShader",
+                        &[f.device, words, output],
+                    );
+                    f.m.cpu.read_u32(output).unwrap()
+                } else {
+                    0
+                };
+                for n in 0..10 {
+                    f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, 0]);
+                    sample_binding(&mut f, None);
+                    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, source]);
+                    clear(&mut f, 0xff112233);
+                    if n != 7 {
+                        let mut q = quad(
+                            &mut f,
+                            if n < 5 { 2. } else { 4. },
+                            [1., n as f32 / 10., 0., 1.],
+                        );
+                        q.target = f.target(source);
+                        record_draw(&mut f, q);
+                    }
+                    let owner = id(&mut f);
+                    let resources = {
+                        let e = env(&mut f);
+                        [source, middle]
+                            .map(|s| com(&e).identity::<Payload>(&e.sys.objects, s).unwrap())
+                    };
+                    let operation = Operation::Copy {
+                        source: f.image(source),
+                        rectangle: Rect {
+                            x: 0,
+                            y: 0,
+                            w: 16,
+                            h: 12,
+                        },
+                        destination: f.target(middle),
+                        region: Rect {
+                            x: 0,
+                            y: 0,
+                            w: 32,
+                            h: 24,
+                        },
+                        filter: Filter::Linear,
+                        resources,
+                    };
+                    assert!(matches!(
+                        record(&mut env(&mut f), owner, operation),
+                        Outcome::Return(0)
+                    ));
+                    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, f.back]);
+                    clear(&mut f, 0xff000000);
+                    sample_binding(&mut f, Some(middle));
+                    let mut q = draw(&mut f);
+                    q.state.texture_op = TextureOp::Texture;
+                    q.state.sampler.u = adv_device::gpu::Address::Clamp;
+                    q.state.sampler.v = adv_device::gpu::Address::Clamp;
+                    q.state.sampler.min = Filter::Linear;
+                    q.state.sampler.mag = Filter::Linear;
+                    q.image = Some(f.image(middle));
+                    q.vertices = [
+                        (0., 0.),
+                        (16., 0.),
+                        (0., 12.),
+                        (0., 12.),
+                        (16., 0.),
+                        (16., 12.),
+                    ]
+                    .map(|(x, y)| Vertex {
+                        position: [x / 8. - 1., 1. - y / 6., 0., 1.],
+                        color: [1.; 4],
+                        uv: [if flipped { 1. - x / 16. } else { x / 16. }, y / 12.],
+                    })
+                    .to_vec();
+                    if shader {
+                        f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, ps]);
+                        f.okay(
+                            "IDirect3DDevice9::SetVertexShader",
+                            &[f.device, unused_vertex],
+                        );
+                        f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x144]);
+                        f.okay("IDirect3DDevice9::SetRenderState", &[f.device, 22, 1]);
+                        f.okay("IDirect3DDevice9::SetRenderState", &[f.device, 7, 0]);
+                        f.okay("IDirect3DDevice9::SetSamplerState", &[f.device, 0, 1, 3]);
+                        f.okay("IDirect3DDevice9::SetSamplerState", &[f.device, 0, 2, 3]);
+                        f.okay("IDirect3DDevice9::SetSamplerState", &[f.device, 0, 5, 2]);
+                        f.okay("IDirect3DDevice9::SetSamplerState", &[f.device, 0, 6, 2]);
+                        let raw: Vec<[u32; 7]> = q
+                            .vertices
+                            .iter()
+                            .map(|v| {
+                                [
+                                    ((v.position[0] + 1.) * 8. - 0.5).to_bits(),
+                                    ((1. - v.position[1]) * 6. - 0.5).to_bits(),
+                                    0,
+                                    1f32.to_bits(),
+                                    0xffffffff,
+                                    v.uv[0].to_bits(),
+                                    v.uv[1].to_bits(),
+                                ]
+                            })
+                            .collect();
+                        let raw = f.packet(<[[u32; 7]; 6]>::try_from(raw).unwrap());
+                        f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+                        f.okay(
+                            "IDirect3DDevice9::DrawPrimitiveUP",
+                            &[f.device, 4, 2, raw, 28],
+                        );
+                        f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+                    } else {
+                        record_draw(&mut f, q);
+                    }
+                    present(&mut f);
+                    frames.push(latest(&mut f));
+                    if n > 0 {
+                        let damage =
+                            f.m.ext
+                                .get::<Rotation>()
+                                .damage
+                                .last()
+                                .copied()
+                                .flatten()
+                                .unwrap();
+                        assert!(
+                            damage.w * damage.h < 16 * 12 / 2,
+                            "shader={shader} flip={flipped}, frame={n}: {damage:?}"
+                        );
+                    }
+                }
+                assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
+                outputs.push(frames);
+            }
+            assert_eq!(outputs[0], outputs[1], "shader={shader} flip={flipped}");
+        }
+    }
 }

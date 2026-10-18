@@ -105,7 +105,7 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
         clip_planes.map(|m| m.map(f32::to_bits)),
     ))
 }
-fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
+pub(super) fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
     match com(env).get_identity(&env.sys.objects, id) {
@@ -181,6 +181,7 @@ pub(super) struct Prepared {
     pub operation: Operation,
     pub key: u128,
     pub reads: Vec<Content>,
+    pub samples: Vec<damage::sampling::Read>,
     pub writes: Vec<(Content, bool)>,
     pub bytes: usize,
     pub bounds: adv_device::surface::Rect,
@@ -314,7 +315,7 @@ pub(super) fn prepare(
                 _ => None,
             };
             write(content(env, resources[1], level, 0), false);
-            sample(env, resources[0], &mut reads);
+            reads.push(content(env, resources[0], None, 0));
             (
                 2u8,
                 image(source),
@@ -414,6 +415,7 @@ pub(super) fn prepare(
         _ => return Err(INVALID),
     }
     let bounds = super::damage::bounds(env, d, &operation);
+    let samples = damage::sampling::prepare(env, d, &operation, &reads);
     // Programmable streams already own these exact inputs; bounds have consumed
     // the neutral representation and backend execution only reads the streams.
     if let Operation::Draw(d) = &mut operation
@@ -429,6 +431,7 @@ pub(super) fn prepare(
         operation,
         key: h.digest128(),
         reads,
+        samples,
         writes,
         bytes,
     })

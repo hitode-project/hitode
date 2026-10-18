@@ -5,6 +5,7 @@ use adv_device::{
     surface::Rect,
 };
 use std::collections::HashSet;
+pub(super) mod sampling;
 
 pub(super) fn image(operation: &Operation) -> Option<&Image> {
     match operation {
@@ -33,7 +34,7 @@ pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> R
     }
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
-    use crate::shader::interpreter::{self, Constants, Inputs, NoTextures};
+    use crate::shader::interpreter::{self, Constants, NoTextures};
     let mut positions = [[0.; 4]; 64];
     let count;
     let point = d.programmable.as_ref().filter(|p| p.parameters[2][3] != 0);
@@ -72,31 +73,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             bump_luminance: p.vertex_constants.bump_luminance,
         };
         for n in 0..p.vertex_count {
-            let mut input = Inputs::default();
-            for stream in &p.streams {
-                for a in &stream.attributes {
-                    if !matches!(
-                        a.format,
-                        AttributeFormat::Float1
-                            | AttributeFormat::Float2
-                            | AttributeFormat::Float3
-                            | AttributeFormat::Float4
-                    ) {
-                        return None;
-                    }
-                    let mut v = [0., 0., 0., 1.];
-                    let start = (n * stream.stride + a.offset) as usize;
-                    for (component, bytes) in stream
-                        .bytes
-                        .get(start..start + a.format.size() as usize)?
-                        .chunks_exact(4)
-                        .enumerate()
-                    {
-                        v[component] = f32::from_le_bytes(bytes.try_into().ok()?);
-                    }
-                    *input.v.get_mut(a.location as usize)? = v;
-                }
-            }
+            let input = vertex_input(p, n)?;
             let output =
                 interpreter::run(&shader.parsed, &input, &constants, &mut NoTextures).ok()?;
             if point.is_some() && shader.translation.as_ref().ok()?.writes_point_size {
@@ -141,6 +118,59 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
     .clipped(full(&d.target.image));
     Some(d.state.scissor.map_or(r, |s| r.clipped(s)))
 }
+fn vertex_input(
+    p: &adv_device::gpu::ProgrammableDraw,
+    n: u32,
+) -> Option<crate::shader::interpreter::Inputs> {
+    let mut input = crate::shader::interpreter::Inputs::default();
+    for stream in &p.streams {
+        for a in &stream.attributes {
+            if !matches!(
+                a.format,
+                AttributeFormat::Float1
+                    | AttributeFormat::Float2
+                    | AttributeFormat::Float3
+                    | AttributeFormat::Float4
+            ) {
+                return None;
+            }
+            let mut v = [0., 0., 0., 1.];
+            let start = (n * stream.stride + a.offset) as usize;
+            for (component, bytes) in stream
+                .bytes
+                .get(start..start + a.format.size() as usize)?
+                .chunks_exact(4)
+                .enumerate()
+            {
+                v[component] = f32::from_le_bytes(bytes.try_into().ok()?);
+            }
+            *input.v.get_mut(a.location as usize)? = v;
+        }
+    }
+    Some(input)
+}
+#[derive(Default)]
+struct Samples {
+    base: u128,
+    reads: Vec<(sampling::Read, u128)>,
+}
+impl Samples {
+    fn changed(&self, old: &Self, changes: &HashMap<Content, Rect>, bounds: Rect) -> Option<Rect> {
+        if self.base != old.base || self.reads.len() != old.reads.len() {
+            return None;
+        }
+        let mut damage = Rect::default();
+        for ((read, version), (previous, before)) in self.reads.iter().zip(&old.reads) {
+            if read != previous {
+                return None;
+            }
+            if version != before {
+                damage = damage.union(read.mapping.map(*changes.get(&read.source)?, bounds));
+            }
+        }
+        Some(damage)
+    }
+}
 #[derive(Clone, Default)]
 struct Damage {
     rects: [Rect; 4],
@@ -174,6 +204,8 @@ impl Damage {
 #[derive(Default)]
 struct Sequence {
     entries: Vec<(u128, Rect)>,
+    samples: HashMap<usize, Samples>,
+    last_write: u64,
     full: Rect,
     view: Rect,
     shape: u128,
@@ -190,7 +222,7 @@ struct History {
     seen: u64,
 }
 impl History {
-    fn advance(&mut self, force: bool) -> (Rect, Rect) {
+    fn advance(&mut self, force: bool, changes: &HashMap<Content, Rect>) -> (Rect, Rect) {
         let next = &self.next;
         let mut changed = Damage::default();
         if force || self.serial == 0 || self.previous.shape != next.shape {
@@ -201,6 +233,17 @@ impl History {
                 let old = self.previous.entries.get(n);
                 let new = next.entries.get(n);
                 if old != new {
+                    if let (Some((_, old_bounds)), Some((_, bounds)), Some(previous), Some(samples)) = (
+                        old,
+                        new,
+                        self.previous.samples.get(&n),
+                        next.samples.get(&n),
+                    ) && old_bounds == bounds
+                        && let Some(local) = samples.changed(previous, changes, *bounds)
+                    {
+                        changed.add(local);
+                        continue;
+                    }
                     if let Some((_, r)) = old {
                         changed.add(*r);
                     }
@@ -234,6 +277,7 @@ impl History {
         self.slots.retain(|_, n| self.serial - *n <= 8);
         std::mem::swap(&mut self.previous, &mut self.next);
         self.next.entries.clear();
+        self.next.samples.clear();
         result
     }
 }
@@ -246,13 +290,20 @@ pub(super) struct Analysis {
     pub changed: HashMap<u128, Rect>,
     pub planned: bool,
     epoch: u64,
+    ordinal: u64,
 }
 impl Analysis {
+    pub fn written(&self, content: &Content) -> bool {
+        self.histories
+            .get(content)
+            .is_some_and(|h| !h.next.entries.is_empty())
+    }
     pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &Contents) {
         let Some(image) = image(&p.operation) else {
             return;
         };
         let slot = hash(image.view());
+        self.ordinal += 1;
         for &(k, overwrite) in &p.writes {
             self.unsafe_order |= self.reads.contains(&k);
             let s = &mut self.histories.entry(k).or_default().next;
@@ -274,6 +325,7 @@ impl Analysis {
                 }
             };
             s.full = bounds;
+            s.last_write = self.ordinal;
             s.view = full(image);
             s.shape = hash((
                 rect(bounds),
@@ -295,6 +347,30 @@ impl Analysis {
                 (matches!(p.operation, Operation::Draw(_)) && !s.independent)
                     .then(|| contents.get(&k).copied().unwrap_or(0)),
             ));
+            if !p.samples.is_empty() {
+                let external: Vec<_> = p
+                    .reads
+                    .iter()
+                    .filter(|k| !p.samples.iter().any(|r| r.source == **k))
+                    .map(|k| (*k, contents.get(k).copied().unwrap_or(0)))
+                    .collect();
+                s.samples.insert(
+                    s.entries.len(),
+                    Samples {
+                        base: hash((
+                            p.key,
+                            external,
+                            (matches!(p.operation, Operation::Draw(_)) && !s.independent)
+                                .then(|| contents.get(&k).copied().unwrap_or(0)),
+                        )),
+                        reads: p
+                            .samples
+                            .iter()
+                            .map(|r| (*r, contents.get(&r.source).copied().unwrap_or(0)))
+                            .collect(),
+                    },
+                );
+            }
             s.entries.push((key, bounds));
         }
         self.reads
@@ -305,15 +381,23 @@ impl Analysis {
             return;
         }
         self.epoch += 1;
-        for (content, h) in self
+        let mut order: Vec<_> = self
             .histories
-            .iter_mut()
+            .iter()
             .filter(|(_, h)| !h.next.entries.is_empty())
-        {
+            .map(|(k, h)| (*k, h.next.last_write))
+            .collect();
+        order.sort_unstable_by_key(|(_, last)| *last);
+        let mut changes = HashMap::new();
+        for (content, _) in order {
+            let h = self.histories.get_mut(&content).unwrap();
             let slot = h.next.slot;
             let full = h.next.view;
-            let (changed, redraw) =
-                h.advance(force || self.unsafe_order || h.seen + 1 != self.epoch);
+            let (changed, redraw) = h.advance(
+                force || self.unsafe_order || h.seen + 1 != self.epoch,
+                &changes,
+            );
+            changes.insert(content, changed);
             let redraw = redraw.clipped(full);
             h.seen = self.epoch;
             self.clips
@@ -341,8 +425,10 @@ impl Analysis {
     pub fn finish(&mut self) {
         for h in self.histories.values_mut() {
             h.next.entries.clear();
+            h.next.samples.clear();
         }
         self.reads.clear();
+        self.ordinal = 0;
         self.clips.clear();
         self.changed.clear();
         self.unsafe_order = false;
