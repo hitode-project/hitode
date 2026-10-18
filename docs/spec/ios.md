@@ -71,7 +71,7 @@ Finder file sharing places games in Documents, inside the container. Copies use 
 
 ### IOS-APP-4 Game sessions
 
-**Rule**: The launcher MUST create and drive game sessions on the main thread, at most one at a time. A session MUST be paused while the app is inactive, its audio session is interrupted or the overlay holds a pause, following AND-APP-15. While a session runs, the idle timer MUST stay disabled, the app MUST hold landscape, and the status bar and home indicator MUST be hidden.
+**Rule**: The launcher MUST create and drive at most one session on the main thread, pausing on inactivity, audio interruption or overlay pause under AND-APP-15. During play, the app MUST disable idle sleep, hold landscape and hide the status bar. System edge gestures MUST require a confirming swipe, with home-indicator auto-hiding disabled so touches do not reveal it.
 **Applies to**: iOS
 **Verification**: Review — sessions need UIKit's main run loop, which only an application provides.
 

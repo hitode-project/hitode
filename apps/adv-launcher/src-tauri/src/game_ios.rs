@@ -220,7 +220,7 @@ fn set_game_mode(active: bool) {
 
 /// Limits tao's root view controller to landscape, or to all orientations
 /// but upside down, and asks the scene to rotate now: iOS 16 and later only
-/// rotate when asked. A game also hides the status bar and home indicator.
+/// rotate when asked. A game also hides the status bar and defers edge gestures.
 fn hold_landscape(view: &UIView, landscape: bool) {
     // UIInterfaceOrientationMaskLandscape, or AllButUpsideDown.
     let mask: usize = if landscape { 24 } else { 26 };
@@ -239,10 +239,10 @@ fn hold_landscape(view: &UIView, landscape: bool) {
         let _: () = msg_send![controller, setNeedsUpdateOfSupportedInterfaceOrientations];
         // tao's setters request the appearance updates themselves.
         let _: () = msg_send![controller, setPrefersStatusBarHidden: landscape];
-        let _: () = msg_send![controller, setPrefersHomeIndicatorAutoHidden: landscape];
-        // As in Moonlight's stream view: system edge swipes need a second
-        // swipe during play, so touches near an edge reach the game and the
-        // hidden home indicator stays away.
+        // Auto-hiding makes every touch reveal the indicator and suppresses
+        // edge deferral. Keep it dim during play, with a second swipe needed
+        // to activate system gestures, as in Moonlight's touch controls.
+        let _: () = msg_send![controller, setPrefersHomeIndicatorAutoHidden: false];
         let edges: usize = if landscape { 15 } else { 0 };
         let _: () = msg_send![controller, setPreferredScreenEdgesDeferringSystemGestures: edges];
         let scene: *mut AnyObject = msg_send![window, windowScene];

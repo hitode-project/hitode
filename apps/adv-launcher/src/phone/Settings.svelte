@@ -1,7 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
-  import { preview } from "../lib/bridge";
+  import { call, preview } from "../lib/bridge";
   import PhoneSettingsHeader from "../components/PhoneSettingsHeader.svelte";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
@@ -15,6 +15,17 @@
   import { general, setPref as set } from "../lib/settings-form.svelte";
 
   let contentsOpen = $state(false);
+
+  interface Update { current: string; latest: string | null; url: string }
+  let update = $state<"idle" | "checking" | "failed" | Update>("idle");
+  async function checkUpdate() {
+    update = "checking";
+    try {
+      update = (await call<Update | null>("check_update", {}, null)) ?? "failed";
+    } catch {
+      update = "failed";
+    }
+  }
 </script>
 
 <div class="screen">
@@ -216,6 +227,23 @@
           <p>{t("不含文件路径、用户名、截图和存档")}</p>
         </div>
       {/if}
+    </section>
+
+    <section class="sec" aria-labelledby="p-about">
+      <h2 id="p-about">{t("关于")}</h2>
+      <div class="row">
+        <span class="t two">
+          <span>{t("版本")} {device.version}</span>
+          <span class="meta" aria-live="polite">
+            {#if update === "checking"}{t("正在检查…")}
+            {:else if update === "failed"}{t("检查失败，请稍后再试")}
+            {:else if update !== "idle" && update.latest}{t("有新版本 {0}", update.latest)} · <a href={update.url} target="_blank" rel="noreferrer">{t("前往下载")}</a>
+            {:else if update !== "idle"}{t("已是最新版本")}
+            {/if}
+          </span>
+        </span>
+        <button class="quiet" onclick={checkUpdate} disabled={update === "checking"}>{t("检查更新")}</button>
+      </div>
     </section>
 
     <footer>hitode {device.version} · GPL-3.0-or-later</footer>

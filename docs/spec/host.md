@@ -253,7 +253,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-UPDATE-1 Update check
 
-**Rule**: The launcher MUST check for updates only when the user asks in Settings. The check MUST read only the latest hitode-project release and compare its numeric version. External links MUST open only VNDB and hitode-project pages.
+**Rule**: The launcher MUST check for updates only on request from phone or sidebar Settings, both showing the installed version. The check MUST read only the latest hitode-project release and compare its numeric version. External links MUST open only VNDB and hitode-project pages.
 **Applies to**: Launcher
 **Verification**: Test
 
