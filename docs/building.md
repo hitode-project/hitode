@@ -45,6 +45,14 @@ python3 -m unittest discover -s tools/<folder>
 - The workspace suite builds the launcher, so it needs the FFmpeg variables too.
 - The default suite must pass on every supported host, so any failure in it is real. A test that needs particular hardware, a GPU backend or an architecture states it with `required-features`, a `cfg` or `#[ignore = "reason"]`. A test that fails intermittently gets its cause fixed, not a retry.
 
+Pull requests that change code run Linux core checks, ARM64 hardware acceptance
+and the privacy scan. Windows workspace and x87 checks run for shared CPU or x64
+changes, Windows source in either side of the diff, native fixtures, build
+configuration and performance tooling. They also run every Monday at 03:17 UTC
+and through the core workflow's manual trigger. Rust build jobs use four workers
+and cache Cargo dependencies and workspace artifacts; compilation, tests and
+strict Clippy remain gates wherever those checks run.
+
 ## Launcher
 
 The launcher in `apps/adv-launcher` is a Tauri app with a Svelte front end. It builds with `media` on every platform, so it needs the FFmpeg variables.

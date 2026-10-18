@@ -6,6 +6,16 @@ name: ARM64 hardware acceptance
 # Android sigchain/ART coexistence still needs a device and is not covered.
 
 on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'apps/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'tools/cpu/**'
+      - 'tools/performance/**'
+      - '.github/workflows/arm64-acceptance.yml'
   push:
     branches:
       - 'ci/arm64**'
@@ -15,7 +25,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: arm64-acceptance-${{ github.ref }}
+  group: arm64-acceptance-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,6 +48,12 @@ jobs:
           rustup update stable --no-self-update
           { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; echo "page size: $(getconf PAGESIZE)"; lscpu; } > "$RUNNER_TEMP/environment.txt"
           cat "$RUNNER_TEMP/environment.txt"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Lint execution layer
+        run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
       - name: Test execution layer
         run: |
           set -o pipefail
@@ -119,7 +135,7 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     env:
-      CARGO_BUILD_JOBS: '3'
+      CARGO_BUILD_JOBS: '4'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -129,6 +145,10 @@ jobs:
           rustup update stable --no-self-update
           { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; echo "page size: $(sysctl -n hw.pagesize)"; sysctl -n machdep.cpu.brand_string; } > "$RUNNER_TEMP/environment.txt"
           cat "$RUNNER_TEMP/environment.txt"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          cache-workspace-crates: true
       - name: Build execution layer and tests
         run: |
           set -o pipefail
