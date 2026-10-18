@@ -18,8 +18,10 @@
     onlibrary: () => void;
     onmenu: () => void;
     onkeyboard: () => void;
+    /** The game's Ctrl setting is 切换: a tap latches Ctrl instead of holding it. */
+    latchCtrl: boolean;
   }
-  let { layout, onlibrary, onmenu, onkeyboard }: Props = $props();
+  let { layout, latchCtrl, onlibrary, onmenu, onkeyboard }: Props = $props();
 
   const arrangement = $derived(arrange(layout));
   const trackpad = $derived(prefs.touchMode === "trackpad");
@@ -79,13 +81,14 @@
       case "key":
         void call("game_key", { key: action.key, down: held }, null).catch(() => {});
         return;
+      case "ctrl":
+        if (latchCtrl && !held) return;
+        ctrl = latchCtrl ? !ctrl : held;
+        void call("game_key", { key: 0x11, down: ctrl }, null).catch(() => {});
+        return;
     }
     if (!held) return;
     switch (action.kind) {
-      case "ctrl":
-        ctrl = !ctrl;
-        void call("game_key", { key: 0x11, down: ctrl }, null).catch(() => {});
-        return;
       case "wheel":
         void call("game_wheel", { notches: action.notches }, null).catch(() => {});
         return;

@@ -29,7 +29,9 @@ pub struct Folder {
 
 #[derive(Deserialize, Serialize)]
 pub struct PickedFile {
-    /// A private copy of the picked file; `None` when the user cancelled.
+    /// The picked file, `None` when the user cancelled. iOS hands over a
+    /// copy in its temporary inbox; Android a shared-storage path it can
+    /// reach, or else a copy under `dest`.
     pub path: Option<PathBuf>,
 }
 
@@ -52,9 +54,9 @@ impl<R: Runtime> Storage<R> {
         self.call("pickFolder", json!({})).await
     }
 
-    /// iOS only: one file, copied by Files into the app's temporary inbox.
-    pub async fn pick_file(&self) -> Reply<PickedFile> {
-        self.call("pickFile", json!({})).await
+    /// One file of any type; see `PickedFile` for where it ends up.
+    pub async fn pick_file(&self, dest: &std::path::Path) -> Reply<PickedFile> {
+        self.call("pickFile", json!({ "dest": dest })).await
     }
 
     pub async fn copy_folder(

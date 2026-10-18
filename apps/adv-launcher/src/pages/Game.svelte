@@ -435,7 +435,7 @@
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
   {:else if phone && screen.layout}
     {#if !stopping}
-      <TouchControls layout={screen.layout} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <TouchControls layout={screen.layout} latchCtrl={playback(gameId).toggle} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
   {:else if phone}
     <button class="grip fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}><span></span></button>

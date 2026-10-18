@@ -23,6 +23,7 @@ import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.Files
 import kotlin.concurrent.thread
 
 @InvokeArg
@@ -36,6 +37,11 @@ class CopyArgs {
     lateinit var uri: String
     lateinit var dest: String
     var progress: Channel? = null
+}
+
+@InvokeArg
+class PickFileArgs {
+    lateinit var dest: String
 }
 
 @InvokeArg
@@ -120,6 +126,66 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         } catch (error: Exception) {
             invoke.reject(error.message)
         }
+    }
+
+    /** One file: its real path when shared storage is reachable, else a private copy. */
+    @Command
+    fun pickFile(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*")
+            startActivityForResult(invoke, intent, "fileResult")
+        } catch (error: Exception) {
+            invoke.reject(error.message)
+        }
+    }
+
+    @ActivityCallback
+    fun fileResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            invoke.resolve(JSObject().put("path", null))
+            return
+        }
+        thread(name = "file-copy") {
+            try {
+                val uri = result.data?.data ?: throw IOException("No file selected")
+                val direct = directPath(uri)
+                if (direct != null) {
+                    invoke.resolve(JSObject().put("path", direct))
+                    return@thread
+                }
+                val dest = File(invoke.parseArgs(PickFileArgs::class.java).dest)
+                val name = resolver.query(uri, arrayOf(Document.COLUMN_DISPLAY_NAME), null, null, null)
+                    ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                    ?: throw IOException("Cannot read the file name")
+                // A folder per copy keeps the original name without collisions.
+                val folder = Files.createTempDirectory(dest.toPath(), "file-").toFile()
+                val file = File(folder, checkedName(name))
+                try {
+                    val input = resolver.openInputStream(uri) ?: throw IOException("Cannot open file")
+                    input.use { file.outputStream().use { output -> it.copyTo(output, 65536) } }
+                } catch (error: Exception) {
+                    folder.deleteRecursively()
+                    throw error
+                }
+                invoke.resolve(JSObject().put("path", file.path))
+            } catch (error: Exception) {
+                invoke.reject(error.message)
+            }
+        }
+    }
+
+    /** Shared storage and Downloads documents name a real file under all-files access. */
+    private fun directPath(uri: Uri): String? {
+        if (!granted() || !DocumentsContract.isDocumentUri(activity, uri)) return null
+        val id = DocumentsContract.getDocumentId(uri)
+        val path = when (uri.authority) {
+            "com.android.externalstorage.documents" -> primaryPath(id, true)
+            "com.android.providers.downloads.documents" -> id.removePrefix("raw:").takeIf { id.startsWith("raw:") }
+            else -> null
+        }
+        return path?.takeIf { File(it).isFile }
     }
 
     private fun entries(tree: Uri, parent: String, signal: CancellationSignal): List<Entry> {

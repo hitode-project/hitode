@@ -191,7 +191,7 @@ fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String
 #[tauri::command]
 pub async fn import_pairing_file(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_storage::StorageExt;
-    let Some(source) = app.storage().pick_file().await?.path else {
+    let Some(source) = app.storage().pick_file(&std::env::temp_dir()).await?.path else {
         return Ok(false);
     };
     let bytes = std::fs::read(&source);

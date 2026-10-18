@@ -132,7 +132,9 @@ class MainActivity : TauriActivity() {
     /**
      * Opens a primary-storage folder in the system Files app (DocumentsUI),
      * asked for by name so file-handling apps do not offer themselves.
-     * `relative` is the folder below the storage root.
+     * `relative` is the folder below the storage root. DocumentsUI stacks
+     * every ancestor folder for Back, so it opens as its own task beside the
+     * launcher (split screen on large screens) rather than on top of it.
      */
     fun revealFolder(relative: String): Boolean {
         val uri = DocumentsContract.buildDocumentUri(
@@ -141,6 +143,7 @@ class MainActivity : TauriActivity() {
         )
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
         val files = packageManager.queryIntentActivities(intent, 0)
             .firstOrNull { it.activityInfo.packageName.endsWith(".documentsui") }
             ?: return false
