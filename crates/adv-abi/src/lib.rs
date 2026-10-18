@@ -591,15 +591,15 @@ impl Registry {
             } else {
                 signature::lookup(module, name)
             };
-            if let Some(metadata) = metadata {
-                if metadata.conv != Some(entry.host.conv) {
-                    conflicts.push(SignatureConflict {
-                        module: module.clone(),
-                        name: name.clone(),
-                        registered: entry.host.conv,
-                        metadata: metadata.conv,
-                    });
-                }
+            if let Some(metadata) = metadata
+                && metadata.conv != Some(entry.host.conv)
+            {
+                conflicts.push(SignatureConflict {
+                    module: module.clone(),
+                    name: name.clone(),
+                    registered: entry.host.conv,
+                    metadata: metadata.conv,
+                });
             }
         }
         conflicts.sort_by(|a, b| (&a.module, &a.name).cmp(&(&b.module, &b.name)));

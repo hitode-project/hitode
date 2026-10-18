@@ -61,13 +61,12 @@ fn subclass<B: TestCpu>(cpu: B) {
         ("SetWindowLongW", 3),
         ("CallWindowProcW", 5),
     ] {
-        assert_eq!(
+        assert!(
             t.machine
                 .sys
                 .thunks
                 .resolver()
-                .implemented("user32.dll", name),
-            true
+                .implemented("user32.dll", name)
         );
         let registry = t.machine.sys.thunks.resolver();
         let binding = registry.host_fn("user32.dll", name).unwrap();

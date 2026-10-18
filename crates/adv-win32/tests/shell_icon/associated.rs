@@ -208,7 +208,7 @@ fn associated_and_existing_extractors_read_dirty_shared_file_bytes_without_flush
         let page = section.page(0);
         f.machine
             .cpu
-            .map_file_pages(VIEW, &[page.clone()], Prot::RW, false)
+            .map_file_pages(VIEW, std::slice::from_ref(&page), Prot::RW, false)
             .unwrap();
         let before = f.machine.sys.objects.object_count();
         let path = f.path("図像.ico", true);

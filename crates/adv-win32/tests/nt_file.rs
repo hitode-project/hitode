@@ -1230,7 +1230,7 @@ fn read_coherence_and_guards<B: Backend>(cpu: B) {
         .unwrap();
     let page = section.page(0);
     m.cpu
-        .map_file_pages(VIEW, &[page.clone()], Prot::RW, false)
+        .map_file_pages(VIEW, std::slice::from_ref(&page), Prot::RW, false)
         .unwrap();
     m.cpu.write(READ_ONLY, &[0x77; 32]).unwrap();
     let seek = m

@@ -89,7 +89,7 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
     #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     emit_metal_pixels(&pixels);
     let expected = expected.colors[0].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32);
-    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+    for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
         for channel in 0..4 {
             let actual = i32::from(pixel[[2, 1, 0, 3][channel]]);
             assert!(

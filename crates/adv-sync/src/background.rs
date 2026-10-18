@@ -272,7 +272,7 @@ impl Sender {
         if self
             .shared
             .gate
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |gate| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |gate| {
                 (gate & CLOSED == 0).then_some(gate + 1)
             })
             .is_err()
@@ -333,7 +333,7 @@ impl Builder {
         Ok(Self {
             shared: Arc::new(Shared {
                 id: NEXT_SERVICE
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                     .map_err(|_| std::io::Error::other("background affinity IDs exhausted"))?,
                 started: AtomicBool::new(false),
                 gate: AtomicUsize::new(0),

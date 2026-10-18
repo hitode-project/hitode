@@ -424,10 +424,10 @@ fn execute_decoded(
                 .as_deref()
                 .is_some_and(|c| *c == MmxCache::Coherent);
             let step = plan.execute(state, memory, coherent);
-            if let Some(cache) = deferred_mmx {
-                if coherent || step == Step::Executed {
-                    *cache = MmxCache::Coherent;
-                }
+            if let Some(cache) = deferred_mmx
+                && (coherent || step == Step::Executed)
+            {
+                *cache = MmxCache::Coherent;
             }
             let completed = step == Step::Executed;
             return Execution {

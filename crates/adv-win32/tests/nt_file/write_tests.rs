@@ -164,7 +164,7 @@ fn write_positions<B: Backend>(cpu: B) {
         .unwrap();
     let page = section.page(0);
     m.cpu
-        .map_file_pages(VIEW, &[page.clone()], Prot::RW, false)
+        .map_file_pages(VIEW, std::slice::from_ref(&page), Prot::RW, false)
         .unwrap();
     let cases = [
         ("ZwWriteFile", handle, None, b"save".as_slice(), 4),

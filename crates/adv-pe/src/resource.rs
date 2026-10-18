@@ -178,7 +178,7 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
         encoded_entries.resize(count as usize * 8, 0);
         self.read_bytes(add(directory, 16)?, &mut encoded_entries)?;
         reserve(&mut entries, count as usize)?;
-        for entry in encoded_entries.chunks_exact(8) {
+        for entry in encoded_entries.as_chunks::<8>().0.iter() {
             let name = u32::from_le_bytes(entry[..4].try_into().unwrap());
             let target = u32::from_le_bytes(entry[4..].try_into().unwrap());
             let id = if name & 0x8000_0000 != 0 {

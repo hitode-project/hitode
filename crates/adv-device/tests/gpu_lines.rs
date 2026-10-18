@@ -71,7 +71,8 @@ fn integer_lines_match_reference_pixels_for_both_endpoint_states() {
         for &(x, y, argb) in case.pixels {
             expected[(y * SIZE + x) as usize] = argb;
         }
-        for (at, (actual, &expected)) in pixels.chunks_exact(4).zip(&expected).enumerate() {
+        for (at, (actual, &expected)) in pixels.as_chunks::<4>().0.iter().zip(&expected).enumerate()
+        {
             let expected = expected.to_le_bytes();
             assert_eq!(
                 actual[..3].iter().any(|&c| c != 0),

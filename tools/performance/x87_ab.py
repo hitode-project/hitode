@@ -19,7 +19,8 @@ import statistics
 import subprocess
 
 WORKLOADS = {"load_store": 2, "add_sub": 4, "mul_div": 4,
-             "compare_exchange": 6, "pcm": 3, "interpolation": 5}
+             "compare_exchange": 6, "pcm": 3, "interpolation": 5,
+             "interleaved": 6}
 FIELDS = ["mode", "workload", "samples", "iterations", "x87_ops",
           "median_ns_per_op", "p95_ns_per_op", "max_ns_per_op",
           "compile_ms", "native_bytes", "checksum"]

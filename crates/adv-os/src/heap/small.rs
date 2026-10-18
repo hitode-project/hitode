@@ -29,7 +29,9 @@ impl Slab {
         (self.class + 1) * 8 + 8
     }
     fn contains(self, addr: u32) -> bool {
-        addr >= self.base + 8 && addr < self.end && (addr - self.base - 8) % self.stride() == 0
+        addr >= self.base + 8
+            && addr < self.end
+            && (addr - self.base - 8).is_multiple_of(self.stride())
     }
 }
 pub(super) fn header(cpu: &dyn Guest, heap: u32, slab: Slab, addr: u32) -> Option<u32> {

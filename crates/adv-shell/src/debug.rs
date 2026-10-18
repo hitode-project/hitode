@@ -473,13 +473,26 @@ struct Classified {
     host: Option<usize>,
 }
 
+/// A host address inside translated code: the unit, the guest instruction
+/// when the unit recorded marks, and the code part.
+#[derive(Clone, Copy)]
+struct Spot {
+    unit: u32,
+    eip: Option<u32>,
+    part: &'static str,
+}
+
 #[cfg(target_arch = "aarch64")]
-fn locate(pc: usize, at_ns: u128) -> Option<adv_runtime::JitLocation> {
-    adv_runtime::jit_map_locate(pc, at_ns)
+fn locate(pc: usize, at_ns: u128) -> Option<Spot> {
+    adv_runtime::jit_map_locate(pc, at_ns).map(|location| Spot {
+        unit: location.unit,
+        eip: location.eip,
+        part: part_name(location.part),
+    })
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn locate(_: usize, _: u128) -> Option<adv_runtime::JitLocation> {
+fn locate(_: usize, _: u128) -> Option<Spot> {
     None
 }
 
@@ -493,6 +506,7 @@ fn stub(_: usize) -> Option<&'static str> {
     None
 }
 
+#[cfg(target_arch = "aarch64")]
 fn part_name(part: adv_runtime::JitPart) -> &'static str {
     match part {
         adv_runtime::JitPart::Body => "body",
@@ -520,7 +534,7 @@ fn classify(sample: &profile::Sample) -> Classified {
             kind: Kind::Guest,
             eip: Some(location.unit),
             inst: location.eip,
-            part: part_name(location.part).into(),
+            part: location.part.into(),
             host: None,
         };
     }
@@ -724,30 +738,31 @@ fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
     )];
     for (eip, parts) in rows.into_iter().take(HOT_INSTRUCTIONS) {
         #[cfg(target_arch = "aarch64")]
-        let (form, sizes) = (
-            runtime
+        let (form, bytes) = {
+            let sizes = adv_runtime::jit_map_code_of(eip);
+            let form = runtime
                 .machine
                 .cpu
                 .executor()
                 .instruction_form(eip)
-                .map_or_else(|| "-".into(), |code| format!("{code:?}")),
-            adv_runtime::jit_map_code_of(eip),
-        );
+                .map_or_else(|| "-".into(), |code| format!("{code:?}"));
+            let bytes = [
+                adv_runtime::JitPart::Body,
+                adv_runtime::JitPart::Cold,
+                adv_runtime::JitPart::X87Entry,
+                adv_runtime::JitPart::X87Publish,
+            ]
+            .map(|part| {
+                sizes
+                    .iter()
+                    .find(|&&(at, _)| at == part)
+                    .map_or(0, |&(_, bytes)| bytes)
+                    .to_string()
+            });
+            (form, bytes)
+        };
         #[cfg(not(target_arch = "aarch64"))]
-        let (form, sizes): (String, Vec<(adv_runtime::JitPart, usize)>) = ("-".into(), Vec::new());
-        let bytes = [
-            adv_runtime::JitPart::Body,
-            adv_runtime::JitPart::Cold,
-            adv_runtime::JitPart::X87Entry,
-            adv_runtime::JitPart::X87Publish,
-        ]
-        .map(|part| {
-            sizes
-                .iter()
-                .find(|&&(at, _)| at == part)
-                .map_or(0, |&(_, bytes)| bytes)
-                .to_string()
-        });
+        let (form, bytes) = (String::from("-"), ["0"; 4].map(String::from));
         text.push(format!(
             "{}\t{eip:#010x}\t{}\t{form}\t{}\t{}",
             parts.iter().sum::<usize>(),

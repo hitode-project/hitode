@@ -133,14 +133,17 @@ fn put32(bytes: &mut [u8], offset: usize, value: u32) {
 }
 
 fn dib(size: u32, color: [u8; 4]) -> Vec<u8> {
-    let mask = ((size + 31) / 32) * 4;
+    let mask = size.div_ceil(32) * 4;
     let mut bytes = vec![0; (40 + size * size * 4 + mask * size) as usize];
     put32(&mut bytes, 0, 40);
     put32(&mut bytes, 4, size);
     put32(&mut bytes, 8, size * 2);
     put16(&mut bytes, 12, 1);
     put16(&mut bytes, 14, 32);
-    for pixel in bytes[40..40 + (size * size * 4) as usize].chunks_exact_mut(4) {
+    for pixel in bytes[40..40 + (size * size * 4) as usize]
+        .as_chunks_mut::<4>()
+        .0
+    {
         pixel.copy_from_slice(&color);
     }
     bytes

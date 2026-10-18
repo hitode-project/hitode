@@ -95,7 +95,7 @@ impl Default for NamespaceState {
     fn default() -> Self {
         Self {
             next: 0x100,
-            last: u32::MAX & !3,
+            last: !3,
             aliases: 0,
         }
     }
@@ -147,7 +147,7 @@ impl Objects {
     }
     pub fn with_limits(limits: ObjectLimits) -> Self {
         let table = NEXT_TABLE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("object table identity space exhausted");
         Self {
             table,
@@ -294,7 +294,7 @@ impl Objects {
     }
 
     pub fn new_namespace(&mut self) -> Option<Namespace> {
-        self.new_namespace_in(0x104, u32::MAX & !3)
+        self.new_namespace_in(0x104, !3)
     }
 
     /// Select a bounded, inclusive range for automatic aliases. Explicit

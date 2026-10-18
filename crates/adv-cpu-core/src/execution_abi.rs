@@ -16,7 +16,7 @@ pub const ARM64_WINDOW: u8 = 28;
 /// it is not silently interpreted as guest EFLAGS. Unsupported extended state
 /// must be rejected by the platform adapter before claiming the exception.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct HostContextSnapshot {
     pub gpr: [u64; 32],
     pub sp: u64,
@@ -29,23 +29,6 @@ pub struct HostContextSnapshot {
     pub simd_count: u32,
     /// 1 = x86_64, 2 = aarch64. Zero is not a valid captured context.
     pub architecture: u32,
-}
-
-impl Default for HostContextSnapshot {
-    fn default() -> Self {
-        Self {
-            gpr: [0; 32],
-            sp: 0,
-            pc: 0,
-            flags: 0,
-            simd: [[0; 16]; 32],
-            fpcr: 0,
-            fpsr: 0,
-            gpr_count: 0,
-            simd_count: 0,
-            architecture: 0,
-        }
-    }
 }
 
 /// A recoverable value, never an instruction to reread mutable guest memory.

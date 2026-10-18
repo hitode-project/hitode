@@ -339,7 +339,7 @@ impl FramePin {
     fn new(image: &Image) -> Result<Arc<Self>, Error> {
         image
             .frame_pins
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_add(1)
             })
             .map_err(|_| Error::Busy)?;
@@ -1719,7 +1719,7 @@ impl Gpu {
         let submission_guard = context.submission_for(SwitchReason::Readback)?;
         self.own(image)?;
         self.readbacks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < self.readback_limit).then_some(count + 1)
             })
             .map_err(|_| Error::Busy)?;

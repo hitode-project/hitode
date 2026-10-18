@@ -192,8 +192,8 @@ impl Memory {
                 use crate::virtual_memory::GuestAccess;
                 let allows = |page: usize| {
                     let offset = slack + page * PAGE_SIZE;
-                    u8::from(view.host_allows(offset, GuestAccess::Read)) * READ
-                        | u8::from(view.host_allows(offset, GuestAccess::Write)) * WRITE
+                    (u8::from(view.host_allows(offset, GuestAccess::Read)) * READ)
+                        | (u8::from(view.host_allows(offset, GuestAccess::Write)) * WRITE)
                 };
                 let span = view.host_page_size() / PAGE_SIZE;
                 return self.fast.snapshot(
@@ -2295,7 +2295,7 @@ mod file_page_tests {
         let mut memory = Memory::reserve(0, 0x30000).unwrap();
         for at in [0x10000, 0x20000] {
             memory
-                .map_file_pages(at, &[page.clone()], READ | WRITE, false)
+                .map_file_pages(at, std::slice::from_ref(&page), READ | WRITE, false)
                 .unwrap();
         }
         assert!(memory.shared_range(0x10000, 4));
@@ -2338,10 +2338,10 @@ mod file_page_tests {
         let page = crate::backend::FilePage::new([0x17; PAGE_SIZE]);
         let mut memory = Memory::reserve(0, 0x30000).unwrap();
         memory
-            .map_file_pages(0x10000, &[page.clone()], READ | WRITE, true)
+            .map_file_pages(0x10000, std::slice::from_ref(&page), READ | WRITE, true)
             .unwrap();
         memory
-            .map_file_pages(0x20000, &[page.clone()], READ, false)
+            .map_file_pages(0x20000, std::slice::from_ref(&page), READ, false)
             .unwrap();
         memory.prepare_native_access(0x10000, 4, false).unwrap();
         assert!(memory.shared_range(0x10000, 4));

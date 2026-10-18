@@ -101,7 +101,7 @@ fn completed(jit: &mut Executor, interpreter: &mut Executor, unicorn: &mut Execu
 
 fn words(values: [i16; 8]) -> [u8; 16] {
     let mut bytes = [0; 16];
-    for (chunk, value) in bytes.chunks_exact_mut(2).zip(values) {
+    for (chunk, value) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(values) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes

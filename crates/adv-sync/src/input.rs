@@ -17,7 +17,7 @@ impl KeyState {
         let Some(value) = self.keys.get(key as usize) else {
             return;
         };
-        let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             let toggle = if pressed && old & 0x80 == 0 && matches!(key, 0x14 | 0x90 | 0x91) {
                 old ^ 1
             } else {
@@ -38,7 +38,7 @@ impl KeyState {
     }
     pub fn release_all(&self) {
         for key in &self.keys {
-            let _ = key.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let _ = key.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 (old & 0x80 != 0).then(|| (old & !0xff).wrapping_add(0x100) | (old & 1))
             });
         }

@@ -95,7 +95,7 @@ fn finish(jit: &mut Executor, interpreter: &mut Executor, uc: &mut Executor) {
 
 fn dwords(values: [i32; 4]) -> [u8; 16] {
     let mut out = [0; 16];
-    for (lane, value) in out.chunks_exact_mut(4).zip(values) {
+    for (lane, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
         lane.copy_from_slice(&value.to_le_bytes());
     }
     out
@@ -103,7 +103,7 @@ fn dwords(values: [i32; 4]) -> [u8; 16] {
 
 fn words(values: [i16; 8]) -> [u8; 16] {
     let mut out = [0; 16];
-    for (lane, value) in out.chunks_exact_mut(2).zip(values) {
+    for (lane, value) in out.as_chunks_mut::<2>().0.iter_mut().zip(values) {
         lane.copy_from_slice(&value.to_le_bytes());
     }
     out

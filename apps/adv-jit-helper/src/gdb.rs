@@ -74,7 +74,7 @@ pub fn stopped_thread(reply: &str) -> std::result::Result<&str, String> {
 
 /// Little-endian hex bytes, as register and memory reads return them.
 pub fn le_value(hex: &str) -> Option<u64> {
-    if hex.is_empty() || hex.len() > 16 || hex.len() % 2 != 0 {
+    if hex.is_empty() || hex.len() > 16 || !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut value = 0u64;

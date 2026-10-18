@@ -149,12 +149,11 @@ fn reason(op: &NativeX87, state: &CpuState, memory: &Memory) -> Reason {
                 return Reason::Operand;
             }
         }
-        Fast::Load(source) => {
-            if load(source, i, state, memory, i32::MAX).is_none()
-                || x87.physical_tag(x87.top().wrapping_sub(1) & 7) != 3
-            {
-                return Reason::Operand;
-            }
+        Fast::Load(source)
+            if (load(source, i, state, memory, i32::MAX).is_none()
+                || x87.physical_tag(x87.top().wrapping_sub(1) & 7) != 3) =>
+        {
+            return Reason::Operand;
         }
         _ => {}
     }

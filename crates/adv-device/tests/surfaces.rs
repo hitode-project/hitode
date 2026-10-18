@@ -208,7 +208,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     store.set_video_layer(7, Some(scaled), &memory).unwrap();
     assert!(consumer.update());
     consumer.current().snapshot(&mut composed).unwrap();
-    for row in composed.bgra.chunks_exact(20) {
+    for row in composed.bgra.as_chunks::<20>().0 {
         assert_eq!(
             row,
             &[
@@ -1156,7 +1156,11 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
             .unwrap();
         let row = memory.read(surfaces[rgb].pixels, 36).unwrap();
         assert_eq!(
-            row.chunks_exact(4).map(|p| p[0]).collect::<Vec<_>>(),
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[0])
+                .collect::<Vec<_>>(),
             [8, 7, 6, 5, 4, 3, 2, 1, 0]
         );
         surfaces
@@ -1192,7 +1196,9 @@ fn packed_blit_snapshots_overlaps_and_converts_mirrored_palette_indices() {
             surfaces
                 .presenter
                 .bgra
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| p[0])
                 .collect::<Vec<_>>(),
             [8, 7, 6, 5, 4, 3, 2, 1, 0]

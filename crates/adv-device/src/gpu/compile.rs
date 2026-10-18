@@ -44,7 +44,7 @@ impl<T: Send + Sync + 'static> Compile<T> {
             counters,
         }));
         if RESERVED
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|v| *v <= BYTES)
             })
             .is_ok()

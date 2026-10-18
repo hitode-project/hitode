@@ -299,7 +299,7 @@ fn cold(functions: u32) -> Workload {
         a.mov(eax, dword_ptr(slot)).unwrap();
         a.add(eax, i.wrapping_mul(2_654_435_761)).unwrap();
         a.xor(eax, ebx).unwrap();
-        a.rol(eax, (i % 31 + 1) as u32).unwrap();
+        a.rol(eax, i % 31 + 1).unwrap();
         a.mov(dword_ptr(slot), eax).unwrap();
         a.lea(edx, eax + ecx * 4 + (i as i32 & 0x7ff)).unwrap();
         a.sub(edx, ebx).unwrap();

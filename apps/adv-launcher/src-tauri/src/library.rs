@@ -769,7 +769,7 @@ mod tests {
             // An unreadable executable is skipped rather than failing the folder.
             use std::os::unix::fs::PermissionsExt;
             pe(&dir, "locked.exe", 0x14c, 500);
-            fs::set_permissions(dir.join("locked.exe"), fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(dir.join("locked.exe"), fs::Permissions::from_mode(0o0)).unwrap();
         }
         let found = inspect(&lib.known(), &dir).unwrap();
         let arch: Vec<_> = found.exes.iter().map(|e| e.arch).collect();

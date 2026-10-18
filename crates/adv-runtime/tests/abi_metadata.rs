@@ -205,14 +205,14 @@ fn all_fronts_signature_audit() {
             if reason == "uncategorized metadata gap" {
                 uncategorized.push(name);
             }
-            if let Some(export) = name.strip_prefix("kernelbase.dll!") {
-                if let Some(signature) = adv_abi::signature::lookup("kernel32.dll", export) {
-                    assert_eq!(
-                        Some(registry.get("kernelbase.dll", export).unwrap().conv),
-                        signature.conv,
-                        "{name}"
-                    );
-                }
+            if let Some(export) = name.strip_prefix("kernelbase.dll!")
+                && let Some(signature) = adv_abi::signature::lookup("kernel32.dll", export)
+            {
+                assert_eq!(
+                    Some(registry.get("kernelbase.dll", export).unwrap().conv),
+                    signature.conv,
+                    "{name}"
+                );
             }
             if let Some(conv) = name.strip_prefix("vcomp140.dll!").and_then(vcomp_conv) {
                 let export = name.split_once('!').unwrap().1;
