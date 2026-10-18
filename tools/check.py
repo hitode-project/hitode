@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The one pre-commit check: formatting, whitespace, privacy, layering, specs and the launcher frontend.
+"""The one pre-commit check: formatting, whitespace, privacy, layering, specs, docs and the launcher frontend.
 
   python tools/check.py                 # what is staged (the pre-commit hook runs this)
   python tools/check.py --all           # every workspace crate (cargo fmt --check)
@@ -113,6 +113,7 @@ def check(everything: bool) -> bool:
     ok &= run("privacy", [sys.executable, "tools/privacy/scan.py"])
     ok &= run("layering", [sys.executable, "tools/layering/check_layers.py"])
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
+    ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
     ok &= launcher(everything)
     return ok
 
