@@ -135,8 +135,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
-      HOMEBREW_NO_INSTALL_CLEANUP: '1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -146,11 +144,19 @@ jobs:
           rustup update stable --no-self-update
           test "$(uname -m)" = arm64
           { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; getconf PAGESIZE; } | tee "$RUNNER_TEMP/workspace-environment.txt"
-      - name: Install FFmpeg 8
+      - name: Cache pinned FFmpeg
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target/macos-ffmpeg/*/install
+            target/macos-ffmpeg/*.tar.xz
+          key: macos-arm64-ffmpeg-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
+      - name: Build pinned FFmpeg libraries
         timeout-minutes: 5
         run: |
-          brew install ffmpeg@8
-          echo "FFMPEG_DIR=$(brew --prefix ffmpeg@8)" >> "$GITHUB_ENV"
+          python3 tools/macos/build.py --ffmpeg-only --jobs 3
+          prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
+          echo "FFMPEG_DIR=${prefix[0]}" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -169,6 +175,7 @@ jobs:
           path: |
             ${{ runner.temp }}/workspace-environment.txt
             ${{ runner.temp }}/workspace-clippy.txt
+            target/scratch/macos-package/build-static.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -201,8 +208,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
-      HOMEBREW_NO_INSTALL_CLEANUP: '1'
       WORKSPACE_PACKAGES: ${{ matrix.packages }}
       WORKSPACE_FEATURES: ${{ matrix.features }}
       WORKSPACE_GROUP: ${{ matrix.group }}
@@ -216,13 +221,21 @@ jobs:
           rustup update stable --no-self-update
           test "$(uname -m)" = arm64
           { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; getconf PAGESIZE; } | tee "$RUNNER_TEMP/workspace-environment.txt"
-      - name: Install FFmpeg 8
+      - name: Cache pinned FFmpeg
+        if: matrix.media
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target/macos-ffmpeg/*/install
+            target/macos-ffmpeg/*.tar.xz
+          key: macos-arm64-ffmpeg-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
+      - name: Build pinned FFmpeg libraries
         if: matrix.media
         timeout-minutes: 5
         run: |
-          brew install ffmpeg@8
-          echo "FFMPEG_DIR=$(brew --prefix ffmpeg@8)" >> "$GITHUB_ENV"
-          echo "ADV_TEST_FFMPEG=$(brew --prefix ffmpeg@8)/bin/ffmpeg" >> "$GITHUB_ENV"
+          python3 tools/macos/build.py --ffmpeg-only --jobs 3
+          prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
+          echo "FFMPEG_DIR=${prefix[0]}" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.group == 'frontends'
@@ -273,6 +286,7 @@ jobs:
             ${{ runner.temp }}/workspace-build.txt
             ${{ runner.temp }}/workspace-tests.txt
             target/workspace-ci/cargo-timings/
+            target/scratch/macos-package/build-static.log
           if-no-files-found: ignore
           retention-days: 14
 

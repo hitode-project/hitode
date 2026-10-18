@@ -53,6 +53,8 @@ another group. Tests use the development profile without debug information;
 third-party dependencies retain the optimized settings in `Cargo.toml`.
 Compilation and execution are separate steps, limited to 12 and 5 minutes, with
 a 20-minute job limit. Artifacts contain verbose build logs and Cargo timings.
+Media jobs reuse the pinned, decode-only FFmpeg build used by release packages;
+its libraries are cached independently from Cargo.
 The full DAC rate matrices run every Monday at 03:17 UTC or through the manual
 `slow-tests` input. Master pushes populate caches for later pull requests.
 
