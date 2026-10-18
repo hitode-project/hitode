@@ -37,8 +37,10 @@ fn open(
         return failure(env, output, ACCESS_VIOLATION);
     }
     let fields: Vec<_> = bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     // Capture failures leave the PHANDLE untouched, matching native ordering.
     if fields[0] != 24 {

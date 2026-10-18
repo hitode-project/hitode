@@ -1034,7 +1034,7 @@ fn seeking(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> {
         }
         "SetRate" => {
             let rate = arg_f64(env, 1);
-            if !(rate > 0.0) {
+            if rate.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                 return r(E_INVALIDARG);
             }
             let now = env.sys.clock.now_us();

@@ -107,10 +107,11 @@ fn finish(env: &mut Env<'_>) -> Outcome {
     if flags & 0x80 == 0 {
         notifications.push_back([owner, 0x212, 1, 0]);
     }
-    if !failed && flags & 0x100 == 0 {
-        if let Some(command) = choice {
-            notifications.push_back([owner, 0x111, command.id & 0xffff, 0]);
-        }
+    if !failed
+        && flags & 0x100 == 0
+        && let Some(command) = choice
+    {
+        notifications.push_back([owner, 0x111, command.id & 0xffff, 0]);
     }
     super::super::message::send_all(env, notifications, move |_env| {
         if failed {

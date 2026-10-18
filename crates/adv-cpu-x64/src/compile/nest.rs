@@ -603,10 +603,12 @@ fn nest(
         }
         inner_written |= write;
         let memory = factory.info(i).used_memory().to_vec();
-        if i.mnemonic() != M::Lea && i.mnemonic() != M::Nop && !memory.is_empty() {
-            if memory.len() != 1 || !plan.proven.contains_key(&i.ip32()) {
-                return None;
-            }
+        if i.mnemonic() != M::Lea
+            && i.mnemonic() != M::Nop
+            && !memory.is_empty()
+            && (memory.len() != 1 || !plan.proven.contains_key(&i.ip32()))
+        {
+            return None;
         }
     }
     for i in &glue {
@@ -665,13 +667,13 @@ fn nest(
         )
     });
     let mut next = seed.clone();
-    for index in 0..8 {
+    for (index, value) in next.iter_mut().enumerate() {
         if plan.inductions & 1 << index != 0 {
-            next[index] = next[index]
+            *value = value
                 .take()
                 .map(|a| a.plus(&trip.clone().scaled(plan.steps[index] as u32)));
         } else if inner_written & 1 << index != 0 {
-            next[index] = None;
+            *value = None;
         }
     }
     for i in suffix.iter().chain(&prefix) {

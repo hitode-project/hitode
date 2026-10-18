@@ -222,7 +222,7 @@ fn automatic_audio_graph_owns_the_file_and_negotiates_pcm_without_a_video_render
     let input = &state.pins[&renderer.pins[0]];
     assert_ne!(input.peer, 0);
     assert_eq!(input.mt.as_ref().unwrap().sub, MEDIASUBTYPE_PCM);
-    assert_eq!(duration(&mut env(&mut m), graph), 1_000_000);
+    assert_eq!(duration(&env(&mut m), graph), 1_000_000);
     let outcome = super::super::render::pin(&mut env(&mut m), graph, output);
     assert_eq!(finish(&mut m, outcome), VFW_E_ALREADY_CONNECTED);
     let file_face = query(&mut m, source, IID_IFILESOURCEFILTER);

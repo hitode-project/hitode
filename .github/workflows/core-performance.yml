@@ -2,15 +2,16 @@ name: Core execution validation
 
 on:
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'apps/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'tools/layering/**'
-      - 'tools/performance/**'
-      - '.github/workflows/core-performance.yml'
+  push:
+    branches: [master]
   workflow_dispatch:
+    inputs:
+      slow-tests:
+        description: Run the full DAC rate matrices
+        type: boolean
+        default: true
+  schedule:
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
@@ -20,11 +21,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-changes:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      required: ${{ steps.changes.outputs.required }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: changes
+        name: Select Windows coverage
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import PurePosixPath
+
+          required = os.environ['EVENT_NAME'] != 'pull_request'
+          if not required:
+              base, head = os.environ['BASE_SHA'], os.environ['HEAD_SHA']
+              paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
+              for path in filter(None, paths):
+                  file = PurePosixPath(path)
+                  if (path.startswith(('crates/adv-cpu-x64/', 'crates/adv-cpu-core/', 'crates/adv-cpu/', 'tools/fixtures/', 'tools/performance/'))
+                      or file.name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml')
+                      or path.startswith('.cargo/') or path in ('.github/workflows/core-performance.yml', 'docs/host-call-boundary.tsv')
+                      or file.suffix == '.ps1' or re.search(r'windows|msvc|x64', path, re.I)):
+                      required = True
+                      break
+                  if file.suffix in ('.rs', '.c', '.h'):
+                      # Inspect both versions so removed Windows code also runs its checks.
+                      for ref in (base, head):
+                          source = subprocess.run(['git', 'show', f'{ref}:{path}'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+                          if re.search(rb'\b(windows|msvc)\b', source):
+                              required = True
+                              break
+                  if required:
+                      break
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'required={str(required).lower()}', file=output)
+          PY
+
   core:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '4'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/core-ci
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -32,31 +83,21 @@ jobs:
           persist-credentials: false
       - name: Record source and environment
         run: |
+          rustup update stable --no-self-update
+          test "$(uname -m)" = aarch64
           { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; lscpu; } > "$RUNNER_TEMP/core-environment.txt"
           cat "$RUNNER_TEMP/core-environment.txt"
-      - name: Test runtime comparison gates
-        run: python3 -m unittest discover -s tools/performance -v
-      - name: Check crate layering
-        run: |
-          python3 -m unittest discover -s tools/layering -v
-          python3 tools/layering/check_layers.py
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target/core-ci'
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Lint execution layer
+        run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
       - name: Test execution layer
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
-      - name: Run explicitly ignored CPU diagnostics
-        run: |
-          set -o pipefail
-          cargo test --release --locked -p adv-cpu --lib -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/core-diagnostics.txt"
-      - name: Record diagnostic synthetic benchmark
-        run: |
-          set -o pipefail
-          cargo build --release --locked -p adv-cpu --example execution_bench
-          "$CARGO_TARGET_DIR/release/examples/execution_bench" 7 | tee "$RUNNER_TEMP/core-bench.csv"
-      - name: Compare x87 helper and native emission
-        run: |
-          cargo build --release --locked -p adv-cpu --example x87_native_bench
-          python3 tools/performance/x87_ab.py "$CARGO_TARGET_DIR/release/examples/x87_native_bench" "$RUNNER_TEMP/x87-ab" --rounds 5 --samples 31
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -64,48 +105,199 @@ jobs:
           path: |
             ${{ runner.temp }}/core-environment.txt
             ${{ runner.temp }}/core-tests.txt
-            ${{ runner.temp }}/core-diagnostics.txt
-            ${{ runner.temp }}/core-bench.csv
-            ${{ runner.temp }}/x87-ab/
           if-no-files-found: ignore
           retention-days: 14
 
-  workspace:
-    runs-on: windows-latest
-    timeout-minutes: 60
+  workspace-format:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Test the whole workspace without stopping at the first failed target
+      - name: Check formatting
         run: |
-          cargo test-full --release --locked --no-fail-fast 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-tests.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check formatting independently
-        if: always()
+          rustup update stable --no-self-update
+          cargo fmt --all -- --check
+      - name: Test runtime comparison gates
+        run: python3 -m unittest discover -s tools/performance -v
+      - name: Check crate layering
         run: |
-          cargo fmt --all -- --check 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-fmt.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Lint independently
-        if: always()
+          python3 -m unittest discover -s tools/layering -v
+          python3 tools/layering/check_layers.py
+
+  workspace-lint:
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record native ARM64 environment
         run: |
-          cargo clippy --workspace --all-targets --release --locked -- -D warnings 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-clippy.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup update stable --no-self-update
+          test "$(uname -m)" = arm64
+          { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; getconf PAGESIZE; } | tee "$RUNNER_TEMP/workspace-environment.txt"
+      - name: Cache pinned FFmpeg
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target/macos-ffmpeg/*/install
+            target/macos-ffmpeg/*.tar.xz
+          key: macos-arm64-ffmpeg-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
+      - name: Build pinned FFmpeg libraries
+        timeout-minutes: 5
+        run: |
+          python3 tools/macos/build.py --ffmpeg-only --jobs 3
+          prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
+          echo "FFMPEG_DIR=${prefix[0]}" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target/workspace-ci'
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Lint the whole workspace
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked --features adv-shell/gpu,adv-shell/media,adv-device/slow-tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: workspace-validation-${{ github.sha }}
+          name: workspace-lint-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/workspace-tests.txt
-            ${{ runner.temp }}/workspace-fmt.txt
+            ${{ runner.temp }}/workspace-environment.txt
             ${{ runner.temp }}/workspace-clippy.txt
+            target/scratch/macos-package/build-static.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  workspace:
+    name: workspace (${{ matrix.group }}, macOS ARM64)
+    runs-on: macos-14
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core-system
+            packages: >-
+              --workspace --exclude adv-device --exclude adv-dx
+              --exclude adv-runtime --exclude adv-shell --exclude adv-run
+              --exclude adv-launcher --exclude adv-jit-helper --exclude tauri-plugin-storage
+            features: ''
+            media: false
+          - group: graphics-runtime
+            packages: -p adv-device -p adv-dx -p adv-runtime -p adv-shell -p adv-run
+            features: adv-shell/gpu,adv-shell/media
+            media: true
+          - group: frontends
+            packages: -p adv-launcher -p adv-jit-helper -p tauri-plugin-storage
+            features: adv-shell/gpu
+            media: true
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      WORKSPACE_PACKAGES: ${{ matrix.packages }}
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+      WORKSPACE_FEATURES: ${{ matrix.features }}
+      WORKSPACE_GROUP: ${{ matrix.group }}
+      WORKSPACE_SLOW_TESTS: ${{ github.event_name == 'schedule' || inputs.slow-tests }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record native ARM64 environment
+        run: |
+          rustup update stable --no-self-update
+          test "$(uname -m)" = arm64
+          { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; getconf PAGESIZE; } | tee "$RUNNER_TEMP/workspace-environment.txt"
+      - name: Cache pinned FFmpeg
+        if: matrix.media
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target/macos-ffmpeg/*/install
+            target/macos-ffmpeg/*.tar.xz
+          key: macos-arm64-ffmpeg-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
+      - name: Build pinned FFmpeg libraries
+        if: matrix.media
+        timeout-minutes: 5
+        run: |
+          python3 tools/macos/build.py --ffmpeg-only --jobs 3
+          prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
+          echo "FFMPEG_DIR=${prefix[0]}" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.group == 'frontends'
+        with:
+          node-version: '24'
+      - name: Check and build the launcher frontend
+        if: matrix.group == 'frontends'
+        timeout-minutes: 5
+        run: |
+          npm install --global "$(node --print "require('./apps/adv-launcher/package.json').packageManager")"
+          pnpm --dir apps/adv-launcher install --frozen-lockfile
+          pnpm --dir apps/adv-launcher check
+          pnpm --dir apps/adv-launcher build
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target/workspace-ci'
+          key: ${{ matrix.group }}
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Compile test programs
+        timeout-minutes: 12
+        run: |
+          set -o pipefail
+          read -r -a packages <<< "$WORKSPACE_PACKAGES"
+          args=(--locked --lib --tests "${packages[@]}")
+          if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
+          if [[ "$WORKSPACE_SLOW_TESTS" == true && "$WORKSPACE_GROUP" == graphics-runtime ]]; then
+            args+=(--features adv-device/slow-tests)
+          fi
+          cargo test "${args[@]}" --no-run --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
+      - name: Execute tests
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          read -r -a packages <<< "$WORKSPACE_PACKAGES"
+          args=(--locked --lib --tests "${packages[@]}")
+          if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
+          if [[ "$WORKSPACE_SLOW_TESTS" == true && "$WORKSPACE_GROUP" == graphics-runtime ]]; then
+            args+=(--features adv-device/slow-tests)
+          fi
+          cargo test "${args[@]}" --no-fail-fast -- --nocapture 2>&1 | tee "$RUNNER_TEMP/workspace-tests.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: workspace-${{ matrix.group }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/workspace-environment.txt
+            ${{ runner.temp }}/workspace-build.txt
+            ${{ runner.temp }}/workspace-tests.txt
+            target/workspace-ci/cargo-timings/
+            target/scratch/macos-package/build-static.log
+          if-no-files-found: ignore
           retention-days: 14
 
   x87-windows:
+    needs: windows-changes
+    if: needs.windows-changes.outputs.required == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '4'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -116,11 +308,17 @@ jobs:
           rustc -Vv | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
           Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
           Get-Content "$env:RUNNER_TEMP/x87-windows-environment.txt"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          cache-workspace-crates: true
       - name: Check Windows execution and x87 guards
         run: |
           cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/x87-windows-tests.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo clippy --release --locked -p adv-cpu --lib -- -D warnings
+      - name: Lint Windows platform compatibility
+        run: |
+          cargo clippy --workspace --exclude adv-launcher --exclude adv-jit-helper --exclude tauri-plugin-storage --all-targets --release --locked --features adv-shell/gpu -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Stress callback progress and lifetime checkpoints
         run: |

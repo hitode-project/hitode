@@ -237,8 +237,10 @@ fn setup(cpu: &dyn Guest, info: u32, address: u32) -> Result<Setup, String> {
                 }
             }
             Ok(read(cpu, address, length * 2)?
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b))
                 .collect::<Vec<_>>())
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -250,8 +252,10 @@ fn setup(cpu: &dyn Guest, info: u32, address: u32) -> Result<Setup, String> {
                 return Err("invalid quantization ranges".into());
             }
             let sizes = read(cpu, word(&raw, at + 4), count * 4)?
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect::<Vec<_>>();
             if sizes.iter().any(|&n| n <= 0)
                 || sizes.iter().map(|&n| i64::from(n)).sum::<i64>() != 63

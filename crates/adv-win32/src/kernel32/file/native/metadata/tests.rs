@@ -108,8 +108,10 @@ fn set(env: &mut Env<'_>) -> Outcome {
             let flags = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
             if flags == 0 {
                 env.ext.get_mut::<Provider>().times = bytes[..24]
-                    .chunks_exact(8)
-                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| u64::from_le_bytes(*bytes))
                     .collect();
             } else {
                 assert_eq!(&bytes[..32], &[0; 32]);

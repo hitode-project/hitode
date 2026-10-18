@@ -51,6 +51,13 @@ fn free(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Outcome {
     super::super::ole_memory::free_value(env, pointer.addr())
 }
 #[win32(gdiplus,name="GdipCreateFromHDC",level=state)]
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::arc_with_non_send_sync,
+        reason = "GDI handles are shared only within the owning execution thread"
+    )
+)]
 fn from_hdc(env: &mut Env<'_>, dc: Handle, out: GuestPtr<()>) -> Outcome {
     if !clear(env, out.addr()) {
         return Outcome::Return(2);
@@ -95,6 +102,13 @@ fn from_hdc2(env: &mut Env<'_>, dc: Handle, device: Handle, out: GuestPtr<()>) -
     from_hdc(env, dc, out)
 }
 #[win32(gdiplus,name="GdipCreateBitmapFromScan0",level=state)]
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::arc_with_non_send_sync,
+        reason = "GDI handles are shared only within the owning execution thread"
+    )
+)]
 fn scan0(
     env: &mut Env<'_>,
     width: i32,
@@ -259,6 +273,13 @@ fn string_format(env: &mut Env<'_>, flags: i32, language: u32, out: GuestPtr<()>
     publish(env, out.addr(), value)
 }
 #[win32(gdiplus,name="GdipCloneImage",level=state)]
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::arc_with_non_send_sync,
+        reason = "GDI handles are shared only within the owning execution thread"
+    )
+)]
 fn clone_image(env: &mut Env<'_>, handle: GuestPtr<()>, out: GuestPtr<()>) -> Outcome {
     if !clear(env, out.addr()) {
         return Outcome::Return(2);
@@ -486,8 +507,10 @@ fn surround(
         return Outcome::Return(2);
     }
     let colors: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     match object(env, handle.addr()).and_then(|o| o.execute(Op::Surround(&colors))) {
         Ok(Reply::Count(n)) => Outcome::Return(if count.write(env.cpu, n).is_ok() {

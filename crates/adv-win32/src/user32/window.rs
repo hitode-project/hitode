@@ -2154,10 +2154,11 @@ fn procedure_encoding(env: &Env<'_>, proc: u32) -> Option<bool> {
     }
     let mut mask = u.saved_procedure_encodings.get(&proc).copied().unwrap_or(0);
     for class in &u.classes {
-        if class.proc == proc && !class.name.is_empty() {
-            if let Some(wide) = class.unicode {
-                mask |= if wide { 2 } else { 1 };
-            }
+        if class.proc == proc
+            && !class.name.is_empty()
+            && let Some(wide) = class.unicode
+        {
+            mask |= if wide { 2 } else { 1 };
         }
     }
     match mask {

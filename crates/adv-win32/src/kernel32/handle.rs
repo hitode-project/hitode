@@ -85,10 +85,11 @@ fn close_handle(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     }
-    if !matches!(h, STD_INPUT | STD_OUTPUT | STD_ERROR) && h < CURRENT_THREAD {
-        if let Some(outcome) = super::file::native::bridge::close(env, h) {
-            return outcome;
-        }
+    if !matches!(h, STD_INPUT | STD_OUTPUT | STD_ERROR)
+        && h < CURRENT_THREAD
+        && let Some(outcome) = super::file::native::bridge::close(env, h)
+    {
+        return outcome;
     }
     // The last handle drops the object: files close, sections lose a handle.
     let object = env.sys.objects.close(h).is_some();

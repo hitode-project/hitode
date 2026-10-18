@@ -1010,7 +1010,7 @@ fn get_process_version(env: &mut Env<'_>) -> Outcome {
             env.cpu.read_u32(header.checked_add(24 + 48)?).ok()
         });
     match version {
-        Some(version) => Outcome::Return((version << 16) | (version >> 16)),
+        Some(version) => Outcome::Return(version.rotate_right(16)),
         None => {
             set_last_error(env, err::INVALID_PARAMETER);
             Outcome::Return(0)

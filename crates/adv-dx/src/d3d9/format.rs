@@ -86,7 +86,7 @@ pub(super) fn upload(
 /// Explicit staging copies convert back to the declared guest pixel layout.
 pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
     bytes(format)?;
-    if pixels.len() % 4 != 0 {
+    if !pixels.len().is_multiple_of(4) {
         return None;
     }
     if format == 28 {
@@ -101,7 +101,7 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
     }
     if format == 23 {
         let mut output = Vec::with_capacity(pixels.len() / 2);
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             let packed = u16::from(pixel[0] >> 3)
                 | u16::from(pixel[1] >> 2) << 5
                 | u16::from(pixel[2] >> 3) << 11;
@@ -113,7 +113,7 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
         return Some(pixels);
     }
     let mut output = Vec::with_capacity(pixels.len() / 2);
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0 {
         let packed = (0..4).fold(0u16, |value, channel| {
             value | u16::from(pixel[channel] >> 4) << (channel * 4)
         });

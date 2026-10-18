@@ -3,7 +3,9 @@ use adv_cpu::{
     JitCpu,
     backend::{Guest, GuestExt},
 };
-use adv_machine::{Clock, Machine, Resume};
+#[cfg(windows)]
+use adv_machine::Resume;
+use adv_machine::{Clock, Machine};
 
 fn fixture() -> (Machine<JitCpu>, u32) {
     let mut registry = Registry::default();
@@ -106,7 +108,12 @@ fn extended_fonts_match_native_charset_script_and_signature_in_a_and_w_callbacks
         let mut query = [0; 92];
         query[23] = charset;
         if let Some(face) = face {
-            for (dst, unit) in query[28..].chunks_exact_mut(2).zip(face.encode_utf16()) {
+            for (dst, unit) in query[28..]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(face.encode_utf16())
+            {
                 dst.copy_from_slice(&unit.to_le_bytes());
             }
         }
@@ -131,7 +138,9 @@ fn extended_fonts_match_native_charset_script_and_signature_in_a_and_w_callbacks
     let string = |bytes: &[u8]| {
         String::from_utf16_lossy(
             &bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .take_while(|&u| u != 0)
                 .collect::<Vec<_>>(),
@@ -154,8 +163,11 @@ fn extended_fonts_match_native_charset_script_and_signature_in_a_and_w_callbacks
             logical[23] = charset;
             if let Some(face) = filter {
                 if wide {
-                    for (destination, unit) in
-                        logical[28..].chunks_exact_mut(2).zip(face.encode_utf16())
+                    for (destination, unit) in logical[28..]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .zip(face.encode_utf16())
                     {
                         destination.copy_from_slice(&unit.to_le_bytes());
                     }
@@ -386,7 +398,9 @@ fn full_actual_enumeration_keeps_japanese_filter_and_wide_metrics() {
                     encode_encoding(expected[count].metrics.encoding)
                 );
                 let face = logical[28..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|v| u16::from_le_bytes([v[0], v[1]]))
                     .take_while(|&v| v != 0)
                     .collect::<Vec<_>>();

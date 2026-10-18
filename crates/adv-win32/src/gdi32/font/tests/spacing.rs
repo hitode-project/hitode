@@ -155,10 +155,10 @@ fn glyph_spacing_matches_native_ranges_arrays_defaults_and_bitmap_fonts() {
                         u32::from(width_ok != 0),
                         "{face} {height} {italic} width"
                     );
-                    for i in 0..5 {
+                    for (i, expected) in expected_widths.iter().enumerate() {
                         assert_eq!(
                             machine.cpu.read_u32(data + 1024 + i as u32 * 4).unwrap() as i32,
-                            expected_widths[i],
+                            *expected,
                             "{face} width {i}"
                         );
                     }

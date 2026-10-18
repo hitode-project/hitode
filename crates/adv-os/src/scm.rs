@@ -191,10 +191,11 @@ impl Catalog {
             return Err(INVALID_PARAMETER);
         }
         let folded = group.map(fold);
-        if let Some(group) = &folded {
-            if !group.is_empty() && !self.groups.contains(group) {
-                return Err(SERVICE_DOES_NOT_EXIST);
-            }
+        if let Some(group) = &folded
+            && !group.is_empty()
+            && !self.groups.contains(group)
+        {
+            return Err(SERVICE_DOES_NOT_EXIST);
         }
         Ok(self.services.values().filter(|service| {
             let status = &service.status;

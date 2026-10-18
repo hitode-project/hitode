@@ -14,10 +14,15 @@ const SLOT: u64 = 256;
 /// and output pixels (zero for a whole-frame run).
 fn slots_for(size: (u32, u32), regions: &[Option<Rect>]) -> Vec<u8> {
     let mut bytes = vec![0u8; SLOT as usize * regions.len()];
-    for (slot, region) in bytes.chunks_exact_mut(SLOT as usize).zip(regions) {
+    for (slot, region) in bytes
+        .as_chunks_mut::<{ SLOT as usize }>()
+        .0
+        .iter_mut()
+        .zip(regions)
+    {
         let (x, y) = region.map_or((0, 0), |r| (r.x, r.y));
         let values = [size.0, size.1, size.0 * 2, size.1 * 2, x, y, x * 2, y * 2];
-        for (out, value) in slot.chunks_exact_mut(4).zip(values) {
+        for (out, value) in slot.as_chunks_mut::<4>().0.iter_mut().zip(values) {
             out.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -537,9 +542,11 @@ mod tests {
                             );
                         }
                         assert!(
-                            results
+                            results.iter().all(|r| r
+                                .as_chunks::<4>()
+                                .0
                                 .iter()
-                                .all(|r| r.chunks_exact(4).all(|p| p[3] == 255))
+                                .all(|p| p[3] == 255))
                         );
                     }
                 }

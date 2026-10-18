@@ -56,15 +56,14 @@ fn capabilities(env: &mut Env<'_>, id: u32, output: GuestPtr<()>, size: u32, wid
     if !wide && id >= DRIVER_SLOTS && id != u32::MAX {
         return NODRIVER;
     }
-    if wide || id != u32::MAX {
-        if !env.cpu.accessible(output.addr(), size, Prot::WRITE)
+    if (wide || id != u32::MAX)
+        && (!env.cpu.accessible(output.addr(), size, Prot::WRITE)
             || env
                 .cpu
                 .write(output.addr(), &[0; 776][..size as usize])
-                .is_err()
-        {
-            return INVALPARAM;
-        }
+                .is_err())
+    {
+        return INVALPARAM;
     }
     if id == u32::MAX {
         // ID -1 queries only the driver's registry key, even without devices.

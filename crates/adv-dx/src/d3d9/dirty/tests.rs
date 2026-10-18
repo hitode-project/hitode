@@ -451,7 +451,7 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
         okay(unlock(&mut m, texture, 0));
         let mut expected_upload = row.repeat(4);
         if format == 22 {
-            for pixel in expected_upload.chunks_exact_mut(4) {
+            for pixel in expected_upload.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -564,7 +564,7 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
             &[device_pointer],
         ));
         let drawn = pixels(&mut m, &target.image);
-        for row in drawn.chunks_exact(16) {
+        for row in drawn.as_chunks::<16>().0 {
             if format != 22 {
                 assert_eq!(
                     &row[..3],
@@ -795,7 +795,7 @@ fn a8_bytes_mip_aliases_identity_sampling_and_managed_restoration_match_native()
         levels.iter().map(|level| level.offset).collect::<Vec<_>>(),
         [0, 16, 20]
     );
-    let mut raw = vec![0u8, 64, 128, 255].repeat(4);
+    let mut raw = [0u8, 64, 128, 255].repeat(4);
     let mip_data = [raw.clone(), vec![17, 85, 170, 255], vec![128]];
     for (level, side) in [4, 2, 1].into_iter().enumerate() {
         let locked = lock(&mut m, texture, level as u32, 0, 0);

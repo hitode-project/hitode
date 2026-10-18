@@ -463,7 +463,7 @@ impl ThunkTable {
         cpu.write(slot, &target.to_le_bytes())?;
         cpu.write(body, &code)?;
         cpu.write(counts, &[0; 24])?;
-        for (i, code) in probes.chunks_exact_mut(21).enumerate() {
+        for (i, code) in probes.as_chunks_mut::<21>().0.iter_mut().enumerate() {
             let absolute = u32::from_le_bytes(code[17..21].try_into().unwrap());
             let next = probe_base + (i as u32 + 1) * 21;
             code[17..21].copy_from_slice(&absolute.wrapping_sub(next).to_le_bytes());

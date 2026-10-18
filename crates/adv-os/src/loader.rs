@@ -269,7 +269,7 @@ impl<'a> Loader<'a> {
             path: path.clone(),
             err: PeError::Malformed("invalid mapped process import directory".into()),
         };
-        let add = |base: u32, offset: u32| base.checked_add(offset).ok_or_else(&invalid);
+        let add = |base: u32, offset: u32| base.checked_add(offset).ok_or_else(invalid);
         let read = |cpu: &dyn Guest, address| -> Result<u32, LoadError> {
             if !cpu.accessible(address, 4, Prot::READ) {
                 return Err(invalid());
@@ -696,6 +696,10 @@ impl<'a> Loader<'a> {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "image placement and identity are passed together to the loader"
+    )]
     fn populate_image(
         &mut self,
         key: String,
@@ -1555,26 +1559,6 @@ pub(crate) fn system_image(
     })
 }
 
-#[cfg(test)]
-mod host_dir_tests {
-    use super::HostDir;
-    #[test]
-    fn multibyte_relative_names_do_not_slice_inside_utf8() {
-        let root = std::env::temp_dir().join(format!("adv-sync-dir-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let name = "時計のゲーム.exe";
-        std::fs::write(root.join(name), b"test").unwrap();
-        let files = HostDir::new(&root, "C:\\Game");
-        assert_eq!(files.host_path(name), Some(root.join(name)));
-        assert_eq!(
-            files.host_path(&format!("C:\\Game\\{name}")),
-            Some(root.join(name))
-        );
-        assert_eq!(files.host_path("C:\\時計\\other.exe"), None);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
 fn mapped_string(cpu: &dyn Guest, at: u32, limit: u32) -> Result<String, LoadError> {
     let mut bytes = Vec::new();
     for offset in 0..limit {
@@ -1602,4 +1586,24 @@ fn mapped_string(cpu: &dyn Guest, at: u32, limit: u32) -> Result<String, LoadErr
         path: "mapped import".into(),
         err: PeError::Malformed("unterminated import name".into()),
     })
+}
+
+#[cfg(test)]
+mod host_dir_tests {
+    use super::HostDir;
+    #[test]
+    fn multibyte_relative_names_do_not_slice_inside_utf8() {
+        let root = std::env::temp_dir().join(format!("adv-sync-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = "時計のゲーム.exe";
+        std::fs::write(root.join(name), b"test").unwrap();
+        let files = HostDir::new(&root, "C:\\Game");
+        assert_eq!(files.host_path(name), Some(root.join(name)));
+        assert_eq!(
+            files.host_path(&format!("C:\\Game\\{name}")),
+            Some(root.join(name))
+        );
+        assert_eq!(files.host_path("C:\\時計\\other.exe"), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

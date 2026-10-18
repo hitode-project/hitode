@@ -56,12 +56,12 @@ fn query_system_information(env: &mut Env<'_>) -> Outcome {
         );
         return Outcome::Return(0xc000_0002);
     }
-    if returned != 0 {
-        if adv_abi::guest::check_range(env.cpu, returned, 4, adv_cpu::backend::Prot::WRITE).is_err()
-            || env.cpu.write_u32(returned, 2).is_err()
-        {
-            return Outcome::Return(0xc000_0005);
-        }
+    if returned != 0
+        && (adv_abi::guest::check_range(env.cpu, returned, 4, adv_cpu::backend::Prot::WRITE)
+            .is_err()
+            || env.cpu.write_u32(returned, 2).is_err())
+    {
+        return Outcome::Return(0xc000_0005);
     }
     if size < 2 {
         return Outcome::Return(0xc000_0004);
@@ -147,14 +147,13 @@ fn query_information_process(env: &mut Env<'_>) -> Outcome {
                     .unwrap_or(0)
             })
             .unwrap_or(0);
-        let exit_status = target.completion.exit_code().map_or(0x0000_0103u32, |c| c); // STATUS_PENDING or exit code
-        if returned != 0 {
-            if adv_abi::guest::check_range(env.cpu, returned, 4, adv_cpu::backend::Prot::WRITE)
+        let exit_status = target.completion.exit_code().unwrap_or(0x0000_0103u32); // STATUS_PENDING or exit code
+        if returned != 0
+            && (adv_abi::guest::check_range(env.cpu, returned, 4, adv_cpu::backend::Prot::WRITE)
                 .is_err()
-                || env.cpu.write_u32(returned, 24).is_err()
-            {
-                return Outcome::Return(0xc000_0005);
-            }
+                || env.cpu.write_u32(returned, 24).is_err())
+        {
+            return Outcome::Return(0xc000_0005);
         }
         if adv_abi::guest::check_range(env.cpu, out, 24, adv_cpu::backend::Prot::WRITE).is_err() {
             return Outcome::Return(0xc000_0005);
@@ -182,12 +181,11 @@ fn query_information_process(env: &mut Env<'_>) -> Outcome {
     {
         return Outcome::Return(0xc000_0005);
     }
-    if class != 30 {
-        if adv_abi::guest::check_range(env.cpu, out, 4, adv_cpu::backend::Prot::WRITE).is_err()
-            || env.cpu.write_u32(out, u32::from(class == 31)).is_err()
-        {
-            return Outcome::Return(0xc000_0005);
-        }
+    if class != 30
+        && (adv_abi::guest::check_range(env.cpu, out, 4, adv_cpu::backend::Prot::WRITE).is_err()
+            || env.cpu.write_u32(out, u32::from(class == 31)).is_err())
+    {
+        return Outcome::Return(0xc000_0005);
     }
     if returned != 0 && env.cpu.write_u32(returned, 4).is_err() {
         return Outcome::Return(0xc000_0005);
@@ -237,15 +235,15 @@ fn rtl_format_current_user_key_path(env: &mut Env<'_>) -> Outcome {
 fn rtl_free_unicode_string(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     if p != 0 {
-        if let Ok(buf) = env.cpu.read_u32(p + 4) {
-            if buf != 0 {
-                let heap = env.ext.get::<Heaps>().process_heap;
-                let _ = env
-                    .ext
-                    .get_mut::<Heaps>()
-                    .free(env.cpu, &mut env.sys.vm, heap, buf);
-                let _ = env.cpu.write_u32(p + 4, 0);
-            }
+        if let Ok(buf) = env.cpu.read_u32(p + 4)
+            && buf != 0
+        {
+            let heap = env.ext.get::<Heaps>().process_heap;
+            let _ = env
+                .ext
+                .get_mut::<Heaps>()
+                .free(env.cpu, &mut env.sys.vm, heap, buf);
+            let _ = env.cpu.write_u32(p + 4, 0);
         }
         let _ = env.cpu.write(p, &0u16.to_le_bytes());
         let _ = env.cpu.write(p + 2, &0u16.to_le_bytes());

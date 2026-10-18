@@ -40,57 +40,59 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
     let destination = destination.wrapping_sub(back);
     let source = source.wrapping_sub(back);
     let len = (count * width) as usize;
-    let dst = memory.direct(destination, len, true);
-    if dst.is_none() {
-        // A forward copy from ordinary RAM to PCM can validate once per page.
-        // It still publishes through Memory's byte-atomic audio stores.
-        if reverse
-            || op.kind != StringKind::Movs
-            || memory.direct(source, len, false).is_none()
-            || !memory.writable_audio(destination, len)
-        {
-            return 0;
+    match memory.direct(destination, len, true) {
+        None => {
+            // A forward copy from ordinary RAM to PCM can validate once per page.
+            // It still publishes through Memory's byte-atomic audio stores.
+            if reverse
+                || op.kind != StringKind::Movs
+                || memory.direct(source, len, false).is_none()
+                || !memory.writable_audio(destination, len)
+            {
+                return 0;
+            }
+            memory
+                .copy(source, destination, len)
+                .expect("validated ordinary-to-PCM copy");
         }
-        memory
-            .copy(source, destination, len)
-            .expect("validated ordinary-to-PCM copy");
-    } else if op.kind == StringKind::Movs {
-        let Some(src) = memory.direct(source, len, false) else {
-            return 0;
-        };
-        // Overlapping REP copies propagate each preceding element. A memcpy
-        // or memmove snapshot would change this, including distinct file views.
-        if u64::from(source) < u64::from(destination) + len as u64
-            && u64::from(destination) < u64::from(source) + len as u64
-            || memory.rep_alias_hazard(source, destination, len)
-        {
-            return 0;
+        Some(dst) if op.kind == StringKind::Movs => {
+            let Some(src) = memory.direct(source, len, false) else {
+                return 0;
+            };
+            // Overlapping REP copies propagate each preceding element. A memcpy
+            // or memmove snapshot would change this, including distinct file views.
+            if u64::from(source) < u64::from(destination) + len as u64
+                && u64::from(destination) < u64::from(source) + len as u64
+                || memory.rep_alias_hazard(source, destination, len)
+            {
+                return 0;
+            }
+            // SAFETY: direct() validated both complete ordinary ranges, and the
+            // overlap/alias checks exclude physically overlapping storage. The
+            // exclusive Memory borrow keeps mappings and permissions unchanged.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         }
-        // SAFETY: direct() validated both complete ordinary ranges, and the
-        // overlap/alias checks exclude physically overlapping storage. The
-        // exclusive Memory borrow keeps mappings and permissions unchanged.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst.unwrap(), len) };
-    } else {
-        let dst = dst.unwrap();
-        let value = state.regs[0];
-        // SAFETY: the entire ordinary writable page range was validated above;
-        // each unaligned element is inside it, and no shared/code page qualifies.
-        unsafe {
-            match width {
-                1 => std::ptr::write_bytes(dst, value as u8, len),
-                2 => {
-                    for n in 0..count as usize {
-                        dst.add(n * 2)
-                            .cast::<u16>()
-                            .write_unaligned((value as u16).to_le());
+        Some(dst) => {
+            let value = state.regs[0];
+            // SAFETY: the entire ordinary writable page range was validated above;
+            // each unaligned element is inside it, and no shared/code page qualifies.
+            unsafe {
+                match width {
+                    1 => std::ptr::write_bytes(dst, value as u8, len),
+                    2 => {
+                        for n in 0..count as usize {
+                            dst.add(n * 2)
+                                .cast::<u16>()
+                                .write_unaligned((value as u16).to_le());
+                        }
                     }
-                }
-                4 => {
-                    for n in 0..count as usize {
-                        dst.add(n * 4).cast::<u32>().write_unaligned(value.to_le());
+                    4 => {
+                        for n in 0..count as usize {
+                            dst.add(n * 4).cast::<u32>().write_unaligned(value.to_le());
+                        }
                     }
+                    _ => unreachable!("validated string width"),
                 }
-                _ => unreachable!("validated string width"),
             }
         }
     }

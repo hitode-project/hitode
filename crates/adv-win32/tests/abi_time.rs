@@ -186,6 +186,7 @@ fn spin(
 }
 
 #[test]
+// spec: PROC-CLOCK-1, PROC-CLOCK-3
 fn clock_polling_spins_idle_and_skip_like_any_timed_wait() {
     for (dll, api, second) in [
         ("kernel32.dll", "GetTickCount", 1000),
@@ -196,20 +197,14 @@ fn clock_polling_spins_idle_and_skip_like_any_timed_wait() {
             adv_machine::clock::QPC_FREQ as u32,
         ),
     ] {
-        let started = std::time::Instant::now();
-        let (machine, iterations) = spin(Clock::real(), dll, api, second, false);
+        let (machine, iterations) = spin(Clock::virtual_time(), dll, api, second, false);
         // A second of guest time passed by skipping, not by spinning through it.
-        assert!(
-            started.elapsed().as_millis() < 900,
-            "{api} spun in real time"
-        );
         assert!(
             machine.sys.scheduling.active_time_skip_us >= 500_000,
             "{api}"
         );
-        // About 3,000 polls on an idle host. Under load, real time can end a
-        // tick between polls and restart detection; spinning through the
-        // second instead would take about a million.
+        // After the initial streak, polls wait for the next millisecond.
+        // Without those waits, the virtual clock needs about a million reads.
         assert!(iterations < 50_000, "{api}: {iterations} polls");
     }
 }

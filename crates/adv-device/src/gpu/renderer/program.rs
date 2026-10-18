@@ -668,7 +668,7 @@ impl Pipeline {
             label: Some("programmable pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
-                module: &module,
+                module,
                 entry_point: Some("vertex_main"),
                 compilation_options: Default::default(),
                 buffers: &buffers,
@@ -697,7 +697,7 @@ impl Pipeline {
             }),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &module,
+                module,
                 entry_point: Some("fragment_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -713,7 +713,6 @@ impl Pipeline {
             cache: driver,
         });
         context.check()?;
-        let uniform = uniform;
         let entry = |binding, offset, size| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -952,7 +951,7 @@ impl Gpu {
         {
             let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, &pipeline.constants, &[base as u32; 3]);
+            pass.set_bind_group(0, &pipeline.constants, &[base; 3]);
             pass.set_bind_group(1, &textures, &[]);
             let v = state.viewport;
             pass.set_viewport(

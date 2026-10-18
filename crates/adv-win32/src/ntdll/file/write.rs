@@ -15,6 +15,10 @@ struct CountedWriter<'a> {
     written: u32,
 }
 impl Write for CountedWriter<'_> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the parameters mirror the guest API"
+    )]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = self.file.write(bytes)?;
         self.written += count as u32;

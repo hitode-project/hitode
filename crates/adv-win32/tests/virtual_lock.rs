@@ -1,9 +1,10 @@
 //! Authored private buffers; host Locked bits prove physical pins, not residency.
 use adv_abi::{ApiDiagnostics, Registry};
-use adv_cpu::{
-    JitCpu,
-    backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
-};
+#[cfg(windows)]
+use adv_cpu::JitCpu;
+#[cfg(windows)]
+use adv_cpu::backend::Guest;
+use adv_cpu::backend::{Backend, GuestExt, Prot, asm::Asm};
 use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
@@ -128,6 +129,7 @@ fn run<B: Backend>(m: &mut Machine<B>, mut code: Asm, process_exit: bool) {
 #[cfg(windows)]
 #[test]
 fn private_pages_really_pin_without_counts_and_retire_on_noaccess_release_and_process_exit() {
+    type Case<'a> = (&'a str, &'a [u32], u32, u32, bool, u32);
     for (jit, native, process_exit) in [(false, false, false), (true, true, true)] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
         cpu.set_async_compilation(false);
@@ -136,7 +138,7 @@ fn private_pages_really_pin_without_counts_and_retire_on_noaccess_release_and_pr
         }
         let mut m = machine(cpu);
         let mut code = Asm::new(CODE);
-        let cases: &[(&str, &[u32], u32, u32, bool, u32)] = &[
+        let cases: &[Case<'_>] = &[
             (
                 "VirtualAlloc",
                 &[BUFFER, 0x20000, 0x3000, 4],

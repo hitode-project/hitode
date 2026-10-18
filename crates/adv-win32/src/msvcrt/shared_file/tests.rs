@@ -79,7 +79,7 @@ fn guest<B: Backend>(cpu: B) {
     let filename = "文件.bin";
     let original = root.join("game").join(filename);
     std::fs::write(&original, b"original").unwrap();
-    let mut config = crate::Win32Config::new(&root.join("game"), "fixture.exe", &root.join("data"));
+    let mut config = crate::Win32Config::new(root.join("game"), "fixture.exe", root.join("data"));
     config.os.codepage = 936;
     config.os.write_game = false;
     let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
@@ -345,7 +345,7 @@ fn writers<B: Backend>(cpu: B) {
     std::fs::create_dir_all(&game).unwrap();
     std::fs::write(game.join(WRITE_NAME), b"immutable source sentinel").unwrap();
     std::fs::write(game.join("blocked.bin"), b"immutable blocked sentinel").unwrap();
-    let mut config = crate::Win32Config::new(&game, "fixture.exe", &root.join("data"));
+    let mut config = crate::Win32Config::new(&game, "fixture.exe", root.join("data"));
     config.os.codepage = 936;
     config.os.write_game = false;
     let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();

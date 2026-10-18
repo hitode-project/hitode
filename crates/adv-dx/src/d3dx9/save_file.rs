@@ -8,6 +8,7 @@ const INVALID: u32 = 0x8876086c;
 struct Pending {
     buffer: u32,
     handle: Option<u32>,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     guard: Weak<()>,
 }
 #[derive(Default)]
@@ -135,6 +136,7 @@ fn finish(env: &mut Env<'_>, pointer: u32) {
         super::buffer::retire(env, entry.buffer);
     }
 }
+#[cfg(feature = "gpu")]
 pub(super) fn reap(env: &mut Env<'_>, all: bool) {
     let Some(writes) = env.ext.try_get::<Writes>() else {
         return;

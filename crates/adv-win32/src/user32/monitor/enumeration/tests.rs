@@ -97,8 +97,10 @@ fn raw(machine: &Machine<JitCpu>, output: u32) -> Vec<u8> {
 fn text(bytes: &[u8], offset: usize, length: usize, wide: bool) -> String {
     if wide {
         let units = bytes[offset..offset + length * 2]
-            .chunks_exact(2)
-            .map(|word| u16::from_le_bytes(word.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|word| u16::from_le_bytes(*word))
             .take_while(|unit| *unit != 0)
             .collect::<Vec<_>>();
         String::from_utf16(&units).unwrap()

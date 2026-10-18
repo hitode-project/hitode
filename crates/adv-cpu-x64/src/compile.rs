@@ -3588,13 +3588,12 @@ impl Emitter<'_> {
             .iter()
             .find(|hook| hook.nest.inner == index)
             .map(|hook| hook.nest.exit)
+            && let Some(&block) = self.blocks.get(&exit)
         {
-            if let Some(&block) = self.blocks.get(&exit) {
-                let same = self.b.ins().icmp_imm(IntCC::Equal, pc, i64::from(exit));
-                let other = self.b.create_block();
-                self.b.ins().brif(same, block, &[], other, &[]);
-                self.b.switch_to_block(other);
-            }
+            let same = self.b.ins().icmp_imm(IntCC::Equal, pc, i64::from(exit));
+            let other = self.b.create_block();
+            self.b.ins().brif(same, block, &[], other, &[]);
+            self.b.switch_to_block(other);
         }
         let (first, last) = (self.plans[index].header, self.plans[index].latch);
         let inside = self.b.ins().iadd_imm(pc, -i64::from(first) - 1);
@@ -4713,7 +4712,6 @@ impl Emitter<'_> {
         });
         let recovery = contract::RecoveryExit::new(&mut self.b);
         let draft = fault::Draft::capture(
-            &mut self.b,
             &self.fault_seeds,
             self.state,
             outputs,

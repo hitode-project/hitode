@@ -245,8 +245,8 @@ fn depth_only_stencil_never_is_ignored_but_real_stencil_and_depth_tests_still_re
             .unwrap();
         let pixels = transfer.poll().expect("completed readback").unwrap();
         assert_eq!(pixels.len(), 16 * 12 * 4);
-        for pixel in pixels.chunks_exact(4) {
-            assert_eq!(pixel, expected, "format={format}, z_never={z_never}");
+        for pixel in pixels.as_chunks::<4>().0 {
+            assert_eq!(*pixel, expected, "format={format}, z_never={z_never}");
         }
         assert_eq!(
             env.ext.get::<State>().gpu.as_ref().unwrap().stats().draws,

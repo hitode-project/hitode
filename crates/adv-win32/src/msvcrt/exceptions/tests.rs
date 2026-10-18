@@ -304,7 +304,6 @@ fn phase_guest<B: Backend>(cpu: B, mode: Mode) {
     } else {
         assert_eq!(crate::kernel32::uncaught_query_blocker(&env), None);
     }
-    drop(env);
     let other = machine
         .spawn("independent clean CRT thread", PARK_ADDR, &[], 65536)
         .unwrap();

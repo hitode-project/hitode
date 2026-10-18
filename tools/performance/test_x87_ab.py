@@ -30,7 +30,7 @@ class X87ComparisonTests(unittest.TestCase):
         helper, native = ab.parse(document(), "helper"), ab.parse(document("native"), "native")
         summary = ab.summarize([(helper, native), (helper, native)])
         self.assertEqual(summary["acceptance"], "synthetic-only")
-        self.assertEqual(len(summary["workloads"]), 6)
+        self.assertEqual(len(summary["workloads"]), 7)
         self.assertTrue(all(row["speedup_median"] == 2 for row in summary["workloads"]))
 
     def test_rejects_wrong_mode_missing_duplicate_and_unknown_workload(self):

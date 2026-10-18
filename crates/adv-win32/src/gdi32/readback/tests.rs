@@ -82,7 +82,14 @@ fn fixture(dib: bool, bottom_up: bool) -> (Machine<JitCpu>, u32, u32) {
             .unwrap();
         let s = store.get(bitmap).unwrap();
         let raw: Vec<_> = if bottom_up {
-            PIXELS.chunks_exact(8).rev().flatten().copied().collect()
+            PIXELS
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .rev()
+                .flatten()
+                .copied()
+                .collect()
         } else {
             PIXELS.to_vec()
         };

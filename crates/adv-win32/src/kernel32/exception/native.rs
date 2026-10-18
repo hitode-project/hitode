@@ -79,8 +79,8 @@ fn take(env: &mut Env<'_>, kind: Kind, record: u32, context: u32) -> Option<Payl
             && item.value.strong_count() != 0
     })?;
     let owned = item.value.upgrade()?;
-    let value = owned.borrow_mut().take();
-    value
+
+    owned.borrow_mut().take()
 }
 fn unsupported(env: &mut Env<'_>, name: &str, reason: &str) -> Outcome {
     adv_abi::warn_structural(env, name, reason);

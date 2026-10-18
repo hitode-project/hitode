@@ -34,7 +34,7 @@ fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
     ticket.poll().unwrap().unwrap()
 }
 fn solid(bytes: &[u8], bgra: [u8; 4]) {
-    assert!(bytes.chunks_exact(4).all(|pixel| pixel == bgra));
+    assert!(bytes.as_chunks::<4>().0.iter().all(|&pixel| pixel == bgra));
 }
 const FULL: Rect = Rect {
     x: 0,
@@ -308,13 +308,13 @@ fn a_partial_depth_clear_follows_the_deferred_whole_clear() {
         state.depth = Some(Compare::Less);
         gpu.draw_programmable(&target, &red, &state).unwrap();
         let pixels = read(&mut gpu, &target.image);
-        for (at, pixel) in pixels.chunks_exact(4).enumerate() {
+        for (at, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
             let expected = if at % 4 < 2 {
                 [0, 0, 255, 255]
             } else {
                 [0, 255, 0, 255]
             };
-            assert_eq!(pixel, expected, "pixel {at}");
+            assert_eq!(*pixel, expected, "pixel {at}");
         }
     }
 }

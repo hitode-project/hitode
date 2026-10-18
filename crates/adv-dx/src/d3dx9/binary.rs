@@ -496,8 +496,10 @@ mod tests {
             .collect();
         assert_eq!(shaders.len(), 1);
         let words: Vec<_> = effect.objects[shaders[0]]
-            .chunks_exact(4)
-            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
             .collect();
         assert!(
             super::super::preshader::comments(&words)

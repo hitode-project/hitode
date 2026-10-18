@@ -37,11 +37,11 @@ impl Parse for Args {
                 if name.is_some() {
                     return Err(syn::Error::new_spanned(option, "duplicate name"));
                 }
-                if let Expr::Lit(expr) = &option.value {
-                    if let Lit::Str(value) = &expr.lit {
-                        name = Some(value.value());
-                        continue;
-                    }
+                if let Expr::Lit(expr) = &option.value
+                    && let Lit::Str(value) = &expr.lit
+                {
+                    name = Some(value.value());
+                    continue;
                 }
                 return Err(syn::Error::new_spanned(
                     option.value,
@@ -51,11 +51,11 @@ impl Parse for Args {
                 if level.is_some() {
                     return Err(syn::Error::new_spanned(option, "duplicate level"));
                 }
-                if let Expr::Path(expr) = &option.value {
-                    if let Some(ident) = expr.path.get_ident() {
-                        level = Some(ident.clone());
-                        continue;
-                    }
+                if let Expr::Path(expr) = &option.value
+                    && let Some(ident) = expr.path.get_ident()
+                {
+                    level = Some(ident.clone());
+                    continue;
                 }
                 return Err(syn::Error::new_spanned(
                     option.value,
@@ -284,6 +284,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         (quote!(), quote!(None))
     };
     Ok(quote! {
+        #[allow(clippy::too_many_arguments, reason = "the parameters match the guest ABI")]
         #function
         #leaf_function
         const _: () = {

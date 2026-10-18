@@ -320,7 +320,10 @@ impl Bitmap {
         let row = self.row(y);
         match self.bpp {
             1 => ((self.bits[row + x / 8] >> (7 - x % 8)) & 1) as usize,
-            4 => ((self.bits[row + x / 2] >> (if x % 2 == 0 { 4 } else { 0 })) & 15) as usize,
+            4 => {
+                ((self.bits[row + x / 2] >> (if x.is_multiple_of(2) { 4 } else { 0 })) & 15)
+                    as usize
+            }
             _ => self.bits[row + x] as usize,
         }
     }

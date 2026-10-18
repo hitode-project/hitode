@@ -53,7 +53,9 @@ fn expression(env: &Env<'_>, pointer: GuestPtr<()>) -> Result<String, i32> {
         .read(buffer, &mut bytes)
         .map_err(|_| ACCESS_VIOLATION)?;
     let units: Vec<_> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     let name = String::from_utf16(&units).map_err(|_| NAME_INVALID)?;

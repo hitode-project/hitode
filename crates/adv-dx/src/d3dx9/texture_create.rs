@@ -42,7 +42,7 @@ fn requirements(
     }
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (device, width, height, mips, usage, format);
+        let _ = (env, device, width, height, mips, usage, format);
         Err(UNAVAILABLE)
     }
     #[cfg(feature = "gpu")]
@@ -118,6 +118,7 @@ fn requirements(
     }
 }
 
+#[cfg(feature = "gpu")]
 fn unavailable(env: &mut Env<'_>, reason: &str) -> u32 {
     let name = env.sys.thunks.get(env.thunk).name.clone();
     adv_abi::warn_unavailable(env, &name, reason);

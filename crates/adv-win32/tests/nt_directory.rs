@@ -49,6 +49,7 @@ fn text<B: Backend>(m: &mut Machine<B>, p: u32, s: &str, wide: bool) {
     };
     m.cpu.write(p, &bytes).unwrap();
 }
+#[cfg(windows)]
 fn attrs<B: Backend>(m: &mut Machine<B>, p: u32, name: u32, s: &str) {
     let units: Vec<_> = s.encode_utf16().collect();
     m.cpu
@@ -88,6 +89,7 @@ fn call<B: Backend>(
     }
     code.mov_mem_eax(out);
 }
+#[cfg(windows)]
 fn handle_call<B: Backend>(
     m: &mut Machine<B>,
     code: &mut Asm,
@@ -508,7 +510,9 @@ fn boolean_slots<B: Backend>(cpu: B) {
         m.cpu.read(p + 12, &mut bytes).unwrap();
         String::from_utf16(
             &bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect::<Vec<_>>(),
         )

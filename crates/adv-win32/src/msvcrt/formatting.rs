@@ -354,10 +354,8 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
         };
         match crt::wide_with_float_profile(env.cpu, cp, &format, values, float_profile) {
             Ok((output, encoding_error)) => {
-                if encoding_error {
-                    if let Err(outcome) = store_errno(env, 42) {
-                        return outcome;
-                    }
+                if encoding_error && let Err(outcome) = store_errno(env, 42) {
+                    return outcome;
                 }
                 let count_units = output.len();
                 finish(
@@ -390,10 +388,8 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
         };
         match crt::narrow_with_float_profile(env.cpu, cp, &format, values, float_profile) {
             Ok((output, encoding_error)) => {
-                if encoding_error {
-                    if let Err(outcome) = store_errno(env, 42) {
-                        return outcome;
-                    }
+                if encoding_error && let Err(outcome) = store_errno(env, 42) {
+                    return outcome;
                 }
                 let length = output.len();
                 finish(env, front, destination, capacity, count, output, length)

@@ -39,7 +39,7 @@ fn screen(env: &mut Env<'_>, size: (i32, i32)) {
     if let Some(window) = win32.user.windows.get_mut(&mut env.sys.objects, &desktop) {
         window.rect = Rect::new(0, 0, size.0, size.1);
     }
-    let windows: Vec<_> = win32.user.top.iter().copied().collect();
+    let windows: Vec<_> = win32.user.top.to_vec();
     for hwnd in windows {
         // The display changed in the guest; notification belongs to its queue.
         message::post(env, hwnd, 0x7e, 32, window::make_long(size.0, size.1));

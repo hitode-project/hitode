@@ -48,8 +48,10 @@ fn condition_variable_pairs_preserve_lock_ownership() {
         let actual = std::fs::read(data.join("overlay/condition.bin")).unwrap();
         assert_eq!(actual.len(), expected.len(), "{backend}");
         for (index, (actual, expected)) in actual
-            .chunks_exact(4)
-            .zip(expected.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<4>().0.iter())
             .enumerate()
         {
             assert_eq!(actual, expected, "{backend}: scalar {index}");

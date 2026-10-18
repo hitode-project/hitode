@@ -1,4 +1,4 @@
 [alias]
 # `cargo test --workspace` is the fast suite for iteration. The full suite adds
-# the slow matrices; CI runs it.
+# the slow matrices; weekly and manual CI runs enable them.
 test-full = ["test", "--workspace", "--features", "adv-device/slow-tests"]

@@ -28,7 +28,7 @@ impl Gate {
     }
     pub(super) fn enter(self: &Arc<Self>) -> Result<Lease, Error> {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & PAUSED == 0 && state & READERS < READERS).then(|| state + 1)
             })
             .map_err(|_| Error::Busy)?;
@@ -36,7 +36,7 @@ impl Gate {
     }
     pub(super) fn pause(self: &Arc<Self>) -> Result<SubmissionPause, Error> {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & PAUSED == 0).then_some(state | PAUSED)
             })
             .map_err(|_| Error::Busy)?;

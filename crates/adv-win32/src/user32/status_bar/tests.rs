@@ -71,7 +71,9 @@ fn read_wide(m: &Machine<JitCpu>, at: u32, units: usize) -> String {
     let mut bytes = vec![0; units * 2];
     m.cpu.read(at, &mut bytes).unwrap();
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     String::from_utf16_lossy(&units)
@@ -144,8 +146,10 @@ fn parts_text_types_and_simple_mode_round_trip() {
     let mut rect = [0u8; 16];
     m.cpu.read(out, &mut rect).unwrap();
     let rect: Vec<i32> = rect
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect();
     assert_eq!(rect, [202, 2, 500, HEIGHT - 2]);
     assert_eq!(send(&mut m, data, hwnd, 0x40a, 3, out), 0);

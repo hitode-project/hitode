@@ -78,6 +78,8 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
     Ok(block)
 }
 
+type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>;
+
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
@@ -118,7 +120,7 @@ pub struct Sys {
     /// Frontend termination policy when the process entry point returns.
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// Personality infrastructure that must exist before the initial context.
-    pub process_prepare: Option<fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>>,
+    pub process_prepare: Option<ProcessPrepare>,
     /// Personality work before a context parks on an Outcome::Block.
     pub context_wait: Option<fn(&mut Env<'_>) -> Option<Outcome>>,
     /// Personality-supplied interpretation of precise CPU stops.

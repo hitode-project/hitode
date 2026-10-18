@@ -98,7 +98,10 @@ fn get_clip_cursor(env: &mut Env<'_>, out: GuestPtr<Rect>) -> i32 {
     let rect = clip_bounds(user(env));
     let fields = [rect.left, rect.top, rect.right, rect.bottom];
     let mut bytes = [0; 16];
-    for (coordinate, output) in fields.into_iter().zip(bytes.chunks_exact_mut(4)) {
+    for (coordinate, output) in fields
+        .into_iter()
+        .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
+    {
         output.copy_from_slice(&coordinate.to_le_bytes());
     }
     if env.cpu.write(out.addr(), &bytes).is_err() {
@@ -189,7 +192,10 @@ fn get_cursor_info(env: &mut Env<'_>, out: GuestPtr<u8>) -> i32 {
         state.cursor_pos.1 as u32,
     ];
     let mut bytes = [0; 20];
-    for (word, output) in words.into_iter().zip(bytes.chunks_exact_mut(4)) {
+    for (word, output) in words
+        .into_iter()
+        .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
+    {
         output.copy_from_slice(&word.to_le_bytes());
     }
     if env.cpu.write(pointer, &bytes).is_err() {

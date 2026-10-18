@@ -22,9 +22,11 @@ fn data<B: Backend>(machine: &Machine<B>, pointer: u32) -> (Vec<Vec<u8>>, [u8; 8
     let mut prefix = [0; PREFIX_BYTES];
     machine.cpu.read(pointer, &mut prefix).unwrap();
     let strings = prefix[..40]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|bytes| {
-            let address = u32::from_le_bytes(bytes.try_into().unwrap());
+            let address = u32::from_le_bytes(*bytes);
             assert!(address >= pointer + PREFIX_BYTES as u32);
             // Every pointer, including the C locale's empty strings, is non-NULL
             // and belongs to the same allocation as the lconv prefix.

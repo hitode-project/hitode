@@ -6,30 +6,6 @@ pub struct ConstantUsage {
     pub relative: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    // spec: GFX-REC-7
-    fn sparse_runs_cover_word_boundaries_and_the_exact_block_size() {
-        assert_eq!(ConstantUsage::default().ranges().count(), 0);
-        assert_eq!(
-            ConstantUsage::ALL.ranges().map(|r| r.len()).sum::<usize>(),
-            4864
-        );
-        let mut usage = ConstantUsage::default();
-        for n in [0, 1, 63, 64, 255, 256, 271, 272, 287, 288, 295, 296, 303] {
-            usage.set(n);
-        }
-        assert_eq!(
-            usage
-                .ranges()
-                .flat_map(|r| (r.start / 16)..(r.end / 16))
-                .collect::<Vec<_>>(),
-            [0, 1, 63, 64, 255, 256, 271, 272, 287, 288, 295, 296, 303]
-        );
-    }
-}
 impl ConstantUsage {
     pub const ALL: Self = Self {
         registers: [u64::MAX, u64::MAX, u64::MAX, u64::MAX, (1 << 48) - 1],
@@ -57,5 +33,30 @@ impl ConstantUsage {
                     Some((word * 64 + first as usize) * 16..(word * 64 + end as usize) * 16)
                 })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    // spec: GFX-REC-7
+    fn sparse_runs_cover_word_boundaries_and_the_exact_block_size() {
+        assert_eq!(ConstantUsage::default().ranges().count(), 0);
+        assert_eq!(
+            ConstantUsage::ALL.ranges().map(|r| r.len()).sum::<usize>(),
+            4864
+        );
+        let mut usage = ConstantUsage::default();
+        for n in [0, 1, 63, 64, 255, 256, 271, 272, 287, 288, 295, 296, 303] {
+            usage.set(n);
+        }
+        assert_eq!(
+            usage
+                .ranges()
+                .flat_map(|r| (r.start / 16)..(r.end / 16))
+                .collect::<Vec<_>>(),
+            [0, 1, 63, 64, 255, 256, 271, 272, 287, 288, 295, 296, 303]
+        );
     }
 }

@@ -174,6 +174,10 @@ impl State {
             self.last_metal = false;
         }
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     pub(super) fn draw(
         &mut self,
         gpu: &mut Gpu,

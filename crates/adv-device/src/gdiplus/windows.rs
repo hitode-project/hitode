@@ -143,6 +143,10 @@ pub(super) fn destroy(object: &Object) {
         }
     }
 }
+#[allow(
+    clippy::arc_with_non_send_sync,
+    reason = "GDI handles are shared only within the owning execution thread"
+)]
 pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<Object>, i32> {
     if let Create::Canvas(w, h, bytes) = &create {
         let canvas = Canvas::new(*w, *h, bytes)?;

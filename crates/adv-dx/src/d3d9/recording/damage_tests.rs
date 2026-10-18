@@ -529,7 +529,7 @@ fn clipped_partial_attachment_clears_preserve_values_seen_by_a_larger_target() {
         }
         present(&mut f);
         let actual = pixels(&mut f, &target.image);
-        for (n, pixel) in actual.chunks_exact(4).enumerate() {
+        for (n, pixel) in actual.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
                 pixel,
                 if n % 32 < 16 && n / 32 < 12 {
@@ -685,8 +685,10 @@ fn age_two_and_three_rotating_targets_match_full_execution_bit_for_bit() {
             let published = f.m.ext.get::<Rotation>().damage.last().copied().flatten();
             if let (Some(r), Some(previous)) = (published, &previous) {
                 for (i, (a, b)) in pixels
-                    .chunks_exact(4)
-                    .zip(previous.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(previous.as_chunks::<4>().0.iter())
                     .enumerate()
                 {
                     let (x, y) = (i as u32 % 16, i as u32 / 16);

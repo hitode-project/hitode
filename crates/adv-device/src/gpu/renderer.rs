@@ -20,6 +20,7 @@ pub use program::validate_program;
 #[derive(Clone, Copy)]
 pub(super) enum SwitchReason {
     PartialClear,
+    #[cfg(target_vendor = "apple")]
     Copy,
     Upload,
     FixedDraw,
@@ -339,7 +340,7 @@ impl FramePin {
     fn new(image: &Image) -> Result<Arc<Self>, Error> {
         image
             .frame_pins
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_add(1)
             })
             .map_err(|_| Error::Busy)?;
@@ -1400,7 +1401,7 @@ impl Gpu {
                 Some(line::Inclusive::List) => {
                     // Keep endpoint blending/depth/stencil in each segment's
                     // original order, including intersections with later lines.
-                    for (index, pair) in vertices.chunks_exact(2).enumerate() {
+                    for (index, pair) in vertices.as_chunks::<2>().0.iter().enumerate() {
                         let first = index as u32 * 2;
                         pass.set_pipeline(&pipeline);
                         pass.draw(first..first + 2, 0..1);
@@ -1584,13 +1585,12 @@ impl Gpu {
                 pending.flush_metal(SwitchReason::Copy);
                 pending.flush(&context.queue);
             }
-            if let Some(metal) = &mut pending.metal {
-                if metal.active() {
-                    metal.copy(self, source, rectangle, destination, x, y);
-                    self.stats.image_copy_bytes +=
-                        u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
-                    return self.check();
-                }
+            if let Some(metal) = &mut pending.metal
+                && metal.active()
+            {
+                metal.copy(self, source, rectangle, destination, x, y);
+                self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
+                return self.check();
             }
         }
         let mut encoder = self
@@ -1719,7 +1719,7 @@ impl Gpu {
         let submission_guard = context.submission_for(SwitchReason::Readback)?;
         self.own(image)?;
         self.readbacks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < self.readback_limit).then_some(count + 1)
             })
             .map_err(|_| Error::Busy)?;

@@ -1063,7 +1063,7 @@ pub(super) fn attach_source(
         }
     };
     let filter = state(env).pins[&pin].filter;
-    let video = info.as_ref().map_or(true, |i| i.video.is_some());
+    let video = info.as_ref().is_none_or(|i| i.video.is_some());
     let audio = info.as_ref().is_some_and(|i| i.audio.is_some());
     log::info!(
         "DirectShow: splitter {filter:#x} source {length} bytes: {}",

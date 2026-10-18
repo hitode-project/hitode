@@ -1,4 +1,6 @@
+#[cfg(target_os = "android")]
 pub use crate::mobile::TouchAction;
+#[cfg(target_os = "android")]
 pub(crate) use crate::mobile::position;
 /// Android physical key codes to Win32 virtual keys and set-1 scan codes.
 pub(crate) fn key(code: i32) -> Option<(u32, u32)> {

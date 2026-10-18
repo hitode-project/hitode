@@ -34,6 +34,10 @@ fn source(m: &mut Machine<JitCpu>, data: u32, bpp: u32) -> (u32, u32) {
     (info, bits)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the guest API"
+)]
 fn draw(
     m: &mut Machine<JitCpu>,
     data: u32,

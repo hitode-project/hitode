@@ -103,30 +103,25 @@ pub unsafe extern "C" fn x87_call(
             cliffs.x87_fast += 1;
             return result;
         }
-        let reason = if operation.fast.is_none() {
-            X87Cliff::NoFastForm
-        } else if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 {
-            X87Cliff::Pending
-        } else if fast::arithmetic_precision(state.x87.control).is_none() {
-            if state.x87.control & 0x0f3f == 0x033f {
-                let category = fast::pc64_opportunity(
-                    &operation.instruction,
-                    operation.fast.unwrap(),
-                    state,
-                    memory,
-                );
+        let reason = match operation.fast {
+            None => X87Cliff::NoFastForm,
+            Some(_) if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 => X87Cliff::Pending,
+            Some(fast) if fast::arithmetic_precision(state.x87.control).is_none() => {
+                if state.x87.control & 0x0f3f == 0x033f {
+                    let category =
+                        fast::pc64_opportunity(&operation.instruction, fast, state, memory);
+                    *cliffs
+                        .x87_pc64
+                        .entry((operation.instruction.mnemonic(), category))
+                        .or_default() += 1;
+                }
                 *cliffs
-                    .x87_pc64
-                    .entry((operation.instruction.mnemonic(), category))
+                    .x87_control
+                    .entry(state.x87.control & 0x0f3f)
                     .or_default() += 1;
+                X87Cliff::Control
             }
-            *cliffs
-                .x87_control
-                .entry(state.x87.control & 0x0f3f)
-                .or_default() += 1;
-            X87Cliff::Control
-        } else {
-            X87Cliff::Operand
+            Some(_) => X87Cliff::Operand,
         };
         *cliffs
             .x87_exact

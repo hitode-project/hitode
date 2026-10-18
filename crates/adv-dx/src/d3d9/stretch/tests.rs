@@ -454,7 +454,7 @@ fn recorded_blit_retains_image_leases_until_success_or_cancel() {
         let dst = f.render_target(2, 2, 21);
         let src_image = f.image(src);
         let dst_image = f.image(dst);
-        let color = vec![0x12, 0x34, 0x56, 0x78].repeat(16);
+        let color = [0x12, 0x34, 0x56, 0x78].repeat(16);
         f.m.ext
             .get_mut::<State>()
             .gpu
@@ -501,7 +501,7 @@ fn recorded_blit_retains_image_leases_until_success_or_cancel() {
         } else {
             drop(pause);
             assert_eq!(f.finish(outcome), 0);
-            assert_eq!(f.pixels(&dst_image), vec![0x12, 0x34, 0x56, 0x78].repeat(4));
+            assert_eq!(f.pixels(&dst_image), [0x12, 0x34, 0x56, 0x78].repeat(4));
         }
         assert_eq!(f.m.ext.get::<Surfaces>().targets.len(), 1);
         assert!(resources::resource(&env(&mut f.m), src).is_none());
@@ -705,7 +705,7 @@ fn linear_scaling_handles_single_texel_axes_and_rejects_unsupported_profiles() {
         let input: Vec<u32> = (0..w * h)
             .map(|i| {
                 let (x, y) = (i % w, i / w);
-                (24 + y * 64) << 24 | (40 + x * 50) << 16 | (12 + y * 60) << 8 | (x + y) * 30
+                (24 + y * 64) << 24 | (40 + x * 50) << 16 | (12 + y * 60) << 8 | ((x + y) * 30)
             })
             .collect();
         let locked = f.lock(source, 0, 0);
@@ -738,7 +738,7 @@ fn linear_scaling_handles_single_texel_axes_and_rejects_unsupported_profiles() {
         let pixels = f.pixels(&destination_target.image);
         for y in 0..8 {
             for x in 0..8 {
-                if x < 1 || x >= 1 + xs.len() || y < 2 || y >= 2 + ys.len() {
+                if x < 1 || x > xs.len() || y < 2 || y >= 2 + ys.len() {
                     assert_eq!(
                         &pixels[(y * 8 + x) * 4..(y * 8 + x + 1) * 4],
                         &0xaa010203u32.to_le_bytes()

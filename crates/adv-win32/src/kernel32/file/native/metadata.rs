@@ -21,15 +21,14 @@ pub(in crate::kernel32) fn flush(env: &mut Env<'_>, handle: u32) -> Outcome {
 pub(in crate::kernel32) fn set_times(env: &mut Env<'_>, handle: u32, inputs: [u32; 3]) -> Outcome {
     let mut bytes = vec![0; 40];
     for (index, input) in inputs.into_iter().enumerate() {
-        if input != 0 {
-            if check_range(env.cpu, input, 8, Prot::READ).is_err()
+        if input != 0
+            && (check_range(env.cpu, input, 8, Prot::READ).is_err()
                 || env
                     .cpu
                     .read(input, &mut bytes[index * 8..index * 8 + 8])
-                    .is_err()
-            {
-                return failed(env, ACCESS_VIOLATION);
-            }
+                    .is_err())
+        {
+            return failed(env, ACCESS_VIOLATION);
         }
     }
     operations::set_information(

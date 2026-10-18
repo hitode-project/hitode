@@ -49,7 +49,9 @@ fn publish(env: &mut Env<'_>, output: u32, wide: bool, bytes: &[u8]) -> Result<(
         return Err(INVALID_PARAMETER);
     }
     let units: Vec<_> = bytes[94..94 + length]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     let mut data = vec![0; if wide { 592 } else { 320 }];
@@ -59,7 +61,9 @@ fn publish(env: &mut Env<'_>, output: u32, wide: bool, bytes: &[u8]) -> Result<(
     data[32..36].copy_from_slice(&bytes[40..44]);
     let short = usize::from(bytes[68]).min(24) & !1;
     let short_units: Vec<_> = bytes[70..70 + short]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     if wide {

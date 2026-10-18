@@ -112,9 +112,8 @@ pub(super) fn read(
                 return Ok(None);
             }
             let indices = memory.read(address, count as usize * 2)?;
-            for (entry, index) in palette.iter_mut().zip(indices.chunks_exact(2)) {
-                let color = logical
-                    [usize::from(u16::from_le_bytes(index.try_into().unwrap())) % logical.len()];
+            for (entry, index) in palette.iter_mut().zip(indices.as_chunks::<2>().0.iter()) {
+                let color = logical[usize::from(u16::from_le_bytes(*index)) % logical.len()];
                 *entry = [color[2], color[1], color[0], 0];
             }
         } else {

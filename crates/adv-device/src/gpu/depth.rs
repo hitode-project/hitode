@@ -71,6 +71,10 @@ impl Depth {
     }
     /// Record a clear. An older clear the new one cannot absorb is returned
     /// instead, to execute first; the caller then records the new one again.
+    #[allow(
+        clippy::result_large_err,
+        reason = "returns ownership of the pending clear without allocating on the draw path"
+    )]
     pub(super) fn defer_clear(&self, new: DeferredClear) -> Result<(), DeferredClear> {
         let mut slot = self.0.deferred.lock().unwrap();
         let Some(old) = slot.take() else {

@@ -484,7 +484,7 @@ pub(crate) fn map_section(
     if rights & required == 0 || (write && section.protection != 4) {
         return fail(env, 5);
     }
-    if offset % GRANULE != 0 {
+    if !offset.is_multiple_of(GRANULE) {
         return fail(env, 1132);
     }
     let count = if count == 0 {

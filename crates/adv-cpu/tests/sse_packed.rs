@@ -31,20 +31,22 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
 }
 
 fn initial() -> CpuState {
-    let mut state = CpuState::default();
-    state.eip = CODE;
-    state.regs = [
-        0x1234_5678,
-        17,
-        0x9876_5432,
-        0x2468_ace0,
-        STACK,
-        DATA,
-        DATA,
-        DATA + 64,
-    ];
-    state.eflags = 0xcd7;
-    state.mxcsr = 0x5fc3;
+    let mut state = CpuState {
+        eip: CODE,
+        regs: [
+            0x1234_5678,
+            17,
+            0x9876_5432,
+            0x2468_ace0,
+            STACK,
+            DATA,
+            DATA,
+            DATA + 64,
+        ],
+        eflags: 0xcd7,
+        mxcsr: 0x5fc3,
+        ..CpuState::default()
+    };
     state.x87.status = 0x4500;
     state.x87.set_top(5);
     state.x87.tag = 0;
@@ -101,7 +103,7 @@ fn completed(jit: &mut Executor, interpreter: &mut Executor, unicorn: &mut Execu
 
 fn words(values: [i16; 8]) -> [u8; 16] {
     let mut bytes = [0; 16];
-    for (chunk, value) in bytes.chunks_exact_mut(2).zip(values) {
+    for (chunk, value) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(values) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes

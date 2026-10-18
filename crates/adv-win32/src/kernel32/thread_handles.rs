@@ -16,10 +16,11 @@ fn owned_thread(env: &Env<'_>, pid: u32, tid: u32) -> Option<ThreadIdentity> {
             Object::Thread { ctx } => env.sys.thread_identity(*ctx),
             _ => None,
         };
-        if let Some(identity) = identity {
-            if identity.tid == tid && (pid == 0 || identity.process.pid == pid) {
-                return Some(identity);
-            }
+        if let Some(identity) = identity
+            && identity.tid == tid
+            && (pid == 0 || identity.process.pid == pid)
+        {
+            return Some(identity);
         }
     }
     if pid == 0 || pid == env.sys.pid {

@@ -132,9 +132,7 @@ fn canonical(path: &[u32]) -> Vec<u32> {
         }
         result.extend_from_slice(part);
     }
-    if result.is_empty() {
-        result.push(SLASH);
-    } else if result.len() == 2 && result[1] == COLON {
+    if result.is_empty() || (result.len() == 2 && result[1] == COLON) {
         result.push(SLASH);
     }
     result

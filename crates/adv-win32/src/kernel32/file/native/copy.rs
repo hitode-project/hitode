@@ -256,11 +256,12 @@ fn copy_options(
             }
         }
     }
-    if !native_owns_names && !fail_if_exists {
-        if let Err(error) = super::super::replacement_allowed(env, &target, 0, true) {
-            set_last_error(env, error);
-            return Outcome::Return(0);
-        }
+    if !native_owns_names
+        && !fail_if_exists
+        && let Err(error) = super::super::replacement_allowed(env, &target, 0, true)
+    {
+        set_last_error(env, error);
+        return Outcome::Return(0);
     }
     let move_source = moving.then(|| source.clone());
     operations::open(

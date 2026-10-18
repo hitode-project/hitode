@@ -107,6 +107,10 @@ impl Surface {
 }
 
 impl<P: Presenter> Surfaces<P> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     pub(super) fn draw_monochrome_text(
         &mut self,
         id: u32,
@@ -170,6 +174,10 @@ impl<P: Presenter> Surfaces<P> {
         Ok(true)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the operation takes explicit image layout and draw parameters"
+    )]
     pub(super) fn blit_packed(
         &mut self,
         source: &Surface,
@@ -257,7 +265,10 @@ impl<P: Presenter> Surfaces<P> {
                 let sy = if options.mirror_y { sr.h - 1 - sy } else { sy };
                 let input = &self.blit_source[sy as usize * stride..(sy as usize + 1) * stride];
                 if colour {
-                    for (raw, pixel) in input.chunks_exact(sb).zip(decoded.chunks_exact_mut(4)) {
+                    for (raw, pixel) in input
+                        .chunks_exact(sb)
+                        .zip(decoded.as_chunks_mut::<4>().0.iter_mut())
+                    {
                         pixel.copy_from_slice(&source.decode_pixel(raw));
                     }
                     sample_row(&decoded, &mut self.blit_sample, 4, ox, sr.w, dr.w, options);

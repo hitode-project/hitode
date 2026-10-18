@@ -299,7 +299,7 @@ impl Pe {
                 .ok_or_else(|| PeError::Malformed("section table truncated".into()))?
         };
         reserve(&mut pe.sections, nsections)?;
-        for s in sections.chunks_exact(40) {
+        for s in sections.as_chunks::<40>().0.iter() {
             let raw_name = &s[..8];
             let name_len = raw_name.iter().position(|&c| c == 0).unwrap_or(8);
             pe.sections.push(Section {
@@ -474,7 +474,7 @@ impl Pe {
                 return Err(PeError::Malformed("relocation block truncated".into()));
             }
             let (block, remaining) = blocks.split_at(size as usize);
-            for entry in block[8..].chunks_exact(2) {
+            for entry in block[8..].as_chunks::<2>().0.iter() {
                 let v = le16(entry, 0)?;
                 match v >> 12 {
                     0 => {}
@@ -538,8 +538,10 @@ impl Pe {
                 len: 4,
             })?;
         let count = tail
-            .chunks_exact(4)
-            .position(|word| word == [0; 4])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .position(|word| *word == [0; 4])
             .ok_or_else(|| PeError::Malformed("import thunk array lacks a terminator".into()))?;
         let len = u32::try_from(count)
             .ok()
@@ -551,7 +553,7 @@ impl Pe {
         }
         reserve(&mut out, count)?;
         let mut iat_rva = iat_rva;
-        for word in names.chunks_exact(4) {
+        for word in names.as_chunks::<4>().0.iter() {
             let t = le32(word, 0)?;
             let name = if t & 0x8000_0000 != 0 {
                 ImportName::Ordinal(t as u16)
@@ -585,7 +587,7 @@ impl Pe {
                 rva: d.rva,
                 len: 20,
             })?;
-        for desc in descriptors.chunks_exact(20) {
+        for desc in descriptors.as_chunks::<20>().0.iter() {
             let (int, name, iat) = (le32(desc, 0)?, le32(desc, 12)?, le32(desc, 16)?);
             if name == 0 && iat == 0 {
                 return Ok(out);
@@ -641,7 +643,7 @@ impl Pe {
                 rva: d.rva,
                 len: 32,
             })?;
-        for desc in descriptors.chunks_exact(32) {
+        for desc in descriptors.as_chunks::<32>().0.iter() {
             let attrs = le32(desc, 0)?;
             let name = le32(desc, 4)?;
             if name == 0 {
@@ -750,7 +752,13 @@ impl Pe {
         reserve(&mut name_of, count)?;
         name_of.resize_with(count, || None);
         let ords = self.image.get(ords as usize..).unwrap_or_default();
-        for (i, ord) in ords.chunks_exact(2).take(nnames as usize).enumerate() {
+        for (i, ord) in ords
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(nnames as usize)
+            .enumerate()
+        {
             let idx = le16(ord, 0)? as usize;
             let Some(slot) = name_of.get_mut(idx) else {
                 continue;
@@ -766,7 +774,11 @@ impl Pe {
             }
         }
         reserve(&mut out, count)?;
-        for (i, (name, func)) in name_of.into_iter().zip(funcs.chunks_exact(4)).enumerate() {
+        for (i, (name, func)) in name_of
+            .into_iter()
+            .zip(funcs.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
             let rva = le32(func, 0)?;
             if rva == 0 {
                 continue;

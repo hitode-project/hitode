@@ -925,7 +925,7 @@ impl Font {
         ]
         .map(|offset| {
             let start = offset as usize;
-            if start % 2 != 0 || start >= size as usize {
+            if !start.is_multiple_of(2) || start >= size as usize {
                 return Err(TextError::Font("invalid outline font name offset".into()));
             }
             // SAFETY: the offset and count stay within the initialized native

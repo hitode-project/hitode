@@ -522,7 +522,7 @@ fn prepare(case: Case, tiers: &[u8]) -> Result<Ready, &'static str> {
         let mut m = setup(&case, tier).map_err(|_| "setup_or_compile")?;
         run(&mut m, &initial, case.stop).map_err(|_| "execution")?;
         if m.state.capture_architecture() != expected
-            || m.memory().read(DATA, 4096).map_err(|_| "data")?.as_ref() != data
+            || m.memory().read(DATA, 4096).map_err(|_| "data")? != data
         {
             return Err("semantic_mismatch");
         }
@@ -620,6 +620,10 @@ pub fn main() {
             .collect();
         let cpu_start = cpu();
         // Rotate the tier order to distribute gradual thermal/frequency drift.
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "each sample rotates across the tier-major timing rows"
+        )]
         for sample in 0..samples {
             for offset in 0..tiers.len() {
                 let index = (sample + offset) % tiers.len();
@@ -649,7 +653,7 @@ pub fn main() {
                     "anonymous state mismatch"
                 );
                 assert!(
-                    m.memory().read(DATA, 4096).unwrap().as_ref() == ready.data,
+                    m.memory().read(DATA, 4096).unwrap() == ready.data,
                     "anonymous memory mismatch"
                 );
             }

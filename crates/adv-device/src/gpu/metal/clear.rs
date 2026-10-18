@@ -8,9 +8,7 @@ impl Gpu {
         vertices: &[Vertex],
         state: DrawState,
     ) -> Option<Result<(), Error>> {
-        if self.context.pending.lock().unwrap().metal.is_none() {
-            return None;
-        }
+        self.context.pending.lock().unwrap().metal.as_ref()?;
         static PROGRAM: OnceLock<Program> = OnceLock::new();
         let program = PROGRAM.get_or_init(|| {
             let mut program = Program::new(

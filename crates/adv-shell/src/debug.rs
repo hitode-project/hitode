@@ -17,17 +17,21 @@ use crate::window::WakeEvent;
 use adv_runtime::Engine;
 use adv_runtime::boot::Runtime;
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 mod profile;
 
 /// Guest instructions a snapshot describes by form and code size.
 const HOT_INSTRUCTIONS: usize = 60;
 /// How long a socket request waits for a guest boundary.
+#[cfg(unix)]
 const BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames the timeline keeps: ten minutes at 60 fps.
 const TIMELINE_CAPACITY: usize = 36_000;
@@ -101,7 +105,9 @@ struct Shared {
     marks: Mutex<Vec<(u64, String)>>,
     snapshots: Mutex<VecDeque<(String, String)>>,
     profiler: Arc<profile::Profiler>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     requests: Mutex<mpsc::Sender<Request>>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     wake: WakeEvent,
     stopped: AtomicBool,
 }
@@ -473,13 +479,26 @@ struct Classified {
     host: Option<usize>,
 }
 
+/// A host address inside translated code: the unit, the guest instruction
+/// when the unit recorded marks, and the code part.
+#[derive(Clone, Copy)]
+struct Spot {
+    unit: u32,
+    eip: Option<u32>,
+    part: &'static str,
+}
+
 #[cfg(target_arch = "aarch64")]
-fn locate(pc: usize, at_ns: u128) -> Option<adv_runtime::JitLocation> {
-    adv_runtime::jit_map_locate(pc, at_ns)
+fn locate(pc: usize, at_ns: u128) -> Option<Spot> {
+    adv_runtime::jit_map_locate(pc, at_ns).map(|location| Spot {
+        unit: location.unit,
+        eip: location.eip,
+        part: part_name(location.part),
+    })
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn locate(_: usize, _: u128) -> Option<adv_runtime::JitLocation> {
+fn locate(_: usize, _: u128) -> Option<Spot> {
     None
 }
 
@@ -493,6 +512,7 @@ fn stub(_: usize) -> Option<&'static str> {
     None
 }
 
+#[cfg(target_arch = "aarch64")]
 fn part_name(part: adv_runtime::JitPart) -> &'static str {
     match part {
         adv_runtime::JitPart::Body => "body",
@@ -520,7 +540,7 @@ fn classify(sample: &profile::Sample) -> Classified {
             kind: Kind::Guest,
             eip: Some(location.unit),
             inst: location.eip,
-            part: part_name(location.part).into(),
+            part: location.part.into(),
             host: None,
         };
     }
@@ -574,13 +594,13 @@ fn symbol(pc: usize) -> Option<(String, String)> {
             return None;
         }
         let text = |p: *const libc::c_char| {
-            (!p.is_null())
-                .then(|| {
-                    unsafe { std::ffi::CStr::from_ptr(p) }
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default()
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
         };
         let image = text(info.dli_fname);
         let image = image.rsplit('/').next().unwrap_or_default().to_owned();
@@ -724,30 +744,31 @@ fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
     )];
     for (eip, parts) in rows.into_iter().take(HOT_INSTRUCTIONS) {
         #[cfg(target_arch = "aarch64")]
-        let (form, sizes) = (
-            runtime
+        let (form, bytes) = {
+            let sizes = adv_runtime::jit_map_code_of(eip);
+            let form = runtime
                 .machine
                 .cpu
                 .executor()
                 .instruction_form(eip)
-                .map_or_else(|| "-".into(), |code| format!("{code:?}")),
-            adv_runtime::jit_map_code_of(eip),
-        );
+                .map_or_else(|| "-".into(), |code| format!("{code:?}"));
+            let bytes = [
+                adv_runtime::JitPart::Body,
+                adv_runtime::JitPart::Cold,
+                adv_runtime::JitPart::X87Entry,
+                adv_runtime::JitPart::X87Publish,
+            ]
+            .map(|part| {
+                sizes
+                    .iter()
+                    .find(|&&(at, _)| at == part)
+                    .map_or(0, |&(_, bytes)| bytes)
+                    .to_string()
+            });
+            (form, bytes)
+        };
         #[cfg(not(target_arch = "aarch64"))]
-        let (form, sizes): (String, Vec<(adv_runtime::JitPart, usize)>) = ("-".into(), Vec::new());
-        let bytes = [
-            adv_runtime::JitPart::Body,
-            adv_runtime::JitPart::Cold,
-            adv_runtime::JitPart::X87Entry,
-            adv_runtime::JitPart::X87Publish,
-        ]
-        .map(|part| {
-            sizes
-                .iter()
-                .find(|&&(at, _)| at == part)
-                .map_or(0, |&(_, bytes)| bytes)
-                .to_string()
-        });
+        let (form, bytes) = (String::from("-"), ["0"; 4].map(String::from));
         text.push(format!(
             "{}\t{eip:#010x}\t{}\t{form}\t{}\t{}",
             parts.iter().sum::<usize>(),
@@ -821,6 +842,7 @@ fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
 }
 
 /// Answers what this module records without the execution thread.
+#[cfg(unix)]
 fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<String, String>> {
     let seconds_back = |default: u64| {
         let seconds = args
@@ -894,6 +916,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
     })
 }
 
+#[cfg(unix)]
 const HELP: &str = "\
 answered at once: ping, help, info, timeline [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
@@ -961,6 +984,7 @@ fn connection(stream: std::os::unix::net::UnixStream, shared: &Shared) {
     }
 }
 
+#[cfg(unix)]
 fn answer(shared: &Shared, line: &str) -> Result<String, String> {
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or_default();

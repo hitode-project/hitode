@@ -468,7 +468,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let link = e.arg(1) as i32;
             let Some(s) = e.ext.get::<Provider>().get_mut(&mut e.sys.objects, vf) else {
                 return if matches!(name, "ov_time_tell" | "ov_pcm_tell" | "ov_raw_tell") {
-                    total_error(&name, OV_EINVAL)
+                    total_error(name, OV_EINVAL)
                 } else {
                     if matches!(
                         name,
@@ -481,7 +481,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 };
             };
             if s.partial && matches!(name, "ov_pcm_tell" | "ov_raw_tell" | "ov_time_tell") {
-                return total_error(&name, OV_EINVAL);
+                return total_error(name, OV_EINVAL);
             }
             match name {
                 "ov_test_open" => {

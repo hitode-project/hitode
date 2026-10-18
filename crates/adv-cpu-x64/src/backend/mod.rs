@@ -37,7 +37,7 @@ impl CodeImageSink {
         if bytes != 0
             && self
                 .bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(bytes).filter(|&total| total <= limit)
                 })
                 .is_err()

@@ -382,14 +382,17 @@ mod tests {
     use crate::user32::image::decode::{Candidate, Group, bitmap};
 
     fn color_dib(size: u32, color: [u8; 4]) -> Vec<u8> {
-        let mask_stride = (size + 31) / 32 * 4;
+        let mask_stride = size.div_ceil(32) * 4;
         let mut bytes = vec![0; (40 + size * size * 4 + mask_stride * size) as usize];
         bytes[..4].copy_from_slice(&40u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&size.to_le_bytes());
         bytes[8..12].copy_from_slice(&(size * 2).to_le_bytes());
         bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
         bytes[14..16].copy_from_slice(&32u16.to_le_bytes());
-        for pixel in bytes[40..40 + (size * size * 4) as usize].chunks_exact_mut(4) {
+        for pixel in bytes[40..40 + (size * size * 4) as usize]
+            .as_chunks_mut::<4>()
+            .0
+        {
             pixel.copy_from_slice(&color);
         }
         bytes
@@ -421,8 +424,10 @@ mod tests {
         assert!(
             extracted
                 .pixels
-                .chunks_exact(4)
-                .all(|pixel| pixel == [0, 255, 0, 123])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|&pixel| pixel == [0, 255, 0, 123])
         );
         assert!(extracted.mask.iter().all(|&value| value == 0));
         assert_eq!(&image(&group, 16).unwrap().pixels[..4], &[255, 0, 0, 255]);

@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(running[0], READ | WRITE);
         assert_eq!(running[1], READ | WRITE | SHARED);
         memory.prepare_native_access(0x11000, 4, false).unwrap();
-        assert_eq!(memory.read(0x11000, 4).unwrap().as_ref(), &[0x71; 4]);
+        assert_eq!(memory.read(0x11000, 4).unwrap(), &[0x71; 4]);
         assert_eq!(running[1], READ | WRITE | SHARED);
         let next = memory.native_permissions();
         assert_eq!(next[0] & super::super::FAST_READ, super::super::FAST_READ);

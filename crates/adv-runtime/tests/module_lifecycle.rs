@@ -192,8 +192,10 @@ fn freeing_the_executing_dll_and_exiting_its_thread_matches_windows() {
     }
     let decode = |bytes: Vec<u8>| {
         bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect::<Vec<_>>()
     };
     let golden = decode(std::fs::read(directory.join("module-self-exit.bin")).unwrap());
@@ -312,8 +314,10 @@ fn thread_and_process_notifications_match_windows_including_disabled_tls_modules
     }
     let decode = |bytes: Vec<u8>| {
         bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect::<Vec<_>>()
     };
     let golden = decode(std::fs::read(directory.join("module-notifications.bin")).unwrap());
@@ -387,8 +391,10 @@ fn repeated_load_dependency_release_failed_attach_and_pin_match_windows() {
     }
     let decode = |bytes: Vec<u8>| {
         bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect::<Vec<_>>()
     };
     let golden = decode(std::fs::read(directory.join("module-lifecycle.bin")).unwrap());

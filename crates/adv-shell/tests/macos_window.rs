@@ -81,16 +81,16 @@ mod mac {
     }
 
     fn post(mtm: MainThreadMarker, event: &NSEvent) {
-        if let Some(view) = event.window(mtm).and_then(|window| window.contentView()) {
-            if view.downcast_ref::<adv_shell::window::GameView>().is_some() {
-                match event.r#type() {
-                    NSEventType::KeyDown => view.keyDown(event),
-                    NSEventType::KeyUp => view.keyUp(event),
-                    NSEventType::LeftMouseDown => view.mouseDown(event),
-                    _ => unreachable!(),
-                }
-                return;
+        if let Some(view) = event.window(mtm).and_then(|window| window.contentView())
+            && view.downcast_ref::<adv_shell::window::GameView>().is_some()
+        {
+            match event.r#type() {
+                NSEventType::KeyDown => view.keyDown(event),
+                NSEventType::KeyUp => view.keyUp(event),
+                NSEventType::LeftMouseDown => view.mouseDown(event),
+                _ => unreachable!(),
             }
+            return;
         }
         NSApplication::sharedApplication(mtm).sendEvent(event);
     }

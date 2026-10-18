@@ -320,7 +320,7 @@ pub(super) fn flags(f: &Flags, values: &[u64]) -> u32 {
     };
     bit(ZF, result == 0);
     bit(SF, result & sign != 0);
-    bit(PF, (result as u8).count_ones() % 2 == 0);
+    bit(PF, (result as u8).count_ones().is_multiple_of(2));
     match f.kind {
         FlagKind::Add | FlagKind::Sub => {
             let sub = f.kind == FlagKind::Sub;

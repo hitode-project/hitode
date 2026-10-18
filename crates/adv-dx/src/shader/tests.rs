@@ -133,6 +133,10 @@ fn relative_usage_covers_all_floats_but_keeps_local_definitions_private() {
 
 #[test]
 // spec: GFX-REC-7
+#[allow(
+    clippy::single_range_in_vec_init,
+    reason = "the expected result contains one constant range"
+)]
 fn legacy_bump_usage_covers_only_the_implicit_stage_parameters() {
     for op in [Opcode::Texbem, Opcode::Texbeml] {
         let s = shader(Stage::Pixel, 1, 1, &[op as u32, dst(3, 1), src(3, 0)]);

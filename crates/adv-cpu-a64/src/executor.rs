@@ -324,7 +324,7 @@ impl Executor {
             *forms.entry(decoder.decode().code()).or_default() += count;
         }
         let mut forms: Vec<_> = forms.into_iter().collect();
-        forms.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        forms.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
         forms
     }
 
@@ -417,7 +417,7 @@ impl Executor {
         {
             return native.past();
         }
-        polls % 16 == 0 && self.deadline.is_some_and(|at| Instant::now() >= at)
+        polls.is_multiple_of(16) && self.deadline.is_some_and(|at| Instant::now() >= at)
     }
 
     #[cfg(not(native))]

@@ -105,6 +105,10 @@ pub(crate) fn create(
     open_at(env, path, access, share, disposition, options, false, then)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the guest API"
+)]
 fn open_at(
     env: &mut Env<'_>,
     path: &str,

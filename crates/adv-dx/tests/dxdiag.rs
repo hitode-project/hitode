@@ -5,8 +5,12 @@ use adv_cpu::{
     JitCpu,
     backend::{Guest, GuestExt, Prot, asm::Asm},
 };
-use adv_dx::dxdiag::{CLSID_PROVIDER, IID_CONTAINER, IID_PROVIDER};
-use adv_machine::{Clock, Env, Machine, RunResult, layout::PARK_ADDR};
+#[cfg(feature = "gpu")]
+use adv_dx::dxdiag::IID_CONTAINER;
+use adv_dx::dxdiag::{CLSID_PROVIDER, IID_PROVIDER};
+#[cfg(feature = "gpu")]
+use adv_machine::Env;
+use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_win32::{Win32, Win32Config};
 
 const CODE: u32 = 0x400000;
@@ -15,6 +19,7 @@ const DATA: u32 = 0x410000;
 #[derive(Clone, Copy)]
 enum Arg {
     Value(u32),
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     Stored(u32),
 }
 use Arg::{Stored as M, Value as I};

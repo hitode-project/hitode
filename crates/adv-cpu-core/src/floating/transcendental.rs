@@ -363,7 +363,7 @@ mod tests {
         inputs.extend((0..32).map(|n| {
             Ext::from_parts(
                 0x8000_0000_0000_0001 + n * 0x0301_0101_0101_0101,
-                0x3ffb + (n % 8) as u16 | if n % 2 != 0 { 0x8000 } else { 0 },
+                (0x3ffb + (n % 8) as u16) | if n % 2 != 0 { 0x8000 } else { 0 },
             )
         }));
         for precision in [0, 2, 3] {

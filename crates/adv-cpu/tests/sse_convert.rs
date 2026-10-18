@@ -143,7 +143,7 @@ fn compare(m: &mut [Executor; 3], state: CpuState, source: [u8; 16], unicorn: bo
 
 fn words(values: [u32; 4]) -> [u8; 16] {
     let mut bytes = [0; 16];
-    for (chunk, value) in bytes.chunks_exact_mut(4).zip(values) {
+    for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes
@@ -151,7 +151,7 @@ fn words(values: [u32; 4]) -> [u8; 16] {
 
 fn doubles(values: [u64; 2]) -> [u8; 16] {
     let mut bytes = [0; 16];
-    for (chunk, value) in bytes.chunks_exact_mut(8).zip(values) {
+    for (chunk, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(values) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     bytes

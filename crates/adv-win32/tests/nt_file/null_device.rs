@@ -215,7 +215,8 @@ fn operations<B: Backend>(cpu: B) {
         // (return, last error, IOSB/count dwords, buffer dwords)
         let denied = |status| if writable { status } else { 0xc0000022 };
         let error = |code| if writable { code } else { 5 };
-        let expected: Vec<(u32, Option<u32>, [u32; 2], Vec<u32>)> = vec![
+        type Expected = (u32, Option<u32>, [u32; 2], Vec<u32>);
+        let expected: Vec<Expected> = vec![
             (2, Some(MARKER), [UNTOUCHED; 2], vec![]),
             (1, Some(MARKER), [0, UNTOUCHED], vec![UNTOUCHED]),
             (1, Some(MARKER), [0, UNTOUCHED], vec![]),

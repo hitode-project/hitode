@@ -207,7 +207,7 @@ fn typed_wide(
     method: u32,
 ) -> Result<i32, adv_cpu::backend::MemFault> {
     assert_eq!(file.0, 0x1234);
-    assert_eq!(distance, -0x1020_3040_5060_708);
+    assert_eq!(distance, -0x0102_0304_0506_0708);
     assert_eq!(method, 2);
     output.write(_env.cpu, distance)?;
     Ok(1)
@@ -287,7 +287,7 @@ fn metadata_uses_stack_words_for_64_bit_parameters() {
     let thunk = machine
         .resolve_import("kernel32.dll", "SetFilePointerEx")
         .unwrap();
-    let distance = -0x1020_3040_5060_708i64;
+    let distance = -0x0102_0304_0506_0708i64;
     let mut code = Asm::new(CODE);
     code.push_imm(2)
         .push_imm(DATA)

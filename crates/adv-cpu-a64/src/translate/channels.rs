@@ -56,7 +56,7 @@ impl Plan {
         let mut pointers = 1u8 << destination;
         let mut temps = 0u8;
         let mut pairs = Vec::new();
-        for ops in ops.chunks_exact(3) {
+        for ops in ops.as_chunks::<3>().0 {
             let (temp, byte, source) = match ops[0] {
                 Op::Extend(temp @ 0..=3, Narrow8or16::Mem(source, false), _) => {
                     (temp, temp, source)

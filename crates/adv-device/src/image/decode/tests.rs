@@ -45,13 +45,13 @@ fn image_metadata_and_bgra_decode_match_authored_native_samples_and_reject_trunc
     for (color, samples, format, bgra) in [
         (
             png::ColorType::Rgb,
-            vec![40, 80, 120].repeat(3),
+            [40, 80, 120].repeat(3),
             Format::Rgb8,
             [120, 80, 40, 255],
         ),
         (
             png::ColorType::Rgba,
-            vec![40, 80, 120, 160].repeat(3),
+            [40, 80, 120, 160].repeat(3),
             Format::Rgba8,
             [120, 80, 40, 160],
         ),
@@ -63,7 +63,7 @@ fn image_metadata_and_bgra_decode_match_authored_native_samples_and_reject_trunc
         ),
         (
             png::ColorType::GrayscaleAlpha,
-            vec![40, 160].repeat(3),
+            [40, 160].repeat(3),
             Format::LumaAlpha8,
             [40, 40, 40, 160],
         ),

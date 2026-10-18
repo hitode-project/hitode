@@ -22,15 +22,13 @@ pub struct VideoWindowGeometry {
     pub visible: bool,
 }
 
+type VideoUpdate =
+    fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u64, Option<VideoLayer>) -> Result<u64, String>;
+
 #[derive(Clone, Copy)]
 pub struct VideoProvider {
     pub window: fn(&Ext, &Objects, u32) -> Option<VideoWindowGeometry>,
-    pub update: fn(
-        &mut Ext,
-        &mut dyn adv_cpu::backend::Guest,
-        u64,
-        Option<VideoLayer>,
-    ) -> Result<u64, String>,
+    pub update: VideoUpdate,
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
 }
 

@@ -18,7 +18,9 @@ pub mod overlay;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
 mod report;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod settings;
+mod update;
 mod vndb;
 
 use serde::Serialize;
@@ -71,7 +73,9 @@ pub fn run() {
         }
         game::prepare_jit();
     }
-    let builder = tauri::Builder::default().manage(overlay::OverlayState::default());
+    let builder = tauri::Builder::default()
+        .manage(overlay::OverlayState::default())
+        .plugin(tauri_plugin_opener::init());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_storage::init());
     let builder = builder.setup(|app| {
@@ -99,7 +103,6 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()));
     #[cfg(target_os = "macos")]
     let builder =
@@ -130,6 +133,7 @@ pub fn run() {
                 vndb::vndb_search,
                 vndb::vndb_apply,
                 vndb::vndb_unlink,
+                update::check_update,
                 library::set_tracking,
                 library::library_inspect,
                 library::library_scan,
@@ -153,6 +157,7 @@ pub fn run() {
         vndb::vndb_search,
         vndb::vndb_apply,
         vndb::vndb_unlink,
+        update::check_update,
         library::set_tracking,
         library::library_inspect,
         library::library_scan,
@@ -194,6 +199,7 @@ pub fn run() {
         vndb::vndb_search,
         vndb::vndb_apply,
         vndb::vndb_unlink,
+        update::check_update,
         library::set_tracking,
         library::library_inspect,
         library::library_scan,
@@ -240,6 +246,7 @@ pub fn run() {
         vndb::vndb_search,
         vndb::vndb_apply,
         vndb::vndb_unlink,
+        update::check_update,
         library::set_tracking,
         library::library_inspect,
         library::library_scan,

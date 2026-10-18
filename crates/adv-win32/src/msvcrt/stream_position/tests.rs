@@ -51,7 +51,7 @@ fn fixture<B: Backend>(cpu: B) -> Machine<B> {
         ));
     std::fs::create_dir_all(root.join("game")).unwrap();
     std::fs::write(root.join("game/stream.bin"), b"original").unwrap();
-    let mut config = crate::Win32Config::new(&root.join("game"), "fixture.exe", &root.join("data"));
+    let mut config = crate::Win32Config::new(root.join("game"), "fixture.exe", root.join("data"));
     config.os.write_game = false;
     let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
     crate::Win32::install(&mut machine, config).unwrap();

@@ -156,11 +156,13 @@ impl Library {
         }
         self.metadata_target(id)
     }
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn launch(&self, id: &str) -> io::Result<(PathBuf, PathBuf, u32)> {
         let game = &self.games[self.game(id)?];
         let data = self.path.parent().unwrap().join("games").join(id);
         Ok((game.folder.join(&game.exe), data, game.codepage))
     }
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn finished(&mut self, id: &str, seconds: u32, run: LastRun) -> io::Result<()> {
         let ended = run.ended;
         let i = self.game(id)?;
@@ -769,7 +771,7 @@ mod tests {
             // An unreadable executable is skipped rather than failing the folder.
             use std::os::unix::fs::PermissionsExt;
             pe(&dir, "locked.exe", 0x14c, 500);
-            fs::set_permissions(dir.join("locked.exe"), fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(dir.join("locked.exe"), fs::Permissions::from_mode(0o0)).unwrap();
         }
         let found = inspect(&lib.known(), &dir).unwrap();
         let arch: Vec<_> = found.exes.iter().map(|e| e.arch).collect();

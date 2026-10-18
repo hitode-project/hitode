@@ -28,10 +28,11 @@ fn key(env: &mut Env<'_>, pointer: u32, wide: bool, add: bool) -> Result<u16, u3
             // Native SetPropA first finds an existing global atom, whereas W
             // adds a reference even when replacing the same named property.
             // RemoveProp does not delete either kind of atom reference.
-            if add && !wide {
-                if let Ok(id) = atom::resolve(env, units.clone(), false) {
-                    return Ok(id);
-                }
+            if add
+                && !wide
+                && let Ok(id) = atom::resolve(env, units.clone(), false)
+            {
+                return Ok(id);
             }
             atom::resolve(env, units, add)
         }

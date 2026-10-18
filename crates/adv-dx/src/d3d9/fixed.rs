@@ -692,7 +692,7 @@ fn set_sampler(env: &mut Env<'_>, this: GuestPtr<()>, sampler: u32, kind: i32, v
         return INVALID;
     };
     let valid = match kind {
-        1 | 2 | 3 => address(value).is_some(),
+        1..=3 => address(value).is_some(),
         5 | 6 => matches!(value, 1 | 2),
         7 => value <= 2,
         4 | 9 => true,
@@ -1160,8 +1160,10 @@ fn prepare_input_checked(
         let mut coordinates = [[0., 0., 0., 1.]; 8];
         for (n, coordinate) in layout.texcoords.iter().enumerate() {
             if let Some((stream, offset, dimensions)) = *coordinate {
-                for component in 0..dimensions as usize {
-                    coordinates[n][component] = float(stream, offset + component as u32 * 4);
+                for (component, value) in
+                    coordinates[n][..dimensions as usize].iter_mut().enumerate()
+                {
+                    *value = float(stream, offset + component as u32 * 4);
                 }
                 if coordinates[n].iter().any(|v| !v.is_finite()) {
                     return Err(rejected(

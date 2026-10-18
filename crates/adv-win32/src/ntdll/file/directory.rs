@@ -50,6 +50,10 @@ fn mutable(env: &mut Env<'_>, path: &str) -> Result<(), i32> {
     }
     Ok(())
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameters mirror the guest API"
+)]
 pub(crate) fn open(
     env: &mut Env<'_>,
     path: &str,
@@ -152,18 +156,16 @@ pub(crate) fn open(
         return SHARING_VIOLATION;
     }
     let created = !exists;
-    if created {
-        if let Err(code) = crate::kernel32::create_directory_path(env, path) {
-            return match code {
-                2 | 3 => PATH_NOT_FOUND,
-                5 => ACCESS_DENIED,
-                8 => INSUFFICIENT_RESOURCES,
-                183 => 0xc0000035u32 as i32,
-                19 => 0xc00000a2u32 as i32,
-                123 => NAME_INVALID,
-                _ => 0xc0000001u32 as i32,
-            };
-        }
+    if created && let Err(code) = crate::kernel32::create_directory_path(env, path) {
+        return match code {
+            2 | 3 => PATH_NOT_FOUND,
+            5 => ACCESS_DENIED,
+            8 => INSUFFICIENT_RESOURCES,
+            183 => 0xc0000035u32 as i32,
+            19 => 0xc00000a2u32 as i32,
+            123 => NAME_INVALID,
+            _ => 0xc0000001u32 as i32,
+        };
     }
     let backing = match env.ext.get::<Win32>().vfs.lookup(path) {
         Some(host) => match FileStream::open_directory_instance(&host, access) {
@@ -395,7 +397,9 @@ pub(crate) fn set(
         return ACCESS_VIOLATION;
     }
     let units: Vec<_> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
     let name = match String::from_utf16(&units) {
@@ -472,16 +476,16 @@ pub(crate) fn set(
 
 pub(crate) fn retarget_owners(env: &mut Env<'_>, source: &str, target: &str) {
     for (_, owner) in env.sys.objects.all_hosts_mut::<DirectoryObj>() {
-        if let Some(path) = retarget(&owner.path, &source, &target) {
+        if let Some(path) = retarget(&owner.path, source, target) {
             owner.path = path;
         }
     }
     for (_, owner) in env.sys.objects.all_hosts_mut::<FileObj>() {
-        if let Some(path) = retarget(&owner.guest_path, &source, &target) {
+        if let Some(path) = retarget(&owner.guest_path, source, target) {
             owner.guest_path = path;
         }
     }
-    if let Some(path) = retarget(&env.ext.get::<Win32>().vfs.cwd, &source, &target) {
+    if let Some(path) = retarget(&env.ext.get::<Win32>().vfs.cwd, source, target) {
         env.ext.get_mut::<Win32>().vfs.cwd = path;
     }
 }
