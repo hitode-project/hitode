@@ -248,7 +248,7 @@ fn registered_transport_survives_copy_and_arithmetic_reconstruction_with_normal_
     });
     let stats = machine.cpu.stats();
     assert!(stats.native_entries > 0, "fixture must enter compiled code");
-    // a64 runs each entry's first visit outside translated code (decision 18).
+    // a64 runs each entry's first visit outside translated code.
     #[cfg(not(target_arch = "aarch64"))]
     assert_eq!(
         stats.interpreter_instructions, 0,

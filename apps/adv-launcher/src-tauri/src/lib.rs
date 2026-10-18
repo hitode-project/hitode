@@ -1,6 +1,6 @@
 //! The player frontend: a Tauri window whose webview draws the game library
 //! and, while a game runs, a transparent in-game overlay above the native game
-//! view that adv-shell presents into (decision 25).
+//! view that adv-shell presents into.
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
