@@ -57,6 +57,8 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> pnpm tauri dev
 
 `pnpm check` runs the type check, and `pnpm tauri build` builds a release.
 
+For a macOS release, link the static FFmpeg that `python3 tools/macos/build.py --ffmpeg-only` builds: set `FFMPEG_DIR` to the `install` folder it prints under `target/macos-ffmpeg`, then run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
+
 ## macOS release package
 
 The release links a decode-only FFmpeg statically, so the app bundle carries no third-party dylibs.
