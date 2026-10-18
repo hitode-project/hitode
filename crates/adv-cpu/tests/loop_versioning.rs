@@ -1674,6 +1674,9 @@ fn batched_loop_interrupts_and_resumes_exactly() {
     m.state.regs = regs(100_000_000, SRC, DST);
     m.state.regs[3] = 5;
     m.write(SRC, &1u32.to_le_bytes()).unwrap();
+    // Complete the prologue and ten six-instruction iterations first, so an
+    // interrupt arriving at the next entry still observes a nonempty prefix.
+    assert_eq!(m.run(STOP, 61).unwrap(), RunOutcome::Budget);
     let flag = Arc::new(AtomicBool::new(false));
     m.set_host_interrupt_flag(flag.clone());
     let notify = flag.clone();
