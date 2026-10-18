@@ -290,7 +290,7 @@
 
   {#if loading}
     {@const g = screen.layout?.game}
-    <div class="loading fade" style={g ? `left: ${g.x}px; top: ${g.y}px; width: ${g.width}px; height: ${g.height}px` : "inset: 0"}>
+    <div class="loading over fade" style={g ? `left: ${g.x}px; top: ${g.y}px; width: ${g.width}px; height: ${g.height}px` : "inset: 0"}>
       <div class="spinner" role="progressbar" aria-label={t("加载中")}></div>
       {#if slowLoad && !stopping}
         <button class="quiet" onclick={leave} {@attach region}>{t("退出游戏")}</button>
@@ -317,7 +317,7 @@
   {/if}
 
   {#if phone && gameView && stopping}
-    <div class="quitting surface fade" role="status" {@attach region}>
+    <div class="quitting surface over fade" role="status" {@attach region}>
       {#if forceAsk}
         <span>{t("强制结束游戏？")}</span>
         <button class="quiet" onclick={() => (forceAsk = false)}>{t("取消")}</button>
@@ -458,7 +458,7 @@
   {/if}
 
   {#if textBar}
-    <div class="surface textbar fade" role="dialog" aria-label={t("输入文字")} {@attach region}>
+    <div class="surface textbar over fade" role="dialog" aria-label={t("输入文字")} {@attach region}>
       <span class="kbd"><Icon name="keyboard" /></span>
       <input
         bind:this={textInput}
@@ -485,8 +485,28 @@
 </div>
 
 <style>
-  /* The overlay always uses the dark palette over the game. */
+  /* Menus and dialogs follow the theme over the dimmed game. */
   .game {
+    --seg-on: #ffffff;
+    --rail: rgba(24, 24, 22, 0.14);
+    --off: rgba(24, 24, 22, 0.2);
+    --knob: #ffffff;
+    --danger-fill: #c8392e;
+    position: relative;
+    height: 100%;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    color: var(--fg);
+  }
+  :global(:root[data-theme="dark"]) .game {
+    --seg-on: #38383c;
+    --rail: rgba(255, 255, 255, 0.14);
+    --off: rgba(255, 255, 255, 0.2);
+    --knob: #ececea;
+  }
+  /* Bars that sit on the game itself, with no dimming, stay dark. */
+  .over {
     --panel: #1e1e20;
     --line: rgba(255, 255, 255, 0.08);
     --fg: #ececea;
@@ -494,20 +514,8 @@
     --fg3: #8f8f8b;
     --field: rgba(255, 255, 255, 0.07);
     --hover: rgba(255, 255, 255, 0.05);
-    --seg-on: #38383c;
-    --rail: rgba(255, 255, 255, 0.14);
-    --off: rgba(255, 255, 255, 0.2);
-    --knob: #ececea;
-    --accent: #3767d6;
-    --on-accent: #ffffff;
     --danger: #ff8b7e;
-    --danger-fill: #c8392e;
     color-scheme: dark;
-    position: relative;
-    height: 100%;
-    overflow: hidden;
-    display: grid;
-    place-items: center;
     color: var(--fg);
   }
   .scene {
