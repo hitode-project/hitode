@@ -209,6 +209,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
       WORKSPACE_PACKAGES: ${{ matrix.packages }}
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
       WORKSPACE_FEATURES: ${{ matrix.features }}
       WORKSPACE_GROUP: ${{ matrix.group }}
       WORKSPACE_SLOW_TESTS: ${{ github.event_name == 'schedule' || inputs.slow-tests }}

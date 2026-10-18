@@ -20,6 +20,7 @@ pub use program::validate_program;
 #[derive(Clone, Copy)]
 pub(super) enum SwitchReason {
     PartialClear,
+    #[cfg(target_vendor = "apple")]
     Copy,
     Upload,
     FixedDraw,

@@ -49,8 +49,9 @@ Every pull request runs the workspace on Apple Silicon (`macos-14`), with
 independent formatting and strict Clippy gates. Three parallel test groups cover
 core/system crates, graphics/runtime crates, and the launcher/JIT helper/storage
 plugin. New workspace members join the core/system group unless assigned to
-another group. Tests use the development profile without debug information;
-third-party dependencies retain the optimized settings in `Cargo.toml`.
+another group. Tests use the development profile with optimization level 1 and
+no debug information; third-party dependencies retain the optimized settings in
+`Cargo.toml`.
 Compilation and execution are separate steps, limited to 12 and 5 minutes, with
 a 20-minute job limit. Artifacts contain verbose build logs and Cargo timings.
 Media jobs reuse the pinned, decode-only FFmpeg build used by release packages;

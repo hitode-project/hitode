@@ -191,6 +191,9 @@ fn frame_yields_do_not_renew_the_hard_watchdog() {
     });
     m.spawn("renderer", CODE, &[], 65536).unwrap();
     prepare(&mut m);
+    // Compile the first frame before measuring the watchdog across handoffs.
+    assert!(matches!(step(&mut m), SliceResult::Yielded));
+    assert!(m.sys.scheduling.frame_host_yields > 0);
     m.set_execution_budget(Some(Duration::from_millis(15)));
     let start = Instant::now();
     loop {
@@ -204,7 +207,6 @@ fn frame_yields_do_not_renew_the_hard_watchdog() {
             other => panic!("{other:?}"),
         }
     }
-    assert!(m.sys.scheduling.frame_host_yields > 0);
 }
 
 #[test]

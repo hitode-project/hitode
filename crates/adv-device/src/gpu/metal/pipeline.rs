@@ -232,7 +232,7 @@ impl Builder {
             let entry = translation.entry_point_names[0].as_ref().map_err(error)?;
             let compile = MTLCompileOptions::new();
             compile.setLanguageVersion(MTLLanguageVersion(
-                ((lang_version.0 as usize) << 16) | ((lang_version.1 as usize) << 8),
+                ((lang_version.0 as usize) << 16) | (lang_version.1 as usize),
             ));
             if objc2::available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0) {
                 compile.setPreserveInvariance(true);
