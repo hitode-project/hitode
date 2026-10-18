@@ -6,6 +6,8 @@
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
+  import JitRow from "../components/JitRow.svelte";
+  import { jit } from "../lib/jit.svelte";
   import { DATA_DIR, reportContents } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
@@ -49,12 +51,15 @@
       </div>
       <div class="row">
         <span class="t">{t("强调色")}</span>
-        <SettingsAccent />
+        <SettingsAccent touch={device.touch} />
       </div>
     </section>
 
     <section class="sec" aria-labelledby="g-play">
       <h2 id="g-play">{t("游戏中")}</h2>
+      {#if jit.active}
+        <JitRow />
+      {/if}
       {#if device.gameView || preview}
         <div class="row">
           <span class="t">{t("缩放")}</span>
@@ -88,11 +93,11 @@
         </div>
         <div class="row">
           <span class="t">{t("切到后台时暂停")}</span>
-          <SettingsSwitch label={t("切到后台时暂停")} checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
+          <SettingsSwitch touch={device.touch} label={t("切到后台时暂停")} checked={prefs.pauseInBackground} onchange={(v) => set("pauseInBackground", v)} />
         </div>
         <div class="row">
           <span class="t">{t("显示帧率")}</span>
-          <SettingsSwitch label={t("显示帧率")} checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
+          <SettingsSwitch touch={device.touch} label={t("显示帧率")} checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
         </div>
       {/if}
     </section>
@@ -101,18 +106,18 @@
       <h2 id="g-lib">{t("游戏库")}</h2>
         <div class="row">
           <span class="t">{t("导入时自动搜索 VNDB")}</span>
-          <SettingsSwitch label={t("导入时自动搜索 VNDB")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
+          <SettingsSwitch touch={device.touch} label={t("导入时自动搜索 VNDB")} checked={prefs.fetchVndb} onchange={(v) => set("fetchVndb", v)} />
         </div>
         <p class="credit">{t("资料来源：VNDB；封面版权属于原权利人。")}</p>
 
 
       <div class="row">
         <span class="t">{t("遮挡成人内容封面")}</span>
-        <SettingsSwitch label={t("遮挡成人内容封面")} checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
+        <SettingsSwitch touch={device.touch} label={t("遮挡成人内容封面")} checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
       </div>
       <div class="row">
         <span class="t">{t("记录游玩时间")}</span>
-        <SettingsSwitch label={t("记录游玩时间")} checked={prefs.trackPlayTime} onchange={(v) => set("trackPlayTime", v)} />
+        <SettingsSwitch touch={device.touch} label={t("记录游玩时间")} checked={prefs.trackPlayTime} onchange={(v) => set("trackPlayTime", v)} />
       </div>
     </section>
 
@@ -140,7 +145,7 @@
         <div class="store">
           <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
             <span class="total">{general.totalLabel}</span>
-            <span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>
+            {#if !device.touch}<span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>{/if}
           </div>
           <div class="usage" role="img" aria-label={t("存档 128 MB，缓存 {0}", general.cacheLabel)}>
             <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>

@@ -62,6 +62,13 @@
     inset: 0 0 auto 0;
     height: 40px;
   }
+  /* Touch has no traffic lights or window to drag, only the status bar. */
+  :global(:root[data-touch]) .side {
+    padding: calc(var(--safe-top) + 16px) 12px calc(var(--safe-bottom) + 16px) calc(var(--safe-left) + 12px);
+  }
+  :global(:root[data-touch]) .drag {
+    display: none;
+  }
   @media (max-width: 760px) {
     .side {
       display: none;

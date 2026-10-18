@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import VndbLink from "../components/VndbLink.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
@@ -6,6 +7,7 @@
   import JitBanner from "../components/JitBanner.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
+  import { device } from "../lib/device.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game, LibraryFilter } from "../lib/types";
@@ -64,6 +66,11 @@
     more = false;
     undoToast = true;
   }
+
+  // A window growing to the sidebar layout selects the open game there.
+  onDestroy(() => {
+    if (!device.phone && openId) library.focus = openId;
+  });
 
   // The back gesture closes the detail page, then the search field; the
   // manage sheet registers its own handler while it is open.
@@ -335,7 +342,9 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    /* Three columns on a phone, more in a wider window (split screen, a
+       small tablet, a large phone in landscape). */
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
     column-gap: 12px;
     row-gap: 18px;
   }

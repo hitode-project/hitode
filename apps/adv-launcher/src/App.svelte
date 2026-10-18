@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t, locale } from "./lib/i18n.svelte";
   import { call, onHostEvent } from "./lib/bridge";
+  import JitBanner from "./components/JitBanner.svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
   import { jit } from "./lib/jit.svelte";
@@ -39,6 +40,12 @@
   const route = $derived(nav.route);
   /** Screens drawn without the library sidebar. */
   const fullscreen = $derived(route.name === "launch" || route.name === "game" || route.name === "report");
+  /**
+   * Flows that keep the phone screens on touch at any width, so resizing the
+   * window mid-flow restyles them instead of starting them over.
+   */
+  const flow = $derived(route.name === "launch" || route.name === "report" || route.name === "scan" || route.name === "import");
+  const phoneScreens = $derived(device.phone || (device.touch && flow));
 
   $effect(() => {
     const root = document.documentElement;
@@ -47,7 +54,9 @@
     root.dataset.accent = prefs.accent;
     root.dataset.screen = route.name;
     root.dataset.platform = device.platform;
-    root.dataset.device = device.phone ? "phone" : "desktop";
+    root.dataset.device = phoneScreens ? "phone" : "desktop";
+    if (device.touch) root.dataset.touch = "";
+    else delete root.dataset.touch;
     if (device.simulated) root.dataset.simulated = "";
   });
 
@@ -69,10 +78,12 @@
 
 {#key locale()}
 {#if route.name === "game"}
-  <Game gameId={route.gameId} gameView={device.gameView} phone={device.phone} />
-{:else if device.phone}
-  <!-- Phone screens fill the window; there is no sidebar. -->
-  <div class="phone">
+  <Game gameId={route.gameId} gameView={device.gameView} phone={device.touch} />
+{:else if phoneScreens}
+  <!-- Phone screens fill the window; there is no sidebar. In a wide window
+       the forms keep a centered column; launch is already centered over its
+       full-bleed backdrop. -->
+  <div class="phone" class:column={!device.phone && route.name !== "launch"}>
     {#if route.name === "library"}
       <PhoneLibrary filter={route.filter} />
     {:else if route.name === "stats"}
@@ -103,6 +114,7 @@
   <div class="shell">
     <Sidebar />
     <div class="content">
+      <JitBanner />
       {#if route.name === "library"}
         <Library filter={route.filter} />
       {:else if route.name === "stats"}
@@ -143,11 +155,22 @@
     color: var(--fg);
     overflow: hidden;
   }
+  .column {
+    align-items: center;
+  }
+  .column > :global(*) {
+    width: 100%;
+    max-width: 640px;
+  }
   .content {
     view-transition-name: page;
     flex: 1 1 0;
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* A tablet or an unfolded phone: the status bar and home indicator. */
+  :global(:root[data-touch]) .content {
+    padding: var(--safe-top) var(--safe-right) var(--safe-bottom) 0;
   }
 </style>

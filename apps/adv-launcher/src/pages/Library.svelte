@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import VndbLink from "../components/VndbLink.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
@@ -9,6 +10,7 @@
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { device } from "../lib/device.svelte";
   import { canReveal, reveal } from "../lib/reveal";
   import type { Game, LibraryFilter } from "../lib/types";
 
@@ -81,6 +83,21 @@
       on: minutes > 0,
     }));
   }
+
+  // The back gesture (Android) closes the menu or dialog, then the detail sheet.
+  $effect(() => {
+    if (popup === "none" && !sheet) return;
+    return nav.onBack(() => {
+      if (popup !== "none") popup = "none";
+      else sheet = false;
+      return true;
+    });
+  });
+
+  // A window shrinking to the phone layout opens the picked game there.
+  onDestroy(() => {
+    if (device.phone && selectedId) library.focus = selectedId;
+  });
 
   /** A press outside the menu and its button closes the menu. */
   function onpointerdown(event: PointerEvent) {
