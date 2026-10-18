@@ -593,6 +593,13 @@ mod tests {
         f.cleanup();
     }
 }
+#[cfg_attr(
+    windows,
+    allow(
+        clippy::arc_with_non_send_sync,
+        reason = "GDI handles are shared only within the owning execution thread"
+    )
+)]
 fn stream_done(env: &mut Env<'_>, scratch: u32, out: u32, bytes: Result<Vec<u8>, i32>) -> Outcome {
     env.ext
         .get_mut::<Heaps>()

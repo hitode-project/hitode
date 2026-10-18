@@ -158,7 +158,7 @@ fn full_run_pixels_match_native_for_formats_alignment_background_and_counted_str
             bottom: 47,
         };
         let paint = Paint {
-            input: if h[5] % 2 == 0 {
+            input: if h[5].is_multiple_of(2) {
                 TextInput::Encoded(&ansi[..h[6] as usize])
             } else {
                 TextInput::Unicode(&wide)

@@ -1016,6 +1016,7 @@ fn bounds(rects: &[Rect]) -> Option<Rect> {
 pub(crate) struct Rendered {
     pub(crate) result: DrawResult,
     /// Set when this render presented with it.
+    #[cfg(target_vendor = "apple")]
     pub(crate) placement: Option<Placement>,
     pub(crate) serial: u64,
     pub(crate) canvas: (u32, u32),
@@ -1193,6 +1194,7 @@ impl Session {
                         #[cfg(target_os = "macos")]
                         shared: None,
                         result: DrawResult::Skipped,
+                        #[cfg(target_vendor = "apple")]
                         placement: None,
                         serial: self.serial,
                         canvas: (self.width, self.height),
@@ -1271,6 +1273,7 @@ impl Session {
                 #[cfg(target_os = "macos")]
                 shared: None,
                 result: DrawResult::Skipped,
+                #[cfg(target_vendor = "apple")]
                 placement: None,
                 serial: self.serial,
                 canvas,
@@ -1333,6 +1336,7 @@ impl Session {
         Ok(Rendered {
             #[cfg(target_os = "macos")]
             shared: None,
+            #[cfg(target_vendor = "apple")]
             placement: matches!(result, DrawResult::Presented).then_some(placement),
             result,
             serial: self.serial,
@@ -1428,9 +1432,11 @@ impl UiPresenter {
         self.surface_live.store(window.is_some(), Ordering::Release);
         failure.map_or(Ok(()), Err)
     }
+    #[cfg(host_view)]
     pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
         self.scaling = value;
     }
+    #[cfg(host_view)]
     pub(crate) fn set_upscaler(&mut self, value: crate::Upscaler) {
         self.upscaler = value;
     }
@@ -1556,7 +1562,6 @@ impl UiPresenter {
                 if !surface_live.load(std::sync::atomic::Ordering::Acquire) {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
-                        placement: None,
                         serial: session.serial,
                         canvas: (session.width, session.height),
                         cursor_regions: session.cursor_regions.clone(),

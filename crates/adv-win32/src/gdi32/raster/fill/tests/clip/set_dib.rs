@@ -549,7 +549,7 @@ fn indexed_readback_matches_native_palette_mapping_queries_and_partial_bytes() {
                 &[dc, info, 0, output, 0, 0],
             );
             assert_ne!(bitmap, 0);
-            let pitch = ((9 * bpp + 31) / 32) * 4;
+            let pitch = (9 * bpp).div_ceil(32) * 4;
             m.cpu
                 .write(
                     m.cpu.read_u32(output).unwrap(),

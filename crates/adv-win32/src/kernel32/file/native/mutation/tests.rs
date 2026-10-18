@@ -181,11 +181,7 @@ fn mutation_failures_preserve_sources_and_destinations() {
     let other_volume = format!("{}:\\target.dat", 'D');
     for (target, error) in [(other_volume, 17), (r"missing\target.dat".into(), 3)] {
         assert_eq!(
-            returned(rename(
-                &mut env(&mut machine),
-                "source.dat".into(),
-                target.into()
-            )),
+            returned(rename(&mut env(&mut machine), "source.dat".into(), target)),
             0
         );
         assert_eq!(last(&mut machine), error);

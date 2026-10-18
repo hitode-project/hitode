@@ -114,8 +114,7 @@ fn compile_inner(
         &mut fc,
         graph,
         route,
-        base,
-        len,
+        (base, len),
         proven,
         recoverable,
     );
@@ -209,8 +208,7 @@ fn build<'a>(
     context: &'a mut FunctionBuilderContext,
     graph: &'a Graph,
     route: Route,
-    base: u32,
-    len: usize,
+    (base, len): (u32, usize),
     proven: &'a BTreeSet<u32>,
     recoverable: bool,
 ) -> (ir::StackSlot, usize, usize, usize) {
