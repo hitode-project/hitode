@@ -1,0 +1,49 @@
+# Glossary
+
+These terms have one meaning across the docs, specs, code comments and reports. The Chinese column gives the term used when talking with users in Chinese. [ARCHITECTURE.md](../ARCHITECTURE.md) shows where each part lives.
+
+## Roles and layers
+
+| Term | 中文 | Meaning |
+|---|---|---|
+| guest | guest（客体） | The original Windows program: the game EXE, its DLLs and the code they load. Not "client" or "emulated program". |
+| host | 宿主 | The machine and operating system that run Hitode, and the native code that runs on them. |
+| personality | 人格层 | The Windows identity the guest sees: exports, version facts and API behavior. The profile is Windows 7 SP1. |
+| HLE | HLE | A Win32 API service that the host implements, covering the personality and the API front ends. |
+| Tier 2 front end / API front end / shell | Tier 2 前端／API 前端／宿主壳 | Respectively: x86 to IR translation, the entry point of an API such as DSound, and the platform window with its input and output. Do not write "front end" alone for any of them. |
+| overlay input region | 覆盖层输入区域 | A rectangle the launcher overlay claims for input. A press inside a region, or any press while the overlay is modal, goes to the webview. |
+
+## Execution
+
+| Term | 中文 | Meaning |
+|---|---|---|
+| Tier 0 | Tier 0 | The predecoding interpreter. It runs cold code, code still waiting for compilation and instructions the engines do not support, and it is the reference for differential runs. |
+| predecode window | 预解码窗口 | A bounded run of instructions with a boundary index that Tier 0 caches to reuse local branches, calls and returns. It is not a GIR region. |
+| Tier 2 | Tier 2 | The Cranelift region JIT on x86_64 hosts. It compiles in the background. AArch64 hosts use a64 and have no Tier 2. |
+| a64 | a64 | The translation engine for every AArch64 host. It keeps guest registers in fixed host registers, accesses memory directly through a guarded window and translates in one pass without an IR. |
+| GIR | GIR | The guest semantic IR. Production Tier 2 turns modeled integer instructions into SSA segments and keeps the rest as opaque operations. |
+| opaque operation | 不透明操作 | An instruction or kernel that GIR does not model and that reuses the existing emitter, such as x87, SSE and string loops. It is not interpreted. |
+| region / entry / link | 区域／入口／链接 | A region is the Tier 2 unit of compilation. An entry is where the dispatcher enters a region. A link is a direct transfer between regions that does not return to the Rust dispatch loop. |
+| execution contract | 执行契约 | The state, memory access, exit and recovery rules that Tier 0 and the platform engines share. `CpuState` is the authoritative state. |
+| pending fallback | 待编译回退 | Time the interpreter spends running a region whose compilation has not finished. It is not compile service time. |
+| warm profile | 预热档案 | `jit-warm.bin`, a list of regions worth compiling and their identities. Regions in it are compiled again after loading; it holds no machine code. |
+| code cache | 代码缓存 | Without qualification, persistent machine code that a later start loads after checking identity and validity. Compiled regions in one process form the in-memory code cache. |
+| image AOT | 映像提前编译 | Budgeted static discovery from image metadata and direct control flow that compiles private regions in idle compile slots. A region is published only when execution reaches it with matching inputs. |
+| soft page | 软页 | A host page protected more strictly than the 4 KiB permission table says, for mixed permissions, translated code, shared audio memory or first file access. Accesses fault and are emulated, and hot access sites are translated again as checked accesses. |
+| biased ESP / EBP | 偏置 ESP／EBP | In a64, x23 and x24 hold the window base plus ESP and EBP. The window is 4 GiB aligned, so the low 32 bits are the guest value. |
+| carry sense | 进位感 | How a64 maps the ARM C flag to x86 CF: add sense means C equals CF, subtract sense means C is the inverse of CF. Block boundaries use subtract sense. |
+| leaf host call | 叶子宿主调用 | An explicitly registered, nonblocking API handler called within an a64 unit through a restricted CPU view. It may decline before side effects and cannot transfer guest control; see A64-CTL-12. |
+| shadow return stack | 影子返回栈 | The a64 stack of `{host continuation, guest return EIP}` pairs for each guest thread or fiber. A guest call uses BL, and a checked return uses RET so the hardware predicts it. |
+| TXM | TXM | The iOS mechanism, from iOS 26 on A15 and later, in which hardware supervises executable pages. A third-party app can execute only memory that a debugger has allowed. |
+
+## Testing and measurement
+
+| Term | 中文 | Meaning |
+|---|---|---|
+| differential run (verify) | 差分（verify） | Comparing the observable results of two implementations on the same input, stating what is covered and skipped. CPU verify usually uses Tier 0 as the reference. |
+| strict | strict | API strict stops at an unimplemented diagnostic stub. `ADV_JIT_VERIFY=strict` is a separate CPU check policy. Always write the full name. |
+| smoke | 冒烟 | A short start of one game per engine. It passes when frames are produced and no new structural gap appears; it does not show that the title is playable. |
+| full run | 全量 | The whole workspace test suite or the full sample matrix. It runs when batching changes or updating the compatibility baseline, not for each change. |
+| headed / headless | 有头／无头 | A headed run shows a window and is judged by the user. A headless run has no window; agents use short headless A/B runs to check mechanisms, and headless throughput says nothing about the headed experience. |
+| cold start / warm start | 冷启动／热启动 | A cold start has no warm profile and no code cache. A warm start reuses one of them and states which. Neither implies clearing the operating system file cache. |
+| feature / comparison / diagnostic switch | 功能／对照／诊断开关 | A feature switch changes what the program can do. A comparison switch selects an old or new implementation to verify a migration. A diagnostic switch only observes or checks. |
