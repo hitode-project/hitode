@@ -156,11 +156,13 @@ impl Library {
         }
         self.metadata_target(id)
     }
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn launch(&self, id: &str) -> io::Result<(PathBuf, PathBuf, u32)> {
         let game = &self.games[self.game(id)?];
         let data = self.path.parent().unwrap().join("games").join(id);
         Ok((game.folder.join(&game.exe), data, game.codepage))
     }
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn finished(&mut self, id: &str, seconds: u32, run: LastRun) -> io::Result<()> {
         let ended = run.ended;
         let i = self.game(id)?;

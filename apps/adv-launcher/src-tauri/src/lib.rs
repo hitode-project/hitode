@@ -18,6 +18,7 @@ pub mod overlay;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
 mod report;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod settings;
 mod update;
 mod vndb;
