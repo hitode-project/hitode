@@ -45,13 +45,24 @@ python3 -m unittest discover -s tools/<folder>
 - The workspace suite builds the launcher, so it needs the FFmpeg variables too.
 - The default suite must pass on every supported host, so any failure in it is real. A test that needs particular hardware, a GPU backend or an architecture states it with `required-features`, a `cfg` or `#[ignore = "reason"]`. A test that fails intermittently gets its cause fixed, not a retry.
 
-Pull requests that change code run Linux core checks, ARM64 hardware acceptance
-and the privacy scan. Windows workspace and x87 checks run for shared CPU or x64
-changes, Windows source in either side of the diff, native fixtures, build
-configuration and performance tooling. They also run every Monday at 03:17 UTC
-and through the core workflow's manual trigger. Rust build jobs use four workers
-and cache Cargo dependencies and workspace artifacts; compilation, tests and
-strict Clippy remain gates wherever those checks run.
+Every pull request runs the workspace on Apple Silicon (`macos-14`), with
+independent formatting and strict Clippy gates. Three parallel test groups cover
+core/system crates, graphics/runtime crates, and the launcher/JIT helper/storage
+plugin. New workspace members join the core/system group unless assigned to
+another group. Tests use the development profile without debug information;
+third-party dependencies retain the optimized settings in `Cargo.toml`.
+Compilation and execution are separate steps, limited to 12 and 5 minutes, with
+a 20-minute job limit. Artifacts contain verbose build logs and Cargo timings.
+The full DAC rate matrices run every Monday at 03:17 UTC or through the manual
+`slow-tests` input. Master pushes populate caches for later pull requests.
+
+Linux core and hardware acceptance checks use `ubuntu-24.04-arm`; release-mode
+Apple Silicon acceptance is also a gate. Windows x64 compatibility checks run
+for shared CPU or x64 changes, Windows source in either side of the diff, native
+fixtures, build configuration and performance tooling, plus weekly and manual
+runs. They test the CPU and lint platform code without building the launcher or
+iOS helper. Cargo caches are separated by job and test group. Mac jobs use three
+workers; Linux and Windows jobs use four. The privacy scan runs on every PR.
 
 ## Launcher
 

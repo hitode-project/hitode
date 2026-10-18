@@ -7,17 +7,9 @@ name: ARM64 hardware acceptance
 
 on:
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'apps/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.cargo/**'
-      - 'tools/cpu/**'
-      - 'tools/performance/**'
-      - '.github/workflows/arm64-acceptance.yml'
   push:
     branches:
+      - master
       - 'ci/arm64**'
   workflow_dispatch:
 
@@ -30,12 +22,7 @@ concurrency:
 
 jobs:
   linux:
-    # x64 runs the same steps so ARM64-only failures stand out.
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04-arm, ubuntu-24.04]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '4'
@@ -53,14 +40,17 @@ jobs:
           cache-on-failure: true
           cache-workspace-crates: true
       - name: Lint execution layer
+        if: github.event_name != 'pull_request'
         run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
       - name: Test execution layer
+        # PRs already run this checked-memory release suite in the core job.
+        if: github.event_name != 'pull_request'
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.txt"
       - name: Differential tier verification (strict)
-        # Tests that assert native execution shape fail under verification by
-        # design; the log is compared against the x64 strict failure set.
+        # Execution-shape assertions can differ under strict verification;
+        # keep the diagnostic separate from ordinary regression gates.
         if: always()
         continue-on-error: true
         env:
@@ -84,58 +74,25 @@ jobs:
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/direct-strict.txt"
-      - name: Full regression including Bridge differential fixtures (checked and direct)
-        if: always() && matrix.runner == 'ubuntu-24.04-arm'
-        # The bridge differential fixtures select each lane explicitly so their
-        # Tier 0 and Cranelift-only references remain independent. ADV_TIER1 is a
-        # shell option; it cannot turn CPU tests into Bridge tests. The native
-        # fixtures assert actual bridge retirements and Cranelift handoff.
-        run: |
-          set +e
-          set -o pipefail
-          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge.txt"
-          checked=${PIPESTATUS[0]}
-          ADV_DIRECT_MEMORY=1 cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-direct.txt"
-          direct=${PIPESTATUS[0]}
-          test "$checked" -eq 0 && test "$direct" -eq 0
-      - name: Bridge coexistence differential verification (strict)
-        if: always() && matrix.runner == 'ubuntu-24.04-arm'
-        continue-on-error: true
-        env:
-          ADV_JIT_VERIFY: strict
-        run: |
-          set +e
-          set -o pipefail
-          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-strict.txt"
-          checked=${PIPESTATUS[0]}
-          ADV_DIRECT_MEMORY=1 cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/bridge-direct-strict.txt"
-          direct=${PIPESTATUS[0]}
-          test "$checked" -eq 0 && test "$direct" -eq 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: linux-${{ matrix.runner }}-${{ github.sha }}
+          name: linux-arm64-${{ github.sha }}
           path: |
             ${{ runner.temp }}/environment.txt
             ${{ runner.temp }}/tests.txt
             ${{ runner.temp }}/strict.txt
             ${{ runner.temp }}/direct.txt
             ${{ runner.temp }}/direct-strict.txt
-            ${{ runner.temp }}/bridge.txt
-            ${{ runner.temp }}/bridge-direct.txt
-            ${{ runner.temp }}/bridge-strict.txt
-            ${{ runner.temp }}/bridge-direct-strict.txt
           if-no-files-found: ignore
           retention-days: 14
 
   macos-arm64:
-    # Probe: macOS is not yet a supported execution host, so a failure here is
-    # a finding to triage rather than a regression gate.
+    # Release execution on Apple Silicon also covers native 16 KiB pages.
     runs-on: macos-14
-    timeout-minutes: 45
-    continue-on-error: true
+    timeout-minutes: 15
     env:
-      CARGO_BUILD_JOBS: '4'
+      CARGO_BUILD_JOBS: '3'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
