@@ -60,8 +60,8 @@ targets:
         # Games are copied into Documents through Finder or the Files app.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        CFBundleShortVersionString: 1.0.0
-        CFBundleVersion: "1.0.0"
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
     entitlements:
       path: adv-launcher_iOS/adv-launcher_iOS.entitlements
     scheme:
@@ -78,6 +78,11 @@ targets:
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
       groups: [app]
+      configs:
+        release:
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: debugging
     dependencies:
       - target: HitodeJIT
         embed: true
@@ -110,8 +115,8 @@ targets:
       path: JitHelper/Info.plist
       properties:
         CFBundleDisplayName: Hitode JIT
-        CFBundleShortVersionString: 1.0.0
-        CFBundleVersion: "1.0.0"
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
         NSLocalNetworkUsageDescription: Connect to this device through LocalDevVPN to enable JIT.
         NSExtension:
           NSExtensionPointIdentifier: com.apple.ar.viewer
@@ -130,6 +135,11 @@ targets:
         SKIP_INSTALL: YES
         LIBRARY_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)
         OTHER_LDFLAGS: $(inherited) -ladv_jit_helper -liconv -lresolv
+      configs:
+        release:
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: debugging
     dependencies:
       - sdk: Foundation.framework
       - sdk: Security.framework
@@ -145,7 +155,17 @@ targets:
           if [ "$PLATFORM_NAME" = iphonesimulator ]; then target=aarch64-apple-ios-sim; fi
           profile=debug
           release=""
-          if [ "$CONFIGURATION" = release ]; then profile=release; release=--release; fi
+          if [ "$CONFIGURATION" = release ]; then
+            profile=release
+            release=--release
+            export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+            sep=$(printf '\037')
+            flags="${CARGO_ENCODED_RUSTFLAGS-$(printf '%s' "${RUSTFLAGS-}" | tr ' ' '\037')}"
+            for remap in "$HOME=/home" "${CARGO_HOME:-$HOME/.cargo}=/cargo" "${RUSTUP_HOME:-$HOME/.rustup}=/rustup" "$PWD=/hitode"; do
+              flags="${flags:+$flags$sep}--remap-path-prefix=$remap"
+            done
+            export CARGO_ENCODED_RUSTFLAGS="$flags"
+          fi
           cargo build --locked -p adv-jit-helper --target "$target" $release
           cp "$CARGO_TARGET_DIR/$target/$profile/libadv_jit_helper.a" "$BUILT_PRODUCTS_DIR/"
         outputFiles:

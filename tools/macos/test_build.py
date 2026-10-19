@@ -1,7 +1,9 @@
-"""Validate the pinned decode-only FFmpeg configuration without building it."""
+"""Validate pinned FFmpeg configuration and release path mapping without building FFmpeg."""
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 import unittest.mock
 
@@ -11,6 +13,19 @@ spec.loader.exec_module(build)
 
 
 class BuildTests(unittest.TestCase):
+    # spec: HOST-PKG-6
+    def test_release_rust_file_metadata_uses_the_checkout_mapping(self):
+        output = build.ROOT / 'target'
+        output.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output) as temporary:
+            source = Path(temporary) / 'probe.rs'
+            binary = Path(temporary) / 'probe'
+            source.write_text('fn main() { println!("{}", file!()); }')
+            subprocess.run(['rustc', *build.remap_flags(), str(source), '-o', str(binary)], check=True)
+            result = subprocess.check_output([str(binary)], text=True).strip()
+            self.assertTrue(result.startswith('/hitode/target/'), result)
+            self.assertNotIn(str(Path.home()), result)
+
     # spec: HOST-PKG-1
     def test_decode_only_configuration_covers_media_contract(self):
         profile = json.loads(build.PROFILE.read_text())

@@ -374,6 +374,11 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: macOS
 **Verification**: Review — the privacy scan cannot recognize every credential.
 
+### HOST-PKG-6 Published build paths
+
+**Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
+**Verification**: Test
+
 Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11
 
 ### HOST-DAMAGE-1 Software texture uploads

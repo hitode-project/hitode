@@ -13,8 +13,8 @@ Input: ffmpeg.json, Xcode Command Line Tools, Rust, cmake for test dependencies,
 ANDROID_NDK_HOME for --android.
 Output: target/macos/adv-run and its build.json, source/configuration and static
 libraries under target/macos-ffmpeg (target/<ios|android>-ffmpeg for a mobile
-target; stdout then names a folder whose cargo wrapper sets FFMPEG_DIR, to put
-first on PATH). Logs stay in target/scratch/macos-package.
+target). FFmpeg-only modes print a cargo wrapper folder to put first on PATH;
+it selects FFmpeg and removes release build paths. Logs stay in target/scratch/macos-package.
 Stdout contains build statistics only. No Homebrew runtime libraries are used.
 Tests: python3 -m unittest discover -s tools/macos -p 'test_*.py'
 """
@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import subprocess
 import urllib.request
@@ -68,6 +69,15 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def remap_flags() -> list[str]:
+    return [f'--remap-path-prefix={source}={target}' for source, target in [
+        (Path.home(), '/home'),
+        (Path(os.environ.get('CARGO_HOME', Path.home() / '.cargo')).resolve(), '/cargo'),
+        (Path(os.environ.get('RUSTUP_HOME', Path.home() / '.rustup')).resolve(), '/rustup'),
+        (ROOT, '/hitode'),
+    ]]
+
+
 def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise ValueError('this build targets ARM macOS')
@@ -101,10 +111,10 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
                 raise ValueError('static FFmpeg build is incomplete')
         if list((prefix / 'lib').glob('*.dylib')) or list((prefix / 'lib').glob('*.so')):
             raise ValueError('static FFmpeg prefix contains dynamic libraries')
-        if mobile:
+        if mobile or ffmpeg_only:
             # Tauri's Xcode build passes only HOME and PATH to Cargo, so a cargo
             # wrapper first on PATH carries the FFmpeg location instead.
-            bin_dir = ROOT / f'target/{mobile}-ffmpeg/bin'
+            bin_dir = ROOT / f'target/{mobile or "macos"}-ffmpeg/bin'
             bin_dir.mkdir(exist_ok=True)
             wrapper = bin_dir / 'cargo'
             # bindgen parses FFmpeg's headers against the NDK's libc headers.
@@ -113,6 +123,15 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
             wrapper.write_text('#!/bin/sh\n'
                                f"export FFMPEG_DIR='{prefix}'\n"
                                "export LIBCLANG_PATH='/Library/Developer/CommandLineTools/usr/lib'\n"
+                               "export CARGO_PROFILE_RELEASE_STRIP=debuginfo\n"
+                               "case \" $* \" in *' --release '*)\n"
+                               "sep=$(printf '\\037')\n"
+                               "flags=\"${CARGO_ENCODED_RUSTFLAGS-$(printf '%s' \"${RUSTFLAGS-}\" | tr ' ' '\\037')}\"\n"
+                               f"for mapping in {shlex.join(remap_flags())}; do\n"
+                               "  flags=\"${flags:+$flags$sep}$mapping\"\n"
+                               "done\n"
+                               "export CARGO_ENCODED_RUSTFLAGS=\"$flags\"\n"
+                               "esac\n"
                                f"{sysroot}exec '{shutil.which('cargo')}' \"$@\"\n")
             wrapper.chmod(0o755)
             return {'static_libraries': 5, 'decoders': len(profile['decoders']), 'path': str(bin_dir)}
@@ -122,6 +141,12 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
                        LIBCLANG_PATH='/Library/Developer/CommandLineTools/usr/lib',
                        MACOSX_DEPLOYMENT_TARGET=profile['minimum_macos'],
                        CARGO_TARGET_DIR=str(ROOT / 'target/macos-build' / key))
+            flags = env.get('CARGO_ENCODED_RUSTFLAGS')
+            previous = flags.split('\x1f') if flags else []
+            if flags is None:
+                previous = env.get('RUSTFLAGS', '').split()
+            env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join([*previous, *remap_flags()])
+            env['CARGO_PROFILE_RELEASE_STRIP'] = 'debuginfo'
             # ffmpeg-sys-next's prebuilt-library path passes -lav* to the linker;
             # this prefix contains only .a files, so no FFmpeg dylib is linked.
             run('cargo', 'build', '--release', '-p', 'adv-run', '--features',

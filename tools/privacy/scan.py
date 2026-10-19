@@ -7,6 +7,7 @@ emulator itself presents (C:\\Users\\Player, C:\\Program Files, ...) are fine.
 
   python3 tools/privacy/scan.py                  # tracked and unignored files
   python3 tools/privacy/scan.py --commits A..B   # also author/committer emails
+  python3 tools/privacy/scan.py --artifacts <app> <apk> <ipa> <licenses.zip>
 
 Extra terms (game titles, user names, machine names) go one per line in a
 file named by $ADV_PRIVACY_TERMS, or in `.privacy-terms` at the repository
@@ -16,10 +17,12 @@ file contents and paths. A line containing `privacy: allow` is skipped.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 NOREPLY = "@users.noreply.github.com"
@@ -131,15 +134,59 @@ def scan_commits(root: Path, commits: str) -> list[str]:
     return problems
 
 
+def scan_artifact(name: str, data: bytes, prefixes: list[str]) -> list[str]:
+    stream = io.BytesIO(data)
+    if zipfile.is_zipfile(stream):
+        problems = []
+        with zipfile.ZipFile(stream) as archive:
+            for member in archive.infolist():
+                label = f"{name}!{member.filename}"
+                problems += scan_artifact(label, member.filename.encode(), prefixes)
+                if not member.is_dir():
+                    problems += scan_artifact(label, archive.read(member), prefixes)
+        return problems
+    texts = [data.decode("utf-8", errors="replace")]
+    if b"\0" in data:
+        texts += [data[offset:].decode(encoding, errors="replace")
+                  for encoding in ("utf-16-le", "utf-16-be") for offset in (0, 1)]
+    for text in texts:
+        private = any(prefix in text for prefix in prefixes)
+        text = re.sub(r"https?://[^\s\0]+", "", text)
+        private |= bool(re.search(r"/(?:Users|home)/[\w.-]+", text))
+        private |= "/var/folders/" in text
+        private |= any(match.group(1).casefold() not in GUEST_USERS for match in
+                       re.finditer(r"[A-Za-z]:[/\\]+Users[/\\]+([\w.-]+)", text))
+        if private:
+            return [f"{name}: contains a local build path"]
+    return []
+
+
+def scan_artifacts(paths: list[Path], root: Path) -> list[str]:
+    prefixes = [str(root), str(Path.home())]
+    problems = []
+    for path in paths:
+        if path.suffix.lower() == ".dmg":
+            raise ValueError("mount the DMG and scan its mounted directory")
+        files = (file for file in path.rglob("*") if file.is_file() or file.is_symlink()) if path.is_dir() else [path]
+        for file in files:
+            data = os.readlink(file).encode() if file.is_symlink() else file.read_bytes()
+            problems += scan_artifact(str(file), data, prefixes)
+    return problems
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--commits", help="also check author/committer emails in this range")
+    parser.add_argument("--artifacts", nargs="+", type=Path,
+                        help="also scan shipped files, directories and ZIP/IPA/APK contents; mount DMGs first")
     args = parser.parse_args(argv)
     root = Path(git("rev-parse", "--show-toplevel").strip())
     terms = load_terms(root)
     problems = scan_files(root, terms)
     if args.commits:
         problems += scan_commits(root, args.commits)
+    if args.artifacts:
+        problems += scan_artifacts(args.artifacts, root)
     for problem in problems:
         print(problem)
     if problems:

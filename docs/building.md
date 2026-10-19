@@ -79,7 +79,7 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> pnpm tauri dev
 
 `pnpm check` runs the type check, and `pnpm tauri build` builds a release.
 
-For a macOS release, link the static FFmpeg that `python3 tools/macos/build.py --ffmpeg-only` builds: set `FFMPEG_DIR` to the `install` folder it prints under `target/macos-ffmpeg`, then run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
+For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
 
 ## macOS release package
 
@@ -142,11 +142,15 @@ PATH=../../target/ios-ffmpeg/bin:$PATH APPLE_DEVELOPMENT_TEAM=<team> \
   pnpm tauri ios build --export-method debugging --target aarch64
 ```
 
-- Tauri's Xcode build passes only `HOME` and `PATH` on to Cargo, so `FFMPEG_DIR` cannot be set directly. `build.py --ios` writes a `cargo` wrapper into `target/ios-ffmpeg/bin` that sets it.
+- Tauri's Xcode build passes only `HOME` and `PATH` on to Cargo, so `FFMPEG_DIR` cannot be set directly. `build.py --ios` writes a `cargo` wrapper into `target/ios-ffmpeg/bin` that sets it and strips release debug records. Both iOS executables also strip linker debug records on export.
 - The IPA is `src-tauri/gen/apple/build/arm64/Hitode.ipa`. Install it with `xcrun devicectl device install app --device <udid> <ipa>`.
 - Games go in the app's Documents folder, through Finder, the Files app or `devicectl device copy to --domain-type appDataContainer`. The launcher reads them there in place.
 - The AppIcon images are not committed. `python3 apps/adv-launcher/scripts/icons.py` writes them to `src-tauri/icons/ios/`; copy them into `gen/apple/Assets.xcassets/AppIcon.appiconset/` before the first build.
 
 ## Local output
+
+Before distribution, run `python3 tools/privacy/scan.py --artifacts <app> <apk> <ipa> <licenses.zip>`.
+This scans binary contents and nested archives for local build paths; mount a DMG and pass its mounted directory too.
+Release Cargo wrappers and JIT helper builds remap checkout and toolchain paths, including when Xcode invokes Cargo directly. The storage plugin's Swift source uses a stable source location for runtime diagnostics.
 
 Build and run output stays under the ignored `target/` folder. Each worktree uses its own `target`, so builds do not wait on each other's Cargo lock or replace a binary another run is using. [investigation.md](investigation.md) describes where runs and analysis output go.

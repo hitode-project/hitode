@@ -1,3 +1,4 @@
+#sourceLocation(file: "tauri-plugin-storage/StoragePlugin.swift", line: 2)
 import Foundation
 import Tauri
 import UIKit

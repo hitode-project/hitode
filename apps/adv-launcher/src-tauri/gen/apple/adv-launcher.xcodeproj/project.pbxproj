@@ -352,7 +352,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncd \"$SRCROOT/../../../../..\"\nexport CARGO_TARGET_DIR=\"$PWD/target\"\ntarget=aarch64-apple-ios\nif [ \"$PLATFORM_NAME\" = iphonesimulator ]; then target=aarch64-apple-ios-sim; fi\nprofile=debug\nrelease=\"\"\nif [ \"$CONFIGURATION\" = release ]; then profile=release; release=--release; fi\ncargo build --locked -p adv-jit-helper --target \"$target\" $release\ncp \"$CARGO_TARGET_DIR/$target/$profile/libadv_jit_helper.a\" \"$BUILT_PRODUCTS_DIR/\"\n";
+			shellScript = "set -eu\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncd \"$SRCROOT/../../../../..\"\nexport CARGO_TARGET_DIR=\"$PWD/target\"\ntarget=aarch64-apple-ios\nif [ \"$PLATFORM_NAME\" = iphonesimulator ]; then target=aarch64-apple-ios-sim; fi\nprofile=debug\nrelease=\"\"\nif [ \"$CONFIGURATION\" = release ]; then\n  profile=release\n  release=--release\n  export CARGO_PROFILE_RELEASE_STRIP=debuginfo\n  sep=$(printf '\\037')\n  flags=\"${CARGO_ENCODED_RUSTFLAGS-$(printf '%s' \"${RUSTFLAGS-}\" | tr ' ' '\\037')}\"\n  for remap in \"$HOME=/home\" \"${CARGO_HOME:-$HOME/.cargo}=/cargo\" \"${RUSTUP_HOME:-$HOME/.rustup}=/rustup\" \"$PWD=/hitode\"; do\n    flags=\"${flags:+$flags$sep}--remap-path-prefix=$remap\"\n  done\n  export CARGO_ENCODED_RUSTFLAGS=\"$flags\"\nfi\ncargo build --locked -p adv-jit-helper --target \"$target\" $release\ncp \"$CARGO_TARGET_DIR/$target/$profile/libadv_jit_helper.a\" \"$BUILT_PRODUCTS_DIR/\"\n";
 		};
 		B1F300845D2BAC61CA31BCF6 /* Build Rust Code */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -431,6 +431,9 @@
 		1A254F05463FCD2CA61DF5D8 /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				DEPLOYMENT_POSTPROCESSING = YES;
+				STRIP_INSTALLED_PRODUCT = YES;
+				STRIP_STYLE = debugging;
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				ARCHS = (
 					arm64,
@@ -612,6 +615,9 @@
 		FA591512A541A95A3C6C64F7 /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				DEPLOYMENT_POSTPROCESSING = YES;
+				STRIP_INSTALLED_PRODUCT = YES;
+				STRIP_STYLE = debugging;
 				ARCHS = (
 					arm64,
 				);
