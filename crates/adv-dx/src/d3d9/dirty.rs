@@ -1,5 +1,5 @@
-//! Texture dirtiness lives in the shared mip metadata. Regions may expand to
-//! complete levels; CPU storage is uploaded only after every lock is released.
+//! Texture dirtiness lives in the shared mip metadata as each level's bounding
+//! rectangle; only that rectangle is uploaded, after every lock is released.
 use super::*;
 use adv_device::surface::Rect;
 use resources::{Kind, Lock};
@@ -15,6 +15,7 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
     else {
         return Outcome::Return(INVALID);
     };
+    let mut region = None;
     if !rectangle.is_null() {
         let Ok(rectangle) = rectangle.read(env.cpu) else {
             return Outcome::Return(INVALID);
@@ -28,6 +29,12 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
         {
             return Outcome::Return(INVALID);
         }
+        region = Some(Rect {
+            x: rectangle.left as u32,
+            y: rectangle.top as u32,
+            w: (rectangle.right - rectangle.left) as u32,
+            h: (rectangle.bottom - rectangle.top) as u32,
+        });
     }
     // An upload can complete before its ReleaseDC continuation runs. Keep
     // dirtiness, but do not start another upload while the DC lease is live.
@@ -36,10 +43,12 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
     else {
         return Outcome::Return(INVALID);
     };
-    // Only level zero is specified by AddDirtyRect; expanding all its scaled
-    // mip regions to full levels is a safe, bounded synchronization policy.
-    for level in &mut r.levels {
-        level.dirty = true;
+    // AddDirtyRect names a level-zero region; D3D9 scales it to every level.
+    for (index, level) in r.levels.iter_mut().enumerate() {
+        match region {
+            Some(rect) => level.mark_scaled(rect, index as u32),
+            None => level.mark_all(),
+        }
     }
     if deferred {
         Outcome::Return(0)
@@ -75,12 +84,11 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
         return Outcome::Return(INVALID);
     };
-    let Some((index, selected)) = r
+    let Some((index, selected, rectangle)) = r
         .levels
         .iter()
         .enumerate()
-        .find(|(_, level)| level.dirty)
-        .map(|(index, level)| (index as u32, *level))
+        .find_map(|(index, level)| Some((index as u32, *level, level.dirty?)))
     else {
         return Outcome::Return(0);
     };
@@ -99,19 +107,20 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     else {
         return Outcome::Return(INVALID);
     };
-    let Some(pitch) = format::pitch(selected.desc.Format, selected.desc.Width) else {
-        return Outcome::Return(INVALID);
-    };
-    let Some(size) = format::length(
-        selected.desc.Format,
-        selected.desc.Width,
-        selected.desc.Height,
+    // Read only the dirty rows, from the first dirty texel of the first row
+    // to the last of the final one.
+    let format = selected.desc.Format;
+    let (Some(pitch), Some(row), Some(bytes)) = (
+        format::pitch(format, selected.desc.Width),
+        format::pitch(format, rectangle.w),
+        format::bytes(format),
     ) else {
         return Outcome::Return(INVALID);
     };
+    let size = (rectangle.h - 1) * pitch + row;
     let Some(address) = r
         .storage
-        .checked_add(selected.offset)
+        .checked_add(selected.offset + rectangle.y * pitch + rectangle.x * bytes)
         .filter(|_| r.storage != 0)
     else {
         return Outcome::Return(INVALID);
@@ -123,25 +132,14 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if env.cpu.read(address, &mut pixels).is_err() {
         return Outcome::Return(INVALID);
     }
-    let Some((pixels, pitch)) = format::upload(
-        selected.desc.Format,
-        pixels,
-        pitch,
-        selected.desc.Width,
-        selected.desc.Height,
-    ) else {
+    let Some((pixels, pitch)) = format::upload(format, pixels, pitch, rectangle.w, rectangle.h)
+    else {
         return Outcome::Return(INVALID);
-    };
-    let rectangle = Rect {
-        x: 0,
-        y: 0,
-        w: selected.desc.Width,
-        h: selected.desc.Height,
     };
     if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         // Clear before submission so a later AddDirtyRect cannot be erased by
         // this upload's completion. Its original bytes already belong to the op.
-        r.levels[index as usize].dirty = false;
+        r.levels[index as usize].dirty = None;
         r.levels[index as usize].lock = Some(Lock {
             rectangle,
             flags: 0,
@@ -160,16 +158,16 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
             rectangle,
         },
     );
-    uploaded(env, id, index, outcome)
+    uploaded(env, id, index, rectangle, outcome)
 }
 
-fn uploaded(env: &mut Env<'_>, id: Id, index: u32, outcome: Outcome) -> Outcome {
+fn uploaded(env: &mut Env<'_>, id: Id, index: u32, rectangle: Rect, outcome: Outcome) -> Outcome {
     match outcome {
         Outcome::Return(0) => next(env, id),
         Outcome::Return(error) => {
             if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id)
             {
-                r.levels[index as usize].dirty = true;
+                r.levels[index as usize].mark(rectangle);
                 r.levels[index as usize].lock = None;
             }
             Outcome::Return(error)
@@ -183,7 +181,7 @@ fn uploaded(env: &mut Env<'_>, id: Id, index: u32, outcome: Outcome) -> Outcome 
             allow_time_skip,
             then: Box::new(move |env, resume| {
                 let outcome = then(env, resume);
-                uploaded(env, id, index, outcome)
+                uploaded(env, id, index, rectangle, outcome)
             }),
         },
         other => other,

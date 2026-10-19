@@ -139,6 +139,9 @@ pub const IID_DDRAW7: [u8; 16] = [
 pub const IID_SURFACE7: [u8; 16] = [
     0x80, 0x5a, 0x67, 0x06, 0x9b, 0x3b, 0xd2, 0x11, 0xb9, 0x2f, 0, 0x60, 0x97, 0x97, 0xea, 0x5b,
 ];
+/// Offscreen surfaces: plain, back buffer, texture, in system, local or
+/// nonlocal video memory, which share one storage.
+const SURFACE_CAPS: u32 = 0x40 | 4 | 0x1000 | 0x800 | 0x4000 | 0x1000_0000 | 0x2000_0000;
 const IID_DDRAW: [u8; 16] = [
     0x80, 0xdb, 0x14, 0x6c, 0x33, 0xa7, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -796,10 +799,14 @@ impl DirectDraw {
                         }
                         let mut caps = vec![0; len as usize];
                         caps[..4].copy_from_slice(&len.to_le_bytes());
+                        // dwCaps2 and ddsCaps report the surfaces CreateSurface
+                        // makes, local and nonlocal (AGP) video memory alike.
                         for (offset, value) in [
                             (4usize, 0x00400040u32),
-                            (88, 64 * 1024 * 1024),
-                            (92, 32 * 1024 * 1024),
+                            (8, 0x200),
+                            (60, 64 * 1024 * 1024), // dwVidMemTotal
+                            (64, 32 * 1024 * 1024), // dwVidMemFree
+                            (0x16c, SURFACE_CAPS | 0x200 | 0x10 | 8),
                         ] {
                             if offset + 4 <= caps.len() {
                                 caps[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -848,9 +855,7 @@ impl DirectDraw {
                     }
                     primary
                 } else {
-                    if caps & !(0x40 | 0x800 | 0x4000 | 0x1000 | 4 | 0x10000000) != 0
-                        || flags & 7 != 7
-                    {
+                    if caps & !SURFACE_CAPS != 0 || flags & 7 != 7 {
                         return Ok(UNSUPPORTED);
                     }
                     let format = if flags & 0x1000 == 0 {

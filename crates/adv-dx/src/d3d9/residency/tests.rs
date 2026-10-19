@@ -412,7 +412,7 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
             .unwrap()
             .levels
             .iter()
-            .all(|level| level.lock.is_none() && level.dirty)
+            .all(|level| level.lock.is_none() && level.dirty.is_some())
     );
     okay(call(
         &mut machine,

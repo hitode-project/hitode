@@ -187,7 +187,7 @@ impl Fixture {
             .unwrap()
             .levels
             .iter()
-            .map(|l| l.dirty)
+            .map(|l| l.dirty.is_some())
             .collect()
     }
     fn submissions(&self) -> u64 {

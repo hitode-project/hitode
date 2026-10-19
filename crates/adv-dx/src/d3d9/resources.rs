@@ -44,8 +44,38 @@ pub(super) struct Level {
     pub surface: Option<u32>,
     pub interface: Option<Id>,
     pub lock: Option<Lock>,
-    /// Pending CPU-to-GPU synchronization, conservatively expanded to a level.
-    pub dirty: bool,
+    /// Pending CPU-to-GPU synchronization: the bounds of the changed texels.
+    pub dirty: Option<Rect>,
+}
+impl Level {
+    pub(super) fn whole(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: self.desc.Width,
+            h: self.desc.Height,
+        }
+    }
+    pub(super) fn mark(&mut self, rect: Rect) {
+        self.dirty = Some(self.dirty.map_or(rect, |dirty| dirty.union(rect)));
+    }
+    pub(super) fn mark_all(&mut self) {
+        self.mark(self.whole());
+    }
+    /// Mark a level-zero rectangle on this level, rounded outward as D3D9
+    /// scales dirty regions to the sublevels.
+    pub(super) fn mark_scaled(&mut self, rect: Rect, index: u32) {
+        let x = (rect.x >> index).min(self.desc.Width - 1);
+        let y = (rect.y >> index).min(self.desc.Height - 1);
+        let right = (rect.x + rect.w).div_ceil(1 << index).min(self.desc.Width);
+        let bottom = (rect.y + rect.h).div_ceil(1 << index).min(self.desc.Height);
+        self.mark(Rect {
+            x,
+            y,
+            w: right.max(x + 1) - x,
+            h: bottom.max(y + 1) - y,
+        });
+    }
 }
 impl Resource {
     pub(super) fn new_depth(
@@ -602,6 +632,8 @@ pub(super) fn create_texture(
     }
     Outcome::Return(0)
 }
+/// A full 4096-square ARGB mip chain, the largest texture the caps advertise.
+const CHAIN_BYTES: u32 = 89_478_484;
 /// One checked guest allocation spans every level. GPU views and COM metadata
 /// remain bounded by the full chain; they do not own separate pixel buffers.
 fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> {
@@ -621,16 +653,19 @@ fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> 
         level_desc.Height = (desc.Height >> index).max(1);
         let bytes = format::length(level_desc.Format, level_desc.Width, level_desc.Height)?;
         let offset = length;
-        length = length
-            .checked_add(bytes)
-            .filter(|&n| n <= 64 * 1024 * 1024)?;
+        length = length.checked_add(bytes).filter(|&n| n <= CHAIN_BYTES)?;
         levels.push(Level {
             desc: level_desc,
             offset,
             surface: None,
             interface: None,
             lock: None,
-            dirty: true,
+            dirty: Some(Rect {
+                x: 0,
+                y: 0,
+                w: level_desc.Width,
+                h: level_desc.Height,
+            }),
         });
     }
     Some((levels, length))
@@ -790,11 +825,11 @@ pub(super) fn texture_lock(
         });
         if flags & 0x10 == 0 && (flags & 0x8000 == 0 || r.desc.Pool == 0) {
             if level == 0 {
-                for selected in &mut r.levels {
-                    selected.dirty = true;
+                for (index, selected) in r.levels.iter_mut().enumerate() {
+                    selected.mark_scaled(rect, index as u32);
                 }
             } else {
-                r.levels[level as usize].dirty = true;
+                r.levels[level as usize].mark(rect);
             }
         }
     }
@@ -857,7 +892,7 @@ fn set_texture(
             r.kind == Kind::Texture
                 && r.desc.Pool == 1
                 && (residency::cold(env, texture.addr())
-                    || r.levels.iter().any(|level| level.dirty))
+                    || r.levels.iter().any(|level| level.dirty.is_some()))
         })
     {
         let Some(r) = resource(env, texture.addr()).filter(|r| r.device == device) else {
@@ -1041,9 +1076,17 @@ mod tests {
             ..desc
         };
         assert_eq!(level_layout(limit, 1).unwrap().1, 64 * 1024 * 1024);
+        assert_eq!(level_layout(limit, 0).unwrap().1, CHAIN_BYTES);
         assert!(
-            level_layout(limit, 0).is_none(),
-            "the base fitting the budget does not exempt lower levels"
+            level_layout(
+                D3DSURFACE_DESC {
+                    Width: 8192,
+                    ..limit
+                },
+                1
+            )
+            .is_none(),
+            "one level stays within the 64 MiB level budget"
         );
         assert!(
             level_layout(

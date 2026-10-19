@@ -88,6 +88,34 @@ fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachmen
     );
 }
 
+#[test]
+fn caps_report_nonlocal_video_memory_surfaces_that_create_succeeds_for() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    m.cpu.write_u32(DATA + 0x200, 0x17c).unwrap();
+    assert_eq!(call(&mut m, api::GET_CAPS, &[device, DATA + 0x200, 0]), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 0x208).unwrap() & 0x200, 0x200);
+    assert_eq!(m.cpu.read_u32(DATA + 0x200 + 60).unwrap(), 64 * 1024 * 1024);
+    assert_eq!(m.cpu.read_u32(DATA + 0x200 + 88).unwrap(), 0);
+    let surfaces = m.cpu.read_u32(DATA + 0x200 + 0x16c).unwrap();
+    assert_eq!(surfaces & 0x3000_5000, 0x3000_5000);
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&7u32.to_le_bytes());
+    desc[8..12].copy_from_slice(&2u32.to_le_bytes());
+    desc[12..16].copy_from_slice(&4u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&(0x1000u32 | 0x4000 | 0x2000_0000).to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 64, DATA, 0]),
+        0
+    );
+}
+
 fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
         context: m.sys.current,
