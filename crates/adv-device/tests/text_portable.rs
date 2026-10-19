@@ -66,9 +66,10 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
     declared[478..482].copy_from_slice(&codepages.to_be_bytes());
     let mut text = Text::with_font_directories(&[]);
     text.add_file_resource(&declared, true).unwrap();
-    let entries = text
-        .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
-        .unwrap();
+    let entries = installed(
+        text.enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
+            .unwrap(),
+    );
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].font.encoding, Encoding::Latin);
     assert_eq!(entries[1].font.encoding, Encoding::Japanese);
@@ -120,9 +121,7 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
     // Legacy discovery remains a single physical face, independent of its
     // repertoire declarations.
     assert_eq!(
-        text.enumerate(None, FontEnumeration::Families)
-            .unwrap()
-            .len(),
+        installed(text.enumerate(None, FontEnumeration::Families).unwrap()).len(),
         1
     );
 }
@@ -147,9 +146,7 @@ fn legacy_family_names_select_and_enumerate_like_gdi() {
         };
         assert_eq!(entries[0].font.face, reported);
     }
-    let all: BTreeSet<_> = text
-        .enumerate(None, FontEnumeration::Families)
-        .unwrap()
+    let all: BTreeSet<_> = installed(text.enumerate(None, FontEnumeration::Families).unwrap())
         .into_iter()
         .map(|entry| entry.font.face)
         .collect();
@@ -161,9 +158,7 @@ fn legacy_family_names_select_and_enumerate_like_gdi() {
         ])
     ); // A Chinese guest sees the Simplified Chinese name; the fixture without one stays English.
     text.set_language("zh-Hans");
-    let all: BTreeSet<_> = text
-        .enumerate(None, FontEnumeration::Families)
-        .unwrap()
+    let all: BTreeSet<_> = installed(text.enumerate(None, FontEnumeration::Families).unwrap())
         .into_iter()
         .map(|entry| entry.font.face)
         .collect();
@@ -196,7 +191,7 @@ fn enumeration_skips_faces_it_cannot_measure() {
     let mut text = Text::with_font_directories(&[]);
     text.add_file_resource(&broken, true).unwrap();
     text.add_file_resource(SINGLE, true).unwrap();
-    let entries = text.enumerate(None, FontEnumeration::Families).unwrap();
+    let entries = installed(text.enumerate(None, FontEnumeration::Families).unwrap());
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].font.face, "ADV Resource Fixture");
 }
@@ -209,9 +204,7 @@ fn full_enumeration_reports_each_family_once() {
         text.add_file_resource(bytes, true).unwrap();
     }
     for mode in [FontEnumeration::Families, FontEnumeration::Faces] {
-        let faces: Vec<_> = text
-            .enumerate(None, mode)
-            .unwrap()
+        let faces: Vec<_> = installed(text.enumerate(None, mode).unwrap())
             .into_iter()
             .map(|entry| entry.font.face)
             .collect();
@@ -227,6 +220,46 @@ fn full_enumeration_reports_each_family_once() {
         .len(),
         2
     );
+}
+
+/// The host faces of a full enumeration, without the Windows standard
+/// families it reports through substitutes.
+fn installed(entries: Vec<EnumeratedFont>) -> Vec<EnumeratedFont> {
+    entries
+        .into_iter()
+        .filter(|entry| !entry.substitute)
+        .collect()
+}
+
+#[test]
+// spec: DEV-FONT-4
+fn full_enumeration_reports_missing_windows_families_through_their_substitutes() {
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(SINGLE, true).unwrap();
+    let entries = text.enumerate(None, FontEnumeration::Families).unwrap();
+    let missing: Vec<_> = entries.iter().filter(|entry| entry.substitute).collect();
+    for name in ["MS UI Gothic", "MS Gothic", "SimSun", "Arial"] {
+        assert!(
+            missing.iter().any(|entry| entry.font.face == name),
+            "{name} missing from {:?}",
+            entries.iter().map(|e| &e.font.face).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        missing
+            .iter()
+            .all(|entry| entry.full_name == entries[0].full_name)
+    );
+    text.set_language("ja-JP");
+    let localized: Vec<_> = text
+        .enumerate(None, FontEnumeration::Families)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.font.face)
+        .collect();
+    assert!(localized.iter().any(|face| face == "ＭＳ ゴシック"));
+    assert!(localized.iter().any(|face| face == "MS UI Gothic"));
+    assert!(!localized.iter().any(|face| face == "MS Gothic"));
 }
 
 fn font(face: &str) -> FontRequest {
@@ -725,7 +758,7 @@ fn resources_enumerate_match_invalidate_and_keep_immutable_glyphs_alive() {
     let (id, count) = text.add_file_resource(COLLECTION, true).unwrap();
     assert_eq!(count, 2);
     assert_eq!(text.resource_stats(), (1, COLLECTION.len()));
-    let list = text.enumerate(None, FontEnumeration::Families).unwrap();
+    let list = installed(text.enumerate(None, FontEnumeration::Families).unwrap());
     assert_eq!(list.len(), 2);
     assert!(
         list.iter()
@@ -761,7 +794,7 @@ fn resources_enumerate_match_invalidate_and_keep_immutable_glyphs_alive() {
 fn explicit_directories_discover_fixture_faces_without_host_font_dependencies() {
     let directory = FixtureDirectory::new();
     let mut text = Text::with_font_directories(std::slice::from_ref(&directory.0));
-    let discovered = text.enumerate(None, FontEnumeration::Families).unwrap();
+    let discovered = installed(text.enumerate(None, FontEnumeration::Families).unwrap());
     assert_eq!(discovered.len(), 3);
     let request = font("ADV Resource Fixture");
     let query = glyph(Character::Unicode(66), GlyphFormat::Gray8);
