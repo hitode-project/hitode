@@ -1,4 +1,4 @@
-//! Authored no-WaveOut/no-MCI-device requests; no audio device or game is used.
+//! Authored no-WaveOut/no-MCI/no-mixer-device requests; no audio device or game is used.
 use adv_abi::{ApiDiagnostics, ImplementationLevel, Registry};
 use adv_cpu::{
     JitCpu,
@@ -602,4 +602,48 @@ fn midi_native_stream_failure_clears_handle_and_tags_device_after_count_validati
             assert_eq!(device, if count == 1 { 0xfffffffe } else { 0x7ffffffe });
         }
     }
+}
+
+fn mixer_boundary<B: Backend>(cpu: B) {
+    let mut m = machine(cpu);
+    // Structures whose cbStruct is right, and one whose size is wrong.
+    m.cpu.write_u32(DATA, 0x118).unwrap(); // MIXERLINEW
+    m.cpu.write_u32(DATA + 0x200, 0xa8).unwrap(); // MIXERLINEA
+    m.cpu.write_u32(DATA + 0x300, 0x18).unwrap(); // controls / details
+    m.cpu.write_u32(DATA + 0x400, 0x17).unwrap();
+    let mut code = start();
+    let calls: [(&str, [u32; 3], u32); 13] = [
+        ("mixerGetNumDevs", [0; 3], 0),
+        ("mixerGetDevCapsW", [0, DATA + 0x500, 0x50], 2),
+        ("mixerGetDevCapsA", [0, 0, 0x30], 11),
+        ("mixerGetLineInfoW", [0, DATA, 1], 2),
+        ("mixerGetLineInfoW", [0, DATA, 0x8000_0001], 5),
+        ("mixerGetLineInfoW", [0, DATA + 0x200, 1], 11),
+        ("mixerGetLineInfoA", [0, DATA + 0x200, 0], 2),
+        ("mixerGetLineControlsW", [0, DATA + 0x300, 0], 2),
+        ("mixerGetLineControlsA", [0, 0, 0], 11),
+        ("mixerGetControlDetailsW", [0, DATA + 0x300, 0x8000_0000], 5),
+        ("mixerGetControlDetailsA", [0, DATA + 0x400, 0], 11),
+        ("mixerSetControlDetails", [0, DATA + 0x300, 0], 2),
+        ("mixerOpen", [DATA + 0x600, 0, 0], 6),
+    ];
+    for (index, (name, args, _)) in calls.iter().enumerate() {
+        let args: &[u32] = match *name {
+            "mixerGetNumDevs" => &[],
+            "mixerOpen" => &[args[0], 0, 0, 0, 0],
+            _ => args,
+        };
+        call(&mut m, &mut code, name, args, index as u32);
+    }
+    run(&mut m, code);
+    for (index, (_, _, expected)) in calls.iter().enumerate() {
+        result(&m, index as u32, *expected);
+    }
+    assert_eq!(bytes(&m, DATA + 0x500, 0x50), vec![0; 0x50]);
+}
+#[test]
+fn mixer_queries_without_a_device_fail_before_touching_their_structures() {
+    mixer_boundary(JitCpu::new(PARK_ADDR, false).unwrap());
+    mixer_boundary(JitCpu::new(PARK_ADDR, true).unwrap());
+    mixer_boundary(UnicornCpu::new(PARK_ADDR).unwrap());
 }
