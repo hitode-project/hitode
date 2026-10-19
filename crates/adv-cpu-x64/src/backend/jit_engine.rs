@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::jit::JitCpu;
 use crate::engine::{Engine, EngineCounters, EngineOptions, json_string as json};
-use crate::{Cliffs, ProfileSample, VerifyStats};
+use crate::{Cliffs, ProfileSample};
 
 const WARM_PROFILE: &str = "jit-warm.bin";
 const CODE_CACHE: &str = "jit-code.bin";
@@ -106,7 +106,7 @@ impl Engine for JitCpu {
             stats.native_entries,
             stats.interpreter_entries,
             cliffs_report(&stats.cliffs),
-            verification_report(&stats.verification),
+            stats.verification.json(),
             executor.persistent_code_cache_json(),
             stats.aot.json(),
             executor.compilation_schedule_json(),
@@ -161,22 +161,6 @@ fn compile_thread_override(value: Option<&str>, default: usize) -> Result<usize,
             .filter(|threads| (1..=8).contains(threads))
             .ok_or_else(|| "ADV_COMPILE_THREADS must be an integer from 1 to 8".into()),
     }
-}
-
-/// `ADV_JIT_VERIFY` interpreter checks of newly published native code.
-fn verification_report(v: &VerifyStats) -> String {
-    format!(
-        "{{\"verified\":{},\"inconclusive\":{},\"mismatches\":{},\"mxcsr_flags\":{},\"reports\":[{}]}}",
-        v.verified,
-        v.inconclusive,
-        v.mismatches,
-        v.mxcsr_flags,
-        v.reports
-            .iter()
-            .map(|r| json(r))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 
 /// Slow-path counters, each list cut to its most frequent entries.

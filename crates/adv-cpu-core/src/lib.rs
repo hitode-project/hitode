@@ -34,6 +34,7 @@ pub mod file_memory;
 pub mod floating;
 pub mod frame_counters;
 pub mod host_features;
+pub mod instruction_trace;
 pub mod interpreter;
 #[doc(hidden)]
 pub mod machine_memory;
@@ -48,6 +49,7 @@ pub mod state;
 #[doc(hidden)]
 pub mod strings;
 #[doc(hidden)]
+pub mod tier_verify;
 pub mod timestamp;
 #[doc(hidden)]
 pub mod trap;

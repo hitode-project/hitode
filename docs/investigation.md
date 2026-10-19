@@ -93,13 +93,15 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 - A process or thread exit that does not return adds a `# terminal` comment with the original binding, exit code, entry stack and resume point.
 - `# cpu_fault` records a real CPU fault before personality exception handling. It does not mean the fault went unhandled. Interrupts use `# raw_interrupt`. Addresses stay out of shared reports.
 
-**Bounded interpreter observation.** With `--backend interpreter`, set `ADV_INTERP_TRACE_DIR` to an existing folder under `target` and `ADV_INTERP_TRACE_RANGES` to comma-separated half-open `<start>..<end>` PC ranges.
+**Bounded interpreter observation.** With `--backend interpreter` on either CPU engine, set `ADV_INTERP_TRACE_DIR` to an existing folder under `target` and `ADV_INTERP_TRACE_RANGES` to comma-separated half-open `<start>..<end>` PC ranges.
 
 - `ADV_INTERP_TRACE_MAX` defaults to 4096 (1 to 100000), and `ADV_INTERP_TRACE_STACK_WORDS` to 4 (0 to 8). `ADV_INTERP_TRACE_START` delays observation until a PC.
 - Each executor writes `interpreter-*.jsonl` with the opcode name, integer registers and flags before and after, stack words, the step and the stop reason. It holds no code bytes.
 - `ADV_INTERP_TRACE_WATCH_DWORD` watches one address. The recorded PCs narrow down the writing block; they do not name the exact instruction.
 - `ADV_INTERP_TRACE_OPERANDS=1` adds explicit register, immediate and memory operand values of up to 8 bytes.
 - Observation never changes guest memory or exception behavior. Output stays local.
+
+**Tier verification.** `ADV_JIT_VERIFY=1` interprets the first native entries before running them natively and counts the comparisons in the report's `tier_verification`; `strict` stops at the first mismatch. The x64 engine checks one unlinked block after each publication. The a64 engine checks the first runs from each entry PC by their retired instruction count. Mismatch reports carry guest addresses and stay local.
 
 ## Live sessions: the debugger
 

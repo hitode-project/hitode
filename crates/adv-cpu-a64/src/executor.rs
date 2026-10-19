@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use adv_cpu_core::instruction_trace::Trace;
 use adv_cpu_core::interpreter::{Interpreter, Step};
+use adv_cpu_core::tier_verify::{self, Check, Verifier, VerifyStats};
 use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 
@@ -52,6 +54,7 @@ pub struct Stats {
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
     pub cliffs: Box<adv_cpu_core::Cliffs>,
+    pub verification: VerifyStats,
 }
 
 pub struct Executor {
@@ -70,6 +73,11 @@ pub struct Executor {
     interrupt: Arc<AtomicBool>,
     host_interrupts: bool,
     deadline: Option<Instant>,
+    /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
+    pub(crate) instruction_trace: Option<Box<Trace>>,
+    /// `ADV_JIT_VERIFY` checks, and how often each entry has been checked.
+    verifier: Option<Box<Verifier>>,
+    verified: rustc_hash::FxHashMap<u32, u8>,
     /// Translated code; `None` when every instruction is interpreted, so
     /// such an executor maps no code cache and installs no fault handler.
     #[cfg(native)]
@@ -143,11 +151,23 @@ impl Executor {
             interrupt: Arc::new(AtomicBool::new(false)),
             host_interrupts: true,
             deadline: None,
+            instruction_trace: (!translate).then(Trace::from_env).flatten(),
+            verifier: translate.then(Verifier::from_env).flatten(),
+            verified: Default::default(),
             #[cfg(native)]
             native,
             #[cfg(native)]
             native_warning,
         })
+    }
+
+    /// Runs every instruction in the interpreter, without a trap handler.
+    #[cfg(test)]
+    pub(crate) fn run_interpreted(&mut self, stop: u32, budget: u64) -> Result<RunOutcome, String> {
+        let saved = std::mem::replace(&mut self.interpreter_only, true);
+        let result = self.run_execution(stop, budget, None);
+        self.interpreter_only = saved;
+        result
     }
 
     pub(crate) fn count_tier0(&mut self, enabled: bool) {
@@ -357,7 +377,18 @@ impl Executor {
             native.deadline = self.deadline.map(crate::native::deadline);
             native.interrupt = self.host_interrupts.then(|| self.interrupt.clone());
         }
-        let result = self.run_inner(stop, budget, &mut bridge);
+        // Observations follow only interpreter-only runs, as in the x64 engine.
+        let mut trace = self
+            .interpreter_only
+            .then(|| self.instruction_trace.take())
+            .flatten();
+        let result = self.run_inner(stop, budget, &mut bridge, trace.as_deref_mut());
+        if let Some(trace) = &mut trace {
+            trace.boundary(&result, &self.state, &self.memory);
+        }
+        if trace.is_some() {
+            self.instruction_trace = trace;
+        }
         // Export canonical floating state at every public CPU boundary.
         self.state.refresh_mmx();
         self.stats.trap_calls += bridge.calls;
@@ -389,7 +420,44 @@ impl Executor {
         } else {
             std::ptr::null_mut()
         };
-        let run = native.run(&mut self.state, &mut self.memory, stop, fuel, traps);
+        let entry = self.state.eip;
+        let due = self.verifier.is_some()
+            && self
+                .verified
+                .get(&entry)
+                .is_none_or(|&n| n < tier_verify::ENTRIES);
+        let run = if due {
+            // The interpreter goes first and restores what it changed; the
+            // unit then runs alone, with host calls left to the owner.
+            let n = self.verified.entry(entry).or_default();
+            *n += 1;
+            let verifier = self.verifier.as_mut().unwrap();
+            let trace = verifier.record(
+                entry,
+                stop,
+                &mut self.interpreter,
+                &mut self.state,
+                &mut self.memory,
+            )?;
+            let fuel = fuel.min(tier_verify::MAX_STEPS as u64);
+            let run = native.run(
+                &mut self.state,
+                &mut self.memory,
+                stop,
+                fuel,
+                std::ptr::null_mut(),
+            )?;
+            if let Some(run) = &run
+                && run.exit != Exit::Stepped
+            {
+                let check = trace.check_retired(run.retired as usize, &self.state, &self.memory);
+                let strict = verifier.strict;
+                record_verification(&mut self.stats.verification, strict, check)?;
+            }
+            Ok(run)
+        } else {
+            native.run(&mut self.state, &mut self.memory, stop, fuel, traps)
+        };
         if let Some(error) = bridge.error.take() {
             return Err(error);
         }
@@ -430,7 +498,9 @@ impl Executor {
         stop: u32,
         budget: u64,
         bridge: &mut Bridge<'_>,
+        mut trace: Option<&mut Trace>,
     ) -> Result<RunOutcome, String> {
+        self.interpreter.observe_transfers = trace.is_some();
         self.state.refresh_mmx();
         self.state.fuel = budget;
         let mut polls = 0u32;
@@ -463,7 +533,10 @@ impl Executor {
             // A restored TF or RF needs precise instruction boundaries.
             let precise_flags = self.state.eflags & ((1 << 8) | (1 << 16)) != 0;
             let units = self.state.fuel.min(BLOCK_UNITS) as u32;
-            let (execution, last_units) = if precise_flags {
+            let (units, observed) = trace.as_deref_mut().map_or((units, None), |trace| {
+                trace.prepare(units, &self.state, &self.memory)
+            });
+            let (execution, last_units) = if precise_flags || observed.is_some() {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -522,6 +595,15 @@ impl Executor {
                 }
                 other => other,
             };
+            if let Some(observed) = observed {
+                trace.as_deref_mut().unwrap().complete(
+                    observed,
+                    step,
+                    execution.units,
+                    &self.state,
+                    &self.memory,
+                );
+            }
             match step {
                 Step::Executed => {}
                 Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
@@ -563,7 +645,51 @@ impl Executor {
     }
 }
 
+/// Accounts one verified exit; strict mode stops at a mismatch.
+fn record_verification(
+    stats: &mut VerifyStats,
+    strict: bool,
+    check: Option<Result<Check, String>>,
+) -> Result<(), String> {
+    match check {
+        None => stats.inconclusive += 1,
+        Some(Ok(Check::Equal)) => stats.verified += 1,
+        Some(Ok(Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+        Some(Err(report)) => {
+            stats.mismatches += 1;
+            if strict {
+                return Err(format!("tier verification: {report}"));
+            }
+            if stats.reports.len() < tier_verify::REPORTS {
+                stats.reports.push(report);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod instruction_trace_tests {
+    // These vectors contain address ranges, not the elements of each range.
+    #![allow(clippy::single_range_in_vec_init)]
+    use super::Executor;
+
+    fn executor(base: u32, len: usize) -> Executor {
+        Executor::new(base, len).unwrap()
+    }
+
+    /// Reserved memory is no guest window, so the executor only interprets.
+    fn reserved(memory: adv_cpu_core::Memory) -> Executor {
+        Executor::create(memory, false).unwrap()
+    }
+
+    fn run_interpreted(cpu: &mut Executor, stop: u32, budget: u64) -> adv_cpu_core::RunOutcome {
+        cpu.run_interpreted(stop, budget).unwrap()
+    }
+
+    include!("../../adv-cpu-core/src/instruction_trace/executor_tests.rs");
+}
 #[cfg(all(test, native))]
 mod leaf_tests;

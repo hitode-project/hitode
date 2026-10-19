@@ -653,7 +653,8 @@ impl Engine for Cpu {
             concat!(
                 "\"engine\": \"a64\",\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
                 "  \"interpreter_instructions\": {},\n  \"compilations\": {},\n",
-                "  \"native_code_bytes\": {},\n  \"a64_diagnostics\": {},\n",
+                "  \"native_code_bytes\": {},\n  \"tier_verification\": {},\n",
+                "  \"a64_diagnostics\": {},\n",
                 "  \"interpreted_forms\": {{{}}},
   \"fault_forms\": {{{}}},
 ",
@@ -664,6 +665,7 @@ impl Engine for Cpu {
             stats.interpreter_instructions,
             stats.compilations,
             stats.native_code_bytes,
+            stats.verification.json(),
             json(&self.inner.diagnostics()),
             forms(0),
             forms(1),
