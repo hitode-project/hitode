@@ -959,6 +959,11 @@ impl Native {
         self.runtime.channel_batches
     }
 
+    #[cfg(test)]
+    pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
+        self.units.get(&eip).map(|entry| entry.unit)
+    }
+
     /// Guest instructions whose accesses check their page.
     pub(crate) fn checked_count(&self) -> usize {
         self.checked.len()
