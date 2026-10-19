@@ -219,6 +219,8 @@ export const messages: Record<string, [string, string]> = {
   "请在游戏内确认退出": ["Confirm quitting in the game", "ゲーム内で終了を確認してください"],
   "返回游戏": ["Back to game", "ゲームに戻る"],
   "JIT 加速": ["JIT", "JIT"],
+  "当前签名不支持 JIT": ["This signing does not support JIT", "現在の署名は JIT に対応していません"],
+  "此安装未获得调试权限，请使用支持 JIT 的开发签名重新签名安装。": ["This installation has no debugging permission. Re-sign and reinstall it with a development signing method that supports JIT.", "このインストールにはデバッグ権限がありません。JIT 対応の開発用署名で再署名してインストールしてください。"],
   "已启用": ["On", "有効"],
   "正在等待 StikDebug…": ["Waiting for StikDebug…", "StikDebug を待っています…"],
   "在 LiveContainer 中请先打开“使用 LiveContainer 的 Bundle ID”": ["In LiveContainer, first turn on \"Use LiveContainer's Bundle ID\"", "LiveContainer では先に「LiveContainer の Bundle ID を使用」をオンにしてください"],

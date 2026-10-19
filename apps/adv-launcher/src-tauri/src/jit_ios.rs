@@ -9,6 +9,7 @@ use objc2_foundation::{
 };
 use std::{
     cell::RefCell,
+    ffi::c_void,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     path::PathBuf,
@@ -59,6 +60,7 @@ thread_local! {
 #[serde(rename_all = "camelCase")]
 pub struct JitStatus {
     ready: bool,
+    debuggable: bool,
     error: Option<String>,
     waiting: bool,
     task: Option<&'static str>,
@@ -67,6 +69,54 @@ pub struct JitStatus {
     pairing_file: bool,
     /// Whether the developer disk image is downloaded; `None` until checked.
     ddi: Option<bool>,
+}
+
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    fn SecTaskCreateFromSelf(allocator: *const c_void) -> *const c_void;
+    fn SecTaskCopyValueForEntitlement(
+        task: *const c_void,
+        entitlement: *const c_void,
+        error: *mut *const c_void,
+    ) -> *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    fn CFRelease(value: *const c_void);
+}
+
+/// Query the running host's signed entitlement, including inside LiveContainer.
+fn signing_allows_debugging() -> bool {
+    let key = NSString::from_str("get-task-allow");
+    // SAFETY: NSString bridges to CFString; both Copy/Create results are
+    // released after use. This is the Security SPI used by StikJIT's preflight.
+    unsafe {
+        let task = SecTaskCreateFromSelf(std::ptr::null());
+        if task.is_null() {
+            return false;
+        }
+        let value = SecTaskCopyValueForEntitlement(
+            task,
+            Retained::as_ptr(&key).cast(),
+            std::ptr::null_mut(),
+        );
+        let allowed = value == kCFBooleanTrue;
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        CFRelease(task);
+        allowed
+    }
+}
+
+fn require_debug_signing() -> Result<(), String> {
+    if signing_allows_debugging() {
+        Ok(())
+    } else {
+        Err("jitSigningUnsupported".into())
+    }
 }
 
 fn pairing_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -82,6 +132,7 @@ pub fn jit_status(app: AppHandle) -> JitStatus {
     let request = REQUEST.lock().unwrap();
     JitStatus {
         ready: matches!(state, Some(Ok(()))),
+        debuggable: signing_allows_debugging(),
         error: request
             .error
             .clone()
@@ -100,6 +151,7 @@ pub fn request_jit(app: AppHandle, external: Option<bool>) -> Result<(), String>
     if let Some(result) = adv_shell::code_pool_state() {
         return result;
     }
+    require_debug_signing()?;
     if !external.unwrap_or(false) {
         if std::env::var_os("LC_HOME_PATH").is_some() {
             return Err("Use StikDebug inside LiveContainer".into());
@@ -160,6 +212,7 @@ pub fn download_ddi(app: AppHandle) -> Result<(), String> {
 }
 
 fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String> {
+    require_debug_signing()?;
     let mut state = REQUEST.lock().unwrap();
     if state.waiting {
         return Ok(());

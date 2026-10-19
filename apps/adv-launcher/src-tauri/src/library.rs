@@ -524,7 +524,12 @@ pub async fn library_pick_folder(app: AppHandle) -> Reply<Option<PathBuf>> {
 }
 
 #[tauri::command]
-pub fn library_list(state: Store<'_>) -> Reply<Vec<LibraryGame>> {
+pub async fn library_list(_app: AppHandle, state: Store<'_>) -> Reply<Vec<LibraryGame>> {
+    #[cfg(target_os = "ios")]
+    {
+        use tauri_plugin_storage::StorageExt;
+        _app.storage().restore_folders().await?;
+    }
     let mut library = state.lock().unwrap();
     if library.prune(now()) {
         library.save().map_err(|e| e.to_string())?;

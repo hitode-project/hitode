@@ -16,14 +16,22 @@ The external StikDebug action in settings opens `stikdebug://enable-jit` with th
 
 ### IOS-JIT-2 Embedded debugger extension
 
-**Rule**: The launcher MUST launch a separate debugger extension for the player's PID, using local RPPairing credentials and LocalDevVPN. The helper MUST mount the appropriate DDI, serve IOS-JIT-1 and detach, including on protocol failure. The launcher MUST report progress and failures, with readiness established only by the player's prepared pool.
+**Rule**: When debugging is permitted, the launcher MUST launch a separate debugger extension for the player's PID using local RPPairing credentials and LocalDevVPN. The helper MUST mount the appropriate DDI, serve IOS-JIT-1 and detach, including on protocol failure. The launcher MUST report progress and failures, with readiness established only by the player's prepared pool.
 **Applies to**: iOS
 **Verification**: Test — debugger session transcripts; device pairing, mounting and extension activation also require review on a sideloaded device.
 **Basis**: IOS-JIT-1
 
 `apps/adv-jit-helper` is a Rust static library linked into `HitodeJIT.appex`, registered at `com.apple.ar.viewer` and launched through Foundation's private NSExtension API. The player sends credentials from Documents/pairingFile.plist over a loopback connection authenticated with a fresh random token delivered in the extension request. Settings imports that file through the document picker and rejects lockdown pairing records, which cannot open the tunnel. Enable Developer Mode and LocalDevVPN before activation; connections to it time out after 10 seconds. DDI files are cached in the extension's Application Support, downloaded from one pinned DeveloperDiskImage revision with jsDelivr as a fallback. Settings shows whether they are present and offers the download separately, because LocalDevVPN takes the only VPN slot from the user's usual network. The helper uses a personalized DDI before iOS 26.4 and a cryptex DDI from iOS 26.4. Before iOS 26 it attaches and detaches; from iOS 26 it serves the universal protocol and writes every code page. The system developer services perform pairing verification and image personalization. LiveContainer uses the external StikDebug action because it does not host this embedded extension.
 
-A game started before the pool is ready stays on Tier 0 for its whole run. So by default, a launcher with an imported pairing file requests JIT when it opens. It asks again on returning to the foreground after a failure. Until JIT is on, the library shows a banner that strongly recommends it. The launch screen waits for a request in progress and otherwise recommends JIT once per session.
+A game started before the pool is ready stays on Tier 0 for its whole run. So by default, a launcher with debugging permission and an imported pairing file requests JIT when it opens. It asks again on returning to the foreground after a failure. For supported signatures, the library banner strongly recommends JIT until it is on. The launch screen waits for a request in progress and otherwise recommends JIT once per session.
+
+### IOS-JIT-3 Signing capability
+
+**Rule**: Before starting a JIT request or helper operation, the launcher MUST check the running host's signed `get-task-allow` entitlement. Unsupported signatures MUST receive an explicit development-signing instruction in settings, the library banner and game-launch advice. Unsupported installations MUST NOT automatically request JIT or start DDI checks or downloads.
+**Applies to**: iOS
+**Verification**: Review — signed entitlement queries require a sideloaded device, including the host process inside LiveContainer.
+
+The check uses Security's `SecTaskCopyValueForEntitlement` for the current process rather than inferring capability from certificate names or embedded profiles. Pairing files remain ordinary app data; possessing one does not grant debugging permission.
 
 ### IOS-MEM-1 Compact window
 
@@ -49,13 +57,13 @@ The family runs one process at a time. Every window starts at guest address 0, s
 
 The app's address space ends a few GiB past the dyld shared region. WebKit reserves its 2 GiB JavaScript heap at the start of that range once a webview loads, after which no 4 GiB-aligned window fits. Reserved first, the window leaves WebKit to run without that heap.
 
-### IOS-APP-1 Game import
+### IOS-APP-1 Game folder access
 
-**Rule**: Folders MUST be picked through Files, and one inside the app's container MUST be used in place. Any other MUST be copied into private storage before library discovery, each file read through a file coordinator so iCloud downloads it first. Copies MUST report byte progress, publish complete by same-parent rename, and remove the temporary directory on failure or cancellation without modifying sources.
+**Rule**: Game imports MUST read folders selected through Files at their original locations by default. External directory permissions MUST persist as bookmarks and be restored before library access. Coordinated reads MUST make cloud files locally readable before discovery and game launch.
 **Applies to**: iOS
 **Verification**: Review — the Files picker and iCloud downloads run only on a device.
 
-Finder file sharing places games in Documents, inside the container. Copies use the file manager's copy, which clones on the same volume. A copy from another app's storage or a downloaded iCloud folder then takes no extra space.
+The launcher holds selected directories' security scopes while it runs. Game folders remain at their selected locations; saves and registry use the game's independent private data directory. Finder file sharing also places games in Documents, where the launcher reads them in place.
 
 ### IOS-APP-2 Native view
 

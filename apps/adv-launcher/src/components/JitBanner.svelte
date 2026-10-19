@@ -6,10 +6,12 @@
   const status = $derived(jit.status);
 </script>
 
-<!-- iOS library: JIT is strongly recommended until it is on. -->
+<!-- iOS library: show JIT readiness and signing restrictions. -->
 {#if jit.active && status && !status.ready}
   <div class="banner" role="status">
-    {#if jit.busy}
+    {#if jit.signingUnsupported}
+      <span class="text"><b>{t("当前签名不支持 JIT")}</b><span>{jit.note}</span></span>
+    {:else if jit.busy}
       <span class="text"><b>{t("正在启用 JIT")}</b><span>{jit.note}</span></span>
     {:else}
       <span class="text">

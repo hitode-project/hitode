@@ -54,6 +54,17 @@ impl<R: Runtime> Storage<R> {
         self.call("pickFolder", json!({})).await
     }
 
+    #[cfg(target_os = "ios")]
+    pub async fn restore_folders(&self) -> Reply<()> {
+        self.call("restoreFolders", json!({})).await
+    }
+
+    #[cfg(target_os = "ios")]
+    pub async fn prepare_folder(&self, path: &std::path::Path) -> Reply<PathBuf> {
+        let folder: CopiedFolder = self.call("prepareFolder", json!({ "path": path })).await?;
+        Ok(folder.path)
+    }
+
     /// One file of any type; see `PickedFile` for where it ends up.
     pub async fn pick_file(&self, dest: &std::path::Path) -> Reply<PickedFile> {
         self.call("pickFile", json!({ "dest": dest })).await

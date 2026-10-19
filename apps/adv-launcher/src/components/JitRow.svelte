@@ -13,9 +13,9 @@
     <div class="row head">
       <span class="t">
         <span>{t("JIT 加速")}</span>
-        <span class="note" class:ok={status.ready} role="status">{jit.note}</span>
+        <span class="note" class:ok={status.ready} role="status">{jit.signingUnsupported ? t("当前签名不支持 JIT") : jit.note}</span>
       </span>
-      {#if !status.ready}
+      {#if !status.ready && status.debuggable}
         {#if status.liveContainer}
           <button class="secondary" disabled={jit.busy} onclick={() => jit.stikDebug()}>{t("用 StikDebug 启用")}</button>
         {:else}
@@ -24,7 +24,9 @@
       {/if}
     </div>
 
-    {#if !status.ready}
+    {#if jit.signingUnsupported}
+      <p class="advice">{jit.note}</p>
+    {:else if !status.ready}
       <p class="advice">{t("强烈建议启用 JIT。未启用时游戏以解释模式运行，速度会慢很多。")}</p>
       {#if status.liveContainer}
         <p class="advice">{t("在 LiveContainer 中请先打开“使用 LiveContainer 的 Bundle ID”")}</p>
@@ -60,7 +62,7 @@
       {/if}
     {/if}
 
-    {#if status.pairingFile && !status.liveContainer}
+    {#if status.debuggable && status.pairingFile && !status.liveContainer}
       <div class="row">
         <span class="t">{t("打开启动器时自动启用 JIT")}</span>
         <SettingsSwitch touch label={t("打开启动器时自动启用 JIT")} checked={prefs.autoJit} onchange={(v) => setPref("autoJit", v)} />

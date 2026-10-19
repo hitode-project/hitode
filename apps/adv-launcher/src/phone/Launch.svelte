@@ -36,9 +36,10 @@
           </div>
         {:else if flow.view === "jit"}
           <div class="state fade">
-            <div class="msg">{t("强烈建议启用 JIT")}</div>
+            <div class="msg">{jit.signingUnsupported ? t("当前签名不支持 JIT") : t("强烈建议启用 JIT")}</div>
+            {#if jit.signingUnsupported}<div class="hint">{jit.note}</div>{/if}
             <div class="hint">{t("未启用时，这次游戏会全程以解释模式运行，速度会慢很多。")}</div>
-            {#if jit.status?.error || jit.requestError}<div class="chip mono">{jit.note}</div>{/if}
+            {#if !jit.signingUnsupported && (jit.status?.error || jit.requestError)}<div class="chip mono">{jit.note}</div>{/if}
           </div>
         {:else if flow.view === "failed"}
           <div class="state fade">
@@ -67,9 +68,9 @@
       </div>
     {:else if flow.view === "jit"}
       <div class="acts fade">
-        {#if jit.configured || jit.status?.liveContainer}
+        {#if !jit.signingUnsupported && (jit.configured || jit.status?.liveContainer)}
           <button class="btn primary" onclick={() => flow.enableJit()}>{jit.status?.liveContainer ? t("用 StikDebug 启用") : t("启用 JIT")}</button>
-        {:else}
+        {:else if !jit.signingUnsupported}
           <button class="btn primary" onclick={() => nav.replace({ name: "settings" })}>{t("设置方法")}</button>
         {/if}
         <button class="btn quiet" onclick={() => flow.withoutJit()}>{t("仍然开始")}</button>

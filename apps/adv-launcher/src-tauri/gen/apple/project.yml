@@ -57,7 +57,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        # Games are copied into Documents through Finder or the Files app.
+        # Finder file sharing also exposes the app's Documents folder.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         CFBundleShortVersionString: 0.1.0

@@ -8,6 +8,15 @@ struct FolderArgs: Decodable {
   let uri: String
 }
 
+struct PrepareArgs: Decodable {
+  let path: String
+}
+
+struct RestoredFolder {
+  let original: String
+  let path: String
+}
+
 struct CopyArgs: Decodable {
   let id: String
   let uri: String
@@ -37,19 +46,24 @@ struct StorageError: LocalizedError {
   init(_ message: String) { errorDescription = message }
 }
 
-/// Folders picked in Files. One inside the app's container (Finder file
-/// sharing puts games in Documents) is read in place; any other is copied
-/// into the app, which downloads iCloud items first and clones files on the
-/// same volume, so a copy costs neither time nor space there.
+/// Files folders are read in place. Bookmarks keep external directories
+/// accessible across launches; coordinated reads download cloud files.
 class StoragePlugin: Plugin, UIDocumentPickerDelegate {
   private let lock = NSLock()
   private var picking: Invoke?
   /// A single-file pick, told apart from folder picks by its controller.
   private var pickingFile: (picker: UIDocumentPickerViewController, invoke: Invoke)?
-  /// Picked folders keep their security scope until imported.
+  private let bookmarksKey = "hitode.storage.folders"
+  private var bookmarks =
+    UserDefaults.standard.dictionary(forKey: "hitode.storage.folders") as? [String: Data] ?? [:]
+  /// One active security scope per bookmarked directory, held until exit.
   private var picked: [String: URL] = [:]
   private var copying: String?
   private var cancelled: Set<String> = []
+
+  deinit {
+    for url in picked.values { url.stopAccessingSecurityScopedResource() }
+  }
 
   /// iOS has no storage permission: Files grants each picked folder.
   @objc public func storageStatus(_ invoke: Invoke) {
@@ -70,7 +84,7 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
         invoke.reject("No view controller to present the folder picker")
         return
       }
-      let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+      let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
       picker.delegate = self
       picker.allowsMultipleSelection = false
       self.picking = invoke
@@ -116,17 +130,20 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
       invoke.resolve(Folder(uri: nil, path: nil))
       return
     }
-    if StoragePlugin.contained(url) {
-      invoke.resolve(Folder(uri: url.absoluteString, path: url.path))
+    do {
+      try remember(url)
+    } catch {
+      invoke.reject(error.localizedDescription)
       return
     }
-    if url.startAccessingSecurityScopedResource() {
-      lock.lock()
-      picked[url.absoluteString]?.stopAccessingSecurityScopedResource()
-      picked[url.absoluteString] = url
-      lock.unlock()
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        if !StoragePlugin.contained(url) { try StoragePlugin.prepare(url) }
+        invoke.resolve(Folder(uri: url.absoluteString, path: url.resolvingSymlinksInPath().path))
+      } catch {
+        invoke.reject(error.localizedDescription)
+      }
     }
-    invoke.resolve(Folder(uri: url.absoluteString, path: nil))
   }
 
   public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -145,20 +162,118 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
     return url.resolvingSymlinksInPath().path.hasPrefix(home)
   }
 
-  private func folder(_ uri: String) throws -> URL {
+  private func remember(_ url: URL) throws {
+    if StoragePlugin.contained(url) { return }
+    guard url.startAccessingSecurityScopedResource() else {
+      throw StorageError("Cannot access this folder. Select it again in Files.")
+    }
+    do {
+      let data = try url.bookmarkData(
+        options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+      lock.lock()
+      defer { lock.unlock() }
+      let path = url.resolvingSymlinksInPath().path
+      let key = picked.first { $0.value.resolvingSymlinksInPath().path == path }?.key ?? path
+      picked[key]?.stopAccessingSecurityScopedResource()
+      picked[key] = url
+      bookmarks[key] = data
+      UserDefaults.standard.set(bookmarks, forKey: bookmarksKey)
+    } catch {
+      url.stopAccessingSecurityScopedResource()
+      throw error
+    }
+  }
+
+  private func restoreAccess() -> [RestoredFolder] {
     lock.lock()
     defer { lock.unlock() }
-    if let url = picked[uri] { return url }
+    for (original, data) in bookmarks where picked[original] == nil {
+      do {
+        var stale = false
+        let url = try URL(
+          resolvingBookmarkData: data, options: .withoutUI, relativeTo: nil,
+          bookmarkDataIsStale: &stale)
+        guard url.startAccessingSecurityScopedResource() else {
+          throw StorageError("Cannot restore folder access. Select it again in Files.")
+        }
+        picked[original] = url
+        if stale {
+          bookmarks[original] = try url.bookmarkData(
+            options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+          UserDefaults.standard.set(bookmarks, forKey: bookmarksKey)
+        }
+      } catch {
+        NSLog("Cannot restore game folder access: %@", error.localizedDescription)
+      }
+    }
+    return picked.map {
+      RestoredFolder(original: $0.key, path: $0.value.resolvingSymlinksInPath().path)
+    }
+  }
+
+  @objc public func restoreFolders(_ invoke: Invoke) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      _ = self.restoreAccess()
+      invoke.resolve()
+    }
+  }
+
+  private func folder(_ uri: String) throws -> URL {
     guard let url = URL(string: uri), url.isFileURL else {
       throw StorageError("Invalid folder")
     }
-    return url
+    return try folderAtPath(url.path)
   }
 
-  private func release(_ uri: String) {
-    lock.lock()
-    picked.removeValue(forKey: uri)?.stopAccessingSecurityScopedResource()
-    lock.unlock()
+  private func folderAtPath(_ path: String) throws -> URL {
+    let url = URL(fileURLWithPath: path)
+    if StoragePlugin.contained(url) { return url }
+    let roots = restoreAccess()
+    // A library entry may name a subdirectory of the folder picked in Files.
+    let canonical = url.resolvingSymlinksInPath().path
+    for root in roots.sorted(by: { $0.original.count > $1.original.count }) {
+      for prefix in [root.original, root.path] {
+        if canonical == prefix { return URL(fileURLWithPath: root.path) }
+        if canonical.hasPrefix(prefix + "/") {
+          return URL(fileURLWithPath: root.path).appendingPathComponent(
+            String(canonical.dropFirst(prefix.count + 1)))
+        }
+      }
+    }
+    throw StorageError("Folder access is unavailable. Select it again in Files.")
+  }
+
+  @objc public func prepareFolder(_ invoke: Invoke) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let url = try self.folderAtPath(invoke.parseArgs(PrepareArgs.self).path)
+        if !StoragePlugin.contained(url) { try StoragePlugin.prepare(url) }
+        invoke.resolve(Copied(path: url.resolvingSymlinksInPath().path))
+      } catch {
+        invoke.reject(error.localizedDescription)
+      }
+    }
+  }
+
+  private static func prepare(_ directory: URL) throws {
+    for entry in try entries(directory) {
+      if entry.directory {
+        try prepare(entry.url)
+        continue
+      }
+      var coordination: NSError?
+      var failure: Error?
+      NSFileCoordinator().coordinate(readingItemAt: entry.url, options: [], error: &coordination) {
+        readable in
+        do {
+          let file = try FileHandle(forReadingFrom: readable)
+          try file.close()
+        } catch {
+          failure = error
+        }
+      }
+      if let error = coordination ?? failure { throw error }
+    }
   }
 
   /// A folder's items under their real names; Files lists an iCloud item
@@ -285,7 +400,6 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
         try manager.moveItem(at: temporary, to: dest)
         staging = nil
         args.progress?.send(["bytes": bytes, "file": name])
-        self.release(args.uri)
         invoke.resolve(Copied(path: dest.appendingPathComponent(name).path))
       } catch {
         if let staging = staging { try? manager.removeItem(at: staging) }

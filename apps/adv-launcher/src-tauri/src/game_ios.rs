@@ -27,6 +27,7 @@ use objc2_ui_kit::{
 };
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Mutex, time::Instant};
 use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri_plugin_storage::StorageExt;
 
 thread_local! {
     static HOST: RefCell<Host> = RefCell::new(Host::default());
@@ -304,6 +305,11 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
+    let folder = window
+        .storage()
+        .prepare_folder(exe.parent().unwrap())
+        .await?;
+    let exe = folder.join(exe.file_name().unwrap());
     let backup_data = data_dir.clone();
     let options = playback.options(exe, data_dir, codepage)?;
     let host_window = window.clone();
