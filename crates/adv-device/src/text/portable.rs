@@ -266,26 +266,42 @@ impl Backend {
             .flat_map(|resource| resource.faces.iter().copied())
             .collect();
         let named = face.filter(|name| !name.is_empty());
+        let present = |name: &str| db.faces().any(|info| family_matches(db, info, name));
         // A family the host lacks enumerates as the face that draws it, under
         // the requested name, so a presence check agrees with drawing.
-        let substitute = named
-            .filter(|name| !db.faces().any(|info| family_matches(db, info, name)))
-            .and_then(|name| {
-                let mut request = enumeration_request(db.faces().next()?, name.to_owned());
-                (request.weight, request.italic) = (400, false);
-                (request.pitch, request.family) = (Pitch::Default, Family::Default);
-                if let FontEnumeration::FamiliesEx(encoding) = mode {
-                    request.encoding = encoding;
-                }
-                Some(self.font(&request).ok()?.primary.info.id)
-            });
-        for info in db
-            .faces()
-            .filter(|info| !hidden.contains(&info.id))
-            .filter(|info| match substitute {
-                Some(id) => info.id == id,
-                None => named.is_none_or(|name| family_matches(db, info, name)),
-            })
+        let substitute = |name: &str| {
+            let mut request = enumeration_request(db.faces().next()?, name.to_owned());
+            (request.weight, request.italic) = (400, false);
+            (request.pitch, request.family) = (Pitch::Default, Family::Default);
+            if let FontEnumeration::FamiliesEx(encoding) = mode {
+                request.encoding = encoding;
+            }
+            let id = self.font(&request).ok()?.primary.info.id;
+            Some((db.face(id)?, Some(name.to_owned())))
+        };
+        let faces: Vec<_> = match named {
+            Some(name) if !present(name) => substitute(name).into_iter().collect(),
+            Some(name) => db
+                .faces()
+                .filter(|info| family_matches(db, info, name))
+                .map(|info| (info, None))
+                .collect(),
+            // Windows always ships its standard families, so a full enumeration
+            // lists the missing ones the same way.
+            None => db
+                .faces()
+                .map(|info| (info, None))
+                .chain(
+                    WINDOWS_FAMILIES
+                        .iter()
+                        .filter(|family| !family.names().any(present))
+                        .filter_map(|family| substitute(family.name(self.language))),
+                )
+                .collect(),
+        };
+        for (info, forced) in faces
+            .into_iter()
+            .filter(|(info, _)| !hidden.contains(&info.id))
         {
             if output.len() >= 8192 {
                 return Err(TextError::Font("font enumeration budget exceeded".into()));
@@ -302,10 +318,8 @@ impl Backend {
                     let font = FontRef::from_index(bytes, index).map_err(font_error)?;
                     // Report the legacy family GDI uses: the requested spelling
                     // when it names one, else the guest UI language, else English.
-                    let requested = named.and_then(|name| {
-                        if substitute.is_some() {
-                            return Some(name.to_owned());
-                        }
+                    let requested = forced.clone().or_else(|| {
+                        let name = named?;
                         legacy_families(&font)
                             .find(|family| family.to_lowercase() == name.to_lowercase())
                     });
@@ -387,7 +401,7 @@ impl Backend {
                             average_width: unscaled.average_width.unwrap_or(0.0).max(0.0).round()
                                 as u32,
                         }),
-                        substitute: substitute.is_some(),
+                        substitute: forced.is_some(),
                     })
                 })
                 .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()));
@@ -425,6 +439,45 @@ impl Backend {
         Ok(output)
     }
 }
+
+/// A family every Windows installation ships, with its name in the UI
+/// language that localizes it.
+struct WindowsFamily(&'static str, Option<(&'static str, &'static str)>);
+impl WindowsFamily {
+    fn name(&self, language: Option<&str>) -> &'static str {
+        match self.1 {
+            Some((tag, local)) if language == Some(tag) => local,
+            _ => self.0,
+        }
+    }
+    fn names(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.0).chain(self.1.map(|(_, local)| local))
+    }
+}
+const WINDOWS_FAMILIES: &[WindowsFamily] = &[
+    WindowsFamily("Arial", None),
+    WindowsFamily("Courier New", None),
+    WindowsFamily("Times New Roman", None),
+    WindowsFamily("Tahoma", None),
+    WindowsFamily("Verdana", None),
+    WindowsFamily("Microsoft Sans Serif", None),
+    WindowsFamily("Segoe UI", None),
+    WindowsFamily("MS Gothic", Some(("ja-JP", "ＭＳ ゴシック"))),
+    WindowsFamily("MS PGothic", Some(("ja-JP", "ＭＳ Ｐゴシック"))),
+    WindowsFamily("MS UI Gothic", None),
+    WindowsFamily("MS Mincho", Some(("ja-JP", "ＭＳ 明朝"))),
+    WindowsFamily("MS PMincho", Some(("ja-JP", "ＭＳ Ｐ明朝"))),
+    WindowsFamily("Meiryo", Some(("ja-JP", "メイリオ"))),
+    WindowsFamily("Meiryo UI", None),
+    WindowsFamily("SimSun", Some(("zh-Hans", "宋体"))),
+    WindowsFamily("NSimSun", Some(("zh-Hans", "新宋体"))),
+    WindowsFamily("SimHei", Some(("zh-Hans", "黑体"))),
+    WindowsFamily("Microsoft YaHei", Some(("zh-Hans", "微软雅黑"))),
+    WindowsFamily("MingLiU", None),
+    WindowsFamily("PMingLiU", None),
+    WindowsFamily("Gulim", None),
+    WindowsFamily("Batang", None),
+];
 
 /// Whether a full enumeration lists a family. A leading period marks a
 /// host-private family that host font menus also leave out.

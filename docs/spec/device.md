@@ -180,7 +180,7 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-FONT-4 Missing family fallback
 
-**Rule**: Portable enumeration of a named family that no font provides MUST report the face drawing would substitute, under the requested name. Hosts MUST record a diagnostic when this happens.
+**Rule**: Portable enumeration of a named family that no font provides MUST report the face drawing would substitute, under the requested name. Hosts MUST record a diagnostic when this happens. A full enumeration MUST likewise report each standard Windows family the host lacks, named in the guest UI language when Windows localizes it.
 **Verification**: Test
 
 ### DEV-FONT-5 Full family enumeration

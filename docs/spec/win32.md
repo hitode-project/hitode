@@ -65,7 +65,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-OBJECT-4 Large heaps
 
-**Rule**: Heap, RTL, CRT, Global, and Local allocation MUST share storage. Large allocations MUST start zeroed without requiring ZERO_MEMORY and retire their mapping on release. Moving realloc MUST preserve prior bytes and zero an enlarged large-block tail.
+**Rule**: Heap, RTL, CRT, Global, and Local allocation MUST share storage. Large blocks MUST start zeroed without ZERO_MEMORY, retire their mapping on release, and zero an enlarged moving-realloc tail. Moving realloc MUST preserve prior bytes, and blocks up to 16 KiB MUST NOT expose bytes another size freed.
 **Verification**: Test
 
 ### WIN32-OBJECT-5 Persistent storage

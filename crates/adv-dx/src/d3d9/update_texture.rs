@@ -30,8 +30,8 @@ struct Transfer {
     device: Id,
     source: Id,
     destination: Id,
-    source_dirty: Vec<bool>,
-    destination_dirty: Vec<bool>,
+    source_dirty: Vec<Option<Rect>>,
+    destination_dirty: Vec<Option<Rect>>,
     remaining: VecDeque<Upload>,
     current: Option<Commit>,
 }
@@ -121,7 +121,7 @@ fn update(
         com(env).get_identity_mut(&mut env.sys.objects, transfer.source)
     {
         for level in &mut r.levels {
-            level.dirty = false;
+            level.dirty = None;
         }
     }
     transfer.context = env.context;
@@ -165,7 +165,7 @@ fn prepare(
             return Err(INVALID);
         }
     }
-    if !src.levels.iter().any(|level| level.dirty) {
+    if !src.levels.iter().any(|level| level.dirty.is_some()) {
         return Ok(None);
     }
     let state = env.ext.get::<State>();
@@ -313,7 +313,7 @@ fn uploaded(env: &mut Env<'_>, destination: Id, outcome: Outcome) -> Outcome {
             if let Some(Payload::Resource(r)) =
                 com(env).get_identity_mut(&mut env.sys.objects, destination)
             {
-                r.levels[level as usize].dirty = false;
+                r.levels[level as usize].dirty = None;
             }
             let commit = env.ext.get_mut::<Transfers>().active[index]
                 .current
@@ -361,7 +361,9 @@ fn retire(env: &mut Env<'_>, destination: Id, success: bool) {
             com(env).get_identity_mut(&mut env.sys.objects, transfer.source)
         {
             for (level, dirty) in r.levels.iter_mut().zip(transfer.source_dirty) {
-                level.dirty |= dirty;
+                if let Some(rect) = dirty {
+                    level.mark(rect);
+                }
             }
         }
         if let Some(current) = transfer.current

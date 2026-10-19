@@ -607,7 +607,9 @@ fn clear_upload_lock(env: &mut Env<'_>, resource: Id, level: Option<u32>, dirty:
         if let Some(n) = level {
             if let Some(l) = r.levels.get_mut(n as usize) {
                 l.lock = None;
-                l.dirty |= dirty;
+                if dirty {
+                    l.mark_all();
+                }
             }
         } else {
             r.lock = None;

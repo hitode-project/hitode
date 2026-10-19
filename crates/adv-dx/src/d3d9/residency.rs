@@ -27,7 +27,7 @@ fn surfaces(env: &mut Env<'_>, id: Id, views: &[Option<u32>], dirty: bool) {
         for (level, &surface) in r.levels.iter_mut().zip(views) {
             level.surface = surface;
             if dirty {
-                level.dirty = true;
+                level.mark_all();
             }
             if let Some(alias) = level.interface {
                 aliases.push((alias, surface));

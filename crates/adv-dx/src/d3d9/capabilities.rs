@@ -175,6 +175,9 @@ fn check_format(
     }
     // Color surface/texture: sampled, dynamic or manual render-target mips.
     // Autogen, sRGB, depth textures, cubes and volumes remain unadvertised.
+    // QUERY_FILTER asks for filtering beyond point sampling, which every
+    // sampled 2D format here has.
+    let (filter, usage) = (usage & 0x20000 != 0, usage & !0x20000);
     let vertex_texture_query = usage == 0x100000
         && resource == 3
         && matches!(check, 21 | 22)
@@ -196,6 +199,7 @@ fn check_format(
         // render targets, standalone DEFAULT surfaces, vertex fetch or autogen.
         || (check == 28 && resource == 3 && matches!(usage, 0 | 0x200))
         || (resource == 1 && usage == 2 && depth::format(check).is_some());
+    let supported = supported && (!filter || resource == 3 && usage & 0x100000 == 0);
     if available(env) && format == 22 && supported {
         0
     } else {
@@ -274,14 +278,15 @@ fn check_conversion(
 pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
     let g = env.ext.get::<State>().gpu.as_ref().ok_or(UNAVAILABLE)?;
     g.context().check().map_err(|_| DEVICE_LOST)?;
-    // Full-square textures must also fit the 16 MiB upload limit. Drawing uses
-    // 40-byte neutral vertices; 131072 triangles fit that same bounded upload.
+    // 4096 is what D3D9-era hardware reported and titles test against; a full
+    // square level fits the 64 MiB level budget. Drawing uses 40-byte neutral
+    // vertices; 131072 triangles fit the 16 MiB bounded vertex upload.
     let texture_size = g
         .context()
         .device
         .limits()
         .max_texture_dimension_2d
-        .min(2048);
+        .min(4096);
     let gates = env.ext.get::<State>().shader_caps;
     let model = if gates.sm3 {
         3
@@ -536,7 +541,7 @@ mod tests {
         assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");
         assert!(
             u64::from(value.MaxTextureWidth) * u64::from(value.MaxTextureHeight) * 4
-                <= 16 * 1024 * 1024
+                <= 64 * 1024 * 1024
         );
         assert!(u64::from(value.MaxPrimitiveCount) * 3 * 40 <= 16 * 1024 * 1024);
         for (usage, kind, format) in [
@@ -553,6 +558,10 @@ mod tests {
             (2, 1, 75),
             (2, 1, 77),
             (2, 1, 80),
+            (0x20000, 3, 21),
+            (0x20000, 3, 22),
+            (0x20200, 3, 26),
+            (0x20000, 3, 28),
         ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),
@@ -568,6 +577,8 @@ mod tests {
             (0x400, 3, 21),
             (0, 4, 21),
             (0, 5, 21),
+            (0x20000, 1, 22),
+            (0x20001, 3, 26),
         ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),

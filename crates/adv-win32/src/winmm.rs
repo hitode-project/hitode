@@ -58,6 +58,15 @@ pub fn register(registry: &mut Registry) {
         ("mixerGetNumDevs", 0, mixer_get_num_devs),
         ("mixerOpen", 5, mixer_open),
         ("mixerClose", 1, mixer_close),
+        ("mixerGetDevCapsA", 3, mixer_get_dev_caps),
+        ("mixerGetDevCapsW", 3, mixer_get_dev_caps),
+        ("mixerGetLineInfoA", 3, mixer_get_line_info_a),
+        ("mixerGetLineInfoW", 3, mixer_get_line_info_w),
+        ("mixerGetLineControlsA", 3, mixer_get_line_controls),
+        ("mixerGetLineControlsW", 3, mixer_get_line_controls),
+        ("mixerGetControlDetailsA", 3, mixer_control_details),
+        ("mixerGetControlDetailsW", 3, mixer_control_details),
+        ("mixerSetControlDetails", 3, mixer_control_details),
         (WORKER, 0, worker),
     ] {
         crate::stdcall(registry, "winmm.dll", name, argc, handler);
@@ -94,6 +103,47 @@ fn mixer_open(env: &mut Env<'_>) -> Outcome {
 
 fn mixer_close(_env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0) // MMSYSERR_NOERROR
+}
+
+// No mixer device exists, so queries fail as winmm does without one: a bad
+// structure first, then the object: handles are invalid and IDs out of range.
+const BADDEVICEID: u32 = 2;
+const INVALHANDLE: u32 = 5;
+const INVALPARAM: u32 = 11;
+const OBJECTF_HANDLE: u32 = 0x8000_0000;
+
+fn mixer_get_dev_caps(env: &mut Env<'_>) -> Outcome {
+    if env.arg(1) == 0 {
+        return Outcome::Return(INVALPARAM);
+    }
+    Outcome::Return(BADDEVICEID)
+}
+
+fn mixer_query(env: &mut Env<'_>, size: u32) -> Outcome {
+    let (info, flags) = (env.arg(1), env.arg(2));
+    if info == 0 || env.cpu.read_u32(info).ok() != Some(size) {
+        return Outcome::Return(INVALPARAM);
+    }
+    if flags & OBJECTF_HANDLE != 0 {
+        return Outcome::Return(INVALHANDLE);
+    }
+    Outcome::Return(BADDEVICEID)
+}
+
+fn mixer_get_line_info_a(env: &mut Env<'_>) -> Outcome {
+    mixer_query(env, 0xa8) // sizeof(MIXERLINEA)
+}
+
+fn mixer_get_line_info_w(env: &mut Env<'_>) -> Outcome {
+    mixer_query(env, 0x118) // sizeof(MIXERLINEW)
+}
+
+fn mixer_get_line_controls(env: &mut Env<'_>) -> Outcome {
+    mixer_query(env, 0x18) // sizeof(MIXERLINECONTROLS)
+}
+
+fn mixer_control_details(env: &mut Env<'_>) -> Outcome {
+    mixer_query(env, 0x18) // sizeof(MIXERCONTROLDETAILS)
 }
 
 fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Timers {

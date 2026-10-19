@@ -100,7 +100,7 @@ pub(super) fn binding(env: &mut Env<'_>) -> Option<u64> {
             if resources::resource(env, pointer).is_some_and(|r| {
                 r.kind == resources::Kind::Texture
                     && r.desc.Pool == 1
-                    && (residency::cold(env, pointer) || r.levels.iter().any(|l| l.dirty))
+                    && (residency::cold(env, pointer) || r.levels.iter().any(|l| l.dirty.is_some()))
             }) {
                 return None;
             }

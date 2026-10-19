@@ -90,13 +90,7 @@ fn invalid_parameter_then(
     if errno.is_null() || errno.write(env.cpu, error).is_err() {
         return Outcome::Fail("CRT errno allocation/write failed".into());
     }
-    let handler = env
-        .ext
-        .get::<CrtState>()
-        .invalid_handlers
-        .get(crt_module(&env.sys.thunks.get(env.thunk).module))
-        .copied()
-        .unwrap_or(0);
+    let handler = invalid_handler(env);
     if handler == 0 {
         return Outcome::Fail(format!(
             "{function}: invalid parameter without a returning guest handler"
@@ -105,6 +99,29 @@ fn invalid_parameter_then(
     // Release UCRT passes no diagnostic strings. errno is assigned before the
     // callback, and a returning callback may change it or wait via the Machine.
     Outcome::call(handler, [0, 0, 0, 0, 0], move |env, _| then(env))
+}
+
+fn invalid_handler(env: &Env<'_>) -> u32 {
+    env.ext
+        .try_get::<CrtState>()
+        .and_then(|state| {
+            state
+                .invalid_handlers
+                .get(crt_module(&env.sys.thunks.get(env.thunk).module))
+                .copied()
+        })
+        .unwrap_or(0)
+}
+
+// Inlined checks (such as checked STL iterators) report through this entry. A
+// registered handler returns to the caller; without one, _invoke_watson ends the
+// process with STATUS_INVALID_CRT_PARAMETER.
+fn invalid_parameter_noinfo(env: &mut Env<'_>) -> Outcome {
+    let handler = invalid_handler(env);
+    if handler == 0 {
+        return crate::kernel32::exit_process(env, 0xc000_0417);
+    }
+    Outcome::call(handler, [0, 0, 0, 0, 0], |_, _| Outcome::Return(0))
 }
 
 pub fn install<B: adv_cpu::backend::Backend>(
@@ -250,6 +267,7 @@ pub fn register(r: &mut Registry) {
             ("__p__fmode", 0),
             ("__p__commode", 0),
             ("__iob_func", 0),
+            ("_invalid_parameter_noinfo", 0),
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
@@ -1094,6 +1112,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         // abort exits with 3 and _amsg_exit with 255, as msvcrt does.
         "abort" => return crate::kernel32::exit_process(e, 3),
         "_amsg_exit" => return crate::kernel32::exit_process(e, 255),
+        "_invalid_parameter_noinfo" => return invalid_parameter_noinfo(e),
         "_wcsnicmp" => {
             let n = c as usize;
             if n == 0 {

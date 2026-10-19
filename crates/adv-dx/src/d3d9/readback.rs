@@ -423,7 +423,7 @@ pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled:
     {
         if let Some(level) = level {
             if let Some(selected) = r.levels.get_mut(*level as usize) {
-                selected.dirty = true;
+                selected.mark_all();
                 if cancelled {
                     selected.lock = None;
                 } else if let Some(lock) = &mut selected.lock {

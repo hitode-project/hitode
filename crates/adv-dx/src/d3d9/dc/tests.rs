@@ -472,10 +472,18 @@ fn dirty_marks_wait_for_release_dc_continuation_after_a_busy_upload() {
         submissions,
         "live DC lease defers a competing dirty upload"
     );
-    assert!(resources::resource(&env(&mut f.m), texture).unwrap().levels[0].dirty);
+    assert!(
+        resources::resource(&env(&mut f.m), texture).unwrap().levels[0]
+            .dirty
+            .is_some()
+    );
     assert_eq!(f.finish(outcome), 0);
     assert!(f.m.ext.get::<State>().dcs.is_empty());
-    assert!(!resources::resource(&env(&mut f.m), texture).unwrap().levels[0].dirty);
+    assert!(
+        !resources::resource(&env(&mut f.m), texture).unwrap().levels[0]
+            .dirty
+            .is_some()
+    );
     assert_eq!(f.d3d("IDirect3DSurface9::Release", &[surface]), 1);
     assert_eq!(f.d3d("IDirect3DTexture9::Release", &[texture]), 0);
     assert_eq!(f.m.ext.get::<SurfaceStore>().live_surfaces(), 0);

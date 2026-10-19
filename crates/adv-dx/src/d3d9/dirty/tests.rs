@@ -182,7 +182,7 @@ fn system_memory_dirty_metadata_is_shared_and_bad_rectangles_do_not_mark_or_allo
         if let Some(Payload::Resource(r)) = com(&e).get_mut::<Payload>(&mut e.sys.objects, texture)
         {
             for level in &mut r.levels {
-                level.dirty = false;
+                level.dirty = None;
             }
         }
         assert!(matches!(
@@ -194,7 +194,7 @@ fn system_memory_dirty_metadata_is_shared_and_bad_rectangles_do_not_mark_or_allo
                 .unwrap()
                 .levels
                 .iter()
-                .all(|level| !level.dirty)
+                .all(|level| level.dirty.is_none())
         );
     }
     for (this, rect) in [(texture, 1), (texture, 0x551000), (device, 0), (0, 0)] {
@@ -211,7 +211,7 @@ fn system_memory_dirty_metadata_is_shared_and_bad_rectangles_do_not_mark_or_allo
             .unwrap()
             .levels
             .iter()
-            .all(|level| level.dirty)
+            .all(|level| level.dirty.is_some())
     );
     assert!(
         resources::resource(&env(&mut m), texture).unwrap().levels[0]
@@ -289,7 +289,7 @@ fn managed_no_dirty_lock_defers_explicit_updates_until_unlock_and_no_mark_keeps_
             .unwrap()
             .levels
             .iter()
-            .all(|level| !level.dirty && level.lock.is_none())
+            .all(|level| level.dirty.is_none() && level.lock.is_none())
     );
 
     let locked = lock(&mut m, texture, 0, 0, 0x8000);
@@ -344,7 +344,11 @@ fn mip_dirty_expansion_waits_for_last_lock_and_failed_storage_read_can_be_retrie
         unlock(&mut m, texture, 0),
         Outcome::Return(INVALID)
     ));
-    assert!(resources::resource(&env(&mut m), texture).unwrap().levels[0].dirty);
+    assert!(
+        resources::resource(&env(&mut m), texture).unwrap().levels[0]
+            .dirty
+            .is_some()
+    );
     m.cpu.protect(page, 4096, Prot::RW).unwrap();
     okay(unlock(&mut m, texture, 0));
     assert!(
@@ -352,8 +356,47 @@ fn mip_dirty_expansion_waits_for_last_lock_and_failed_storage_read_can_be_retrie
             .unwrap()
             .levels
             .iter()
-            .all(|level| !level.dirty && level.lock.is_none())
+            .all(|level| level.dirty.is_none() && level.lock.is_none())
     );
+    assert_eq!(release(&mut env(&mut m), texture), 0);
+}
+
+#[test]
+fn partial_locks_upload_only_their_rectangle_and_scale_to_sublevels() {
+    let (mut m, device) = machine(true);
+    let texture = texture(&mut m, device, 3, 1);
+    let target = image(&mut m, texture, 0);
+    let locked = lock(&mut m, texture, 0, 0, 0);
+    m.cpu.write(locked.pBits, &[0x11; 64]).unwrap();
+    okay(unlock(&mut m, texture, 0));
+    okay(unlock(&mut m, texture, 1));
+    okay(unlock(&mut m, texture, 2));
+    // Bytes outside the locked rectangle change too, but only the rectangle
+    // is marked, so the GPU keeps the earlier texels around it.
+    let storage = resources::resource(&env(&mut m), texture).unwrap().storage;
+    m.cpu.write(storage, &[0x55; 64]).unwrap();
+    let rect = packet(
+        &mut m,
+        RECT {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 2,
+        },
+    );
+    lock(&mut m, texture, 0, rect, 0);
+    {
+        let e = env(&mut m);
+        let levels = &resources::resource(&e, texture).unwrap().levels;
+        let rect = |x, y, w, h| Some(Rect { x, y, w, h });
+        assert_eq!(levels[0].dirty, rect(1, 1, 2, 1));
+        assert_eq!(levels[1].dirty, rect(0, 0, 2, 1));
+        assert_eq!(levels[2].dirty, rect(0, 0, 1, 1));
+    }
+    okay(unlock(&mut m, texture, 0));
+    let mut expected = [0x11; 64];
+    expected[(4 + 1) * 4..(4 + 3) * 4].fill(0x55);
+    assert_eq!(pixels(&mut m, &target), expected);
     assert_eq!(release(&mut env(&mut m), texture), 0);
 }
 
@@ -378,12 +421,20 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
         panic!("paused GPU must wait");
     };
     okay(add_rect(&mut m, texture, 0)); // Must survive the older pending upload.
-    assert!(resources::resource(&env(&mut m), texture).unwrap().levels[0].dirty);
+    assert!(
+        resources::resource(&env(&mut m), texture).unwrap().levels[0]
+            .dirty
+            .is_some()
+    );
     drop(pause);
     assert!(super::super::pump(&mut m).unwrap());
     okay(then(&mut env(&mut m), Resume::Woke(WakeReason::Signaled)));
     assert_eq!(pixels(&mut m, &target), [0x66; 64]);
-    assert!(!resources::resource(&env(&mut m), texture).unwrap().levels[0].dirty);
+    assert!(
+        resources::resource(&env(&mut m), texture).unwrap().levels[0]
+            .dirty
+            .is_none()
+    );
     assert!(m.ext.get::<State>().pending.is_empty());
     let objects = m.sys.objects.object_count();
     super::super::tests::force_recording_limit(&mut env(&mut m), device);
@@ -404,7 +455,7 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     {
         let e = env(&mut m);
         let r = resources::resource(&e, texture).unwrap();
-        assert!(r.levels[0].dirty);
+        assert!(r.levels[0].dirty.is_some());
         assert!(r.levels[0].lock.is_none());
     }
     assert_eq!(m.sys.objects.object_count(), objects);
