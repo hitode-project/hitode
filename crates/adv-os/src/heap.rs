@@ -4,6 +4,8 @@
 //! validate headers against registered slabs; corruption is an invalid pointer, never
 //! a panic. Other allocations use host metadata and coalescing arena free ranges.
 //! Blocks are 8-byte aligned; large blocks own freshly zeroed VM regions.
+//! Arena blocks up to the Windows LFH limit start zeroed: native buckets reuse
+//! only blocks of one size, so another size's stale bytes never reach them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +20,7 @@ mod small;
 const ALIGN: u32 = 8;
 const ARENA: u32 = 0x10_0000;
 const LARGE: u32 = 0x8_0000;
+const LFH_LIMIT: u32 = 0x4000;
 
 fn round(size: u32) -> Option<u32> {
     size.max(1)
@@ -275,7 +278,8 @@ impl Heaps {
             }
         };
         h.used.insert(addr, (rsize, size));
-        if zero && !freshly_mapped && zero_memory(cpu, addr, rsize).is_err() {
+        if (zero || rsize <= LFH_LIMIT) && !freshly_mapped && zero_memory(cpu, addr, rsize).is_err()
+        {
             self.free(cpu, vm, handle, addr);
             return None;
         }
@@ -522,6 +526,29 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0),
             "large allocations must retain fresh committed-page contents"
+        );
+    }
+
+    #[test]
+    // spec: WIN32-OBJECT-4
+    fn arena_block_of_another_size_does_not_expose_freed_bytes() {
+        let (mut guest, mut vm, mut heaps) = heap();
+        let (old, new) = (0x68c, 0x20c);
+        let block = heaps.alloc(&mut guest, &mut vm, 0, old, false).unwrap();
+        guest.write(block, &vec![0xa5; old as usize]).unwrap();
+        assert!(heaps.free(&mut guest, &mut vm, 0, block));
+        let next = heaps.alloc(&mut guest, &mut vm, 0, new, false).unwrap();
+        assert!(
+            next >= block && next < block + old,
+            "test needs the freed range"
+        );
+        assert!(
+            guest
+                .bytes(next, new as usize)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0),
+            "LFH-sized blocks must not inherit another size's freed bytes"
         );
     }
 

@@ -226,3 +226,37 @@ fn canonical_crt_instances_keep_independent_tables_while_ucrt_apisets_share_one(
     assert!(reg.dynamic_available(RUNTIME, "_crt_atexit"));
     assert!(!reg.dynamic_available("ucrtbase.dll", "_onexit"));
 }
+
+fn invalid_parameter_noinfo<B: Backend>(cpu: B, module: &str, handler: bool) {
+    let mut machine = machine(cpu);
+    let report = machine
+        .resolve_import(module, "_invalid_parameter_noinfo")
+        .unwrap();
+    callback(&mut machine, FIRST, 1);
+    let mut code = Asm::new(CODE);
+    if handler {
+        let setter = machine
+            .resolve_import(module, "_set_invalid_parameter_handler")
+            .unwrap();
+        code.push_imm(FIRST).call(setter).add_esp(4);
+    }
+    code.call(report);
+    append_digit(&mut code, 2);
+    run(&mut machine, code, if handler { 0 } else { 0xc000_0417 });
+    assert_eq!(
+        machine.cpu.read_u32(DATA).unwrap(),
+        if handler { 12 } else { 0 },
+        "{module} handler={handler}"
+    );
+}
+#[test]
+fn invalid_parameter_noinfo_returns_through_handler_or_ends_process() {
+    for module in ["msvcr80.dll", "msvcr90.dll"] {
+        for handler in [false, true] {
+            for jit in [false, true] {
+                invalid_parameter_noinfo(JitCpu::new(PARK_ADDR, jit).unwrap(), module, handler);
+            }
+            invalid_parameter_noinfo(UnicornCpu::new(PARK_ADDR).unwrap(), module, handler);
+        }
+    }
+}
