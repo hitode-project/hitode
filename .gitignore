@@ -6,6 +6,8 @@ __pycache__/
 *.trace
 *.png
 *.bmp
+# documentation screenshots, checked for personal data before committing
+!docs/images/**/*.png
 # local privacy-scan terms (tools/privacy/scan.py)
 /.privacy-terms
 /dist

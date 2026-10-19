@@ -33,6 +33,7 @@ ALLOWED = {
     "docs/glossary.md",
     "docs/investigation.md",
     "docs/ios.md",
+    "docs/ios.zh-CN.md",
     "docs/maintaining.md",
     "tools/abi/README.md",
     "tools/android/README.md",

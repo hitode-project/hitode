@@ -33,4 +33,4 @@ This file routes AI coding agents. It holds only what applies to every task; eve
 
 ## Language
 
-Talk with your person in their language. Docs, code comments and commit messages are English; only `README.zh-CN.md` is not.
+Talk with your person in their language. Docs, code comments and commit messages are English; only `README.zh-CN.md` and the iOS guide `docs/ios.zh-CN.md` are not.
