@@ -239,7 +239,6 @@ export const messages: Record<string, [string, string]> = {
   "开发者镜像：检查中…": ["Developer disk image: checking…", "開発者ディスクイメージ：確認中…"],
   "连不上 LocalDevVPN，请确认它已开启并显示已连接": ["Cannot reach LocalDevVPN; make sure it is on and connected", "LocalDevVPN に接続できません。オンになっていて接続済みか確認してください"],
   "强烈建议启用 JIT。未启用时游戏以解释模式运行，速度会慢很多。": ["JIT is strongly recommended. Without it, games run interpreted and much slower.", "JIT の有効化を強くおすすめします。無効だとゲームはインタプリタで動作し、かなり遅くなります。"],
-  "在“隐私与安全性”中打开开发者模式": ["Turn on Developer Mode in Privacy & Security", "「プライバシーとセキュリティ」でデベロッパモードをオンにする"],
   "更换": ["Replace", "置き換える"],
   "导入": ["Import", "インポート"],
   "下载": ["Download", "ダウンロード"],

@@ -31,7 +31,7 @@ A game started before the pool is ready stays on Tier 0 for its whole run. So by
 **Applies to**: iOS
 **Verification**: Review — signed entitlement queries require a sideloaded device, including the host process inside LiveContainer.
 
-The check uses Security's `SecTaskCopyValueForEntitlement` for the current process rather than inferring capability from certificate names or embedded profiles. Pairing files remain ordinary app data; possessing one does not grant debugging permission.
+The check uses Security's `SecTaskCopyValueForEntitlement` for the current process rather than inferring capability from certificate names or embedded profiles. Pairing files remain ordinary app data; possessing one does not grant debugging permission. Settings lists no Developer Mode step: iOS launches development-signed apps only with Developer Mode on, so a host that passes this check already has it.
 
 ### IOS-MEM-1 Compact window
 

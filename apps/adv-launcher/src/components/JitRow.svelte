@@ -32,17 +32,13 @@
         <p class="advice">{t("在 LiveContainer 中请先打开“使用 LiveContainer 的 Bundle ID”")}</p>
       {:else}
         <ol class="steps">
-          <li>
-            <span class="mark" aria-hidden="true">1</span>
-            <span class="what">{t("在“隐私与安全性”中打开开发者模式")}</span>
-          </li>
           <li class:done={status.pairingFile}>
-            <span class="mark" aria-hidden="true">{status.pairingFile ? "✓" : "2"}</span>
+            <span class="mark" aria-hidden="true">{status.pairingFile ? "✓" : "1"}</span>
             <span class="what">{status.pairingFile ? t("配对文件已导入") : t("导入 StikDebug 的配对文件 pairingFile.plist")}</span>
             <button class="link" disabled={jit.busy} onclick={() => jit.importPairing()}>{status.pairingFile ? t("更换") : t("导入")}</button>
           </li>
           <li class:done={status.ddi === true}>
-            <span class="mark" aria-hidden="true">{status.ddi ? "✓" : "3"}</span>
+            <span class="mark" aria-hidden="true">{status.ddi ? "✓" : "2"}</span>
             <span class="what">
               {status.ddi === null
                 ? t("开发者镜像：检查中…")
@@ -55,7 +51,7 @@
             {/if}
           </li>
           <li>
-            <span class="mark" aria-hidden="true">4</span>
+            <span class="mark" aria-hidden="true">3</span>
             <span class="what">{t("打开 LocalDevVPN 并确认已连接")}</span>
           </li>
         </ol>
