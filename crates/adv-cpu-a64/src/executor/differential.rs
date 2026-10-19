@@ -2101,7 +2101,17 @@ fn units_map_host_code_to_instructions_and_parts() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let (base, marks) = units_of(CODE).pop().expect("the unit was recorded");
+    // Parallel tests record their own units for CODE in the shared map.
+    let base = executor
+        .native
+        .as_ref()
+        .unwrap()
+        .unit_address(CODE)
+        .unwrap();
+    let (base, marks) = units_of(CODE)
+        .into_iter()
+        .rfind(|&(unit, _)| unit == base)
+        .expect("the unit was recorded");
     let parts: Vec<_> = marks.iter().map(|mark| mark.part).collect();
     for part in [
         Part::Body,
