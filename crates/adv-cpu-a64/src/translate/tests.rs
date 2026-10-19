@@ -792,3 +792,40 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
         }
     }
 }
+
+// spec: A64-FLAG-5
+#[test]
+fn narrow_immediate_moves_keep_their_value_when_pf_and_af_materialize() {
+    // The register a lazy PF/AF recipe reads is overwritten by a narrow
+    // immediate move, so the recipe materializes first; that must not
+    // replace the moved value with the recipe's immediate.
+    let mut h = Harness::new();
+    let regs = [eax, ecx, edx, ebx, esp, ebp, esi, edi];
+    let bytes8 = [al, cl, dl, iced_x86::code_asm::bl, ah, ch, dh, bh];
+    let words = [ax, cx, dx, bx, sp, bp, si, di];
+    for part in 0..16 {
+        for recipe in 0..3 {
+            let base = if part < 8 { part % 4 } else { part - 8 };
+            let code = bytes(|a| {
+                let reg = regs[base];
+                match recipe {
+                    0 => a.cmp(reg, 0x50).unwrap(),
+                    1 => a.add(reg, 0x5a).unwrap(),
+                    _ => a.sub(reg, 0x12345).unwrap(),
+                }
+                if part < 8 {
+                    a.mov(bytes8[part], 0x90).unwrap();
+                } else {
+                    a.mov(words[part - 8], 0x9091).unwrap();
+                }
+            });
+            let state = initial();
+            let want = reference(&code, &[], &state);
+            for flagm in [false, true] {
+                let (got, exit, _) = h.run(&code, &[], &state, flagm);
+                assert_eq!(exit, Exit::Dispatch);
+                assert_eq!(got, want, "part={part}, recipe={recipe}, flagm={flagm}");
+            }
+        }
+    }
+}
