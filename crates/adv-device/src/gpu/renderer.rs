@@ -33,7 +33,9 @@ static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
 /// The software adapter (WARP on Windows) has crashed the whole process when
 /// several of its devices render concurrently, so a process runs one software
 /// device at a time. One thread may hold several, as a fixture comparing two
-/// devices does; others wait. Hardware devices are not affected.
+/// devices does; others wait. Hardware devices are not affected, except in
+/// this crate's Apple unit tests: each device maps a 64 MiB native ring, and
+/// parallel tests exhausted the small virtual GPU of CI runners.
 struct SoftwareTurn;
 static SOFTWARE: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)> =
     std::sync::Mutex::new((None, 0));
@@ -516,7 +518,8 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         fallback: bool,
     ) -> Result<Self, Error> {
-        let software = fallback.then(|| Arc::new(SoftwareTurn::take()));
+        let software = (fallback || cfg!(all(test, target_vendor = "apple")))
+            .then(|| Arc::new(SoftwareTurn::take()));
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
