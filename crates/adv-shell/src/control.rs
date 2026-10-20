@@ -21,6 +21,7 @@ pub enum Command {
     KeyDown(u32),
     KeyUp(u32),
     Text(String),
+    Activate(bool),
     Menus,
     Menu(u32),
     Dialogs,
@@ -51,6 +52,7 @@ impl Command {
                 | Self::KeyDown(_)
                 | Self::KeyUp(_)
                 | Self::Text(_)
+                | Self::Activate(_)
                 | Self::Menu(_)
                 | Self::Dialog(_)
                 | Self::DialogTrack(..)
@@ -110,6 +112,11 @@ impl Command {
                 })
             }
             "text" if !rest.is_empty() => Ok(Self::Text(rest.to_owned())),
+            "activate" => match rest {
+                "0" => Ok(Self::Activate(false)),
+                "1" => Ok(Self::Activate(true)),
+                _ => Err("activate requires 0 or 1".into()),
+            },
             "memory" => {
                 let mut fields = rest.split_whitespace();
                 let address = fields.next().ok_or("memory requires ADDRESS LENGTH")?;
@@ -144,7 +151,7 @@ impl Command {
             "await-frame" => Ok(Self::AwaitFrame(FrameGateSpec::parse(rest)?)),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click/move X Y, key/key-down/key-up VK, text STRING, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
+                "expected click/move X Y, key/key-down/key-up VK, text STRING, activate 0|1, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
                     .into(),
             ),
         }
@@ -774,6 +781,9 @@ mod tests {
         );
         assert!(Command::parse("text").is_err());
         assert!(Command::Text("a".into()).interrupts_guest());
+        assert_eq!(Command::parse("activate 0"), Ok(Command::Activate(false)));
+        assert_eq!(Command::parse("activate 1"), Ok(Command::Activate(true)));
+        assert!(Command::parse("activate").is_err());
         assert_eq!(Command::parse("menus"), Ok(Command::Menus));
         assert_eq!(Command::parse("menu 100"), Ok(Command::Menu(100)));
         assert_eq!(Command::parse("dialogs"), Ok(Command::Dialogs));
