@@ -1,7 +1,10 @@
 """Tests for tools/check.py against a throwaway repository."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -52,6 +55,21 @@ class StagedFormatting(unittest.TestCase):
         self.stage("crates/c/src/lib.rs", "pub struct C;\n")
         self.assertEqual(check.staged_rust(), ["crates/c/src/lib.rs"])
 
+    def test_notes_code_committed_on_the_default_branch_only(self) -> None:
+        subprocess.run(["git", "-C", str(self.root), "checkout", "-q", "-b", "master"], check=True)
+        self.stage("docs/a.md", "text\n")
+        self.assertEqual(self.note(), "")
+        self.stage("crates/c/src/lib.rs", "pub struct C;\n")
+        self.assertIn("committing code on master", self.note())
+        subprocess.run(["git", "-C", str(self.root), "checkout", "-q", "-b", "fix/topic"], check=True)
+        self.assertEqual(self.note(), "")
+
+    def note(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            check.master_note()
+        return out.getvalue()
+
 
 
 class LauncherGate(unittest.TestCase):
@@ -60,6 +78,27 @@ class LauncherGate(unittest.TestCase):
         self.assertTrue(check.touches_launcher(["apps/adv-launcher/src-tauri/src/lib.rs"]))
         self.assertFalse(check.touches_launcher(["apps/adv-run/src/main.rs", "apps/adv-launcher-old/x"]))
         self.assertFalse(check.touches_launcher([]))
+
+
+class CodePaths(unittest.TestCase):
+    def test_documentation_alone_is_not_code(self) -> None:
+        names = ["docs/a.md", "README.md", "crates/a/src/lib.rs", "Cargo.lock", ".github/workflows/x.yml",
+                 "tools/check.py", "docs/images/a.png"]
+        self.assertEqual(check.code_paths(names),
+                         ["crates/a/src/lib.rs", "Cargo.lock", ".github/workflows/x.yml", "tools/check.py"])
+
+
+class CargoEnvironment(unittest.TestCase):
+    def test_keeps_variables_that_are_already_set(self) -> None:
+        saved = dict(os.environ)
+        try:
+            os.environ["FFMPEG_DIR"] = "/set/ffmpeg"
+            os.environ["LIBCLANG_PATH"] = "/set/clang"
+            env = check.cargo_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual((env["FFMPEG_DIR"], env["LIBCLANG_PATH"]), ("/set/ffmpeg", "/set/clang"))
 
 
 if __name__ == "__main__":
