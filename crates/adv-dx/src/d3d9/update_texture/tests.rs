@@ -587,6 +587,7 @@ fn partial_dirty_marks_copy_matching_tail_mips_and_no_dirty_lock_stays_clean() {
 }
 
 #[test]
+// spec: GFX-REC-10
 fn updated_render_target_texture_is_visible_to_get_render_target_data() {
     use std::{
         sync::Arc,
@@ -628,17 +629,23 @@ fn updated_render_target_texture_is_visible_to_get_render_target_data() {
         0
     );
     let staging = f.m.cpu.read_u32(output).unwrap();
-    let outcome = f.call(
-        "IDirect3DDevice9::GetRenderTargetData",
-        &[f.device, surface, staging],
-    );
+    // A plain destination returns at once; its first CPU lock settles the copy.
+    assert!(matches!(
+        f.call(
+            "IDirect3DDevice9::GetRenderTargetData",
+            &[f.device, surface, staging],
+        ),
+        Outcome::Return(0)
+    ));
+    let locked = f.packet(D3DLOCKED_RECT::default());
+    let outcome = f.call("IDirect3DSurface9::LockRect", &[staging, locked, 0, 0x10]);
     let Outcome::Block {
         wait: Wait::Object { handle, .. },
         then,
         ..
     } = outcome
     else {
-        panic!("expected readback continuation")
+        panic!("expected the lock to settle the readback")
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -652,15 +659,11 @@ fn updated_render_target_texture_is_visible_to_get_render_target_data() {
         assert!(Instant::now() < deadline, "bounded readback wait");
         wake.wait(Some(Duration::from_millis(10))).unwrap();
     }
+    assert!(f.m.ext.get::<State>().transfers.is_empty());
     assert!(matches!(
         then(&mut env(&mut f.m), Resume::Woke(WakeReason::Signaled)),
         Outcome::Return(0)
     ));
-    let locked = f.packet(D3DLOCKED_RECT::default());
-    assert_eq!(
-        f.invoke("IDirect3DSurface9::LockRect", &[staging, locked, 0, 0x10]),
-        0
-    );
     let locked: D3DLOCKED_RECT = GuestPtr::new(locked).read(&f.m.cpu).unwrap();
     let mut pixels = vec![0; 8 * 4 * 4];
     f.m.cpu.read(locked.pBits, &mut pixels).unwrap();

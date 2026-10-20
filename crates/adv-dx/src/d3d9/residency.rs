@@ -118,7 +118,9 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
             "managed eviction with recorded/captured state blocks is unavailable",
         );
     }
-    if !env.ext.get::<State>().pending.is_empty() || !env.ext.get::<State>().transfers.is_empty() {
+    let state = env.ext.get::<State>();
+    // A detached readback's copy is already queued from a render target.
+    if !state.pending.is_empty() || state.transfers.iter().any(|t| !t.detached()) {
         return unavailable(
             env,
             "pending GPU command or readback prevents managed eviction",
