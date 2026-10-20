@@ -6,6 +6,7 @@
 use adv_abi::{GuestCode, Registry};
 mod heap;
 mod interlocked;
+mod memory;
 
 /// Attach after every handler is registered: re-registering a handler drops it.
 pub(crate) fn install(reg: &mut Registry) {
@@ -68,6 +69,37 @@ pub(crate) fn install(reg: &mut Registry) {
         ),
     ] {
         reg.set_guest(module, name, guest);
+    }
+}
+
+pub(crate) fn install_crt(reg: &mut Registry) {
+    let copies: Vec<_> = reg
+        .registered()
+        .filter_map(|(module, name, _)| {
+            let guest = match name {
+                "memcpy" | "memmove" => &memory::COPY,
+                "memset" => &memory::FILL,
+                "memcpy_s" | "memmove_s" => &memory::SECURE_COPY,
+                _ => return None,
+            };
+            matches!(
+                module,
+                "msvcrt.dll"
+                    | "msvcr80.dll"
+                    | "msvcr90.dll"
+                    | "ucrtbase.dll"
+                    | "vcruntime140.dll"
+                    | "api-ms-win-crt-string-l1-1-0.dll"
+            )
+            .then(|| (module.to_owned(), name.to_owned(), guest))
+        })
+        .collect();
+    for (module, name, guest) in copies {
+        reg.set_guest(&module, &name, guest);
+    }
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        reg.set_guest(module, "??2@YAPAXI@Z", &heap::CRT_ALLOCATE);
+        reg.set_guest(module, "??3@YAXPAX@Z", &heap::CRT_FREE);
     }
 }
 

@@ -338,18 +338,23 @@ fn fault<B: Backend>(cpu: B, moving: bool, args: [u32; 4]) {
     let RunResult::Failed(failure) = machine.run_virtual(1_000_000) else {
         panic!("invalid memory accepted");
     };
-    assert!(
-        failure.message.contains("ABI guest memory fault"),
-        "{}",
-        failure.message
-    );
+    if args[2] != 0 && args[1] >= args[3] {
+        assert!(machine.sys.first_cpu_fault.is_some(), "{}", failure.message);
+    } else {
+        assert!(
+            failure.message.contains("ABI guest memory fault"),
+            "{}",
+            failure.message
+        );
+    }
     assert_eq!(observation(&machine).buffer, [0x77; 16]);
     assert_eq!(machine.cpu.read_u32(CALLS).unwrap(), 0);
     let errno = machine.cpu.read_u32(ERRNO_POINTER).unwrap();
     assert_eq!(machine.cpu.read_u32(errno).unwrap(), 79);
 }
+// spec: WIN32-API-16, EXC-SEH-2
 #[test]
-fn actual_copy_and_error_clear_ranges_enforce_permissions_before_modification() {
+fn copies_deliver_guest_faults_and_error_clear_ranges_are_validated_before_modification() {
     for moving in [false, true] {
         let mut inputs = vec![
             [DATA, 16, 0x500000, 8],

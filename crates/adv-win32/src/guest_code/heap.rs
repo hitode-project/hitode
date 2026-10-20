@@ -367,3 +367,101 @@ pub(super) static FREE: GuestCode = GuestCode {
     host: &[448],
     links: &[],
 };
+
+/// Cdecl adapter around the shared ALLOCATE listing. Its rare-case jump
+/// restores the original CRT frame and enters the original CRT host handler.
+/// ```text
+///     push dword [esp+4]
+///     push byte 0
+///     mov eax, [fs:0x30]
+///     mov eax, [eax+0x18]
+///     push eax
+///     call allocate
+///     ret
+/// fallback:
+///     add esp, 16
+///     jmp near host_implementation
+/// allocate:
+///     ; shared ALLOCATE listing, with its host jump targeting fallback
+/// ```
+pub(super) static CRT_ALLOCATE: GuestCode = GuestCode {
+    code: &{
+        const PREFIX: &[u8] = &[
+            0xff, 0x74, 0x24, 0x04, 0x6a, 0x00, 0x64, 0xa1, 0x30, 0x00, 0x00, 0x00, 0x8b, 0x40,
+            0x18, 0x50, 0xe8, 0x09, 0x00, 0x00, 0x00, 0xc3, 0x83, 0xc4, 0x10, 0xe9, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let mut code = [0; 30 + ALLOCATE.code.len()];
+        let mut i = 0;
+        while i < PREFIX.len() {
+            code[i] = PREFIX[i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < ALLOCATE.code.len() {
+            code[i + j] = ALLOCATE.code[j];
+            j += 1;
+        }
+        let displacement = (-(8 + ALLOCATE.code.len() as i32)).to_le_bytes();
+        let at = i + ALLOCATE.host[0];
+        let mut k = 0;
+        while k < 4 {
+            code[at + k] = displacement[k];
+            k += 1;
+        }
+        code
+    },
+    host: &[26],
+    links: &[],
+};
+
+/// Cdecl adapter around the shared FREE listing. Its rare-case jump
+/// restores the original CRT frame and enters the original CRT host handler.
+/// ```text
+///     cmp dword [esp+4], 0
+///     jz zero
+///     push dword [esp+4]
+///     push byte 0
+///     mov eax, [fs:0x30]
+///     mov eax, [eax+0x18]
+///     push eax
+///     call free
+/// zero:
+///     xor eax, eax
+///     ret
+/// fallback:
+///     add esp, 16
+///     jmp near host_implementation
+/// free:
+///     ; shared FREE listing, with its host jump targeting fallback
+/// ```
+pub(super) static CRT_FREE: GuestCode = GuestCode {
+    code: &{
+        const PREFIX: &[u8] = &[
+            0x83, 0x7c, 0x24, 0x04, 0x00, 0x74, 0x15, 0xff, 0x74, 0x24, 0x04, 0x6a, 0x00, 0x64,
+            0xa1, 0x30, 0x00, 0x00, 0x00, 0x8b, 0x40, 0x18, 0x50, 0xe8, 0x0b, 0x00, 0x00, 0x00,
+            0x31, 0xc0, 0xc3, 0x83, 0xc4, 0x10, 0xe9, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut code = [0; 39 + FREE.code.len()];
+        let mut i = 0;
+        while i < PREFIX.len() {
+            code[i] = PREFIX[i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < FREE.code.len() {
+            code[i + j] = FREE.code[j];
+            j += 1;
+        }
+        let displacement = (-(8 + FREE.code.len() as i32)).to_le_bytes();
+        let at = i + FREE.host[0];
+        let mut k = 0;
+        while k < 4 {
+            code[at + k] = displacement[k];
+            k += 1;
+        }
+        code
+    },
+    host: &[35],
+    links: &[],
+};

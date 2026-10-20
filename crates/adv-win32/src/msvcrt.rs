@@ -366,6 +366,7 @@ pub fn register(r: &mut Registry) {
         call,
     );
     r.add("msvcrt.dll", "longjmp", Conv::Cdecl { argc: 2 }, call);
+    crate::guest_code::install_crt(r);
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
@@ -716,6 +717,15 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(0);
             }
             return crate::native_heap::realloc(e, a, b);
+        }
+        "memcpy" | "memmove"
+            if !e.cpu.accessible(b, c, adv_cpu::backend::Prot::READ)
+                || !e.cpu.accessible(a, c, adv_cpu::backend::Prot::WRITE) =>
+        {
+            return memory_ops::guest_fault(e);
+        }
+        "memset" if !e.cpu.accessible(a, c, adv_cpu::backend::Prot::WRITE) => {
+            return memory_ops::guest_fault(e);
         }
         "memcpy" | "memmove" => match memory_ops::copy(e, a, b, c) {
             Ok(pointer) => pointer,

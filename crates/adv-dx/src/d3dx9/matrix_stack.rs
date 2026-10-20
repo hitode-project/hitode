@@ -51,9 +51,52 @@ pub(super) fn register(registry: &mut Registry) {
         translate_local_ABI,
         top_ABI,
     ] {
-        registry.register(api);
+        registry.register(if api.env_leaf.is_some() {
+            adv_abi::Api {
+                env_leaf: Some(stack_leaf),
+                ..api
+            }
+        } else {
+            api
+        });
     }
 }
+fn stack_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let thunk = env.sys.thunks.get(env.thunk);
+    let name = thunk.name.as_str();
+    let binding = thunk.f;
+    let mut arguments = adv_abi::Arguments::new(env.cpu);
+    let this: u32 = arguments.next().ok()?;
+    match name {
+        "ID3DXMatrixStack::QueryInterface" => {
+            let iid: GuestPtr<Iid> = arguments.next().ok()?;
+            let output: GuestPtr<u32> = arguments.next().ok()?;
+            iid.read(env.cpu).ok()?;
+            check_range(env.cpu, output.addr(), 4, Prot::WRITE).ok()?;
+        }
+        "ID3DXMatrixStack::AddRef" | "ID3DXMatrixStack::GetTop" => (),
+        _ => {
+            if name.ends_with("Matrix") || name.ends_with("MatrixLocal") {
+                let input: GuestPtr<Matrix> = arguments.next().ok()?;
+                input.read(env.cpu).ok()?;
+            } else if name.contains("RotateAxis") {
+                let input: GuestPtr<Vector> = arguments.next().ok()?;
+                input.read(env.cpu).ok()?;
+            }
+            if let Some(top) = top_address(env, this) {
+                check_range(env.cpu, top, 64, Prot::WRITE).ok()?;
+                if !name.ends_with("LoadIdentity") && !name.ends_with("LoadMatrix") {
+                    GuestPtr::<Matrix>::new(top).read(env.cpu).ok()?;
+                }
+            }
+        }
+    }
+    let adv_machine::Outcome::Return(result) = (binding.handler)(env) else {
+        return None;
+    };
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(result))
+}
+
 fn warning(env: &mut Env<'_>, reason: &str) {
     let thunk = env.sys.thunks.get(env.thunk);
     let name = format!("{}!{}", thunk.module, thunk.name);
@@ -233,7 +276,7 @@ fn create(env: &mut Env<'_>, flags: u32, output: GuestPtr<u32>) -> u32 {
     OK
 }
 
-#[win32(d3dx9_43, name="ID3DXMatrixStack::QueryInterface", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::QueryInterface", level=implement, leaf)]
 fn query(env: &mut Env<'_>, this: GuestPtr<()>, iid: GuestPtr<Iid>, output: GuestPtr<u32>) -> u32 {
     if check_range(env.cpu, output.addr(), 4, Prot::WRITE).is_err() {
         return POINTER;
@@ -266,7 +309,7 @@ fn query(env: &mut Env<'_>, this: GuestPtr<()>, iid: GuestPtr<Iid>, output: Gues
         Err(QueryError::InvalidObject) => POINTER,
     }
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::AddRef", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::AddRef", level=implement, leaf)]
 fn add_ref(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     com(env)
         .and_then(|com| com.add_ref::<Stack>(&mut env.sys.objects, this.addr()))
@@ -333,30 +376,30 @@ fn push(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         .push(pointer);
     OK
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::LoadIdentity", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::LoadIdentity", level=implement, leaf)]
 fn load_identity(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     put(env, this.addr(), IDENTITY)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::LoadMatrix", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::LoadMatrix", level=implement, leaf)]
 fn load_matrix(env: &mut Env<'_>, this: GuestPtr<()>, matrix: GuestPtr<Matrix>) -> u32 {
     match matrix.read(env.cpu) {
         Ok(value) => put(env, this.addr(), value),
         Err(_) => INVALID,
     }
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::MultMatrix", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::MultMatrix", level=implement, leaf)]
 fn multiply(env: &mut Env<'_>, this: GuestPtr<()>, matrix: GuestPtr<Matrix>) -> u32 {
     from_matrix(env, this.addr(), matrix, false)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::MultMatrixLocal", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::MultMatrixLocal", level=implement, leaf)]
 fn multiply_local(env: &mut Env<'_>, this: GuestPtr<()>, matrix: GuestPtr<Matrix>) -> u32 {
     from_matrix(env, this.addr(), matrix, true)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateAxis", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateAxis", level=implement, leaf)]
 fn rotate_axis(env: &mut Env<'_>, this: GuestPtr<()>, axis: GuestPtr<Vector>, angle: f32) -> u32 {
     rotate_about(env, this.addr(), axis, angle, false)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateAxisLocal", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateAxisLocal", level=implement, leaf)]
 fn rotate_axis_local(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -365,7 +408,7 @@ fn rotate_axis_local(
 ) -> u32 {
     rotate_about(env, this.addr(), axis, angle, true)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateYawPitchRoll", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateYawPitchRoll", level=implement, leaf)]
 fn rotate(env: &mut Env<'_>, this: GuestPtr<()>, yaw: f32, pitch: f32, roll: f32) -> u32 {
     mult(
         env,
@@ -374,7 +417,7 @@ fn rotate(env: &mut Env<'_>, this: GuestPtr<()>, yaw: f32, pitch: f32, roll: f32
         false,
     )
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateYawPitchRollLocal", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::RotateYawPitchRollLocal", level=implement, leaf)]
 fn rotate_local(env: &mut Env<'_>, this: GuestPtr<()>, yaw: f32, pitch: f32, roll: f32) -> u32 {
     mult(
         env,
@@ -383,23 +426,23 @@ fn rotate_local(env: &mut Env<'_>, this: GuestPtr<()>, yaw: f32, pitch: f32, rol
         true,
     )
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::Scale", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::Scale", level=implement, leaf)]
 fn scale(env: &mut Env<'_>, this: GuestPtr<()>, x: f32, y: f32, z: f32) -> u32 {
     mult(env, this.addr(), scaling_value(x, y, z), false)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::ScaleLocal", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::ScaleLocal", level=implement, leaf)]
 fn scale_local(env: &mut Env<'_>, this: GuestPtr<()>, x: f32, y: f32, z: f32) -> u32 {
     mult(env, this.addr(), scaling_value(x, y, z), true)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::Translate", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::Translate", level=implement, leaf)]
 fn translate(env: &mut Env<'_>, this: GuestPtr<()>, x: f32, y: f32, z: f32) -> u32 {
     mult(env, this.addr(), translation_value(x, y, z), false)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::TranslateLocal", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::TranslateLocal", level=implement, leaf)]
 fn translate_local(env: &mut Env<'_>, this: GuestPtr<()>, x: f32, y: f32, z: f32) -> u32 {
     mult(env, this.addr(), translation_value(x, y, z), true)
 }
-#[win32(d3dx9_43, name="ID3DXMatrixStack::GetTop", level=implement)]
+#[win32(d3dx9_43, name="ID3DXMatrixStack::GetTop", level=implement, leaf)]
 fn top(env: &mut Env<'_>, this: GuestPtr<()>) -> GuestPtr<Matrix> {
     GuestPtr::new(top_address(env, this.addr()).unwrap_or(0))
 }

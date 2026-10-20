@@ -116,6 +116,7 @@ fn machine<B: Backend>(cpu: B, guest_code: bool) -> Machine<B> {
 fn machine_with<B: Backend>(cpu: B, guest_code: bool, clock: Clock) -> Machine<B> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
+    adv_win32::msvcrt::register(&mut registry);
     let mut m = Machine::new(cpu, registry, clock).unwrap();
     m.sys.thunks.set_guest_code(&mut m.cpu, guest_code).unwrap();
     m.cpu.map(CODE, 0x1_0000, Prot::RX).unwrap();
@@ -717,4 +718,396 @@ fn interlocked_guest_workers_preserve_all_atomic_updates_and_old_returns() {
     assert_eq!(guest, host);
     assert_eq!(before - after, 1536);
     eprintln!("synthetic atomic workers: non-leaf calls {before} -> {after}");
+}
+
+fn crt_bytes<B: Backend>(cpu: B, guest: bool) -> Vec<u8> {
+    let mut m = machine(cpu, guest);
+    let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
+    adv_win32::msvcrt::register(&mut registry);
+    let mut exports: Vec<_> = registry
+        .registered()
+        .filter(|(_, name, binding)| {
+            binding.guest.is_some()
+                && ["memcpy", "memmove", "memset", "memcpy_s", "memmove_s"].contains(name)
+        })
+        .map(|(module, name, _)| (module.to_owned(), name.to_owned()))
+        .collect();
+    exports.sort();
+    assert_eq!(exports.len(), 22);
+    let mut targets = Vec::new();
+    for (module, name) in &exports {
+        targets.push(m.resolve_import(module, name).unwrap());
+    }
+    let errno = m.resolve_import("msvcr90.dll", "_errno").unwrap();
+    let set_invalid = m
+        .resolve_import("msvcr90.dll", "_set_invalid_parameter_handler")
+        .unwrap();
+    // A returning invalid-parameter handler permits secure error comparisons.
+    m.cpu.write(CODE + 0xf000, &[0xc3]).unwrap();
+    let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let saved = run_loop(&mut m, |a| {
+        a.push_imm(0x12345678).call(set_error);
+        a.push_imm(CODE + 0xf000).call(set_invalid);
+        a.bytes.extend_from_slice(&[0x83, 0xc4, 4]);
+        a.call(errno)
+            .bytes
+            .extend_from_slice(&[0xc7, 0x00, 0x45, 0x23, 0, 0]);
+        for (i, ((_, name), &target)) in exports.iter().zip(&targets).enumerate() {
+            let base = DATA + 0x1000 + i as u32 * 0x100;
+            // Restore an asymmetric source on every iteration.
+            for (j, value) in [0x03020100u32, 0x07060504, 0x0b0a0908, 0x0f0e0d0c]
+                .into_iter()
+                .enumerate()
+            {
+                raw(a, &[0xc7, 0x05], base + j as u32 * 4);
+                a.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let cases = if name.ends_with("_s") {
+                vec![
+                    vec![base + 32, 31, base, 15],
+                    vec![base + 2, 16, base, 11],
+                    vec![base, 16, base + 2, 11],
+                    vec![0, 0, 0, 0],
+                ]
+            } else if name == "memset" {
+                vec![vec![base + 32, 0x1234ab, 15], vec![0, 0, 0]]
+            } else {
+                vec![
+                    vec![base + 32, base, 15],
+                    vec![base + 2, base, 11],
+                    vec![base, base + 2, 11],
+                    vec![0, 0, 0],
+                ]
+            };
+            for (j, args) in cases.into_iter().enumerate() {
+                for arg in args.iter().rev() {
+                    a.push_imm(*arg);
+                }
+                a.call(target).mov_mem_eax(base + 64 + j as u32 * 4);
+                a.bytes
+                    .extend_from_slice(&[0x83, 0xc4, (args.len() * 4) as u8]);
+            }
+        }
+        // Error cases enter the VC90 handler, preserving its zeroing and errno.
+        for (j, name) in ["memcpy_s", "memmove_s"].into_iter().enumerate() {
+            let target = targets[exports
+                .iter()
+                .position(|(module, n)| module == "msvcr90.dll" && n == name)
+                .unwrap()];
+            for (k, (capacity, source, count)) in
+                [(3, DATA + 0x1000, 5), (8, 0, 5)].into_iter().enumerate()
+            {
+                for arg in [count, source, capacity, DATA + 0x3000] {
+                    a.push_imm(arg);
+                }
+                a.call(target)
+                    .mov_mem_eax(DATA + 0x3100 + (j * 16 + k * 8) as u32);
+                a.bytes.extend_from_slice(&[0x83, 0xc4, 16]);
+                a.call(errno).bytes.extend_from_slice(&[0x8b, 0x00]);
+                a.mov_mem_eax(DATA + 0x3104 + (j * 16 + k * 8) as u32);
+            }
+        }
+        a.call(get_error).mov_mem_eax(DATA + 0x3200);
+    });
+    assert_eq!(&saved[..4], &SENTINELS);
+    assert_eq!(saved[4], 0);
+    let mut bytes = vec![0; 0x2300];
+    m.cpu.read(DATA + 0x1000, &mut bytes).unwrap();
+    bytes
+}
+
+// spec: WIN32-API-16
+#[test]
+fn crt_guest_copies_and_fills_match_host_memory_returns_overlap_and_secure_errors() {
+    let host = crt_bytes(JitCpu::new(PARK_ADDR, false).unwrap(), false);
+    assert_eq!(
+        crt_bytes(JitCpu::new(PARK_ADDR, false).unwrap(), true),
+        host
+    );
+    assert_eq!(crt_bytes(JitCpu::new(PARK_ADDR, true).unwrap(), true), host);
+    assert_eq!(crt_bytes(UnicornCpu::new(PARK_ADDR).unwrap(), true), host);
+}
+
+fn crt_heap<B: Backend>(cpu: B, guest: bool) -> Vec<u8> {
+    let mut m = machine(cpu, guest);
+    m.sys.stats.enabled = true;
+    let mut targets = Vec::new();
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        targets.push((
+            m.resolve_import(module, "??2@YAPAXI@Z").unwrap(),
+            m.resolve_import(module, "??3@YAXPAX@Z").unwrap(),
+            m.resolve_import(module, "_errno").unwrap(),
+        ));
+    }
+    let last_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let saved = run_loop(&mut m, |a| {
+        a.push_imm(0x12345678).call(set_error);
+        for (i, &(new, delete, errno)) in targets.iter().enumerate() {
+            a.call(errno)
+                .bytes
+                .extend_from_slice(&[0xc7, 0x00, 79, 0, 0, 0]);
+            for (j, size) in [0, 8, 15, 511, 1024].into_iter().enumerate() {
+                a.push_imm(size).call(new);
+                a.bytes.extend_from_slice(&[0x83, 0xc4, 4]);
+                a.mov_mem_eax(RESULTS + (i * 32 + j * 4) as u32);
+                a.bytes.push(0x50);
+                a.call(delete);
+                a.bytes.extend_from_slice(&[0x83, 0xc4, 4]);
+                a.mov_mem_eax(RESULTS + 128 + (i * 32 + j * 4) as u32);
+            }
+            a.push_imm(0).call(delete);
+            a.bytes.extend_from_slice(&[0x83, 0xc4, 4]);
+            a.call(errno).bytes.extend_from_slice(&[0x8b, 0x00]);
+            a.mov_mem_eax(RESULTS + 272 + i as u32 * 4);
+        }
+        a.call(last_error).mov_mem_eax(RESULTS + 256);
+    });
+    assert_eq!(&saved[..4], &SENTINELS);
+    assert_eq!(saved[4], 0);
+    if guest {
+        for &(new, delete, _) in &targets {
+            for target in [new, delete] {
+                let index =
+                    (target - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+                let [entries, fallback, _] = m.sys.thunks.guest_counts(&m.cpu, index);
+                assert!(
+                    entries > fallback,
+                    "heap listing never completed a call: {entries}/{fallback}"
+                );
+                assert!(fallback > 0, "heap rare-case path was not exercised");
+            }
+        }
+    }
+    let mut bytes = vec![0; 284];
+    m.cpu.read(RESULTS, &mut bytes).unwrap();
+    bytes
+}
+
+// spec: WIN32-API-16
+#[test]
+fn scalar_cpp_guest_heap_matches_host_allocation_free_null_and_large_cases() {
+    let host = crt_heap(JitCpu::new(PARK_ADDR, false).unwrap(), false);
+    assert_eq!(crt_heap(JitCpu::new(PARK_ADDR, false).unwrap(), true), host);
+    assert_eq!(crt_heap(JitCpu::new(PARK_ADDR, true).unwrap(), true), host);
+    assert_eq!(crt_heap(UnicornCpu::new(PARK_ADDR).unwrap(), true), host);
+}
+
+fn query_call(
+    m: &mut Machine<JitCpu>,
+    module: &str,
+    name: &str,
+    args: &[u32],
+    leaf: bool,
+) -> (u32, bool) {
+    use adv_cpu::backend::Reg;
+    use adv_machine::{Env, Outcome};
+    let entry = m.resolve_import(module, name).unwrap();
+    let thunk = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+    let binding = m.sys.thunks.get(thunk).f;
+    m.cpu.set_reg(Reg::Esp, DATA + 512);
+    for (i, arg) in args.iter().enumerate() {
+        m.cpu.write_u32(DATA + 516 + i as u32 * 4, *arg).unwrap();
+    }
+    let mut before = vec![0; 4096];
+    m.cpu.read(DATA, &mut before).unwrap();
+    let mut env = Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk,
+    };
+    if leaf {
+        if let Some(value) = binding.env_leaf.unwrap()(&mut env) {
+            return (value as u32, false);
+        }
+        let mut after = vec![0; 4096];
+        env.cpu.read(DATA, &mut after).unwrap();
+        assert_eq!(before, after, "decline wrote guest memory");
+    }
+    let Outcome::Return(value) = (binding.handler)(&mut env) else {
+        panic!("synchronous query")
+    };
+    (value, leaf)
+}
+
+// spec: WIN32-API-15, A64-CTL-12
+#[test]
+fn errno_leaves_decline_unallocated_cells_then_preserve_module_and_thread_ownership() {
+    let mut outcomes = Vec::new();
+    for leaf in [true, false] {
+        let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), true);
+        let mut addresses = Vec::new();
+        for thread in 0..2 {
+            m.sys.current = m.spawn("errno owner", PARK_ADDR, &[], 65536).unwrap();
+            let error = m.sys.context(m.sys.current).teb + adv_machine::layout::teb::LAST_ERROR;
+            m.cpu.write_u32(error, 0x12345678).unwrap();
+            for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll", "ucrtbase.dll"] {
+                let (address, declined) = query_call(&mut m, module, "_errno", &[], leaf);
+                assert_eq!(declined, leaf);
+                assert!(!addresses.contains(&address));
+                addresses.push(address);
+                m.cpu.write_u32(address, 79 + thread).unwrap();
+                assert_eq!(
+                    query_call(&mut m, module, "_errno", &[], leaf),
+                    (address, false)
+                );
+                assert_eq!(m.cpu.read_u32(address).unwrap(), 79 + thread);
+                assert_eq!(m.cpu.read_u32(error).unwrap(), 0x12345678);
+            }
+        }
+        outcomes.push(addresses);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+// spec: WIN32-API-15, A64-CTL-12
+#[test]
+fn resolved_registry_leaves_match_host_returns_outputs_and_errors() {
+    use adv_os::registry::{Key, Value, VirtualRegistry};
+    fn replay(leaf: bool) -> Vec<u8> {
+        let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), true);
+        m.sys.current = m.spawn("registry owner", PARK_ADDR, &[], 65536).unwrap();
+        // An unresolved registry declines without creating the disk-backed owner.
+        let entry = m
+            .resolve_import("advapi32.dll", "RegQueryValueExW")
+            .unwrap();
+        let thunk = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        let mut env = adv_machine::Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        };
+        assert_eq!(
+            env.sys.thunks.get(thunk).f.env_leaf.unwrap()(&mut env),
+            None
+        );
+        assert!(m.ext.try_get::<VirtualRegistry>().is_none());
+        let mut registry = VirtualRegistry::default();
+        registry
+            .keys
+            .get_mut(&Key {
+                root: 0x80000001,
+                path: vec![],
+            })
+            .unwrap()
+            .insert(
+                vec![],
+                Value {
+                    kind: 1,
+                    display_name: vec![],
+                    bytes: vec![65, 0, 66, 0, 0, 0],
+                },
+            );
+        m.ext.insert(registry);
+        let mut results = Vec::new();
+        for name in ["RegQueryValueExA", "RegQueryValueExW"] {
+            for (handle, capacity, data, reserved) in [
+                (0x80000001, 32, DATA + 128, 0),
+                (0x80000001, 1, DATA + 128, 0),
+                (0x80000001, 0, 0, 0),
+                (123, 32, DATA + 128, 0),
+                (0x80000001, 32, DATA + 128, 1),
+                (0x80000001, 32, 0x70000000, 0),
+            ] {
+                m.cpu.write_u32(DATA + 4, capacity).unwrap();
+                let (value, declined) = query_call(
+                    &mut m,
+                    "advapi32.dll",
+                    name,
+                    &[handle, 0, reserved, DATA, data, DATA + 4],
+                    leaf,
+                );
+                assert_eq!(
+                    declined,
+                    leaf && (handle == 123 || reserved != 0 || data == 0x70000000)
+                );
+                results.extend_from_slice(&value.to_le_bytes());
+                let mut bytes = vec![0; 160];
+                m.cpu.read(DATA, &mut bytes).unwrap();
+                results.extend(bytes);
+            }
+        }
+        results
+    }
+    assert_eq!(replay(true), replay(false));
+}
+
+fn crt_fault(
+    guest: bool,
+    module: &str,
+    name: &str,
+    destination: u32,
+    source: u32,
+) -> (String, u32, Vec<u8>) {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), guest);
+    let target = m.resolve_import(module, name).unwrap();
+    let mut code = Asm::new(CODE);
+    let args = if name.ends_with("_s") {
+        vec![destination, 8, source, 8]
+    } else if name == "memset" {
+        vec![destination, 0xab, 8]
+    } else {
+        vec![destination, source, 8]
+    };
+    for arg in args.iter().rev() {
+        code.push_imm(*arg);
+    }
+    code.call(target).ret();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.cpu.write(DATA + 0xfffc, &[1, 2, 3, 4]).unwrap();
+    m.cpu.protect(DATA + 0xf000, 4096, Prot::READ).unwrap();
+    let ctx = m.spawn("CRT fault", CODE, &[], 65536).unwrap();
+    let error = m.sys.context(ctx).teb + adv_machine::layout::teb::LAST_ERROR;
+    m.cpu.write_u32(error, 0x12345678).unwrap();
+    let result = m.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Failed(_)), "{result:?}");
+    let fault = m
+        .sys
+        .first_cpu_fault
+        .as_ref()
+        .expect("guest access violation");
+    assert!(fault.access().is_some());
+    let mut bytes = vec![0; 0x1_0000];
+    m.cpu.read(DATA, &mut bytes).unwrap();
+    (
+        format!("{:?}", fault.fault),
+        m.cpu.read_u32(error).unwrap(),
+        bytes,
+    )
+}
+
+// spec: WIN32-API-16, EXC-SEH-2
+#[test]
+fn crt_guest_and_host_routes_deliver_identical_access_violations_and_partial_writes() {
+    let mut registry = Registry::default();
+    adv_win32::msvcrt::register(&mut registry);
+    for (module, name, binding) in registry.registered() {
+        if binding.guest.is_none()
+            || !["memcpy", "memmove", "memset", "memcpy_s", "memmove_s"].contains(&name)
+        {
+            continue;
+        }
+        for (destination, source) in [
+            (DATA + 256, 0x70000000),
+            (0x70000000, DATA),
+            (DATA + 0xf000, DATA),
+            (DATA + 256, DATA + 0xfffc),
+            (DATA + 0xeffc, DATA),
+        ] {
+            if name == "memset" && destination == DATA + 256 {
+                continue;
+            }
+            assert_eq!(
+                crt_fault(true, module, name, destination, source),
+                crt_fault(false, module, name, destination, source),
+                "{module}!{name}"
+            );
+        }
+    }
 }
