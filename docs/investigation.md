@@ -35,7 +35,7 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 | First divergence in a new game, zero frames for no known reason | Native capture and `api_diff.py` in [tools/compat](../tools/compat/README.md), aligned on the main thread | Without child processes or output buffers the result is partial. |
 | Wrong behavior after some interaction | Reproduce up to that step with a `play_session.py` schedule | `--trace` keeps `api.trace`. The control command `memory ADDR LEN` reads guest memory. |
 | Wrong picture | A `checkpoint` or `capture` | `--gpu-software` compares adapters, and `trace_hresult.py` shows rendering failures. |
-| Win32 behavior differs from Windows | A self-written fixture in `tools/fixtures/` run natively, under the interpreter and under the JIT | Each fixture's header comment states what it checks and how to build it. `personality_contract.py` runs the shared personality contracts. |
+| Win32 behavior differs from Windows | A self-written fixture in `tools/fixtures/` run natively, under the interpreter and under the JIT; record its native result once on Windows with `tools/fixtures/record_native.py`, and `native_reference` in `adv-runtime` then compares every host and backend with it | Each fixture's header comment states what it checks and how to build it. `personality_contract.py` runs the shared personality contracts. |
 | Backend hangs, or a run needs a CPU comparison | `backend_bisect` in `adv-runtime`, with `ADV_BISECT_EXE` set | Each backend runs with a fixed runner copy, its own data folder and an outer deadline. A timeout proves nothing about correctness. |
 
 Authored fixtures and generators for one area:
@@ -44,13 +44,13 @@ Authored fixtures and generators for one area:
 |---|---|---|
 | Android APK page compatibility | `tools/android/check-apk.py <apk>` | Standard-library ELF LOAD and stored ZIP data alignment checks for 16 KiB pages. Tests: `python -m unittest discover -s tools/android -p test_check_apk.py`. |
 | Upscaling shader regeneration | `tools/upscaling/generate.py <slangc>` | Pinned upstream shaders → WGSL, quantized layer fusion, cooperative matrix RGB convolutions and texture lifetimes; no game inputs. Tests: `python -m unittest discover -s tools/upscaling`. |
-| Recursive Shell directories | [`shell_directories.c`](../tools/fixtures/shell_directories.c), `build-shell-directories.ps1` | Authored local paths and scalar output; Unicode/ANSI recursion, existing paths and errors. Test: `cargo test -p adv-runtime --test shell_directories`. |
+| Recursive Shell directories | [`shell_directories.c`](../tools/fixtures/shell_directories.c), `build-shell-directories.ps1` | Authored local paths and scalar output; Unicode/ANSI recursion, existing paths and errors. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
 | D3DX empty textures | [`d3dx9-texture-create.c`](../tools/fixtures/d3dx9-texture-create.c), `test-d3dx9-texture-create.ps1` | Authored dimensions, formats and usage; scalar correction, mip and lifetime comparisons. Test: `cargo test -p adv-runtime --test d3dx_texture --features gpu`. |
 | D3DX axis rotations and Vec2 | [`d3dx9-math2.c`](../tools/fixtures/d3dx9-math2.c), `build-d3d9.ps1 -Name d3dx9-math2` | Authored matrices, overlapping outputs and special values; native scalar comparison with 2e-6 tolerance. Test: `cargo test -p adv-runtime --test d3dx_math2`. |
-| Linguistic comparison | [`nls-compare.c`](../tools/fixtures/nls-compare.c), `build-nls-compare.ps1` | Authored strings and locale flags; A/W/Ex and lstrcmp scalar results. Test: `cargo test -p adv-runtime --test nls_compare`. |
-| Mouse tracking | [`mouse-track.c`](../tools/fixtures/mouse-track.c), `build-mouse-track.ps1` | Hidden owned windows without host cursor movement; query, cancellation and leave results. Test: `cargo test -p adv-runtime --test mouse_track`. |
+| Linguistic comparison | [`nls-compare.c`](../tools/fixtures/nls-compare.c), `build-nls-compare.ps1` | Authored strings and locale flags; A/W/Ex and lstrcmp scalar results. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
+| Mouse tracking | [`mouse-track.c`](../tools/fixtures/mouse-track.c), `build-mouse-track.ps1` | Hidden owned windows without host cursor movement; query, cancellation and leave results. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
 | D3D9 texture-target copies | [`d3d9-texture-blit.c`](../tools/fixtures/d3d9-texture-blit.c), `test-d3d9-texture-blit.ps1` | Authored RGBX/ARGB images; scalar and pixel comparisons for rectangles, container identity and render state. |
-| Multiline DrawText | [`drawtext-lines.c`](../tools/fixtures/drawtext-lines.c), `build-drawtext-lines.ps1` | Authored text and offscreen DIBs; RGB hashes, line heights, clipping and preserved rectangles. Test: `cargo test -p adv-runtime --test drawtext_lines`. |
+| Multiline DrawText | [`drawtext-lines.c`](../tools/fixtures/drawtext-lines.c), `build-drawtext-lines.ps1` | Authored text and offscreen DIBs; RGB hashes, line heights, clipping and preserved rectangles. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
 
 ### CPU and JIT
 

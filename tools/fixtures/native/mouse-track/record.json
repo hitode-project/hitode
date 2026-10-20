@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "build_script": "build-mouse-track.ps1",
+  "sources": [
+    "mouse-track.c"
+  ],
+  "source_sha256": "714ee36e2d9e0116c7c98245c5b38afff1cc4a86ee6f8446722c1692f159b091",
+  "executable": "fixture_mouse_track.exe",
+  "executable_sha256": "cbf1340aabec5c1ece9fdea77a26d6467f49a7e04da4720d3cb8b35c42a8e317",
+  "output": "mouse-track.bin",
+  "output_sha256": "af354dfde759794f1456d1d8748e5ce8985c3c0ce3938adccaaf0d5ca6695c8d",
+  "windows": "10.0.26300",
+  "captured_date": "2026-10-20"
+}
