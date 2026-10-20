@@ -163,6 +163,9 @@ jobs:
           workspaces: '. -> target/workspace-ci'
           cache-on-failure: true
           cache-workspace-crates: true
+      - name: Build every crate with default features
+        timeout-minutes: 10
+        run: cargo check --workspace --exclude adv-launcher --all-targets --locked
       - name: Lint the whole workspace
         timeout-minutes: 10
         run: |
