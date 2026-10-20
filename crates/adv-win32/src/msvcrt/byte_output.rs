@@ -66,7 +66,7 @@ fn output(env: &mut Env<'_>, character: i32, stream: GuestPtr<u8>) -> Outcome {
         return memory_failure(error);
     }
     let byte = character as u8;
-    // The unbuffered FILE has no pending bytes; use its existing guest storage.
+    // Use the existing guest FILE storage for the output byte.
     if let Err(fault) = env.cpu.write(stream.addr(), &[byte]) {
         return memory_failure(fault);
     }

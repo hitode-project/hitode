@@ -55,12 +55,16 @@ struct CrtState {
     locales: HashMap<String, locale::LocaleState>,
 }
 
-// The original NT handle owns bytes and cursor; FILE holds only CRT metadata.
+// The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
 struct CrtFile {
     handle: u32,
     binary: bool,
     append: bool,
     eof: bool,
+    position: u64,
+    read_buffer: [u8; 4096],
+    read_cursor: usize,
+    read_end: usize,
 }
 
 // API-set imports and their UCRT exports share the same CRT state owner.
@@ -366,6 +370,7 @@ pub fn register(r: &mut Registry) {
         call,
     );
     r.add("msvcrt.dll", "longjmp", Conv::Cdecl { argc: 2 }, call);
+    file::leaves::register(r);
     crate::guest_code::install_crt(r);
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.

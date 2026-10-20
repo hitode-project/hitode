@@ -287,11 +287,14 @@ fn guest<B: Backend>(cpu: B, module: &str, live: bool, wide: bool, protect_outpu
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     assert_eq!(machine.cpu.read_u32(DATA + 260).unwrap(), 2);
     assert_eq!(machine.cpu.read_u32(DATA + 264).unwrap(), 1);
-    assert_eq!(machine.cpu.read_u32(DATA + 268).unwrap(), 4);
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 268).unwrap(),
+        if live { 4 } else { 2 }
+    );
     assert_eq!(machine.cpu.read_u32(DATA + 272).unwrap(), 0);
     let mut bytes = [0; 4];
     machine.cpu.read(DATA + 512, &mut bytes).unwrap();
-    assert_eq!(&bytes, if live { b"live" } else { b"host" });
+    assert_eq!(&bytes, if live { b"live" } else { b"ho\0\0" });
     assert!(machine.ext.get::<CrtState>().files.is_empty());
     if live {
         let provider = machine.ext.get::<Provider>();
@@ -303,6 +306,7 @@ fn guest<B: Backend>(cpu: B, module: &str, live: bool, wide: bool, protect_outpu
     std::fs::remove_dir_all(root).unwrap();
 }
 
+// spec: WIN32-API-19
 #[test]
 fn cp936_crt_streams_share_win32_cursors_and_resume_nt_rtl_callbacks() {
     for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll", "ucrtbase.dll"] {

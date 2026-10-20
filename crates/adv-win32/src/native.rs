@@ -67,6 +67,24 @@ fn deciding_pages(cpu: &dyn Guest, base: u32, entry: u32) -> Option<Vec<u32>> {
     Some(pages)
 }
 
+/// Read-only proof for leaves: an uncertain or changed image takes the ordinary path.
+pub(crate) fn known_unmodified(env: &Env<'_>, name: &str) -> bool {
+    let Some(original) = env
+        .ext
+        .try_get::<Unmodified>()
+        .and_then(|cache| cache.0.get(name))
+    else {
+        return false;
+    };
+    env.ext
+        .get::<Modules>()
+        .try_get(original.module)
+        .is_some_and(|image| image.base == original.base && image.executable_visible())
+        && (original.epoch.is_some() && original.epoch == env.cpu.private_copy_epoch()
+            || unwritten(env.cpu, &original.pages))
+        && check_range(env.cpu, original.entry, THUNK_STRIDE, Prot::READ).is_ok()
+}
+
 pub(crate) fn overridden(env: &mut Env<'_>, name: &str) -> Result<Option<u32>, LoadError> {
     // Standalone handler embedders may install no Windows personality. There
     // is then no guest system image whose entry could have been replaced.
