@@ -85,7 +85,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-OBJECT-8 Overlay whiteouts
 
-**Rule**: Deleting a read-only game file MUST record a persistent whiteout instead of failing. The file MUST stay hidden until the guest writes that name again.
+**Rule**: Deleting a read-only game file MUST record a persistent whiteout instead of failing. The file MUST stay hidden until the guest writes that name again. Directory lookups MUST be answered from an index that only VFS-made changes invalidate, so host changes made outside the runtime during a run stay invisible.
 **Verification**: Test
 
 ### WIN32-OBJECT-9 Shared small heap blocks
@@ -388,7 +388,7 @@ Clock: `timeGetTime`, `GetTickCount`, QPC/QPF, `GetLocalTime`, `GetSystemTime(As
 
 D3DX9 leaves: `D3DXMatrixMultiply`, `D3DXMatrixTranspose`, `D3DXMatrixScaling`, `D3DXMatrixTranslation`, `D3DXMatrixRotationYawPitchRoll`, `D3DXMatrixRotationX/Y/Z`, `D3DXMatrixPerspectiveFovLH`, `D3DXMatrixLookAtLH`, `D3DXVec2Transform(Coord/Normal)`, `D3DXVec3Transform(Coord)`, `D3DXVec4Transform`, `D3DXVec3CatmullRom`, `D3DXVec3Project`, in d3dx9_29/43. Matrix-stack leaves: `QueryInterface`, `AddRef`, `GetTop`, `LoadIdentity`, `LoadMatrix`, `MultMatrix(Local)`, `RotateAxis(Local)`, `RotateYawPitchRoll(Local)`, `Scale(Local)`, `Translate(Local)`. Math leaves MUST decline failed input/output ranges before writing. `Push`, `Pop` and `Release` retain ordinary mapping-capable handlers.
 
-CRT `_errno` leaves MUST decline before allocating a missing module/thread cell. `RegQueryValueExA/W` leaves MUST decline before loading the registry from disk. Resolved registry queries MUST preserve ordinary error returns and output writes.
+CRT `_errno` leaves MUST decline before allocating a missing module/thread cell. `RegQueryValueExA/W` leaves MUST decline before loading the registry from disk. Resolved registry queries MUST preserve ordinary error returns and output writes. `GetFileAttributesA/W` leaves MUST decline live NT attribute providers and system-image paths before side effects.
 
 ### WIN32-API-16 Guest atomic operations
 

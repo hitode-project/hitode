@@ -397,7 +397,7 @@ fn browse(env: &mut Env<'_>, info: u32, wide: bool) -> Outcome {
     if root.is_none()
         && let Some(host) = env.ext.get::<Win32>().vfs.write_path(&current)
     {
-        let _ = std::fs::create_dir_all(host);
+        let _ = adv_os::vfs::host::create_dir_all(&host);
     }
     let mut b = Browse {
         ticket: 0,
@@ -508,7 +508,7 @@ fn folder_location(env: &mut Env<'_>, csidl: u32, token: u32, output: u32) -> i3
     let Some(host) = env.ext.get::<Win32>().vfs.write_path(&text) else {
         return 0x8007_0003u32 as i32;
     };
-    if let Err(error) = std::fs::create_dir_all(host) {
+    if let Err(error) = adv_os::vfs::host::create_dir_all(&host) {
         let code = match error.kind() {
             std::io::ErrorKind::NotFound => 3,
             std::io::ErrorKind::PermissionDenied => 5,

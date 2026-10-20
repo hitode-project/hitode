@@ -337,9 +337,9 @@ fn get_temp_file_name(
     let mut created = false;
     if create_file && let Some(host) = w.vfs.write_path(&full) {
         if let Some(parent) = host.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = adv_os::vfs::host::create_dir_all(parent);
         }
-        created = std::fs::write(host, b"").is_ok();
+        created = adv_os::vfs::host::write(&host, b"").is_ok();
     }
     if wide {
         let u: Vec<u16> = full.encode_utf16().collect();

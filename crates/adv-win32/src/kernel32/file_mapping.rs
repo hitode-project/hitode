@@ -206,7 +206,7 @@ fn file_backing(
         }
         let destination = w.vfs.mapping_write_path(&guest_path).ok_or(5u32)?;
         if destination != selected {
-            std::fs::copy(&selected, &destination).map_err(|e| io_error(&e))?;
+            adv_os::vfs::host::copy(&selected, &destination).map_err(|e| io_error(&e))?;
         }
         let target = std::fs::OpenOptions::new()
             .read(true)

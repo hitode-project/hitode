@@ -216,7 +216,7 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
         {
             to.set_file_name(leaf);
         }
-        match std::fs::rename(&from, &to) {
+        match adv_os::vfs::host::rename(&from, &to) {
             Ok(()) => {
                 // Retarget live owners even if the subsequent durability request fails.
                 for (_, file) in env.sys.objects.all_hosts_mut::<FileObj>() {

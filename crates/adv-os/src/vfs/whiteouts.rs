@@ -49,12 +49,13 @@ impl Whiteouts {
             return Ok(());
         }
         if let Some(parent) = self.index.parent() {
+            // host-only: the whiteout index lives in the data directory, outside guest trees.
             std::fs::create_dir_all(parent)?;
         }
         let staged = self.index.with_extension("tmp");
         let text: String = next.iter().map(|path| format!("{path}\n")).collect();
-        std::fs::write(&staged, text)?;
-        std::fs::rename(&staged, &self.index)?;
+        std::fs::write(&staged, text)?; // host-only: whiteout index
+        std::fs::rename(&staged, &self.index)?; // host-only: whiteout index
         *paths = next;
         Ok(())
     }

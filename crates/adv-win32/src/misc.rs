@@ -322,7 +322,7 @@ fn get_special_folder(env: &mut Env<'_>, buf: u32, csidl: u32) -> bool {
     };
     // Folders always exist (CSIDL_FLAG_CREATE or not): create the host directory.
     if let Some(host) = w.vfs.write_path(&path) {
-        let _ = std::fs::create_dir_all(host);
+        let _ = adv_os::vfs::host::create_dir_all(&host);
     }
     let b = w.codec.encode(&path);
     put_cstr(env.cpu, buf, MAX_PATH, &b).is_some()
@@ -335,7 +335,7 @@ fn get_special_folder_w(env: &mut Env<'_>, buf: u32, csidl: u32) -> bool {
         return false;
     };
     if let Some(host) = w.vfs.write_path(&path) {
-        let _ = std::fs::create_dir_all(host);
+        let _ = adv_os::vfs::host::create_dir_all(&host);
     }
     let u: Vec<u16> = path.encode_utf16().collect();
     put_wstr(env.cpu, buf, MAX_PATH, &u).is_some()

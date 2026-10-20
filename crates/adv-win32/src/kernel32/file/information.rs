@@ -238,6 +238,7 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
             return;
         }
+        adv_os::vfs::host::changed(&root.join("game/alias.bin"));
         let linked = open(
             &mut env(&mut machine),
             "alias.bin",
@@ -250,8 +251,8 @@ mod tests {
         assert_eq!(linked_information[11..], baseline[11..]);
         // Renaming the backing file and recreating its old name must not make
         // the existing handle query the replacement instance.
-        std::fs::rename(&path, root.join("game/renamed.bin")).unwrap();
-        std::fs::write(&path, b"other").unwrap();
+        adv_os::vfs::host::rename(&path, &root.join("game/renamed.bin")).unwrap();
+        adv_os::vfs::host::write(&path, b"other").unwrap();
         assert_eq!(query(&mut machine, first)[9], 13);
         assert_eq!(query(&mut machine, first)[0], 0x80);
         let replacement = open(&mut env(&mut machine), "data.bin", 0, OPEN_EXISTING);

@@ -54,8 +54,8 @@ pub(super) fn migrate(cfg: &OsConfig) -> io::Result<()> {
     if found {
         // Only after all copies succeed. Never import these backups again: otherwise
         // deleting a slot in the new layout could resurrect it on the next launch.
-        std::fs::write(
-            marker,
+        super::host::write(
+            &marker,
             b"Legacy profile saves imported; game directory wins conflicts.\n",
         )?;
     }
@@ -90,7 +90,7 @@ fn find_saves(dir: &Path, game: &Path) -> io::Result<bool> {
 }
 
 fn copy_missing(source: &Path, target: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(target)?;
+    super::host::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let ty = entry.file_type()?;
@@ -104,18 +104,17 @@ fn copy_missing(source: &Path, target: &Path) -> io::Result<()> {
             copy_missing(&entry.path(), &dst)?;
         } else if ty.is_file() {
             let mut input = std::fs::File::open(entry.path())?;
-            let mut output = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&dst)
-            {
+            let mut output = match super::host::open(
+                std::fs::OpenOptions::new().write(true).create_new(true),
+                &dst,
+            ) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dst.is_file() => continue,
                 Err(e) => return Err(e),
             };
             if let Err(e) = io::copy(&mut input, &mut output).and_then(|_| output.sync_all()) {
                 drop(output);
-                let _ = std::fs::remove_file(dst);
+                let _ = super::host::remove_file(&dst);
                 return Err(e);
             }
         }

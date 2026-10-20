@@ -8,6 +8,8 @@
 //! * Every other `C:\` path (user profile, Windows dir, ...) maps into a writable host
 //!   directory, created on demand.
 //! * Path components match case-insensitively; `/` and `\` are equivalent.
+//! * The VFS owns the guest namespace: host entries change only through `host`,
+//!   so directory lookups are answered from memory (WIN32-OBJECT-8).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use std::time::SystemTime;
 use crate::OsConfig;
 
 mod attributes;
+pub mod host;
 mod mutation;
 mod names;
 #[cfg(not(windows))]
@@ -89,14 +92,34 @@ pub struct Vfs {
     optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
 }
 
+/// Existing host entry for `comps` under `base` and whether it is a directory,
+/// matching each component case-insensitively.
+fn ci_entry(base: &Path, comps: &[String]) -> Option<(PathBuf, bool)> {
+    let Some((last, parents)) = comps.split_last() else {
+        // The base itself may not exist yet (an overlay nothing was written to).
+        let metadata = std::fs::metadata(base).ok()?;
+        return Some((base.to_owned(), metadata.is_dir()));
+    };
+    let mut cur = base.to_path_buf();
+    for c in parents {
+        cur = match names::find(&cur, c)? {
+            (_, names::Kind::File) => return None,
+            (path, _) => path,
+        };
+    }
+    match names::find(&cur, last)? {
+        (path, names::Kind::File) => Some((path, false)),
+        (path, names::Kind::Dir) => Some((path, true)),
+        (path, names::Kind::Other) => {
+            let metadata = std::fs::metadata(&path).ok()?;
+            Some((path, metadata.is_dir()))
+        }
+    }
+}
+
 /// Existing host path for `comps` under `base`, matching each component case-insensitively.
 fn ci_find(base: &Path, comps: &[String]) -> Option<PathBuf> {
-    let mut cur = base.to_path_buf();
-    for c in comps {
-        cur = names::find(&cur, c)?;
-    }
-    // With no components the base itself may not exist yet (an overlay nothing was written to).
-    cur.exists().then_some(cur)
+    ci_entry(base, comps).map(|(path, _)| path)
 }
 
 /// Host path for `comps` under `base`, reusing existing components' spelling.
@@ -120,6 +143,7 @@ impl Vfs {
         } else {
             root
         };
+        names::clear();
         let portable_saves = cfg.write_game
             && match portable_saves::migrate(cfg) {
                 Ok(()) => true,
@@ -241,21 +265,26 @@ impl Vfs {
 
     /// Existing host file or directory for reading.
     pub fn lookup(&self, guest: &str) -> Option<PathBuf> {
+        self.entry(guest).map(|(path, _)| path)
+    }
+
+    /// Existing host entry and whether it is a directory.
+    fn entry(&self, guest: &str) -> Option<(PathBuf, bool)> {
         if self.is_optical_path(guest) {
             return None;
         }
         match self.locate(guest)? {
-            Loc::Game(rel) => ci_find(&self.overlay, &rel).or_else(|| {
+            Loc::Game(rel) => ci_entry(&self.overlay, &rel).or_else(|| {
                 if self.whiteouts.contains(&rel) {
                     return None;
                 }
                 self.resources
                     .as_ref()
-                    .and_then(|p| ci_find(p, &rel))
-                    .or_else(|| ci_find(&self.game_host, &rel))
+                    .and_then(|p| ci_entry(p, &rel))
+                    .or_else(|| ci_entry(&self.game_host, &rel))
             }),
-            Loc::Install(rel) => ci_find(self.install.as_ref()?, &rel),
-            Loc::Other(rel) => ci_find(&self.other, &rel),
+            Loc::Install(rel) => ci_entry(self.install.as_ref()?, &rel),
+            Loc::Other(rel) => ci_entry(&self.other, &rel),
         }
     }
 
@@ -291,11 +320,11 @@ impl Vfs {
             .locate(guest)
             .filter(|_| self.has_read_only_underlay(guest))
         else {
-            return std::fs::remove_file(host);
+            return host::remove_file(&host);
         };
         self.whiteouts.set(&rel, true)?;
         if let Some(shadow) = ci_find(&self.overlay, &rel)
-            && let Err(error) = std::fs::remove_file(shadow)
+            && let Err(error) = host::remove_file(&shadow)
         {
             let _ = self.whiteouts.set(&rel, false);
             return Err(error);
@@ -331,7 +360,7 @@ impl Vfs {
             Loc::Other(rel) => ci_path(&self.other, &rel),
         };
         if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = host::create_dir_all(parent);
         }
         Some(p)
     }
@@ -350,7 +379,7 @@ impl Vfs {
             Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
         };
-        std::fs::create_dir_all(path.parent()?).ok()?;
+        host::create_dir_all(path.parent()?).ok()?;
         Some(path)
     }
 
@@ -358,7 +387,7 @@ impl Vfs {
         if self.is_optical_path(guest) {
             return self.optical_entry(guest).is_ok_and(|entry| entry.is_dir);
         }
-        self.lookup(guest).is_some_and(|p| p.is_dir())
+        self.entry(guest).is_some_and(|(_, is_dir)| is_dir)
     }
 
     /// Change only this process's DOS directory after validating its VFS target.
@@ -836,7 +865,7 @@ mod tests {
             game.join("Save/Slot02.dat"),
         );
         // Deletion remains effective, while the original backup remains untouched.
-        std::fs::remove_file(v.lookup(&format!("{guest}/Slot01.dat")).unwrap()).unwrap();
+        host::remove_file(&v.lookup(&format!("{guest}/Slot01.dat")).unwrap()).unwrap();
         let reopened = Vfs::new(&cfg);
         assert!(reopened.lookup(&format!("{guest}/Slot01.dat")).is_none());
         assert_eq!(

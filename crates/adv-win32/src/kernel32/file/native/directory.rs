@@ -64,7 +64,7 @@ pub(crate) fn remove(env: &mut Env<'_>, path: String, then: Done<()>) -> Outcome
         let Some(host) = vfs.lookup(&full) else {
             return then(env, Err(0xc0000034));
         };
-        let result = std::fs::remove_dir(host).map_err(|e| match e.kind() {
+        let result = adv_os::vfs::host::remove_dir(&host).map_err(|e| match e.kind() {
             std::io::ErrorKind::DirectoryNotEmpty => 0xc0000101,
             std::io::ErrorKind::NotADirectory => 0xc0000103,
             std::io::ErrorKind::PermissionDenied => 0xc0000022,
@@ -178,7 +178,7 @@ pub(crate) fn portable_rename(env: &mut Env<'_>, source: String, target: String)
     if let Some(leaf) = target.rsplit('\\').next() {
         to.set_file_name(leaf);
     }
-    match std::fs::rename(from, to) {
+    match adv_os::vfs::host::rename(&from, &to) {
         Ok(()) => {
             crate::ntdll::file::directory::retarget_owners(env, &source, &target);
             Outcome::Return(1)

@@ -217,6 +217,13 @@ pub(super) fn set(
     {
         return ACCESS_VIOLATION;
     }
+    let source_host = env.ext.get::<Win32>().vfs.lookup(&source);
+    if matches!(class, 13 | 64)
+        && let Some(parent) = source_host.as_ref().and_then(|host| host.parent())
+    {
+        // A pending delete removes the entry when the last handle closes.
+        adv_os::vfs::host::volatile(parent);
+    }
     if class == 13 {
         let result = owner_delete(env, handle.0, prefix[0] != 0);
         return match result {
@@ -324,6 +331,9 @@ pub(super) fn set(
         .unwrap()
         .file
         .rename_instance(&host, prefix[0] != 0);
+    for path in source_host.iter().chain([&host]) {
+        adv_os::vfs::host::changed(path);
+    }
     if let Err(error) = result {
         return failure(env, error);
     }

@@ -338,7 +338,12 @@ pub(crate) fn set(
     {
         return ACCESS_VIOLATION;
     }
+    let source_host = env.ext.get::<Win32>().vfs.lookup(&source);
     if matches!(class, 13 | 64) {
+        if let Some(parent) = source_host.as_ref().and_then(|host| host.parent()) {
+            // A pending delete removes the entry when the last handle closes.
+            adv_os::vfs::host::volatile(parent);
+        }
         let flags = if class == 64 {
             u32::from_le_bytes(prefix[..4].try_into().unwrap())
         } else {
@@ -466,6 +471,9 @@ pub(crate) fn set(
         .as_ref()
         .unwrap()
         .rename_instance(&host, false);
+    for path in source_host.iter().chain([&host]) {
+        adv_os::vfs::host::changed(path);
+    }
     if let Err(error) = result {
         let status = instance_failure(env, &error);
         return completion(env, iosb, status, 0);

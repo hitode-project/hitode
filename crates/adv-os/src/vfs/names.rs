@@ -1,163 +1,187 @@
-//! Case-insensitive host directory index with exact-spelling precedence.
-//! Entries are reused while the directory modification time is unchanged.
-//! Recently changed directories are not cached: another change may share their timestamp.
-use std::cell::RefCell;
+//! Authoritative case-insensitive index of the host directories behind the VFS.
+//! Guest-visible entries change only through `vfs::host`, which invalidates the
+//! directories it touches, so a lookup never revalidates against the host.
+//! Read-only layers do not change while a game runs (WIN32-OBJECT-8).
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, LazyLock, Mutex};
 
-const MAX_DIRECTORIES: usize = 256;
-/// Coarser than the directory timestamp granularity of supported host file systems.
-const SETTLED: Duration = Duration::from_secs(2);
+const MAX_DIRECTORIES: usize = 4096;
 
-struct Names {
-    modified: SystemTime,
-    /// Preserve enumeration order and exact spelling on case-sensitive hosts.
-    names: HashMap<String, Vec<OsString>>,
-    ascii: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    File,
+    Dir,
+    /// Symbolic links and other entries resolve through the host on use.
+    Other,
 }
 
-fn choose(
-    dir: &Path,
-    name: &str,
-    spellings: Option<&Vec<OsString>>,
-    ascii: bool,
-) -> Option<PathBuf> {
-    // Preserve native short names on Windows and Unicode filesystem folding.
-    if (cfg!(windows) || !ascii || !name.is_ascii()) && dir.join(name).exists() {
-        return Some(dir.join(name));
-    }
-    let spellings = spellings?;
-    // Exact spelling wins if two live host entries differ only by case.
-    if let Some(exact) = spellings.iter().skip(1).find(|s| s.as_os_str() == name)
-        && dir.join(exact).exists()
-    {
-        return Some(dir.join(exact));
-    }
-    Some(dir.join(&spellings[0]))
+/// Folded name to the entries spelled that way, in enumeration order.
+/// `None` records a directory that does not exist or cannot be listed.
+type Listing = Option<HashMap<String, Vec<(OsString, Kind)>>>;
+
+#[derive(Default)]
+struct Index {
+    /// Bumped by every invalidation, so a listing read concurrently with a
+    /// change is used once but never stored.
+    generation: u64,
+    dirs: HashMap<PathBuf, Arc<Listing>>,
+    /// Directories whose entries change outside a call, e.g. delete-on-close.
+    volatile: Vec<PathBuf>,
 }
 
-thread_local! {
-    static INDEX: RefCell<HashMap<PathBuf, Names>> = RefCell::default();
-}
+static INDEX: LazyLock<Mutex<Index>> = LazyLock::new(Mutex::default);
 
 fn key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// Host path of the entry in `dir` whose name matches `name` ASCII case-insensitively.
-pub(super) fn find(dir: &Path, name: &str) -> Option<PathBuf> {
-    let modified = match std::fs::metadata(dir) {
-        Ok(metadata) => metadata.modified().ok(),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return None;
-        }
-        Err(_) => None,
-    };
-    let key = key(name);
-    if let Some(modified) = modified {
-        let cached = INDEX.with_borrow(|index| {
-            let names = index.get(dir).filter(|names| names.modified == modified)?;
-            Some(choose(dir, name, names.names.get(&key), names.ascii))
-        });
-        if let Some(found) = cached {
-            return found;
-        }
-    }
-    let settled = modified.filter(|&modified| {
-        SystemTime::now()
-            .duration_since(modified)
-            .is_ok_and(|age| age >= SETTLED)
-    });
-    let mut names: HashMap<String, Vec<OsString>> = HashMap::new();
+fn read(dir: &Path) -> Listing {
+    let mut names: HashMap<String, Vec<(OsString, Kind)>> = HashMap::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => Kind::Dir,
+            Ok(kind) if kind.is_file() => Kind::File,
+            _ => Kind::Other,
+        };
         let name = entry.file_name();
         names
-            .entry(self::key(&name.to_string_lossy()))
+            .entry(key(&name.to_string_lossy()))
             .or_default()
-            .push(name);
+            .push((name, kind));
     }
-    let ascii = names.keys().all(|name| name.is_ascii());
-    let found = choose(dir, name, names.get(&key), ascii);
-    if let Some(modified) = settled {
-        INDEX.with_borrow_mut(|index| {
-            if index.len() >= MAX_DIRECTORIES && !index.contains_key(dir) {
-                index.clear();
-            }
-            index.insert(
-                dir.to_owned(),
-                Names {
-                    modified,
-                    names,
-                    ascii,
-                },
-            );
-        });
+    Some(names)
+}
+
+fn listing(dir: &Path) -> Arc<Listing> {
+    let generation = {
+        let index = INDEX.lock().unwrap();
+        if let Some(listing) = index.dirs.get(dir) {
+            return listing.clone();
+        }
+        index.generation
+    };
+    let listing = Arc::new(read(dir));
+    let mut index = INDEX.lock().unwrap();
+    if index.generation == generation && !index.volatile.iter().any(|v| v == dir) {
+        if index.dirs.len() >= MAX_DIRECTORIES {
+            index.dirs.clear();
+        }
+        index.dirs.insert(dir.to_owned(), listing.clone());
     }
-    found
+    listing
+}
+
+/// Names the host resolves itself: non-ASCII folding, and on Windows short
+/// names and the trailing dots and spaces Win32 strips.
+fn host_resolved(name: &str) -> bool {
+    !name.is_ascii() || cfg!(windows) && (name.contains('~') || name.ends_with(['.', ' ']))
+}
+
+/// Host entry in `dir` whose name matches `name` ASCII case-insensitively.
+/// An ASCII name never matches a non-ASCII entry under Windows upcasing.
+pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
+    if host_resolved(name) {
+        let path = dir.join(name);
+        let metadata = std::fs::metadata(&path).ok()?;
+        let kind = if metadata.is_dir() {
+            Kind::Dir
+        } else {
+            Kind::File
+        };
+        return Some((path, kind));
+    }
+    let listing = listing(dir);
+    let spellings = listing.as_ref().as_ref()?.get(&key(name))?;
+    // Exact spelling wins if two host entries differ only by case.
+    let (spelling, kind) = spellings
+        .iter()
+        .find(|(spelling, _)| spelling.as_os_str() == name)
+        .unwrap_or(&spellings[0]);
+    Some((dir.join(spelling), *kind))
+}
+
+/// Forget `path`, its parent and everything cached below it.
+pub(super) fn invalidate(path: &Path) {
+    let mut index = INDEX.lock().unwrap();
+    index.generation += 1;
+    let parent = path.parent();
+    index
+        .dirs
+        .retain(|dir, _| !dir.starts_with(path) && Some(dir.as_path()) != parent);
+}
+
+/// Start a run from the host's current state: the trees may have changed
+/// between runs hosted by the same process.
+pub(super) fn clear() {
+    let mut index = INDEX.lock().unwrap();
+    index.generation += 1;
+    index.dirs.clear();
+    index.volatile.clear();
+}
+
+/// Never cache `dir` again: its entries change at times no call observes.
+pub(super) fn volatile(dir: &Path) {
+    invalidate(&dir.join("."));
+    let mut index = INDEX.lock().unwrap();
+    if !index.volatile.iter().any(|v| v == dir) {
+        index.volatile.push(dir.to_owned());
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    fn settle(dir: &Path) {
-        let old = SystemTime::now() - Duration::from_secs(60);
-        std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
-    }
-
     #[test]
-    fn indexed_directories_follow_later_entries() {
+    // spec: WIN32-OBJECT-8
+    fn the_index_answers_until_its_directory_is_invalidated() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch/vfs-names")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("Data.PCK"), b"").unwrap();
-        // A just-written directory is scanned but not indexed.
-        assert_eq!(find(&root, "data.pck"), Some(root.join("Data.PCK")));
-        assert!(INDEX.with_borrow(|index| !index.contains_key(&root)));
-        settle(&root);
+        let file = |path: &Path| Some((path.to_owned(), Kind::File));
+        assert_eq!(find(&root, "data.pck"), file(&root.join("Data.PCK")));
         assert_eq!(find(&root, "missing.g00"), None);
-        assert!(INDEX.with_borrow(|index| index.contains_key(&root)));
-        assert_eq!(find(&root, "DATA.pck"), Some(root.join("Data.PCK")));
-        // Creating the probed name changes the directory time and drops the index.
+        // An unannounced host change is not observed; an announced one is.
         std::fs::write(root.join("Missing.G00"), b"").unwrap();
-        assert_eq!(find(&root, "missing.g00"), Some(root.join("Missing.G00")));
-        settle(&root);
+        assert_eq!(find(&root, "missing.g00"), None);
+        invalidate(&root.join("Missing.G00"));
+        assert_eq!(find(&root, "missing.g00"), file(&root.join("Missing.G00")));
         std::fs::remove_file(root.join("Data.PCK")).unwrap();
+        invalidate(&root.join("Data.PCK"));
         assert_eq!(find(&root, "data.pck"), None);
         std::fs::write(root.join("Case"), b"upper").unwrap();
         std::fs::write(root.join("case"), b"lower").unwrap();
-        settle(&root);
-        // Exact spelling wins even if a folded directory index already exists.
-        find(&root, "absent");
-        assert_eq!(
-            std::fs::read(find(&root, "Case").unwrap()).unwrap(),
-            std::fs::read(root.join("Case")).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(find(&root, "case").unwrap()).unwrap(),
-            std::fs::read(root.join("case")).unwrap()
-        );
+        invalidate(&root.join("case"));
+        // Exact spelling wins on case-sensitive hosts.
+        for name in ["Case", "case"] {
+            assert_eq!(
+                std::fs::read(find(&root, name).unwrap().0).unwrap(),
+                std::fs::read(root.join(name)).unwrap()
+            );
+        }
         std::os::unix::fs::symlink("absent", root.join("broken")).unwrap();
-        settle(&root);
-        assert!(!find(&root, "broken").unwrap().exists());
+        invalidate(&root.join("broken"));
+        assert_eq!(find(&root, "broken").unwrap().1, Kind::Other);
+        std::fs::create_dir(root.join("Sub")).unwrap();
+        invalidate(&root.join("Sub"));
+        assert_eq!(find(&root, "sub").unwrap().1, Kind::Dir);
+        assert_eq!(find(&root.join("Sub"), "x"), None);
+        // A volatile directory is read on every lookup.
+        volatile(&root.join("Sub"));
+        std::fs::write(root.join("Sub/X"), b"").unwrap();
+        assert_eq!(find(&root.join("Sub"), "x"), file(&root.join("Sub/X")));
         std::fs::write(root.join("É.TXT"), b"unicode").unwrap();
-        settle(&root);
-        find(&root, "absent");
         assert_eq!(find(&root, "é.txt").is_some(), root.join("é.txt").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
