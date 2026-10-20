@@ -4,6 +4,8 @@ use crate::dshow::tests::{activate, env, machine};
 use crate::dshow::tests::{method, query};
 use adv_cpu::backend::{Guest, Reg};
 use adv_machine::{Machine, Resume};
+use adv_os::vfs::host;
+use std::path::Path;
 
 const DATA: u32 = 0x500000;
 const STACK: u32 = 0x600000;
@@ -69,10 +71,10 @@ fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
     assert!(m.ext.get::<State>().filters.is_empty());
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
-    let directory = std::path::Path::new("target/dshow-source-tests");
-    std::fs::create_dir_all(directory).unwrap();
+    let directory = Path::new("./target/dshow-source-tests");
+    host::create_dir_all(directory).unwrap();
     let filename = format!("invalid-{}.bin", std::process::id());
-    std::fs::write(directory.join(&filename), [0x55; 32]).unwrap();
+    host::write(&directory.join(&filename), &[0x55; 32]).unwrap();
     wide(
         &mut m,
         DATA + 256,
@@ -87,8 +89,8 @@ fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
 
 #[cfg(feature = "media")]
 fn authored_wave() -> String {
-    let root = std::path::Path::new("target/dshow-source-tests");
-    std::fs::create_dir_all(root).unwrap();
+    let root = Path::new("./target/dshow-source-tests");
+    host::create_dir_all(root).unwrap();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let filename = format!(
         "authored-{}-{}.wav",
@@ -112,7 +114,7 @@ fn authored_wave() -> String {
     wave.extend_from_slice(b"data");
     wave.extend_from_slice(&size.to_le_bytes());
     wave.resize(wave.len() + size as usize, 0);
-    std::fs::write(path, wave).unwrap();
+    host::write(&path, &wave).unwrap();
     format!(
         "TARGET\\DSHOW-SOURCE-TESTS\\{}",
         filename.to_ascii_uppercase()
@@ -426,9 +428,16 @@ fn render_file_movie_keeps_connected_renderers_and_appends_video_and_audio_strea
             completed: |_, _| None,
         },
     );
-    let path = format!("target/dshow-source-tests/movie-{}.mpg", std::process::id());
-    std::fs::create_dir_all("target/dshow-source-tests").unwrap();
-    std::fs::write(&path, include_bytes!("../render/fixtures/guest_movie.mpg")).unwrap();
+    let path = format!(
+        "./target/dshow-source-tests/movie-{}.mpg",
+        std::process::id()
+    );
+    host::create_dir_all(Path::new("./target/dshow-source-tests")).unwrap();
+    host::write(
+        Path::new(&path),
+        include_bytes!("../render/fixtures/guest_movie.mpg"),
+    )
+    .unwrap();
     wide(&mut m, DATA + 1024, &path);
     for count in [6, 12] {
         assert_eq!(
@@ -474,11 +483,15 @@ fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_w
         },
     );
     let path = format!(
-        "target/dshow-source-tests/movie-existing-{}.mpg",
+        "./target/dshow-source-tests/movie-existing-{}.mpg",
         std::process::id()
     );
-    std::fs::create_dir_all("target/dshow-source-tests").unwrap();
-    std::fs::write(&path, include_bytes!("../render/fixtures/guest_movie.mpg")).unwrap();
+    host::create_dir_all(Path::new("./target/dshow-source-tests")).unwrap();
+    host::write(
+        Path::new(&path),
+        include_bytes!("../render/fixtures/guest_movie.mpg"),
+    )
+    .unwrap();
     wide(&mut m, DATA + 1024, &path);
     assert_eq!(
         invoke(
