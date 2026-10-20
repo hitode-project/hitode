@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "build_script": "build-drawtext-lines.ps1",
+  "sources": [
+    "drawtext-lines.c"
+  ],
+  "source_sha256": "317090076d29f6277d5570847325c5f3f327d00f635105d437c0e049da5530d0",
+  "executable": "fixture_drawtext_lines.exe",
+  "executable_sha256": "756d72692a84ec05762a2ba023b20ddf04e7062ecdd8ac2d9830a23ccb85ea43",
+  "output": "drawtext-lines.bin",
+  "output_sha256": "94393aacd584fc250e1da62568d661e830895a16c672095ec9de2de7bc5b9396",
+  "windows": "10.0.26300",
+  "captured_date": "2026-10-20"
+}

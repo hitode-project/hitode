@@ -7,3 +7,7 @@
 
 # Zero-argument ABI declarations retain an empty final TSV parameter column.
 /data/abi/*.tsv whitespace=-blank-at-eol
+
+# Recorded fixture executables and native outputs (tools/fixtures/record_native.py).
+/tools/fixtures/native/**/*.exe binary
+/tools/fixtures/native/**/*.bin binary

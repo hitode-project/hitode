@@ -41,6 +41,7 @@ python3 -m unittest discover -s tools/<folder>
 
 - Run the tests of the crates you changed. The full workspace suite is for batched changes and baseline updates.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
+- Fixtures with a recording in `tools/fixtures/native/` run on every host: `cargo test -p adv-runtime --features gpu --test native_reference` compares each CPU backend with the native Windows output. Record or refresh one on Windows with `python tools/fixtures/record_native.py <name>`; `--check` there confirms the build is still deterministic.
 - Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow after merges that touch fixtures or `adv-win32`, weekly, and for a branch on demand with `gh workflow run windows-differential.yml --ref <branch>`; without Windows, read the native results in its logs. Failures known on the hosted image are listed in `tools/fixtures/hosted-known-failures.txt`.
 - On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode. x64-only tests do not build there.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
