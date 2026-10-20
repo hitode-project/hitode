@@ -397,6 +397,28 @@ pub(super) fn state_front(env: &mut Env<'_>, signaled: bool) -> Outcome {
         Err(_) => crate::native::unavailable(env, api),
     }
 }
+/// SetEvent grants every wait it can satisfy at once, so resetting right after
+/// releases the current waiters (one for auto-reset) and leaves it unsignaled.
+pub(super) fn pulse_native(env: &mut Env<'_>, handle: u32, previous: u32) -> u32 {
+    let status = state_native(env, handle, previous, true);
+    if status == 0 {
+        env.sys.reset_event(handle);
+    }
+    status
+}
+pub(super) fn pulse_front(env: &mut Env<'_>) -> Outcome {
+    let handle = env.arg(0);
+    match crate::native::overridden(env, "NtPulseEvent") {
+        Ok(Some(target)) => Outcome::call(target, [handle, 0], |env, value| {
+            front_status(env, value.value(), 1)
+        }),
+        Ok(None) => {
+            let status = pulse_native(env, handle, 0);
+            front_status(env, status, 1)
+        }
+        Err(_) => crate::native::unavailable(env, "NtPulseEvent"),
+    }
+}
 pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, "ntdll.dll", "NtCreateEvent", 5, |env| {
         let args = std::array::from_fn(|i| env.arg(i as u32));
@@ -413,5 +435,9 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, "ntdll.dll", "NtResetEvent", 2, |env| {
         let (handle, previous) = (env.arg(0), env.arg(1));
         Outcome::Return(state_native(env, handle, previous, false))
+    });
+    stdcall(registry, "ntdll.dll", "NtPulseEvent", 2, |env| {
+        let (handle, previous) = (env.arg(0), env.arg(1));
+        Outcome::Return(pulse_native(env, handle, previous))
     });
 }

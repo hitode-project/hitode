@@ -88,6 +88,7 @@ impl Raster {
                 mirror_x: false,
                 mirror_y: false,
                 sampling: Sampling::Nearest,
+                key: None,
             },
             &mut memory,
         )?;

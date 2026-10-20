@@ -3523,7 +3523,9 @@ msimg32.dll	GradientFill	stdcall	i32	Windows.Win32.Foundation.BOOL	hdc:Windows.W
 msimg32.dll	TransparentBlt	stdcall	i32	Windows.Win32.Foundation.BOOL	hdcDest:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginDest:i32:i32:1|yoriginDest:i32:i32:1|wDest:i32:i32:1|hDest:i32:i32:1|hdcSrc:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginSrc:i32:i32:1|yoriginSrc:i32:i32:1|wSrc:i32:i32:1|hSrc:i32:i32:1|crTransparent:u32:u32:1
 msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr80.dll	_CIacos	cdecl	void	void	
 msvcr80.dll	_CIcos	cdecl	void	void	
+msvcr80.dll	_CIfmod	cdecl	void	void	
 msvcr80.dll	_CIlog	cdecl	void	void	
 msvcr80.dll	_CIlog10	cdecl	void	void	
 msvcr80.dll	_CIpow	cdecl	void	void	
@@ -3547,6 +3549,7 @@ msvcr80.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcr80.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr80.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr80.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr80.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
@@ -3591,6 +3594,7 @@ msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|coun
 msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr80.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr80.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr80.dll	rand	cdecl	i32	int	
@@ -3610,7 +3614,9 @@ msvcr80.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|f
 msvcr80.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr90.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr90.dll	_CIacos	cdecl	void	void	
 msvcr90.dll	_CIcos	cdecl	void	void	
+msvcr90.dll	_CIfmod	cdecl	void	void	
 msvcr90.dll	_CIlog	cdecl	void	void	
 msvcr90.dll	_CIlog10	cdecl	void	void	
 msvcr90.dll	_CIpow	cdecl	void	void	
@@ -3639,6 +3645,7 @@ msvcr90.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcr90.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr90.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
@@ -3684,6 +3691,7 @@ msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|coun
 msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr90.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr90.dll	rand	cdecl	i32	int	
@@ -3703,7 +3711,9 @@ msvcr90.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|f
 msvcr90.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcrt.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcrt.dll	_CIacos	cdecl	void	void	
 msvcrt.dll	_CIcos	cdecl	void	void	
+msvcrt.dll	_CIfmod	cdecl	void	void	
 msvcrt.dll	_CIlog	cdecl	void	void	
 msvcrt.dll	_CIlog10	cdecl	void	void	
 msvcrt.dll	_CIpow	cdecl	void	void	
@@ -3727,6 +3737,7 @@ msvcrt.dll	_exit	cdecl	void	void	status:i32:i32:1
 msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcrt.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcrt.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcrt.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcrt.dll	_memicmp	cdecl	i32	int	left:const void*:ptr:1|right:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
@@ -3764,6 +3775,7 @@ msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcrt.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcrt.dll	rand	cdecl	i32	int	

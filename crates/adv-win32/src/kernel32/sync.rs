@@ -650,6 +650,7 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(open_event_w_ABI);
     stdcall(reg, K32, "SetEvent", 1, |e| event::state_front(e, true));
     stdcall(reg, K32, "ResetEvent", 1, |e| event::state_front(e, false));
+    stdcall(reg, K32, "PulseEvent", 1, event::pulse_front);
     stdcall(reg, K32, "CreateSemaphoreA", 4, create_semaphore);
     stdcall(reg, K32, "CreateSemaphoreW", 4, create_semaphore);
     stdcall(reg, K32, "OpenSemaphoreA", 3, |env| {

@@ -141,6 +141,19 @@ pub(super) fn register(registry: &mut Registry) {
                 level: ImplementationLevel::Implement,
             });
         }
+        for (name, conv) in [
+            ("fprintf", Conv::CdeclVariadic { fixed: 2 }),
+            ("vfprintf", Conv::Cdecl { argc: 3 }),
+        ] {
+            registry.register(Api {
+                module,
+                name,
+                conv,
+                env_leaf: None,
+                handler: stream,
+                level: ImplementationLevel::Implement,
+            });
+        }
     }
 }
 fn write(env: &mut Env<'_>, pointer: u32, bytes: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
@@ -275,6 +288,82 @@ fn finish(
     }
     invalid_parameter_result(env, front.name, 34, u32::MAX)
 }
+fn float_profile(env: &mut Env<'_>) -> Option<&'static str> {
+    if locale::scalar_float_profile(env).is_none() {
+        Some("LC_NUMERIC/LC_CTYPE floating formatting profile is unavailable")
+    } else {
+        match env.cpu.fpu_environment() {
+            Ok(control) if control.x87_control & 0xc00 == 0 && control.mxcsr & 0x6000 == 0 => None,
+            Ok(_) => Some("non-nearest floating rounding mode is unavailable"),
+            Err(_) => Some("guest floating control state is unavailable"),
+        }
+    }
+}
+/// fprintf/vfprintf: format with the checked formatter, then write the bytes
+/// through the FILE's original handle from a transient heap block.
+fn stream(env: &mut Env<'_>) -> Outcome {
+    let va_list = env.sys.thunks.get(env.thunk).name == "vfprintf";
+    let front = Front {
+        name: if va_list { "vfprintf" } else { "fprintf" },
+        wide: false,
+        va_list,
+        mode: Mode::Unbounded,
+        fixed: if va_list { 3 } else { 2 },
+    };
+    let (file, format) = (env.arg(0), env.arg(1));
+    let values = if va_list {
+        env.arg(2)
+    } else {
+        env.cpu.reg(Reg::Esp).wrapping_add(12)
+    };
+    if format == 0 || file == 0 {
+        return invalid_parameter_result(env, front.name, 22, u32::MAX);
+    }
+    let format = match adv_abi::AnsiStr(GuestPtr::new(format)).read(env.cpu, crt::LIMIT + 1) {
+        Ok(format) => format,
+        Err(error) => return memory_failure(error),
+    };
+    let cp = locale::formatting_codepage(env);
+    let profile = float_profile(env);
+    let output = match crt::narrow_with_float_profile(env.cpu, cp, &format, values, profile) {
+        Ok((output, _)) => output,
+        Err(error) => return failure(env, front, 0, 0, error),
+    };
+    if output.is_empty() {
+        return Outcome::Return(0);
+    }
+    let length = output.len() as u32;
+    crate::native_heap::allocate_then(
+        env,
+        length,
+        false,
+        Box::new(move |env, buffer| {
+            if buffer == 0 {
+                return set_errno(env, 12);
+            }
+            if let Err(error) = env.cpu.write(buffer, &output) {
+                return memory_failure(error);
+            }
+            file::transfer(
+                env,
+                file,
+                buffer,
+                length,
+                true,
+                Box::new(move |env, result| {
+                    crate::native_heap::free_then(
+                        env,
+                        buffer,
+                        Box::new(move |env, _| match result {
+                            Ok(count) => Outcome::Return(count),
+                            Err(status) => file::error(env, status, u32::MAX),
+                        }),
+                    )
+                }),
+            )
+        }),
+    )
+}
 fn buffer(env: &mut Env<'_>) -> Outcome {
     let name = &env.sys.thunks.get(env.thunk).name;
     let front = *FRONTS
@@ -327,15 +416,7 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
     // Integer/string conversions retain their existing transport even when a
     // floating profile is unavailable. Only a floating conversion consumes
     // this reason and reports the qualified API warning through failure().
-    let float_profile = if locale::scalar_float_profile(env).is_none() {
-        Some("LC_NUMERIC/LC_CTYPE floating formatting profile is unavailable")
-    } else {
-        match env.cpu.fpu_environment() {
-            Ok(control) if control.x87_control & 0xc00 == 0 && control.mxcsr & 0x6000 == 0 => None,
-            Ok(_) => Some("non-nearest floating rounding mode is unavailable"),
-            Err(_) => Some("guest floating control state is unavailable"),
-        }
-    };
+    let float_profile = float_profile(env);
     if front.wide {
         let format = match adv_abi::WideStr(GuestPtr::new(format)).read(env.cpu, crt::LIMIT + 1) {
             Ok(format) => format,

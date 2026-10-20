@@ -6,6 +6,8 @@ pub struct DcClip {
     intersection: Option<[i32; 4]>,
     /// USER's current paint update region, separate from the application clip.
     paint_region: Option<Vec<[i32; 4]>>,
+    /// SelectClipRgn's disjoint device rectangles, before the limits above.
+    region: Option<Vec<[i32; 4]>>,
 }
 impl DcClip {
     pub const MAX_RECTANGLES: usize = 64;
@@ -22,7 +24,17 @@ impl DcClip {
         true
     }
     pub fn is_default(&self) -> bool {
-        self.excluded.is_empty() && self.intersection.is_none() && self.paint_region.is_none()
+        self.excluded.is_empty()
+            && self.intersection.is_none()
+            && self.paint_region.is_none()
+            && self.region.is_none()
+    }
+    /// SelectClipRgn replaces the application clip with a copy of `region`,
+    /// or removes it for NULL. The USER paint layer stays in force.
+    pub fn select_region(&mut self, region: Option<Vec<[i32; 4]>>) {
+        self.excluded.clear();
+        self.intersection = None;
+        self.region = region;
     }
     /// USER validates the bounded non-overlapping rectangle union before lending
     /// it to this DC. Returning the previous layer supports nested BeginPaint.
@@ -36,11 +48,13 @@ impl DcClip {
             excluded: self.excluded.clone(),
             intersection: self.intersection,
             paint_region: None,
+            region: self.region.clone(),
         }
     }
     pub fn restore_application(&mut self, saved: Self) {
         self.excluded = saved.excluded;
         self.intersection = saved.intersection;
+        self.region = saved.region;
     }
     pub fn intersect(&mut self, rect: [i32; 4]) {
         let [l, t, r, b] = rect;
@@ -59,13 +73,15 @@ impl DcClip {
         self.intersection = Some(rect);
     }
     pub fn contains(&self, x: i32, y: i32) -> bool {
+        let inside = |rects: &Vec<[i32; 4]>| {
+            rects
+                .iter()
+                .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+        };
         self.intersection
             .is_none_or(|[l, t, r, b]| x >= l && x < r && y >= t && y < b)
-            && self.paint_region.as_ref().is_none_or(|rects| {
-                rects
-                    .iter()
-                    .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
-            })
+            && self.paint_region.as_ref().is_none_or(inside)
+            && self.region.as_ref().is_none_or(inside)
             && !self
                 .excluded
                 .iter()
@@ -84,33 +100,10 @@ impl DcClip {
         if l >= r {
             return Vec::new();
         }
-        let mut spans = if let Some(rects) = &self.paint_region {
-            let mut spans = rects
-                .iter()
-                .filter_map(|&[a, t, z, b]| {
-                    if y < t || y >= b {
-                        return None;
-                    }
-                    let a = (a.max(0) as u32).max(l);
-                    let z = (z.max(0) as u32).min(r);
-                    (a < z).then_some((a, z))
-                })
-                .collect::<Vec<_>>();
-            spans.sort_unstable();
-            let mut joined: Vec<(u32, u32)> = Vec::new();
-            for (a, z) in spans {
-                if let Some(last) = joined.last_mut()
-                    && a <= last.1
-                {
-                    last.1 = last.1.max(z);
-                } else {
-                    joined.push((a, z));
-                }
-            }
-            joined
-        } else {
-            vec![(l, r)]
-        };
+        let mut spans = vec![(l, r)];
+        for rects in [&self.paint_region, &self.region].into_iter().flatten() {
+            spans = overlap(&spans, &row_spans(rects, y, l, r));
+        }
         for &[l, t, r, b] in &self.excluded {
             if y < t || y >= b {
                 continue;
@@ -225,8 +218,53 @@ impl DcClip {
             .chain(
                 self.paint_region
                     .iter()
+                    .chain(&self.region)
                     .flatten()
                     .flat_map(|r| [r[1], r[3]]),
             )
     }
+}
+
+/// Joined spans of `rects` in row `y`, limited to `l..r`.
+fn row_spans(rects: &[[i32; 4]], y: i32, l: u32, r: u32) -> Vec<(u32, u32)> {
+    let mut spans = rects
+        .iter()
+        .filter_map(|&[a, t, z, b]| {
+            if y < t || y >= b {
+                return None;
+            }
+            let a = (a.max(0) as u32).max(l);
+            let z = (z.max(0) as u32).min(r);
+            (a < z).then_some((a, z))
+        })
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut joined: Vec<(u32, u32)> = Vec::new();
+    for (a, z) in spans {
+        if let Some(last) = joined.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(z);
+        } else {
+            joined.push((a, z));
+        }
+    }
+    joined
+}
+
+/// Intersection of two sorted, disjoint span lists.
+fn overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < a.len() && j < b.len() {
+        let (l, r) = (a[i].0.max(b[j].0), a[i].1.min(b[j].1));
+        if l < r {
+            out.push((l, r));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
