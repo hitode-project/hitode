@@ -11,7 +11,7 @@ python3 tools/check.py --install-hook   # checks formatting, privacy, layering a
 python3 tools/check.py --fix            # applies formatting and regenerates generated tables
 python3 tools/check.py --ci             # the checks plus CI's Clippy gates; run before pushing
 cargo test -p adv-cpu                   # test the crates you changed
-cargo run -p adv-run --release -- --audio --codepage 932 path/to/game.exe
+cargo run -p adv-run --release -- --audio path/to/game.exe   # the code page is detected; --codepage 932|936 overrides
 ```
 
 Bring your own games and keep them anywhere outside the repository. Tools find them through the `ADV_SAMPLES` environment variable.
