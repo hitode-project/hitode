@@ -234,14 +234,15 @@ impl State {
         }
     }
 }
+/// Run one invocation. Keep the accepted semantic boundary identical to
+/// translation: callers run only shaders whose (cached) translation succeeded,
+/// since translating here would repeat it for every vertex.
 pub fn run(
     shader: &Shader,
     input: &Inputs,
     constants: &Constants,
     sampler: &mut dyn Sampler,
 ) -> Result<Outputs, Error> {
-    // Keep the interpreter's accepted semantic boundary identical to translation.
-    shader.translate()?;
     let mut st = State {
         r: [[0.0; 4]; 32],
         t: input.t,

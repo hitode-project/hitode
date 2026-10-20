@@ -65,6 +65,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
         }
         count = p.vertex_count as usize;
         let shader = shaders::bound(env, device.shaders.vertex?)?;
+        let translation = shader.translation.as_ref().ok()?;
         let constants = Constants {
             f: p.vertex_constants.floats,
             i: p.vertex_constants.integers,
@@ -76,7 +77,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             let input = vertex_input(p, n)?;
             let output =
                 interpreter::run(&shader.parsed, &input, &constants, &mut NoTextures).ok()?;
-            if point.is_some() && shader.translation.as_ref().ok()?.writes_point_size {
+            if point.is_some() && translation.writes_point_size {
                 margin = margin.max(1. + point_size(output.point_size)? * 0.5);
             }
             let mut position = output.position;
