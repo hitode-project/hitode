@@ -11,8 +11,8 @@ target/investigations/<topic>/<run>/
 target/scratch/<agent>/          # one-off scripts and intermediate files
 ```
 
-- Each run folder has a `cmd.txt` with the full command line and environment, the SHA-256 of the binary under test and the SHA-256 of the entry EXE.
-- Copy the runner into the run or topic folder's `bin/` before a run, with the FFmpeg libraries of a dynamic media build. A rebuild elsewhere then cannot replace it mid-run.
+- Each run folder records the full command line and environment, the SHA-256 of the binary under test and the SHA-256 of the entry EXE: `play_session.py` writes them to `session.json`, and other runs keep a `cmd.txt`.
+- Run a copy of the runner from the run or topic folder's `bin/`, with the FFmpeg libraries of a dynamic media build, so a rebuild elsewhere cannot replace it between or during runs. `play_session.py --pin-runner` does this.
 - Give each run its own `--data-dir`. Copy saves or settings from a seed folder with `play_session.py --seed-data`. Runs never share an overlay or write to the game folder.
 - Record the OS, host page size, engine and build with each result. Evidence from QEMU, cross builds, real hardware and self-written fixtures is not interchangeable.
 - Refer to games only through `$ADV_SAMPLES`. Traces, screenshots, dumps, disassembly, guest code bytes and guest instruction addresses stay local. Only statistics and conclusions go into the repository.

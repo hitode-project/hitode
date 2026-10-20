@@ -104,7 +104,7 @@ def main() -> None:
     parser.add_argument('--frames', type=int, default=120)
     parser.add_argument('--pairs', type=int, default=3)
     parser.add_argument('--timeout', type=float, default=300.0)
-    parser.add_argument('--codepage', choices=('932', '936'), default='932')
+    parser.add_argument('--codepage', choices=('auto', '932', '936'), default='auto')
     parser.add_argument('--backend', choices=('jit', 'interpreter'), default='jit')
     parser.add_argument('--audio', action='store_true')
     parser.add_argument('--mode', choices=('headless', 'hidden'), default='headless')

@@ -82,6 +82,25 @@ class PlaySessionTests(unittest.TestCase):
                 self.assertEqual("--d3d9-sm3" in command, sm3)
                 self.assertEqual(metadata["command"], command)
 
+    def test_pinned_runner_and_its_libraries_run_from_the_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            args = self.args(root, pin_runner=True)
+            (root / "libavcodec.62.dylib").write_bytes(b"library")
+            (root / "notes.txt").write_text("not copied")
+            (command, _), metadata = self.launch(args)
+            pinned = args.output / "bin" / "runner.exe"
+            self.assertEqual(command[0], str(pinned))
+            self.assertTrue((args.output / "bin" / "libavcodec.62.dylib").is_file())
+            self.assertFalse((args.output / "bin" / "notes.txt").exists())
+            self.assertEqual(metadata["command"][0], str(pinned))
+
+    def test_code_page_defaults_to_detection(self):
+        args = play_session.build_parser().parse_args(
+            ["--binary", "b", "--exe", "e", "--schedule", "s", "--output", "o"])
+        self.assertEqual(args.codepage, "auto")
+        self.assertFalse(args.pin_runner)
+
     def args(self, root, **changes):
         binary = root / "runner.exe"
         game = root / "fixture.exe"

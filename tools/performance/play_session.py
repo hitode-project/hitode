@@ -14,6 +14,8 @@ session.json records whether the hardware was requested to be muted.
 Tracing is off by default; --trace writes api.trace for compatibility diagnosis
 and marks the session unsuitable for performance comparison.
 --d3d9-sm3 explicitly opts into the runner's SM3 capability profile; SM2 is the default.
+--pin-runner runs a copy of the binary from OUTPUT/bin; session.json records
+the SHA-256 of what actually ran.
 Native caching/static discovery are default; --no-code-cache diagnoses failures.
 --warm-code-cache
 imports a previous local archive into the new overlay. --cold clears both caches.
@@ -101,6 +103,17 @@ def preserve_failure(send, output: Path) -> None:
     send(f"capture {output / 'blocked.png'}")
 
 
+def pin_runner(executable: Path, bin_dir: Path) -> Path:
+    """Copy the runner and the dynamic libraries beside it into bin_dir."""
+    bin_dir.mkdir(parents=True)
+    for library in executable.parent.glob("*"):
+        if library.is_file() and re.search(r"\.(dylib|so(\.\d+)*|dll)$", library.name):
+            shutil.copy2(library, bin_dir / library.name)
+    pinned = bin_dir / executable.name
+    shutil.copy2(executable, pinned)
+    return pinned
+
+
 def run(args: argparse.Namespace) -> None:
     scene = load_scene(args.schedule)
     steps = scene["steps"] if scene else load_schedule(args.schedule)
@@ -112,6 +125,8 @@ def run(args: argparse.Namespace) -> None:
         shutil.copytree(args.seed_data.resolve(strict=True), output / "overlay",
                         ignore=shutil.ignore_patterns("*.lock"))
     executable = args.binary.resolve(strict=True)
+    if getattr(args, "pin_runner", False):
+        executable = pin_runner(executable, output / "bin")
     game = args.exe.resolve(strict=True)
     duration = max(15.0, float(scene["timeout_seconds"]) if scene else float(steps[-1]["at"]) + args.tail_seconds)
     command = [str(executable), str(game), "--control-stdin", "--codepage", str(args.codepage),
@@ -281,7 +296,7 @@ def run(args: argparse.Namespace) -> None:
             (output / "session.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--exe", required=True, type=Path)
@@ -293,7 +308,10 @@ if __name__ == "__main__":
                         help="automatic dialog delay; zero leaves dialogs pending")
     parser.add_argument("--seed-data", type=Path, help="copy an existing runtime data root into the isolated overlay")
     parser.add_argument("--mode", choices=("headless", "hidden", "window"), default="headless")
-    parser.add_argument("--codepage", choices=(932, 936), type=int, default=936)
+    parser.add_argument("--codepage", choices=("auto", "932", "936"), default="auto",
+                        help="guest ANSI code page; auto detects it as adv-run does")
+    parser.add_argument("--pin-runner", action="store_true",
+                        help="run a copy of --binary (and FFmpeg libraries beside it) from OUTPUT/bin, so a rebuild cannot swap it")
     parser.add_argument("--audio", action="store_true")
     parser.add_argument("--mute-audio", action="store_true",
                         help="mute hardware output without diagnostics; requires --audio and --mode hidden/window")
@@ -315,6 +333,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-tiering", action="store_true",
                         help="disable Fast-to-Speed promotion for matched worker comparisons")
     parser.add_argument("--tail-seconds", type=float, default=3)
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
     options = parser.parse_args()
     if not math.isfinite(options.tail_seconds) or not 0 <= options.tail_seconds <= 3600:
         parser.error("tail seconds must be finite and within 0..3600")
