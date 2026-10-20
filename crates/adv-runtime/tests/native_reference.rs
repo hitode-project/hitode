@@ -12,22 +12,28 @@ use std::path::{Path, PathBuf};
 #[path = "support/cpu.rs"]
 mod cpu;
 
-/// Recordings that do not match yet on non-Windows hosts, with what differs.
-/// A listed recording still runs, and fails the test once it matches so the
-/// entry is removed when its cause is fixed.
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "drawtext-lines",
-        "glyph pixel hashes differ where host fonts stand in",
-    ),
-    (
-        "nls-compare",
-        "linguistic comparison results differ from Windows",
-    ),
-    (
-        "window-property",
-        "three property scalars differ from Windows",
-    ),
+/// Recordings that do not match yet on non-Windows hosts. Each entry names
+/// the host-dependent scalars, or every scalar when it is `None`; the others
+/// are still compared. A whole-recording entry fails the test once the
+/// recording matches, so it is removed when its cause is fixed.
+struct Known {
+    name: &'static str,
+    reason: &'static str,
+    scalars: Option<fn(usize) -> bool>,
+}
+
+const KNOWN: &[Known] = &[
+    Known {
+        name: "drawtext-lines",
+        // Each case records height, rectangle, then pixel hash and changed pixel count.
+        reason: "glyph pixels come from the host rasterizer, not GDI",
+        scalars: Some(|index| index % 7 >= 5),
+    },
+    Known {
+        name: "nls-compare",
+        reason: "portable collation compares code units until Windows sort weights are ported",
+        scalars: None,
+    },
 ];
 
 /// (executable, native output) of one recording folder.
@@ -68,7 +74,9 @@ fn recorded_fixtures_match_native_windows_on_every_backend() {
     let mut failures = Vec::new();
     for folder in folders {
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
-        let known = !cfg!(windows) && KNOWN.iter().any(|(known, _)| *known == name);
+        let known = KNOWN
+            .iter()
+            .find(|known| !cfg!(windows) && known.name == name);
         let before = failures.len();
         let (exe, native) = recording(&folder);
         let expected = std::fs::read(&native).unwrap();
@@ -104,6 +112,11 @@ fn recorded_fixtures_match_native_windows_on_every_backend() {
                 .enumerate()
                 .filter(|(_, (a, e))| a != e)
                 .map(|(index, _)| index)
+                .filter(|&index| {
+                    !known
+                        .and_then(|k| k.scalars)
+                        .is_some_and(|host| host(index))
+                })
                 .collect();
             if !differing.is_empty() {
                 failures.push(format!(
@@ -111,12 +124,17 @@ fn recorded_fixtures_match_native_windows_on_every_backend() {
                 ));
             }
         }
-        if known {
+        if let Some(Known {
+            reason,
+            scalars: None,
+            ..
+        }) = known
+        {
             if failures.len() == before {
                 failures.push(format!("{name} now matches native; remove it from KNOWN"));
             } else {
                 let notes: Vec<_> = failures.drain(before..).collect();
-                eprintln!("known difference: {}", notes.join("; "));
+                eprintln!("known difference ({reason}): {}", notes.join("; "));
             }
         }
     }
