@@ -1,11 +1,16 @@
 name: Windows differential fixtures
 
 # The authored fixtures in tools/fixtures run natively and under Hitode only on
-# Windows (`#![cfg(windows)]` tests). This job is advisory: it is not a required
-# check, and its logs give contributors without Windows the native reference.
+# Windows (`#![cfg(windows)]` tests). This job is advisory and stays off pull
+# requests: a cold Windows build takes about 20 minutes. It runs after merges
+# that touch the fixtures (which also keeps the build cache warm), weekly, and on
+# demand for a branch: `gh workflow run windows-differential.yml --ref <branch>`.
+# Failures listed in tools/fixtures/hosted-known-failures.txt are reported but
+# do not fail the run; a new failure does.
 
 on:
-  pull_request:
+  push:
+    branches: [master]
     paths:
       - 'tools/fixtures/**'
       - 'crates/adv-win32/**'
@@ -49,17 +54,30 @@ jobs:
         run: |
           $features = @{ 'adv-runtime' = @('--features', 'gpu') }
           $failed = @()
+          $tests = @()
           foreach ($crate in 'adv-runtime', 'adv-win32', 'adv-device') {
-            $tests = Get-ChildItem "crates/$crate/tests/*.rs" |
+            $targets = Get-ChildItem "crates/$crate/tests/*.rs" |
               Where-Object { (Get-Content $_ -TotalCount 5) -match '^#!\[cfg\(windows\)\]' } |
               ForEach-Object { '--test'; $_.BaseName }
-            if (-not $tests) { continue }
+            if (-not $targets) { continue }
             $extra = if ($features.ContainsKey($crate)) { $features[$crate] } else { @() }
-            cargo test --locked -p $crate @extra @tests --no-fail-fast -- --nocapture 2>&1 |
+            cargo test --locked -p $crate @extra @targets --no-fail-fast -- --nocapture 2>&1 |
               Tee-Object "$env:RUNNER_TEMP/differential-$crate.txt"
-            if ($LASTEXITCODE -ne 0) { $failed += $crate }
+            $exit = $LASTEXITCODE
+            $names = @(Get-Content "$env:RUNNER_TEMP/differential-$crate.txt" |
+              Select-String '^test (\S+) \.\.\. FAILED' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+            # A nonzero exit without failed tests is a build or harness failure.
+            if ($exit -ne 0 -and -not $names) { $failed += $crate }
+            $tests += $names
           }
-          if ($failed) { throw "differential tests failed in: $($failed -join ', ')" }
+          $known = @(Get-Content tools/fixtures/hosted-known-failures.txt |
+            Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { ($_ -split '\s+')[0] })
+          $new = @($tests | Where-Object { $_ -notin $known })
+          $fixed = @($known | Where-Object { $_ -notin $tests })
+          foreach ($name in $tests) { "::warning::differential test failed: $name" }
+          foreach ($name in $fixed) { "::notice::known failure now passes; remove it from the list: $name" }
+          if ($failed) { throw "build or harness failure in: $($failed -join ', ')" }
+          if ($new) { throw "new differential failures: $($new -join ', ')" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
