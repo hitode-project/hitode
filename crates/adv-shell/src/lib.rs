@@ -1874,6 +1874,15 @@ fn run_execution(
                             Err(format!("text posted {posted} of {total} characters"))
                         }
                     }
+                    control::Command::Activate(active) => {
+                        // The path a frontend uses when the host app gains or loses activation.
+                        if runtime.post_input(0x1c, u32::from(active), 0) {
+                            inputs += 1;
+                            Ok(format!("activate {}", u8::from(active)))
+                        } else {
+                            Err("activation has no guest target window".into())
+                        }
+                    }
                     control::Command::Memory(address, len) => {
                         runtime.inspect_memory(address, len).map(|bytes| {
                             let hex = bytes

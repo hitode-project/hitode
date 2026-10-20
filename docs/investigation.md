@@ -124,6 +124,7 @@ python3 tools/debug/hitode_debug.py [--pid PID]        # prompt; or append one c
 
 - Input: `click X Y`, `move X Y`, `mouse-down X Y`, `mouse-up X Y`, `right-mouse-down X Y`, `right-mouse-up X Y`, `key VK`, `key-down VK`, `key-up VK` and `text STRING`.
 - Menus and dialogs: `menus`, `menu ID`, `dialogs`, `dialog ID`, `dialog-track ID VALUE` and `dialog-close`.
+- App activation: `activate 0` and `activate 1`, as a frontend reports switching away and back.
 - Records: `capture PATH`, `report PATH` and `memory ADDR LEN`.
 - Measurement and flow: `reset-metrics`, `await-frame HASH TIMEOUT_MS ...`, `resume` and `close`.
 
