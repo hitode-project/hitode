@@ -1,4 +1,5 @@
 //! Explicit guest readback uses the one background worker and Machine waits.
+//! GetRenderTargetData into a plain surface returns early; CPU readers settle it.
 use super::*;
 use adv_abi::types::{D3DLOCKED_RECT, D3DSURFACE_DESC};
 use adv_device::{
@@ -22,11 +23,19 @@ pub(super) struct PendingTransfer {
     job: Option<Task>,
     result: Option<u32>,
     lock_output: Option<GuestPtr<D3DLOCKED_RECT>>,
+    /// GetRenderTargetData into a plain surface returned before the copy
+    /// finished. CPU readers of the destination settle it first.
+    detached: bool,
+}
+impl PendingTransfer {
+    pub(super) fn detached(&self) -> bool {
+        self.detached
+    }
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
         create_offscreen_ABI,
-        transfer_ABI,
+        transfer_detached_ABI,
         front_ABI,
         lock_ABI,
         unlock_ABI,
@@ -164,6 +173,11 @@ pub(super) fn lock_internal(
     rect: GuestPtr<RECT>,
     flags: u32,
 ) -> Outcome {
+    if let Some(outcome) = settle(env, this.addr(), move |env| {
+        lock_internal(env, this, output, rect, flags)
+    }) {
+        return outcome;
+    }
     if let Some(r) = resources::resource(env, this.addr()) {
         let owner = r.device;
         if recording::has_work(env, owner) {
@@ -272,6 +286,7 @@ pub(super) fn lock_internal(
             job: None,
             result: None,
             lock_output: Some(output),
+            detached: false,
         },
     )
 }
@@ -438,17 +453,39 @@ pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled:
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]
+fn transfer_detached(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    source: GuestPtr<()>,
+    destination: GuestPtr<()>,
+) -> Outcome {
+    read_target(env, this, source, destination, true)
+}
 pub(super) fn transfer(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
 ) -> Outcome {
+    read_target(env, this, source, destination, false)
+}
+fn read_target(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    source: GuestPtr<()>,
+    destination: GuestPtr<()>,
+    detach: bool,
+) -> Outcome {
+    if let Some(outcome) = settle(env, destination.addr(), move |env| {
+        read_target(env, this, source, destination, detach)
+    }) {
+        return outcome;
+    }
     if let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr())
         && recording::has_work(env, owner)
     {
         return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
-            transfer(env, this, source, destination)
+            read_target(env, this, source, destination, detach)
         });
     }
     let Some(owner) = com(env)
@@ -493,6 +530,7 @@ pub(super) fn transfer(
         return Outcome::Return(INVALID);
     };
     let format = dst.desc.Format;
+    let detach = detach && dst.container.is_none();
     let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
         return Outcome::Return(INVALID);
     };
@@ -507,23 +545,66 @@ pub(super) fn transfer(
         Ok(event) => event,
         Err(error) => return Outcome::Return(error),
     };
-    enqueue(
-        env,
-        PendingTransfer {
-            context: env.context,
-            event,
-            owner,
-            destination,
-            image,
-            storage,
-            length,
-            format,
-            ticket: None,
-            job: None,
-            result: None,
-            lock_output: None,
+    let mut transfer = PendingTransfer {
+        context: env.context,
+        event,
+        owner,
+        destination,
+        image,
+        storage,
+        length,
+        format,
+        ticket: None,
+        job: None,
+        result: None,
+        lock_output: None,
+        detached: false,
+    };
+    if detach {
+        // The copy is queued now, in submission order with the guest's draws,
+        // so returning early never lets a later frame reach these pixels.
+        if advance(env, &mut transfer) {
+            env.sys.set_event(event);
+        } else if transfer.ticket.is_some() {
+            transfer.detached = true;
+            env.ext.get_mut::<State>().transfers.push(transfer);
+            return Outcome::Return(0);
+        }
+    }
+    enqueue(env, transfer)
+}
+/// Wait for a detached readback into `pointer`'s resource, then retry.
+pub(super) fn settle(
+    env: &mut Env<'_>,
+    pointer: u32,
+    retry: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Option<Outcome> {
+    let state = env.ext.try_get::<State>()?;
+    if state.transfers.iter().all(|t| !t.detached) {
+        return None;
+    }
+    let id = com(env).identity::<Payload>(&env.sys.objects, pointer)?;
+    let id = resources::binding_owner(env, id);
+    let event = env
+        .ext
+        .get::<State>()
+        .transfers
+        .iter()
+        .find(|t| t.detached && t.destination == id)?
+        .event;
+    // Completion closes the transfer's own handle; this alias keeps the
+    // event alive for the waiter.
+    let handle = env.sys.objects.duplicate(event)?;
+    Some(Outcome::block(
+        Wait::Object {
+            handle,
+            deadline: None,
         },
-    )
+        move |env, _| {
+            env.sys.objects.close(handle);
+            retry(env)
+        },
+    ))
 }
 fn retain_transfer(env: &mut Env<'_>, owner: Id, destination: Id) -> Result<u32, u32> {
     if !com(env).retain_internal(&mut env.sys.objects, owner) {
@@ -647,96 +728,104 @@ pub(super) fn pump(env: &mut Env<'_>) -> bool {
     let transfers = std::mem::take(&mut env.ext.get_mut::<State>().transfers);
     let mut progress = false;
     for mut transfer in transfers {
-        if env
-            .sys
-            .contexts
-            .get(transfer.context as usize)
-            .is_none_or(|ctx| ctx.is_done())
+        // A detached readback outlives its calling thread; the copy belongs
+        // to the destination surface.
+        if !transfer.detached
+            && env
+                .sys
+                .contexts
+                .get(transfer.context as usize)
+                .is_none_or(|ctx| ctx.is_done())
         {
             cleanup(env, transfer);
             continue;
         }
-        if transfer.result.is_none() {
-            if transfer.ticket.is_none() {
-                let wake = env.ext.get::<State>().wake.clone();
-                let mut gpu = env
-                    .ext
-                    .get_mut::<State>()
-                    .gpu
-                    .take()
-                    .expect("installed readback GPU");
-                let result = gpu.readback(&transfer.image, wake);
-                env.ext.get_mut::<State>().gpu = Some(gpu);
-                match result {
-                    Ok(mut ticket) => {
-                        transfer.job = Some(
-                            Task::new(ticket.take_completion_job().unwrap())
-                                .finish_on_shutdown()
-                                .without_wake(),
-                        );
-                        transfer.ticket = Some(ticket);
-                    }
-                    Err(Error::Busy) => {}
-                    Err(_) => transfer.result = Some(DEVICE_LOST),
-                }
-            }
-            if let Some(job) = transfer.job.take() {
-                let sender = env.ext.get::<State>().sender.clone().unwrap();
-                match sender.borrow_mut().try_submit(Priority::Urgent, job) {
-                    Ok(_) => {}
-                    Err(TrySendError::Full(job)) => transfer.job = Some(job),
-                    Err(TrySendError::Disconnected(_)) => {
-                        transfer.ticket.as_ref().unwrap().cancel();
-                        transfer.result = Some(DEVICE_LOST);
-                    }
-                }
-            }
-            if transfer.result.is_none()
-                && let Some(ticket) = &mut transfer.ticket
-                && let Some(result) = ticket.poll()
-            {
-                transfer.result = Some(match result {
-                    Ok(pixels)
-                        if pixels.len()
-                            == transfer.image.width() as usize
-                                * transfer.image.height() as usize
-                                * 4 =>
-                    {
-                        match format::readback(transfer.format, pixels)
-                            .filter(|pixels| pixels.len() == transfer.length as usize)
-                        {
-                            Some(pixels) => {
-                                // A different guest thread can change protection while
-                                // this thread is blocked. Revalidate the complete span
-                                // before committing any bytes on every backend.
-                                if adv_abi::guest::check_range(
-                                    env.cpu,
-                                    transfer.storage,
-                                    transfer.length,
-                                    Prot::WRITE,
-                                )
-                                .is_ok()
-                                    && env.cpu.write(transfer.storage, &pixels).is_ok()
-                                {
-                                    0
-                                } else {
-                                    INVALID
-                                }
-                            }
-                            None => DEVICE_LOST,
-                        }
-                    }
-                    _ => DEVICE_LOST,
-                });
-            }
-            if transfer.result.is_some() {
-                env.sys.set_event(transfer.event);
-                progress = true;
+        if transfer.result.is_none() && advance(env, &mut transfer) {
+            env.sys.set_event(transfer.event);
+            progress = true;
+            if transfer.detached {
+                cleanup(env, transfer);
+                continue;
             }
         }
         env.ext.get_mut::<State>().transfers.push(transfer);
     }
     progress
+}
+
+/// Start, submit and poll one readback; true once it has a result.
+fn advance(env: &mut Env<'_>, transfer: &mut PendingTransfer) -> bool {
+    if transfer.ticket.is_none() {
+        let wake = env.ext.get::<State>().wake.clone();
+        let mut gpu = env
+            .ext
+            .get_mut::<State>()
+            .gpu
+            .take()
+            .expect("installed readback GPU");
+        let result = gpu.readback(&transfer.image, wake);
+        env.ext.get_mut::<State>().gpu = Some(gpu);
+        match result {
+            Ok(mut ticket) => {
+                transfer.job = Some(
+                    Task::new(ticket.take_completion_job().unwrap())
+                        .finish_on_shutdown()
+                        .without_wake(),
+                );
+                transfer.ticket = Some(ticket);
+            }
+            Err(Error::Busy) => {}
+            Err(_) => transfer.result = Some(DEVICE_LOST),
+        }
+    }
+    if let Some(job) = transfer.job.take() {
+        let sender = env.ext.get::<State>().sender.clone().unwrap();
+        match sender.borrow_mut().try_submit(Priority::Urgent, job) {
+            Ok(_) => {}
+            Err(TrySendError::Full(job)) => transfer.job = Some(job),
+            Err(TrySendError::Disconnected(_)) => {
+                transfer.ticket.as_ref().unwrap().cancel();
+                transfer.result = Some(DEVICE_LOST);
+            }
+        }
+    }
+    if transfer.result.is_none()
+        && let Some(ticket) = &mut transfer.ticket
+        && let Some(result) = ticket.poll()
+    {
+        transfer.result = Some(match result {
+            Ok(pixels)
+                if pixels.len()
+                    == transfer.image.width() as usize * transfer.image.height() as usize * 4 =>
+            {
+                match format::readback(transfer.format, pixels)
+                    .filter(|pixels| pixels.len() == transfer.length as usize)
+                {
+                    Some(pixels) => {
+                        // A different guest thread can change protection while
+                        // this thread is blocked. Revalidate the complete span
+                        // before committing any bytes on every backend.
+                        if adv_abi::guest::check_range(
+                            env.cpu,
+                            transfer.storage,
+                            transfer.length,
+                            Prot::WRITE,
+                        )
+                        .is_ok()
+                            && env.cpu.write(transfer.storage, &pixels).is_ok()
+                        {
+                            0
+                        } else {
+                            INVALID
+                        }
+                    }
+                    None => DEVICE_LOST,
+                }
+            }
+            _ => DEVICE_LOST,
+        });
+    }
+    transfer.result.is_some()
 }
 
 #[cfg(test)]

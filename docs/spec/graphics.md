@@ -151,6 +151,11 @@ liveness tracks logical resource levels and attachment aspects. Dead frames use
 GFX-REC-2; these and dead passes are the only whole-frame/pass omissions.
 Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
+### GFX-REC-10 Detached render-target readback
+
+**Rule**: GetRenderTargetData into a plain system-memory surface MUST queue its copy in submission order and return before completion. LockRect, GetDC, surface export and another readback into that surface MUST wait for the copy first. Texture-level destinations and a busy readback lane MUST keep the blocking path.
+**Verification**: Test
+
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
 **Rule**: When the host display rate is within 1% of a whole multiple of the guest refresh rate, Present boundaries MUST fall on host vsyncs. An on-time boundary MUST follow the previous one by exactly that multiple of vsyncs. A late Present MUST wait for the next vsync without repaying missed frames, and other rates MUST keep machine-clock boundaries.

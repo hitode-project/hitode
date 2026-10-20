@@ -173,6 +173,9 @@ pub(crate) fn readable_surface(env: &mut Env<'_>, source: u32) -> Outcome {
     if env.ext.try_get::<State>().is_none() {
         return Outcome::Return(INVALID);
     }
+    if let Some(outcome) = readback::settle(env, source, move |env| readable_surface(env, source)) {
+        return outcome;
+    }
     let Some(resource) = resources::resource(env, source) else {
         return Outcome::Return(INVALID);
     };
