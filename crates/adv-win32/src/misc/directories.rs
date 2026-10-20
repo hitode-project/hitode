@@ -255,7 +255,7 @@ mod tests {
             ansi(&mut f, "");
             assert_eq!(f.call(module, "MakeSureDirectoryPathExists", &[DATA]), 0);
         }
-        std::fs::write(f.root.join("game/owned-file"), b"fixture").unwrap();
+        adv_os::vfs::host::write(&f.root.join("game/owned-file"), b"fixture").unwrap();
         ansi(&mut f, "owned-file\\child\\");
         assert_eq!(
             f.call("imagehlp.dll", "MakeSureDirectoryPathExists", &[DATA]),

@@ -357,8 +357,8 @@ fn native_host_mutations_follow_opened_instance_and_share_the_existing_cursor() 
         .lookup("original.dat")
         .unwrap();
     let renamed = original.parent().unwrap().join("renamed.dat");
-    std::fs::rename(&original, &renamed).unwrap();
-    std::fs::write(&original, b"replacement").unwrap();
+    adv_os::vfs::host::rename(&original, &renamed).unwrap();
+    adv_os::vfs::host::write(&original, b"replacement").unwrap();
     let mut basic = [0; 40];
     basic[32..36].copy_from_slice(&0x80u32.to_le_bytes());
     machine.cpu.write(DATA, &basic).unwrap();

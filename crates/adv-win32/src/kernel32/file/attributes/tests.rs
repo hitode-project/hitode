@@ -289,13 +289,13 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
         drop(old);
     }
     #[cfg(not(windows))]
-    std::fs::remove_file(&owned).unwrap(); // Attribute lifetime, independent of host NT support.
+    adv_os::vfs::host::remove_file(&owned).unwrap(); // Attribute lifetime, independent of host NT support.
     assert_eq!(
         invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
         u32::MAX
     );
     assert_eq!(error(&mut machine), 2);
-    std::fs::write(&owned, b"new").unwrap();
+    adv_os::vfs::host::write(&owned, b"new").unwrap();
     let new = std::fs::File::open(&owned).unwrap();
     assert_ne!(old_identity, adv_os::vfs::file_identity(&new).unwrap());
     assert_eq!(invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]), 32);
@@ -304,7 +304,7 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
         1
     );
     let renamed = owned.with_file_name("renamed.dat");
-    std::fs::rename(&owned, &renamed).unwrap();
+    adv_os::vfs::host::rename(&owned, &renamed).unwrap();
     ansi(&mut machine, DATA + 0x400, b".\\renamed.dat");
     assert_eq!(
         invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
@@ -312,7 +312,7 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
     );
     std::fs::write(&renamed, b"subsequent backing write").unwrap();
     assert_eq!(invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]), 32);
-    std::fs::write(root.join("game/switch.dat"), b"base").unwrap();
+    adv_os::vfs::host::write(&root.join("game/switch.dat"), b"base").unwrap();
     ansi(&mut machine, DATA + 0x400, b".\\switch.dat");
     assert_eq!(
         invoke(&mut machine, set_a_ABI.handler, &[DATA + 0x400, 128]),
@@ -324,7 +324,7 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
         .vfs
         .write_path("switch.dat")
         .unwrap();
-    std::fs::write(overlay, b"overlay").unwrap();
+    adv_os::vfs::host::write(&overlay, b"overlay").unwrap();
     assert_eq!(invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]), 32);
     assert_eq!(
         std::fs::read(root.join("game/switch.dat")).unwrap(),
@@ -662,6 +662,58 @@ fn wide_path_exists_uses_attributes_and_preserves_null_error() {
             error
         );
     }
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// spec: WIN32-API-15, A64-CTL-12
+#[test]
+fn attribute_leaves_match_handlers_and_decline_system_images() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), "leaves");
+    machine.spawn("attributes", PARK_ADDR, &[], 65536).unwrap();
+    machine.cpu.set_reg(Reg::Esp, DATA);
+    std::fs::write(root.join("game/State.dat"), b"original").unwrap();
+    std::fs::create_dir(root.join("game/Folder")).unwrap();
+    let leaf = |machine: &mut Machine<JitCpu>, wide: bool, pointer: u32| {
+        machine.cpu.write_u32(DATA + 4, pointer).unwrap();
+        crate::util::set_last_error(&mut env(machine), 0x1357);
+        get_leaf(&mut env(machine), wide).map(|value| (value as u32, error(machine)))
+    };
+    let trap = |machine: &mut Machine<JitCpu>, wide: bool, pointer: u32| {
+        crate::util::set_last_error(&mut env(machine), 0x1357);
+        let handler = if wide { get_w_ABI } else { get_a_ABI }.handler;
+        (invoke(machine, handler, &[pointer]), error(machine))
+    };
+    for path in [
+        ".\\state.DAT",
+        "folder",
+        ".\\missing.dat",
+        ".\\absent\\missing.dat",
+        "",
+    ] {
+        ansi(&mut machine, DATA + 0x400, path.as_bytes());
+        wide(&mut machine, DATA + 0x600, path);
+        for (is_wide, pointer) in [(false, DATA + 0x400), (true, DATA + 0x600)] {
+            let expected = trap(&mut machine, is_wide, pointer);
+            assert_eq!(
+                leaf(&mut machine, is_wide, pointer),
+                Some(expected),
+                "{path}"
+            );
+        }
+    }
+    machine.cpu.write(DATA + 0x600, &[0, 0xd8, 0, 0]).unwrap();
+    for pointer in [0, 0xdead0000, DATA + 0x600] {
+        let expected = trap(&mut machine, true, pointer);
+        assert_eq!(leaf(&mut machine, true, pointer), Some(expected));
+    }
+    wide(
+        &mut machine,
+        DATA + 0x600,
+        "C:\\Windows\\system32\\kernel32.dll",
+    );
+    assert_eq!(leaf(&mut machine, true, DATA + 0x600), None);
+    assert_eq!(error(&mut machine), 0x1357);
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }

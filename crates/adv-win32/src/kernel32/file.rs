@@ -374,12 +374,14 @@ pub(crate) fn open_with_share(
                 w.vfs
                     .write_path(&guest)
                     .map_or(Err(std::io::ErrorKind::NotFound.into()), |p| {
-                        std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create(true)
-                            .truncate(false)
-                            .open(p)
+                        adv_os::vfs::host::open(
+                            std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .create(true)
+                                .truncate(false),
+                            &p,
+                        )
                     })
             }
             _ => Err(std::io::ErrorKind::NotFound.into()),
@@ -411,18 +413,20 @@ pub(crate) fn open_with_share(
                             return INVALID_HANDLE_VALUE;
                         }
                     };
-                    if let Err(error) = std::fs::copy(src, &dst) {
+                    if let Err(error) = adv_os::vfs::host::copy(src, &dst) {
                         io_error(env, &error);
                         return INVALID_HANDLE_VALUE;
                     }
                     transfer = Some((old, dst.clone()));
                 }
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(truncate)
-                    .open(dst)
+                adv_os::vfs::host::open(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(truncate),
+                    &dst,
+                )
             }
         }
     };
@@ -1115,7 +1119,7 @@ pub(crate) fn create_directory_path(env: &Env<'_>, path: &str) -> Result<(), u32
         return Err(err::PATH_NOT_FOUND);
     }
     let destination = w.vfs.write_path(path).ok_or(err::PATH_NOT_FOUND)?;
-    std::fs::create_dir(destination).map_err(|error| match error.kind() {
+    adv_os::vfs::host::create_dir(&destination).map_err(|error| match error.kind() {
         std::io::ErrorKind::AlreadyExists => err::ALREADY_EXISTS,
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => err::PATH_NOT_FOUND,
         std::io::ErrorKind::PermissionDenied => err::ACCESS_DENIED,

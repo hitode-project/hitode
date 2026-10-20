@@ -129,7 +129,7 @@ fn diagnostic_wsprintf(e: &mut Env<'_>) -> Outcome {
     if let Some((path, message)) = diagnostic {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
+            .create(true) // host-only: diagnostic file named by the host environment
             .append(true)
             .open(path)
         {
@@ -158,7 +158,7 @@ fn diagnostic_peek(e: &mut Env<'_>) -> Outcome {
             .map(|i| e.cpu.read_u32(pointer + i * 4).ok())
             .collect();
         if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
+            .create(true) // host-only: diagnostic file named by the host environment
             .append(true)
             .open(path)
         {

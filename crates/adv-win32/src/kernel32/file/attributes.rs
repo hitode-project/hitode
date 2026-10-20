@@ -93,6 +93,37 @@ fn get(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
     )
 }
 
+/// EnvLeaf over the VFS view (WIN32-API-15). Live NT attribute providers call
+/// back into the guest and synthetic system images may load on first use, so
+/// both decline before any side effect.
+fn get_leaf(env: &mut Env<'_>, wide: bool) -> Option<u64> {
+    for name in ["NtQueryAttributesFile", "NtQueryFullAttributesFile"] {
+        if !matches!(super::native::overridden(env, name), Ok(None)) {
+            return None;
+        }
+    }
+    let pointer = env.arg(0);
+    let api = if wide {
+        "kernel32.dll!GetFileAttributesW"
+    } else {
+        "kernel32.dll!GetFileAttributesA"
+    };
+    let result = match path(env, pointer, wide, api) {
+        Ok(path) => {
+            let guest = env.ext.get::<Win32>().vfs.normalize(&path);
+            if adv_os::loader::is_system_path(&guest) {
+                return None;
+            }
+            file_attributes_path(env, &path, api).unwrap_or(u32::MAX)
+        }
+        Err(error) => {
+            set_last_error(env, error);
+            u32::MAX
+        }
+    };
+    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(result))
+}
+
 pub(crate) fn file_attributes_path_then(
     env: &mut Env<'_>,
     path: &str,
@@ -257,4 +288,10 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(get_w_ABI);
     registry.register(set_a_ABI);
     registry.register(set_w_ABI);
+    registry.set_env_leaf("kernel32.dll", "GetFileAttributesA", |env| {
+        get_leaf(env, false)
+    });
+    registry.set_env_leaf("kernel32.dll", "GetFileAttributesW", |env| {
+        get_leaf(env, true)
+    });
 }

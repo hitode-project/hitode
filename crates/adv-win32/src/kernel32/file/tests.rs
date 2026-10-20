@@ -443,6 +443,7 @@ fn copy_reads_unflushed_shared_source_in_bounded_chunks_and_retargets_old_target
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         return;
     }
+    adv_os::vfs::host::changed(&root.join("game/alias.bin"));
     for target in ["source.bin", "SOURCE.bin", "alias.bin"] {
         assert_eq!(
             returned(copy_file(

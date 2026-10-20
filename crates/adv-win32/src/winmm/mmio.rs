@@ -272,7 +272,7 @@ fn open(e: &mut Env<'_>) -> Outcome {
         let mut magic = [0u8; 64];
         let got = file.read_at(e.cpu, 0, &mut magic).unwrap_or(0);
         if let Ok(mut trace) = std::fs::OpenOptions::new()
-            .create(true)
+            .create(true) // host-only: diagnostic file named by the host environment
             .append(true)
             .open(path)
         {
