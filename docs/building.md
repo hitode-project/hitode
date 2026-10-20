@@ -41,7 +41,7 @@ python3 -m unittest discover -s tools/<folder>
 
 - Run the tests of the crates you changed. The full workspace suite is for batched changes and baseline updates.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
-- Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow for pull requests that touch fixtures or `adv-win32`, weekly and on demand; without Windows, read the native results in its logs.
+- Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow after merges that touch fixtures or `adv-win32`, weekly, and for a branch on demand with `gh workflow run windows-differential.yml --ref <branch>`; without Windows, read the native results in its logs. Failures known on the hosted image are listed in `tools/fixtures/hosted-known-failures.txt`.
 - On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode. x64-only tests do not build there.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.
