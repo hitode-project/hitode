@@ -58,14 +58,17 @@ fn copy(
         }
         return invalid_parameter(env, name, if source.is_null() { 22 } else { 34 });
     }
+    if check_range(env.cpu, source.addr(), count, Prot::READ)
+        .and_then(|_| check_range(env.cpu, destination.addr(), count, Prot::WRITE))
+        .is_err()
+    {
+        return memory_ops::guest_fault(env);
+    }
     // Only count bytes are touched on success, regardless of excess capacity.
     // The common copy handles overlap for memmove_s; overlap in memcpy_s is UB.
-    if let Err(error) = check_range(env.cpu, source.addr(), count, Prot::READ)
-        .and_then(|_| check_range(env.cpu, destination.addr(), count, Prot::WRITE))
-        .and_then(|_| {
-            env.cpu
-                .copy_memory(source.addr(), destination.addr(), count as usize)
-        })
+    if let Err(error) = env
+        .cpu
+        .copy_memory(source.addr(), destination.addr(), count as usize)
     {
         return memory_failure(error);
     }

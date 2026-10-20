@@ -382,9 +382,15 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 Clock: `timeGetTime`, `GetTickCount`, QPC/QPF, `GetLocalTime`, `GetSystemTime(AsFileTime)`; keyboard: `GetKeyState`, `GetAsyncKeyState`, `GetKeyboardState`; character: `IsDBCSLeadByte(Ex)`, `CharNextA`. Additional leaves cover synchronous USER window/focus/cursor/metric queries and host lstr length/copy/locale comparisons. Output queries MUST decline invalid complete ranges before reading clocks or modifying outputs. String leaves MUST retain host caught-fault and locale behavior, with invalid `lstrlenA/W` returning zero.
 
+D3DX9 leaves: `D3DXMatrixMultiply`, `D3DXMatrixTranspose`, `D3DXMatrixScaling`, `D3DXMatrixTranslation`, `D3DXMatrixRotationYawPitchRoll`, `D3DXMatrixRotationX/Y/Z`, `D3DXMatrixPerspectiveFovLH`, `D3DXMatrixLookAtLH`, `D3DXVec2Transform(Coord/Normal)`, `D3DXVec3Transform(Coord)`, `D3DXVec4Transform`, `D3DXVec3CatmullRom`, `D3DXVec3Project`, in d3dx9_29/43. Matrix-stack leaves: `QueryInterface`, `AddRef`, `GetTop`, `LoadIdentity`, `LoadMatrix`, `MultMatrix(Local)`, `RotateAxis(Local)`, `RotateYawPitchRoll(Local)`, `Scale(Local)`, `Translate(Local)`. Math leaves MUST decline failed input/output ranges before writing. `Push`, `Pop` and `Release` retain ordinary mapping-capable handlers.
+
+CRT `_errno` leaves MUST decline before allocating a missing module/thread cell. `RegQueryValueExA/W` leaves MUST decline before loading the registry from disk. Resolved registry queries MUST preserve ordinary error returns and output writes.
+
 ### WIN32-API-16 Guest atomic operations
 
 **Rule**: InterlockedIncrement, InterlockedDecrement, InterlockedExchange, InterlockedExchangeAdd and InterlockedCompareExchange MUST use LOCK-prefixed guest operations with 32-bit wrapping and native old/new return values. They MUST preserve LastError, callee-saved registers and native access-fault delivery, including when diagnostic guest routing is disabled. Critical-section guest entries MUST retain the ordinary contention, ownership and wake paths under PROC-MACH-2/3.
 **Verification**: Test
+
+CRT guest entries: `memcpy`, `memmove`, `memset`, `memcpy_s`, `memmove_s`, wherever registered in msvcrt, msvcr80, msvcr90, ucrtbase, vcruntime140 and the CRT string API set. Copy entries MUST preserve overlapping bytes in both directions. Secure-copy argument errors MUST enter the original host handler before destination writes. Guest memory faults MUST use ordinary guest access-violation delivery. Scalar `operator new/delete` in msvcrt/msvcr80/msvcr90 MUST reuse the shared heap listings, with rare cases entering their original CRT handlers.
 
 Withdrawn: WIN32-EXC-1, WIN32-EXC-2, WIN32-EXC-3, WIN32-EXC-4, WIN32-EXC-5, WIN32-EXC-6, WIN32-EXC-7

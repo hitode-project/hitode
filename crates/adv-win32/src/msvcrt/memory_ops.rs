@@ -1,6 +1,6 @@
 //! VCRuntime memory fronts share the established legacy CRT byte operations.
 use adv_abi::{
-    GuestPtr, Registry,
+    GuestPtr, GuestReturn, Registry,
     guest::{check_range, memory_failure},
     win32,
 };
@@ -114,18 +114,40 @@ pub(super) fn fill(
     Ok(destination)
 }
 
+pub(super) fn guest_fault(env: &mut Env<'_>) -> Outcome {
+    // As for Interlocked, diagnostic host routing retains native SEH and
+    // partial-copy state by resuming at the same authored instruction body.
+    let body = env
+        .sys
+        .thunks
+        .get(env.thunk)
+        .guest_body()
+        .expect("CRT guest body");
+    match env.checkpoint() {
+        Ok(mut checkpoint) => {
+            checkpoint.state.eip = body;
+            Outcome::ResumeExecution(checkpoint)
+        }
+        Err(error) => Outcome::Fail(error.to_string()),
+    }
+}
+
 fn checked_copy(
     env: &mut Env<'_>,
     destination: GuestPtr<u8>,
     source: GuestPtr<u8>,
     count: u32,
-) -> Result<GuestPtr<u8>, MemFault> {
+) -> Outcome {
     if count == 0 {
-        return Ok(destination);
+        return Outcome::Return(destination.addr());
     }
-    check_range(env.cpu, source.addr(), count, Prot::READ)?;
-    check_range(env.cpu, destination.addr(), count, Prot::WRITE)?;
-    copy(env, destination.addr(), source.addr(), count).map(GuestPtr::new)
+    if check_range(env.cpu, source.addr(), count, Prot::READ)
+        .and_then(|_| check_range(env.cpu, destination.addr(), count, Prot::WRITE))
+        .is_err()
+    {
+        return guest_fault(env);
+    }
+    copy(env, destination.addr(), source.addr(), count).into_outcome()
 }
 
 #[win32(vcruntime140, name = "memcpy", level = implement)]
@@ -134,7 +156,7 @@ fn memcpy(
     destination: GuestPtr<u8>,
     source: GuestPtr<u8>,
     count: u32,
-) -> Result<GuestPtr<u8>, MemFault> {
+) -> Outcome {
     checked_copy(env, destination, source, count)
 }
 
@@ -144,17 +166,14 @@ fn memmove(
     destination: GuestPtr<u8>,
     source: GuestPtr<u8>,
     count: u32,
-) -> Result<GuestPtr<u8>, MemFault> {
+) -> Outcome {
     checked_copy(env, destination, source, count)
 }
 
 #[win32(vcruntime140, name = "memset", level = implement)]
-fn memset(
-    env: &mut Env<'_>,
-    destination: GuestPtr<u8>,
-    value: i32,
-    count: u32,
-) -> Result<GuestPtr<u8>, MemFault> {
-    check_range(env.cpu, destination.addr(), count, Prot::WRITE)?;
-    fill(env, destination.addr(), value as u8, count).map(GuestPtr::new)
+fn memset(env: &mut Env<'_>, destination: GuestPtr<u8>, value: i32, count: u32) -> Outcome {
+    if check_range(env.cpu, destination.addr(), count, Prot::WRITE).is_err() {
+        return guest_fault(env);
+    }
+    fill(env, destination.addr(), value as u8, count).into_outcome()
 }
