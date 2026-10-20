@@ -64,11 +64,9 @@ impl Stream {
             CodecFormat::Video { frame_100ns, .. } => {
                 let mut frames = Vec::new();
                 for (i, packet) in stream.packets.iter().enumerate() {
-                    let at = if frame_100ns == 0 {
-                        i
-                    } else {
-                        ((packet.time_100ns + frame_100ns / 2) / frame_100ns) as usize
-                    };
+                    let at = (packet.time_100ns + frame_100ns / 2)
+                        .checked_div(frame_100ns)
+                        .map_or(i, |frame| frame as usize);
                     if frames.len() <= at {
                         frames.resize(at + 1, None);
                     }
@@ -716,8 +714,8 @@ fn decode_frame(env: &mut Env<'_>, session: u32, position: i32) -> u32 {
         }
     };
     let mut picture = None;
-    for at in from..=target {
-        if let Some(index) = table[at] {
+    for (at, entry) in table.iter().enumerate().take(target + 1).skip(from) {
+        if let Some(index) = *entry {
             let packet = &packets[index];
             match frames.decoder.decode(&packet.data, Some(packet.time_100ns)) {
                 Ok(decoded) => {
@@ -740,7 +738,7 @@ fn decode_frame(env: &mut Env<'_>, session: u32, position: i32) -> u32 {
         for (y, source) in picture.bgra.chunks_exact(width as usize * 4).enumerate() {
             // Bottom-up DIB rows.
             let row = &mut rows[(height as usize - 1 - y) * stride..][..width as usize * pixel];
-            for (out, bgra) in row.chunks_exact_mut(pixel).zip(source.chunks_exact(4)) {
+            for (out, bgra) in row.chunks_exact_mut(pixel).zip(source.as_chunks::<4>().0) {
                 out.copy_from_slice(&bgra[..pixel]);
             }
         }

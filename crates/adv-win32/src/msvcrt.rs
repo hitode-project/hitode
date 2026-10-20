@@ -1679,6 +1679,26 @@ fn call(e: &mut Env<'_>) -> Outcome {
     Outcome::Return(value)
 }
 
+/// `strtol(text, NULL, 10)`, saturating like the msvcrt `atoi`.
+fn decimal_int(text: &[u16]) -> i32 {
+    let (value, _, error) = convert::parse(text, 10);
+    let negative = text
+        .iter()
+        .find(|c| !matches!(c, 9..=13 | 32))
+        .is_some_and(|c| *c == u16::from(b'-'));
+    let magnitude = if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    match (negative, error) {
+        (false, Some(_)) => i32::MAX,
+        (true, Some(_)) => i32::MIN,
+        (false, None) => magnitude.min(i32::MAX as u64) as i32,
+        (true, None) => (-(magnitude.min(1 << 31) as i64)) as i32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2163,25 +2183,5 @@ mod tests {
             assert!(r.get(module, "??_U@YAPAXI@Z").is_some());
             assert!(r.get(module, "??_V@YAXPAX@Z").is_some());
         }
-    }
-}
-
-/// `strtol(text, NULL, 10)`, saturating like the msvcrt `atoi`.
-fn decimal_int(text: &[u16]) -> i32 {
-    let (value, _, error) = convert::parse(text, 10);
-    let negative = text
-        .iter()
-        .find(|c| !matches!(c, 9..=13 | 32))
-        .is_some_and(|c| *c == u16::from(b'-'));
-    let magnitude = if negative {
-        value.wrapping_neg()
-    } else {
-        value
-    };
-    match (negative, error) {
-        (false, Some(_)) => i32::MAX,
-        (true, Some(_)) => i32::MIN,
-        (false, None) => magnitude.min(i32::MAX as u64) as i32,
-        (true, None) => (-(magnitude.min(1 << 31) as i64)) as i32,
     }
 }
