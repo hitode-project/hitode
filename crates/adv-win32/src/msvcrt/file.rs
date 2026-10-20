@@ -1,7 +1,13 @@
-//! FILE metadata refers to the original NT/Win32 file object and cursor.
+//! CRT read-ahead retains a logical cursor over the original NT file object.
 use super::*;
 use crate::kernel32::file::native::{operations, win32_error};
-use adv_abi::{GuestPtr, WideStr, guest::memory_failure};
+use adv_abi::{
+    GuestPtr, WideStr,
+    guest::{check_range, memory_failure},
+};
+use adv_cpu::backend::Prot;
+
+pub(super) mod leaves;
 
 pub(super) type OpenDone = operations::Done<u32>;
 
@@ -82,6 +88,10 @@ pub(super) fn open(
                             binary,
                             append,
                             eof: false,
+                            position: 0,
+                            read_buffer: [0; 4096],
+                            read_cursor: 0,
+                            read_end: 0,
                         },
                     );
                     then(env, Ok(pointer))
@@ -119,12 +129,13 @@ struct Transfer {
     buffer: u32,
     length: u32,
     writing: bool,
+    buffered: bool,
     completed: u32,
     then: operations::Done<u32>,
 }
 
 impl Transfer {
-    fn next(self, env: &mut Env<'_>) -> Outcome {
+    fn next(mut self, env: &mut Env<'_>) -> Outcome {
         let remaining = self.length - self.completed;
         if remaining == 0 {
             return (self.then)(env, Ok(self.completed));
@@ -132,39 +143,113 @@ impl Transfer {
         let Some(buffer) = self.buffer.checked_add(self.completed) else {
             return (self.then)(env, Err(0xc000_0005));
         };
+        if self.buffered {
+            let file = env
+                .ext
+                .get_mut::<CrtState>()
+                .files
+                .get_mut(&self.stream)
+                .unwrap();
+            let count = (file.read_end - file.read_cursor).min(remaining as usize);
+            if count != 0 {
+                if env
+                    .cpu
+                    .write(
+                        buffer,
+                        &file.read_buffer[file.read_cursor..file.read_cursor + count],
+                    )
+                    .is_err()
+                {
+                    return (self.then)(env, Err(0xc000_0005));
+                }
+                file.read_cursor += count;
+                file.position += count as u64;
+                self.completed += count as u32;
+                return self.next(env);
+            }
+            if remaining < 4096 {
+                let Some(scratch) =
+                    env.ext
+                        .get_mut::<Heaps>()
+                        .alloc(env.cpu, &mut env.sys.vm, 0, 4096, false)
+                else {
+                    return (self.then)(env, Err(0xc000_0017));
+                };
+                return operations::transfer(
+                    env,
+                    self.handle,
+                    scratch,
+                    4096,
+                    false,
+                    Box::new(move |env, result| {
+                        let result = result.and_then(|count| {
+                            let file = env
+                                .ext
+                                .get_mut::<CrtState>()
+                                .files
+                                .get_mut(&self.stream)
+                                .unwrap();
+                            env.cpu
+                                .read(scratch, &mut file.read_buffer[..count as usize])
+                                .map_err(|_| 0xc000_0005u32)?;
+                            file.read_cursor = 0;
+                            file.read_end = count as usize;
+                            Ok(count)
+                        });
+                        env.ext
+                            .get_mut::<Heaps>()
+                            .free(env.cpu, &mut env.sys.vm, 0, scratch);
+                        match result {
+                            Ok(count) if count != 0 => self.next(env),
+                            other => self.finish(env, other),
+                        }
+                    }),
+                );
+            }
+        }
         operations::transfer(
             env,
             self.handle,
             buffer,
             remaining,
             self.writing,
-            Box::new(move |env, result| {
-                let mut transfer = self;
-                match result {
-                    Ok(0) => {
-                        if !transfer.writing
-                            && let Some(file) = env
-                                .ext
-                                .get_mut::<CrtState>()
-                                .files
-                                .get_mut(&transfer.stream)
-                        {
-                            file.eof = true;
-                        }
-                        (transfer.then)(env, Ok(transfer.completed))
-                    }
-                    Ok(count) => {
-                        transfer.completed += count;
-                        transfer.next(env)
-                    }
-                    Err(status) if transfer.completed != 0 => match error(env, status, 0) {
-                        Outcome::Return(_) => (transfer.then)(env, Ok(transfer.completed)),
-                        failure => failure,
-                    },
-                    Err(status) => (transfer.then)(env, Err(status)),
-                }
-            }),
+            Box::new(move |env, result| self.finish(env, result)),
         )
+    }
+
+    fn finish(self, env: &mut Env<'_>, result: Result<u32, u32>) -> Outcome {
+        let mut transfer = self;
+        match result {
+            Ok(0) => {
+                if !transfer.writing
+                    && let Some(file) = env
+                        .ext
+                        .get_mut::<CrtState>()
+                        .files
+                        .get_mut(&transfer.stream)
+                {
+                    file.eof = true;
+                }
+                (transfer.then)(env, Ok(transfer.completed))
+            }
+            Ok(count) => {
+                if let Some(file) = env
+                    .ext
+                    .get_mut::<CrtState>()
+                    .files
+                    .get_mut(&transfer.stream)
+                {
+                    file.position += u64::from(count);
+                }
+                transfer.completed += count;
+                transfer.next(env)
+            }
+            Err(status) if transfer.completed != 0 => match error(env, status, 0) {
+                Outcome::Return(_) => (transfer.then)(env, Ok(transfer.completed)),
+                failure => failure,
+            },
+            Err(status) => (transfer.then)(env, Err(status)),
+        }
     }
 }
 
@@ -176,6 +261,17 @@ pub(super) fn transfer(
     writing: bool,
     then: operations::Done<u32>,
 ) -> Outcome {
+    if check_range(
+        env.cpu,
+        buffer,
+        length,
+        if writing { Prot::READ } else { Prot::WRITE },
+    )
+    .is_err()
+    {
+        return then(env, Err(0xc000_0005));
+    }
+    let buffered = !writing && matches!(crate::native::overridden(env, "NtReadFile"), Ok(None));
     let Some(file) = env
         .ext
         .try_get::<CrtState>()
@@ -184,21 +280,34 @@ pub(super) fn transfer(
         return then(env, Err(0xc000_0008));
     };
     let (handle, append) = (file.handle, file.append && writing);
+    let synchronize = !buffered && file.read_cursor != file.read_end;
     let transfer = Transfer {
         stream,
         handle,
         buffer,
         length,
         writing,
+        buffered,
         completed: 0,
         then,
     };
     if append {
-        operations::seek(
+        seek(
             env,
-            handle,
+            stream,
             0,
             2,
+            Box::new(move |env, result| match result {
+                Ok(_) => transfer.next(env),
+                Err(status) => (transfer.then)(env, Err(status)),
+            }),
+        )
+    } else if synchronize {
+        seek(
+            env,
+            stream,
+            0,
+            1,
             Box::new(move |env, result| match result {
                 Ok(_) => transfer.next(env),
                 Err(status) => (transfer.then)(env, Err(status)),
@@ -219,6 +328,15 @@ pub(super) fn seek(
     let Some(handle) = handle(env, stream) else {
         return then(env, Err(0xc000_0008));
     };
+    let file = env.ext.get::<CrtState>().files.get(&stream).unwrap();
+    let distance = if method == 1 {
+        match distance.checked_sub((file.read_end - file.read_cursor) as i64) {
+            Some(distance) => distance,
+            None => return then(env, Err(0xc000_000d)),
+        }
+    } else {
+        distance
+    };
     operations::seek(
         env,
         handle,
@@ -229,6 +347,9 @@ pub(super) fn seek(
                 && let Some(file) = env.ext.get_mut::<CrtState>().files.get_mut(&stream)
             {
                 file.eof = false;
+                file.position = *result.as_ref().unwrap();
+                file.read_cursor = 0;
+                file.read_end = 0;
             }
             then(env, result)
         }),
@@ -239,7 +360,34 @@ pub(super) fn position(env: &mut Env<'_>, stream: u32, then: operations::Done<u6
     let Some(handle) = handle(env, stream) else {
         return then(env, Err(0xc000_0008));
     };
-    operations::query(env, handle, 14, then)
+    if matches!(crate::native::overridden(env, "NtReadFile"), Ok(None)) {
+        let position = env
+            .ext
+            .get::<CrtState>()
+            .files
+            .get(&stream)
+            .unwrap()
+            .position;
+        then(env, Ok(position))
+    } else {
+        operations::query(env, handle, 14, then)
+    }
+}
+
+fn flush(env: &mut Env<'_>, mut streams: Vec<u32>) -> Outcome {
+    let Some(stream) = streams.pop() else {
+        return Outcome::Return(0);
+    };
+    seek(
+        env,
+        stream,
+        0,
+        1,
+        Box::new(move |env, result| match result {
+            Ok(_) => flush(env, streams),
+            Err(status) => error(env, status, u32::MAX),
+        }),
+    )
 }
 
 fn open_front(env: &mut Env<'_>, wide: bool, secure: bool) -> Outcome {
@@ -374,8 +522,18 @@ pub(super) fn front(env: &mut Env<'_>, name: &str) -> Outcome {
                 .is_none_or(|file| file.eof) as u32,
         ),
         "fflush" => {
-            // Streams are unbuffered; completed writes already reached their provider.
-            Outcome::Return(0)
+            let stream = env.arg(0);
+            let streams: Vec<_> = env
+                .ext
+                .get::<CrtState>()
+                .files
+                .iter()
+                .filter(|(pointer, file)| {
+                    (stream == 0 || **pointer == stream) && file.read_end != file.read_cursor
+                })
+                .map(|(&pointer, _)| pointer)
+                .collect();
+            flush(env, streams)
         }
         _ => unreachable!(),
     }
@@ -383,3 +541,6 @@ pub(super) fn front(env: &mut Env<'_>, name: &str) -> Outcome {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod buffer_tests;

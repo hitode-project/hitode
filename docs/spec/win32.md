@@ -364,6 +364,10 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: msvcrt `_stricmp`, `_strcmpi` and `_strnicmp` MUST fold only ASCII letters and return the byte difference. `__p__iob` MUST return one stable stream table per CRT module. `abort` and `_amsg_exit` MUST end the process with codes 3 and 255.
 **Verification**: Test
 
+### WIN32-API-19 CRT stdio read buffering
+**Rule**: CRT streams MUST use 4096-byte read-ahead, preserve logical positions and EOF, and synchronize unread bytes before writes, seeks or flushes. Buffered reads and position queries MAY use EnvLeaf under A64-CTL-12 after complete destination checks. An overridden `NtReadFile` MUST retain unbuffered reads.
+**Verification**: Test
+
 ### WIN32-INPUT-1 Mouse tracking
 
 **Rule**: `TrackMouseEvent` and `_TrackMouseEvent` MUST share per-thread requests, queries, and selective cancellation. Guest pointer movement and message deadlines MUST deliver one-shot hover/leave notifications. Hover SPI settings MUST remain guest-owned, and window destruction MUST clear tracking.
