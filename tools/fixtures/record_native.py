@@ -14,7 +14,9 @@ native_reference.rs replays every recorded fixture under each CPU backend on
 any host and compares the output word by word.
 --check rebuilds and reruns without writing; it fails when the executable or
 the native output no longer matches the recording, so a stale or
-nondeterministic recording is caught on Windows. --sources only compares
+nondeterministic recording is caught on Windows. record.json keeps the
+Windows build: native results can change between builds (window property
+atoms after DestroyWindow differ between 10.0.26100 and 10.0.26300). --sources only compares
 each record.json with the current fixture sources; tools/check.py runs it so
 a fixture edited without re-recording is caught before commit.
 """
@@ -43,8 +45,6 @@ FIXTURES = {
     "shell-directories": ("build-shell-directories.ps1", "fixture_shell_directories.exe",
                           "shell-directories.bin", ["shell_directories.c"]),
     "srw": ("build-srw.ps1", "fixture_srw.exe", "srw.bin", ["srw.c"]),
-    "window-property": ("build-window-property.ps1", "fixture_window_property.exe", "window-property.bin",
-                        ["window_property.c"]),
 }
 
 

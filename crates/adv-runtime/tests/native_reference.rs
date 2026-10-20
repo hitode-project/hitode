@@ -55,7 +55,7 @@ fn recording(folder: &Path) -> (PathBuf, PathBuf) {
 
 #[test]
 // spec: WIN32-API-11, WIN32-API-12, WIN32-GDI-14, WIN32-INPUT-1
-// spec: WIN32-OBJECT-1, WIN32-OBJECT-2, WIN32-OBJECT-3, WIN32-USER-1, WIN32-USER-2
+// spec: WIN32-OBJECT-1, WIN32-OBJECT-2, WIN32-OBJECT-3
 fn recorded_fixtures_match_native_windows_on_every_backend() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut folders: Vec<_> = std::fs::read_dir(root.join("tools/fixtures/native"))
