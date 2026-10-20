@@ -27,7 +27,9 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 
 | Symptom | First | Then |
 |---|---|---|
-| A user report | Its `failure` (the first missing API, a CPU fault or a runtime error) and `game.codepage` | Rerun with that code page and `--api-mode discovery --report PATH`; the run report's `missing_apis` lists every gap at once. |
+| A user report or a run report | `tools/survey/triage_report.py <report.json>`: gaps by DLL, where each is registered, and the next command | For an anonymous report it prints the discovery rerun with the report's code page; the run report's `missing_apis` then lists every gap at once. |
+| Where an API is implemented | `tools/survey/where.py <dll!api> ...` | Registration status from `host-call-boundary.tsv`, source lines, the table handler, cited specs and tests. |
+| Planning a new game's work | `tools/survey/gap.py <game folder>` (needs `pefile`) | Static imports no registered DLL provides. An estimate only: implement from real calls in `missing_apis`. |
 | Startup hangs, error box, early exit | `sample_matrix.py --only <id> --api-mode discovery --trace`, then the first failure in the report | `trace_hresult.py` summarizes failed HRESULTs. `--warm-from <cold run>` reuses the JIT profiles of a matching cold run. |
 | Smoke test after a personality change | `sample_matrix.py --quick` over `tools/performance/startup-smoke.json`, then `matrix_gate.py --require-frames --frame-tolerance 1` | One game per engine for 10 seconds. A run with zero frames or a new structural warning is a regression. |
 | First divergence in a new game, zero frames for no known reason | Native capture and `api_diff.py` in [tools/compat](../tools/compat/README.md), aligned on the main thread | Without child processes or output buffers the result is partial. |
