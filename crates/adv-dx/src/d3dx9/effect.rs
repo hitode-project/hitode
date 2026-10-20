@@ -210,12 +210,14 @@ impl Calls {
     }
 }
 type Then = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
+#[cfg(feature = "gpu")]
 type Value = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
 fn calls(env: &mut Env<'_>, c: Calls, result: u32) -> Outcome {
     run(env, c, Box::new(move |_| Outcome::Return(result)))
 }
 /// Make the queued COM calls in order, then `then`. Unhooked device methods
 /// run on the host without a guest round trip (GFX-EFFECT-3).
+#[cfg_attr(not(feature = "gpu"), allow(clippy::never_loop))]
 fn run(env: &mut Env<'_>, mut c: Calls, then: Then) -> Outcome {
     // No guest code runs between host calls, so each vtable is read once.
     let mut tables: Vec<(u32, Vec<u32>)> = Vec::new();
@@ -229,6 +231,7 @@ fn run(env: &mut Env<'_>, mut c: Calls, then: Then) -> Outcome {
             return Outcome::Return(INVALID);
         };
         let slot = call.slot;
+        #[cfg(feature = "gpu")]
         if let Some(outcome) = crate::d3d9::direct::effect_call(
             env,
             call.pointer,
@@ -308,6 +311,7 @@ fn step(env: &mut Env<'_>, c: Calls, slot: u32, value: u32, then: Then) -> Outco
 }
 /// Continue with the returned EAX once a host method that waited or called
 /// into the guest finishes.
+#[cfg(feature = "gpu")]
 fn resume(outcome: Outcome, k: Value) -> Outcome {
     match outcome {
         Outcome::Return(_) => unreachable!("returns are handled by the caller"),
