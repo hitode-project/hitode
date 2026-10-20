@@ -8,6 +8,8 @@ You need Rust stable, Python 3, and CMake for the differential tests. [docs/buil
 
 ```sh
 python3 tools/check.py --install-hook   # checks formatting, privacy, layering and specs before each commit
+python3 tools/check.py --fix            # applies formatting and regenerates generated tables
+python3 tools/check.py --ci             # the checks plus CI's Clippy gates; run before pushing
 cargo test -p adv-cpu                   # test the crates you changed
 cargo run -p adv-run --release -- --audio --codepage 932 path/to/game.exe
 ```
@@ -18,7 +20,7 @@ Bring your own games and keep them anywhere outside the repository. Tools find t
 
 - Keep a change small and about one thing. Open an issue first for a large change, a new dependency, a new crate or a change to the layering.
 - Format with `cargo fmt`. Files under `data/abi/` are generated; do not format them by hand.
-- Stage files by name. When the pre-commit check stops a commit, fix what it reports; never bypass it with `--no-verify`.
+- Stage files by name. When the pre-commit check stops a commit, fix what it reports (`check.py --fix` handles formatting and generated tables); never bypass it with `--no-verify`.
 - Write commit messages in English as `type(scope): summary`, with a body that says why.
 - Name branches `<type>/<topic>`, with type one of `feat`, `fix`, `perf`, `docs`, `tools` and `debug`.
 
@@ -31,6 +33,7 @@ Bring your own games and keep them anywhere outside the repository. Tools find t
 
 ## Verifying a change
 
+- Run `python3 tools/check.py --ci` before pushing code; it is the lint CI requires, and passing it locally saves a round trip.
 - Test the paths your change affects. Reuse a passing result when neither the code nor the conditions changed.
 - The full workspace suite (`cargo test-full`) and the full sample matrix are for batched changes and baseline updates.
 - Headless checks are yours to run. The felt experience in a window, such as stutter, audio and input response, is confirmed by a person.

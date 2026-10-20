@@ -20,7 +20,7 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 
 ## Tools by symptom
 
-`cargo run -p adv-runtime --features gpu --example host_call_inventory -- --check docs/host-call-boundary.tsv` checks the generated registry boundary table, including aliases and COM methods. `--write` refreshes it. `cargo test -p adv-runtime --features gpu --example host_call_inventory` tests coverage and conservative admission. Unproven ordinary effects and Windows kernel entry remain explicitly marked as not excluded; names alone never authorize acceleration.
+`cargo run -p adv-runtime --features gpu --example host_call_inventory -- --check docs/host-call-boundary.tsv` checks the generated registry boundary table, including aliases and COM methods. `--write` refreshes it, as does `python3 tools/check.py --fix`. `cargo test -p adv-runtime --features gpu --example host_call_inventory` tests coverage and conservative admission. Unproven ordinary effects and Windows kernel entry remain explicitly marked as not excluded; names alone never authorize acceleration.
 
 
 ### Startup and compatibility

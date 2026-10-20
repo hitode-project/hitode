@@ -3,6 +3,8 @@
 
   python tools/check.py                 # what is staged (the pre-commit hook runs this)
   python tools/check.py --all           # every workspace crate (cargo fmt --check)
+  python tools/check.py --ci            # --all plus the Clippy gates of CI; run before pushing
+  python tools/check.py --fix           # apply formatting and regenerate generated tables
   python tools/check.py --install-hook  # run the staged check before every commit
 
 Formatting is checked on the staged content of each .rs file, not the working
@@ -14,6 +16,14 @@ When staged changes touch apps/adv-launcher (and always with --all), its
 frontend is type-checked with svelte-check and built with Vite through pnpm.
 These run on the working copy and need `pnpm install --frozen-lockfile` in
 apps/adv-launcher once.
+
+--ci runs the workspace-lint Clippy gate as CI does, and approximates the
+x87-windows gate with the x86_64-apple-darwin target on a Mac, which covers
+x86_64-only code but not cfg(windows) code. Cargo commands get FFMPEG_DIR and
+LIBCLANG_PATH from Homebrew ffmpeg@8 and the Xcode clang when they are unset.
+
+Committing code on master prints a note: the default branch accepts code only
+through pull requests, so its checks run (CONTRIBUTING.md).
 """
 from __future__ import annotations
 
@@ -28,6 +38,19 @@ ROOT = Path(__file__).resolve().parent.parent
 # Generated (tools/abi) or third-party sources: never reformatted.
 UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
 LAUNCHER = "apps/adv-launcher/"
+DEFAULT_BRANCHES = ("master", "main")
+# Paths whose changes CI builds or lints; anything else is documentation.
+CODE = (".rs", ".toml", ".lock", ".py", ".c", ".h", ".ps1", ".sh", ".svelte", ".ts", ".js", ".json", ".yml")
+# The Clippy gates of .github/workflows/core-performance.yml: (name, target, arguments).
+WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked",
+                  "--features", "adv-shell/gpu,adv-shell/media,adv-device/slow-tests"]
+X87_LINT = ["--workspace", "--exclude", "adv-launcher", "--exclude", "adv-jit-helper",
+            "--exclude", "tauri-plugin-storage", "--all-targets", "--release", "--locked",
+            "--features", "adv-shell/gpu"]
+CLIPPY = (("workspace-lint", None, WORKSPACE_LINT),
+          ("x87-windows (x86_64 approximation)", "x86_64-apple-darwin", X87_LINT))
+INVENTORY = ["cargo", "run", "-q", "-p", "adv-runtime", "--features", "gpu",
+             "--example", "host_call_inventory", "--"]
 HOOK = """#!/bin/sh
 # Installed by tools/check.py --install-hook; shared by every worktree.
 if [ -f tools/check.py ]; then
@@ -70,9 +93,43 @@ def formatted(path: str) -> bool:
     return result.stdout.replace(b"\r\n", b"\n") == source.replace(b"\r\n", b"\n")
 
 
-def run(name: str, command: list[str]) -> bool:
+def code_paths(names: list[str]) -> list[str]:
+    return [n for n in names if n.endswith(CODE) or n.startswith(".github/")]
+
+
+def branch() -> str:
+    """The checked-out branch, or "" when HEAD is detached."""
+    result = subprocess.run(["git", "-C", str(ROOT), "symbolic-ref", "--short", "-q", "HEAD"],
+                            capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def output(command: list[str]) -> str:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def cargo_env() -> dict[str, str]:
+    """The environment for Cargo, with the media build variables filled in on a Mac."""
+    env = dict(os.environ)
+    if sys.platform != "darwin":
+        return env
+    if not env.get("FFMPEG_DIR"):
+        prefix = output(["brew", "--prefix", "ffmpeg@8"]) if shutil.which("brew") else ""
+        if prefix and (Path(prefix) / "include").is_dir():
+            env["FFMPEG_DIR"] = prefix
+    if not env.get("LIBCLANG_PATH"):
+        clang = output(["xcrun", "--find", "clang"])
+        if clang:
+            env["LIBCLANG_PATH"] = str(Path(clang).parent.parent / "lib")
+    return env
+
+
+def run(name: str, command: list[str], env: dict[str, str] | None = None) -> bool:
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace")
+                            encoding="utf-8", errors="replace", env=env)
     if result.returncode == 0:
         print(f"ok    {name}")
         return True
@@ -96,14 +153,54 @@ def launcher(everything: bool) -> bool:
     return run("vite build (adv-launcher)", [pnpm, "--dir", LAUNCHER, "run", "build"]) and ok
 
 
+def master_note() -> None:
+    """Point at a pull request when code is committed straight to the default branch."""
+    if branch() in DEFAULT_BRANCHES and code_paths(staged_names()):
+        print(f"note  committing code on {branch()}: CI runs only on pull requests; "
+              "consider `git switch -c <type>/<topic>`")
+
+
+def installed_targets() -> set[str]:
+    return set(output(["rustup", "target", "list", "--installed"]).split())
+
+
+def clippy() -> bool:
+    env = cargo_env()
+    targets = installed_targets()
+    ok = True
+    for name, target, arguments in CLIPPY:
+        command = ["cargo", "clippy", *arguments]
+        if target is not None:
+            if sys.platform != "darwin":
+                continue
+            if target not in targets:
+                print(f"skip  clippy {name}: run `rustup target add {target}`")
+                continue
+            command += ["--target", target]
+        ok &= run(f"clippy {name}", [*command, "--", "-D", "warnings"], env)
+    return ok
+
+
+def fix() -> bool:
+    """Apply rustfmt and regenerate the generated tables the checks compare against."""
+    ok = run("cargo fmt", ["cargo", "fmt", "--all"])
+    ok &= run("host call inventory", [*INVENTORY, "--write", "docs/host-call-boundary.tsv"], cargo_env())
+    changed = git("status", "--short").decode().rstrip()
+    if changed:
+        print("changed:\n" + changed)
+    return ok
+
+
 def check(everything: bool) -> bool:
     ok = True
+    if not everything:
+        master_note()
     if everything:
         ok &= run("rustfmt (workspace)", ["cargo", "fmt", "--all", "--check"])
     else:
         bad = [path for path in staged_rust() if not formatted(path)]
         if bad:
-            print("FAIL  rustfmt: run `rustfmt --edition 2024 <file>` (or `cargo fmt`) and restage")
+            print("FAIL  rustfmt: run `python3 tools/check.py --fix` (or `rustfmt --edition 2024 <file>`) and restage")
             for path in bad:
                 print(f"        {path}")
             ok = False
@@ -135,12 +232,19 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--all", action="store_true", help="check every workspace crate")
+    group.add_argument("--ci", action="store_true", help="--all plus the Clippy gates of CI")
+    group.add_argument("--fix", action="store_true", help="apply formatting and regenerate tables")
     group.add_argument("--install-hook", action="store_true", help="install the pre-commit hook")
     args = parser.parse_args(argv)
     if args.install_hook:
         install_hook()
         return 0
-    return 0 if check(args.all) else 1
+    if args.fix:
+        return 0 if fix() else 1
+    ok = check(args.all or args.ci)
+    if args.ci:
+        ok &= clippy()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
