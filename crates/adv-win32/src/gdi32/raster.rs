@@ -404,6 +404,7 @@ impl Raster {
                 3 => Sampling::PixelCentre,
                 _ => Sampling::AndColour,
             },
+            key: None,
         };
         let clip = dcs.clip(objects, destination_dc);
         let surface = surfaces.get(dst).unwrap().clone();
@@ -511,6 +512,7 @@ impl Raster {
                     3 => Sampling::Nearest,
                     _ => Sampling::And,
                 },
+                key: None,
             };
             let clip = dcs.clip(objects, destination_dc);
             let surface = surfaces.get(dst).unwrap().clone();

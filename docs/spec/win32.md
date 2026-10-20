@@ -207,7 +207,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-GDI-2 Regions
 
-**Rule**: GDI regions MUST use bounded nonoverlapping rectangles under one object owner. Nonidentity ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
+**Rule**: GDI regions MUST use bounded nonoverlapping rectangles under one object owner, scan-converting curves and polygons per row. Rotating or shearing ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
 **Verification**: Test
 
 ### WIN32-GDI-3 Presentation canvas

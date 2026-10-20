@@ -13,6 +13,7 @@ enum Operation {
     Sin,
     Cos,
     Sqrt,
+    Acos,
 }
 
 fn unavailable(env: &mut Env<'_>, reason: &'static str) -> Outcome {
@@ -42,6 +43,8 @@ fn calculate(env: &mut Env<'_>, operation: Operation) -> Outcome {
         Some("nonfinite x87 math operands are unavailable")
     } else if matches!(operation, Operation::Sqrt) && input < 0.0 {
         Some("negative square-root CRT exception handling is unavailable")
+    } else if matches!(operation, Operation::Acos) && input.abs() > 1.0 {
+        Some("arc-cosine CRT domain handling is unavailable")
     } else {
         None
     };
@@ -54,6 +57,7 @@ fn calculate(env: &mut Env<'_>, operation: Operation) -> Outcome {
         Operation::Sin => input.sin(),
         Operation::Cos => input.cos(),
         Operation::Sqrt => input.sqrt(),
+        Operation::Acos => input.acos(),
     };
     // The machine restores a floating return to the same shared x87 owner and
     // applies the SDK cdecl(0) epilogue. It preserves the integer registers.
@@ -76,10 +80,20 @@ fn cosine(env: &mut Env<'_>) -> Outcome {
 fn square_root(env: &mut Env<'_>) -> Outcome {
     calculate(env, Operation::Sqrt)
 }
+#[win32(msvcrt, name = "_CIacos", level = implement)]
+fn arc_cosine(env: &mut Env<'_>) -> Outcome {
+    calculate(env, Operation::Acos)
+}
 
 pub(super) fn register(registry: &mut Registry) {
     for module in MODULES {
-        for api in [tangent_ABI, sine_ABI, cosine_ABI, square_root_ABI] {
+        for api in [
+            tangent_ABI,
+            sine_ABI,
+            cosine_ABI,
+            square_root_ABI,
+            arc_cosine_ABI,
+        ] {
             registry.register(Api { module, ..api });
         }
     }

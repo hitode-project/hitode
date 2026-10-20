@@ -256,6 +256,8 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::SURFACE_RELEASE_DC, surface_release_dc_ABI),
     (api::RESTORE, restore_ABI),
     (api::GET_PIXEL_FORMAT, get_pixel_format_ABI),
+    (api::SET_COLOR_KEY, set_color_key_ABI),
+    (api::GET_COLOR_KEY, get_color_key_ABI),
 ];
 #[win32(ddraw, name = "IDirectDraw7::CreateClipper", level = implement)]
 fn create_clipper(
@@ -381,6 +383,14 @@ fn blt(
             arg5.addr(),
         ],
     )
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::SetColorKey", level = implement)]
+fn set_color_key(env: &mut Env<'_>, this: GuestPtr<()>, flags: u32, key: GuestPtr<()>) -> Outcome {
+    call(env, api::SET_COLOR_KEY, &[this.addr(), flags, key.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetColorKey", level = implement)]
+fn get_color_key(env: &mut Env<'_>, this: GuestPtr<()>, flags: u32, key: GuestPtr<()>) -> Outcome {
+    call(env, api::GET_COLOR_KEY, &[this.addr(), flags, key.addr()])
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::GetSurfaceDesc", level = implement)]
 fn get_desc(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {

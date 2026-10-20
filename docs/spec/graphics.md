@@ -21,6 +21,11 @@ This spec covers the DirectDraw and Direct3D 9 API front ends: capabilities, sha
 **Rule**: SETFOCUSWINDOW MUST retain the device's focus HWND.
 **Verification**: Review — no dedicated test asserts the stored focus-window identity.
 
+### GFX-DDRAW-4 Source color keys
+
+**Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
+**Verification**: Test
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

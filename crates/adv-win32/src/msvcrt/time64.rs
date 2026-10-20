@@ -60,16 +60,22 @@ fn invalid_tm(env: &mut Env<'_>, output: GuestPtr<[i32; 9]>, error: i32) -> Outc
         Err(outcome) => outcome,
     }
 }
-fn convert(env: &mut Env<'_>, input: GuestPtr<i64>, local: bool) -> Outcome {
+/// Converts the 64-bit (`wide`) or 32-bit `time_t` at `input` into the shared tm.
+pub(super) fn convert(env: &mut Env<'_>, input: u32, wide: bool, local: bool) -> Outcome {
     // Snapshot readable input before touching the cached output (the guest may
     // alias them). An actual read fault leaves any published tm unchanged.
-    let seconds = if input.is_null() {
-        None
+    let read = if input == 0 {
+        Ok(None)
+    } else if wide {
+        GuestPtr::<i64>::new(input).read(env.cpu).map(Some)
     } else {
-        match input.read(env.cpu) {
-            Ok(seconds) => Some(seconds),
-            Err(error) => return memory_failure(error),
-        }
+        GuestPtr::<i32>::new(input)
+            .read(env.cpu)
+            .map(|seconds| Some(seconds.into()))
+    };
+    let seconds = match read {
+        Ok(seconds) => seconds,
+        Err(error) => return memory_failure(error),
     };
     let output = match tm_address(env) {
         Ok(output) => output,
@@ -158,12 +164,12 @@ fn time64(env: &mut Env<'_>, output: GuestPtr<i64>) -> Outcome {
 
 #[win32(msvcrt, name = "_gmtime64", level = implement)]
 fn gmtime64(env: &mut Env<'_>, input: GuestPtr<i64>) -> Outcome {
-    convert(env, input, false)
+    convert(env, input.addr(), true, false)
 }
 
 #[win32(msvcrt, name = "_localtime64", level = implement)]
 fn localtime64(env: &mut Env<'_>, input: GuestPtr<i64>) -> Outcome {
-    convert(env, input, true)
+    convert(env, input.addr(), true, true)
 }
 
 #[win32(msvcrt, name = "_difftime64", level = implement)]

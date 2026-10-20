@@ -12,6 +12,9 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(set_pixel_v_ABI);
     registry.register(get_pixel_ABI);
     registry.register(pat_blt_ABI);
+    registry.register(fill_region_ABI);
+    registry.register(frame_region_ABI);
+    registry.register(ellipse_ABI);
 }
 fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
     set_last_error(env, error);
@@ -34,7 +37,7 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
     paint_rectangles(
         env,
         dc,
-        brush,
+        Paint::Brush(brush),
         &[[
             i64::from(r.left),
             i64::from(r.top),
@@ -75,7 +78,7 @@ fn frame(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle
     paint_rectangles(
         env,
         dc,
-        brush,
+        Paint::Brush(brush),
         &[
             [l, t, r, t + 1],
             [l, b - 1, r, b],
@@ -86,10 +89,72 @@ fn frame(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle
     )
 }
 
-fn paint_rectangles(
+fn wide(rects: &[[i32; 4]]) -> Vec<[i64; 4]> {
+    rects.iter().map(|r| r.map(i64::from)).collect()
+}
+
+#[win32(gdi32, name = "FillRgn", level = implement)]
+fn fill_region(env: &mut Env<'_>, dc: Handle, region: Handle, brush: Handle) -> Outcome {
+    let Some(rects) = crate::gdi32::region::rectangles(env, region.0).map(|r| wide(r)) else {
+        return fail(env, 6);
+    };
+    paint_rectangles(env, dc, Paint::Brush(brush), &rects, "gdi32.dll!FillRgn")
+}
+
+#[win32(gdi32, name = "FrameRgn", level = implement)]
+fn frame_region(
     env: &mut Env<'_>,
     dc: Handle,
+    region: Handle,
     brush: Handle,
+    width: i32,
+    height: i32,
+) -> Outcome {
+    let Some(rects) = crate::gdi32::region::rectangles(env, region.0) else {
+        return fail(env, 6);
+    };
+    let rects = wide(&crate::gdi32::region::frame(rects, width, height));
+    paint_rectangles(env, dc, Paint::Brush(brush), &rects, "gdi32.dll!FrameRgn")
+}
+
+/// Fills with the selected brush, then outlines inside the bounds with the
+/// selected solid pen. Pen styles and geometric joins are not drawn.
+#[win32(gdi32, name = "Ellipse", level = implement)]
+fn ellipse(env: &mut Env<'_>, dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> Outcome {
+    let Some(GdiObj::Dc { selected, .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        return fail(env, 6);
+    };
+    let [brush, pen] = [selected[0], selected[1]];
+    let shape = crate::gdi32::region::ellipse(left, top, right, bottom);
+    let api = "gdi32.dll!Ellipse";
+    let filled = paint_rectangles(env, dc, Paint::Brush(Handle(brush)), &wide(&shape), api);
+    if !matches!(filled, Outcome::Return(1)) {
+        return filled;
+    }
+    let Some(logical) = crate::gdi32::pen::describe(env, pen) else {
+        return Outcome::Return(1);
+    };
+    let word = |at: usize| u32::from_le_bytes(logical[at..at + 4].try_into().unwrap());
+    if word(0) == 5 {
+        return Outcome::Return(1);
+    }
+    let width = word(4).max(1) as i32;
+    let outline = crate::gdi32::region::frame(&shape, width, width);
+    paint_rectangles(env, dc, Paint::Color(word(12)), &wide(&outline), api)
+}
+
+/// What fills the rectangles: a brush, or a COLORREF such as a pen's.
+#[derive(Clone, Copy)]
+pub(crate) enum Paint {
+    Brush(Handle),
+    Color(u32),
+}
+
+pub(crate) fn paint_rectangles(
+    env: &mut Env<'_>,
+    dc: Handle,
+    paint: Paint,
     rectangles: &[[i64; 4]],
     api: &str,
 ) -> Outcome {
@@ -111,17 +176,19 @@ fn paint_rectangles(
         return fail(env, 50);
     }
     let (target, palette, clip, modes) = (selected[3], *palette, clip.clone(), *modes);
-    let stock = brush.0.checked_sub(stock_object(0));
-    let color = match stock {
-        Some(0) => 0xffffff,
-        Some(1) => 0xc0c0c0,
-        Some(2) => 0x808080,
-        Some(3) => 0x404040,
-        Some(4) => 0,
-        Some(5) => return Outcome::Return(1),
-        _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush.0) {
-            Some(GdiObj::Brush { color }) => *color,
-            _ => return fail(env, 6),
+    let color = match paint {
+        Paint::Color(color) => color,
+        Paint::Brush(brush) => match brush.0.checked_sub(stock_object(0)) {
+            Some(0) => 0xffffff,
+            Some(1) => 0xc0c0c0,
+            Some(2) => 0x808080,
+            Some(3) => 0x404040,
+            Some(4) => 0,
+            Some(5) => return Outcome::Return(1),
+            _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush.0) {
+                Some(GdiObj::Brush { color }) => *color,
+                _ => return fail(env, 6),
+            },
         },
     };
     let rgb = match color >> 24 {
@@ -271,7 +338,7 @@ pub(crate) fn erase_background(
     paint_rectangles(
         env,
         Handle(dc),
-        Handle(brush),
+        Paint::Brush(Handle(brush)),
         &[[x, y, x + i64::from(width), y + i64::from(height)]],
         api,
     )

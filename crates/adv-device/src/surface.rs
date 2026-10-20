@@ -1142,6 +1142,8 @@ pub struct BlitOptions {
     pub mirror_x: bool,
     pub mirror_y: bool,
     pub sampling: Sampling,
+    /// Inclusive source color key: raw source pixels in range are not copied.
+    pub key: Option<(u32, u32)>,
 }
 
 impl Surface {
@@ -2710,6 +2712,12 @@ impl<P: Presenter> Surfaces<P> {
         };
         let ox = (left - dr.x) as u32;
         let oy = (top - dr.y) as u32;
+        if let Some(key) = options.key {
+            if s.format.packed() || d.format.packed() {
+                return Err("color-keyed blits of packed pixels are unavailable".into());
+            }
+            return blit_keyed(s, sr, &d, dr, clipped, key, m);
+        }
         if s.format.packed() || d.format.packed() {
             return self.blit_packed(s, sr, dst, &d, dr, options, m);
         }
@@ -3020,4 +3028,59 @@ mod tests {
         assert_eq!(damage.since(Some(5)), None, "evicted history");
         assert_eq!(damage.since(Some(6)), Some(rect(0, 1)));
     }
+}
+
+/// Copies the nearest source pixel unless its raw value lies in the key range.
+/// Source rows are read before the first write, so overlapping surfaces work.
+fn blit_keyed(
+    s: &Surface,
+    sr: Rect,
+    d: &Surface,
+    dr: BlitRect,
+    clipped: Rect,
+    (low, high): (u32, u32),
+    m: &mut dyn SurfaceMemory,
+) -> Result<Rect, String> {
+    let (sb, db) = (s.format.bytes() as usize, d.format.bytes() as usize);
+    let sample = |offset: i64, size: u32, out: u32, from: u32| {
+        from + (offset as u64 * u64::from(size) / u64::from(out)) as u32
+    };
+    let columns: Vec<usize> = (0..clipped.w)
+        .map(|x| (sample(i64::from(clipped.x + x) - dr.x, sr.w, dr.w, sr.x) - sr.x) as usize * sb)
+        .collect();
+    let source = (0..clipped.h)
+        .map(|y| {
+            let row = sample(i64::from(clipped.y + y) - dr.y, sr.h, dr.h, sr.y);
+            m.read(s.row(sr.x, row), sr.w as usize * sb)
+                .map(|r| r.into_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // X8R8G8B8 keys compare color bits only.
+    let mask = if s.format == PixelFormat::Bgra32 {
+        0x00ff_ffff
+    } else {
+        u32::MAX
+    };
+    let (low, high) = (low & mask, high & mask);
+    let same =
+        s.format == d.format && (s.format != PixelFormat::Indexed8 || s.palette == d.palette);
+    for (y, input) in source.iter().enumerate() {
+        let address = d.row(clipped.x, clipped.y + y as u32);
+        let mut output = m.read(address, clipped.w as usize * db)?.into_owned();
+        for (out, &column) in output.chunks_exact_mut(db).zip(&columns) {
+            let pixel = &input[column..column + sb];
+            let mut raw = [0; 4];
+            raw[..sb].copy_from_slice(pixel);
+            if (low..=high).contains(&(u32::from_le_bytes(raw) & mask)) {
+                continue;
+            }
+            if same {
+                out.copy_from_slice(pixel);
+            } else {
+                out.copy_from_slice(&d.encode_pixel(s.decode_pixel(pixel))[..db]);
+            }
+        }
+        m.write(address, &output)?;
+    }
+    Ok(clipped)
 }

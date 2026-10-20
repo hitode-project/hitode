@@ -401,7 +401,7 @@ fn surface_versions_and_clipper_replacement_release_their_retained_objects() {
 }
 
 #[test]
-fn directdraw_scaled_blt_keeps_clipper_phase_and_rejects_color_key_flags() {
+fn directdraw_scaled_blt_keeps_clipper_phase_and_requires_a_source_color_key() {
     let mut f = Fixture::new();
     let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Bgra32, false);
     let (primary, _, _) = f.surface(5, 4, PixelFormat::Bgra32, true);
@@ -441,15 +441,17 @@ fn directdraw_scaled_blt_keeps_clipper_phase_and_rejects_color_key_flags() {
         ]
     );
     let before = f.surfaces.presenter.bgra.clone();
+    // Source-keyed blits fail without a source key and leave pixels alone.
     assert_eq!(
         f.dd(dd::BLT, &[primary, 208, source, 192, 0x8000, 0]),
-        0x80004001
+        0x80070057
     );
     assert_eq!(f.surfaces.presenter.bgra, before);
     assert_eq!(
         f.dd(dd::BLT_FAST, &[primary, 0, 0, source, 0, 1]),
-        0x80004001
+        0x80070057
     );
+    assert_eq!(f.surfaces.presenter.bgra, before);
     f.rect(208, [4, 14, 8, 17]); // Complete clip: no extra frame boundary.
     let frames = f.surfaces.stats.presentations;
     assert_eq!(f.dd(dd::BLT, &[primary, 208, source, 192, 0, 0]), 0);

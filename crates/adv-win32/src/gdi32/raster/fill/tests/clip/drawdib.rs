@@ -92,6 +92,7 @@ fn draw_dib_native_palette_orientation_scaling_clip_and_default_size() {
             ([1, 1, 4, 4], [1, 1, 2, 2], false, false),
             ([0, 0, 4, 4], [0, 0, 4, 4], true, false),
             ([0, 0, -1, -1], [1, 1, 2, 2], false, false),
+            ([0, 0, 4, 4], [0, 0, -1, -1], false, false),
             ([0, 0, 2, 2], [0, 0, 4, 4], false, false),
             ([0, 0, 0, 4], [0, 0, 4, 4], false, false),
             ([0, 0, 4, 4], [0, 0, 4, 4], false, true),
@@ -115,7 +116,7 @@ fn draw_dib_native_palette_orientation_scaling_clip_and_default_size() {
                     src,
                     info,
                     if contiguous { 0 } else { bits },
-                    0
+                    0x1000
                 ),
                 1
             );
@@ -132,7 +133,13 @@ fn draw_dib_native_palette_orientation_scaling_clip_and_default_size() {
                     }),
                 Some(3)
             );
-            let [sx, sy, sw, sh] = src;
+            let [sx, sy, mut sw, mut sh] = src;
+            if sw == -1 {
+                sw = 4;
+            }
+            if sh == -1 {
+                sh = 4;
+            }
             let [dx, dy, mut dw, mut dh] = dst;
             if dw == -1 {
                 dw = sw;
@@ -198,7 +205,7 @@ fn draw_dib_invalid_inputs_preserve_pixels_and_capability_gaps_warn() {
         assert_eq!(draw(&mut m, data, h, d, rect, src, i, b, 0), 0);
         assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
     }
-    for (offset, value) in [(16, 1), (12, 24 << 16 | 1)] {
+    for (offset, value) in [(16, 1), (12, 4 << 16 | 1)] {
         let original = m.cpu.read_u32(info + offset).unwrap();
         m.cpu.write_u32(info + offset, value).unwrap();
         assert_eq!(draw(&mut m, data, handle, dc, rect, rect, info, bits, 0), 0);

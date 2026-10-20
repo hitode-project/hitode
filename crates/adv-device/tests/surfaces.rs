@@ -1661,3 +1661,48 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
         assert_eq!(publish(&mut s, &m), [full]);
     }
 }
+
+#[test]
+// spec: GFX-DDRAW-4
+fn source_color_keys_skip_keyed_pixels_when_copying_and_scaling() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    let src = s.create(2, 2, false, PixelFormat::Rgb565, &mut m).unwrap();
+    // Key, red / green, key; 0x0001 lies inside the inclusive key range.
+    m.write(s[src].pixels, &[0, 0, 0, 0xf8]).unwrap();
+    m.write(s[src].row(0, 1), &[0xe0, 0x07, 1, 0]).unwrap();
+    let key = Some((0, 1));
+    let same = s.create(2, 2, false, PixelFormat::Rgb565, &mut m).unwrap();
+    s.fill_raw(same, s[same].rect(), 0xffff, &mut m).unwrap();
+    let whole = BlitRect {
+        x: 0,
+        y: 0,
+        w: 2,
+        h: 2,
+    };
+    let options = BlitOptions {
+        key,
+        ..Default::default()
+    };
+    s.blit(src, s[src].rect(), same, whole, options, &mut m)
+        .unwrap();
+    assert_eq!(
+        m.read(s[same].pixels, 4).unwrap().as_ref(),
+        &[0xff, 0xff, 0, 0xf8]
+    );
+    assert_eq!(
+        m.read(s[same].row(0, 1), 4).unwrap().as_ref(),
+        &[0xe0, 0x07, 0xff, 0xff]
+    );
+    let wide = s.create(4, 2, false, PixelFormat::Bgra32, &mut m).unwrap();
+    let scaled = BlitRect {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 2,
+    };
+    s.blit(src, s[src].rect(), wide, scaled, options, &mut m)
+        .unwrap();
+    let first: Vec<u8> = logical_pixels(&s, wide, &m).iter().map(|p| p[2]).collect();
+    assert_eq!(first, vec![0, 0, 0xff, 0xff, 0, 0, 0, 0]);
+}
