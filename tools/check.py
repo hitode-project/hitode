@@ -138,15 +138,29 @@ def run(name: str, command: list[str], env: dict[str, str] | None = None) -> boo
     return False
 
 
-def launcher(everything: bool) -> bool:
+def branch_names() -> list[str]:
+    """Files changed since this branch left origin/master, committed or not."""
+    try:
+        base = git("merge-base", "HEAD", "origin/master").decode().strip()
+        out = git("diff", "--name-only", "-z", base).decode()
+    except subprocess.CalledProcessError:
+        return []
+    return [n for n in out.split("\0") if n]
+
+
+def launcher(everything: bool, ci: bool = False) -> bool:
     """svelte-check and the Vite build of the launcher frontend, when it changed."""
     if not everything and not touches_launcher(staged_names()):
+        return True
+    installed = (ROOT / LAUNCHER / "node_modules").is_dir()
+    if ci and not installed and not touches_launcher(branch_names()):
+        print("skip  launcher: unchanged on this branch and not installed here")
         return True
     pnpm = shutil.which("pnpm")
     if pnpm is None:
         print("FAIL  launcher: pnpm not found; install it (see apps/adv-launcher/package.json)")
         return False
-    if not (ROOT / LAUNCHER / "node_modules").is_dir():
+    if not installed:
         print(f"FAIL  launcher: run `pnpm --dir {LAUNCHER} install --frozen-lockfile` first")
         return False
     ok = run("svelte-check (adv-launcher)", [pnpm, "--dir", LAUNCHER, "run", "check"])
@@ -191,7 +205,7 @@ def fix() -> bool:
     return ok
 
 
-def check(everything: bool) -> bool:
+def check(everything: bool, ci: bool = False) -> bool:
     ok = True
     if not everything:
         master_note()
@@ -211,7 +225,7 @@ def check(everything: bool) -> bool:
     ok &= run("layering", [sys.executable, "tools/layering/check_layers.py"])
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
     ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
-    ok &= launcher(everything)
+    ok &= launcher(everything, ci)
     return ok
 
 
@@ -241,7 +255,7 @@ def main(argv: list[str]) -> int:
         return 0
     if args.fix:
         return 0 if fix() else 1
-    ok = check(args.all or args.ci)
+    ok = check(args.all or args.ci, args.ci)
     if args.ci:
         ok &= clippy()
     return 0 if ok else 1

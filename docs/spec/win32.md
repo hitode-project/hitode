@@ -203,6 +203,11 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Host application activation MUST reach the active top-level window as WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE. Deactivation MUST use the reverse order.
 **Verification**: Test
 
+### WIN32-USER-20 Input inspection
+
+**Rule**: The host input view MUST report the displayed top-level window and its thread's focus, active and capture windows. A host hit test at a point of the displayed window MUST name the window that ordinary mouse input there reaches.
+**Verification**: Test
+
 ## Drawing and text
 
 ### WIN32-GDI-1 Virtual display

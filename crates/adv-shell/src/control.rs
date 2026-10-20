@@ -22,6 +22,8 @@ pub enum Command {
     KeyUp(u32),
     Text(String),
     Activate(bool),
+    Windows,
+    Hit(i16, i16),
     Menus,
     Menu(u32),
     Dialogs,
@@ -79,7 +81,9 @@ impl Command {
                 Ok(Self::DialogTrack(id, value))
             }
             "menu" => Ok(Self::Menu(rest.parse().map_err(|_| "menu requires a decimal command ID")?)),
-            "click" | "move" | "mouse-down" | "mouse-up" | "right-mouse-down" | "right-mouse-up" => {
+            "windows" if rest.is_empty() => Ok(Self::Windows),
+            "click" | "move" | "mouse-down" | "mouse-up" | "right-mouse-down" | "right-mouse-up"
+            | "hit" => {
                 let values: Vec<_> = rest.split_whitespace().collect();
                 if values.len() != 2 {
                     return Err(format!("{command} requires two signed client coordinates"));
@@ -92,6 +96,7 @@ impl Command {
                     "mouse-up" => Self::MouseUp(x, y),
                     "right-mouse-down" => Self::RightMouseDown(x, y),
                     "right-mouse-up" => Self::RightMouseUp(x, y),
+                    "hit" => Self::Hit(x, y),
                     _ => Self::Move(x, y),
                 })
             }
@@ -151,7 +156,7 @@ impl Command {
             "await-frame" => Ok(Self::AwaitFrame(FrameGateSpec::parse(rest)?)),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click/move X Y, key/key-down/key-up VK, text STRING, activate 0|1, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
+                "expected click/move X Y, key/key-down/key-up VK, text STRING, activate 0|1, windows, hit X Y, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
                     .into(),
             ),
         }
@@ -748,6 +753,10 @@ mod tests {
             Ok(Command::Click(650, 410))
         );
         assert_eq!(Command::parse("key 0x0d"), Ok(Command::Key(13)));
+        assert_eq!(Command::parse("windows"), Ok(Command::Windows));
+        assert_eq!(Command::parse("hit 640 -1"), Ok(Command::Hit(640, -1)));
+        assert!(Command::parse("hit 1").is_err());
+        assert!(Command::parse("windows 1").is_err());
         assert_eq!(Command::parse("move -12 410"), Ok(Command::Move(-12, 410)));
         assert_eq!(
             Command::parse("mouse-down -1 620"),

@@ -36,7 +36,7 @@ pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 pub use adv_win32::user32::dialog::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,
 };
-pub use adv_win32::user32::host_input::mouse_mapping;
+pub use adv_win32::user32::host_input::{InputView, WindowView, mouse_mapping};
 pub use adv_win32::user32::menu::{
     MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation,
 };
