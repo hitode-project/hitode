@@ -191,6 +191,11 @@ pub fn register(r: &mut Registry) {
         ("_ftol", 0),
         ("time", 1),
         ("_time32", 1),
+        ("gmtime", 1),
+        ("localtime", 1),
+        ("atoi", 1),
+        ("abs", 1),
+        ("_itoa", 3),
         ("strncmp", 3),
         ("strchr", 2),
         ("strstr", 2),
@@ -286,6 +291,8 @@ pub fn register(r: &mut Registry) {
             ("_encoded_null", 0),
             ("time", 1),
             ("_time32", 1),
+            ("_gmtime32", 1),
+            ("_localtime32", 1),
             ("_ismbblead", 1),
             ("_ismbbtrail", 1),
             ("memcpy", 3),
@@ -1113,6 +1120,8 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "abort" => return crate::kernel32::exit_process(e, 3),
         "_amsg_exit" => return crate::kernel32::exit_process(e, 255),
         "_invalid_parameter_noinfo" => return invalid_parameter_noinfo(e),
+        "gmtime" | "_gmtime32" => return time64::convert(e, a, false, false),
+        "localtime" | "_localtime32" => return time64::convert(e, a, false, true),
         "_wcsnicmp" => {
             let n = c as usize;
             if n == 0 {
@@ -1437,6 +1446,42 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write(ptr.wrapping_add(s.len() as u32), &[0]);
             }
             ptr
+        }
+        "atoi" => {
+            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
+                return Outcome::Fail("CRT string unmapped".into());
+            };
+            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
+            decimal_int(&wide) as u32
+        }
+        "abs" => (a as i32).unsigned_abs(),
+        "_itoa" => {
+            if !(2..=36).contains(&c) {
+                return Outcome::Return(b);
+            }
+            // Only radix 10 is signed, as in msvcrt.
+            let (negative, mut magnitude) = if c == 10 && (a as i32) < 0 {
+                (true, (a as i32).unsigned_abs())
+            } else {
+                (false, a)
+            };
+            let mut text = Vec::new();
+            loop {
+                text.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(magnitude % c) as usize]);
+                magnitude /= c;
+                if magnitude == 0 {
+                    break;
+                }
+            }
+            if negative {
+                text.push(b'-');
+            }
+            text.reverse();
+            text.push(0);
+            if let Err(error) = e.cpu.write(b, &text) {
+                return Outcome::Fail(error.to_string());
+            }
+            b
         }
         "strtoul" => {
             let Ok(s) = e.cpu.read_cstr(a, 1024) else {
@@ -2118,5 +2163,25 @@ mod tests {
             assert!(r.get(module, "??_U@YAPAXI@Z").is_some());
             assert!(r.get(module, "??_V@YAXPAX@Z").is_some());
         }
+    }
+}
+
+/// `strtol(text, NULL, 10)`, saturating like the msvcrt `atoi`.
+fn decimal_int(text: &[u16]) -> i32 {
+    let (value, _, error) = convert::parse(text, 10);
+    let negative = text
+        .iter()
+        .find(|c| !matches!(c, 9..=13 | 32))
+        .is_some_and(|c| *c == u16::from(b'-'));
+    let magnitude = if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    match (negative, error) {
+        (false, Some(_)) => i32::MAX,
+        (true, Some(_)) => i32::MIN,
+        (false, None) => magnitude.min(i32::MAX as u64) as i32,
+        (true, None) => (-(magnitude.min(1 << 31) as i64)) as i32,
     }
 }

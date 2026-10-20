@@ -259,9 +259,11 @@
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/citan",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisin",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cicos",
-      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisqrt"
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisqrt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/ciacos",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cifmod"
     ],
-    "projection": "void __cdecl _CItan/_CIsin/_CIcos/_CIsqrt(void); zero integer-stack parameter slots, specialized x87 input/result in ST0. Result must replace the operand while preserving lower x87 stack and guest ESP; not a two-slot cdecl double input.",
+    "projection": "void __cdecl _CItan/_CIsin/_CIcos/_CIsqrt/_CIacos(void); zero integer-stack parameter slots, specialized x87 input/result in ST0. Result must replace the operand while preserving lower x87 stack and guest ESP; not a two-slot cdecl double input. void __cdecl _CIfmod(void) takes the divisor in ST0 and the dividend in ST1, like _CIpow, and replaces both with the exact remainder.",
     "profile": "Only legacy CRT aliases. Reuse guest FPU owner, measured finite nearest/masked inputs; unavailable exceptional/control profiles must warn and fail rather than claim complete CRT math compatibility."
   },
   "byte_ctype": {
@@ -414,5 +416,14 @@
     ],
     "native_oracle_source_sha256": "fffaf19a1e0de2acd6f263f4d4a042974ba2133ea5b60e2c4bac6631fd534a33",
     "native_verification": "Authored VC80 probe measures 45 cases: finite rounding, signed zero, infinities, quiet-NaN payload/sign and EDOM, x87 rounding/control preservation, signaling-NaN invalid status and fabs denormal status. Guest tests cover typed binary64 arguments, x87 return and lower stack, caller stack cleanup and shared error ownership. Signaling-NaN and subnormal fabs status/exception handling remain qualified unsupported failures; custom matherr callbacks are outside the existing CRT profile."
+  },
+  "binary64_power_and_hypotenuse": {
+    "header": "ucrt/corecrt_math.h",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/pow-powf-powl",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/hypot-hypotf-hypotl-hypot-hypotf-hypotl"
+    ],
+    "projection": "double __cdecl pow(double, double) and _hypot(double, double): four x86 argument words, x87 double return. Only the three legacy CRT aliases.",
+    "profile": "Finite normal operands and results within the _CIpow profile; domain, range and nonfinite CRT error handling warn and fail."
   }
 }

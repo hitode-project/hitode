@@ -71,8 +71,15 @@ fn draw(
     if !valid(env, handle) || dc.0 == 0 {
         return Outcome::Return(0);
     }
-    if flags != 0 {
-        return unsupported(env, "only unbuffered DrawDib flags=0 is available");
+    // Hints about reuse, buffering and timing do not change one DIB transfer:
+    // SAME_HDC, SAME_DRAW, ANIMATE, BUFFER, JUSTDRAWIT, BACKGROUNDPAL,
+    // NOTKEYFRAME, HURRYUP and HALFTONE.
+    if flags & !(0x1eec | 0x10) != 0 {
+        return unsupported(env, &format!("DrawDib flags {flags:#x} are unavailable"));
+    }
+    // DDF_DONTDRAW decompresses only; uncompressed DIBs have nothing to keep.
+    if flags & 0x10 != 0 {
+        return Outcome::Return(u32::from(valid(env, handle)));
     }
     if info.is_null() || adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err()
     {
@@ -86,9 +93,12 @@ fn draw(
     let bitmap_width = word(4) as i32;
     let bitmap_height = word(8) as i32;
     let bpp = u16::from_le_bytes(header[14..16].try_into().unwrap());
-    if word(0) != 40 || !matches!(bpp, 8 | 32) || word(16) != 0 {
-        return unsupported(env, "only 40-byte BI_RGB 8/32-bit DIBs are available");
+    if word(0) != 40 || !matches!(bpp, 8 | 16 | 24 | 32) || word(16) != 0 {
+        return unsupported(env, "only 40-byte BI_RGB 8/16/24/32-bit DIBs are available");
     }
+    // A source extent of -1 selects the whole bitmap axis, as for the destination.
+    let sw = if sw == -1 { bitmap_width } else { sw };
+    let sh = if sh == -1 { bitmap_height } else { sh };
     if bitmap_width <= 0
         || bitmap_height <= 0
         || header[12..14] != 1u16.to_le_bytes()

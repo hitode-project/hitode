@@ -47,6 +47,8 @@ pub mod api {
     pub const CLIPPER_INITIALIZE: u32 = 229;
     pub const ENUM_MODES: u32 = 230;
     pub const INITIALIZE: u32 = 231;
+    pub const SET_COLOR_KEY: u32 = 232;
+    pub const GET_COLOR_KEY: u32 = 233;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -169,6 +171,9 @@ const IID_CLIPPER: [u8; 16] = [
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
+const NO_COLOR_KEY: u32 = 0x887600d7;
+/// DDCKEY_DESTBLT, DDCKEY_DESTOVERLAY, DDCKEY_SRCBLT and DDCKEY_SRCOVERLAY.
+const KEY_KINDS: [u32; 4] = [2, 4, 8, 0x10];
 const NOT_LOCKED: u32 = 0x88760248;
 
 pub struct DirectDraw {
@@ -183,6 +188,8 @@ pub struct DirectDraw {
     clipper_vtable: Option<u32>,
     clipper_windows: BTreeMap<u32, u32>,
     surface_clippers: BTreeMap<u32, u32>,
+    /// (surface, DDCKEY kind) -> inclusive raw pixel range.
+    color_keys: BTreeMap<(u32, u32), (u32, u32)>,
     clipper_origins: BTreeMap<u32, (i32, i32)>,
     /// Call id -> guest entry; 400 + slot and 500 + slot are the device and surface
     /// vtables' diagnostic entries.
@@ -205,6 +212,7 @@ impl DirectDraw {
             clipper_vtable: None,
             clipper_windows: BTreeMap::new(),
             surface_clippers: BTreeMap::new(),
+            color_keys: BTreeMap::new(),
             clipper_origins: BTreeMap::new(),
             entries,
             attached: BTreeMap::new(),
@@ -284,7 +292,9 @@ impl DirectDraw {
                 (25, api::LOCK),
                 (26, api::SURFACE_RELEASE_DC),
                 (27, api::RESTORE),
+                (16, api::GET_COLOR_KEY),
                 (28, api::SET_CLIPPER),
+                (29, api::SET_COLOR_KEY),
                 (32, api::UNLOCK),
             ]);
         } else {
@@ -524,6 +534,7 @@ impl DirectDraw {
                 if let Some(clipper) = self.surface_clippers.remove(&sid) {
                     self.release_com(objects, surfaces, clipper);
                 }
+                self.color_keys.retain(|&(owner, _), _| owner != sid);
                 if surfaces.primary_id() != Some(sid)
                     && !self.attached.values().any(|&other| other == sid)
                 {
@@ -722,6 +733,38 @@ impl DirectDraw {
                     return Ok(INVALID);
                 }
                 m.put_u32(a[1], *self.clipper_windows.get(&a[0]).unwrap_or(&0))?;
+                0
+            }
+            api::SET_COLOR_KEY => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                // DDCKEY_COLORSPACE selects a range; otherwise the high bound is ignored.
+                let kinds = a[1] & !1;
+                if !KEY_KINDS.contains(&kinds) {
+                    return Ok(INVALID);
+                }
+                if a[2] == 0 {
+                    self.color_keys.remove(&(sid, kinds));
+                } else {
+                    let low = m.u32(a[2])?;
+                    let high = if a[1] & 1 != 0 { m.u32(a[2] + 4)? } else { low };
+                    self.color_keys.insert((sid, kinds), (low, high));
+                }
+                0
+            }
+            api::GET_COLOR_KEY => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if !KEY_KINDS.contains(&a[1]) || a[2] == 0 {
+                    return Ok(INVALID);
+                }
+                let Some(&(low, high)) = self.color_keys.get(&(sid, a[1])) else {
+                    return Ok(NO_COLOR_KEY);
+                };
+                m.put_u32(a[2], low)?;
+                m.put_u32(a[2] + 4, high)?;
                 0
             }
             api::SET_CLIPPER => {
@@ -1044,9 +1087,18 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
-                if a[5] & !0x10 != 0 {
+                // DDBLTFAST_SRCCOLORKEY, WAIT and DONOTWAIT.
+                if a[5] & !0x31 != 0 {
                     return Ok(UNSUPPORTED);
                 }
+                let key = if a[5] & 1 != 0 {
+                    let Some(&key) = self.color_keys.get(&(src, 8)) else {
+                        return Ok(INVALID);
+                    };
+                    Some(key)
+                } else {
+                    None
+                };
                 let Ok(sr) = rect(surfaces, src, a[4], m) else {
                     return Ok(INVALID);
                 };
@@ -1064,7 +1116,17 @@ impl DirectDraw {
                 if d.locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                let damage = surfaces.copy(src, sr, dst, dr, m)?;
+                let target = BlitRect {
+                    x: i64::from(dr.x),
+                    y: i64::from(dr.y),
+                    w: dr.w,
+                    h: dr.h,
+                };
+                let options = BlitOptions {
+                    key,
+                    ..BlitOptions::default()
+                };
+                let damage = surfaces.blit(src, sr, dst, target, options, m)?;
                 if surfaces.primary_id() == Some(dst) {
                     surfaces.present_from(self.context, dst, m, damage)?;
                 }
@@ -1098,7 +1160,8 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
-                if a[4] & !0x01000000 != 0 {
+                // DDBLT_KEYSRC, KEYSRCOVERRIDE, ASYNC, WAIT and DONOTWAIT.
+                if a[4] & !(0x8000 | 0x10000 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
                     return Ok(UNSUPPORTED);
                 }
                 // An optional DDBLTFX is legal even when no effect flag selects
@@ -1112,6 +1175,20 @@ impl DirectDraw {
                         return Ok(INVALID);
                     }
                 }
+                let key = if a[4] & 0x10000 != 0 {
+                    if a[5] == 0 {
+                        return Ok(INVALID);
+                    }
+                    Some((m.u32(a[5] + 92)?, m.u32(a[5] + 96)?))
+                } else if a[4] & 0x8000 != 0 {
+                    // Like Wine, a source-keyed blit needs a source key.
+                    let Some(&key) = self.color_keys.get(&(src, 8)) else {
+                        return Ok(INVALID);
+                    };
+                    Some(key)
+                } else {
+                    None
+                };
                 if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
@@ -1160,7 +1237,11 @@ impl DirectDraw {
                 {
                     return Ok(0);
                 }
-                let damage = surfaces.blit(src, sr, dst, dr, BlitOptions::default(), m)?;
+                let options = BlitOptions {
+                    key,
+                    ..BlitOptions::default()
+                };
+                let damage = surfaces.blit(src, sr, dst, dr, options, m)?;
                 if surfaces.primary_id() == Some(dst) {
                     surfaces.present_from(self.context, dst, m, damage)?;
                 }

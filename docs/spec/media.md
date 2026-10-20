@@ -137,6 +137,13 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 **Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. When supplied, guest IWMReaderAllocatorEx MUST own the buffer receiving each delivered sample.
 **Verification**: Review — packet tests use prepared demuxed data and do not exercise full IStream admission or guest sample allocation.
 
+## AVIFile streams
+
+### MEDIA-AVI-1 Read-only file streams
+
+**Rule**: AVIFileOpenA MUST read through guest CreateFileA and the common demuxer, rejecting writing modes and custom handlers. Video samples MUST be indexed by frame time, audio samples addressed in block-aligned bytes. AVIStreamGetFrame MUST decode from the nearest key frame through the common packet decoder.
+**Verification**: Test
+
 ## Embedded video
 
 ### MEDIA-VIDEO-1 Window state

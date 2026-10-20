@@ -19,6 +19,29 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(viewport_origin_ABI);
     reg.register(set_window_origin_ABI);
     reg.register(set_viewport_origin_ABI);
+    reg.register(select_region_ABI);
+}
+
+/// Regions are in device units, so a copy replaces the DC clip directly.
+#[win32(gdi32, name = "SelectClipRgn", level = state)]
+fn select_region(env: &mut Env<'_>, dc: Handle, region: Handle) -> Outcome {
+    let region = if region.0 == 0 {
+        None
+    } else {
+        let Some(rects) = crate::gdi32::region::rectangles(env, region.0) else {
+            return Outcome::Return(0);
+        };
+        Some(rects.clone())
+    };
+    let kind = region
+        .as_deref()
+        .map_or(2, |rects| crate::gdi32::region::complexity(rects) as u32);
+    let gdi = env.ext.get::<Win32>().gdi.clone();
+    let Some(GdiObj::Dc { clip, .. }) = gdi.get_mut(&mut env.sys.objects, dc.0) else {
+        return Outcome::Return(0);
+    };
+    clip.select_region(region);
+    Outcome::Return(kind)
 }
 
 #[win32(gdi32, name = "GetClipBox", level = state)]
