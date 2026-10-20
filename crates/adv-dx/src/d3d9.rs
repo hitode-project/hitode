@@ -17,6 +17,7 @@ mod capabilities;
 mod creation;
 mod cursor;
 mod dc;
+pub(crate) mod direct;
 mod dirty;
 mod fixed;
 mod format;
@@ -130,6 +131,9 @@ struct Device {
 pub struct State {
     com: Com,
     tables: BTreeMap<&'static str, u32>,
+    /// Published device and state block thunks by COM slot (GFX-EFFECT-3).
+    device_methods: Vec<u32>,
+    block_methods: Vec<u32>,
     gpu: Option<Gpu>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
@@ -323,6 +327,7 @@ pub fn install<B: Backend>(
     provider: SurfaceProvider,
 ) -> Result<(), String> {
     let mut tables = BTreeMap::new();
+    let (mut device_methods, mut block_methods) = (Vec::new(), Vec::new());
     for interface in [
         "IDirect3D9",
         "IDirect3DDevice9",
@@ -354,10 +359,20 @@ pub fn install<B: Backend>(
                 .thunks
                 .publish(&mut machine.cpu, "d3d9.dll", &method)
                 .map_err(|e| e.to_string())?;
+            let slot = signature.com_slot.unwrap();
             machine
                 .cpu
-                .write_u32(table + u32::from(signature.com_slot.unwrap()) * 4, thunk)
+                .write_u32(table + u32::from(slot) * 4, thunk)
                 .map_err(|e| e.to_string())?;
+            let methods = match interface {
+                "IDirect3DDevice9" => &mut device_methods,
+                "IDirect3DStateBlock9" => &mut block_methods,
+                _ => continue,
+            };
+            if methods.len() <= usize::from(slot) {
+                methods.resize(usize::from(slot) + 1, 0);
+            }
+            methods[usize::from(slot)] = thunk;
         }
         tables.insert(interface, table);
     }
@@ -365,6 +380,8 @@ pub fn install<B: Backend>(
     machine.ext.insert(State {
         com,
         tables,
+        device_methods,
+        block_methods,
         gpu: None,
         provider,
         pending: Vec::new(),

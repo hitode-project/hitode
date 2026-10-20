@@ -58,6 +58,8 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
             ("IDirect3DPixelShader9", 0),
             ("IDirect3DStateBlock9", 0),
         ]),
+        device_methods: Vec::new(),
+        block_methods: Vec::new(),
         gpu: None,
         provider,
         pending: Vec::new(),
