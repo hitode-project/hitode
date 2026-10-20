@@ -13,7 +13,7 @@ This file routes AI coding agents. It holds only what applies to every task; eve
 ## Your role
 
 - You work for one person, who reviews what you produce and submits it under their name.
-- Draft replies instead of posting to issues, pull requests or chats. Ask before pushing or opening a pull request.
+- Draft replies instead of posting to issues, pull requests or chats. Ask before pushing or opening a pull request, unless you work for a maintainer as [docs/maintaining.md](docs/maintaining.md) defines.
 - Propose trade-offs and let maintainers decide them. Report problems outside your task instead of fixing them.
 
 ## Routes
@@ -29,7 +29,7 @@ This file routes AI coding agents. It holds only what applies to every task; eve
 | Debug a game or keep run output | [docs/investigation.md](docs/investigation.md) |
 | Work on speed or power use | [Performance work](docs/investigation.md#performance-work) |
 | Name something | [docs/glossary.md](docs/glossary.md) |
-| Integrate, when your local configuration says you work for a maintainer | [docs/maintaining.md](docs/maintaining.md) |
+| Push, open or merge a pull request when `git config hitode.maintainer` is `true` | [docs/maintaining.md](docs/maintaining.md) |
 
 ## Language
 

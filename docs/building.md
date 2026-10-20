@@ -7,6 +7,9 @@ This page lists how to build, test and package each front end. Games are never p
 - Rust stable with rustfmt, and Python 3.
 - CMake, for the test-only Unicorn reference in `adv-unicorn`.
 - For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib` (and `bin` on Windows), and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
+  - Development on a Mac may use Homebrew: `brew install ffmpeg@8`, then `export FFMPEG_DIR=$(brew --prefix ffmpeg@8) LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib`. `tools/check.py` fills in these two values by itself when they are unset.
+  - Release packages never use Homebrew: they link the pinned static FFmpeg that `tools/macos/build.py` builds (below).
+  - Without FFmpeg, everything except `media` builds and tests: leave out `adv-shell/media` and test single crates with `-p`, since the workspace suites (`cargo test --workspace`, `cargo test-full`) build the launcher.
 - For the launcher: Node.js and pnpm.
 
 After cloning, install the pre-commit hook:
@@ -93,13 +96,13 @@ python3 tools/macos/package.py
 - `build.py` downloads the FFmpeg source pinned in `tools/macos/ffmpeg.json`, checks its SHA-256 and builds only the listed demuxers, decoders and parsers. It writes `target/macos/adv-run` and `build.json`, with the log under `target/scratch/macos-package/`.
 - `package.py` writes `target/macos/ADV.app`, or another new folder under `target` given with `--output`. It checks the load commands and the build record, signs with Hardened Runtime and the `allow-jit` entitlement only, and adds licenses, source locations and checksums.
 - The default signature is ad hoc. For distribution, set `ADV_CODESIGN_IDENTITY` to a Developer ID and pass `--notary-profile` with a notarytool profile stored in the keychain. Keep both out of the repository.
-- To add a format, update `ffmpeg.json` and the decode tests together. Do not fall back to Homebrew libraries.
+- To add a format, update `ffmpeg.json` and the decode tests together. Release builds never fall back to Homebrew libraries.
 - `python3 -m unittest discover -s tools/macos` tests the scripts without building FFmpeg.
 
 The runner inside the bundle takes the usual arguments:
 
 ```sh
-target/macos/ADV.app/Contents/MacOS/adv-run --audio --codepage 932 \
+target/macos/ADV.app/Contents/MacOS/adv-run --audio \
   --data-dir target/investigations/<topic>/data "$ADV_SAMPLES/<game>/<game>.exe"
 ```
 
