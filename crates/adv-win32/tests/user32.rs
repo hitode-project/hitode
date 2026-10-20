@@ -2635,3 +2635,58 @@ fn adjust_client_rect_and_window_moves_use_consistent_geometry() {
         ]
     );
 }
+
+#[test]
+fn message_box_indirect_a_reads_owner_text_and_style_from_its_parameters() {
+    use adv_win32::user32::dialog::{self, DialogEvent};
+    let mut t = T::new();
+    let (text, caption) = (t.text("Save settings?"), t.text("Config"));
+    // cbSize, hwndOwner, hInstance, lpszText, lpszCaption, dwStyle (MB_YESNO |
+    // MB_USERICON), lpszIcon, dwContextHelpId, lpfnMsgBoxCallback, dwLanguageId.
+    let params = t.alloc(40);
+    for (index, value) in [40, 0, 0, text, caption, 0x84, 1, 0, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
+        t.m.cpu.write_u32(params + 4 * index as u32, value).unwrap();
+    }
+    let mut code = Asm::new(CODE);
+    let result = t.call(&mut code, "MessageBoxIndirectA", &[I(params)]);
+    t.start(code);
+    assert!(matches!(
+        t.m.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    let presentation = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    let projected = &presentation.dialogs[0];
+    assert_eq!(projected.text, "Config");
+    let no = projected
+        .controls
+        .iter()
+        .find(|control| control.target.id == 7)
+        .unwrap()
+        .target;
+    let mut env = adv_machine::Env {
+        context: t.m.sys.current,
+        cpu: &mut t.m.cpu,
+        sys: &mut t.m.sys,
+        ext: &mut t.m.ext,
+        thunk: 0,
+    };
+    assert!(dialog::post_host_event(&mut env, DialogEvent::Click(no)));
+    t.finish();
+    assert_eq!(t.u32(result), 7);
+    let diagnostic =
+        t.m.ext
+            .get::<adv_abi::ApiDiagnostics>()
+            .message_boxes
+            .back()
+            .unwrap();
+    assert_eq!(diagnostic.api, "user32.dll!MessageBoxIndirectA");
+    assert_eq!(
+        (diagnostic.text.as_str(), diagnostic.style),
+        ("Save settings?", 0x4)
+    );
+}

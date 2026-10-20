@@ -103,7 +103,7 @@ fn message_box_a_named(env: &mut Env<'_>, api: &str) -> Outcome {
         c.decode_for_display(&cstr(env.cpu, text)),
         c.decode_for_display(&cstr(env.cpu, caption)),
     );
-    message_box(env, t, cap, ty, api)
+    message_box(env, env.arg(0), t, cap, ty, api)
 }
 
 fn message_box_w(env: &mut Env<'_>) -> Outcome {
@@ -113,7 +113,40 @@ fn message_box_w(env: &mut Env<'_>) -> Outcome {
 fn message_box_w_named(env: &mut Env<'_>, api: &str) -> Outcome {
     let t = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(1)));
     let cap = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(2)));
-    message_box(env, t, cap, env.arg(3), api)
+    message_box(env, env.arg(0), t, cap, env.arg(3), api)
+}
+
+// MSGBOXPARAMSA: cbSize, hwndOwner, hInstance, lpszText, lpszCaption, dwStyle,
+// then icon, help and language fields. Text and caption may be string resource
+// IDs of hInstance. The dialog has no custom icon or help button here.
+fn message_box_indirect_a(env: &mut Env<'_>) -> Outcome {
+    let params = env.arg(0);
+    let mut words = [0; 6];
+    for (index, word) in words.iter_mut().enumerate() {
+        match env.cpu.read_u32(params.wrapping_add(4 * index as u32)) {
+            Ok(value) => *word = value,
+            Err(error) => return Outcome::Fail(format!("MessageBoxIndirectA parameters: {error}")),
+        }
+    }
+    let [_, owner, instance, text, caption, style] = words;
+    let string = |env: &mut Env<'_>, value: u32| {
+        if value != 0 && value >> 16 == 0 {
+            String::from_utf16_lossy(&resource_string(env, instance, value).unwrap_or_default())
+        } else {
+            let c = env.ext.get::<Win32>().codec;
+            c.decode_for_display(&cstr(env.cpu, value))
+        }
+    };
+    let (t, cap) = (string(env, text), string(env, caption));
+    const MB_USERICON: u32 = 0x80;
+    message_box(
+        env,
+        owner,
+        t,
+        cap,
+        style & !MB_USERICON,
+        "MessageBoxIndirectA",
+    )
 }
 
 // Microsoft Learn: current MessageBoxEx uses the system UI language and
@@ -141,12 +174,18 @@ fn message_box_ex_w(
     message_box_w_named(env, "MessageBoxExW")
 }
 
-fn message_box(env: &mut Env<'_>, t: String, cap: String, ty: u32, api: &str) -> Outcome {
+fn message_box(
+    env: &mut Env<'_>,
+    owner: u32,
+    t: String,
+    cap: String,
+    ty: u32,
+    api: &str,
+) -> Outcome {
     log::warn!(
         "{api} [{cap}] {t} (type {ty:#x}) from {:#010x}",
         env.caller()
     );
-    let owner = env.arg(0);
     let mut record = adv_abi::MessageBoxCall {
         sequence: 0,
         frame: env.sys.frame,
@@ -566,27 +605,31 @@ fn destroy_user_object(env: &mut Env<'_>) -> Outcome {
 
 fn load_string_a(env: &mut Env<'_>) -> Outcome {
     let (inst, id, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let block = ResId::Id(((id >> 4) + 1) as u16);
-    let Some((addr, _)) =
-        crate::kernel32::find_resource_data(env, inst, &ResId::Id(RT_STRING), &block)
-    else {
+    let units = resource_string(env, inst, id).unwrap_or_default();
+    if units.is_empty() {
         return put_empty(env, buf, cap);
-    };
-    // A block holds 16 length-prefixed UTF-16 strings.
+    }
+    let (bytes, _) = env.ext.get::<Win32>().codec.from_utf16(0, &units);
+    Outcome::Return(put_cstr(env.cpu, buf, cap, &bytes).unwrap_or(cap.saturating_sub(1)))
+}
+
+/// String `id` of a module's RT_STRING table: a block holds 16 length-prefixed
+/// UTF-16 strings.
+fn resource_string(env: &mut Env<'_>, instance: u32, id: u32) -> Option<Vec<u16>> {
+    let block = ResId::Id(((id >> 4) + 1) as u16);
+    let (addr, _) =
+        crate::kernel32::find_resource_data(env, instance, &ResId::Id(RT_STRING), &block)?;
     let mut p = addr;
     for _ in 0..(id & 15) {
         let len = env.cpu.read_u16(p).unwrap_or(0);
         p += 2 + 2 * u32::from(len);
     }
     let len = env.cpu.read_u16(p).unwrap_or(0);
-    if len == 0 {
-        return put_empty(env, buf, cap);
-    }
-    let units: Vec<u16> = (0..u32::from(len))
-        .map(|i| env.cpu.read_u16(p + 2 + 2 * i).unwrap_or(0))
-        .collect();
-    let (bytes, _) = env.ext.get::<Win32>().codec.from_utf16(0, &units);
-    Outcome::Return(put_cstr(env.cpu, buf, cap, &bytes).unwrap_or(cap.saturating_sub(1)))
+    Some(
+        (0..u32::from(len))
+            .map(|i| env.cpu.read_u16(p + 2 + 2 * i).unwrap_or(0))
+            .collect(),
+    )
 }
 
 #[adv_abi::win32(user32, name = "LoadStringW", level = implement)]
@@ -807,6 +850,7 @@ pub fn register(reg: &mut Registry) {
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "MessageBoxA", 4, message_box_a);
     s(reg, "MessageBoxW", 4, message_box_w);
+    s(reg, "MessageBoxIndirectA", 1, message_box_indirect_a);
     reg.register(message_box_ex_a_ABI);
     reg.register(message_box_ex_w_ABI);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));

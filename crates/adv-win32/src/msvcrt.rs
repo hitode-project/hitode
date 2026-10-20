@@ -254,6 +254,7 @@ pub fn register(r: &mut Registry) {
         ("__p__iob", 0),
         ("abort", 0),
         ("_amsg_exit", 1),
+        ("_purecall", 0),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
     }
@@ -356,6 +357,7 @@ pub fn register(r: &mut Registry) {
             adv_machine::Conv::CdeclVariadic { fixed: 2 },
             call,
         );
+        r.add(module, "longjmp", Conv::Cdecl { argc: 2 }, call);
     }
     r.add(
         "msvcrt.dll",
@@ -363,6 +365,7 @@ pub fn register(r: &mut Registry) {
         adv_machine::Conv::CdeclVariadic { fixed: 2 },
         call,
     );
+    r.add("msvcrt.dll", "longjmp", Conv::Cdecl { argc: 2 }, call);
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
@@ -486,6 +489,52 @@ fn split_path_a(path: &[u8]) -> (&[u8], &[u8], &[u8], &[u8]) {
     };
     (drive, dir, fname, ext)
 }
+/// 'VC20', marking a `_setjmp3` buffer that carries an unwind function.
+const JMP_MAGIC: u32 = 0x5643_3230;
+
+/// longjmp over a `_setjmp3` buffer, after Wine msvcrt `MSVCRT_longjmp`. The
+/// buffer's unwind function runs first; a jump that would need a global SEH
+/// unwind or a local `__try` unwind without one stops instead of skipping it.
+fn long_jump(e: &mut Env<'_>, buffer: u32, value: u32) -> Outcome {
+    let mut words = [0; 10];
+    for (index, word) in words.iter_mut().enumerate() {
+        match e.cpu.read_u32(buffer.wrapping_add(4 * index as u32)) {
+            Ok(read) => *word = read,
+            Err(error) => return Outcome::Fail(format!("longjmp buffer: {error}")),
+        }
+    }
+    let [.., registration, try_level, cookie, unwind] = words;
+    let teb = e.ctx().teb;
+    let current = e.cpu.read_u32(teb).unwrap_or(u32::MAX);
+    if registration != current {
+        return Outcome::Fail(format!(
+            "longjmp across SEH frames {current:#010x}..{registration:#010x} needs a global unwind"
+        ));
+    }
+    let value = value.max(1);
+    if registration != u32::MAX && cookie == JMP_MAGIC && unwind != 0 {
+        return Outcome::call(unwind, [buffer], move |e, _| restore_jump(e, words, value));
+    }
+    if registration != u32::MAX
+        && e.cpu.read_u32(registration + 12).unwrap_or(try_level) != try_level
+    {
+        return Outcome::Fail("longjmp out of a __try block needs a local unwind".into());
+    }
+    restore_jump(e, words, value)
+}
+
+fn restore_jump(e: &mut Env<'_>, words: [u32; 10], value: u32) -> Outcome {
+    let [ebp, ebx, edi, esi, esp, eip, ..] = words;
+    let mut checkpoint = match e.checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Outcome::Fail(error.to_string()),
+    };
+    let regs = &mut checkpoint.state.regs;
+    (regs[0], regs[3], regs[4], regs[5], regs[6], regs[7]) = (value, ebx, esp, ebp, esi, edi);
+    checkpoint.state.eip = eip;
+    Outcome::ResumeExecution(checkpoint.unwind_callbacks())
+}
+
 fn call(e: &mut Env<'_>) -> Outcome {
     let name = e.sys.thunks.get(e.thunk).name.clone();
     let arg = |i| e.arg(i);
@@ -1577,15 +1626,36 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write_u32(jmp_buf + 16, esp.wrapping_add(4));
                 let _ = e.cpu.write_u32(jmp_buf + 20, caller);
                 let _ = e.cpu.write_u32(jmp_buf + 24, exception_list);
-                let _ = e.cpu.write_u32(jmp_buf + 28, 0);
-
-                for i in 0..count.min(6) {
-                    let val = e.arg(2 + i);
-                    let _ = e.cpu.write_u32(jmp_buf + 32 + i * 4, val);
+                // Wine msvcrt `_setjmp3`: TryLevel, the 'VC20' cookie, the optional
+                // unwind function and up to six words of its data follow.
+                let try_level = if exception_list == u32::MAX {
+                    u32::MAX
+                } else if count > 1 {
+                    e.arg(3)
+                } else {
+                    e.cpu.read_u32(exception_list + 12).unwrap_or(u32::MAX)
+                };
+                let unwind = if count > 0 && exception_list != u32::MAX {
+                    e.arg(2)
+                } else {
+                    0
+                };
+                let _ = e.cpu.write_u32(jmp_buf + 28, try_level);
+                let _ = e.cpu.write_u32(jmp_buf + 32, JMP_MAGIC);
+                let _ = e.cpu.write_u32(jmp_buf + 36, unwind);
+                if exception_list != u32::MAX {
+                    for i in 0..count.saturating_sub(2).min(6) {
+                        let val = e.arg(4 + i);
+                        let _ = e.cpu.write_u32(jmp_buf + 40 + i * 4, val);
+                    }
                 }
             }
             0
         }
+        "longjmp" => return long_jump(e, a, b),
+        // R6025: no `_set_purecall_handler` exists in this CRT, so it ends the
+        // process the way `_amsg_exit` does.
+        "_purecall" => return crate::kernel32::exit_process(e, 255),
         "getenv" => 0,
         "_makepath" => {
             let mut out = Vec::new();
@@ -1777,6 +1847,76 @@ mod tests {
         assert_eq!(value(&m, 3), 0, "the limit stops before X/y");
         assert_ne!(value(&m, 4), 0);
         assert_eq!(value(&m, 4), value(&m, 5));
+    }
+    #[test]
+    fn longjmp_resumes_setjmp3_with_saved_registers_and_a_nonzero_value() {
+        for jit in [false, true] {
+            let mut m = machine(jit);
+            let (code, data) = (0x400000, 0x500000);
+            let buffer = data + 0x100;
+            m.cpu.map(code, 4096, Prot::RX).unwrap();
+            m.cpu.map(data, 4096, Prot::RW).unwrap();
+            let api = |m: &mut Machine<JitCpu>, name| m.resolve_import("msvcrt.dll", name).unwrap();
+            let (setjmp, longjmp) = (api(&mut m, "_setjmp3"), api(&mut m, "longjmp"));
+            let abort = api(&mut m, "abort");
+            let slot = |offset: u32| dword_ptr((data + offset) as i32);
+            let mut a = CodeAssembler::new(32).unwrap();
+            let mut done = a.create_label();
+            a.mov(ebx, 0x1234_5678).unwrap();
+            a.mov(esi, 0x1111).unwrap();
+            a.mov(edi, 0x2222).unwrap();
+            a.mov(ebp, 0x3333).unwrap();
+            a.mov(slot(8), esp).unwrap();
+            a.push(0).unwrap();
+            a.push(buffer as i32).unwrap();
+            a.call(u64::from(setjmp)).unwrap();
+            a.add(esp, 8).unwrap();
+            a.inc(slot(0)).unwrap();
+            a.mov(slot(4), eax).unwrap();
+            a.test(eax, eax).unwrap();
+            a.jne(done).unwrap();
+            for register in [ebx, esi, edi, ebp] {
+                a.xor(register, register).unwrap();
+            }
+            a.push(0).unwrap();
+            a.push(buffer as i32).unwrap();
+            a.call(u64::from(longjmp)).unwrap();
+            a.call(u64::from(abort)).unwrap();
+            a.set_label(&mut done).unwrap();
+            for (offset, register) in [(12, ebx), (16, esi), (20, edi), (24, ebp), (28, esp)] {
+                a.mov(slot(offset), register).unwrap();
+            }
+            a.call(u64::from(abort)).unwrap();
+            m.cpu
+                .write(code, &a.assemble(u64::from(code)).unwrap())
+                .unwrap();
+            m.spawn("longjmp", code, &[], 65536).unwrap();
+            let result = m.run();
+            assert!(matches!(result, RunResult::Exited(3)), "{result:?}");
+            let value = |offset| m.cpu.read_u32(data + offset).unwrap();
+            assert_eq!(value(0), 2, "setjmp returns twice");
+            assert_eq!(value(4), 1, "longjmp(buf, 0) returns 1");
+            assert_eq!(
+                [value(12), value(16), value(20), value(24), value(28)],
+                [0x1234_5678, 0x1111, 0x2222, 0x3333, value(8)]
+            );
+            assert_eq!(m.cpu.read_u32(buffer + 32).unwrap(), JMP_MAGIC);
+        }
+    }
+    #[test]
+    fn purecall_ends_the_process_like_amsg_exit() {
+        let mut m = machine(false);
+        let code = 0x400000;
+        m.cpu.map(code, 4096, Prot::RX).unwrap();
+        let purecall = m.resolve_import("msvcrt.dll", "_purecall").unwrap();
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.call(u64::from(purecall)).unwrap();
+        m.cpu
+            .write(code, &a.assemble(u64::from(code)).unwrap())
+            .unwrap();
+        m.spawn("purecall", code, &[], 65536).unwrap();
+        let result = m.run();
+        assert!(matches!(result, RunResult::Exited(255)), "{result:?}");
     }
     #[test]
     fn vcruntime_memset_fills_only_the_requested_bytes_returns_destination_and_is_cdecl() {
