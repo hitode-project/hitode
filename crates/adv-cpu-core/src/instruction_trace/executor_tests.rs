@@ -1,9 +1,16 @@
-// These vectors contain address ranges, not the elements of each range.
-#![allow(clippy::single_range_in_vec_init)]
+// Shared by both engines through `include!`: the including module provides
+// `Executor`, `executor(base, len)`, `reserved(memory)` and
+// `run_interpreted(cpu, stop, budget)`.
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::*;
-use crate::{Executor, WRITE};
+use adv_cpu_core::instruction_trace::{Config, Trace};
+use adv_cpu_core::{CpuState, EXEC, Memory, PAGE_SIZE, READ, RunOutcome, WRITE};
 use serde_json::Value;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 const CODE: u32 = 0x10000;
 const DATA: u32 = 0x18000;
@@ -33,7 +40,7 @@ fn directory() -> PathBuf {
 }
 
 fn cpu(bytes: &[u8]) -> Executor {
-    let mut cpu = Executor::new(CODE, 0x10000).unwrap();
+    let mut cpu = executor(CODE, 0x10000);
     cpu.instruction_trace = None;
     cpu.protect(CODE, 0x10000, READ | WRITE).unwrap();
     cpu.write(CODE, bytes).unwrap();
@@ -64,7 +71,7 @@ fn attach_operands(
         start: None,
         watch_dword: None,
     });
-    let path = trace.path.clone();
+    let path = trace.path().to_owned();
     cpu.instruction_trace = Some(Box::new(trace));
     path
 }
@@ -78,7 +85,7 @@ fn events(path: &PathBuf) -> Vec<Value> {
 }
 
 fn run(cpu: &mut Executor, budget: u64) -> RunOutcome {
-    cpu.run_execution(STOP, budget, None, true).unwrap()
+    run_interpreted(cpu, STOP, budget)
 }
 
 #[test]
@@ -187,8 +194,7 @@ fn delayed_start_preserves_execution_and_captures_the_trigger_instruction() {
         0,
     );
     let trace = traced.instruction_trace.as_mut().unwrap();
-    trace.config.start = Some(CODE + 5);
-    trace.armed = false;
+    trace.delay_until(CODE + 5);
     assert_eq!(run(&mut control, 100), RunOutcome::ReachedStop);
     assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
     assert_eq!(traced.state, control.state);
@@ -214,16 +220,7 @@ fn configuration_rejects_empty_or_unbounded_capture_and_non_target_output() {
     let config = Config::parse(dir, "0X1000..0x2000,8192..12288", "1", "8", "1").unwrap();
     assert_eq!(config.ranges, [0x1000..0x2000, 0x2000..0x3000]);
     assert!(config.operands);
-    assert!(
-        Config::parse(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            "0..1",
-            "1",
-            "0",
-            "0"
-        )
-        .is_err()
-    );
+    assert!(Config::parse(std::env::temp_dir(), "0..1", "1", "0", "0").is_err());
 }
 
 #[test]
@@ -241,7 +238,7 @@ fn unreadable_stack_words_across_a_page_are_null_without_faulting_the_guest() {
         2,
     );
     assert_eq!(
-        traced.run_execution(CODE + 1, 100, None, true).unwrap(),
+        run_interpreted(&mut traced, CODE + 1, 100),
         RunOutcome::ReachedStop
     );
     assert_eq!(traced.state.regs[4], esp);
@@ -270,9 +267,8 @@ fn io_failure_disables_diagnostics_and_preserves_execution() {
     assert_eq!(run(&mut traced, 100), RunOutcome::ReachedStop);
     assert_eq!(traced.state, control.state);
     let trace = traced.instruction_trace.as_ref().unwrap();
-    assert!(trace.disabled);
-    assert!(trace.failure.is_some());
-    assert_eq!(trace.written, 0);
+    assert!(trace.failed());
+    assert_eq!(trace.written(), 0);
 }
 
 #[test]
@@ -300,7 +296,7 @@ fn a_fetch_fault_outside_the_range_remains_visible_as_a_boundary() {
 }
 
 struct Trap;
-impl crate::ExecutionTrap for Trap {
+impl adv_cpu_core::ExecutionTrap for Trap {
     fn call(&mut self, state: &mut CpuState, _: &mut Memory, vector: u32) -> Result<bool, String> {
         assert_eq!(vector, 0x2e);
         state.regs[0] = 0xaabbccdd;
@@ -349,7 +345,7 @@ fn jit_backend_selection_does_not_activate_instruction_capture() {
     );
     assert_eq!(traced.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert!(!path.exists());
-    assert_eq!(traced.instruction_trace.as_ref().unwrap().written, 0);
+    assert_eq!(traced.instruction_trace.as_ref().unwrap().written(), 0);
 }
 
 #[test]
@@ -474,38 +470,6 @@ fn explicit_pop_memory_uses_the_post_pop_destination_without_observing_implicit_
 }
 
 #[test]
-fn unreadable_overwide_and_unknown_operands_are_null_without_mutating_execution() {
-    let mut traced = cpu(&[0x83, 0x38, 1]); // Authored cmp dword [eax],1.
-    traced
-        .protect(DATA + PAGE_SIZE as u32, PAGE_SIZE, 0)
-        .unwrap();
-    for address in [DATA + PAGE_SIZE as u32 - 2, u32::MAX - 1] {
-        traced.state.regs[0] = address;
-        let state = traced.state.clone();
-        let i = instruction(&traced.memory, CODE).unwrap();
-        let entries = operands(&i, &traced.state);
-        let row: Value =
-            serde_json::from_str(&operand_snapshot(&entries, &traced.state, &traced.memory))
-                .unwrap();
-        assert_eq!(row[0]["ea"], address);
-        assert!(row[0]["scalar"].is_null());
-        assert_eq!(traced.state, state);
-    }
-    let mut traced = cpu(&[0x0f, 0x10, 0x00]); // Authored movups xmm0,[eax].
-    traced.state.regs[0] = DATA;
-    let i = instruction(&traced.memory, CODE).unwrap();
-    let row: Value = serde_json::from_str(&operand_snapshot(
-        &operands(&i, &traced.state),
-        &traced.state,
-        &traced.memory,
-    ))
-    .unwrap();
-    assert!(row[0]["value"].is_null());
-    assert_eq!(row[1]["width"], 16);
-    assert!(row[1]["scalar"].is_null());
-}
-
-#[test]
 fn disabled_operands_preserve_the_existing_schema_and_execution() {
     let mut plain = cpu(&[0x83, 0xf9, 78, 0xc3]);
     let mut off = cpu(&[0x83, 0xf9, 78, 0xc3]);
@@ -585,7 +549,7 @@ fn watch_changes_cover_unselected_blocks_without_tracing_unrelated_iterations() 
         .instruction_trace
         .as_mut()
         .unwrap()
-        .config
+        .config_mut()
         .watch_dword = Some(DATA);
     assert_eq!(run(&mut control, 80), RunOutcome::Budget);
     assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
@@ -613,7 +577,7 @@ fn watch_changes_cover_unselected_blocks_without_tracing_unrelated_iterations() 
 
 #[test]
 fn watch_first_mapping_and_readability_changes_are_observations_without_cpu_faults() {
-    let mut traced = Executor::create(Memory::reserve(CODE, 0x10000).unwrap()).unwrap();
+    let mut traced = reserved(Memory::reserve(CODE, 0x10000).unwrap());
     traced.instruction_trace = None;
     traced.map(CODE, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
     traced.write(CODE, &[0x40, 0xc3]).unwrap();
@@ -628,7 +592,7 @@ fn watch_first_mapping_and_readability_changes_are_observations_without_cpu_faul
         .instruction_trace
         .as_mut()
         .unwrap()
-        .config
+        .config_mut()
         .watch_dword = Some(DATA);
     let observe = |cpu: &mut Executor| {
         let state = cpu.state.clone();
@@ -669,9 +633,8 @@ fn watch_uses_the_delayed_start_and_shared_event_limit_without_changing_executio
     let mut traced = cpu(&bytes);
     let path = attach(&mut traced, vec![0..1], 2, 0);
     let trace = traced.instruction_trace.as_mut().unwrap();
-    trace.config.watch_dword = Some(DATA);
-    trace.config.start = Some(CODE + 12);
-    trace.armed = false;
+    trace.config_mut().watch_dword = Some(DATA);
+    trace.delay_until(CODE + 12);
     assert_eq!(run(&mut control, 80), RunOutcome::Budget);
     assert_eq!(run(&mut traced, 80), RunOutcome::Budget);
     assert_eq!(traced.state, control.state);

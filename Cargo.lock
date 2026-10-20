@@ -55,6 +55,7 @@ dependencies = [
  "libc",
  "log",
  "rustc-hash 2.1.3",
+ "serde_json",
  "unicorn-engine",
 ]
 
@@ -68,6 +69,7 @@ dependencies = [
  "libc",
  "log",
  "rustc-hash 2.1.3",
+ "serde_json",
  "sha2",
  "thiserror 2.0.21",
 ]

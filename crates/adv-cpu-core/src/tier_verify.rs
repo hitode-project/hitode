@@ -1,14 +1,17 @@
-//! Opt-in tier verification: the first native entries after each
-//! publication are checked against the interpreter.
+//! Opt-in tier verification for both engines: the first native entries are
+//! checked against the interpreter.
 //!
 //! With `ADV_JIT_VERIFY=1` (or `strict`), the executor first interprets from
 //! the entry one instruction at a time, keeping the architectural state before
 //! each instruction and the bytes each one writes. It restores those bytes and
-//! the entry state, runs one native block without region links, and compares
-//! the native exit with the interpreted state at the same PC; one block has no
-//! back edge, so that PC names a single interpreted state. Native writes
-//! outside the interpreted footprint go unseen. Strict mode turns a mismatch
-//! into a run error, so a bisection stops at the first divergent region.
+//! the entry state, then runs the native code once. The x64 engine runs one
+//! block without region links after each publication and compares its exit
+//! with the interpreted state at the same PC; one block has no back edge, so
+//! that PC names a single interpreted state. The a64 engine checks each entry
+//! PC's first runs and reports how many instructions they retired, which names
+//! the interpreted state directly. Native writes outside the interpreted
+//! footprint go unseen. Strict mode turns a mismatch into a run error, so a
+//! bisection stops at the first divergent unit.
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -20,11 +23,11 @@ use crate::interpreter::{Interpreter, Step};
 use crate::{ArchitecturalState, CpuState, Memory};
 
 /// Interpreted instructions per trace; a native exit beyond it is inconclusive.
-const MAX_STEPS: usize = 4096;
-/// Native entries verified after each publication.
-pub(crate) const ENTRIES: u8 = 4;
+pub const MAX_STEPS: usize = 4096;
+/// Native entries verified per x64 publication or a64 entry PC.
+pub const ENTRIES: u8 = 4;
 /// Mismatch descriptions kept for the run report.
-pub(crate) const REPORTS: usize = 16;
+pub const REPORTS: usize = 16;
 
 #[derive(Default, Clone, Debug)]
 pub struct VerifyStats {
@@ -39,14 +42,32 @@ pub struct VerifyStats {
     pub reports: Vec<String>,
 }
 
-pub(crate) struct Verifier {
+impl VerifyStats {
+    /// The `tier_verification` report object.
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"verified\":{},\"inconclusive\":{},\"mismatches\":{},\"mxcsr_flags\":{},\"reports\":[{}]}}",
+            self.verified,
+            self.inconclusive,
+            self.mismatches,
+            self.mxcsr_flags,
+            self.reports
+                .iter()
+                .map(|r| crate::engine::json_string(r))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+pub struct Verifier {
     pub strict: bool,
     /// Published regions and how many of their next native entries to verify.
     pub pending: HashMap<u32, u8>,
     factory: InstructionInfoFactory,
 }
 
-pub(crate) struct Trace {
+pub struct Trace {
     owner: u32,
     entry: u32,
     /// State before each interpreted step, with the write log length and the
@@ -65,7 +86,7 @@ struct Written {
 }
 
 impl Verifier {
-    pub(crate) fn from_env() -> Option<Box<Self>> {
+    pub fn from_env() -> Option<Box<Self>> {
         let mode = std::env::var("ADV_JIT_VERIFY").ok()?;
         match mode.as_str() {
             "" | "0" => None,
@@ -73,7 +94,7 @@ impl Verifier {
         }
     }
 
-    pub(crate) fn new(strict: bool) -> Self {
+    pub fn new(strict: bool) -> Self {
         Self {
             strict,
             pending: HashMap::new(),
@@ -81,7 +102,7 @@ impl Verifier {
         }
     }
 
-    pub(crate) fn take(&mut self, owner: u32) {
+    pub fn take(&mut self, owner: u32) {
         if let Some(left) = self.pending.get_mut(&owner) {
             *left -= 1;
             if *left == 0 {
@@ -91,7 +112,7 @@ impl Verifier {
     }
 
     /// Interpret from the current state, then restore the state and memory.
-    pub(crate) fn record(
+    pub fn record(
         &mut self,
         owner: u32,
         stop: u32,
@@ -158,7 +179,7 @@ impl Verifier {
 impl Trace {
     /// Compare the native exit with interpreted states at its PC. `None` when
     /// no interpreted state reached it, or none matched a cut trace.
-    pub(crate) fn check(&self, state: &CpuState, memory: &Memory) -> Option<Result<Check, String>> {
+    pub fn check(&self, state: &CpuState, memory: &Memory) -> Option<Result<Check, String>> {
         let native = state.clone().capture_architecture();
         let mut best: Option<Vec<String>> = None;
         for recorded in self.states.iter().filter(|(s, ..)| s.eip == native.eip) {
@@ -173,6 +194,24 @@ impl Trace {
         }
         let diff = best.filter(|_| !self.cut)?;
         Some(Err(self.report(&native, &diff)))
+    }
+
+    /// Compare the native exit after `retired` instructions with the
+    /// interpreted state after as many: for engines that count what a run
+    /// retired, whose units may loop. `None` when the interpreter did not
+    /// get that far.
+    pub fn check_retired(
+        &self,
+        retired: usize,
+        state: &CpuState,
+        memory: &Memory,
+    ) -> Option<Result<Check, String>> {
+        let native = state.clone().capture_architecture();
+        let recorded = self.states.get(retired)?;
+        Some(
+            self.compare(recorded, &native, memory)
+                .map_err(|diff| self.report(&native, &diff)),
+        )
     }
 
     fn compare(
@@ -244,7 +283,7 @@ impl Trace {
 const MXCSR_FLAGS: u32 = 0x3f;
 
 #[derive(Debug)]
-pub(crate) enum Check {
+pub enum Check {
     Equal,
     /// Equal except for MXCSR exception flags.
     MxcsrFlags,

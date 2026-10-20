@@ -1,4 +1,5 @@
-//! Bounded local instruction observations for the explicit interpreter backend.
+//! Bounded local instruction observations for the explicit interpreter
+//! backend of either engine.
 //!
 //! Set ADV_INTERP_TRACE_DIR to an existing directory beneath target and
 //! ADV_INTERP_TRACE_RANGES to comma-separated START..END half-open PC ranges
@@ -37,26 +38,25 @@ use iced_x86::{
     Code, Decoder, DecoderOptions, Instruction, InstructionInfoFactory, OpKind, Register,
 };
 
-use super::RunOutcome;
 use crate::interpreter::Step;
-use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ};
+use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, RunOutcome};
 
 const ADDRESS_END: u64 = 1 << 32;
 const MAX_EVENTS: usize = 100_000;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-struct Config {
-    directory: PathBuf,
-    ranges: Vec<Range<u64>>,
-    max: usize,
-    stack_words: usize,
-    operands: bool,
-    start: Option<u32>,
-    watch_dword: Option<u32>,
+pub struct Config {
+    pub directory: PathBuf,
+    pub ranges: Vec<Range<u64>>,
+    pub max: usize,
+    pub stack_words: usize,
+    pub operands: bool,
+    pub start: Option<u32>,
+    pub watch_dword: Option<u32>,
 }
 
 impl Config {
-    fn parse(
+    pub fn parse(
         directory: PathBuf,
         ranges: &str,
         max: &str,
@@ -113,7 +113,7 @@ impl Config {
         })
     }
 
-    fn set_watch(&mut self, value: &str) -> Result<(), String> {
+    pub fn set_watch(&mut self, value: &str) -> Result<(), String> {
         let value = value.trim();
         let address = match value
             .strip_prefix("0x")
@@ -131,7 +131,7 @@ impl Config {
     }
 }
 
-pub(super) struct Before {
+pub struct Before {
     opcode: Option<Code>,
     state: String,
     operands: Option<OperandSnapshot>,
@@ -163,7 +163,7 @@ enum OperandDetail {
     Unknown,
 }
 
-pub(crate) struct Trace {
+pub struct Trace {
     config: Config,
     path: PathBuf,
     writer: Option<BufWriter<File>>,
@@ -178,7 +178,7 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    pub(super) fn from_env() -> Option<Box<Self>> {
+    pub fn from_env() -> Option<Box<Self>> {
         let directory = std::env::var_os("ADV_INTERP_TRACE_DIR")?;
         let read = |name, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
         match Config::parse(
@@ -225,7 +225,7 @@ impl Trace {
         }
     }
 
-    fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -250,7 +250,7 @@ impl Trace {
         }
     }
 
-    pub(super) fn prepare(
+    pub fn prepare(
         &mut self,
         units: u32,
         state: &CpuState,
@@ -359,7 +359,7 @@ impl Trace {
         self.record("watch_change", &fields);
     }
 
-    pub(super) fn complete(
+    pub fn complete(
         &mut self,
         before: Before,
         step: Step,
@@ -392,7 +392,7 @@ impl Trace {
         self.pending_resume = matches!(step, Step::Trap { .. });
     }
 
-    pub(super) fn boundary(
+    pub fn boundary(
         &mut self,
         result: &Result<RunOutcome, String>,
         state: &CpuState,
@@ -702,6 +702,33 @@ fn snapshot(state: &CpuState, memory: &Memory, stack_words: usize) -> String {
     }
     text.push_str("]}");
     text
+}
+
+/// What executor tests inspect.
+#[cfg(any(test, feature = "testing"))]
+impl Trace {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn written(&self) -> usize {
+        self.written
+    }
+
+    /// Whether an IO failure disabled capture.
+    pub fn failed(&self) -> bool {
+        self.disabled && self.failure.is_some()
+    }
+
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
+    /// Observation starts only once `pc` is reached.
+    pub fn delay_until(&mut self, pc: u32) {
+        self.config.start = Some(pc);
+        self.armed = false;
+    }
 }
 
 #[cfg(test)]

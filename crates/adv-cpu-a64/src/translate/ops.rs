@@ -748,7 +748,12 @@ impl Translator<'_> {
             _ => temp(1),
         };
         let Some(alu) = alu else {
-            let value = right_reg(self);
+            // Not x17: writing a register part may first materialize flags
+            // through it.
+            let value = match right {
+                Operand::Imm(value) => self.imm(value, X6),
+                _ => temp(1),
+            };
             self.narrow_write(dst, width, address, value);
             for t in [Operand::Temp(0), Operand::Temp(1)] {
                 self.forget(t);
@@ -859,7 +864,9 @@ impl Translator<'_> {
         }
     }
 
-    /// Writes the low bytes of `value` to the narrow `part`.
+    /// Writes the low bytes of `value` to the narrow `part`. A register part
+    /// first prepares its guest register, which may use x15 to x17, so
+    /// `value` is never one of them.
     pub(super) fn narrow_write(&mut self, part: Part, width: u8, address: Reg, value: Reg) {
         match part {
             Part::Reg(number) => {

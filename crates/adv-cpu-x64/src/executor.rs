@@ -11,7 +11,6 @@ use crate::{CompileStrategy, CpuState, Exit, Memory, ProfileSample, Region, RunO
 mod code_store;
 mod coverage;
 mod frame_timing;
-mod instruction_trace;
 mod interpreter_profile;
 #[cfg(all(test, windows))]
 mod native_memory_tests;
@@ -19,11 +18,12 @@ mod schedule;
 pub use schedule::CompilationSchedule;
 mod aot;
 mod persistent;
-mod verify;
 mod warm;
+use crate::instruction_trace;
+use crate::tier_verify as verify;
+pub use crate::tier_verify::VerifyStats;
 pub use aot::AotStats;
 use code_store::CodeStore;
-pub use verify::VerifyStats;
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
@@ -3577,4 +3577,25 @@ mod native_deadline_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod instruction_trace_tests {
+    // These vectors contain address ranges, not the elements of each range.
+    #![allow(clippy::single_range_in_vec_init)]
+    use super::Executor;
+
+    fn executor(base: u32, len: usize) -> Executor {
+        Executor::new(base, len).unwrap()
+    }
+
+    fn reserved(memory: adv_cpu_core::Memory) -> Executor {
+        Executor::create(memory).unwrap()
+    }
+
+    fn run_interpreted(cpu: &mut Executor, stop: u32, budget: u64) -> adv_cpu_core::RunOutcome {
+        cpu.run_execution(stop, budget, None, true).unwrap()
+    }
+
+    include!("../../adv-cpu-core/src/instruction_trace/executor_tests.rs");
 }
