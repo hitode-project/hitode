@@ -23,7 +23,7 @@
         checked={value === e.k}
         onpick={() => onpick(e.k)}
         check={false}
-        style="flex-direction: column; align-items: flex-start; justify-content: center; gap: {compact ? 4 : 6}px; min-height: {compact ? 80 : 96}px; padding: {compact ? '14px 18px' : '16px 18px'}; background: {value === e.k ? 'var(--sel)' : 'var(--field)'}"
+        style="flex-direction: column; align-items: flex-start; justify-content: center; gap: {compact ? 4 : 6}px; min-height: {compact ? 80 : 96}px; padding: {compact ? '14px 18px' : '16px 18px'}; background: {value === e.k ? 'var(--sel)' : 'var(--field)'}; box-shadow: {value === e.k ? 'inset 0 0 0 2px var(--accent)' : 'none'}"
       >
         <span class="pv" class:compact lang={e.lang}>{e.preview}</span>
         <span class="cap">{e.label}</span>
