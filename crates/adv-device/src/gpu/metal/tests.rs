@@ -1,74 +1,8 @@
 use super::*;
-use std::cell::RefCell;
-use std::sync::{Mutex, MutexGuard};
-
-// Each native state maps a 64 MiB ring. Tests running in parallel could map
-// one per test at once and exhaust a small virtual GPU (CI runners report
-// "Out of memory" device loss), so native states are made one test at a time.
-// The lock is reentrant per thread for tests that hold two native devices.
-static NATIVE: Mutex<()> = Mutex::new(());
-thread_local! {
-    static HELD: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) };
-}
-
-struct Serial;
-
-impl Serial {
-    fn acquire() -> Self {
-        HELD.with(|held| {
-            let mut held = held.borrow_mut();
-            if held.0 == 0 {
-                held.1 = Some(
-                    NATIVE
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                );
-            }
-            held.0 += 1;
-        });
-        Self
-    }
-}
-
-impl Drop for Serial {
-    fn drop(&mut self) {
-        HELD.with(|held| {
-            let mut held = held.borrow_mut();
-            held.0 -= 1;
-            if held.0 == 0 {
-                held.1 = None;
-            }
-        });
-    }
-}
-
-/// A test device; fields drop in order, so the device goes before its permit.
-struct TestGpu {
-    gpu: Gpu,
-    _serial: Option<Serial>,
-}
-
-impl std::ops::Deref for TestGpu {
-    type Target = Gpu;
-    fn deref(&self) -> &Gpu {
-        &self.gpu
-    }
-}
-
-impl std::ops::DerefMut for TestGpu {
-    fn deref_mut(&mut self) -> &mut Gpu {
-        &mut self.gpu
-    }
-}
-
-fn gpu(native: bool) -> TestGpu {
-    let serial = native.then(Serial::acquire);
+fn gpu(native: bool) -> Gpu {
     let gpu = pollster::block_on(Gpu::request_backend(false, GpuBackend::Metal)).unwrap();
     gpu.context.pending.lock().unwrap().metal = native.then(|| State::new(&gpu.context).unwrap());
-    TestGpu {
-        gpu,
-        _serial: serial,
-    }
+    gpu
 }
 fn read(gpu: &mut Gpu, target: &Target) -> Vec<u8> {
     let mut ticket = gpu.readback(&target.image, None).unwrap();
