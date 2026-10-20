@@ -1,5 +1,6 @@
 //! Default ANSI code page for a game executable. Simplified Chinese builds are
-//! recognized by a name marker such as `_chs`, or by non-executable sections
+//! recognized by a name marker such as `_chs`, a name written with simplified
+//! characters that Shift_JIS lacks, or by non-executable sections
 //! holding clearly more GB2312 text than Shift_JIS text. Everything else runs
 //! as Japanese. Text that lives only in archives is not visible here.
 use adv_os::nls;
@@ -21,12 +22,29 @@ pub fn detect(name: &str, image: &[u8]) -> u32 {
     {
         return SIMPLIFIED_CHINESE;
     }
+    if simplified_name(stem) {
+        return SIMPLIFIED_CHINESE;
+    }
     let (japanese, chinese) = text_evidence(image);
     if chinese >= MIN_CHINESE && chinese >= 3 * japanese {
         SIMPLIFIED_CHINESE
     } else {
         JAPANESE
     }
+}
+
+/// A kana-free name with a CJK character that GBK has and Shift_JIS lacks,
+/// such as 时 or 线, is a Simplified Chinese title.
+fn simplified_name(stem: &str) -> bool {
+    let codec = nls::Codec::new(JAPANESE);
+    let mut units = [0; 2];
+    !stem.chars().any(|c| matches!(c, '\u{3040}'..='\u{30ff}'))
+        && stem.chars().any(|c| {
+            let units = c.encode_utf16(&mut units);
+            matches!(c, '\u{4e00}'..='\u{9fff}')
+                && codec.from_utf16(JAPANESE, units).1
+                && !codec.from_utf16(SIMPLIFIED_CHINESE, units).1
+        })
 }
 
 /// Distinct common Shift_JIS and GB2312 characters in NUL-terminated strings
@@ -139,5 +157,9 @@ mod tests {
         assert_eq!(detect("Game_chs.exe", &image(&japanese)), 936);
         assert_eq!(detect("nana-CN.exe", &[]), 936);
         assert_eq!(detect("chaos.exe", &[]), 932);
+        // Simplified characters missing from Shift_JIS name a Chinese build.
+        assert_eq!(detect("黄昏时的境界线.exe", &image(&japanese)), 936);
+        assert_eq!(detect("黄昏時の境界線.exe", &[]), 932);
+        assert_eq!(detect("白詰草話.exe", &[]), 932);
     }
 }

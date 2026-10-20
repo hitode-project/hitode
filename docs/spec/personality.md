@@ -166,7 +166,7 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-PROFILE-7 ANSI code page selection
 
-**Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. A name token `chs`, `cn`, `gb` or `zhcn` marks such an executable, as do 16 distinct GB2312 characters in data sections outnumbering Shift_JIS ones threefold. An explicit code page MUST replace the detected one before guest code runs.
+**Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. Markers are a name token `chs`, `cn`, `gb` or `zhcn`, a kana-free name with a GBK-only character, or GB2312 data text outnumbering Shift_JIS threefold. An explicit code page MUST replace the detected one before guest code runs.
 **Verification**: Test
 
 ## ABI ownership
