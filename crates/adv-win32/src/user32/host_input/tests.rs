@@ -251,3 +251,31 @@ fn wheel_uses_focus_over_capture_and_default_processing_returns_the_parent_resul
     }
     f.cleanup();
 }
+
+#[test]
+// spec: WIN32-USER-19
+fn host_activation_posts_the_windows_activation_order_to_the_active_window() {
+    let mut f = Fixture::new("host-activation");
+    let hwnd = f.m.ext.get::<Win32>().user.desktop;
+    f.m.ext.get_mut::<Win32>().user.top.push(hwnd);
+    let time = Instant::now();
+    assert!(post_at(&mut env(&mut f.m), 0x1c, 0, 0, time));
+    assert!(post_at(&mut env(&mut f.m), 0x1c, 1, 0, time));
+    let posted: Vec<_> = f.m.ext.get::<Win32>().user.queues[&0]
+        .posted
+        .iter()
+        .map(|event| (event.hwnd, event.msg, event.wparam, event.lparam))
+        .collect();
+    assert_eq!(
+        posted,
+        [
+            (hwnd, 0x86, 0, 0),
+            (hwnd, 0x06, 0, 0),
+            (hwnd, 0x1c, 0, 0),
+            (hwnd, 0x1c, 1, 0),
+            (hwnd, 0x86, 1, 0),
+            (hwnd, 0x06, 1, 0),
+        ]
+    );
+    f.cleanup();
+}

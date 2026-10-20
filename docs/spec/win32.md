@@ -198,6 +198,11 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: The ListBox class MUST keep items, item data, selection and top index, inserting in case-insensitive order under LBS_SORT. A host selection MUST update the guest selection and notify the parent with LBN_SELCHANGE only under LBS_NOTIFY. Multiple selection and string-less owner-drawn lists MUST warn.
 **Verification**: Test
 
+### WIN32-USER-19 Host activation
+
+**Rule**: Host application activation MUST reach the active top-level window as WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE. Deactivation MUST use the reverse order.
+**Verification**: Test
+
 ## Drawing and text
 
 ### WIN32-GDI-1 Virtual display

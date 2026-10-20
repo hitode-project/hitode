@@ -3,7 +3,7 @@
 use adv_machine::Env;
 
 use super::User;
-use super::window::make_long;
+use super::window::{make_long, wm};
 use crate::Win32;
 
 /// Involutive mapping between physical L/R and logical primary/secondary.
@@ -37,6 +37,9 @@ fn post_at(
     lparam: u32,
     time: std::time::Instant,
 ) -> bool {
+    if message == wm::ACTIVATEAPP {
+        return activate_app(env, wparam != 0);
+    }
     let user = &mut env.ext.get_mut::<Win32>().user;
     let Some((top, mut hwnd)) = target(user, &env.sys.objects, message) else {
         return false;
@@ -106,6 +109,41 @@ fn post_at(
     super::mouse_tracking::poll(env);
     super::message::post_input(env, hwnd, message, wparam, lparam)
 }
+
+/// The host application gained or lost activation. Windows tells the active
+/// window in this order; some programs re-enable input only on WM_ACTIVATE.
+fn activate_app(env: &mut Env<'_>, active: bool) -> bool {
+    let user = &env.ext.get::<Win32>().user;
+    let Some((top, _)) = target(user, &env.sys.objects, wm::ACTIVATEAPP) else {
+        return false;
+    };
+    let thread = user.windows.get(&env.sys.objects, &top).unwrap().thread;
+    let hwnd = user
+        .queues
+        .get(&thread)
+        .map(|queue| queue.active)
+        .filter(|&hwnd| valid_window(user, &env.sys.objects, hwnd, thread))
+        .unwrap_or(top);
+    let flag = u32::from(active);
+    let messages = if active {
+        [
+            (wm::ACTIVATEAPP, flag),
+            (NCACTIVATE, flag),
+            (wm::ACTIVATE, flag),
+        ]
+    } else {
+        [
+            (NCACTIVATE, flag),
+            (wm::ACTIVATE, flag),
+            (wm::ACTIVATEAPP, flag),
+        ]
+    };
+    messages
+        .into_iter()
+        .all(|(message, wparam)| super::message::post_input(env, hwnd, message, wparam, 0))
+}
+
+const NCACTIVATE: u32 = 0x86;
 
 /// Text committed by a host input method, delivered the way an IME hands its
 /// result to a program without IME support: one WM_IME_CHAR per character to
