@@ -574,6 +574,60 @@ fn constants_set(
     if bytes != 0 && env.cpu.read(input.addr(), &mut data).is_err() {
         return INVALID;
     }
+    store_constants(env, id, range, &data, stage, kind)
+}
+/// Host-side constant upload for a D3DX Effect pass (GFX-EFFECT-3): the same
+/// validation and storage as the API without staging data in guest memory.
+pub(super) fn set_constants_direct(
+    env: &mut Env<'_>,
+    this: u32,
+    slot: u32,
+    start: u32,
+    data: &[u8],
+    count: u32,
+) -> u32 {
+    let (stage, kind) = match slot {
+        94 => (Stage::Vertex, ConstantKind::Float),
+        96 => (Stage::Vertex, ConstantKind::Integer),
+        98 => (Stage::Vertex, ConstantKind::Boolean),
+        109 => (Stage::Pixel, ConstantKind::Float),
+        111 => (Stage::Pixel, ConstantKind::Integer),
+        _ => (Stage::Pixel, ConstantKind::Boolean),
+    };
+    let Some(id) = device_id(env, this) else {
+        return INVALID;
+    };
+    let Some(range) = constant_range(start, count, constant_limit(stage, kind)) else {
+        return INVALID;
+    };
+    let width = match kind {
+        ConstantKind::Boolean => 4,
+        _ => 16,
+    };
+    if data.len() < (count * width) as usize {
+        return INVALID;
+    }
+    store_constants(
+        env,
+        id,
+        range,
+        &data[..(count * width) as usize],
+        stage,
+        kind,
+    )
+}
+fn store_constants(
+    env: &mut Env<'_>,
+    id: Id,
+    range: std::ops::Range<usize>,
+    data: &[u8],
+    stage: Stage,
+    kind: ConstantKind,
+) -> u32 {
+    let width = match kind {
+        ConstantKind::Boolean => 4,
+        _ => 16,
+    };
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };

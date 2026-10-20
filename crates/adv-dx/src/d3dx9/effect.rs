@@ -1,6 +1,8 @@
 //! Native precompiled D3DX Effect objects over the existing D3D9 COM device.
-//! Shader and state changes execute through the device's guest-visible vtable,
-//! preserving hooked methods and the machine continuation/ownership rules.
+//! Shader and state changes go through the device's guest-visible vtable:
+//! entries that still hold the published thunk run on the host directly, and
+//! replaced (hooked) entries get a guest call (GFX-EFFECT-3). Saving Begins
+//! record one block per technique, as native D3DX does.
 //! Every observed `D3DXCreateEffect` input was a precompiled FXO, so Effects run
 //! natively and HLSL source compilation fails explicitly (GFX-EFFECT-2). Source
 //! input would need a compiler, such as Wine's d3dcompiler built as a guest DLL.
@@ -49,8 +51,19 @@ struct Object {
     current: usize,
     started: bool,
     active_pass: Option<usize>,
+    /// The block End applies: the current technique's recorded block.
     saved_state: u32,
+    /// One recorded block per technique, holding the states its passes set
+    /// (GFX-EFFECT-3); 0 until the first saving Begin of that technique.
+    technique_states: Vec<u32>,
+    /// Parsed constant tables and preshaders by shader object.
+    shader_tables: BTreeMap<usize, std::sync::Arc<ShaderTable>>,
     begin_flags: u32,
+}
+struct ShaderTable {
+    /// Each constant with the parameter it reads, if the Effect has one.
+    constants: Vec<(Constant, Option<usize>)>,
+    preshaders: Vec<Vec<u32>>,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
@@ -152,50 +165,194 @@ fn target(env: &Env<'_>, pointer: u32, slot: u32) -> Option<u32> {
         .read(env.cpu)
         .ok()
 }
+struct Pending {
+    pointer: u32,
+    slot: u32,
+    args: Vec<u32>,
+    /// Constant registers; staged in guest memory only for a guest call.
+    data: Option<Vec<u32>>,
+}
 struct Calls {
-    pending: VecDeque<(u32, u32, Vec<u32>)>,
+    pending: VecDeque<Pending>,
     temporary: Vec<u32>,
+    /// Recording a technique's block ignores failed state calls, as native
+    /// D3DX does; the block calls themselves still stop the chain.
+    tolerant: bool,
 }
 impl Calls {
     fn new() -> Self {
         Self {
             pending: VecDeque::new(),
             temporary: Vec::new(),
+            tolerant: false,
         }
     }
     fn push(&mut self, pointer: u32, slot: u32, args: impl Into<Vec<u32>>) {
-        self.pending.push_back((pointer, slot, args.into()));
+        self.pending.push_back(Pending {
+            pointer,
+            slot,
+            args: args.into(),
+            data: None,
+        });
     }
-    fn data(&mut self, env: &mut Env<'_>, bytes: &[u8]) -> Option<u32> {
-        let p = alloc(env, bytes)?;
-        self.temporary.push(p);
-        Some(p)
+    fn push_data(&mut self, pointer: u32, slot: u32, index: u32, data: Vec<u32>, count: u32) {
+        self.pending.push_back(Pending {
+            pointer,
+            slot,
+            args: vec![index, 0, count],
+            data: Some(data),
+        });
+    }
+    fn finish(self, env: &mut Env<'_>) {
+        for pointer in self.temporary {
+            free(env, pointer);
+        }
     }
 }
-fn calls(env: &mut Env<'_>, mut c: Calls, result: u32) -> Outcome {
-    let Some((pointer, slot, mut args)) = c.pending.pop_front() else {
-        for pointer in c.temporary {
-            free(env, pointer);
-        }
-        return Outcome::Return(result);
-    };
-    let Some(target) = target(env, pointer, slot) else {
-        for pointer in c.temporary {
-            free(env, pointer);
-        }
-        return Outcome::Return(INVALID);
-    };
-    args.insert(0, pointer);
-    Outcome::call(target, args, move |env, resume| {
-        if slot > 2 && resume.value() & 0x80000000 != 0 {
-            for pointer in c.temporary {
-                free(env, pointer);
+type Then = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
+type Value = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
+fn calls(env: &mut Env<'_>, c: Calls, result: u32) -> Outcome {
+    run(env, c, Box::new(move |_| Outcome::Return(result)))
+}
+/// Make the queued COM calls in order, then `then`. Unhooked device methods
+/// run on the host without a guest round trip (GFX-EFFECT-3).
+fn run(env: &mut Env<'_>, mut c: Calls, then: Then) -> Outcome {
+    // No guest code runs between host calls, so each vtable is read once.
+    let mut tables: Vec<(u32, Vec<u32>)> = Vec::new();
+    loop {
+        let Some(call) = c.pending.pop_front() else {
+            c.finish(env);
+            return then(env);
+        };
+        let Some(entry) = cached_target(env, &mut tables, call.pointer, call.slot) else {
+            c.finish(env);
+            return Outcome::Return(INVALID);
+        };
+        let slot = call.slot;
+        if let Some(outcome) = crate::d3d9::direct::effect_call(
+            env,
+            call.pointer,
+            slot,
+            entry,
+            &call.args,
+            call.data.as_deref(),
+        ) {
+            match outcome {
+                Outcome::Return(value) if !stops(&c, slot, value) => continue,
+                Outcome::Return(value) => {
+                    c.finish(env);
+                    return Outcome::Return(value);
+                }
+                other => {
+                    return resume(
+                        other,
+                        Box::new(move |env, value| step(env, c, slot, value, then)),
+                    );
+                }
             }
-            Outcome::Return(resume.value())
-        } else {
-            calls(env, c, result)
         }
-    })
+        let mut args = call.args;
+        if let Some(data) = call.data {
+            let Some(pointer) = alloc(env, bytemuck::cast_slice(&data)) else {
+                c.finish(env);
+                return Outcome::Return(OOM);
+            };
+            c.temporary.push(pointer);
+            args[1] = pointer;
+        }
+        args.insert(0, call.pointer);
+        return Outcome::call(entry, args, move |env, resume| {
+            step(env, c, slot, resume.value(), then)
+        });
+    }
+}
+fn cached_target(
+    env: &Env<'_>,
+    tables: &mut Vec<(u32, Vec<u32>)>,
+    pointer: u32,
+    slot: u32,
+) -> Option<u32> {
+    if slot >= 128 {
+        return target(env, pointer, slot);
+    }
+    if let Some((_, table)) = tables.iter().find(|(p, _)| *p == pointer) {
+        return table
+            .get(slot as usize)
+            .copied()
+            .or_else(|| target(env, pointer, slot));
+    }
+    let base = GuestPtr::<u32>::new(pointer).read(env.cpu).ok()?;
+    // Read up to the highest slot used so far; a short table falls back.
+    let mut words = vec![0u32; 128];
+    if base.checked_add(128 * 4).is_none()
+        || env
+            .cpu
+            .read(base, bytemuck::cast_slice_mut(&mut words))
+            .is_err()
+    {
+        return target(env, pointer, slot);
+    }
+    let entry = words[slot as usize];
+    tables.push((pointer, words));
+    Some(entry)
+}
+fn stops(c: &Calls, slot: u32, value: u32) -> bool {
+    slot > 2 && value & 0x80000000 != 0 && !(c.tolerant && slot != 60 && slot != 61)
+}
+fn step(env: &mut Env<'_>, c: Calls, slot: u32, value: u32, then: Then) -> Outcome {
+    if stops(&c, slot, value) {
+        c.finish(env);
+        return Outcome::Return(value);
+    }
+    run(env, c, then)
+}
+/// Continue with the returned EAX once a host method that waited or called
+/// into the guest finishes.
+fn resume(outcome: Outcome, k: Value) -> Outcome {
+    match outcome {
+        Outcome::Return(_) => unreachable!("returns are handled by the caller"),
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, r| match then(env, r) {
+                Outcome::Return(value) => k(env, value),
+                other => resume(other, k),
+            }),
+        },
+        Outcome::Call {
+            target,
+            args,
+            then,
+            stack,
+            unwindable,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            unwindable,
+            then: Box::new(move |env, r| match then(env, r) {
+                Outcome::Return(value) => k(env, value),
+                other => resume(other, k),
+            }),
+        },
+        Outcome::Defer { then } => Outcome::Defer {
+            then: Box::new(move |env| match then(env) {
+                Outcome::Return(value) => k(env, value),
+                other => resume(other, k),
+            }),
+        },
+        Outcome::HostRequest { then } => Outcome::HostRequest {
+            then: Box::new(move |env| match then(env) {
+                Outcome::Return(value) => k(env, value),
+                other => resume(other, k),
+            }),
+        },
+        other => other,
+    }
 }
 fn fail(env: &mut Env<'_>, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, "d3dx9_43.dll!ID3DXEffect", reason);
@@ -269,6 +426,8 @@ fn create(
         started: false,
         active_pass: None,
         saved_state: 0,
+        technique_states: Vec::new(),
+        shader_tables: BTreeMap::new(),
         begin_flags: flags,
     };
     let result = (|| {
@@ -435,8 +594,8 @@ fn release(env: &mut Env<'_>, this: u32, result: u32) -> Outcome {
                 }
             }
         }
-        if dead.value.saved_state != 0 {
-            c.push(dead.value.saved_state, 2, []);
+        for block in dead.value.technique_states.into_iter().filter(|p| *p != 0) {
+            c.push(block, 2, []);
         }
         if dead.value.device_retained {
             c.push(dead.value.device, 2, []);
@@ -649,7 +808,16 @@ fn dispatch(env: &mut Env<'_>, this: u32, slot: u32, args: &[u32]) -> Outcome {
             if o.started {
                 return Outcome::Return(INVALID);
             }
-            Outcome::Return(0)
+            // State blocks do not survive Reset; record them again afterwards.
+            let mut c = Calls::new();
+            if slot == 69 {
+                for block in std::mem::take(&mut o.technique_states) {
+                    if block != 0 {
+                        c.push(block, 2, []);
+                    }
+                }
+            }
+            calls(env, c, 0)
         }
         71 if a(0) == 0 => Outcome::Return(0),
         _ => fail(env, "Effect method has no implemented contract"),
@@ -1175,25 +1343,63 @@ fn begin(env: &mut Env<'_>, this: u32, output: u32, flags: u32) -> Outcome {
         o.begin_flags = flags;
         return Outcome::Return(0);
     }
+    // Native D3DX saves only what the technique sets: it records the passes'
+    // states into one block on first use, then captures it on each Begin.
+    let o = object(env, this).unwrap();
+    let technique = o.current;
+    let saved = o.technique_states.get(technique).copied().unwrap_or(0);
+    if saved != 0 {
+        return capture(env, this, saved, flags);
+    }
+    let passes = o.binary.techniques[technique].passes.clone();
     let Some(scratch) = alloc(env, &[0; 4]) else {
         return Outcome::Return(OOM);
     };
-    let Some(target) = target(env, device, 59) else {
-        free(env, scratch);
-        return Outcome::Return(INVALID);
-    };
-    Outcome::call(target, [device, 1, scratch], move |env, resume| {
-        let state = env.cpu.read_u32(scratch).unwrap_or(0);
-        free(env, scratch);
-        if resume.value() & 0x80000000 != 0 {
-            return Outcome::Return(resume.value());
+    let mut c = Calls::new();
+    c.tolerant = true;
+    c.push(device, 60, []);
+    for pass in &passes {
+        for state in &pass.states {
+            if let Err(reason) = append_state(env, this, device, state, None, &mut c) {
+                c.finish(env);
+                free(env, scratch);
+                return fail(env, reason);
+            }
         }
-        let o = object_mut(env, this).unwrap();
-        o.saved_state = state;
-        o.started = true;
-        o.begin_flags = flags;
-        Outcome::Return(0)
-    })
+    }
+    c.push(device, 61, [scratch]);
+    run(
+        env,
+        c,
+        Box::new(move |env| {
+            let block = env.cpu.read_u32(scratch).unwrap_or(0);
+            free(env, scratch);
+            if block == 0 {
+                return Outcome::Return(INVALID);
+            }
+            let o = object_mut(env, this).unwrap();
+            if o.technique_states.len() <= technique {
+                o.technique_states.resize(technique + 1, 0);
+            }
+            o.technique_states[technique] = block;
+            capture(env, this, block, flags)
+        }),
+    )
+}
+fn capture(env: &mut Env<'_>, this: u32, block: u32, flags: u32) -> Outcome {
+    let mut c = Calls::new();
+    c.push(block, 4, []);
+    run(
+        env,
+        c,
+        Box::new(move |env| {
+            let o = object_mut(env, this).unwrap();
+            o.saved_state = block;
+            o.started = true;
+            o.begin_flags = flags;
+            Outcome::Return(0)
+        }),
+    )
 }
 fn begin_pass(env: &mut Env<'_>, this: u32, pass: usize) -> Outcome {
     let o = object_mut(env, this).unwrap();
@@ -1219,7 +1425,6 @@ fn end(env: &mut Env<'_>, this: u32) -> Outcome {
     let mut c = Calls::new();
     if saved != 0 {
         c.push(saved, 5, []);
-        c.push(saved, 2, []);
     }
     calls(env, c, 0)
 }
@@ -1322,19 +1527,8 @@ fn append_constants(
     vertex: bool,
     c: &mut Calls,
 ) -> Result<(), &'static str> {
-    let o = object(env, this).unwrap();
-    let bytes = o.binary.objects[id].clone();
-    let constants = constants(&bytes)?;
-    let tokens: Vec<_> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| u32::from_le_bytes(*v))
-        .collect();
-    for (tag, program) in super::preshader::comments(&tokens)? {
-        if tag != 0x53455250 {
-            continue;
-        }
+    let table = shader_table(env, this, id)?;
+    for program in &table.preshaders {
         let result = super::preshader::evaluate(bytemuck::cast_slice(program), |constant| {
             let o = object(env, this)?;
             let p = o
@@ -1345,38 +1539,73 @@ fn append_constants(
             pack_constant(p, constant).ok()
         })?;
         for (set, index, data) in result {
-            let pointer = c
-                .data(env, bytemuck::cast_slice(&data))
-                .ok_or("Effect preshader upload allocation failed")?;
-            let slot = constant_slot(vertex, set)?;
-            c.push(device, slot, [index, pointer, 1]);
+            c.push_data(device, constant_slot(vertex, set)?, index, data, 1);
         }
     }
-    for constant in constants {
-        let o = object(env, this).unwrap();
-        let Some(p) = o
-            .binary
-            .parameters
-            .iter()
-            .find(|p| p.full_name == constant.name)
-        else {
+    for (constant, parameter) in &table.constants {
+        let Some(parameter) = *parameter else {
             continue;
         };
         if constant.set == 3 {
-            let states = p.sampler.clone();
+            let states = object(env, this).unwrap().binary.parameters[parameter]
+                .sampler
+                .clone();
             for state in states {
                 append_state(env, this, device, &state, Some(constant.index), c)?;
             }
             continue;
         }
-        let data = pack_constant(p, &constant)?;
-        let pointer = c
-            .data(env, bytemuck::cast_slice(&data))
-            .ok_or("Effect constant upload allocation failed")?;
+        let data = pack_constant(
+            &object(env, this).unwrap().binary.parameters[parameter],
+            constant,
+        )?;
         let slot = constant_slot(vertex, constant.set)?;
-        c.push(device, slot, [constant.index, pointer, constant.count]);
+        c.push_data(device, slot, constant.index, data, constant.count);
     }
     Ok(())
+}
+/// Constant table and preshaders of shader object `id`, parsed once.
+fn shader_table(
+    env: &mut Env<'_>,
+    this: u32,
+    id: usize,
+) -> Result<std::sync::Arc<ShaderTable>, &'static str> {
+    let o = object(env, this).unwrap();
+    if let Some(table) = o.shader_tables.get(&id) {
+        return Ok(table.clone());
+    }
+    let bytes = &o.binary.objects[id];
+    let tokens: Vec<_> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| u32::from_le_bytes(*v))
+        .collect();
+    let preshaders = super::preshader::comments(&tokens)?
+        .into_iter()
+        .filter(|(tag, _)| *tag == 0x53455250)
+        .map(|(_, program)| program.to_vec())
+        .collect();
+    let constants = constants(bytes)?
+        .into_iter()
+        .map(|constant| {
+            let parameter = o
+                .binary
+                .parameters
+                .iter()
+                .position(|p| p.full_name == constant.name);
+            (constant, parameter)
+        })
+        .collect();
+    let table = std::sync::Arc::new(ShaderTable {
+        constants,
+        preshaders,
+    });
+    object_mut(env, this)
+        .unwrap()
+        .shader_tables
+        .insert(id, table.clone());
+    Ok(table)
 }
 fn constant_slot(vertex: bool, set: u32) -> Result<u32, &'static str> {
     match (vertex, set) {

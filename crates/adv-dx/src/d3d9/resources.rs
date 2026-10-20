@@ -872,7 +872,7 @@ pub(super) fn texture_unlock_internal(
     dirty::flush(env, this.addr())
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTexture",level=state)]
-fn set_texture(
+pub(super) fn set_texture(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     stage: u32,

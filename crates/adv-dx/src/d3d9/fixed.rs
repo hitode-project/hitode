@@ -483,7 +483,7 @@ fn stencil_op(value: u32) -> Option<StencilOp> {
     })
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state,leaf)]
-fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
+pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
@@ -565,7 +565,13 @@ fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPt
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state,leaf)]
-fn set_stage(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, kind: i32, value: u32) -> u32 {
+pub(super) fn set_stage(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stage: u32,
+    kind: i32,
+    value: u32,
+) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
@@ -684,7 +690,13 @@ fn rgba(argb: u32) -> u32 {
     (argb & 0xff00_ff00) | ((argb >> 16) & 0xff) | ((argb & 0xff) << 16)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state,leaf)]
-fn set_sampler(env: &mut Env<'_>, this: GuestPtr<()>, sampler: u32, kind: i32, value: u32) -> u32 {
+pub(super) fn set_sampler(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    sampler: u32,
+    kind: i32,
+    value: u32,
+) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };

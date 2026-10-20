@@ -326,6 +326,11 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 **Rule**: HLSL source compilation, unsupported FXLC expressions, state managers, parameter blocks, and pools MUST fail explicitly. Version declarations MUST NOT hide these limits behind successful no-ops.
 **Verification**: Review — binary and preshader tests do not enumerate every unsupported Effect interface and source-compilation entry.
 
+### GFX-EFFECT-3 Effect state saving and device calls
+
+**Rule**: A saving Begin MUST record its technique's pass states into one block on first use, capture it later, and apply it at End. OnLostDevice and Release MUST release these blocks. Device and block calls MUST run on the host only while the live vtable entry is the published thunk.
+**Verification**: Test — the hooked and unhooked call gate and host constant upload. Block recording follows Wine's d3dx9 Effect and is checked by game runs.
+
 ## D3DX and surface copies
 
 ### GFX-D3DX-1 Empty texture correction
