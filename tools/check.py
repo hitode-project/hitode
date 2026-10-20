@@ -17,7 +17,8 @@ frontend is type-checked with svelte-check and built with Vite through pnpm.
 These run on the working copy and need `pnpm install --frozen-lockfile` in
 apps/adv-launcher once.
 
---ci runs the workspace-lint Clippy gate as CI does, and approximates the
+--ci checks that every crate builds with default features (the launcher
+needs media, so it is left out), runs the workspace-lint Clippy gate as CI does, and approximates the
 x87-windows gate with the x86_64-apple-darwin target on a Mac, which covers
 x86_64-only code but not cfg(windows) code. Cargo commands get FFMPEG_DIR and
 LIBCLANG_PATH from Homebrew ffmpeg@8 and the Xcode clang when they are unset.
@@ -195,6 +196,13 @@ def clippy() -> bool:
     return ok
 
 
+def default_features() -> bool:
+    """Every crate builds without the optional features CI's lint gates turn on."""
+    return run("cargo check (default features)",
+               ["cargo", "check", "--workspace", "--exclude", "adv-launcher", "--all-targets", "--locked"],
+               cargo_env())
+
+
 def fix() -> bool:
     """Apply rustfmt and regenerate the generated tables the checks compare against."""
     ok = run("cargo fmt", ["cargo", "fmt", "--all"])
@@ -258,6 +266,7 @@ def main(argv: list[str]) -> int:
         return 0 if fix() else 1
     ok = check(args.all or args.ci, args.ci)
     if args.ci:
+        ok &= default_features()
         ok &= clippy()
     return 0 if ok else 1
 
