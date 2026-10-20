@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Replay normal/held-key play through the production frontend.
 
-The JSON schedule is an adv-scene-v1 document (shared with Android replay) or a list of {"at": seconds, "command": "key-down 17"} or
-{"at": seconds, "checkpoint": "normal", "reset_metrics": true} entries.
+The JSON schedule is an adv-scene-v1 document (shared with Android replay) or a list of {"at": seconds, "command": "key-down 17"},
+{"at": seconds, "checkpoint": "normal", "reset_metrics": true} or {"at": seconds, "wait": {...}} entries.
+A wait polls the runner until a visible top-level window's text contains (or class equals)
+{"window": TEXT}, a click at {"hit": [X, Y]} reaches a window whose text contains "text",
+or {"frames": N} more frames are presented; "timeout" defaults to 30 seconds. Later steps
+run at their "at" time or as soon as the wait ends, whichever is later.
 Checkpoints save the actual framebuffer and frontend/device report, then optionally
 start a new measurement window. Times are host time since process launch, and every
 command waits for its real acknowledgement; no release may overtake its key-down.
@@ -53,8 +57,11 @@ def load_schedule(path: Path) -> list[dict]:
                 or at < previous or at > 86400):
             raise ValueError("schedule times must be finite, nonnegative and ordered")
         previous = at
-        if ("command" in step) == ("checkpoint" in step):
-            raise ValueError("each step needs exactly one command or checkpoint")
+        if sum(key in step for key in ("command", "checkpoint", "wait")) != 1:
+            raise ValueError("each step needs exactly one command, checkpoint or wait")
+        if "wait" in step:
+            validate_wait(step["wait"])
+            continue
         if "command" in step:
             command = step["command"]
             if not isinstance(command, str) or not command.strip() or "\n" in command or "\r" in command:
@@ -65,6 +72,36 @@ def load_schedule(path: Path) -> list[dict]:
                 raise ValueError("checkpoint names must be unique filename-safe names")
             names.add(name)
     return steps
+
+
+def validate_wait(wait: dict) -> None:
+    if not isinstance(wait, dict) or sum(key in wait for key in ("window", "hit", "frames")) != 1:
+        raise ValueError("a wait needs exactly one of window, hit or frames")
+    timeout = wait.get("timeout", 30)
+    if type(timeout) not in (int, float) or not 0 < timeout <= 3600:
+        raise ValueError("wait timeout must be within (0, 3600] seconds")
+    if "window" in wait and (not isinstance(wait["window"], str) or not wait["window"]):
+        raise ValueError("wait window needs a nonempty text fragment")
+    if "hit" in wait and (not isinstance(wait["hit"], list) or len(wait["hit"]) != 2
+                          or not all(type(v) is int for v in wait["hit"])
+                          or not isinstance(wait.get("text", ""), str)):
+        raise ValueError("wait hit needs [X, Y] and an optional text fragment")
+    if "frames" in wait and (type(wait["frames"]) is not int or wait["frames"] < 1):
+        raise ValueError("wait frames must be a positive count")
+
+
+def wait_satisfied(wait: dict, response: str, first_frames: int | None) -> tuple[bool, int | None]:
+    """Whether a `windows` or `hit` acknowledgement meets `wait`; also the frame count seen."""
+    payload = json.loads(response.split(" ", 3)[3])
+    if "hit" in wait:
+        text = wait.get("text", "")
+        return payload is not None and text in payload["text"], first_frames
+    frames = payload["frames"]
+    if "frames" in wait:
+        start = frames if first_frames is None else first_frames
+        return frames - start >= wait["frames"], start
+    return any(wait["window"] in window["text"] or wait["window"] == window["class"]
+               for window in payload["windows"] if window["visible"]), first_frames
 
 
 def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str, str], list[str]]:
@@ -128,7 +165,8 @@ def run(args: argparse.Namespace) -> None:
     if getattr(args, "pin_runner", False):
         executable = pin_runner(executable, output / "bin")
     game = args.exe.resolve(strict=True)
-    duration = max(15.0, float(scene["timeout_seconds"]) if scene else float(steps[-1]["at"]) + args.tail_seconds)
+    waits = sum(float(step["wait"].get("timeout", 30)) for step in steps if "wait" in step)
+    duration = max(15.0, float(scene["timeout_seconds"]) if scene else float(steps[-1]["at"]) + waits + args.tail_seconds)
     command = [str(executable), str(game), "--control-stdin", "--codepage", str(args.codepage),
                "--seconds", str(duration), "--auto-dialog-ms", str(getattr(args, "auto_dialog_ms", 50)),
                "--data-dir", str(output / "overlay"), "--report", str(output / "final.json"),
@@ -199,7 +237,7 @@ def run(args: argparse.Namespace) -> None:
         reader = threading.Thread(target=receive, daemon=True)
         reader.start()
 
-        def send(line: str, timeout: float = 30) -> str:
+        def send(line: str, timeout: float = 30, quiet: bool = False) -> str:
             sent = time.monotonic() - start
             if process.poll() is not None:
                 raise RuntimeError(f"runner exited before {line!r}: {process.returncode}")
@@ -207,12 +245,14 @@ def run(args: argparse.Namespace) -> None:
             process.stdin.write(line + "\n")
             process.stdin.flush()
             response = acknowledgement.get(timeout=timeout)
-            actions.append({"sent_seconds": sent, "ack_seconds": time.monotonic() - start,
-                            "command": line, "ack": response})
-            (output / "actions.json").write_text(json.dumps(actions, indent=2), encoding="utf-8")
+            if not quiet:
+                actions.append({"sent_seconds": sent, "ack_seconds": time.monotonic() - start,
+                                "command": line, "ack": response})
+                (output / "actions.json").write_text(json.dumps(actions, indent=2), encoding="utf-8")
             if not valid_acknowledgement(line, response):
                 raise RuntimeError(f"command failed: {line!r}: {response}")
-            print(f"{sent:.3f}s {response}", flush=True)
+            if not quiet:
+                print(f"{sent:.3f}s {response}", flush=True)
             return response
 
         try:
@@ -227,7 +267,20 @@ def run(args: argparse.Namespace) -> None:
                     time.sleep(min(0.05, max(0.001, due - (time.monotonic() - start))))
                 if "delay_ms" in step:
                     continue
-                if "command" in step:
+                if "wait" in step:
+                    wait = step["wait"]
+                    query = "hit {} {}".format(*wait["hit"]) if "hit" in wait else "windows"
+                    deadline = time.monotonic() + wait.get("timeout", 30)
+                    first = None
+                    while True:
+                        met, first = wait_satisfied(wait, send(query, quiet=True), first)
+                        if met:
+                            print(f"{time.monotonic() - start:.3f}s wait met {json.dumps(wait)}", flush=True)
+                            break
+                        if time.monotonic() > deadline:
+                            raise RuntimeError(f"wait timed out: {json.dumps(wait)}")
+                        time.sleep(0.25)
+                elif "command" in step:
                     send(step["command"])
                 else:
                     name = step["checkpoint"]

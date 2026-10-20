@@ -95,6 +95,30 @@ class PlaySessionTests(unittest.TestCase):
             self.assertFalse((args.output / "bin" / "notes.txt").exists())
             self.assertEqual(metadata["command"][0], str(pinned))
 
+    def test_waits_are_validated_and_judged_from_acknowledgements(self):
+        for bad in ({}, {"window": ""}, {"hit": [1]}, {"frames": 0}, {"window": "a", "frames": 1},
+                    {"window": "a", "timeout": 0}):
+            with self.assertRaises(ValueError):
+                play_session.validate_wait(bad)
+        windows = 'control ok windows {"frames": 10, "top": 1, "focus": 0, "active": 1, "capture": 0, ' \
+            '"windows": [{"hwnd": 1, "parent": 0, "id": 0, "class": "Main", "text": "Game - Title", ' \
+            '"visible": true, "enabled": true}, {"hwnd": 2, "parent": 0, "id": 0, "class": "Hidden", ' \
+            '"text": "Loading", "visible": false, "enabled": true}]}'
+        self.assertEqual(play_session.wait_satisfied({"window": "Title"}, windows, None), (True, None))
+        self.assertEqual(play_session.wait_satisfied({"window": "Main"}, windows, None), (True, None))
+        self.assertFalse(play_session.wait_satisfied({"window": "Loading"}, windows, None)[0])
+        self.assertEqual(play_session.wait_satisfied({"frames": 5}, windows, None), (False, 10))
+        self.assertEqual(play_session.wait_satisfied({"frames": 5}, windows.replace("10", "15", 1), 10), (True, 10))
+        hit = 'control ok hit {"hwnd": 3, "parent": 1, "id": 7, "class": "Button", "text": "Start", ' \
+            '"visible": true, "enabled": true}'
+        self.assertTrue(play_session.wait_satisfied({"hit": [5, 5], "text": "Sta"}, hit, None)[0])
+        self.assertTrue(play_session.wait_satisfied({"hit": [5, 5]}, hit, None)[0])
+        self.assertFalse(play_session.wait_satisfied({"hit": [5, 5]}, "control ok hit null", None)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            schedule = Path(directory) / "schedule.json"
+            schedule.write_text(json.dumps([{"at": 0, "wait": {"window": "Title"}}, {"at": 1, "command": "close"}]))
+            self.assertEqual(len(play_session.load_schedule(schedule)), 2)
+
     def test_code_page_defaults_to_detection(self):
         args = play_session.build_parser().parse_args(
             ["--binary", "b", "--exe", "e", "--schedule", "s", "--output", "o"])

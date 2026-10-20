@@ -388,6 +388,19 @@ fn debug_info(options: &Options, windowed: bool) -> String {
     )
 }
 
+fn window_json(window: &adv_runtime::WindowView) -> String {
+    format!(
+        "{{\"hwnd\": {}, \"parent\": {}, \"id\": {}, \"class\": {}, \"text\": {}, \"visible\": {}, \"enabled\": {}}}",
+        window.hwnd,
+        window.parent,
+        window.id,
+        json(&window.class),
+        json(&window.text),
+        window.visible,
+        window.enabled
+    )
+}
+
 fn json(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -1883,6 +1896,28 @@ fn run_execution(
                             Err("activation has no guest target window".into())
                         }
                     }
+                    control::Command::Windows => {
+                        let view = runtime.input_view();
+                        Ok(format!(
+                            "windows {{\"frames\": {}, \"top\": {}, \"focus\": {}, \"active\": {}, \"capture\": {}, \"windows\": [{}]}}",
+                            runtime.presented_frames(),
+                            view.top,
+                            view.focus,
+                            view.active,
+                            view.capture,
+                            view.windows
+                                .iter()
+                                .map(window_json)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                    control::Command::Hit(x, y) => Ok(format!(
+                        "hit {}",
+                        runtime
+                            .window_at(x.into(), y.into())
+                            .map_or_else(|| "null".into(), |window| window_json(&window))
+                    )),
                     control::Command::Memory(address, len) => {
                         runtime.inspect_memory(address, len).map(|bytes| {
                             let hex = bytes

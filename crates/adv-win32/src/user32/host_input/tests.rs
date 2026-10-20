@@ -279,3 +279,76 @@ fn host_activation_posts_the_windows_activation_order_to_the_active_window() {
     );
     f.cleanup();
 }
+
+#[test]
+// spec: WIN32-USER-20
+fn input_view_reports_the_windows_and_hit_target_host_input_would_address() {
+    use crate::user32::window::{Rect, WS_CHILD, WS_DISABLED, WS_POPUP, WS_VISIBLE, Window};
+    let mut f = Fixture::new("input-view");
+    assert_eq!(view(&f.m.ext.get::<Win32>().user, &f.m.sys.objects).top, 0);
+    let (top, button, disabled) = (0x10020, 0x10024, 0x10028);
+    let desktop = f.m.ext.get::<Win32>().user.desktop;
+    let class =
+        f.m.ext
+            .get::<Win32>()
+            .user
+            .windows
+            .get(&f.m.sys.objects, &desktop)
+            .unwrap()
+            .class;
+    for (hwnd, parent, style, rect, text) in [
+        (top, 0, WS_POPUP, Rect::new(100, 50, 640, 480), "Title"),
+        (button, top, WS_CHILD, Rect::new(20, 30, 100, 40), "Start"),
+        (
+            disabled,
+            top,
+            WS_CHILD | WS_DISABLED,
+            Rect::new(200, 30, 100, 40),
+            "Load",
+        ),
+    ] {
+        let mut window = Window::new(hwnd, class, 0, WS_VISIBLE | style, 0, parent, rect, 0);
+        window.text = text.into();
+        window.id = hwnd & 0xff;
+        let user = &mut f.m.ext.get_mut::<Win32>().user;
+        assert!(user.windows.insert(&mut f.m.sys.objects, hwnd, window));
+        if parent != 0 {
+            user.windows
+                .get_mut(&mut f.m.sys.objects, &parent)
+                .unwrap()
+                .children
+                .push(hwnd);
+        }
+    }
+    let user = &mut f.m.ext.get_mut::<Win32>().user;
+    user.top = vec![top];
+    user.queue(0).focus = button;
+    user.queue(0).active = top;
+    let user = &f.m.ext.get::<Win32>().user;
+    let objects = &f.m.sys.objects;
+    let seen = view(user, objects);
+    assert_eq!(
+        (seen.top, seen.focus, seen.active, seen.capture),
+        (top, button, top, 0)
+    );
+    assert_eq!(seen.windows.len(), 1);
+    assert_eq!(
+        (seen.windows[0].hwnd, seen.windows[0].text.as_str()),
+        (top, "Title")
+    );
+    // Top-level client coordinates, as click and move take them.
+    let hit = |x, y| window_at(user, objects, x, y).map(|window| window.hwnd);
+    assert_eq!(hit(25, 35), Some(button));
+    assert_eq!(hit(5, 5), Some(top));
+    // A disabled child does not take input; its parent does, as WindowFromPoint skips it.
+    assert_eq!(hit(210, 35), Some(top));
+    let button_view = window_at(user, objects, 25, 35).unwrap();
+    assert_eq!(
+        (
+            button_view.parent,
+            button_view.id,
+            button_view.text.as_str()
+        ),
+        (top, 0x24, "Start")
+    );
+}

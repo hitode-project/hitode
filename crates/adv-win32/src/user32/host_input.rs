@@ -225,6 +225,83 @@ pub fn release(env: &mut Env<'_>) -> usize {
     posted
 }
 
+/// A guest window as the control channel reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowView {
+    pub hwnd: u32,
+    pub parent: u32,
+    pub id: u32,
+    pub class: String,
+    pub text: String,
+    pub visible: bool,
+    pub enabled: bool,
+}
+
+/// What host input would address now: the displayed top-level window, its
+/// thread's focus, active and capture windows, and every top-level window in
+/// z-order. `top` is 0 when no guest window is displayed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputView {
+    pub top: u32,
+    pub focus: u32,
+    pub active: u32,
+    pub capture: u32,
+    pub windows: Vec<WindowView>,
+}
+
+fn window_view(user: &User, window: &super::window::Window) -> WindowView {
+    WindowView {
+        hwnd: window.hwnd,
+        parent: window.parent,
+        id: window.id,
+        class: user.classes[window.class].name.clone(),
+        text: window.text.clone(),
+        visible: window.visible(),
+        enabled: window.enabled(),
+    }
+}
+
+pub fn view(user: &User, objects: &adv_machine::Objects) -> InputView {
+    let windows = user
+        .top
+        .iter()
+        .filter_map(|hwnd| user.windows.get(objects, hwnd))
+        .filter(|window| window.hwnd != user.desktop && !window.destroying)
+        .map(|window| window_view(user, window))
+        .collect();
+    let Some((top, _)) = target(user, objects, 0) else {
+        return InputView {
+            windows,
+            ..InputView::default()
+        };
+    };
+    let thread = user.windows.get(objects, &top).unwrap().thread;
+    let queue = user.queues.get(&thread);
+    InputView {
+        top,
+        focus: queue.map_or(0, |q| q.focus),
+        active: queue.map_or(0, |q| q.active),
+        capture: queue.map_or(0, |q| q.capture),
+        windows,
+    }
+}
+
+/// The window that ordinary mouse input at top-level client point `(x, y)`
+/// reaches, as [`post`] routes it without capture.
+pub fn window_at(
+    user: &User,
+    objects: &adv_machine::Objects,
+    x: i32,
+    y: i32,
+) -> Option<WindowView> {
+    let (top, _) = target(user, objects, 0)?;
+    let (ox, oy) = user.client_origin(objects, top);
+    let hwnd = super::hit_test::descendant(user, objects, top, (x + ox, y + oy));
+    user.windows
+        .get(objects, &hwnd)
+        .map(|window| window_view(user, window))
+}
+
 /// (top-level window, target window) for `message`.
 pub(super) fn target(
     user: &User,

@@ -737,6 +737,24 @@ impl<B: Backend> Runtime<B> {
         adv_win32::user32::dialog::post_host_event(&mut self.env(), event)
     }
 
+    /// Windows host input would address now (see
+    /// [`adv_win32::user32::host_input::view`]).
+    pub fn input_view(&self) -> crate::InputView {
+        adv_win32::user32::host_input::view(
+            &self.machine.ext.get::<Win32>().user,
+            &self.machine.sys.objects,
+        )
+    }
+    /// The window a click at top-level client point `(x, y)` reaches.
+    pub fn window_at(&self, x: i32, y: i32) -> Option<crate::WindowView> {
+        adv_win32::user32::host_input::window_at(
+            &self.machine.ext.get::<Win32>().user,
+            &self.machine.sys.objects,
+            x,
+            y,
+        )
+    }
+
     /// Release held keys and buttons when the host loses focus.
     pub fn release_input(&mut self) -> usize {
         let released = adv_win32::user32::host_input::release(&mut self.env());
