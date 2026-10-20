@@ -12,7 +12,9 @@ use std::time::Instant;
 
 use adv_cpu_core::instruction_trace::Trace;
 use adv_cpu_core::interpreter::{Interpreter, Step};
-use adv_cpu_core::tier_verify::{self, Check, Verifier, VerifyStats};
+use adv_cpu_core::tier_verify::VerifyStats;
+#[cfg(native)]
+use adv_cpu_core::tier_verify::{self, Check, Verifier};
 use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 
@@ -76,7 +78,9 @@ pub struct Executor {
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
     /// `ADV_JIT_VERIFY` checks, and how often each entry has been checked.
+    #[cfg(native)]
     verifier: Option<Box<Verifier>>,
+    #[cfg(native)]
     verified: rustc_hash::FxHashMap<u32, u8>,
     /// Translated code; `None` when every instruction is interpreted, so
     /// such an executor maps no code cache and installs no fault handler.
@@ -152,7 +156,9 @@ impl Executor {
             host_interrupts: true,
             deadline: None,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
+            #[cfg(native)]
             verifier: translate.then(Verifier::from_env).flatten(),
+            #[cfg(native)]
             verified: Default::default(),
             #[cfg(native)]
             native,
@@ -646,6 +652,7 @@ impl Executor {
 }
 
 /// Accounts one verified exit; strict mode stops at a mismatch.
+#[cfg(native)]
 fn record_verification(
     stats: &mut VerifyStats,
     strict: bool,
