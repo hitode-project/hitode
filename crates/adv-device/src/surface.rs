@@ -3001,35 +3001,6 @@ pub fn size(w: u32, h: u32) -> Result<u32, String> {
         .ok_or("surface overflow".into())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{FrameDamage, Rect};
-
-    // spec: HOST-VIEW-10
-    #[test]
-    fn frame_damage_unions_publications_and_reports_gaps_as_unknown() {
-        let rect = |x, w| Rect { x, y: 0, w, h: 1 };
-        let mut damage = FrameDamage::default();
-        damage.push(1, Some(rect(0, 2)));
-        damage.push(1, Some(rect(10, 2)));
-        assert_eq!(damage.since(Some(1)), Some(rect(10, 2)));
-        assert_eq!(damage.since(Some(0)), None, "an unknown publication");
-        assert_eq!(damage.since(None), None);
-        assert_eq!(damage.since(Some(2)), None, "nothing new is a full redraw");
-        damage.push(1, None);
-        damage.push(1, Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(3)), Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(2)), None, "a full publication in between");
-        damage.push(2, Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(4)), None, "another surface in between");
-        for _ in 0..8 {
-            damage.push(2, Some(rect(0, 1)));
-        }
-        assert_eq!(damage.since(Some(5)), None, "evicted history");
-        assert_eq!(damage.since(Some(6)), Some(rect(0, 1)));
-    }
-}
-
 /// Copies the nearest source pixel unless its raw value lies in the key range.
 /// Source rows are read before the first write, so overlapping surfaces work.
 fn blit_keyed(
@@ -3083,4 +3054,33 @@ fn blit_keyed(
         m.write(address, &output)?;
     }
     Ok(clipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameDamage, Rect};
+
+    // spec: HOST-VIEW-10
+    #[test]
+    fn frame_damage_unions_publications_and_reports_gaps_as_unknown() {
+        let rect = |x, w| Rect { x, y: 0, w, h: 1 };
+        let mut damage = FrameDamage::default();
+        damage.push(1, Some(rect(0, 2)));
+        damage.push(1, Some(rect(10, 2)));
+        assert_eq!(damage.since(Some(1)), Some(rect(10, 2)));
+        assert_eq!(damage.since(Some(0)), None, "an unknown publication");
+        assert_eq!(damage.since(None), None);
+        assert_eq!(damage.since(Some(2)), None, "nothing new is a full redraw");
+        damage.push(1, None);
+        damage.push(1, Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(3)), Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(2)), None, "a full publication in between");
+        damage.push(2, Some(rect(4, 1)));
+        assert_eq!(damage.since(Some(4)), None, "another surface in between");
+        for _ in 0..8 {
+            damage.push(2, Some(rect(0, 1)));
+        }
+        assert_eq!(damage.since(Some(5)), None, "evicted history");
+        assert_eq!(damage.since(Some(6)), Some(rect(0, 1)));
+    }
 }
