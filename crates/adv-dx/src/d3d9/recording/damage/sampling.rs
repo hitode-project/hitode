@@ -316,6 +316,9 @@ fn draw_reads(env: &Env<'_>, device: &Device, draw: &fixed::Draw) -> Option<Vec<
             ],
         )]
     };
+    if vertex.is_some_and(|v| v.translation.as_ref().is_err()) {
+        return None;
+    }
     let vertices = vertices(
         draw,
         vertex.map(|v| v.parsed.as_ref()),
