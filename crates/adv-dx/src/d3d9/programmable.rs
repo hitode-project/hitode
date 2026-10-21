@@ -713,7 +713,7 @@ fn texture(
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
         return Err(INVALID);
     };
-    if resources::locked(env, r) {
+    if resources::sampling_blocked(env, r) {
         return Err(INVALID);
     }
     let image = (env.ext.get::<State>().provider.target)(env.ext, r.surface.ok_or(INVALID)?)

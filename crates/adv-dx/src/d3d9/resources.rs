@@ -189,6 +189,12 @@ pub(super) fn storage(env: &Env<'_>, r: &Resource) -> Option<u32> {
         (r.storage != 0).then_some(r.storage)
     }
 }
+/// A texture lock only lends its CPU storage; the GPU image keeps the last
+/// unlocked contents, so draws sample those as native D3D9 does. GDI leases
+/// and texture transfers still change the image under the draw.
+pub(super) fn sampling_blocked(env: &Env<'_>, r: &Resource) -> bool {
+    dc::leased(env, r) || update_texture::reserved(env, r)
+}
 pub(super) fn locked(env: &Env<'_>, r: &Resource) -> bool {
     if dc::leased(env, r) || update_texture::reserved(env, r) {
         return true;
@@ -898,8 +904,8 @@ pub(super) fn set_texture(
         let Some(r) = resource(env, texture.addr()).filter(|r| r.device == device) else {
             return Outcome::Return(INVALID);
         };
-        // Binding a CPU-locked texture is valid. Unlock/DC release restores it
-        // before it can be sampled; normal draw admission still rejects locks.
+        // Binding a CPU-locked texture is valid. Unlock or DC release flushes it;
+        // draws in between sample the last uploaded contents.
         if !locked(env, r) {
             let restored = residency::ensure(env, texture.addr());
             if restored != 0 {
