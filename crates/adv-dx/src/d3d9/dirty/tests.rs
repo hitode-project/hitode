@@ -464,6 +464,126 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     assert_eq!(release(&mut env(&mut m), texture), 0);
 }
 
+/// A 4x4 opaque X8R8G8B8 target installed as the device back buffer.
+fn attach_target(m: &mut Machine<JitCpu>, device_pointer: u32) -> Image {
+    use adv_device::gpu::AlphaMode;
+    let target = m
+        .ext
+        .get::<State>()
+        .gpu
+        .as_ref()
+        .unwrap()
+        .target(4, 4, false)
+        .unwrap()
+        .with_alpha_mode(AlphaMode::Opaque);
+    let target_surface = {
+        let surfaces = m.ext.get_mut::<Surfaces>();
+        surfaces.next += 1;
+        surfaces.targets.insert(surfaces.next, target.clone());
+        surfaces.next
+    };
+    {
+        let e = env(m);
+        let owner = com(&e)
+            .identity::<Payload>(&e.sys.objects, device_pointer)
+            .unwrap();
+        let back = e
+            .sys
+            .objects
+            .hosts_in::<adv_os::com::ComObject<Payload>>(com(&e).namespace())
+            .find_map(|(id, _)| {
+                matches!(com(&e).get_identity(&e.sys.objects, id),
+                Some(Payload::Resource(r)) if r.kind == Kind::Surface)
+                .then_some(id)
+            })
+            .unwrap();
+        if let Some(Payload::Resource(r)) = com(&e).get_identity_mut(&mut e.sys.objects, back) {
+            r.surface = Some(target_surface);
+            r.desc.Format = 22;
+            r.desc.Width = 4;
+            r.desc.Height = 4;
+        }
+        if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
+            d.surface = target_surface;
+            d.back_buffer = Some(back);
+            d.fixed.target_changed(4, 4);
+        }
+    }
+    target.image
+}
+
+/// One pretransformed white-diffuse quad covering the target.
+fn draw_quad(m: &mut Machine<JitCpu>, device_pointer: u32) -> Outcome {
+    let mut vertices = [0u32; 28];
+    for (index, (x, y, u, v)) in [
+        (-0.5f32, -0.5f32, 0f32, 0f32),
+        (3.5, -0.5, 1., 0.),
+        (-0.5, 3.5, 0., 1.),
+        (3.5, 3.5, 1., 1.),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        vertices[index * 7..index * 7 + 7].copy_from_slice(&[
+            x.to_bits(),
+            y.to_bits(),
+            0,
+            1f32.to_bits(),
+            u32::MAX,
+            u.to_bits(),
+            v.to_bits(),
+        ]);
+    }
+    let vertices = packet(m, vertices);
+    okay(call(m, "IDirect3DDevice9::BeginScene", &[device_pointer]));
+    let drawn = call(
+        m,
+        "IDirect3DDevice9::DrawPrimitiveUP",
+        &[device_pointer, 5, 2, vertices, 28],
+    );
+    okay(call(m, "IDirect3DDevice9::EndScene", &[device_pointer]));
+    drawn
+}
+
+#[test]
+// spec: GFX-SAMPLER-3
+fn draws_sample_the_last_unlocked_contents_of_a_locked_texture() {
+    let (mut m, device_pointer) = machine(true);
+    let texture = texture(&mut m, device_pointer, 1, 1);
+    let fill = |m: &mut Machine<JitCpu>, value: u8| {
+        let locked = lock(m, texture, 0, 0, 0);
+        m.cpu.write(locked.pBits, &[value; 64]).unwrap();
+    };
+    fill(&mut m, 255);
+    okay(unlock(&mut m, texture, 0));
+    let target = attach_target(&mut m, device_pointer);
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::SetTexture",
+        &[device_pointer, 0, texture],
+    ));
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::SetFVF",
+        &[device_pointer, 0x144],
+    ));
+    // Another thread may still be writing the next contents.
+    fill(&mut m, 0);
+    okay(draw_quad(&mut m, device_pointer));
+    let drawn = pixels(&mut m, &target);
+    assert!(drawn.as_chunks::<4>().0.iter().all(|p| p[..3] == [255; 3]));
+    okay(unlock(&mut m, texture, 0));
+    okay(draw_quad(&mut m, device_pointer));
+    let drawn = pixels(&mut m, &target);
+    assert!(drawn.as_chunks::<4>().0.iter().all(|p| p[..3] == [0; 3]));
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::SetTexture",
+        &[device_pointer, 0, 0],
+    ));
+    assert_eq!(release(&mut env(&mut m), texture), 0);
+}
+
 #[test]
 fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaque() {
     use adv_device::gpu::AlphaMode;
@@ -508,48 +628,7 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
         }
         assert_eq!(pixels(&mut m, &source), expected_upload);
 
-        let target = m
-            .ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .target(4, 4, false)
-            .unwrap()
-            .with_alpha_mode(AlphaMode::Opaque);
-        let target_surface = {
-            let surfaces = m.ext.get_mut::<Surfaces>();
-            surfaces.next += 1;
-            surfaces.targets.insert(surfaces.next, target.clone());
-            surfaces.next
-        };
-        {
-            let e = env(&mut m);
-            let owner = com(&e)
-                .identity::<Payload>(&e.sys.objects, device_pointer)
-                .unwrap();
-            let back = e
-                .sys
-                .objects
-                .hosts_in::<adv_os::com::ComObject<Payload>>(com(&e).namespace())
-                .find_map(|(id, _)| {
-                    matches!(com(&e).get_identity(&e.sys.objects, id),
-                    Some(Payload::Resource(r)) if r.kind == Kind::Surface)
-                    .then_some(id)
-                })
-                .unwrap();
-            if let Some(Payload::Resource(r)) = com(&e).get_identity_mut(&mut e.sys.objects, back) {
-                r.surface = Some(target_surface);
-                r.desc.Format = 22;
-                r.desc.Width = 4;
-                r.desc.Height = 4;
-            }
-            if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
-                d.surface = target_surface;
-                d.back_buffer = Some(back);
-                d.fixed.target_changed(4, 4);
-            }
-        }
+        let target = attach_target(&mut m, device_pointer);
         okay(call(
             &mut m,
             "IDirect3DDevice9::Clear",
@@ -578,43 +657,8 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
             "IDirect3DDevice9::SetTextureStageState",
             &[device_pointer, 0, 4, 4],
         ));
-        let mut vertices = [0u32; 28];
-        for (index, (x, y, u, v)) in [
-            (-0.5f32, -0.5f32, 0f32, 0f32),
-            (3.5, -0.5, 1., 0.),
-            (-0.5, 3.5, 0., 1.),
-            (3.5, 3.5, 1., 1.),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            vertices[index * 7..index * 7 + 7].copy_from_slice(&[
-                x.to_bits(),
-                y.to_bits(),
-                0,
-                1f32.to_bits(),
-                u32::MAX,
-                u.to_bits(),
-                v.to_bits(),
-            ]);
-        }
-        let vertices = packet(&mut m, vertices);
-        okay(call(
-            &mut m,
-            "IDirect3DDevice9::BeginScene",
-            &[device_pointer],
-        ));
-        okay(call(
-            &mut m,
-            "IDirect3DDevice9::DrawPrimitiveUP",
-            &[device_pointer, 5, 2, vertices, 28],
-        ));
-        okay(call(
-            &mut m,
-            "IDirect3DDevice9::EndScene",
-            &[device_pointer],
-        ));
-        let drawn = pixels(&mut m, &target.image);
+        okay(draw_quad(&mut m, device_pointer));
+        let drawn = pixels(&mut m, &target);
         for row in drawn.as_chunks::<16>().0 {
             if format != 22 {
                 assert_eq!(

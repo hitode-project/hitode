@@ -257,6 +257,11 @@ snapshot storage; an unchanged Apply performs no state writes.
 **Rule**: Sampler state MUST preserve zero LOD bias including negative zero, anisotropy 1, and zero sRGB, element-index, and displacement-offset values. Setters, queries, and state blocks MUST agree, while unsupported nondefault effects MUST fail explicitly.
 **Verification**: Test
 
+### GFX-SAMPLER-3 Locked textures
+
+**Rule**: Draws MUST sample a CPU-locked texture's last unlocked GPU contents instead of failing. DC leases and pending texture transfers MUST still reject sampling.
+**Verification**: Test
+
 ## Bounded buffers
 
 ### GFX-BUFFER-1 Constant layout

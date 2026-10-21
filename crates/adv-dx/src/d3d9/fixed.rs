@@ -1294,8 +1294,11 @@ pub(super) fn prepare_state(
                 "bound texture no longer has a resource owner",
             ));
         };
-        if resources::locked(env, r) {
-            return Err(rejected(INVALID, "bound texture is locked"));
+        if resources::sampling_blocked(env, r) {
+            return Err(rejected(
+                INVALID,
+                "bound texture has a DC lease or transfer",
+            ));
         }
         (
             Some(
