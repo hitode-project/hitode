@@ -3,6 +3,7 @@
 //! * Game files are writable in portable mode; isolated mode uses a data overlay.
 //!   Read-only replacements always use copy-on-write in the data overlay.
 //!   Deleting a read-only file records a persistent whiteout instead.
+//!   File renames copy up read-only sources and hide their old names.
 //! * An optional read-only resource directory sits between guest writes and game files.
 //! * An optional install folder backs `C:\Program Files` and is written in place.
 //! * Every other `C:\` path (user profile, Windows dir, ...) maps into a writable host
@@ -354,7 +355,6 @@ impl Vfs {
     }
 
     /// Deleting/renaming a writable shadow must not expose a read-only layer.
-    /// Only `delete_file` records whiteouts; renames still refuse.
     pub fn has_read_only_underlay(&self, guest: &str) -> bool {
         matches!(self.locate(guest), Some(Loc::Game(rel)) if self.underlay(&rel))
     }
@@ -380,8 +380,61 @@ impl Vfs {
         Ok(())
     }
 
+    /// Materialize an existing file in its writable layer. Callers that own
+    /// open handles or sections must transfer them to the returned instance.
+    pub fn copy_up_file(&self, guest: &str) -> std::io::Result<PathBuf> {
+        let from = self.lookup(guest).ok_or(std::io::ErrorKind::NotFound)?;
+        if !self.is_base_only(guest) {
+            return Ok(from);
+        }
+        let to = self.write_path(guest).ok_or(std::io::ErrorKind::NotFound)?;
+        if let Err(error) = host::copy(&from, &to) {
+            let _ = host::remove_file(&to);
+            return Err(error);
+        }
+        Ok(to)
+    }
+
+    /// Rename a file after the API's replacement and sharing checks. Read-only
+    /// originals stay untouched; only the writable instance changes names.
+    pub fn rename_file(&self, source: &str, target: &str) -> std::io::Result<PathBuf> {
+        let source = self.normalize(source);
+        let target = self.normalize(target);
+        let from = self.copy_up_file(&source)?;
+        // Keep a deleted destination's whiteout until publication succeeds.
+        // Overlay entries are visible even when their underlay stays hidden.
+        let mut to = self
+            .output_path(&target, false)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        if (source.eq_ignore_ascii_case(&target) || !to.exists())
+            && let Some(leaf) = target.rsplit('\\').next()
+        {
+            to.set_file_name(leaf);
+        }
+        let hidden = match self.locate(&source) {
+            Some(Loc::Game(rel))
+                if !source.eq_ignore_ascii_case(&target) && self.underlay(&rel) =>
+            {
+                self.whiteouts.set(&rel, true)?;
+                Some(rel)
+            }
+            _ => None,
+        };
+        if let Err(error) = host::rename(&from, &to) {
+            if let Some(rel) = hidden {
+                let _ = self.whiteouts.set(&rel, false);
+            }
+            return Err(error);
+        }
+        Ok(to)
+    }
+
     /// Host path to create or write `guest` at; parent directories are created.
     pub fn write_path(&self, guest: &str) -> Option<PathBuf> {
+        self.output_path(guest, true)
+    }
+
+    fn output_path(&self, guest: &str, reveal: bool) -> Option<PathBuf> {
         if self.is_optical_path(guest) {
             return None;
         }
@@ -401,7 +454,9 @@ impl Vfs {
                     &self.overlay
                 };
                 // Writing a deleted name brings it back in the overlay.
-                let _ = self.whiteouts.set(&rel, false);
+                if reveal {
+                    let _ = self.whiteouts.set(&rel, false);
+                }
                 ci_path(base, &rel)
             }
             Loc::Install(rel) => ci_path(self.install.as_ref()?, &rel),

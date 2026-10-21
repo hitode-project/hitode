@@ -100,15 +100,7 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
     if vfs.is_optical_path(&source) {
         return error(env, 19);
     }
-    if target.is_some() && vfs.has_read_only_underlay(&source) {
-        warn_unavailable(
-            env,
-            "kernel32.dll!<file mutation>",
-            "renaming read-only VFS layers requires persistent whiteouts",
-        );
-        return error(env, 50);
-    }
-    let Some(from) = vfs.lookup(&source) else {
+    let Some(mut from) = vfs.lookup(&source) else {
         return error(env, 2);
     };
     if !from.is_file() {
@@ -126,7 +118,7 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
             None => error(env, 5),
         };
     }
-    let identity =
+    let mut identity =
         match std::fs::File::open(&from).and_then(|file| adv_os::vfs::file_identity(&file)) {
             Ok(identity) => identity,
             Err(e) => return error(env, crate::kernel32::file::io_code(&e)),
@@ -191,14 +183,6 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
         if vfs.is_optical_path(&target) {
             return error(env, 19);
         }
-        if vfs.has_read_only_underlay(&target) {
-            warn_unavailable(
-                env,
-                "kernel32.dll!MoveFile",
-                "renaming read-only VFS layers requires persistent whiteouts",
-            );
-            return error(env, 50);
-        }
         let parent = target.rsplit_once('\\').map_or("", |(parent, _)| parent);
         let parent = if parent.len() == 2 {
             format!(r"{parent}\")
@@ -208,16 +192,44 @@ fn portable(env: &mut Env<'_>, source: String, target: Option<String>, flags: u3
         if !vfs.is_dir(&parent) {
             return error(env, 3);
         }
-        let Some(mut to) = vfs.write_path(&target) else {
-            return error(env, 3);
-        };
-        if (source.eq_ignore_ascii_case(&target) || !to.exists())
-            && let Some(leaf) = target.rsplit('\\').next()
-        {
-            to.set_file_name(leaf);
+        if vfs.is_base_only(&source) {
+            from = match vfs.copy_up_file(&source) {
+                Ok(path) => path,
+                Err(e) => return error(env, crate::kernel32::file::io_code(&e)),
+            };
+            let replacements = match crate::kernel32::file_mapping::prepare_retarget_handles(
+                env, &source, identity, &from,
+            ) {
+                Ok(replacements) => replacements,
+                Err(code) => {
+                    let _ = adv_os::vfs::host::remove_file(&from);
+                    return error(env, code);
+                }
+            };
+            let transferred = (|| {
+                let file = std::fs::File::open(&from)?;
+                let new_identity = adv_os::vfs::file_identity(&file)?;
+                let length = file.metadata()?.len();
+                let content = env
+                    .ext
+                    .get::<Win32>()
+                    .vfs
+                    .sections
+                    .transfer(identity, file, length, false)?;
+                replacements.apply(&mut env.sys.objects);
+                drop(content);
+                Ok::<_, std::io::Error>(new_identity)
+            })();
+            identity = match transferred {
+                Ok(identity) => identity,
+                Err(e) => {
+                    let _ = adv_os::vfs::host::remove_file(&from);
+                    return error(env, crate::kernel32::file::io_code(&e));
+                }
+            };
         }
-        match adv_os::vfs::host::rename(&from, &to) {
-            Ok(()) => {
+        match env.ext.get::<Win32>().vfs.rename_file(&source, &target) {
+            Ok(to) => {
                 // Retarget live owners even if the subsequent durability request fails.
                 for (_, file) in env.sys.objects.all_hosts_mut::<FileObj>() {
                     if file.file.cached_identity() == Some(identity)

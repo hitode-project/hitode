@@ -335,8 +335,8 @@ impl SharedFiles {
         let new = file_identity(&file)?;
         self.prune();
         let section = if let Some(section) = self.lookup(old) {
-            if writable {
-                section.retarget(file, len, true);
+            if writable || new != old {
+                section.retarget(file, len, writable);
             }
             section
         } else {
