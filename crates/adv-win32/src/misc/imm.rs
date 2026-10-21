@@ -154,8 +154,92 @@ fn legacy_message(env: &mut Env<'_>, message: u32, api: &str) -> i32 {
     0
 }
 
+/// Composition, candidate and font fronts with no HIMC: NULL getters keep
+/// LastError like the status getters, everything else is ERROR_INVALID_HANDLE.
+/// Outputs and inputs are never touched. Committed text still arrives as
+/// WM_IME_CHAR (WIN32-USER-12).
+fn no_context(env: &mut Env<'_>, context: Handle, getter: bool) -> i32 {
+    if !(getter && context.0 == 0) {
+        set_last_error(env, 6);
+    }
+    0
+}
+
+#[win32(imm32, name = "ImmGetCompositionStringA", level = safe_fail)]
+fn get_composition_a(
+    env: &mut Env<'_>,
+    context: Handle,
+    _index: u32,
+    _buffer: GuestPtr<()>,
+    _length: u32,
+) -> i32 {
+    getter_failure(env, context, "imm32.dll!ImmGetCompositionStringA")
+}
+
+#[win32(imm32, name = "ImmGetCompositionStringW", level = safe_fail)]
+fn get_composition_w(
+    env: &mut Env<'_>,
+    context: Handle,
+    _index: u32,
+    _buffer: GuestPtr<()>,
+    _length: u32,
+) -> i32 {
+    getter_failure(env, context, "imm32.dll!ImmGetCompositionStringW")
+}
+
+/// Cancelling or completing a composition that cannot exist needs no warning.
+#[win32(imm32, name = "ImmNotifyIME", level = safe_fail)]
+fn notify(env: &mut Env<'_>, context: Handle, _action: u32, _index: u32, _value: u32) -> i32 {
+    no_context(env, context, false)
+}
+
+#[win32(imm32, name = "ImmSetCompositionWindow", level = safe_fail)]
+fn set_composition_window(env: &mut Env<'_>, context: Handle, _form: GuestPtr<()>) -> i32 {
+    no_context(env, context, false)
+}
+
+#[win32(imm32, name = "ImmGetCompositionWindow", level = safe_fail)]
+fn get_composition_window(env: &mut Env<'_>, context: Handle, _form: GuestPtr<()>) -> i32 {
+    no_context(env, context, true)
+}
+
+#[win32(imm32, name = "ImmSetCandidateWindow", level = safe_fail)]
+fn set_candidate_window(env: &mut Env<'_>, context: Handle, _form: GuestPtr<()>) -> i32 {
+    no_context(env, context, false)
+}
+
+#[win32(imm32, name = "ImmSetCompositionFontA", level = safe_fail)]
+fn set_composition_font_a(env: &mut Env<'_>, context: Handle, _font: GuestPtr<()>) -> i32 {
+    no_context(env, context, false)
+}
+
+#[win32(imm32, name = "ImmSetCompositionFontW", level = safe_fail)]
+fn set_composition_font_w(env: &mut Env<'_>, context: Handle, _font: GuestPtr<()>) -> i32 {
+    no_context(env, context, false)
+}
+
+#[win32(imm32, name = "ImmGetCompositionFontA", level = safe_fail)]
+fn get_composition_font_a(env: &mut Env<'_>, context: Handle, _font: GuestPtr<()>) -> i32 {
+    no_context(env, context, true)
+}
+
+#[win32(imm32, name = "ImmGetCompositionFontW", level = safe_fail)]
+fn get_composition_font_w(env: &mut Env<'_>, context: Handle, _font: GuestPtr<()>) -> i32 {
+    no_context(env, context, true)
+}
+
 pub(super) fn register(registry: &mut Registry) {
     for api in [
+        get_composition_a_ABI,
+        get_composition_w_ABI,
+        notify_ABI,
+        set_composition_window_ABI,
+        get_composition_window_ABI,
+        set_candidate_window_ABI,
+        set_composition_font_a_ABI,
+        set_composition_font_w_ABI,
+        get_composition_font_a_ABI,
+        get_composition_font_w_ABI,
         get_conversion_ABI,
         get_open_ABI,
         set_conversion_ABI,

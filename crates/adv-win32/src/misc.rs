@@ -18,6 +18,7 @@ mod internet;
 mod ole_memory;
 mod path_match;
 mod property_sheet;
+mod safe_array;
 mod shell_drop;
 mod shell_execute;
 mod shell_icon;
@@ -438,6 +439,7 @@ pub fn register(reg: &mut Registry) {
     gdiplus::register(reg);
     hglobal_stream::register(reg);
     ole_memory::register(reg);
+    safe_array::register(reg);
     task_allocator::register(reg);
     variant::register(reg);
     // Offline, with no error: the guest never reaches the network.

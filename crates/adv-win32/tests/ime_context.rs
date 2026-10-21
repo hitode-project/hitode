@@ -273,3 +273,61 @@ fn null_or_invalid_himc_precedes_both_output_ranges_and_never_publishes_partial_
     outputs(JitCpu::new(PARK_ADDR, false).unwrap());
     outputs(JitCpu::new(PARK_ADDR, true).unwrap());
 }
+
+fn composition<B: TestCpu>(cpu: B) {
+    let mut f = Fixture::new(cpu);
+    let buffer = f.bytes(&[0xcc; 64]);
+    let mut results = Vec::new();
+    for context in [0, 0x1234] {
+        let getter = if context == 0 { MARKER } else { 6 };
+        for name in ["ImmGetCompositionStringA", "ImmGetCompositionStringW"] {
+            for index in [8, 0x800] {
+                results.push((
+                    f.checked(name, &[V(context), V(index), V(buffer), V(64)]),
+                    getter,
+                ));
+            }
+        }
+        for name in [
+            "ImmGetCompositionWindow",
+            "ImmGetCompositionFontA",
+            "ImmGetCompositionFontW",
+        ] {
+            results.push((f.checked(name, &[V(context), V(buffer)]), getter));
+        }
+        for name in [
+            "ImmSetCompositionWindow",
+            "ImmSetCandidateWindow",
+            "ImmSetCompositionFontA",
+            "ImmSetCompositionFontW",
+        ] {
+            results.push((f.checked(name, &[V(context), V(READONLY)]), 6));
+        }
+        results.push((
+            f.checked("ImmNotifyIME", &[V(context), V(0x15), V(4), V(0)]),
+            6,
+        ));
+    }
+    f.run();
+    for (result, error) in results {
+        f.assert_result(result, 0, error);
+    }
+    let mut untouched = [0; 64];
+    f.m.cpu.read(buffer, &mut untouched).unwrap();
+    assert_eq!(untouched, [0xcc; 64]);
+    let diagnostics = f.m.ext.get::<adv_abi::ApiDiagnostics>();
+    assert_eq!(diagnostics.stub_calls, 0);
+    assert!(
+        diagnostics
+            .warnings
+            .keys()
+            .any(|(name, _)| name == "imm32.dll!ImmGetCompositionStringA")
+    );
+}
+
+#[test]
+// spec: WIN32-USER-13
+fn composition_and_window_fronts_fail_without_a_context_and_never_touch_buffers() {
+    composition(UnicornCpu::new(PARK_ADDR).unwrap());
+    composition(JitCpu::new(PARK_ADDR, true).unwrap());
+}
