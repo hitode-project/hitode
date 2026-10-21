@@ -334,3 +334,504 @@ msvcr90.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcrt.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr80.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr90.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
+# Shared process and error declarations; SDK 10.0.26100.0 x86.
+api-ms-win-crt-process-l1-1-0.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+api-ms-win-crt-process-l1-1-0.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	__doserrno	cdecl	ptr	unsigned long*	
+api-ms-win-crt-runtime-l1-1-0.dll	_errno	cdecl	ptr	int*	
+api-ms-win-crt-runtime-l1-1-0.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+api-ms-win-crt-runtime-l1-1-0.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+api-ms-win-crt-runtime-l1-1-0.dll	system	cdecl	i32	int	command:const char*:str8:1
+api-ms-win-crt-stdio-l1-1-0.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+api-ms-win-crt-stdio-l1-1-0.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+api-ms-win-crt-stdio-l1-1-0.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr100.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr100.dll	_errno	cdecl	ptr	int*	
+msvcr100.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr100.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr100.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr100.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr100.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+msvcr100.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+msvcr100.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+msvcr100.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr100.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr100.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+msvcr100.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+msvcr100.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr100.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr100.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr100.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr100.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr100.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr100.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr100.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr100.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr100.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr100.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr100.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr100.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr100.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr100.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr100.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr100.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr100.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr110.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr110.dll	_errno	cdecl	ptr	int*	
+msvcr110.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr110.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr110.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr110.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr110.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+msvcr110.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+msvcr110.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+msvcr110.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr110.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr110.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+msvcr110.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+msvcr110.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr110.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr110.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr110.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr110.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr110.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr110.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr110.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr110.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr110.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr110.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr110.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr110.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr110.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr110.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr110.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr110.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr110.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr120.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr120.dll	_errno	cdecl	ptr	int*	
+msvcr120.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr120.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr120.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr120.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr120.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+msvcr120.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+msvcr120.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+msvcr120.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr120.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr120.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+msvcr120.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+msvcr120.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr120.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr120.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr120.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr120.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr120.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr120.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr120.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr120.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr120.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr120.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr120.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr120.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr120.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr120.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr120.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr120.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr120.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr70.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr70.dll	_errno	cdecl	ptr	int*	
+msvcr70.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr70.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr70.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr70.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr70.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr70.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr70.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr70.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr70.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr70.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr70.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr70.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr70.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr70.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr70.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr70.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr70.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr70.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr70.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr71.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr71.dll	_errno	cdecl	ptr	int*	
+msvcr71.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr71.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr71.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr71.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr71.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr71.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr71.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr71.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr71.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr71.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr71.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr71.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr71.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr71.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr71.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr71.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr71.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr71.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr71.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr80.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr80.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr80.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr80.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr80.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr80.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+msvcr80.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+msvcr80.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr80.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr80.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+msvcr80.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+msvcr80.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr80.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr80.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr80.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr80.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr80.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr80.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr80.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr80.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr80.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr80.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr80.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr80.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr80.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr80.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr80.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr80.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcr90.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr90.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr90.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr90.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr90.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr90.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+msvcr90.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+msvcr90.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcr90.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcr90.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+msvcr90.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+msvcr90.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcr90.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr90.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr90.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcr90.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr90.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr90.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr90.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr90.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr90.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr90.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcr90.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr90.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr90.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcr90.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcr90.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcr90.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcrt.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcrt.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcrt.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcrt.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcrt20.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt20.dll	_errno	cdecl	ptr	int*	
+msvcrt20.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt20.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt20.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcrt20.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcrt20.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt20.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt20.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt20.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt20.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt20.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt20.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcrt20.dll	system	cdecl	i32	int	command:const char*:str8:1
+msvcrt40.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt40.dll	_errno	cdecl	ptr	int*	
+msvcrt40.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt40.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt40.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+msvcrt40.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+msvcrt40.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+msvcrt40.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt40.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+msvcrt40.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt40.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+msvcrt40.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+msvcrt40.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+msvcrt40.dll	system	cdecl	i32	int	command:const char*:str8:1
+ucrtbase.dll	__doserrno	cdecl	ptr	unsigned long*	
+ucrtbase.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_execlpe	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+ucrtbase.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+ucrtbase.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
+ucrtbase.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+ucrtbase.dll	_get_doserrno	cdecl	i32	errno_t	value:unsigned long*:ptr:1
+ucrtbase.dll	_get_errno	cdecl	i32	errno_t	value:int*:ptr:1
+ucrtbase.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
+ucrtbase.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
+ucrtbase.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
+ucrtbase.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
+ucrtbase.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_spawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
+ucrtbase.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+ucrtbase.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+ucrtbase.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
+ucrtbase.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+ucrtbase.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wexeclpe	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wexecv	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+ucrtbase.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wspawnlpe	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
+ucrtbase.dll	_wspawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
+ucrtbase.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+ucrtbase.dll	system	cdecl	i32	int	command:const char*:str8:1

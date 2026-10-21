@@ -425,5 +425,45 @@
     ],
     "projection": "double __cdecl pow(double, double) and _hypot(double, double): four x86 argument words, x87 double return. Only the three legacy CRT aliases.",
     "profile": "Finite normal operands and results within the _CIpow profile; domain, range and nonfinite CRT error handling warn and fail."
+  },
+  "process_environment": {
+    "headers": {
+      "process.h": {
+        "header": "ucrt/process.h",
+        "sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490"
+      },
+      "corecrt_wprocess.h": {
+        "header": "ucrt/corecrt_wprocess.h",
+        "sha256": "e75c5cdf244070ddcebac8920dd4cc96c33d0e21fdfbc82446c0374950e98487"
+      },
+      "stdlib.h": {
+        "header": "ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      "errno.h": {
+        "header": "ucrt/errno.h",
+        "sha256": "c64e8df96f057fdebc0474bd765cee3ae17de34a2b1fc9d197597321f2d1e447"
+      },
+      "stdio.h": {
+        "header": "ucrt/stdio.h",
+        "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6"
+      },
+      "corecrt_wstdio.h": {
+        "header": "ucrt/corecrt_wstdio.h",
+        "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+      }
+    },
+    "package": "Microsoft.Windows.SDK.CPP 10.0.26100.1",
+    "package_url": "https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP/10.0.26100.1",
+    "projection": "Catalog-filtered x86 cdecl process launch, pipe and error-cell declarations. intptr_t is a signed 32-bit integer; list forms retain only the mandatory mode/path/arg0 prefix. Implementations share per-module/thread error cells. Invalid-parameter handling is selected by the CRT version profile.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/system-wsystem",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/spawn-wspawn-functions",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/exec-wexec-functions",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/popen-wpopen",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/pclose",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-errno",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-doserrno"
+    ]
   }
 }

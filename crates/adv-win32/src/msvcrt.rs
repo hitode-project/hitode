@@ -12,6 +12,7 @@ mod convert;
 mod cpp_alloc;
 mod data;
 mod directory;
+mod errors;
 mod exceptions;
 mod file;
 mod find;
@@ -26,6 +27,7 @@ mod modern_stdio;
 mod modern_string;
 mod onexit;
 mod path;
+mod process;
 mod random;
 mod scalar_float;
 mod scalar_log;
@@ -40,6 +42,7 @@ mod startup;
 mod stream_position;
 mod thread;
 mod time64;
+mod versions;
 mod wide_scan;
 mod wide_string;
 
@@ -146,6 +149,7 @@ pub fn register(r: &mut Registry) {
     find::register(r);
     formatting::register(r);
     floating::register(r);
+    errors::register(r);
     intrinsic_math::register(r);
     time64::register(r);
     random::register(r);
@@ -172,6 +176,7 @@ pub fn register(r: &mut Registry) {
     modern_stdio::register(r);
     modern_string::register(r);
     wide_string::register(r);
+    process::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),

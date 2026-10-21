@@ -169,6 +169,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. Markers are a name token `chs`, `cn`, `gb` or `zhcn`, a kana-free name with a GBK-only character, or GB2312 data text outnumbering Shift_JIS threefold. An explicit code page MUST replace the detected one before guest code runs.
 **Verification**: Test
 
+### PERS-PROFILE-8 CRT subprocess environment
+
+**Rule**: CRT `system(NULL)` queries MUST report no command processor without changing error cells. Valid `system`, `_spawn*`, `_exec*`, and `_popen` calls MUST fail with ENOENT in this environment. Ordinary subprocess failures MUST NOT emit capability warnings or publish process handles or streams.
+**Verification**: Test
+
+### PERS-PROFILE-9 CRT error cells
+
+**Rule**: CRT error pointers and getters/setters MUST share the existing module/thread cells. UCRT API-set calls MUST use UCRT's cells. Other CRT modules and threads MUST retain independent cells.
+**Verification**: Test
+
 ## ABI ownership
 
 ### PERS-ABI-1 Single signature source

@@ -149,7 +149,25 @@ The macro and runtime consume that one result through the existing signature
 resolver; neither has an extra CRT table or parser. Empty parameter lists retain
 an empty sixth TSV column, so its final separator is intentional.
 
-The 99 declarations cover guest floating controls, modern invalid-parameter
+The process/error declarations additionally cover cataloged exports in all ten
+legacy CRT DLLs, UCRT and their API sets. `msvcrt::versions` selects those entries
+by both export presence and the generated declaration, using one implementation
+per function family. List-form exec/spawn entries use a variadic mandatory prefix;
+their signed x86 `intptr_t` result is 32 bits. Version profiles select legacy errno
+validation or modern invalid-parameter callbacks. Existing module/thread error
+cells remain the only errno/DOS-error owner, including API-set calls into UCRT.
+The virtual environment has no command processor, so valid subprocess requests
+fail with ENOENT and publish no handles or streams. A `system(NULL)` query returns
+zero without changing the error cells. `test-crt-input.ps1` verifies regeneration
+and rejection of changed process-list and binary-math ABI contracts.
+
+`python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
+`crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
+iostream families, including their data exports. `--check` detects stale entries.
+This scope manifest neither registers behavior nor changes export discovery;
+`tools/survey/coverage.py` continues to report the unfiltered catalogs.
+
+The declarations cover guest floating controls, modern invalid-parameter
 callbacks and `_errno` for the supported msvcrt/msvcr80/msvcr90/ucrtbase profiles,
 plus UCRT exit arrays, initializer ranges, `wcstoull`, `wcscat_s` and the allocation family
 with their API-set aliases. The six legacy `__getmainargs`/`__wgetmainargs`
