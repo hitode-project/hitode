@@ -518,6 +518,23 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         fallback: bool,
     ) -> Result<Self, Error> {
+        let request = Self::create_from(instance, surface, fallback);
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut request = std::pin::pin!(request);
+            // A pool cannot cross an await: a later poll may use another thread.
+            std::future::poll_fn(|cx| objc2::rc::autoreleasepool(|_| request.as_mut().poll(cx)))
+                .await
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        request.await
+    }
+
+    async fn create_from(
+        instance: wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+        fallback: bool,
+    ) -> Result<Self, Error> {
         let software = (fallback || cfg!(all(test, target_vendor = "apple")))
             .then(|| Arc::new(SoftwareTurn::take()));
         let adapter = instance
@@ -1591,7 +1608,9 @@ impl Gpu {
             if let Some(metal) = &mut pending.metal
                 && metal.active()
             {
-                metal.copy(self, source, rectangle, destination, x, y);
+                objc2::rc::autoreleasepool(|_| {
+                    metal.copy(self, source, rectangle, destination, x, y);
+                });
                 self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
                 return self.check();
             }

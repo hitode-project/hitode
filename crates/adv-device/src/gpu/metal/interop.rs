@@ -11,7 +11,7 @@ fn wgpu_clear_metal_triangle_wgpu_readback() {
     let context = gpu.context.clone();
     let submission = context.submission().unwrap();
     submission.flush();
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let device = context.device.as_hal::<wgpu::hal::api::Metal>().unwrap();
         let queue = context.queue.as_hal::<wgpu::hal::api::Metal>().unwrap();
         let texture = target
@@ -64,7 +64,7 @@ fragment float4 fragment_main() { return float4(0, 1, 0, 1); }
         encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         encoder.endEncoding();
         command.commit();
-    }
+    });
     drop(submission);
     let mut readback = gpu.readback(&target.image, None).unwrap();
     context

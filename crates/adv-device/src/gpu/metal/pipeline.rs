@@ -37,7 +37,7 @@ impl Compiler {
     ) -> Result<Pipeline, Error> {
         let mut builder = self.0.lock().unwrap();
         let device = builder.device.clone();
-        builder.build(&device, key, program)
+        objc2::rc::autoreleasepool(|_| builder.build(&device, key, program))
     }
 }
 fn hash(value: &impl Hash) -> u64 {
