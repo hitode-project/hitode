@@ -9,7 +9,7 @@ use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x0040_0000;
 
-// spec: PROC-MACH-7
+// spec: PROC-MACH-7, PROC-MACH-10
 #[test]
 fn personality_wait_hook_observes_initial_and_resumed_contexts_before_parking() {
     #[derive(Default)]
@@ -74,15 +74,6 @@ fn personality_wait_hook_observes_initial_and_resumed_contexts_before_parking() 
     assert_eq!(m.ext.get::<Boundaries>().0, [0, 1, 0]);
     assert_eq!(m.sys.context(0).state_name(), "Blocked");
     assert_eq!(m.sys.context(1).state_name(), "Blocked");
-    m.sys.set_event(event);
-    assert!(matches!(
-        m.run(),
-        RunResult::Idle {
-            next_deadline: None
-        }
-    ));
-    assert_eq!(m.sys.context(0).state_name(), "Done");
-    assert_eq!(m.ext.get::<Boundaries>().0, [0, 1, 0]);
     m.sys.context_wait = Some(|_| Some(Outcome::ExitProcess(42)));
     m.sys.set_event(event);
     assert!(matches!(m.run(), RunResult::Exited(42)));

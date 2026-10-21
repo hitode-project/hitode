@@ -666,18 +666,11 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     |_, _| Outcome::Return(0),
                 );
             }
-            match e.sys.objects.get_mut(handle) {
-                Some(adv_machine::Object::Mutex { owner, recursion })
-                    if *owner == Some(e.context) =>
-                {
-                    *recursion -= 1;
-                    if *recursion == 0 {
-                        *owner = None;
-                    }
-                }
-                _ => return Outcome::Fail("CRT unlock by a non-owner".into()),
+            if !matches!(e.sys.objects.get(handle), Some(adv_machine::Object::Mutex { owner, .. }) if *owner == Some(e.context))
+            {
+                return Outcome::Fail("CRT unlock by a non-owner".into());
             }
-            e.sys.signal_waiters(handle);
+            e.sys.release_mutex(handle);
             0
         }
         "malloc" | "_malloc_crt" | "??_U@YAPAXI@Z" => {

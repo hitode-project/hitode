@@ -67,21 +67,38 @@ impl Images {
 
 /// A waitable terminal result, independent of the machine/address space lifetime.
 #[derive(Debug, Default)]
-pub struct Completion(std::sync::atomic::AtomicU64);
+pub struct Completion {
+    value: std::sync::atomic::AtomicU64,
+    observers:
+        std::sync::Mutex<std::collections::BTreeMap<(u64, u64), crate::objects::ObjectChanges>>,
+}
 impl Completion {
+    pub(crate) fn subscribe(&self, table: u64, id: u64, changed: crate::objects::ObjectChanges) {
+        let mut observers = self.observers.lock().unwrap();
+        if self.exit_code().is_some() {
+            let _ = changed.send((id, crate::WakePriority::Normal));
+        } else {
+            observers.insert((table, id), changed);
+        }
+    }
+
+    pub(crate) fn unsubscribe(&self, table: u64, id: u64) {
+        self.observers.lock().unwrap().remove(&(table, id));
+    }
+
     pub fn exit_code(&self) -> Option<u32> {
-        let value = self.0.load(std::sync::atomic::Ordering::Acquire);
+        let value = self.value.load(std::sync::atomic::Ordering::Acquire);
         (value >> 32 == 1).then_some(value as u32)
     }
     /// A reported termination status may precede the last live thread's exit.
     /// Waits and supervisor liveness must continue to use `exit_code`.
     pub fn exit_status(&self) -> Option<u32> {
-        let value = self.0.load(std::sync::atomic::Ordering::Acquire);
+        let value = self.value.load(std::sync::atomic::Ordering::Acquire);
         (value >> 32 != 0).then_some(value as u32)
     }
     /// Publish the first termination status without signaling completion.
     pub fn begin_termination(&self, code: u32) -> bool {
-        self.0
+        self.value
             .compare_exchange(
                 0,
                 (2u64 << 32) | u64::from(code),
@@ -91,7 +108,7 @@ impl Completion {
             .is_ok()
     }
     pub fn complete(&self, code: u32) {
-        let mut previous = self.0.load(std::sync::atomic::Ordering::Acquire);
+        let mut previous = self.value.load(std::sync::atomic::Ordering::Acquire);
         loop {
             if previous >> 32 == 1 {
                 return;
@@ -101,13 +118,18 @@ impl Completion {
             } else {
                 code
             };
-            match self.0.compare_exchange(
+            match self.value.compare_exchange(
                 previous,
                 (1u64 << 32) | u64::from(code),
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    for ((_, id), changed) in std::mem::take(&mut *self.observers.lock().unwrap()) {
+                        let _ = changed.send((id, crate::WakePriority::Normal));
+                    }
+                    return;
+                }
                 Err(value) => previous = value,
             }
         }

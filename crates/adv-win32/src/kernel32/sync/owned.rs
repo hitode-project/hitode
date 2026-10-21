@@ -167,18 +167,18 @@ pub(super) fn release_native(
         return ACCESS_VIOLATION;
     }
     let current = env.context;
-    let (old, signal) = match (kind, env.sys.objects.get(handle)) {
+    let old = match (kind, env.sys.objects.get(handle)) {
         (Kind::Mutant, Some(Object::Mutex { owner, recursion })) => {
             if *owner != Some(current) || *recursion == 0 {
                 return MUTANT_NOT_OWNED;
             }
-            (1u32.wrapping_sub(*recursion), *recursion == 1)
+            1u32.wrapping_sub(*recursion)
         }
         (Kind::Semaphore, Some(Object::Semaphore { count: old, max })) => {
             if old.checked_add(count).is_none_or(|total| total > *max) {
                 return SEMAPHORE_LIMIT;
             }
-            (*old, true)
+            *old
         }
         (_, Some(_)) => return TYPE_MISMATCH,
         (_, None) => return INVALID_HANDLE,
@@ -187,18 +187,9 @@ pub(super) fn release_native(
     if previous != 0 && env.cpu.write_u32(previous, old).is_err() {
         return ACCESS_VIOLATION;
     }
-    match env.sys.objects.get_mut(handle).unwrap() {
-        Object::Mutex { owner, recursion } => {
-            *recursion -= 1;
-            if *recursion == 0 {
-                *owner = None;
-            }
-        }
-        Object::Semaphore { count: old, .. } => *old += count,
-        _ => unreachable!("validated synchronization owner"),
-    }
-    if signal {
-        env.sys.signal_waiters(handle);
+    match kind {
+        Kind::Mutant => env.sys.release_mutex(handle),
+        Kind::Semaphore => env.sys.release_semaphore(handle, count),
     }
     0
 }

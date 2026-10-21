@@ -71,6 +71,7 @@ impl Objects {
                 unreachable!()
             };
             *signaled = true;
+            let _ = self.changed.send((id, crate::WakePriority::Normal));
             // A timer holds one signal, rather than a backlog of missed ticks.
             // Keep its original phase and jump directly to the next future tick.
             *deadline = if *period_us == 0 {

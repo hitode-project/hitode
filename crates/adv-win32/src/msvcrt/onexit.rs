@@ -64,18 +64,13 @@ fn table(env: &Env<'_>, pointer: GuestPtr<[u32; 3]>) -> Option<[u32; 3]> {
 }
 
 fn finish(env: &mut Env<'_>, lock: u32, result: u32, action: Action) -> Outcome {
-    let Some(adv_machine::Object::Mutex { owner, recursion }) = env.sys.objects.get_mut(lock)
-    else {
+    let Some(adv_machine::Object::Mutex { owner, .. }) = env.sys.objects.get(lock) else {
         return Outcome::Fail("UCRT exit lock disappeared".into());
     };
     if *owner != Some(env.context) {
         return Outcome::Fail("UCRT exit lock owner changed".into());
     }
-    *recursion -= 1;
-    if *recursion == 0 {
-        *owner = None;
-    }
-    env.sys.signal_waiters(lock);
+    env.sys.release_mutex(lock);
     match action {
         Action::OnExit(function) => Outcome::Return(if result == 0 { function } else { 0 }),
         Action::Terminate(code) if result == 0 => crate::kernel32::exit_process(env, code),
