@@ -73,6 +73,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: A real-time polling round MAY wait only after every ready context repeated earlier host-call sequences between its last four yields. A context doing new work between yields MUST run again without a host wait.
 **Verification**: Test
 
+### PROC-CLOCK-6 Timer ticks
+
+**Rule**: In real time, timed waits and waitable timers MUST expire on the first whole guest millisecond at or after their deadline. Display-paced waits MUST keep exact deadlines. Polling rounds MUST end on the next whole millisecond.
+**Verification**: Test
+
 ## Isolation
 
 ### PROC-ISO-1 Separate processes

@@ -151,12 +151,34 @@ pub enum Wait {
     },
 }
 
+/// The Windows timer period a game gets from timeBeginPeriod(1).
+pub(crate) const TICK_US: u64 = 1000;
+
+/// The first timer tick at or after `us`.
+pub(crate) fn next_tick(us: u64) -> u64 {
+    us.div_ceil(TICK_US).saturating_mul(TICK_US)
+}
+
 impl Wait {
     pub(crate) fn deadline(&self) -> Option<u64> {
         match self {
             Self::Until(at) => Some(*at),
             Self::Object { deadline, .. } | Self::Objects { deadline, .. } => *deadline,
             Self::Yield => None,
+        }
+    }
+
+    /// Expire on the next timer tick at or after the deadline (PROC-CLOCK-6).
+    pub(crate) fn round_to_tick(&mut self) {
+        if let Self::Until(at)
+        | Self::Object {
+            deadline: Some(at), ..
+        }
+        | Self::Objects {
+            deadline: Some(at), ..
+        } = self
+        {
+            *at = next_tick(*at);
         }
     }
 
@@ -261,6 +283,8 @@ pub struct Context {
     pub(crate) wait_objects: Vec<u64>,
     /// Its last block was a yield (Sleep(0)): it is polling, not waiting on anything.
     pub(crate) yielded: bool,
+    /// Its next timed wait keeps its exact deadline instead of the next tick.
+    pub(crate) exact_deadline: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
     pub(crate) progress: crate::poll_progress::PollProgress,
     /// Kernel object signaled when this context ends.
@@ -653,6 +677,7 @@ mod active_tests {
             frames: Vec::new(),
             state: super::State::Ready { resume: None },
             yielded: false,
+            exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
             thread_handle,

@@ -365,6 +365,7 @@ impl Sys {
             frames: Vec::new(),
             state: State::Ready { resume: None },
             yielded: false,
+            exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
             thread_handle,
@@ -835,10 +836,21 @@ impl Sys {
         }
     }
 
+    /// The current context's next timed wait follows a display, not the timer
+    /// tick, so it keeps its exact deadline.
+    pub fn keep_exact_deadline(&mut self) {
+        let current = self.current as usize;
+        self.contexts[current].exact_deadline = true;
+    }
+
     fn register_waiter(&mut self, i: usize) {
-        let State::Blocked { wait, .. } = &self.contexts[i].state else {
+        let context = &mut self.contexts[i];
+        let State::Blocked { wait, .. } = &mut context.state else {
             unreachable!()
         };
+        if !std::mem::take(&mut context.exact_deadline) && !self.clock.is_virtual() {
+            wait.round_to_tick();
+        }
         let deadline = wait.deadline();
         let (handles, notification) = wait.objects();
         let mut objects = Vec::new();
@@ -997,7 +1009,13 @@ impl Sys {
             .first()
             .map(|&(deadline, _)| deadline)
             .into_iter()
-            .chain(self.objects.next_timer_deadline())
+            .chain(self.objects.next_timer_deadline().map(|at| {
+                if self.clock.is_virtual() {
+                    at
+                } else {
+                    sched::next_tick(at)
+                }
+            }))
             .min()
     }
 
@@ -2416,7 +2434,8 @@ impl<B: Backend> Machine<B> {
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
-                let soon = self.sys.clock.now_us() + 1000;
+                // End on the tick that timed waits expire on, so both share a wake.
+                let soon = sched::next_tick(self.sys.clock.now_us() + 1);
                 let soon = self.sys.frame_spin_round(soon).unwrap_or(soon);
                 let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
                 self.sys.clock.begin_wait(Some(t));

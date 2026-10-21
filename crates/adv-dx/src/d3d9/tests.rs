@@ -303,6 +303,8 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         unpaced: u32,
     }
     let mut m = machine();
+    m.spawn("present", adv_machine::layout::PARK_ADDR, &[], 0x10000)
+        .unwrap();
     m.ext.insert(Policy {
         held: false,
         fence: false,
