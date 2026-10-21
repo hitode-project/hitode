@@ -108,6 +108,11 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 **Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time.
 **Verification**: Test
 
+### MEDIA-STREAM-4 Decoding off the execution thread
+
+**Rule**: Each movie source MUST decode on a host thread of its own and answer every request exactly as decoding on the caller's thread would. Between requests it MAY decode and convert the next frames ahead.
+**Verification**: Test
+
 ## Windows Media decoder wrappers
 
 ### MEDIA-DMO-1 Decoder admission
