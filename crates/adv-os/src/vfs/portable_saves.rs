@@ -89,7 +89,7 @@ fn find_saves(dir: &Path, game: &Path) -> io::Result<bool> {
     Ok(found)
 }
 
-fn copy_missing(source: &Path, target: &Path) -> io::Result<()> {
+pub(super) fn copy_missing(source: &Path, target: &Path) -> io::Result<()> {
     super::host::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
