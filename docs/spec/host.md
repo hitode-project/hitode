@@ -297,7 +297,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-LIFE-4 Activation and focus
 
-**Rule**: Application activation MUST post `WM_ACTIVATEAPP`. Losing key status MUST lose guest focus unless key moved to a guest dialog. Minimizing and restoring MUST post `WM_SIZE`.
+**Rule**: Application activation MUST post `WM_ACTIVATEAPP`. Losing key status MUST lose guest focus unless key moved to a guest dialog. Minimizing and restoring MUST post `WM_SIZE`, and a guest minimizing the displayed window MUST minimize the host window, also on Windows.
 **Applies to**: macOS
 **Verification**: Review — AppKit notifications cannot be sent in a test.
 

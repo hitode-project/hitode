@@ -74,6 +74,7 @@ mod native {
         client_width: i32,
         client_height: i32,
         closed: bool,
+        minimized: bool,
         cursor_visible: bool,
         video_cursor_regions: Arc<[adv_runtime::VideoCursorRegion]>,
         retained: RetainedFrame,
@@ -627,9 +628,19 @@ mod native {
                 }
                 match message {
                     WM_SIZE => {
-                        if wparam as u32 != SIZE_MINIMIZED {
+                        let minimized = wparam as u32 == SIZE_MINIMIZED;
+                        if !minimized {
                             state.client_width = lparam as u16 as i32;
                             state.client_height = (lparam as u32 >> 16) as u16 as i32;
+                        }
+                        // Minimizing and restoring reach the guest as on macOS.
+                        if minimized != state.minimized {
+                            state.minimized = minimized;
+                            state.events.push_back(Event::Input {
+                                message: WM_SIZE,
+                                wparam: u32::from(minimized),
+                                lparam: if minimized { 0 } else { lparam as u32 },
+                            });
                         }
                         state.events.push_back(Event::Repaint);
                         return 0;
@@ -794,6 +805,7 @@ mod native {
                 client_width: width as i32,
                 client_height: height as i32,
                 closed: false,
+                minimized: false,
                 cursor_visible: true,
                 video_cursor_regions: Arc::from([]),
                 retained: RetainedFrame::default(),
@@ -1043,6 +1055,12 @@ mod native {
             self.dialogs.hide();
             unsafe {
                 ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+
+        pub fn minimize(&mut self) {
+            unsafe {
+                ShowWindow(self.hwnd, SW_MINIMIZE);
             }
         }
 
@@ -1459,6 +1477,7 @@ impl Window {
         Ok(WaitOutcome::Deadline)
     }
     pub fn hide(&mut self) {}
+    pub fn minimize(&mut self) {}
 }
 
 #[cfg(all(test, windows))]

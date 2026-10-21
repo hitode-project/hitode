@@ -738,6 +738,15 @@ impl<B: Backend> Runtime<B> {
         adv_win32::user32::dialog::post_host_event(&mut self.env(), event)
     }
 
+    /// Whether the guest minimized the window the host displays (see
+    /// [`adv_win32::user32::host_input::minimized`]).
+    pub fn window_minimized(&self) -> bool {
+        adv_win32::user32::host_input::minimized(
+            &self.machine.ext.get::<Win32>().user,
+            &self.machine.sys.objects,
+        )
+    }
+
     /// Windows host input would address now (see
     /// [`adv_win32::user32::host_input::view`]).
     pub fn input_view(&self) -> crate::InputView {

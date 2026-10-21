@@ -1611,6 +1611,7 @@ fn run_execution(
     let mut injected = false;
     let mut first_frame_seconds = None;
     let mut close_at = None;
+    let mut minimized = false;
     let mut failure = None;
     let mut guest_error = None;
     let mut exit_code = None;
@@ -2128,6 +2129,13 @@ fn run_execution(
         }
         if let Some(worker) = window.as_mut() {
             worker.publish_dialogs(runtime.dialogs()?);
+            // A guest minimizing itself (a boss key) minimizes the host window
+            // where it has one; restoring that window restores the guest.
+            let now_minimized = runtime.window_minimized();
+            if now_minimized && !minimized {
+                worker.minimize();
+            }
+            minimized = now_minimized;
         }
         if let Some(controller) = control.as_mut() {
             let ordinary = runtime.machine.sys.scheduling.external_interrupts == interrupts_before;

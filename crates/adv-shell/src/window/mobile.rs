@@ -607,6 +607,8 @@ impl GameView {
     pub(crate) fn hide(&self) {
         self.pause(true);
     }
+    /// A mobile view cannot be minimized; the next touch restores the guest.
+    pub(crate) fn minimize(&self) {}
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
     pub(crate) fn refresh_ready(&self) -> bool {
         self.ready.get()
