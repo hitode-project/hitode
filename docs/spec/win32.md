@@ -100,7 +100,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 | Fixed maximum size or other creation options | Retain host allocation |
 | Registry capacity | 16 heaps including the process heap, stored in its control page |
 | Slab capacity | 128 slabs per registered heap, then ordinary host allocation |
-| Slab replenishment | Start each size class at 16 KiB and double exhausted-class replenishments up to 1 MiB |
+| Slab replenishment | Start each size class at 16 KiB; replenish an exhausted class with at least 4× its last slab and an eighth of all slab memory, up to 16 MiB |
 | Slab lookup hint | Validate its registered range; invalid or mismatching hints retain the full search |
 | Destroyed registration | Remove before releasing arenas and initialize fresh metadata on address reuse |
 
