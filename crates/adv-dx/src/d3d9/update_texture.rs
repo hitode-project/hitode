@@ -281,7 +281,7 @@ fn next(env: &mut Env<'_>, destination: Id) -> Outcome {
             resource: destination,
             level: Some(upload.level),
             target: upload.target,
-            pixels: upload.pixels,
+            pixels: Pixels::Host(upload.pixels),
             pitch: upload.pitch,
             rectangle: upload.rectangle,
         },

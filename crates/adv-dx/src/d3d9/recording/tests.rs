@@ -290,7 +290,7 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
         resource,
         level: None,
         target,
-        pixels: Arc::new(vec![7; 16 * 12 * 4]),
+        pixels: Pixels::Host(Arc::new(vec![7; 16 * 12 * 4])),
         pitch: 64,
         rectangle: Rect {
             x: 0,
@@ -1285,7 +1285,7 @@ fn failed_busy_wait_admission_keeps_successful_prefix_but_rejects_incoming_uploa
             resource,
             level: None,
             target: target.clone(),
-            pixels: Arc::new(vec![7; 16 * 12 * 4]),
+            pixels: Pixels::Host(Arc::new(vec![7; 16 * 12 * 4])),
             pitch: 64,
             rectangle: Rect {
                 x: 0,

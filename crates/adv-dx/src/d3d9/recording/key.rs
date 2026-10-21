@@ -284,14 +284,7 @@ pub(super) fn prepare(
             rectangle,
         } => {
             write(content(env, *resource, *level, 0), true);
-            (
-                1u8,
-                target_key(target),
-                pixels.as_slice(),
-                pitch,
-                rect(*rectangle),
-            )
-                .hash(&mut h);
+            (1u8, target_key(target), pixels, pitch, rect(*rectangle)).hash(&mut h);
             bytes = pixels.len();
         }
         Operation::Copy {

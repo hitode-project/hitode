@@ -184,6 +184,46 @@ impl Submission<'_> {
     }
 }
 
+/// BGRA rows in GPU-visible memory from [`Gpu::stage`]. Dropping it returns the
+/// buffer to the pool once the GPU has finished reading it.
+pub struct Staged {
+    buffer: Option<wgpu::Buffer>,
+    pool: Arc<Mutex<Vec<wgpu::Buffer>>>,
+    context: u64,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+impl Staged {
+    /// Bytes per staged row, aligned for GPU copies.
+    pub fn pitch(&self) -> u32 {
+        self.pitch
+    }
+    pub fn len(&self) -> usize {
+        self.pitch as usize * self.height as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+impl Drop for Staged {
+    fn drop(&mut self) {
+        /// Pooled buffers kept per device; more are released.
+        const POOL: usize = 8;
+        let buffer = self.buffer.take().unwrap();
+        let pool = Arc::downgrade(&self.pool);
+        let mapped = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Write, .., move |result| {
+            if let (Ok(()), Some(pool)) = (result, pool.upgrade()) {
+                let mut pool = pool.lock().unwrap();
+                if pool.len() < POOL {
+                    pool.push(mapped);
+                }
+            }
+        });
+    }
+}
+
 /// An owned color image, usable both as a texture and as a render target.
 #[derive(Clone)]
 pub struct Image {
@@ -469,6 +509,8 @@ pub struct Gpu {
     white: Image,
     upload: wgpu::Buffer,
     upload_capacity: u64,
+    /// Mapped staging buffers ready for [`Gpu::stage`].
+    staging: Arc<Mutex<Vec<wgpu::Buffer>>>,
     uniform: wgpu::Buffer,
     stats: Stats,
     frames: Vec<Image>,
@@ -691,6 +733,7 @@ impl Gpu {
             white,
             upload,
             upload_capacity: 4096,
+            staging: Arc::default(),
             uniform,
             stats: Stats {
                 vertex_buffer_allocations: 1,
@@ -737,6 +780,7 @@ impl Gpu {
             white: self.white.clone(),
             upload,
             upload_capacity: 4096,
+            staging: Arc::default(),
             uniform,
             stats: Stats {
                 vertex_buffer_allocations: 1,
@@ -981,6 +1025,109 @@ impl Gpu {
             height,
             format,
         ))
+    }
+
+    /// Snapshot BGRA rows straight into GPU-visible memory: `fill` writes each
+    /// row by index through the callback it is given. This is the upload's
+    /// only CPU copy; [`Gpu::upload_staged`] copies on the GPU.
+    pub fn stage<E>(
+        &self,
+        width: u32,
+        height: u32,
+        fill: impl FnOnce(&mut dyn FnMut(u32, &[u8])) -> Result<(), E>,
+    ) -> Result<Result<Staged, E>, Error> {
+        self.check()?;
+        let pitch = width
+            .checked_mul(4)
+            .filter(|_| width > 0 && height > 0)
+            .ok_or_else(|| invalid("staged upload size"))?
+            .next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let size = u64::from(pitch) * u64::from(height);
+        // Collect buffers whose GPU reads finished; their map callbacks run here.
+        let _ = self.context.device.poll(wgpu::PollType::Poll);
+        let pooled = {
+            let mut pool = self.staging.lock().unwrap();
+            // Reuse a buffer at most twice the size, so one frame's large
+            // buffer does not serve every small upload after it.
+            let at = pool
+                .iter()
+                .position(|b| b.size() >= size && b.size() <= size * 2);
+            at.map(|at| pool.swap_remove(at))
+        };
+        let buffer = pooled.unwrap_or_else(|| {
+            self.context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("staged upload"),
+                size,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            })
+        });
+        let filled = {
+            let mut view = buffer
+                .slice(..size)
+                .get_mapped_range_mut()
+                .map_err(|error| invalid(&format!("staged upload mapping: {error}")))?;
+            let row = width as usize * 4;
+            fill(&mut |y, bytes| {
+                let at = y as usize * pitch as usize;
+                view.slice(at..at + row).copy_from_slice(&bytes[..row]);
+            })
+        };
+        buffer.unmap();
+        Ok(filled.map(|()| Staged {
+            buffer: Some(buffer),
+            pool: self.staging.clone(),
+            context: self.context.id,
+            width,
+            height,
+            pitch,
+        }))
+    }
+
+    /// Copy staged rows into `rectangle` of `image` on the GPU.
+    pub fn upload_staged(
+        &self,
+        image: &Image,
+        rectangle: Rect,
+        staged: &Staged,
+    ) -> Result<(), Error> {
+        let submission = self.context.submission_for(SwitchReason::Upload)?;
+        self.own(image)?;
+        image.writable()?;
+        rectangle_in(image, rectangle)?;
+        if staged.context != self.context.id
+            || (staged.width, staged.height) != (rectangle.w, rectangle.h)
+        {
+            return Err(invalid("staged upload does not match its rectangle"));
+        }
+        let mut encoder =
+            self.context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("staged upload"),
+                });
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: staged.buffer.as_ref().unwrap(),
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(staged.pitch),
+                    rows_per_image: Some(rectangle.h),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                mip_level: image.mip,
+                origin: wgpu::Origin3d {
+                    x: rectangle.x,
+                    y: rectangle.y,
+                    z: 0,
+                },
+                ..image.texture.as_image_copy()
+            },
+            extent(rectangle.w, rectangle.h),
+        );
+        submission.submit([encoder.finish()]);
+        self.check()
     }
 
     /// Upload a checked BGRA rectangle. Row padding stays outside the GPU image.

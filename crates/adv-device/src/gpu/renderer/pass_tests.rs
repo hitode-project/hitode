@@ -318,3 +318,56 @@ fn a_partial_depth_clear_follows_the_deferred_whole_clear() {
         }
     }
 }
+
+// spec: GFX-SAMPLER-4
+#[test]
+fn staged_uploads_land_after_pending_clears_and_recycle_their_buffer() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(3, 2, false).unwrap();
+        gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+        // Three texels per row stage at a 256-byte aligned pitch.
+        let rows: Vec<Vec<u8>> = (0..2u8)
+            .map(|y| (0..12).map(|i| y * 16 + i).collect())
+            .collect();
+        let staged = gpu
+            .stage(2, 2, |write| {
+                rows.iter()
+                    .enumerate()
+                    .for_each(|(y, row)| write(y as u32, &row[4..]));
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.pitch(), 256);
+        let rectangle = Rect {
+            x: 1,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        gpu.upload_staged(&target.image, rectangle, &staged)
+            .unwrap();
+        let red = [0, 0, 255, 255];
+        let expected: Vec<u8> = rows
+            .iter()
+            .flat_map(|row| red.iter().chain(&row[4..]).copied().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(read(&mut gpu, &target.image), expected, "native {native}");
+        drop(staged);
+        gpu.context
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .unwrap();
+        assert_eq!(gpu.staging.lock().unwrap().len(), 1);
+        let again = gpu.stage(2, 2, |_| Ok::<(), ()>(())).unwrap().unwrap();
+        assert!(
+            gpu.staging.lock().unwrap().is_empty(),
+            "the pooled buffer is reused"
+        );
+        drop(again);
+    }
+}

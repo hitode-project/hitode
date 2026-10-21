@@ -393,15 +393,17 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
     let size = (lock.rectangle.h - 1) * pitch + row;
     let address = locked_rect(r, lock.rectangle).pBits;
     let format = r.desc.Format;
-    let mut pixels = vec![0; size as usize];
-    if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err()
-        || env.cpu.read(address, &mut pixels).is_err()
-    {
+    if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
-    let Some((pixels, pitch)) =
-        format::upload(format, pixels, pitch, lock.rectangle.w, lock.rectangle.h)
-    else {
+    let Some((pixels, pitch)) = format::snapshot(
+        env,
+        format,
+        address,
+        pitch,
+        lock.rectangle.w,
+        lock.rectangle.h,
+    ) else {
         return Outcome::Return(INVALID);
     };
     set_lock(
@@ -419,7 +421,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
             resource: id,
             level: None,
             target,
-            pixels: Arc::new(pixels),
+            pixels,
             pitch,
             rectangle: lock.rectangle,
         },
