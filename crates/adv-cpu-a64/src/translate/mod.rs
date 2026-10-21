@@ -336,6 +336,7 @@ enum Cold {
         label: Label,
         model: x87::Model,
         saved: bool,
+        suspended: bool,
     },
 }
 
@@ -1264,7 +1265,8 @@ impl Translator<'_> {
                 label,
                 model,
                 saved,
-            } => self.x87_fault(label, model, saved),
+                suspended,
+            } => self.x87_fault(label, model, saved, suspended),
             Cold::Helper { label, refund } => {
                 self.asm.bind(label);
                 if refund != 0 {
