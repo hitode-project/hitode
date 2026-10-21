@@ -9,6 +9,7 @@ mod effect;
 mod matrix_stack;
 mod preshader;
 mod save_file;
+mod sprite;
 mod texture;
 mod texture_create;
 
@@ -54,6 +55,7 @@ pub fn register(registry: &mut Registry) {
     texture::register(registry);
     texture_create::register(registry);
     save_file::register(registry);
+    sprite::register(registry);
 }
 
 fn math_leaf(env: &mut Env<'_>) -> Option<u64> {

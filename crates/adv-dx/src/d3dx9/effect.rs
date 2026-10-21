@@ -70,7 +70,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(output_semantics_ABI);
     methods::register(registry);
 }
-fn alloc(env: &mut Env<'_>, bytes: &[u8]) -> Option<u32> {
+pub(super) fn alloc(env: &mut Env<'_>, bytes: &[u8]) -> Option<u32> {
     let heaps = env.ext.get_mut::<Heaps>();
     let pointer = heaps.alloc(
         env.cpu,
@@ -85,7 +85,7 @@ fn alloc(env: &mut Env<'_>, bytes: &[u8]) -> Option<u32> {
     }
     Some(pointer)
 }
-fn free(env: &mut Env<'_>, pointer: u32) {
+pub(super) fn free(env: &mut Env<'_>, pointer: u32) {
     let heaps = env.ext.get_mut::<Heaps>();
     heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
 }
@@ -172,22 +172,22 @@ struct Pending {
     /// Constant registers; staged in guest memory only for a guest call.
     data: Option<Vec<u32>>,
 }
-struct Calls {
+pub(super) struct Calls {
     pending: VecDeque<Pending>,
-    temporary: Vec<u32>,
+    pub(super) temporary: Vec<u32>,
     /// Recording a technique's block ignores failed state calls, as native
     /// D3DX does; the block calls themselves still stop the chain.
-    tolerant: bool,
+    pub(super) tolerant: bool,
 }
 impl Calls {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
             temporary: Vec::new(),
             tolerant: false,
         }
     }
-    fn push(&mut self, pointer: u32, slot: u32, args: impl Into<Vec<u32>>) {
+    pub(super) fn push(&mut self, pointer: u32, slot: u32, args: impl Into<Vec<u32>>) {
         self.pending.push_back(Pending {
             pointer,
             slot,
@@ -203,22 +203,22 @@ impl Calls {
             data: Some(data),
         });
     }
-    fn finish(self, env: &mut Env<'_>) {
+    pub(super) fn finish(self, env: &mut Env<'_>) {
         for pointer in self.temporary {
             free(env, pointer);
         }
     }
 }
-type Then = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
+pub(super) type Then = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
 #[cfg(feature = "gpu")]
 type Value = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
-fn calls(env: &mut Env<'_>, c: Calls, result: u32) -> Outcome {
+pub(super) fn calls(env: &mut Env<'_>, c: Calls, result: u32) -> Outcome {
     run(env, c, Box::new(move |_| Outcome::Return(result)))
 }
 /// Make the queued COM calls in order, then `then`. Unhooked device methods
 /// run on the host without a guest round trip (GFX-EFFECT-3).
 #[cfg_attr(not(feature = "gpu"), allow(clippy::never_loop))]
-fn run(env: &mut Env<'_>, mut c: Calls, then: Then) -> Outcome {
+pub(super) fn run(env: &mut Env<'_>, mut c: Calls, then: Then) -> Outcome {
     // No guest code runs between host calls, so each vtable is read once.
     let mut tables: Vec<(u32, Vec<u32>)> = Vec::new();
     loop {

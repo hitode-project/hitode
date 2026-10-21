@@ -43,5 +43,12 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxbuffer--getbufferpointer",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxbuffer--getbuffersize"
     ]
+  },
+  "legacy_d3dx_sprite": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "header": "build/native/include/d3dx9core.h",
+    "header_sha256": "7e360611940e9520c9dd983dbe9e48a78df8b723d95de1a57a63580de52a0207",
+    "scope": "ID3DXSprite 14 x86 slots including IUnknown; pointers, DWORD, D3DCOLOR, ULONG and HRESULT are one stack word",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxsprite"
   }
 }
