@@ -115,6 +115,8 @@ pub(super) fn invalidate(path: &Path) {
 /// Start a run from the host's current state: the trees may have changed
 /// between runs hosted by the same process.
 pub(super) fn clear() {
+    #[cfg(all(test, unix))]
+    let _held = tests::EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
     let mut index = INDEX.lock().unwrap();
     index.generation += 1;
     index.dirs.clear();
@@ -134,9 +136,14 @@ pub(super) fn volatile(dir: &Path) {
 mod tests {
     use super::*;
 
+    /// Parallel tests construct Vfs instances, whose `clear` would drop the
+    /// cached listings this test relies on to ignore unannounced changes.
+    pub(super) static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
     #[test]
     // spec: WIN32-OBJECT-8
     fn the_index_answers_until_its_directory_is_invalidated() {
+        let _held = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch/vfs-names")
             .join(format!(
