@@ -1127,6 +1127,9 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             if output == 0 || (count > 1 && fetched == 0) {
                 return r(E_POINTER);
             }
+            if out_of_sync(env, this) {
+                return r(VFW_E_ENUM_OUT_OF_SYNC);
+            }
             let items = next_items(env, this, count as usize);
             let n = items.len() as u32;
             for (i, &item) in items.iter().enumerate() {
@@ -1150,9 +1153,12 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
         }
         "Skip" => {
             let count = env.arg(1) as usize;
+            if out_of_sync(env, this) {
+                return r(VFW_E_ENUM_OUT_OF_SYNC);
+            }
             // quartz's filter enumerator refuses to skip past its end; the
             // pin and media type enumerators skip what remains.
-            if let Some(Obj::EnumFilters { list, position }) = payload(env, this)
+            if let Some(Obj::EnumFilters { list, position, .. }) = payload(env, this)
                 && count > list.len().saturating_sub(*position)
             {
                 return r(E_INVALIDARG);
@@ -1161,10 +1167,17 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             r(if skipped == count { S_OK } else { S_FALSE })
         }
         "Reset" => {
+            let current = filter_list(env, this);
             match payload_mut(env, this) {
-                Some(Obj::EnumPins { position, .. })
-                | Some(Obj::EnumTypes { position, .. })
-                | Some(Obj::EnumFilters { position, .. }) => *position = 0,
+                Some(Obj::EnumFilters { list, position, .. }) => {
+                    if let Some(current) = current {
+                        *list = current;
+                    }
+                    *position = 0;
+                }
+                Some(Obj::EnumPins { position, .. }) | Some(Obj::EnumTypes { position, .. }) => {
+                    *position = 0
+                }
                 _ => {}
             }
             r(S_OK)
@@ -1180,7 +1193,12 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
                     types: types.clone(),
                     position: *position,
                 },
-                Some(Obj::EnumFilters { list, position }) => Obj::EnumFilters {
+                Some(Obj::EnumFilters {
+                    graph,
+                    list,
+                    position,
+                }) => Obj::EnumFilters {
+                    graph: *graph,
                     list: list.clone(),
                     position: *position,
                 },
@@ -1195,6 +1213,21 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             }
         }
         _ => None,
+    }
+}
+
+/// The filters now in an EnumFilters object's graph, if it is still alive.
+fn filter_list(env: &Env<'_>, this: u32) -> Option<Vec<u32>> {
+    let Some(Obj::EnumFilters { graph, .. }) = payload(env, this) else {
+        return None;
+    };
+    let graph = env.ext.get::<State>().graphs.get(graph)?;
+    Some(graph.members.iter().map(|m| m.filter).collect())
+}
+fn out_of_sync(env: &Env<'_>, this: u32) -> bool {
+    match (payload(env, this), filter_list(env, this)) {
+        (Some(Obj::EnumFilters { list, .. }), Some(current)) => *list != current,
+        _ => false,
     }
 }
 
@@ -1239,7 +1272,7 @@ fn next_items(env: &mut Env<'_>, this: u32, count: usize) -> Vec<u32> {
         Some(Obj::EnumTypes { types, position }) => {
             (*position, types.iter().cloned().map(Item::Type).collect())
         }
-        Some(Obj::EnumFilters { list, position }) => {
+        Some(Obj::EnumFilters { list, position, .. }) => {
             (*position, list.iter().map(|&f| Item::Filter(f)).collect())
         }
         _ => return Vec::new(),

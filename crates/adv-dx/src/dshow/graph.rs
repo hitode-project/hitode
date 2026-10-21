@@ -427,7 +427,11 @@ fn enum_filters(env: &mut Env<'_>, graph: u32, output: u32) -> u32 {
     match super::create(
         env,
         &[Face::EnumFilters],
-        Obj::EnumFilters { list, position: 0 },
+        Obj::EnumFilters {
+            graph,
+            list,
+            position: 0,
+        },
     ) {
         Ok(faces) => {
             let _ = env.cpu.write_u32(output, faces[0]);

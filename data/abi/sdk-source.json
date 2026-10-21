@@ -423,5 +423,20 @@
     "source": "Microsoft Learn wdm.h ZwWriteFile declaration",
     "target": "x86 NTAPI (__stdcall), NTSTATUS and nine 32-bit arguments; same pointer and handle ABI as NtReadFile",
     "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwwritefile"
+  },
+  "legacy_d3dx_sprite": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "url": "https://www.nuget.org/packages/Microsoft.DXSDK.D3DX/9.29.952.8",
+    "package_sha256": "ead0906ae8a26c18a7525da7490127a2110f7c58f18293738283e30e97c6ea4b",
+    "headers": {
+      "d3dx9core.h": "7e360611940e9520c9dd983dbe9e48a78df8b723d95de1a57a63580de52a0207",
+      "d3dx9math.h": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9"
+    },
+    "scope": "D3DXCreateSprite and D3DXMatrixTransformation2D only",
+    "target": "x86 WINAPI stdcall; CreateSprite two pointer words with HRESULT return; Transformation2D seven words (five pointers, two FLOAT) with D3DXMATRIX* return",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatesprite",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtransformation2d"
+    ]
   }
 }

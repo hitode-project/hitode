@@ -316,15 +316,18 @@ public static class AbiMetadata
                 && f[3] == "u32" && f[4] == "u32"
                 && f[5] == "hr:Windows.Win32.Foundation.HRESULT:i32:1|pbuffer:Windows.Win32.Foundation.PSTR:str8:1|MaxLen:u32:u32:1";
             bool d3dx = f.Length == 6 && (f[0] == "d3dx9_43.dll" || f[0] == "d3dx9_29.dll")
-                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixRotationX", "D3DXMatrixRotationZ", "D3DXMatrixPerspectiveFovLH", "D3DXVec4Transform", "D3DXVec3TransformCoord", "D3DXVec3Transform", "D3DXVec3CatmullRom", "D3DXVec2Transform", "D3DXVec2TransformCoord", "D3DXVec2TransformNormal" }.Contains(f[1])
+                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixRotationX", "D3DXMatrixRotationZ", "D3DXMatrixPerspectiveFovLH", "D3DXVec4Transform", "D3DXVec3TransformCoord", "D3DXVec3Transform", "D3DXVec3CatmullRom", "D3DXVec2Transform", "D3DXVec2TransformCoord", "D3DXVec2TransformNormal", "D3DXMatrixTransformation2D" }.Contains(f[1])
                 && f[3] == "ptr" && f[4] == (f[1] switch { "D3DXVec2TransformCoord" or "D3DXVec2TransformNormal" => "D3DXVECTOR2*", "D3DXVec3Project" or "D3DXVec3TransformCoord" or "D3DXVec3CatmullRom" => "D3DXVECTOR3*", "D3DXVec4Transform" or "D3DXVec3Transform" or "D3DXVec2Transform" => "D3DXVECTOR4*", _ => "D3DXMATRIX*" });
-            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixRotationX", "D3DXMatrixRotationZ", "D3DXMatrixPerspectiveFovLH", "D3DXVec3CatmullRom" }.Contains(f[1]);
+            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixRotationX", "D3DXMatrixRotationZ", "D3DXMatrixPerspectiveFovLH", "D3DXVec3CatmullRom", "D3DXMatrixTransformation2D" }.Contains(f[1]);
             bool d3dxEffect = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXCreateEffect", "D3DXGetShaderOutputSemantics" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "HRESULT";
             bool d3dxStack = f.Length == 6 && f[0] == "d3dx9_43.dll" && f[1] == "D3DXCreateMatrixStack"
                 && f[3] == "i32" && f[4] == "HRESULT"
-                && f[5] == "Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1";
+                && f[5] == "Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1"
+                || f.Length == 6 && f[0] == "d3dx9_43.dll" && f[1] == "D3DXCreateSprite"
+                && f[3] == "i32" && f[4] == "HRESULT"
+                && f[5] == "pDevice:LPDIRECT3DDEVICE9:ptr:1|ppSprite:LPD3DXSPRITE*:ptr:1";
             bool d3dxSave = f.Length == 6 && f[0] == "d3dx9_43.dll" && f[3] == "i32" && f[4] == "HRESULT"
                 && (f[1] == "D3DXSaveSurfaceToFileInMemory"
                     && f[5] == "ppDestBuf:LPD3DXBUFFER*:ptr:1|DestFormat:D3DXIMAGE_FILEFORMAT:i32:1|pSrcSurface:LPDIRECT3DSURFACE9:ptr:1|pSrcPalette:const PALETTEENTRY*:ptr:1|pSrcRect:const RECT*:ptr:1"
@@ -473,7 +476,7 @@ public static class AbiMetadata
             if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxSave && !d3dxTexture && !d3dxTextureCreate && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntShutdown && !ntHeap && !ntHeapLock && !ntDelay && !internalProcess && !ntRegistryOpen && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntThreadOpen && !ntTerminateProcess && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntMemoryQuery && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
-                int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" or "D3DXVec2Transform" or "D3DXVec2TransformCoord" or "D3DXVec2TransformNormal" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" or "D3DXMatrixRotationX" or "D3DXMatrixRotationZ" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
+                int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" or "D3DXVec2Transform" or "D3DXVec2TransformCoord" or "D3DXVec2TransformNormal" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" or "D3DXMatrixRotationX" or "D3DXMatrixRotationZ" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, "D3DXMatrixTransformation2D" => 7, _ => 0 };
                 if (f[5].Split('|', StringSplitOptions.RemoveEmptyEntries).Length != expected)
                     throw new InvalidDataException("D3DX x86 stack contract changed: " + row);
                 string scalarDeclaration = f[1] switch {
@@ -483,6 +486,7 @@ public static class AbiMetadata
                     "D3DXMatrixRotationY" or "D3DXMatrixRotationX" or "D3DXMatrixRotationZ" => "pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1",
                     "D3DXMatrixPerspectiveFovLH" => "pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1",
                     "D3DXVec3CatmullRom" => "pOut:D3DXVECTOR3*:ptr:1|pV0:const D3DXVECTOR3*:ptr:1|pV1:const D3DXVECTOR3*:ptr:1|pV2:const D3DXVECTOR3*:ptr:1|pV3:const D3DXVECTOR3*:ptr:1|s:FLOAT:f32:1",
+                    "D3DXMatrixTransformation2D" => "pOut:D3DXMATRIX*:ptr:1|pScalingCenter:const D3DXVECTOR2*:ptr:1|ScalingRotation:FLOAT:f32:1|pScaling:const D3DXVECTOR2*:ptr:1|pRotationCenter:const D3DXVECTOR2*:ptr:1|Rotation:FLOAT:f32:1|pTranslation:const D3DXVECTOR2*:ptr:1",
                     _ => null
                 };
                 if (d3dxScalars && f[5] != scalarDeclaration)
@@ -579,7 +583,7 @@ public static class AbiMetadata
         if (sdkSupplement != null)
         {
             var seen = new HashSet<string>(com.Skip(1).Select(row => string.Join('\t', row.Split('\t').Take(2))));
-            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXBuffer"] = 0, ["ID3DXMatrixStack"] = 0, ["IDirectInputA"] = 0, ["IDirectInputW"] = 0, ["IDirectInputDeviceA"] = 0, ["IDirectInputDeviceW"] = 0, ["IDirectInputDevice2A"] = 0, ["IDirectInputDevice2W"] = 0 };
+            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXBuffer"] = 0, ["ID3DXMatrixStack"] = 0, ["ID3DXSprite"] = 0, ["IDirectInputA"] = 0, ["IDirectInputW"] = 0, ["IDirectInputDeviceA"] = 0, ["IDirectInputDeviceW"] = 0, ["IDirectInputDevice2A"] = 0, ["IDirectInputDevice2W"] = 0 };
             foreach (var row in File.ReadLines(Path.Combine(Path.GetDirectoryName(sdkSupplement), "sdk-com-input.tsv"))
                 .Where(line => line.Length != 0 && !line.StartsWith('#')))
             {
@@ -590,7 +594,7 @@ public static class AbiMetadata
                 foreach (var parameter in f[5].Split('|'))
                 {
                     var p = parameter.Split(':');
-                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : f[0] == "ID3DXMatrixStack" ? new[] { "ptr", "f32" }.Contains(p[2]) : f[0].StartsWith("IDirectInput", StringComparison.Ordinal) ? new[] { "ptr", "u32", "handle" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
+                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : f[0] == "ID3DXMatrixStack" ? new[] { "ptr", "f32" }.Contains(p[2]) : f[0] == "ID3DXSprite" ? new[] { "ptr", "u32" }.Contains(p[2]) : f[0].StartsWith("IDirectInput", StringComparison.Ordinal) ? new[] { "ptr", "u32", "handle" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
                         throw new InvalidDataException("Invalid SDK COM parameter: " + parameter);
                 }
                 if (!seen.Add(f[0] + "\t" + f[1]))
@@ -606,6 +610,8 @@ public static class AbiMetadata
                 throw new InvalidDataException("Incomplete SDK ID3DXBuffer vtable declarations");
             if (counts["ID3DXMatrixStack"] != 18)
                 throw new InvalidDataException("Incomplete SDK ID3DXMatrixStack vtable declarations");
+            if (counts["ID3DXSprite"] != 14)
+                throw new InvalidDataException("Incomplete SDK ID3DXSprite vtable declarations");
             if (counts["IDirectInputA"] != 8 || counts["IDirectInputW"] != 8
                 || counts["IDirectInputDeviceA"] != 18 || counts["IDirectInputDeviceW"] != 18
                 || counts["IDirectInputDevice2A"] != 27 || counts["IDirectInputDevice2W"] != 27)

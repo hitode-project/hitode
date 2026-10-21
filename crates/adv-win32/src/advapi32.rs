@@ -7,6 +7,7 @@ mod scm;
 pub(crate) mod token;
 
 mod legacy;
+mod random;
 mod system;
 
 use adv_abi::Registry;
@@ -508,6 +509,7 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     legacy::register(reg);
+    random::register(reg);
     groups::register(reg);
     identity::register(reg);
     scm::register(reg);

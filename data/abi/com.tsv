@@ -1179,6 +1179,20 @@ ID3DXMatrixStack	14	ScaleLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:
 ID3DXMatrixStack	15	Translate	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
 ID3DXMatrixStack	16	TranslateLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
 ID3DXMatrixStack	17	GetTop	ptr	D3DXMATRIX*	this:ID3DXMatrixStack*:ptr:1
+ID3DXSprite	0	QueryInterface	i32	HRESULT	this:ID3DXSprite*:ptr:1|iid:REFIID:ptr:1|ppv:LPVOID*:ptr:1
+ID3DXSprite	1	AddRef	u32	ULONG	this:ID3DXSprite*:ptr:1
+ID3DXSprite	2	Release	u32	ULONG	this:ID3DXSprite*:ptr:1
+ID3DXSprite	3	GetDevice	i32	HRESULT	this:ID3DXSprite*:ptr:1|ppDevice:LPDIRECT3DDEVICE9*:ptr:1
+ID3DXSprite	4	GetTransform	i32	HRESULT	this:ID3DXSprite*:ptr:1|pTransform:D3DXMATRIX*:ptr:1
+ID3DXSprite	5	SetTransform	i32	HRESULT	this:ID3DXSprite*:ptr:1|pTransform:const D3DXMATRIX*:ptr:1
+ID3DXSprite	6	SetWorldViewRH	i32	HRESULT	this:ID3DXSprite*:ptr:1|pWorld:const D3DXMATRIX*:ptr:1|pView:const D3DXMATRIX*:ptr:1
+ID3DXSprite	7	SetWorldViewLH	i32	HRESULT	this:ID3DXSprite*:ptr:1|pWorld:const D3DXMATRIX*:ptr:1|pView:const D3DXMATRIX*:ptr:1
+ID3DXSprite	8	Begin	i32	HRESULT	this:ID3DXSprite*:ptr:1|Flags:DWORD:u32:1
+ID3DXSprite	9	Draw	i32	HRESULT	this:ID3DXSprite*:ptr:1|pTexture:LPDIRECT3DTEXTURE9:ptr:1|pSrcRect:const RECT*:ptr:1|pCenter:const D3DXVECTOR3*:ptr:1|pPosition:const D3DXVECTOR3*:ptr:1|Color:D3DCOLOR:u32:1
+ID3DXSprite	10	Flush	i32	HRESULT	this:ID3DXSprite*:ptr:1
+ID3DXSprite	11	End	i32	HRESULT	this:ID3DXSprite*:ptr:1
+ID3DXSprite	12	OnLostDevice	i32	HRESULT	this:ID3DXSprite*:ptr:1
+ID3DXSprite	13	OnResetDevice	i32	HRESULT	this:ID3DXSprite*:ptr:1
 IDirectInputA	0	QueryInterface	i32	HRESULT	this:IDirectInputA*:ptr:1|riid:GUID*:ptr:1|ppvObj:void**:ptr:1
 IDirectInputA	1	AddRef	u32	ULONG	this:IDirectInputA*:ptr:1
 IDirectInputA	2	Release	u32	ULONG	this:IDirectInputA*:ptr:1

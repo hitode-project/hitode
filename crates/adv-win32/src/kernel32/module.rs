@@ -545,6 +545,23 @@ fn load_library_ex(env: &mut Env<'_>, name: String, file: Handle, flags: u32) ->
     match flags {
         0 => locked(env, move |env| load_library(env, name)),
         8 => locked(env, move |env| load_library_search(env, name, true)),
+        0x800 => {
+            // LOAD_LIBRARY_SEARCH_SYSTEM32: a bare name resolves in System32
+            // only, bypassing game-side proxies; an absolute path loads as is.
+            let normalized = name.replace('/', "\\");
+            let absolute = normalized.starts_with("\\\\")
+                || (normalized.as_bytes().get(1) == Some(&b':')
+                    && normalized.as_bytes().get(2) == Some(&b'\\'));
+            let name = if absolute {
+                name
+            } else if !normalized.contains('\\') {
+                format!("C:\\Windows\\system32\\{name}")
+            } else {
+                set_last_error(env, err::INVALID_PARAMETER);
+                return Outcome::Return(0);
+            };
+            locked(env, move |env| load_library(env, name))
+        }
         2 => locked(env, move |env| {
             // Raw resource views need file/section ownership, not LdrLoadDll.
             // Until that transport exists, never consume a live NT override.

@@ -81,6 +81,7 @@ impl Test {
             .collect();
         machine.cpu.write(DATA + 128, &wide).unwrap();
         machine.cpu.write(DATA + 256, b"owned.dll\0").unwrap();
+        machine.cpu.write(DATA + 320, b"kernel32.dll\0").unwrap();
         Self {
             machine,
             asm: Asm::new(CODE),
@@ -224,6 +225,24 @@ fn altered_failed_initializer_and_invalid_flag_combinations_leave_no_live_image(
     assert_eq!(test.value(combined_error), 87);
     assert_eq!(test.value(unknown), 0);
     assert_eq!(test.value(unknown_error), 50);
+}
+
+#[test]
+fn system32_search_loads_system_modules_and_skips_the_game_directory() {
+    let mut test = Test::new(false, false);
+    let system = test.call("LoadLibraryExA", &[DATA + 320, 0, 0x800]);
+    let handle = test.call("GetModuleHandleA", &[DATA + 320]);
+    let game = test.call("LoadLibraryExA", &[DATA + 256, 0, 0x800]);
+    let game_error = test.call("GetLastError", &[]);
+    let absolute = test.call("LoadLibraryExA", &[DATA, 0, 0x800]);
+    let initialized = test.count();
+    test.run();
+    assert_ne!(test.value(system), 0);
+    assert_eq!(test.value(system), test.value(handle));
+    assert_eq!(test.value(game), 0);
+    assert_eq!(test.value(game_error), 126);
+    assert_eq!(test.value(absolute), 0x500000);
+    assert_eq!(test.value(initialized), 1);
 }
 
 #[test]
