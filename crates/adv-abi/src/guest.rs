@@ -114,44 +114,58 @@ pub struct AnsiStr(pub GuestPtr<u8>);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WideStr(pub GuestPtr<u16>);
 
+/// Read units up to a terminator in page-bounded chunks. Each chunk is one
+/// permission check and one read; a failing chunk repeats unit by unit, so
+/// faults and their addresses match a unit-at-a-time scan exactly.
+fn read_terminated<T: bytemuck::Pod + PartialEq + Default>(
+    cpu: &dyn Guest,
+    start: GuestPtr<T>,
+    limit: usize,
+) -> Result<Vec<T>, MemFault> {
+    let width = core::mem::size_of::<T>();
+    let mut units = Vec::new();
+    let mut chunk = [T::default(); 64];
+    while units.len() < limit {
+        let index = u32::try_from(units.len()).map_err(|_| MemFault {
+            addr: start.addr(),
+            len: u32::MAX,
+        })?;
+        let p = start.offset(index)?;
+        let room = (0x1000 - (p.addr() as usize & 0xfff)) / width;
+        let n = room.min(chunk.len()).min(limit - units.len());
+        let chunk = &mut chunk[..n];
+        let whole = n != 0
+            && check_range(cpu, p.addr(), (n * width) as u32, Prot::READ).is_ok()
+            && cpu.read(p.addr(), bytemuck::cast_slice_mut(chunk)).is_ok();
+        if !whole {
+            // A unit that straddles a page, or any failure, takes the exact path.
+            let unit = p.read(cpu)?;
+            if unit == T::default() {
+                return Ok(units);
+            }
+            units.push(unit);
+            continue;
+        }
+        if let Some(end) = chunk.iter().position(|unit| *unit == T::default()) {
+            units.extend_from_slice(&chunk[..end]);
+            return Ok(units);
+        }
+        units.extend_from_slice(chunk);
+    }
+    Err(MemFault {
+        addr: start.addr(),
+        len: u32::try_from(limit.saturating_mul(width)).unwrap_or(u32::MAX),
+    })
+}
+
 impl AnsiStr {
     pub fn read(self, cpu: &dyn Guest, limit: usize) -> Result<Vec<u8>, MemFault> {
-        let mut bytes = Vec::new();
-        for i in 0..limit {
-            let p = self.0.offset(u32::try_from(i).map_err(|_| MemFault {
-                addr: self.0.addr(),
-                len: u32::MAX,
-            })?)?;
-            let byte = p.read(cpu)?;
-            if byte == 0 {
-                return Ok(bytes);
-            }
-            bytes.push(byte);
-        }
-        Err(MemFault {
-            addr: self.0.addr(),
-            len: u32::try_from(limit).unwrap_or(u32::MAX),
-        })
+        read_terminated(cpu, self.0, limit)
     }
 }
 impl WideStr {
     pub fn read(self, cpu: &dyn Guest, limit: usize) -> Result<Vec<u16>, MemFault> {
-        let mut units = Vec::new();
-        for i in 0..limit {
-            let p = self.0.offset(u32::try_from(i).map_err(|_| MemFault {
-                addr: self.0.addr(),
-                len: u32::MAX,
-            })?)?;
-            let unit = p.read(cpu)?;
-            if unit == 0 {
-                return Ok(units);
-            }
-            units.push(unit);
-        }
-        Err(MemFault {
-            addr: self.0.addr(),
-            len: u32::try_from(limit.saturating_mul(2)).unwrap_or(u32::MAX),
-        })
+        read_terminated(cpu, self.0, limit)
     }
 }
 
