@@ -14,7 +14,13 @@ const READ_ONLY: u32 = 0x420000;
 const UNMAPPED: u32 = 0x600000;
 const BUFFER: u32 = DATA + 0x800;
 const MARKER: u32 = 0x12345678;
-const DLLS: [&str; 3] = ["xinput9_1_0.dll", "xinput1_3.dll", "xinput1_4.dll"];
+const DLLS: [&str; 5] = [
+    "xinput1_1.dll",
+    "xinput1_2.dll",
+    "xinput9_1_0.dll",
+    "xinput1_3.dll",
+    "xinput1_4.dll",
+];
 
 fn registry() -> Registry {
     let mut registry = Registry::default();
@@ -33,7 +39,7 @@ fn absent_controllers<B: Backend>(cpu: B) {
         ),
     )
     .unwrap();
-    m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    m.cpu.map(CODE, 8192, Prot::RX).unwrap();
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(READ_ONLY, 4096, Prot::READ).unwrap();
     m.cpu.write(BUFFER, &[0xcd; 32]).unwrap();
@@ -42,7 +48,7 @@ fn absent_controllers<B: Backend>(cpu: B) {
     let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
     let mut code = Asm::new(CODE);
     code.bytes.extend_from_slice(&[0x89, 0xe0]); // mov eax, esp
-    code.mov_mem_eax(DATA + 0x700);
+    code.mov_mem_eax(DATA + 0xe00);
     let mut expected = Vec::new();
     for dll in DLLS {
         for name in ["XInputGetState", "XInputSetState", "XInputGetCapabilities"] {
@@ -73,19 +79,62 @@ fn absent_controllers<B: Backend>(cpu: B) {
                 expected.push(result);
             }
         }
+        let mut extra = Vec::new();
+        if dll != "xinput9_1_0.dll" {
+            let function = m.resolve_import(dll, "XInputEnable").unwrap();
+            code.push_imm(0).call(function).push_imm(1).call(function);
+        }
+        if matches!(dll, "xinput1_3.dll" | "xinput1_4.dll") {
+            extra.extend([
+                ("XInputGetBatteryInformation", vec![0, 0, BUFFER], 1167),
+                ("XInputGetBatteryInformation", vec![3, 2, READ_ONLY], 1167),
+                ("XInputGetBatteryInformation", vec![4, 0, BUFFER], 160),
+                ("XInputGetBatteryInformation", vec![0, 0, 0], 160),
+                ("XInputGetKeystroke", vec![255, 0, BUFFER], 1167),
+                ("XInputGetKeystroke", vec![0, 0, UNMAPPED], 1167),
+                ("XInputGetKeystroke", vec![4, 0, BUFFER], 160),
+                ("XInputGetKeystroke", vec![0, 1, BUFFER], 160),
+            ]);
+        }
+        if dll == "xinput1_4.dll" {
+            extra.extend([
+                (
+                    "XInputGetAudioDeviceIds",
+                    vec![0, BUFFER, BUFFER + 4, BUFFER + 8, BUFFER + 12],
+                    1167,
+                ),
+                ("XInputGetAudioDeviceIds", vec![0, 0, 0, 0, 0], 1167),
+                (
+                    "XInputGetAudioDeviceIds",
+                    vec![4, BUFFER, BUFFER + 4, BUFFER + 8, BUFFER + 12],
+                    160,
+                ),
+            ]);
+        }
+        for (name, args, result) in extra {
+            let function = m.resolve_import(dll, name).unwrap();
+            let address = DATA + expected.len() as u32 * 8;
+            code.push_imm(MARKER).call(set_error);
+            for arg in args.into_iter().rev() {
+                code.push_imm(arg);
+            }
+            code.call(function).mov_mem_eax(address);
+            code.call(get_error).mov_mem_eax(address + 4);
+            expected.push(result);
+        }
     }
     code.bytes.extend_from_slice(&[0x89, 0xe0]);
-    code.mov_mem_eax(DATA + 0x704);
+    code.mov_mem_eax(DATA + 0xe04);
     code.bytes.extend_from_slice(&[0x31, 0xc0]);
     code.ret();
-    assert!(code.bytes.len() <= 4096);
+    assert!(code.bytes.len() <= 8192);
     m.cpu.write(CODE, &code.bytes).unwrap();
     m.spawn("absent controllers", CODE, &[], 65536).unwrap();
     let result = m.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     assert_eq!(
-        m.cpu.read_u32(DATA + 0x700).unwrap(),
-        m.cpu.read_u32(DATA + 0x704).unwrap(),
+        m.cpu.read_u32(DATA + 0xe00).unwrap(),
+        m.cpu.read_u32(DATA + 0xe04).unwrap(),
         "typed x86 stdcall adapters balance the stack"
     );
     for (index, result) in expected.into_iter().enumerate() {
@@ -150,6 +199,6 @@ fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
         );
         assert!(registry.dynamic_available("xinput1_4.dll", ordinal));
     }
-    assert!(!registry.dynamic_available("xinput1_3.dll", "XInputGetKeystroke"));
+    assert!(registry.dynamic_available("xinput1_3.dll", "XInputGetKeystroke"));
     assert!(registry.signature_conflicts().is_empty());
 }

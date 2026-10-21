@@ -1,24 +1,34 @@
 //! XInput for the shared input profile with no configured game controllers.
-use adv_abi::{GuestPtr, Registry, win32};
+use adv_abi::{GuestPtr, Registry, WideStr, win32};
 use adv_machine::Env;
 
 const ERROR_BAD_ARGUMENTS: u32 = 160;
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
 
 pub fn register(registry: &mut Registry) {
-    for api in [
-        get_state_9_ABI,
-        set_state_9_ABI,
-        get_capabilities_9_ABI,
-        get_state_13_ABI,
-        set_state_13_ABI,
-        get_capabilities_13_ABI,
-        get_state_14_ABI,
-        set_state_14_ABI,
-        get_capabilities_14_ABI,
+    for module in [
+        "xinput1_1.dll",
+        "xinput1_2.dll",
+        "xinput1_3.dll",
+        "xinput1_4.dll",
+        "xinput9_1_0.dll",
     ] {
-        registry.register(api);
+        for api in [get_state_ABI, set_state_ABI, get_capabilities_ABI] {
+            registry.register(adv_abi::Api { module, ..api });
+        }
+        if module != "xinput9_1_0.dll" {
+            registry.register(adv_abi::Api {
+                module,
+                ..enable_ABI
+            });
+        }
+        if matches!(module, "xinput1_3.dll" | "xinput1_4.dll") {
+            for api in [battery_ABI, keystroke_ABI] {
+                registry.register(adv_abi::Api { module, ..api });
+            }
+        }
     }
+    registry.register(audio_ABI);
 }
 
 /// Native checks the slot and NULL pointer before looking for a device. With
@@ -32,49 +42,49 @@ fn disconnected(index: u32, flags: u32, pointer: GuestPtr<()>) -> u32 {
     }
 }
 
-#[win32(xinput9_1_0, name = "XInputGetState", level = safe_fail)]
-fn get_state_9(_env: &mut Env<'_>, index: u32, output: GuestPtr<()>) -> u32 {
-    disconnected(index, 0, output)
-}
-
-#[win32(xinput9_1_0, name = "XInputSetState", level = safe_fail)]
-fn set_state_9(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
-    disconnected(index, 0, vibration)
-}
-
-#[win32(xinput9_1_0, name = "XInputGetCapabilities", level = safe_fail)]
-fn get_capabilities_9(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
-    // The legacy fixed capabilities apply to connected devices, not a
-    // fabricated controller. The absent-device native result is still 1167.
-    disconnected(index, flags, output)
-}
-
-#[win32(xinput1_3, name = "XInputGetState", level = safe_fail)]
-fn get_state_13(_env: &mut Env<'_>, index: u32, output: GuestPtr<()>) -> u32 {
-    disconnected(index, 0, output)
-}
-
-#[win32(xinput1_3, name = "XInputSetState", level = safe_fail)]
-fn set_state_13(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
-    disconnected(index, 0, vibration)
-}
-
-#[win32(xinput1_3, name = "XInputGetCapabilities", level = safe_fail)]
-fn get_capabilities_13(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
-    disconnected(index, flags, output)
-}
-
 #[win32(xinput1_4, name = "XInputGetState", level = safe_fail)]
-fn get_state_14(_env: &mut Env<'_>, index: u32, output: GuestPtr<()>) -> u32 {
+fn get_state(_env: &mut Env<'_>, index: u32, output: GuestPtr<()>) -> u32 {
     disconnected(index, 0, output)
 }
 
 #[win32(xinput1_4, name = "XInputSetState", level = safe_fail)]
-fn set_state_14(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
+fn set_state(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
     disconnected(index, 0, vibration)
 }
 
 #[win32(xinput1_4, name = "XInputGetCapabilities", level = safe_fail)]
-fn get_capabilities_14(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
+fn get_capabilities(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
     disconnected(index, flags, output)
+}
+
+#[win32(xinput1_4, name = "XInputEnable", level = implement)]
+fn enable(_env: &mut Env<'_>, _enabled: i32) {
+    // With no configured devices there is no vibration or input stream to mute.
+}
+
+#[win32(xinput1_4, name = "XInputGetBatteryInformation", level = safe_fail)]
+fn battery(_env: &mut Env<'_>, index: u32, device: u32, output: GuestPtr<()>) -> u32 {
+    disconnected(index, u32::from(!matches!(device, 0 | 2)) * 2, output)
+}
+
+#[win32(xinput1_4, name = "XInputGetKeystroke", level = safe_fail)]
+fn keystroke(_env: &mut Env<'_>, index: u32, reserved: u32, output: GuestPtr<()>) -> u32 {
+    let index = if index == 255 { 0 } else { index }; // XUSER_INDEX_ANY
+    disconnected(index, u32::from(reserved != 0) * 2, output)
+}
+
+#[win32(xinput1_4, name = "XInputGetAudioDeviceIds", level = safe_fail)]
+fn audio(
+    _env: &mut Env<'_>,
+    index: u32,
+    _render: WideStr,
+    _render_count: GuestPtr<u32>,
+    _capture: WideStr,
+    _capture_count: GuestPtr<u32>,
+) -> u32 {
+    if index >= 4 {
+        ERROR_BAD_ARGUMENTS
+    } else {
+        ERROR_DEVICE_NOT_CONNECTED
+    }
 }

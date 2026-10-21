@@ -289,7 +289,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-API-2 Absent controllers
 
-**Rule**: XInput 9.1.0, 1.3, and 1.4 MUST report no configured controller without modifying output buffers. Named and supported ordinal entries MUST share identity.
+**Rule**: XInput 1.1, 1.2, 1.3, 1.4, and 9.1.0 MUST report no configured controller without modifying output buffers. Named and supported ordinal entries MUST share identity.
 **Verification**: Test
 
 ### WIN32-API-3 Directory notifications
