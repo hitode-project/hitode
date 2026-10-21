@@ -224,3 +224,38 @@ fn pctype_actual_cdecl_getter_eof_bias_and512byte_copy_run_in_interpreter_and_ji
     guest_table(UnicornCpu::new(PARK_ADDR).unwrap());
     guest_table(JitCpu::new(PARK_ADDR, false).unwrap());
 }
+
+fn guest_string_type<B: Backend>(cpu: B) {
+    let mut machine = machine(cpu);
+    let classify = machine
+        .resolve_import(MODULE, "__crtGetStringTypeW")
+        .unwrap();
+    machine.cpu.write(DATA, &[0x41, 0, 0x00, 0x30]).unwrap();
+    let mut code = Asm::new(CODE);
+    // One-character CT_CTYPE1 query with page and LCID, as libcpmt passes them.
+    for (character, mask) in [(DATA, DATA + 8), (DATA + 2, DATA + 10)] {
+        code.push_imm(0x411)
+            .push_imm(932)
+            .push_imm(mask)
+            .push_imm(1)
+            .push_imm(character)
+            .push_imm(1)
+            .push_imm(0)
+            .call(classify)
+            .add_esp(28);
+    }
+    code.ret();
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine
+        .spawn("CRT wide string type", CODE, &[], 65536)
+        .unwrap();
+    let result = machine.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(1)), "{result:?}");
+    // C1_UPPER|C1_XDIGIT|C1_ALPHA|C1_DEFINED, then C1_SPACE|C1_BLANK|C1_DEFINED.
+    assert_eq!(machine.cpu.read_u32(DATA + 8).unwrap(), 0x0248_0381);
+}
+#[test]
+fn crt_string_type_w_is_a_seven_argument_cdecl_ctype1_query_in_interpreter_and_jit() {
+    guest_string_type(UnicornCpu::new(PARK_ADDR).unwrap());
+    guest_string_type(JitCpu::new(PARK_ADDR, false).unwrap());
+}

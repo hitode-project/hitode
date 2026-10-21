@@ -109,6 +109,19 @@ pub(super) fn lowercase_bytes(codepage: u32) -> Option<[u8; 256]> {
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_ABI);
+    // Statically linked C++ library code classifies wide characters through
+    // this internal export: BOOL __cdecl (_locale_t, DWORD type, LPCWSTR,
+    // int count, LPWORD types, int codepage, LCID). The locale, code page and
+    // LCID serve only the pre-NT GetStringTypeA fallback.
+    registry.add(
+        "msvcr90.dll",
+        "__crtGetStringTypeW",
+        Conv::Cdecl { argc: 7 },
+        |env| {
+            let (ty, source, count, types) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+            crate::kernel32::string_type_w(env, ty, source, count as i32, types)
+        },
+    );
     for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
         for api in [
             lower_ABI,
