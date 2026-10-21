@@ -67,19 +67,18 @@ offsets against the installed x86 SDK in addition to the generated assertions.
 
 ## Selected legacy exports and DLL aliases
 
-The pinned WinMD selectively projects the DbgHelp declaration and ImageHlp alias of `MakeSureDirectoryPathExists`, without expanding either DLL's scope beyond those exports.
+DbgHelp is projected in full; ImageHlp retains only the `MakeSureDirectoryPathExists` alias.
 Both share an ANSI directory API front end; `SHCreateDirectoryExW` in the metadata provides the Unicode counterpart.
 
-`data/abi/selected-exports.tsv` projects only six existing legacy registrations
-outside the DLL scope: `mpr.dll!WNetGetUniversalNameA/W`,
-`ntdll.dll!RtlFreeUnicodeString/RtlInitUnicodeString`, and
-`shfolder.dll!SHGetFolderPathA/W`. The first four use the same pinned WinMD;
-the Shfolder aliases inherit the complete existing Shell32 SDK declarations.
-The selection input contains names and expected x86 stack widths, never copied
-parameter or return signatures. It does not add MPR or NTDLL to the full DLL scope.
+`data/abi/selected-exports.tsv` projects explicit legacy registrations and DLL
+aliases from the same pinned WinMD. The input names source and destination
+exports and expected x86 stack widths, never copied parameter or return layouts.
+NTDLL stays outside the full DLL scope; its selected declarations coexist with
+existing checked SDK supplements and native registrations. MPR and DbgHelp are
+projected in full, while Shfolder and ImageHlp retain selected aliases.
 Missing source declarations, changed stdcall stack widths, duplicate selections
 and conflicting aliases stop generation. `tools/abi/test-selected-exports.ps1`
-checks these failures and prevents widening the three DLLs beyond the selected names.
+checks these failures, complete alias equivalence, and selected-only namespaces.
 
 `RtlFormatCurrentUserKeyPath` is absent from the pinned WinMD. Its existing
 registration cannot be projected from that source by inventing a declaration.
@@ -121,6 +120,14 @@ EUDC font linking explicitly; tests never alter the native desktop's EUDC state.
 which are also absent from the pinned WinMD. `sdk-com-source.json` records the
 installed `um/dxdiag.h` header hash. These declarations merge into the same
 `com.tsv`; the generator rejects duplicate, reordered or incomplete slots.
+
+The system-service scope in `modules.txt` additionally projects PSAPI, MPR, MSI,
+NetAPI32, WinHTTP, UrlMon, IP Helper, SetupAPI, DbgHelp, UserEnv, Crypt32 and RPC.
+The pinned WinMD attributes canonical XInput declarations to 1.4 and Winsock
+functions to Ws2_32. Selected legacy XInput and Wsock32 exports reuse those
+complete declarations; Wsock32 names are matched against the existing SDK
+ordinal-import catalog. Signatures describe ABI availability, not implemented
+behavior; coverage continues to report unresolved implementations.
 
 ## CRT export catalog
 
@@ -193,6 +200,8 @@ not host floating-control instructions. Modern `__control87_2` is not invented
 for the system MSVCRT profile, whose native export is absent on the oracle host.
 SDK prototypes establish ABI; authored MSVCRT/UCRT comparisons establish the
 selected behavior contract, not every historic VC runtime DLL revision.
+
+The existing `pow` and `_hypot` declarations retain two binary64 arguments and a binary64 return; their exact whitelist rejects changed stack widths.
 
 An API has one behavior function:
 
