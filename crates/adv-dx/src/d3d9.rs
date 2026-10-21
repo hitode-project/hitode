@@ -221,6 +221,31 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
         frames: state.frames,
     }
 }
+/// Upload bytes snapshotted when the upload was recorded.
+#[derive(Clone)]
+enum Pixels {
+    Host(Arc<Vec<u8>>),
+    /// GPU staging memory and the content hash of the rows written to it.
+    Staged(Arc<adv_device::gpu::Staged>, u64),
+}
+impl Pixels {
+    fn len(&self) -> usize {
+        match self {
+            Self::Host(pixels) => pixels.len(),
+            Self::Staged(staged, _) => staged.len(),
+        }
+    }
+}
+/// Recording keys identify uploads by content.
+impl std::hash::Hash for Pixels {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Host(pixels) => pixels.as_slice().hash(state),
+            Self::Staged(_, digest) => digest.hash(state),
+        }
+    }
+}
+
 // Keep ordinary hot commands inline. Only a parked command requires allocation.
 #[allow(clippy::large_enum_variant)]
 enum Operation {
@@ -242,7 +267,7 @@ enum Operation {
         resource: Id,
         level: Option<u32>,
         target: Target,
-        pixels: Arc<Vec<u8>>,
+        pixels: Pixels,
         pitch: u32,
         rectangle: adv_device::surface::Rect,
     },
@@ -1316,9 +1341,11 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             pixels,
             pitch,
             rectangle,
-        } => gpu
-            .upload(&target.image, *rectangle, *pitch, pixels)
-            .map(|()| Completion::Command),
+        } => match pixels {
+            Pixels::Host(pixels) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
+            Pixels::Staged(staged, _) => gpu.upload_staged(&target.image, *rectangle, staged),
+        }
+        .map(|()| Completion::Command),
         Operation::Draw(draw) => {
             let result = if let Some(program) = &draw.programmable {
                 gpu.draw_programmable(&draw.target, program, &draw.state)

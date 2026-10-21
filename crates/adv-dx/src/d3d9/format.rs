@@ -1,4 +1,7 @@
 //! SDK guest pixel layouts over the shared BGRA8 GPU image representation.
+use std::sync::Arc;
+
+use adv_machine::Env;
 // D3DFORMAT names run from the most significant channel to the least:
 // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat
 
@@ -19,6 +22,61 @@ pub(super) fn length(format: u32, width: u32, height: u32) -> Option<u32> {
     pitch(format, width)?
         .checked_mul(height)
         .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
+}
+
+/// Snapshot guest rows for an upload. BGRA formats go straight into GPU staging
+/// memory, their one CPU copy; others convert through host memory. The caller
+/// has checked that `height` rows of `pitch` bytes are readable at `address`.
+pub(super) fn snapshot(
+    env: &Env<'_>,
+    format: u32,
+    address: u32,
+    pitch: u32,
+    width: u32,
+    height: u32,
+) -> Option<(super::Pixels, u32)> {
+    let gpu = env.ext.get::<super::State>().gpu.as_ref();
+    if let (21 | 22, Some(gpu)) = (format, gpu) {
+        let mut digest = xxhash_rust::xxh3::Xxh3::new();
+        let mut scratch = vec![0; width as usize * 4];
+        let staged = gpu.stage(width, height, |write| {
+            for y in 0..height {
+                let at = address + y * pitch;
+                let row = match env.cpu.shared_bytes(at, scratch.len()) {
+                    Some(row) if format == 21 => row,
+                    shared => {
+                        match shared {
+                            Some(row) => scratch.copy_from_slice(row),
+                            None => env.cpu.read(at, &mut scratch).map_err(drop)?,
+                        }
+                        if format == 22 {
+                            scratch
+                                .as_chunks_mut::<4>()
+                                .0
+                                .iter_mut()
+                                .for_each(|texel| texel[3] = 255);
+                        }
+                        &scratch
+                    }
+                };
+                digest.update(row);
+                write(y, row);
+            }
+            Ok::<(), ()>(())
+        });
+        if let Ok(Ok(staged)) = staged {
+            let pitch = staged.pitch();
+            return Some((
+                super::Pixels::Staged(Arc::new(staged), digest.digest()),
+                pitch,
+            ));
+        }
+    }
+    let row = self::pitch(format, width)?;
+    let mut pixels = vec![0; ((height - 1) * pitch + row) as usize];
+    env.cpu.read(address, &mut pixels).ok()?;
+    let (pixels, pitch) = upload(format, pixels, pitch, width, height)?;
+    Some((super::Pixels::Host(Arc::new(pixels)), pitch))
 }
 
 /// The GPU receives BGRA8, while a packed texture retains its actual SDK bytes.

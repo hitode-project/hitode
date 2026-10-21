@@ -262,6 +262,11 @@ snapshot storage; an unchanged Apply performs no state writes.
 **Rule**: Draws MUST sample a CPU-locked texture's last unlocked GPU contents instead of failing. DC leases and pending texture transfers MUST still reject sampling.
 **Verification**: Test
 
+### GFX-SAMPLER-4 Staged uploads
+
+**Rule**: Unlocked 32-bit BGRA pixels MUST be copied from guest memory once, straight into GPU staging memory, and reach the texture by a GPU copy. Staging buffers MUST return to a bounded per-device pool after the GPU has read them.
+**Verification**: Test
+
 ## Bounded buffers
 
 ### GFX-BUFFER-1 Constant layout

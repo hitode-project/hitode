@@ -128,11 +128,8 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
-    let mut pixels = vec![0; size as usize];
-    if env.cpu.read(address, &mut pixels).is_err() {
-        return Outcome::Return(INVALID);
-    }
-    let Some((pixels, pitch)) = format::upload(format, pixels, pitch, rectangle.w, rectangle.h)
+    let Some((pixels, pitch)) =
+        format::snapshot(env, format, address, pitch, rectangle.w, rectangle.h)
     else {
         return Outcome::Return(INVALID);
     };
@@ -153,7 +150,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
             resource: id,
             level: Some(index),
             target,
-            pixels: Arc::new(pixels),
+            pixels,
             pitch,
             rectangle,
         },

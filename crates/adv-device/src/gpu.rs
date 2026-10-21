@@ -20,7 +20,7 @@ pub use programmable::{
 pub use renderer::DisplayCompletion;
 pub use renderer::Submission;
 pub use renderer::validate_program;
-pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
+pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Staged, Target};
 pub use submission::SubmissionPause;
 #[derive(Clone, Copy, Debug)]
 pub enum GpuBackend {
