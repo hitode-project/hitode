@@ -338,7 +338,10 @@ impl Ui {
         for event in events {
             match &event {
                 window::Event::Input {
-                    message, wparam, ..
+                    message,
+                    wparam,
+                    lparam,
+                    ..
                 } => {
                     #[cfg(mobile)]
                     let update =
@@ -346,7 +349,7 @@ impl Ui {
                     #[cfg(not(mobile))]
                     let update = true;
                     if update {
-                        update_keys(&self.keys, *message, *wparam);
+                        update_keys(&self.keys, *message, *wparam, *lparam);
                     }
                 }
                 window::Event::FocusLost | window::Event::Close => self.keys.release_all(),
@@ -653,10 +656,15 @@ impl Drop for Ui {
         self.execution_wake.signal();
     }
 }
-pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
+pub fn update_keys(keys: &KeyState, message: u32, key: u32, lparam: u32) {
     match message {
-        0x100 | 0x104 => keys.set(key, true),
-        0x101 | 0x105 => keys.set(key, false),
+        0x100 | 0x101 | 0x104 | 0x105 => {
+            let pressed = message & 1 == 0;
+            keys.set(key, pressed);
+            if let Some(side) = adv_os::keyboard::side_virtual_key(key, lparam) {
+                keys.set(side, pressed);
+            }
+        }
         0x201 => keys.set(1, true),
         0x202 => keys.set(1, false),
         0x204 => keys.set(2, true),
@@ -863,5 +871,24 @@ mod tests {
         assert_eq!(ui.events.borrow().available(), INPUT_CAPACITY);
         ui.metric(Delivery::Present(10000, Duration::ZERO, Instant::now()));
         assert_eq!(ui.events.borrow().available(), INPUT_CAPACITY - 1);
+    }
+    // spec: PERS-SCOPE-10
+    #[test]
+    fn modifier_messages_press_the_generic_and_side_keys() {
+        let keys = KeyState::default();
+        update_keys(&keys, 0x100, 0x11, 0x001d_0001);
+        update_keys(&keys, 0x104, 0x12, 0x0138_0001);
+        update_keys(&keys, 0x100, 0x10, 0x0036_0001);
+        for key in [0x10, 0x11, 0x12, 0xa1, 0xa2, 0xa5] {
+            assert_eq!(keys.get(key) & 0x80, 0x80, "{key:#x}");
+        }
+        for key in [0xa0, 0xa3, 0xa4] {
+            assert_eq!(keys.get(key), 0, "{key:#x}");
+        }
+        update_keys(&keys, 0x101, 0x11, 0xc01d_0001);
+        assert_eq!(keys.get(0x11) | keys.get(0xa2), 0);
+        // Mouse button state flags never alias modifier keys.
+        update_keys(&keys, 0x201, 0x10, 0);
+        assert_eq!(keys.get(0xa0), 0);
     }
 }

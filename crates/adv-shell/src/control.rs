@@ -568,8 +568,12 @@ impl Control {
                         Command::MouseUp(..) => keys.set(1, false),
                         Command::RightMouseDown(..) => keys.set(2, true),
                         Command::RightMouseUp(..) => keys.set(2, false),
-                        Command::KeyDown(key) => keys.set(*key, true),
-                        Command::KeyUp(key) => keys.set(*key, false),
+                        Command::KeyDown(key) => {
+                            crate::frontend::update_keys(&keys, 0x100, *key, 1)
+                        }
+                        Command::KeyUp(key) => {
+                            crate::frontend::update_keys(&keys, 0x101, *key, 0xc000_0001)
+                        }
                         Command::Close => keys.release_all(),
                         _ => {}
                     }

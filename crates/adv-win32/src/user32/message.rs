@@ -160,6 +160,8 @@ pub struct Msg {
 #[derive(Clone, Copy, Debug)]
 pub struct KeyTransition {
     pub key: u8,
+    /// Left or right key behind a generic Shift, Ctrl or Alt transition.
+    pub side: Option<u8>,
     pub pressed: bool,
     pub toggle: bool,
 }
@@ -181,6 +183,10 @@ fn key_transition(message: u32, wparam: u32, lparam: u32) -> Option<KeyTransitio
     };
     Some(KeyTransition {
         key,
+        side: matches!(message, 0x100 | 0x101 | 0x104 | 0x105)
+            .then(|| adv_os::keyboard::side_virtual_key(wparam, lparam))
+            .flatten()
+            .map(|side| side as u8),
         pressed,
         // Only the first keyboard down toggles; autorepeat has bit 30 set.
         toggle: pressed && matches!(key, 0x14 | 0x90 | 0x91) && lparam & (1 << 30) == 0,
@@ -1078,6 +1084,10 @@ fn next_message_inner(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg>
             let previous = q.keyboard.0[key.key as usize];
             q.keyboard.0[key.key as usize] =
                 ((previous & 1) ^ u8::from(key.toggle)) | if key.pressed { 0x80 } else { 0 };
+            if let Some(side) = key.side {
+                let previous = q.keyboard.0[side as usize];
+                q.keyboard.0[side as usize] = (previous & 1) | if key.pressed { 0x80 } else { 0 };
+            }
         }
         if remove
             && m.input_receipt != 0

@@ -204,6 +204,43 @@ fn system_keys_and_repeats_toggle_caps_num_scroll_once_per_initial_down() {
 }
 
 #[test]
+// spec: PERS-SCOPE-10
+fn queued_modifiers_update_their_side_keys_for_synchronous_queries() {
+    let (mut machine, _, _) = fixture();
+    assert!(post_input(
+        &mut env(&mut machine),
+        0,
+        0x100,
+        0x11,
+        0x011d_0001
+    ));
+    assert!(post_input(
+        &mut env(&mut machine),
+        0,
+        0x100,
+        0x10,
+        0x0036_0001
+    ));
+    assert_eq!(key(&mut machine, 0xa3, false), 0);
+    next(&mut machine, true);
+    next(&mut machine, true);
+    for vk in [0x10, 0x11, 0xa1, 0xa3] {
+        assert_eq!(key(&mut machine, vk, false), 0xffff_8000, "{vk:#x}");
+    }
+    assert_eq!(key(&mut machine, 0xa0, false), 0);
+    assert_eq!(key(&mut machine, 0xa2, false), 0);
+    assert!(post_input(
+        &mut env(&mut machine),
+        0,
+        0x101,
+        0x11,
+        0xc11d_0001
+    ));
+    next(&mut machine, true);
+    assert_eq!(key(&mut machine, 0xa3, false), 0);
+}
+
+#[test]
 fn swapped_mouse_queue_keys_are_logical_while_async_buttons_remain_physical() {
     let (mut machine, memory, live) = fixture();
     let window = machine.ext.get::<Win32>().user.desktop;
