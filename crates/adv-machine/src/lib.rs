@@ -2220,6 +2220,7 @@ impl<B: Backend> Machine<B> {
                     );
                     diagnostics.wake(id, WakeReason::Timeout, now);
                 }
+                let site = origin.ret_eip;
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Woke {
                         then,
@@ -2228,7 +2229,7 @@ impl<B: Backend> Machine<B> {
                     }),
                 };
                 ctx.yielded = true;
-                ctx.progress.yielded();
+                ctx.progress.yielded(site);
                 self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::Block {
@@ -2685,11 +2686,14 @@ impl<B: Backend> Machine<B> {
                 // recheck deadlines/watchdog, without forcing a host handoff.
                 defer_work: latency_mode,
             };
+            let retired_before = self.cpu.retired_instructions();
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
             let run_elapsed = run_started.elapsed();
+            let retired = self.cpu.retired_instructions() - retired_before;
             if let Some(c) = self.sys.contexts.get_mut(id as usize) {
                 c.spin.ran(run_elapsed);
+                c.progress.ran(retired);
             }
             if self.sys.schedule_trace.enabled() {
                 self.sys.schedule_trace.event(

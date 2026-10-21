@@ -70,7 +70,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 
 ### PROC-CLOCK-5 Productive polling
 
-**Rule**: A real-time polling round MAY wait only after every ready context repeated earlier host-call sequences between its last four yields. A context doing new work between yields MUST run again without a host wait.
+**Rule**: A real-time polling round MAY wait only after every ready context repeated earlier yield intervals 64 times running. An interval is its host calls, completed guest instructions and yield site. A context doing new work between yields MUST run again without a host wait.
 **Verification**: Test
 
 ### PROC-CLOCK-6 Timer ticks

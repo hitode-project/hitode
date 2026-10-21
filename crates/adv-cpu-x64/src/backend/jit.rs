@@ -8,11 +8,16 @@ use crate::{
 };
 use std::time::{Duration, Instant};
 
+/// Instructions one executor call may complete before the run loop rechecks.
+const FUEL: u64 = 32_768;
+
 pub struct JitCpu {
     inner: Executor,
     park: u32,
     budget: Option<Duration>,
     jit: bool,
+    /// Guest instructions completed by finished runs.
+    retired: u64,
     /// Startup artifact directory saved by `Engine::persist`.
     artifacts: Option<std::path::PathBuf>,
 }
@@ -47,6 +52,7 @@ impl JitCpu {
             park,
             budget: Some(Duration::from_secs(5)),
             jit,
+            retired: 0,
             artifacts: None,
         })
     }
@@ -535,7 +541,8 @@ impl Backend for JitCpu {
                 handler,
                 code_images: m.code_image_sink(),
             };
-            let result = m.run_with_traps(self.park, 32_768, &mut raw, !self.jit);
+            let result = m.run_with_traps(self.park, FUEL, &mut raw, !self.jit);
+            self.retired += FUEL - m.state.fuel;
             match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;
@@ -575,6 +582,9 @@ impl Backend for JitCpu {
                 }
             }
         }
+    }
+    fn retired_instructions(&self) -> u64 {
+        self.retired
     }
     fn invalidate_code(&mut self, addr: u32, len: u32) {
         let m = &mut self.inner;
