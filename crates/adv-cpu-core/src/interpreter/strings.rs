@@ -59,18 +59,40 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
             let Some(src) = memory.direct(source, len, false) else {
                 return 0;
             };
-            // Overlapping REP copies propagate each preceding element. A memcpy
-            // or memmove snapshot would change this, including distinct file views.
-            if u64::from(source) < u64::from(destination) + len as u64
-                && u64::from(destination) < u64::from(source) + len as u64
-                || memory.rep_alias_hazard(source, destination, len)
+            if memory.rep_alias_hazard(source, destination, len) {
+                return 0;
+            }
+            let overlap = u64::from(source) < u64::from(destination) + len as u64
+                && u64::from(destination) < u64::from(source) + len as u64;
+            // Overlapping REP copies propagate each preceding element. A forward
+            // copy toward lower addresses reads only unwritten bytes, as memmove
+            // does; toward higher addresses, element-aligned runs of the
+            // distance repeat the pattern exactly. Both ranges are page-local
+            // and overlap, so they share one page and its host storage.
+            let distance = destination.wrapping_sub(source) as usize;
+            if overlap
+                && (reverse || (distance != 0 && distance < len && distance < width as usize))
             {
                 return 0;
             }
             // SAFETY: direct() validated both complete ordinary ranges, and the
-            // overlap/alias checks exclude physically overlapping storage. The
+            // alias check excludes distinct views of the same storage. The
             // exclusive Memory borrow keeps mappings and permissions unchanged.
-            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            unsafe {
+                if !overlap {
+                    std::ptr::copy_nonoverlapping(src, dst, len);
+                } else if destination <= source {
+                    std::ptr::copy(src, dst, len);
+                } else {
+                    let run = distance / width as usize * width as usize;
+                    let mut done = 0;
+                    while done < len {
+                        let n = run.min(len - done);
+                        std::ptr::copy_nonoverlapping(src.add(done), dst.add(done), n);
+                        done += n;
+                    }
+                }
+            }
         }
         Some(dst) => {
             let value = state.regs[0];
@@ -324,7 +346,11 @@ mod tests {
                                 (0x2ffb, 0x4ff9),
                                 (0x3002, 0x4001),
                                 (0x2800, 0x2801),
+                                (0x2800, 0x2803),
+                                (0x2800, 0x2804),
+                                (0x2800, 0x2808),
                                 (0x2803, 0x2800),
+                                (0x2806, 0x2800),
                                 (0xfffd, 0x8ffd),
                                 (0, 0x8000),
                             ] {
