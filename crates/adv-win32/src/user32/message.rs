@@ -116,7 +116,7 @@ pub(super) fn write_text(
     Some(length)
 }
 
-pub(super) fn guest_text(env: &mut Env<'_>, text: &str, wide: bool) -> u32 {
+pub(crate) fn guest_text(env: &mut Env<'_>, text: &str, wide: bool) -> u32 {
     let length = text_length(env, text, wide) + 1;
     let pointer = window::temp_alloc(env, length * if wide { 2 } else { 1 });
     if pointer != 0 && write_text(env, pointer, length, text, wide).is_none() {

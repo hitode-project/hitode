@@ -118,3 +118,6 @@ d3dx9_29.dll	D3DXMatrixRotationZ	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|
 d3dx9_29.dll	D3DXVec2Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR2*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_29.dll	D3DXVec2TransformCoord	stdcall	ptr	D3DXVECTOR2*	pOut:D3DXVECTOR2*:ptr:1|pV:const D3DXVECTOR2*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_29.dll	D3DXVec2TransformNormal	stdcall	ptr	D3DXVECTOR2*	pOut:D3DXVECTOR2*:ptr:1|pV:const D3DXVECTOR2*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+msvfw32.dll	MCIWndCreateA	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:Windows.Win32.Foundation.HWND:handle:1|hInstance:Windows.Win32.Foundation.HINSTANCE:handle:1|dwStyle:u32:u32:1|szFile:Windows.Win32.Foundation.PCSTR:str8:1
+msvfw32.dll	MCIWndCreateW	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:Windows.Win32.Foundation.HWND:handle:1|hInstance:Windows.Win32.Foundation.HINSTANCE:handle:1|dwStyle:u32:u32:1|szFile:Windows.Win32.Foundation.PCWSTR:str16:1
+msvfw32.dll	MCIWndRegisterClass	cdecl	i32	Windows.Win32.Foundation.BOOL	

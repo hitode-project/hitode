@@ -438,5 +438,21 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatesprite",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtransformation2d"
     ]
+  },
+  "mciwnd": {
+    "scope": "MCIWndCreateA/W and MCIWndRegisterClass; MCIWnd macros use USER messages",
+    "source": "Microsoft Learn and Microsoft Win32Metadata RecompiledIdlHeaders/um/Vfw.h",
+    "declarations": [
+      "HWND VFWAPIV MCIWndCreateA(HWND hwndParent, HINSTANCE hInstance, DWORD dwStyle, LPCSTR szFile);",
+      "HWND VFWAPIV MCIWndCreateW(HWND hwndParent, HINSTANCE hInstance, DWORD dwStyle, LPCWSTR szFile);",
+      "BOOL VFWAPIV MCIWndRegisterClass(void);"
+    ],
+    "calling_convention": "VFWAPIV is WINAPIV (__cdecl on x86); Create has four 32-bit arguments; RegisterClass has none",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-mciwndcreatea",
+      "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-mciwndcreatew",
+      "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-mciwndregisterclass",
+      "https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/Vfw.h"
+    ]
   }
 }

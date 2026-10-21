@@ -101,11 +101,13 @@ The generator accepts only these exact declarations, sourced in `sdk-source.json
 `selected-exports.tsv` projects only `DwmSetWindowAttribute` from the pinned WinMD without expanding DWM's DLL scope.
 Three OpenMP compiler-runtime entries are absent from WinMD; audits verify their cdecl/variadic conventions separately against Wine declarations and repository-owned native fixtures.
 
-`sdk-input.tsv` supplements `msvfw32.dll!ICInstall/ICRemove/DrawDibOpen/Close/Draw` from SDK 10.0.26100.0 `um/vfw.h`.
+`sdk-input.tsv` supplements `msvfw32.dll!ICInstall/ICRemove/DrawDibOpen/Close/Draw/MCIWndCreateA/W/MCIWndRegisterClass` from SDK 10.0.26100.0 `um/vfw.h`.
 `sdk-source.json` records the header hash and official source.
 `DrawDibOpen(void)` takes no arguments; `VFWAPI` is stdcall on x86, and HDRAWDIB is a 32-bit HANDLE alias.
 Close and Draw take one and thirteen 32-bit arguments respectively and return BOOL; the generator accepts only those three exact DrawDib declarations.
 They enter the same signature table; `#[win32]` implementations provide behavior. Runtime execution does not require SDK headers.
+`MCIWndCreateA/W` take four x86 arguments and return HWND; `MCIWndRegisterClass` takes none and returns BOOL.
+These three use `VFWAPIV` (`WINAPIV`, x86 cdecl), so their caller owns stack cleanup.
 
 `quartz.dll!AMGetErrorTextA` supplements a three-argument DWORD/WINAPI declaration from the same SDK's `um/errors.h` and x86 `quartz.lib`.
 `sdk-source.json` records source hashes. The generator accepts only the exact A signature with HRESULT/LPSTR/DWORD arguments.

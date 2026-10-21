@@ -1,4 +1,4 @@
-//! VCM installation failures and uncompressed DrawDib over the shared GDI owner.
+//! VCM installation failures, DrawDib over GDI, and MCIWnd over shared MCI video.
 //! Declarations come from the scoped, pinned SDK input in data/abi/sdk-source.json.
 use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, win32};
 use adv_machine::Env;
@@ -6,6 +6,7 @@ use adv_machine::Env;
 use crate::util::{MAX_STR, err, set_last_error};
 
 mod drawdib;
+pub(crate) mod mciwnd;
 
 fn unavailable(env: &mut Env<'_>, api: &str) -> i32 {
     adv_abi::warn_unavailable(
@@ -60,4 +61,5 @@ pub fn register(registry: &mut Registry) {
     registry.register(install_ABI);
     registry.register(remove_ABI);
     drawdib::register(registry);
+    mciwnd::register(registry);
 }
