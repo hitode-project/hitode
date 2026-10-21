@@ -186,4 +186,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Implemented Nt/Zw pairs MUST share binding identity before native numeric service installation. Missing Zw declarations MUST derive from their matching Nt declarations.
 **Verification**: Test
 
+## Offline networking
+
+### PERS-NET-1 Offline Internet sessions
+
+**Rule**: Synchronous WinINet and WinHTTP initialization MUST create library-owned sessions independently of transport availability. Session queries and closure MUST validate library ownership. Offline URL retrieval MUST fail without creating requests or reporting capability gaps.
+**Verification**: Test
+
+### PERS-NET-2 Local network addresses
+
+**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock DLL aliases MUST reuse initialization state and local arithmetic.
+**Verification**: Test
+
 Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
