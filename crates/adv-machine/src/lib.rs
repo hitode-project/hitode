@@ -23,6 +23,7 @@ mod leaf;
 pub mod objects;
 pub mod outcome;
 pub mod patch;
+mod poll_progress;
 pub mod process;
 pub mod sched;
 pub mod schedule_trace;
@@ -364,6 +365,7 @@ impl Sys {
             state: State::Ready { resume: None },
             yielded: false,
             spin: Default::default(),
+            progress: Default::default(),
             thread_handle,
         });
         self.wakes.insert(
@@ -899,6 +901,13 @@ impl Sys {
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
+    /// Every ready context repeats earlier yield intervals (PROC-CLOCK-5).
+    fn polling_settled(&self) -> bool {
+        self.active_contexts()
+            .filter(|c| c.is_ready())
+            .all(|c| c.progress.settled())
+    }
+
     fn next_deadline(&self) -> Option<u64> {
         self.active_contexts()
             .filter_map(|c| match &c.state {
@@ -1425,6 +1434,9 @@ impl Dispatch<'_> {
         self.sys
             .recent
             .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        self.sys.contexts[self.sys.current as usize]
+            .progress
+            .call(index);
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         if self
@@ -1559,6 +1571,9 @@ impl TrapHandler for Dispatch<'_> {
             index,
             cpu.read_u32(cpu.reg(Reg::Esp)).unwrap_or(0),
         );
+        self.sys.contexts[self.sys.current as usize]
+            .progress
+            .call(index);
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         self.sys.stats.leaf(index, &self.sys.thunks);
@@ -2118,6 +2133,7 @@ impl<B: Backend> Machine<B> {
                     }),
                 };
                 ctx.yielded = true;
+                ctx.progress.yielded();
                 self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::Block {
@@ -2311,6 +2327,7 @@ impl<B: Backend> Machine<B> {
             // can wait (at most 1 ms) like the OS would schedule them.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
+                && self.sys.polling_settled()
                 && self
                     .sys
                     .wakes
