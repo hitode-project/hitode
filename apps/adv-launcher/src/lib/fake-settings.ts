@@ -3,7 +3,7 @@ import type { FastForward, Filter } from "./prefs.svelte";
 
 // Persisted per-game settings and browser-only library maintenance fixtures.
 
-export const APP_VERSION = "0.1.1";
+export const APP_VERSION = "0.1.2";
 export const DATA_DIR = "~/Library/Application Support/org.hitode.launcher";
 
 export interface LibraryRoot {
