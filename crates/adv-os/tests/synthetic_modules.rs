@@ -748,21 +748,27 @@ fn forwarder_cycles_fail_with_a_bounded_diagnostic() {
 }
 
 #[test]
+// spec: PERS-EXPORT-1
 fn generated_system_catalog_fits_the_reserved_arena_and_thunk_capacity() {
     let modules: std::collections::BTreeSet<_> = adv_abi::signature::signatures()
         .iter()
         .map(|s| s.module)
         .collect();
-    let mut m = machine(true);
-    for module in modules {
-        let id = m
-            .load(&Empty, module)
-            .unwrap_or_else(|error| panic!("{module}: {error}"));
-        let image = adv_os::modules(&m.ext).get(id);
-        assert!(image.size > 4096);
-        assert_eq!(m.cpu.read_u16(image.base).unwrap(), 0x5a4d);
+    for jit in [false, true] {
+        let mut m = machine(jit);
+        for module in &modules {
+            let id = m
+                .load(&Empty, module)
+                .unwrap_or_else(|error| panic!("{module}: {error}"));
+            let image = adv_os::modules(&m.ext).get(id);
+            let arena = adv_machine::layout::HOST_MODULE_BASE;
+            let end = arena + adv_machine::layout::HOST_MODULE_CAP * adv_machine::layout::GRANULE;
+            assert!(image.base >= arena && image.base + image.size <= end);
+            assert!(image.size > 4096);
+            assert_eq!(m.cpu.read_u16(image.base).unwrap(), 0x5a4d);
+        }
+        assert!(m.sys.thunks.len() < adv_machine::layout::THUNK_CAP);
     }
-    assert!(m.sys.thunks.len() < adv_machine::layout::THUNK_CAP);
 }
 
 // spec: PROC-ISO-1
