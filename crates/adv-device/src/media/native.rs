@@ -158,7 +158,12 @@ pub(super) struct Native {
     audio: Option<Audio>,
     video_packets: VecDeque<ff::Packet>,
     video_packet_bytes: usize,
-    next: Option<(u64, frame::Video)>,
+    /// Decoded future frames in pts order; `prefetch` keeps [`AHEAD`] of them.
+    next: VecDeque<(u64, frame::Video)>,
+    /// The front of `next`, already converted by `prefetch`.
+    converted: Option<VideoFrame>,
+    /// A decode error `prefetch` hit; the request that needs that frame reports it.
+    deferred: Option<Error>,
     audio_out: Vec<AudioFrame>,
     origin_us: i64,
     last_request: Option<u64>,
@@ -180,6 +185,9 @@ const AUDIO_LEAD_US: u64 = 100_000;
 /// ahead as quartz's DirectSound renderer buffers (one second), so a busy
 /// execution thread during a load does not drain music that just started.
 const AUDIO_ONLY_LEAD_US: u64 = 1_000_000;
+/// Decoded frames `prefetch` holds, so a request finds its frame and the one
+/// after it ready.
+const AHEAD: usize = 2;
 const MAX_QUEUED_VIDEO_PACKETS: usize = 180;
 const MAX_QUEUED_VIDEO_BYTES: usize = 8 << 20;
 
@@ -187,6 +195,23 @@ fn micros(pts: i64, tb: Rational) -> i64 {
     ((i128::from(pts) * i128::from(tb.numerator()) * 1_000_000)
         / i128::from(tb.denominator().max(1)))
     .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn convert(video: &mut Video, pts_us: u64, decoded: &frame::Video) -> Result<VideoFrame, Error> {
+    let mut bgra = frame::Video::empty();
+    video.scaler.run(decoded, &mut bgra)?;
+    let (width, height) = (bgra.width(), bgra.height());
+    let row = width as usize * 4;
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for line in bgra.data(0).chunks(bgra.stride(0)).take(height as usize) {
+        pixels.extend_from_slice(&line[..row]);
+    }
+    Ok(VideoFrame {
+        pts_us,
+        width,
+        height,
+        bgra: pixels,
+    })
 }
 
 fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
@@ -316,7 +341,9 @@ impl Native {
             audio,
             video_packets: VecDeque::new(),
             video_packet_bytes: 0,
-            next: None,
+            next: VecDeque::new(),
+            converted: None,
+            deferred: None,
             audio_out: Vec::new(),
             origin_us,
             last_request: None,
@@ -591,7 +618,9 @@ impl Native {
                 *clock = super::audio_clock::AudioClock::default();
             }
         }
-        self.next = None;
+        self.next.clear();
+        self.converted = None;
+        self.deferred = None;
         self.video_packets.clear();
         self.video_packet_bytes = 0;
         self.audio_out.clear();
@@ -623,21 +652,25 @@ impl Native {
                 ended: self.input_eof && self.audio_eof_sent && media_us >= audio_end,
             });
         }
-        let mut due = None;
+        let (mut due, mut ready) = (None, None);
         loop {
-            if self.next.is_none() && !self.eof {
-                self.next = match self.next_video() {
-                    Ok(next) => next,
+            if self.next.is_empty() && !self.eof {
+                if let Some(error) = self.deferred.take() {
+                    return Err(error);
+                }
+                match self.next_video() {
+                    Ok(next) => self.next.extend(next),
                     Err(_) if self.seek_pending && media_us > 0 => {
                         return self.restart_at(media_us);
                     }
                     Err(e) => return Err(e),
                 };
             }
-            if self.next.as_ref().is_none_or(|(pts, _)| *pts > media_us) {
+            if self.next.front().is_none_or(|(pts, _)| *pts > media_us) {
                 break;
             }
-            due = self.next.take();
+            due = self.next.pop_front();
+            ready = self.converted.take();
         }
         // Some MPEG-PS inputs have no usable index and report a successful seek to a
         // future keyframe. Decode from the beginning rather than show it early.
@@ -646,26 +679,16 @@ impl Native {
         }
         self.seek_pending = false;
         self.read_ahead_audio(media_us)?;
-        let video = if let Some((pts_us, decoded)) = due {
-            let scaler = &mut self.video.as_mut().unwrap().scaler;
-            let mut bgra = frame::Video::empty();
-            scaler.run(&decoded, &mut bgra)?;
-            let (w, h) = (bgra.width(), bgra.height());
-            let row = w as usize * 4;
-            let mut pixels = Vec::with_capacity(row * h as usize);
-            for line in bgra.data(0).chunks(bgra.stride(0)).take(h as usize) {
-                pixels.extend_from_slice(&line[..row]);
+        let video = match (ready, due) {
+            (Some(frame), _) => Some(frame),
+            (None, Some((pts_us, decoded))) => {
+                Some(convert(self.video.as_mut().unwrap(), pts_us, &decoded)?)
             }
-            self.stats.converted_frames += 1;
-            Some(VideoFrame {
-                pts_us,
-                width: w,
-                height: h,
-                bgra: pixels,
-            })
-        } else {
-            None
+            (None, None) => None,
         };
+        if video.is_some() {
+            self.stats.converted_frames += 1;
+        }
         let frame_duration = self.video.as_ref().map_or(0, |v| v.frame_duration_us);
         let end = self
             .last_video_us
@@ -676,6 +699,30 @@ impl Native {
             audio: std::mem::take(&mut self.audio_out),
             ended: self.eof && media_us >= end,
         })
+    }
+
+    /// Work a request would otherwise do while its caller waits: decode up to
+    /// [`AHEAD`] future frames and convert the next one. Results depend only on
+    /// the requests made, never on when this runs.
+    pub fn prefetch(&mut self) {
+        if self.video.is_none() || self.seek_pending || self.deferred.is_some() {
+            return;
+        }
+        while self.next.len() < AHEAD && !self.eof {
+            match self.next_video() {
+                Ok(next) => self.next.extend(next),
+                Err(error) => {
+                    self.deferred = Some(error);
+                    break;
+                }
+            }
+        }
+        if self.converted.is_none()
+            && let Some((pts_us, decoded)) = self.next.front()
+        {
+            // A failed conversion is retried, and reported, by the request.
+            self.converted = convert(self.video.as_mut().unwrap(), *pts_us, decoded).ok();
+        }
     }
 
     fn restart_at(&mut self, media_us: u64) -> Result<Update, Error> {

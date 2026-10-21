@@ -4,8 +4,8 @@
 
 use std::io::{Read, Seek};
 
-pub trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
 
 #[derive(Debug)]
 pub enum Error {
@@ -104,6 +104,8 @@ mod audio_clock;
 mod native;
 #[cfg(feature = "media")]
 mod packets;
+#[cfg(feature = "media")]
+mod worker;
 
 /// How a container describes a compressed stream: enough to rebuild a decoder
 /// and the BITMAPINFOHEADER or WAVEFORMATEX a Windows media type carries.
@@ -228,12 +230,12 @@ impl PacketDecoder {
     }
 }
 
-/// A seekable source holding at most one future decoded video frame. `frame_at`
-/// decodes only through the first frame after the requested time; repeated calls
+/// A seekable source decoded on a thread of its own. `frame_at` answers as if it
+/// decoded only through the first frame after the requested time; repeated calls
 /// for the same time do no work. Audio-only sources are supported.
 pub struct Decoder {
     #[cfg(feature = "media")]
-    inner: native::Native,
+    inner: worker::Worker,
 }
 
 impl Decoder {
@@ -249,7 +251,7 @@ impl Decoder {
         #[cfg(feature = "media")]
         {
             Ok(Self {
-                inner: native::Native::open(Box::new(reader))?,
+                inner: worker::Worker::open(Box::new(reader))?,
             })
         }
         #[cfg(not(feature = "media"))]
