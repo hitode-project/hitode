@@ -113,13 +113,16 @@ fn real_pollers_all_get_a_turn_before_each_host_idle() {
     for _ in 0..3 {
         m.spawn("poller", CODE, &[], 65536).unwrap();
     }
-    for round in 1..=5 {
-        assert!(matches!(m.run(), RunResult::Idle { .. }));
+    // Pollers settle (PROC-CLOCK-5) before the first idle; then one round each.
+    assert!(matches!(m.run(), RunResult::Idle { .. }));
+    let [settled, ..] = *m.ext.get::<[u32; 3]>();
+    for round in settled..settled + 5 {
         assert_eq!(
             *m.ext.get::<[u32; 3]>(),
             [round; 3],
             "host slept before completing round {round}"
         );
+        assert!(matches!(m.run(), RunResult::Idle { .. }));
     }
 }
 

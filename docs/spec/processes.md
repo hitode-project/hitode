@@ -63,6 +63,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: With a host frame clock, a real-time polling round MAY wait for the first vsync after a frame, at most once per frame. Every ready context MUST have completed that frame, passed one ordinary round since, and run under 0.5 ms since its last round. Held keys or mouse buttons MUST keep 1 ms rounds, and events MUST still wake the host at once.
 **Verification**: Test
 
+### PROC-CLOCK-5 Productive polling
+
+**Rule**: A real-time polling round MAY wait only after every ready context repeated earlier host-call sequences between its last four yields. A context doing new work between yields MUST run again without a host wait.
+**Verification**: Test
+
 ## Isolation
 
 ### PROC-ISO-1 Separate processes
