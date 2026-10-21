@@ -48,6 +48,42 @@ pub(super) struct Backend {
     resource_bytes: usize,
     store: Arc<Mutex<FaceStore>>,
 }
+/// Installed fonts are scanned once per process; a backend's resources copy
+/// the shared database on first change.
+static SYSTEM_FONTS: OnceLock<Arc<Database>> = OnceLock::new();
+
+fn system_fonts() -> Arc<Database> {
+    SYSTEM_FONTS
+        .get_or_init(|| {
+            let mut db = Database::new();
+            #[cfg(target_os = "macos")]
+            discovery::load_system_fonts(&mut db);
+            #[cfg(not(target_os = "macos"))]
+            db.load_system_fonts();
+            // fontdb's system discovery intentionally excludes Android.
+            #[cfg(target_os = "android")]
+            for directory in ["/system/fonts", "/product/fonts", "/vendor/fonts"] {
+                db.load_fonts_dir(directory);
+            }
+            if let Some(directories) = std::env::var_os("ADV_FONT_DIR") {
+                for directory in std::env::split_paths(&directories) {
+                    db.load_fonts_dir(directory);
+                }
+            }
+            Arc::new(db)
+        })
+        .clone()
+}
+
+/// Scan installed fonts on a background thread so the first text call does
+/// not wait for it. A pinned font profile replaces the scan.
+pub(super) fn prefetch_system_fonts() {
+    if std::env::var_os("ADV_FONT_PROFILE").is_none() && SYSTEM_FONTS.get().is_none() {
+        let _ = std::thread::Builder::new()
+            .name("font-discovery".into())
+            .spawn(|| drop(system_fonts()));
+    }
+}
 struct Discovery {
     database: Arc<Database>,
     profile: Option<Arc<profile::Loaded>>,
@@ -70,13 +106,13 @@ impl Backend {
     fn discovery(&self) -> Result<&Discovery, TextError> {
         self.database
             .get_or_init(|| {
-                let mut db = Database::new();
                 let path = self.profile_path.clone().or_else(|| {
                     self.directories
                         .is_none()
                         .then(|| std::env::var_os("ADV_FONT_PROFILE").map(PathBuf::from))
                         .flatten()
                 });
+                let mut db = Database::new();
                 let profile = if let Some(path) = path {
                     Some(Arc::new(profile::Loaded::load(&path, &mut db).map_err(
                         |error| format!("font profile {}: {error}", path.display()),
@@ -87,21 +123,10 @@ impl Backend {
                     }
                     None
                 } else {
-                    #[cfg(target_os = "macos")]
-                    discovery::load_system_fonts(&mut db);
-                    #[cfg(not(target_os = "macos"))]
-                    db.load_system_fonts();
-                    // fontdb's system discovery intentionally excludes Android.
-                    #[cfg(target_os = "android")]
-                    for directory in ["/system/fonts", "/product/fonts", "/vendor/fonts"] {
-                        db.load_fonts_dir(directory);
-                    }
-                    if let Some(directories) = std::env::var_os("ADV_FONT_DIR") {
-                        for directory in std::env::split_paths(&directories) {
-                            db.load_fonts_dir(directory);
-                        }
-                    }
-                    None
+                    return Ok(Discovery {
+                        database: system_fonts(),
+                        profile: None,
+                    });
                 };
                 Ok(Discovery {
                     database: Arc::new(db),
