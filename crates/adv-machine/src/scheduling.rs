@@ -75,6 +75,8 @@ pub struct SchedulingStats {
     pub frame_host_yields: u64,
     pub active_time_skips: u64,
     pub active_time_skip_us: u64,
+    /// Waits released only by the pre-idle scan: a state change skipped its signal.
+    pub missed_signal_wakes: u64,
 }
 
 /// Only runnable peers (or waits whose signal can change inside guest execution)

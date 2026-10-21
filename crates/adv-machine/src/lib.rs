@@ -149,6 +149,7 @@ pub struct Sys {
     pub frame_pacer: Option<std::sync::Arc<dyn frame_spin::FramePacer>>,
     pub schedule_trace: schedule_trace::ScheduleTrace,
     wakes: sched::ActiveContexts,
+    wait_deadlines: std::collections::BTreeSet<(u64, CtxId)>,
     /// Stopped contexts whose execution storage still needs to be reclaimed.
     finished_contexts: Vec<CtxId>,
     #[cfg(test)]
@@ -367,6 +368,7 @@ impl Sys {
             spin: Default::default(),
             progress: Default::default(),
             thread_handle,
+            wait_objects: Vec::new(),
         });
         self.wakes.insert(
             id,
@@ -451,6 +453,7 @@ impl Sys {
     }
 
     fn retire_context(&mut self, id: CtxId) {
+        self.objects.context_finished(id);
         if self.wakes.retire(id) {
             self.finished_contexts.push(id);
         }
@@ -636,6 +639,8 @@ impl Sys {
         if context.is_done() {
             return false;
         }
+        self.unregister_waiter(id as usize);
+        let context = &mut self.contexts[id as usize];
         context.completion.complete(exit_code);
         context.state = State::Done { exit_code };
         context.frames.clear();
@@ -688,6 +693,27 @@ impl Sys {
     pub fn signal_waiters(&mut self, h: Handle) {
         self.signal_waiters_with_priority(h, WakePriority::Normal);
     }
+    /// Commit a validated mutex release and deliver its newly available signal.
+    pub fn release_mutex(&mut self, h: Handle) {
+        let Some(Object::Mutex { owner, recursion }) = self.objects.get_mut(h) else {
+            unreachable!()
+        };
+        *recursion -= 1;
+        if *recursion == 0 {
+            *owner = None;
+            self.signal_waiters(h);
+        }
+    }
+
+    /// Commit a validated semaphore release before its caller can reacquire.
+    pub fn release_semaphore(&mut self, h: Handle, release: u32) {
+        let Some(Object::Semaphore { count, .. }) = self.objects.get_mut(h) else {
+            unreachable!()
+        };
+        *count += release;
+        self.signal_waiters(h);
+    }
+
     pub fn prefer_ready_context(&mut self, context: CtxId, priority: WakePriority) {
         if self
             .contexts
@@ -699,33 +725,18 @@ impl Sys {
         }
     }
     fn signal_waiters_with_priority(&mut self, h: Handle, priority: WakePriority) {
-        let now = self.clock.now_us();
-        for index in 0..self.wakes.entries().len() {
-            let i = self.wakes.entries()[index].id as usize;
-            let waiting = match &self.contexts[i].state {
-                State::Blocked {
-                    wait: Wait::Object { handle, .. },
-                    ..
-                } => self.objects.same_object(*handle, h),
-                State::Blocked {
-                    wait:
-                        Wait::Objects {
-                            handles,
-                            notification,
-                            ..
-                        },
-                    ..
-                } => {
-                    handles
-                        .iter()
-                        .any(|&handle| self.objects.same_object(handle, h))
-                        || notification.is_some_and(|handle| self.objects.same_object(handle, h))
-                }
-                _ => false,
-            };
-            if waiting && let Some(reason) = self.poll_wait(i, now) {
+        self.objects.mark_changed(h, priority);
+        self.wake_changed(self.clock.now_us());
+    }
+
+    fn wake_changed(&mut self, now: u64) {
+        for (id, priority) in self.objects.changed_waiters() {
+            let i = id as usize;
+            if matches!(self.contexts[i].state, State::Blocked { .. })
+                && let Some(reason) = self.poll_wait(i, now)
+            {
                 self.release_waiter(i, reason, now);
-                self.wakes.wake_as(i as CtxId, now, None, priority);
+                self.wakes.wake_as(id, now, None, priority);
             }
         }
     }
@@ -759,14 +770,14 @@ impl Sys {
 
     /// Non-blocking check of a waitable object (consumes an auto-reset signal).
     pub fn try_acquire(&mut self, h: Handle) -> bool {
-        self.wake();
+        self.objects.expire_timers(self.clock.now_us());
         let cur = self.current;
         sched::poll_object(&mut self.objects, &self.contexts, h, cur, true)
     }
 
     /// Acquire a wait set without partially consuming an unsatisfied WaitAll.
     pub fn try_acquire_objects(&mut self, handles: &[Handle], all: bool) -> Option<WakeReason> {
-        self.wake();
+        self.objects.expire_timers(self.clock.now_us());
         sched::poll_objects(
             &mut self.objects,
             &self.contexts,
@@ -824,20 +835,93 @@ impl Sys {
         }
     }
 
-    /// Wake every blocked context whose wait is satisfied, in context order.
+    fn register_waiter(&mut self, i: usize) {
+        let State::Blocked { wait, .. } = &self.contexts[i].state else {
+            unreachable!()
+        };
+        let deadline = wait.deadline();
+        let (handles, notification) = wait.objects();
+        let mut objects = Vec::new();
+        for handle in handles.iter().copied().chain(notification) {
+            if let Some(id) = self.objects.register_waiter(handle, i as CtxId) {
+                objects.push(id);
+            }
+        }
+        self.contexts[i].wait_objects = objects;
+        if let Some(deadline) = deadline {
+            self.wait_deadlines.insert((deadline, i as CtxId));
+        }
+        if let Some(reason) = self.poll_wait(i, self.clock.now_us()) {
+            self.release_waiter(i, reason, self.clock.now_us());
+        }
+    }
+
+    fn unregister_waiter(&mut self, i: usize) {
+        if let State::Blocked { wait, .. } = &self.contexts[i].state {
+            for id in self.contexts[i].wait_objects.iter().copied() {
+                self.objects.unregister_waiter(id, i as CtxId);
+            }
+            if let Some(deadline) = wait.deadline() {
+                self.wait_deadlines.remove(&(deadline, i as CtxId));
+            }
+            self.contexts[i].wait_objects.clear();
+        }
+    }
+
+    /// Before the host idles, release any wait whose object changed without a
+    /// signal (a direct state write that skipped [`Sys::signal_waiters`]). Idling
+    /// costs nothing here, and a missed signal must delay, never hang, a waiter.
+    fn rescue_missed_wakes(&mut self) -> bool {
+        let now = self.clock.now_us();
+        let mut rescued = false;
+        for index in 0..self.wakes.entries().len() {
+            let i = self.wakes.entries()[index].id as usize;
+            if matches!(self.contexts[i].state, State::Blocked { .. })
+                && let Some(reason) = self.poll_wait(i, now)
+            {
+                if self.scheduling.missed_signal_wakes == 0 {
+                    log::warn!("context {i}: a wait object changed without a signal");
+                }
+                self.scheduling.missed_signal_wakes += 1;
+                self.release_waiter(i, reason, now);
+                self.wakes
+                    .wake_as(i as CtxId, now, None, WakePriority::Normal);
+                rescued = true;
+            }
+        }
+        rescued
+    }
+
+    /// Evaluate changed objects in wait order, then expire timed waits.
     fn wake(&mut self) {
         let now = self.clock.now_us();
         self.objects.expire_timers(now);
-        for index in 0..self.wakes.entries().len() {
-            let i = self.wakes.entries()[index].id as usize;
-            let reason = self.poll_wait(i, now);
-            if let Some(reason) = reason {
-                self.release_waiter(i, reason, now);
+        self.wake_changed(now);
+        while let Some(&(deadline, id)) = self.wait_deadlines.first() {
+            if deadline > now {
+                break;
             }
+            self.wait_deadlines.pop_first();
+            if let Some(reason) = self.poll_wait(id as usize, now) {
+                self.release_waiter(id as usize, reason, now);
+            }
+        }
+        #[cfg(test)]
+        {
+            let polls = self.scheduler_work.polls.get();
+            for index in 0..self.wakes.entries().len() {
+                let i = self.wakes.entries()[index].id as usize;
+                assert!(
+                    self.poll_wait(i, now).is_none(),
+                    "missed satisfiable wait for context {i}"
+                );
+            }
+            self.scheduler_work.polls.set(polls);
         }
     }
 
     fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64) {
+        self.unregister_waiter(i);
         let State::Blocked {
             wait, then, origin, ..
         } = std::mem::replace(&mut self.contexts[i].state, State::Ready { resume: None })
@@ -909,18 +993,10 @@ impl Sys {
     }
 
     fn next_deadline(&self) -> Option<u64> {
-        self.active_contexts()
-            .filter_map(|c| match &c.state {
-                State::Blocked {
-                    wait: Wait::Until(t),
-                    ..
-                } => Some(*t),
-                State::Blocked {
-                    wait: Wait::Object { deadline, .. } | Wait::Objects { deadline, .. },
-                    ..
-                } => *deadline,
-                _ => None,
-            })
+        self.wait_deadlines
+            .first()
+            .map(|&(deadline, _)| deadline)
+            .into_iter()
             .chain(self.objects.next_timer_deadline())
             .min()
     }
@@ -1797,6 +1873,7 @@ impl<B: Backend> Machine<B> {
             schedule_trace: schedule_trace::ScheduleTrace::default(),
             scheduling: scheduling::SchedulingStats::default(),
             wakes: sched::ActiveContexts::default(),
+            wait_deadlines: Default::default(),
             finished_contexts: Vec::new(),
             rr_last: None,
             #[cfg(test)]
@@ -2168,6 +2245,7 @@ impl<B: Backend> Machine<B> {
                     allow_time_skip,
                 };
                 ctx.yielded = false;
+                self.sys.register_waiter(id as usize);
             }
             Parked::ExitThread(code) => {
                 ctx.completion.complete(code);
@@ -2334,6 +2412,7 @@ impl<B: Backend> Machine<B> {
                     .entries()
                     .iter()
                     .all(|entry| !self.sys.contexts[entry.id as usize].is_ready() || entry.ran)
+                && !self.sys.rescue_missed_wakes()
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
@@ -2366,7 +2445,7 @@ impl<B: Backend> Machine<B> {
                     self.sys.scheduling.external_interrupts += 1;
                     return SliceResult::Yielded;
                 }
-                if self.skip_idle_time() {
+                if self.sys.rescue_missed_wakes() || self.skip_idle_time() {
                     continue;
                 }
                 self.sys.trace.flush();
@@ -2721,7 +2800,7 @@ impl<B: Backend> Machine<B> {
         }
         self.sys.scheduling.frame_host_yields += 1;
         self.sys.wake();
-        if self.sys.active_contexts().any(|c| c.is_ready()) {
+        if self.sys.active_contexts().any(|c| c.is_ready()) || self.sys.rescue_missed_wakes() {
             SliceResult::Yielded
         } else {
             let next_deadline = self.sys.next_deadline();

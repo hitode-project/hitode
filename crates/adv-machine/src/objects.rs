@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::sched::{Handle, Object};
 mod timers;
 
+pub(crate) type ObjectChanges = std::sync::mpsc::Sender<(u64, crate::WakePriority)>;
+
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
 /// An opaque alias namespace, valid only in the table which created it.
@@ -103,6 +105,7 @@ impl Default for NamespaceState {
 
 struct Entry {
     value: Object,
+    waiters: Vec<crate::CtxId>,
     owners: u32,
     aliases: u32,
     /// Counts aliases per namespace, so iteration yields each payload once.
@@ -121,6 +124,8 @@ impl Entry {
 /// One payload table for the process, with independent numeric alias namespaces.
 pub struct Objects {
     table: u64,
+    changed: ObjectChanges,
+    changes: std::sync::mpsc::Receiver<(u64, crate::WakePriority)>,
     entries: HashMap<u64, Entry>,
     targets: HashMap<(u32, u32), u64>,
     kernel_identities: HashMap<Handle, u64>,
@@ -135,6 +140,16 @@ pub struct Objects {
     limits: ObjectLimits,
 }
 
+impl Drop for Objects {
+    fn drop(&mut self) {
+        for (&id, entry) in &self.entries {
+            if let Some(completion) = entry.value.completion() {
+                completion.unsubscribe(self.table, id);
+            }
+        }
+    }
+}
+
 impl Default for Objects {
     fn default() -> Self {
         Self::with_limits(ObjectLimits::default())
@@ -142,6 +157,52 @@ impl Default for Objects {
 }
 
 impl Objects {
+    pub(crate) fn register_waiter(&mut self, handle: Handle, context: crate::CtxId) -> Option<u64> {
+        let id = self.object_id(handle)?;
+        let waiters = &mut self.entries.get_mut(&id).unwrap().waiters;
+        if !waiters.contains(&context) {
+            waiters.push(context);
+        }
+        Some(id)
+    }
+
+    pub(crate) fn unregister_waiter(&mut self, id: u64, context: crate::CtxId) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.waiters.retain(|&id| id != context);
+        }
+    }
+
+    pub(crate) fn mark_changed(&self, handle: Handle, priority: crate::WakePriority) {
+        if let Some(id) = self.object_id(handle) {
+            let _ = self.changed.send((id, priority));
+        }
+    }
+
+    pub(crate) fn changed_waiters(&self) -> Vec<(crate::CtxId, crate::WakePriority)> {
+        let mut changes = BTreeMap::new();
+        for (id, priority) in self.changes.try_iter() {
+            let previous = changes.entry(id).or_insert(priority);
+            *previous = (*previous).min(priority);
+        }
+        let mut waiters = Vec::new();
+        for (id, priority) in changes {
+            if let Some(entry) = self.entries.get(&id) {
+                waiters.extend(entry.waiters.iter().map(|&id| (id, priority)));
+            }
+        }
+        waiters
+    }
+
+    pub(crate) fn context_finished(&self, context: crate::CtxId) {
+        for (&id, entry) in &self.entries {
+            if matches!(entry.value, Object::Thread { ctx } if ctx == context)
+                || matches!(entry.value, Object::Mutex { owner: Some(owner), .. } if owner == context)
+            {
+                let _ = self.changed.send((id, crate::WakePriority::Normal));
+            }
+        }
+    }
+
     pub fn reference_limit(&self) -> u32 {
         self.limits.references
     }
@@ -149,8 +210,11 @@ impl Objects {
         let table = NEXT_TABLE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("object table identity space exhausted");
+        let (changed, changes) = std::sync::mpsc::channel();
         Self {
             table,
+            changed,
+            changes,
             entries: HashMap::default(),
             targets: HashMap::default(),
             kernel_identities: HashMap::default(),
@@ -234,10 +298,14 @@ impl Objects {
         let id = self.next_object.checked_add(1)?;
         self.next_object = id;
         let kernel_identity = (ns == 0).then_some(alias);
+        if let Some(completion) = value.completion() {
+            completion.subscribe(self.table, id, self.changed.clone());
+        }
         self.entries.insert(
             id,
             Entry {
                 value,
+                waiters: Vec::new(),
                 owners: 0,
                 aliases: 1,
                 namespaces: BTreeMap::from([(ns, 1)]),
@@ -280,6 +348,9 @@ impl Objects {
             return None;
         }
         let entry = self.entries.remove(&id).unwrap();
+        if let Some(completion) = entry.value.completion() {
+            completion.unsubscribe(self.table, id);
+        }
         if let Object::Timer {
             deadline: Some(deadline),
             ..
@@ -370,6 +441,7 @@ impl Objects {
             id,
             Entry {
                 value: Object::Host(Box::new(value)),
+                waiters: Vec::new(),
                 owners: 1,
                 aliases: 0,
                 namespaces: BTreeMap::new(),
@@ -760,10 +832,8 @@ mod tests {
         assert_eq!(objects.strong_count(id), Some(u32::MAX));
         assert_eq!(objects.alias_count(Namespace::DEFAULT), 0);
 
-        let mut objects = Objects {
-            next_object: u64::MAX,
-            ..Objects::default()
-        };
+        let mut objects = Objects::with_limits(ObjectLimits::default());
+        objects.next_object = u64::MAX;
         assert!(objects.insert_owned(1_u32).is_none());
         assert_eq!(objects.insert_host(2_u32), 0);
         assert_eq!(objects.object_count(), 0);

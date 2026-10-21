@@ -151,6 +151,28 @@ pub enum Wait {
     },
 }
 
+impl Wait {
+    pub(crate) fn deadline(&self) -> Option<u64> {
+        match self {
+            Self::Until(at) => Some(*at),
+            Self::Object { deadline, .. } | Self::Objects { deadline, .. } => *deadline,
+            Self::Yield => None,
+        }
+    }
+
+    pub(crate) fn objects(&self) -> (&[Handle], Option<Handle>) {
+        match self {
+            Self::Object { handle, .. } => (std::slice::from_ref(handle), None),
+            Self::Objects {
+                handles,
+                notification,
+                ..
+            } => (handles, *notification),
+            _ => (&[], None),
+        }
+    }
+}
+
 /// The host call a parked context is inside: where to return and what to finish.
 pub(crate) struct Origin {
     /// ESP at the host call's entry ([esp] = guest return address).
@@ -236,6 +258,7 @@ pub struct Context {
     pub(crate) bootstrap_pending: Option<u32>,
     pub(crate) frames: Vec<Frame>,
     pub(crate) state: State,
+    pub(crate) wait_objects: Vec<u64>,
     /// Its last block was a yield (Sleep(0)): it is polling, not waiting on anything.
     pub(crate) yielded: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
@@ -351,6 +374,16 @@ pub enum Object {
     },
     /// Owned by a higher layer; never waitable here.
     Host(Box<dyn Any>),
+}
+
+impl Object {
+    pub(crate) fn completion(&self) -> Option<&crate::process::Completion> {
+        match self {
+            Self::Process { identity, .. } => Some(&identity.completion),
+            Self::RemoteThread { identity, .. } => Some(&identity.completion),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Object {
@@ -528,6 +561,368 @@ mod active_tests {
         .unwrap()
     }
 
+    fn wait_sys() -> Sys {
+        Sys {
+            clock: Clock::virtual_time(),
+            invocation_arguments: None,
+            trace: Trace::default(),
+            thunks: ThunkTable::new(Box::new(Empty)),
+            objects: Objects::default(),
+            vm: Vm::new(),
+            contexts: Vec::new(),
+            guest_words: GuestWordPool::default(),
+            current: 0,
+            frame: 0,
+            completed_frames: 0,
+            frame_pacer: None,
+            pid: 0x1000,
+            process_identity: process::ProcessIdentity::new(0x1000),
+            next_tid: 0x1004,
+            images: Images::default(),
+            tls_images: Vec::new(),
+            process_init: VecDeque::new(),
+            process_ready: Vec::new(),
+            process_entry: None,
+            process_start_entry: None,
+            guest_return_entry: thunk_addr(thunk::RETURN_PAD),
+            thread_exception_entry: None,
+            process_return: None,
+            process_prepare: None,
+            context_wait: None,
+            exception_handler: None,
+            first_cpu_fault: None,
+            latest_cpu_fault: None,
+            guest_failure_code: None,
+            checkpoint_identity: std::sync::Arc::new(()),
+            next_frame_id: 0,
+            recent: RecentCalls::new(256),
+            host_calls: 0,
+            call_limit: None,
+            stats: Stats::new(),
+            schedule_trace: schedule_trace::ScheduleTrace::default(),
+            scheduling: scheduling::SchedulingStats::default(),
+            wakes: sched::ActiveContexts::default(),
+            wait_deadlines: Default::default(),
+            finished_contexts: Vec::new(),
+            rr_last: None,
+            scheduler_work: sched::SchedulerWork::default(),
+        }
+    }
+
+    fn block(sys: &mut Sys, id: CtxId, wait: Wait) {
+        sys.contexts[id as usize].state = super::State::Blocked {
+            wait,
+            then: Box::new(|_, _| Outcome::Return(0)),
+            origin: super::Origin {
+                esp: 0,
+                ret_eip: 0,
+                thunk: 0,
+                trace_args: None,
+                interrupted: false,
+            },
+            allow_time_skip: true,
+        };
+        sys.register_waiter(id as usize);
+    }
+
+    fn event(sys: &mut Sys) -> Handle {
+        sys.objects.insert(Object::Event {
+            manual_reset: false,
+            signaled: false,
+        })
+    }
+
+    fn spawn(sys: &mut Sys) -> CtxId {
+        let id = sys.contexts.len() as CtxId;
+        let thread_handle = sys.objects.insert(Object::Thread { ctx: id });
+        sys.contexts.push(super::Context {
+            audio_call_us: None,
+            audio_guest: None,
+            suspend_count: 0,
+            completion: std::sync::Arc::new(crate::process::Completion::default()),
+            id,
+            name: "waiter".into(),
+            tid: id,
+            teb: 0,
+            stack_lo: 0,
+            stack_hi: 0,
+            start: None,
+            initial_registers: Vec::new(),
+            storage: None,
+            bootstrap_pending: None,
+            frames: Vec::new(),
+            state: super::State::Ready { resume: None },
+            yielded: false,
+            spin: Default::default(),
+            progress: Default::default(),
+            thread_handle,
+            wait_objects: Vec::new(),
+        });
+        sys.wakes.insert(id, id);
+        id
+    }
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn auto_reset_releases_three_waiters_in_wait_order_across_aliases() {
+        let mut sys = wait_sys();
+        let h = event(&mut sys);
+        let alias = sys.objects.duplicate(h).unwrap();
+        for _ in 0..3 {
+            spawn(&mut sys);
+        }
+        for id in [2, 0, 1] {
+            block(
+                &mut sys,
+                id,
+                Wait::Object {
+                    handle: h,
+                    deadline: None,
+                },
+            );
+        }
+        for (turn, id) in [2, 0, 1].into_iter().enumerate() {
+            assert!(sys.set_event(alias));
+            assert!(sys.context(id).is_ready());
+            assert_eq!(
+                sys.contexts.iter().filter(|c| c.is_ready()).count(),
+                turn + 1
+            );
+            assert!(!sys.try_acquire(h));
+        }
+    }
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn wait_all_acquires_atomically_when_its_last_member_changes() {
+        let mut sys = wait_sys();
+        let id = spawn(&mut sys);
+        let handles = [event(&mut sys), event(&mut sys)];
+        block(
+            &mut sys,
+            id,
+            Wait::Objects {
+                handles: handles.to_vec(),
+                all: true,
+                deadline: None,
+                notification: None,
+            },
+        );
+        sys.set_event(handles[0]);
+        assert_eq!(sys.context(id).state_name(), "Blocked");
+        assert!(matches!(
+            sys.objects.get(handles[0]),
+            Some(Object::Event { signaled: true, .. })
+        ));
+        sys.set_event(handles[1]);
+        assert!(sys.context(id).is_ready());
+        for h in handles {
+            assert!(!sys.try_acquire(h));
+        }
+        assert!(sys.contexts[id as usize].wait_objects.is_empty());
+    }
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn nonblocking_acquires_expire_timers_without_evaluating_other_waits() {
+        let mut sys = wait_sys();
+        let now = sys.clock.now_us();
+        let id = spawn(&mut sys);
+        let other = event(&mut sys);
+        block(
+            &mut sys,
+            id,
+            Wait::Object {
+                handle: other,
+                deadline: Some(now + 10),
+            },
+        );
+        let timer = sys.objects.insert(Object::Timer {
+            manual_reset: false,
+            signaled: false,
+            deadline: None,
+            period_us: 0,
+        });
+        assert!(sys.arm_timer(timer, now + 10, 10));
+        sys.clock.advance_to(now + 10);
+        sys.scheduler_work.polls.set(0);
+        assert!(sys.try_acquire(timer));
+        assert_eq!(sys.scheduler_work.polls.get(), 0);
+        assert_eq!(sys.context(id).state_name(), "Blocked");
+        sys.clock.advance_to(now + 20);
+        sys.scheduler_work.polls.set(0);
+        assert!(sys.try_acquire_objects(&[timer], true).is_some());
+        assert_eq!(sys.scheduler_work.polls.get(), 0);
+        assert_eq!(sys.context(id).state_name(), "Blocked");
+        sys.wake();
+        assert!(sys.context(id).is_ready());
+    }
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn unchanged_pass_evaluates_no_waits() {
+        let mut sys = wait_sys();
+        let id = spawn(&mut sys);
+        let h = event(&mut sys);
+        block(
+            &mut sys,
+            id,
+            Wait::Object {
+                handle: h,
+                deadline: None,
+            },
+        );
+        sys.scheduler_work.polls.set(0);
+        sys.wake();
+        assert_eq!(sys.scheduler_work.polls.get(), 0);
+        assert_eq!(sys.context(id).state_name(), "Blocked");
+    }
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn finished_owner_abandons_mutex_to_its_waiter() {
+        let mut sys = wait_sys();
+        let owner = spawn(&mut sys);
+        let waiter = spawn(&mut sys);
+        let h = sys.objects.insert(Object::Mutex {
+            owner: Some(owner),
+            recursion: 1,
+        });
+        block(
+            &mut sys,
+            waiter,
+            Wait::Objects {
+                handles: vec![h],
+                all: true,
+                deadline: None,
+                notification: None,
+            },
+        );
+        assert!(sys.terminate_context_stopped(owner, 0));
+        sys.wake();
+        assert!(matches!(
+            sys.contexts[waiter as usize].state,
+            super::State::Ready {
+                resume: Some(super::ReadyResume::Woke {
+                    reason: WakeReason::Objects {
+                        index: 0,
+                        abandoned: true
+                    },
+                    ..
+                })
+            }
+        ));
+        assert!(
+            matches!(sys.objects.get(h), Some(Object::Mutex { owner: Some(id), recursion: 1 }) if *id == waiter)
+        );
+    }
+
+    // spec: PROC-MACH-10, PROC-MACH-2
+    #[test]
+    fn deadlines_and_registrations_retire_on_notification_timeout_and_termination() {
+        let mut sys = wait_sys();
+        let now = sys.clock.now_us();
+        let id = spawn(&mut sys);
+        let h = event(&mut sys);
+        let alias = sys.objects.duplicate(h).unwrap();
+        let notification = event(&mut sys);
+        block(
+            &mut sys,
+            id,
+            Wait::Objects {
+                handles: vec![h],
+                all: true,
+                deadline: Some(now + 10),
+                notification: Some(notification),
+            },
+        );
+        sys.objects.close(h).unwrap();
+        assert_eq!(sys.next_deadline(), Some(now + 10));
+        sys.set_event(notification);
+        assert!(matches!(
+            sys.contexts[id as usize].state,
+            super::State::Ready {
+                resume: Some(super::ReadyResume::Woke {
+                    reason: WakeReason::Notified,
+                    ..
+                })
+            }
+        ));
+        assert_eq!(sys.next_deadline(), None);
+        sys.scheduler_work.polls.set(0);
+        sys.set_event(alias);
+        assert_eq!(sys.scheduler_work.polls.get(), 0);
+        sys.reset_event(alias);
+        block(
+            &mut sys,
+            id,
+            Wait::Object {
+                handle: alias,
+                deadline: Some(now + 20),
+            },
+        );
+        sys.clock.advance_to(now + 20);
+        sys.wake();
+        assert!(sys.context(id).is_ready());
+        assert_eq!(sys.next_deadline(), None);
+        block(
+            &mut sys,
+            id,
+            Wait::Object {
+                handle: alias,
+                deadline: Some(now + 30),
+            },
+        );
+        assert!(sys.terminate_context_stopped(id, 0));
+        assert_eq!(sys.next_deadline(), None);
+        sys.scheduler_work.polls.set(0);
+        sys.set_event(alias);
+        sys.wake();
+        assert_eq!(sys.scheduler_work.polls.get(), 0);
+        assert!(sys.contexts[id as usize].wait_objects.is_empty());
+    }
+
+    // spec: PROC-MACH-10, PROC-HANDLE-1
+    #[test]
+    fn shared_process_and_thread_completions_mark_their_waiters_changed() {
+        let mut sys = wait_sys();
+        let process = crate::process::ProcessIdentity::new(42);
+        let thread = std::sync::Arc::new(crate::process::Completion::default());
+        let handles = [
+            sys.objects.insert(Object::Process {
+                identity: process.clone(),
+                access: 0x100000,
+            }),
+            sys.objects.insert(Object::RemoteThread {
+                identity: crate::process::ThreadIdentity {
+                    process: process.clone(),
+                    context: 0,
+                    tid: 43,
+                    completion: thread.clone(),
+                },
+                access: 0x100000,
+            }),
+        ];
+        for h in handles {
+            let id = spawn(&mut sys);
+            block(
+                &mut sys,
+                id,
+                Wait::Object {
+                    handle: h,
+                    deadline: None,
+                },
+            );
+        }
+        process.completion.complete(0);
+        sys.wake();
+        assert!(sys.context(0).is_ready());
+        assert_eq!(sys.context(1).state_name(), "Blocked");
+        thread.complete(0);
+        sys.wake();
+        assert!(sys.context(1).is_ready());
+    }
+
     fn churn(machine: &mut Machine<JitCpu>, count: u32) -> Vec<(CtxId, Handle, u32, u32)> {
         let mut retained = Vec::new();
         for code in 1..=count {
@@ -613,6 +1008,7 @@ mod active_tests {
         assert!(machine.sys.wakes.slots.len() <= layout::MAX_CONTEXTS as usize);
     }
 
+    // spec: PROC-MACH-10
     #[test]
     fn sparse_execution_slots_do_not_visit_retired_contexts() {
         let mut machine = machine();
@@ -635,7 +1031,7 @@ mod active_tests {
             machine.run_slice(Duration::from_secs(1)),
             SliceResult::Complete(RunResult::Idle { .. })
         ));
-        assert_eq!(machine.sys.scheduler_work.polls.get(), 1);
+        assert_eq!(machine.sys.scheduler_work.polls.get(), 0);
         assert_eq!(machine.sys.scheduler_work.selections.get(), 2);
         assert_eq!(machine.sys.scheduler_work.scratch.get(), 0);
         assert_eq!(machine.sys.wakes.entries().len(), 1);

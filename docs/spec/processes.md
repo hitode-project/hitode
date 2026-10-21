@@ -16,6 +16,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: Each context MUST have one owner at a time. Wait registration, signal consumption, timeouts and cancellation MUST go through the same machine state. A host with no events MUST sleep on `WakeEvent`, which keeps pending notifications so wakeups are not lost.
 **Verification**: Test
 
+### PROC-MACH-10 Signal-driven waits
+
+**Rule**: Signaling MUST release satisfiable waiters in wait order per object. A wake pass MUST evaluate only changed objects and expired wait deadlines. Before the host idles, a full scan MUST release any wait an unsignaled state change satisfied.
+**Verification**: Test
+
 ### PROC-MACH-3 Continuations
 
 **Rule**: An API that needs a guest callback or a wait MUST save a continuation and resume it in the original thread context. Host object locks MUST NOT be held across guest execution or waits. Nonlocal unwinding MUST NOT be handled by relaxing continuation checks.

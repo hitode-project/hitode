@@ -100,6 +100,7 @@ fn nine_object_wait_keeps_grant_after_reset_and_later_wait() {
     );
 }
 
+// spec: PROC-MACH-10
 #[test]
 fn wait_all_does_not_consume_partial_sets_then_grants_atomically() {
     let (mut m, handles, _) = fixture(true, None, false);
@@ -130,6 +131,7 @@ fn wait_any_uses_lowest_index_and_wait_all_reports_abandoned_mutex() {
             *signaled = true;
         }
     }
+    m.sys.signal_waiters(handles[2]);
     assert!(matches!(m.run(), RunResult::Exited(2)));
     assert!(m.sys.try_acquire(handles[7]));
 
@@ -249,4 +251,15 @@ fn one_yield_before_signal_does_not_jump_virtual_time_to_waiter_timeout() {
         start,
         "yielding only hands off the CPU; the worker signals without a timed wait"
     );
+}
+
+// spec: PROC-MACH-10
+#[test]
+fn a_state_write_without_a_signal_still_wakes_its_waiter_before_the_host_idles() {
+    let (mut m, handles, _) = fixture(false, None, false);
+    if let Some(Object::Event { signaled, .. }) = m.sys.objects.get_mut(handles[3]) {
+        *signaled = true;
+    }
+    assert!(matches!(m.run(), RunResult::Exited(3)));
+    assert_eq!(m.sys.scheduling.missed_signal_wakes, 1);
 }
