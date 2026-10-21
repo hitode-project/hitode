@@ -33,7 +33,7 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
         h.digest128()
     };
     hash((
-        fixed_key(&d.fixed),
+        d.fixed.key(),
         d.shaders.vertex,
         d.shaders.pixel,
         d.buffers.declaration,

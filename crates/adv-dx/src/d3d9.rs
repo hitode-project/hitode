@@ -119,7 +119,7 @@ struct Device {
     /// Borrowed surface identity; its controlling resource has one internal ref.
     render_target: Option<Id>,
     buffers: buffers::Bindings,
-    fixed: fixed::Fixed,
+    fixed: fixed::CachedFixed,
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
     versions: [u64; 15],
@@ -971,7 +971,8 @@ fn create_device(
             return Outcome::Return(OUT_OF_MEMORY);
         }
     };
-    let mut fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+    let mut fixed =
+        fixed::CachedFixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     let device = Device {
         pointer: 0,
@@ -1220,7 +1221,7 @@ fn reset(
         d.gpu_lost = false;
         d.frame = recording::Recording::default();
         d.creation.reset();
-        d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+        *d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
         d.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     }
     depth::release_binding(env, old_depth);

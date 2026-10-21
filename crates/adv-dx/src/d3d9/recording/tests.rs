@@ -488,6 +488,103 @@ fn command_and_byte_limits_flush_complete_ordered_work_and_disable_partial_frame
     );
 }
 
+// spec: GFX-REC-2, GFX-SHADER-4
+#[test]
+fn fixed_key_cache_tracks_setters_stateblock_apply_and_reset_between_draws() {
+    fn check(f: &mut Fixture) -> (u128, u128) {
+        let pointer = f.device;
+        let e = env(f);
+        let d = device(&e, pointer).unwrap();
+        let fresh = fixed_key(&d.fixed);
+        assert_eq!(d.fixed.key(), fresh);
+        let empty = xxhash_rust::xxh3::Xxh3::new().digest128();
+        let expected = hash((
+            fresh,
+            d.shaders.vertex,
+            d.shaders.pixel,
+            d.buffers.declaration,
+            empty,
+            empty,
+        ));
+        assert_eq!(draw_key(&e, pointer), expected);
+        assert_eq!(draw_key(&e, pointer), expected);
+        (fresh, expected)
+    }
+    fn changed(f: &mut Fixture, old: &mut (u128, u128)) {
+        let new = check(f);
+        assert_ne!(new.0, old.0);
+        assert_ne!(new.1, old.1);
+        *old = new;
+    }
+    let mut f = fixture();
+    check(&mut f);
+    let d = f.device;
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    f.okay("IDirect3DDevice9::BeginScene", &[d]);
+    let vertices = f.packet([
+        [0f32.to_bits(), 0, 0, 1f32.to_bits(), 0xffffffff],
+        [8f32.to_bits(), 0, 0, 1f32.to_bits(), 0xffffffff],
+        [0, 8f32.to_bits(), 0, 1f32.to_bits(), 0xffffffff],
+    ]);
+    let draw = |f: &mut Fixture| {
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[d, 4, 1, vertices, 20],
+        );
+    };
+    draw(&mut f);
+    let mut old = check(&mut f);
+    let original = old;
+    let output = f.packet(0u32);
+    f.okay("IDirect3DDevice9::CreateStateBlock", &[d, 1, output]);
+    let block = f.m.cpu.read_u32(output).unwrap();
+    let matrix = f.packet([
+        1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0.25, 0., 0., 1.,
+    ]);
+    let viewport = f.packet(adv_abi::types::D3DVIEWPORT9 {
+        Width: 15,
+        Height: 12,
+        MaxZ: 1.,
+        ..adv_abi::types::D3DVIEWPORT9::default()
+    });
+    let scissor = f.packet(RECT {
+        left: 1,
+        top: 0,
+        right: 15,
+        bottom: 12,
+    });
+    let plane = f.packet([1f32, 0., 0., 0.]);
+    for (method, args) in [
+        ("SetRenderState", vec![d, 22, 1]),
+        ("SetTextureStageState", vec![d, 0, 1, 2]),
+        ("SetTextureStageState", vec![d, 2, 2, 1]),
+        ("SetSamplerState", vec![d, 0, 1, 3]),
+        ("SetSamplerState", vec![d, 1, 1, 3]),
+        ("SetTransform", vec![d, 256, matrix]),
+        ("SetViewport", vec![d, viewport]),
+        ("SetScissorRect", vec![d, scissor]),
+        ("SetClipPlane", vec![d, 0, plane]),
+    ] {
+        f.okay(&format!("IDirect3DDevice9::{method}"), &args);
+        draw(&mut f);
+        changed(&mut f, &mut old);
+    }
+    f.okay("IDirect3DStateBlock9::Apply", &[block]);
+    draw(&mut f);
+    changed(&mut f, &mut old);
+    assert_eq!(old, original);
+    f.okay("IDirect3DStateBlock9::Release", &[block]);
+    f.okay("IDirect3DDevice9::EndScene", &[d]);
+    let parameters = device(&env(&mut f), d).unwrap().parameters;
+    let parameters = f.packet(parameters);
+    f.okay("IDirect3DDevice9::Reset", &[d, parameters]);
+    changed(&mut f, &mut old);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    f.okay("IDirect3DDevice9::BeginScene", &[d]);
+    draw(&mut f);
+    assert_eq!(check(&mut f), original);
+}
+
 // spec: GFX-REC-2
 #[test]
 fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {

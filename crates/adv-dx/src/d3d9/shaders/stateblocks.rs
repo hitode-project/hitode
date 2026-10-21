@@ -1158,7 +1158,8 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        d.fixed.render.insert(7, 1 - d.fixed.render[&7]);
+        let fixed = &mut *d.fixed;
+        fixed.render.insert(7, 1 - fixed.render[&7]);
         d.versions[0] += 1;
         assert_eq!(apply(&mut env, this), 0);
         assert_eq!(apply(&mut env, this), 0);
@@ -1208,7 +1209,8 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        d.fixed.render.insert(7, 1 - d.fixed.render[&7]);
+        let fixed = &mut *d.fixed;
+        fixed.render.insert(7, 1 - fixed.render[&7]);
         d.versions[0] += 1;
         let b = block(&env, this.addr()).unwrap();
         let d = device(&env, pointer).unwrap();
@@ -1224,23 +1226,24 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        for value in d.fixed.render.values_mut() {
+        let fixed = &mut *d.fixed;
+        for value in fixed.render.values_mut() {
             *value ^= 1;
         }
-        for map in std::iter::once(&mut d.fixed.stage)
-            .chain(&mut d.fixed.stage_slots)
-            .chain(std::iter::once(&mut d.fixed.sampler))
-            .chain(d.fixed.sampler_slots.iter_mut().skip(1))
+        for map in std::iter::once(&mut fixed.stage)
+            .chain(&mut fixed.stage_slots)
+            .chain(std::iter::once(&mut fixed.sampler))
+            .chain(fixed.sampler_slots.iter_mut().skip(1))
         {
             for value in map.values_mut() {
                 *value ^= 1;
             }
         }
-        d.fixed.fvf ^= 4;
-        d.fixed.viewport.MinZ = -0.;
-        d.fixed.scissor.left = 1;
-        d.fixed.transforms.fill([2.; 16]);
-        d.fixed.clip_planes.fill([3.; 4]);
+        fixed.fvf ^= 4;
+        fixed.viewport.MinZ = -0.;
+        fixed.scissor.left = 1;
+        fixed.transforms.fill([2.; 16]);
+        fixed.clip_planes.fill([3.; 4]);
         for (constants, limit) in [
             (&mut d.shaders.vertex_constants, 256),
             (&mut d.shaders.pixel_constants, 224),
