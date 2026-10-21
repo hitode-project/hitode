@@ -104,7 +104,8 @@ fn mixer_open(env: &mut Env<'_>) -> Outcome {
 }
 
 fn mixer_close(_env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0) // MMSYSERR_NOERROR
+    // No successful mixerOpen can publish a handle in this profile.
+    Outcome::Return(INVALHANDLE)
 }
 
 // No mixer device exists, so queries fail as winmm does without one: a bad

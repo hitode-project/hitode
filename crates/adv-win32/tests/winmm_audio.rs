@@ -748,7 +748,7 @@ fn mixer_boundary<B: Backend>(cpu: B) {
     m.cpu.write_u32(DATA + 0x300, 0x18).unwrap(); // controls / details
     m.cpu.write_u32(DATA + 0x400, 0x17).unwrap();
     let mut code = start();
-    let calls: [(&str, [u32; 3], u32); 13] = [
+    let calls: [(&str, [u32; 3], u32); 14] = [
         ("mixerGetNumDevs", [0; 3], 0),
         ("mixerGetDevCapsW", [0, DATA + 0x500, 0x50], 2),
         ("mixerGetDevCapsA", [0, 0, 0x30], 11),
@@ -762,11 +762,13 @@ fn mixer_boundary<B: Backend>(cpu: B) {
         ("mixerGetControlDetailsA", [0, DATA + 0x400, 0], 11),
         ("mixerSetControlDetails", [0, DATA + 0x300, 0], 2),
         ("mixerOpen", [DATA + 0x600, 0, 0], 6),
+        ("mixerClose", [0xdead_beef, 0, 0], 5),
     ];
     for (index, (name, args, _)) in calls.iter().enumerate() {
         let args: &[u32] = match *name {
             "mixerGetNumDevs" => &[],
             "mixerOpen" => &[args[0], 0, 0, 0, 0],
+            "mixerClose" => &args[..1],
             _ => args,
         };
         call(&mut m, &mut code, name, args, index as u32);
@@ -778,6 +780,7 @@ fn mixer_boundary<B: Backend>(cpu: B) {
     assert_eq!(bytes(&m, DATA + 0x500, 0x50), vec![0; 0x50]);
 }
 #[test]
+// spec: MEDIA-AUDIO-5
 fn mixer_queries_without_a_device_fail_before_touching_their_structures() {
     mixer_boundary(JitCpu::new(PARK_ADDR, false).unwrap());
     mixer_boundary(JitCpu::new(PARK_ADDR, true).unwrap());

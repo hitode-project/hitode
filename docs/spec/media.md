@@ -37,10 +37,11 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 | low_lead_events | Cumulative low-lead transitions |
 | min_lead_ratio_permille | Lifetime minimum floor(1000 × lead / period); zero before any valid observation |
 
-### MEDIA-AUDIO-5 Absent MIDI devices
+### MEDIA-AUDIO-5 Absent MIDI and mixer devices
 
-**Rule**: MIDI input and output enumeration MUST report zero devices without capability warnings. Failed opens MUST NOT create handles or callbacks. Operations requiring an open handle MUST return `MMSYSERR_INVALHANDLE` without consuming buffers or changing LastError.
+**Rule**: MIDI input/output and mixer enumeration MUST report zero devices without capability warnings. Failed opens MUST NOT create handles or callbacks. Calls requiring an opened MIDI handle, and `mixerClose`, MUST return `MMSYSERR_INVALHANDLE` without changing buffers or LastError.
 **Verification**: Test
+**Basis**: [mixerClose](https://learn.microsoft.com/windows/win32/api/mmeapi/nf-mmeapi-mixerclose).
 
 ### MEDIA-AUDIO-6 MIDI error text
 
