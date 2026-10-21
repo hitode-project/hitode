@@ -373,9 +373,110 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
                 }
                 && reason.contains("dithering"))
     );
+    // An unrepresentable staging capacity fails before a backing-memory read.
+    // Only device metadata is enlarged; this fixture allocates no huge buffer.
+    let source_dc = m.cpu.read_u32(DATA + 128).unwrap();
+    let source_id = match m.ext.get::<Win32>().gdi.get(&m.sys.objects, source_dc) {
+        Some(adv_os::gdi::GdiObj::Dc { selected, .. }) => selected[3],
+        _ => panic!("missing source DC"),
+    };
+    let surface = m.ext.get_mut::<SurfaceStore>().get_mut(source_id).unwrap();
+    surface.width = i32::MAX as u32;
+    surface.height = i32::MAX as u32;
+    let mut before = [0; 64];
+    m.cpu.read(dst, &mut before).unwrap();
+    let warnings = m.ext.get::<ApiDiagnostics>().warnings.len();
+    let mut code = Asm::new(CODE + 2800);
+    call(
+        &mut m,
+        &mut code,
+        dll,
+        alpha,
+        &[
+            0xffff_0004,
+            0,
+            0,
+            1,
+            1,
+            0xffff_0000,
+            0,
+            0,
+            i32::MAX as u32,
+            i32::MAX as u32,
+            0x00ff0000,
+        ],
+        DATA + 400,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "kernel32.dll",
+        "GetLastError",
+        &[],
+        DATA + 404,
+    );
+    code.ret();
+    m.cpu.write(CODE + 2800, &code.bytes).unwrap();
+    m.spawn("composite allocation failure", CODE + 2800, &[], 65536)
+        .unwrap();
+    assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
+    let surface = m.ext.get_mut::<SurfaceStore>().get_mut(source_id).unwrap();
+    surface.width = 4;
+    surface.height = 4;
+    assert_eq!(m.cpu.read_u32(DATA + 400).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 404).unwrap(), 8);
+    let mut after = [0; 64];
+    m.cpu.read(dst, &mut after).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(m.ext.get::<ApiDiagnostics>().warnings.len(), warnings);
+    // Read-only DIB backing is an ordinary failed draw, not a host-call gap.
+    m.cpu.protect(arena, 65536, Prot::READ).unwrap();
+    let mut code = Asm::new(CODE + 3000);
+    call(
+        &mut m,
+        &mut code,
+        dll,
+        alpha,
+        &[0xffff_0004, 0, 0, 1, 1, 0xffff_0000, 0, 0, 1, 1, 0x00ff0000],
+        DATA + 400,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "kernel32.dll",
+        "GetLastError",
+        &[],
+        DATA + 404,
+    );
+    let name = if alias {
+        "GdiGradientFill"
+    } else {
+        "GradientFill"
+    };
+    call(
+        &mut m,
+        &mut code,
+        dll,
+        name,
+        &[0xffff_0004, DATA + 256, 3, DATA + 320, 1, 0],
+        DATA + 408,
+    );
+    code.ret();
+    m.cpu.write(CODE + 3000, &code.bytes).unwrap();
+    m.spawn("protected DIB backing", CODE + 3000, &[], 65536)
+        .unwrap();
+    let outcome = m.run_virtual(1_000_000);
+    assert!(matches!(outcome, RunResult::Exited(_)), "{outcome:?}");
+    m.cpu.protect(arena, 65536, Prot::RW).unwrap();
+    assert_eq!(m.cpu.read_u32(DATA + 400).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 404).unwrap(), 87);
+    assert_eq!(m.cpu.read_u32(DATA + 408).unwrap(), 0);
+    m.cpu.read(dst, &mut after).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(m.ext.get::<ApiDiagnostics>().warnings.len(), warnings);
 }
 #[test]
-// spec: GFX-BLIT-1 GFX-BLIT-2
+// spec: GFX-BLIT-1 GFX-BLIT-2 PERS-SCOPE-4
 fn alpha_and_color_key_transfers_share_pixels_and_aliases() {
     for alias in [false, true] {
         fixture(JitCpu::new(PARK_ADDR, false).unwrap(), alias);

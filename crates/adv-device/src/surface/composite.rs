@@ -9,6 +9,22 @@ pub enum Composite {
     ColorKey([u8; 3]),
 }
 
+#[derive(Debug)]
+pub enum CompositeError {
+    Allocation,
+    Storage(String),
+}
+impl From<String> for CompositeError {
+    fn from(value: String) -> Self {
+        Self::Storage(value)
+    }
+}
+impl From<&str> for CompositeError {
+    fn from(value: &str) -> Self {
+        Self::Storage(value.into())
+    }
+}
+
 impl<P: Presenter> Surfaces<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn composite(
@@ -19,7 +35,7 @@ impl<P: Presenter> Surfaces<P> {
         dr: BlitRect,
         operation: Composite,
         memory: &mut dyn SurfaceMemory,
-    ) -> Result<Rect, String> {
+    ) -> Result<Rect, CompositeError> {
         let s = self.get(source).ok_or("unknown source surface")?.clone();
         let d = self
             .get(destination)
@@ -65,11 +81,11 @@ impl<P: Presenter> Surfaces<P> {
         // first write. A failed transfer cannot leave a partially painted DIB.
         let count = (sr.w as usize)
             .checked_mul(sr.h as usize)
-            .ok_or("composite size overflow")?;
+            .ok_or(CompositeError::Allocation)?;
         let mut pixels = Vec::new();
         pixels
             .try_reserve_exact(count)
-            .map_err(|_| "composite allocation failed")?;
+            .map_err(|_| CompositeError::Allocation)?;
         for y in sr.y..sr.y + sr.h {
             let row = s.read_pixels(memory, sr.x, y, sr.w)?;
             pixels.extend(

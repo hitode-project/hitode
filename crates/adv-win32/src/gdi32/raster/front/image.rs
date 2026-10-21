@@ -1,7 +1,7 @@
 //! MSIMG32 and GDI32 aliases share the same DCs, pixels and compositing service.
 use super::*;
 use adv_abi::types::BLENDFUNCTION;
-use adv_device::surface::{Composite, PixelFormat};
+use adv_device::surface::{Composite, CompositeError, PixelFormat};
 
 pub(super) fn register(registry: &mut Registry) {
     for (api, alias) in [
@@ -166,7 +166,7 @@ fn transfer(
         }
         let clip = dcs.clip(objects, dst.0);
         let mut clipped = clip::ClippedMemory::new(memory, d.clone(), &clip);
-        surfaces.composite(
+        let result = surfaces.composite(
             src_id,
             Rect {
                 x: sx as u32,
@@ -183,7 +183,12 @@ fn transfer(
             },
             operation,
             &mut clipped,
-        )?;
+        );
+        match result {
+            Ok(_) => {}
+            Err(CompositeError::Allocation) => return Ok(raster.fail(8)),
+            Err(CompositeError::Storage(_)) => return Ok(raster.fail(87)),
+        }
         if dcs.is_window_dc(objects, dst.0) {
             surfaces.present_from(raster.context, dst_id, &clipped, clipped.damage())?;
         }
@@ -301,10 +306,13 @@ fn gradient(
         let clip = dcs.clip(objects, dc.0);
         let mut clipped = clip::ClippedMemory::new(memory, surface, &clip);
         for [a, b, c] in shapes {
-            if mode == 2 {
-                surfaces.gradient_triangle(id, [points[a], points[b], points[c]], &mut clipped)?;
+            let result = if mode == 2 {
+                surfaces.gradient_triangle(id, [points[a], points[b], points[c]], &mut clipped)
             } else {
-                surfaces.gradient_rectangle(id, [points[a], points[b]], mode == 0, &mut clipped)?;
+                surfaces.gradient_rectangle(id, [points[a], points[b]], mode == 0, &mut clipped)
+            };
+            if result.is_err() {
+                return Ok(raster.fail(87));
             }
         }
         if dcs.is_window_dc(objects, dc.0) {
