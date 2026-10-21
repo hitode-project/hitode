@@ -85,7 +85,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-OBJECT-8 Overlay whiteouts
 
-**Rule**: Deleting a read-only game file MUST record a persistent whiteout instead of failing. The file MUST stay hidden until the guest writes that name again. Directory lookups MUST be answered from an index that only VFS-made changes invalidate, so host changes made outside the runtime during a run stay invisible.
+**Rule**: Deleting read-only game files MUST persist whiteouts, hiding names until rewritten. Non-Windows Win32 file renames over read-only layers MUST preserve originals and live owners, persistently hide old names, and preserve visibility on failure. Directory lookups MUST be answered from an index that only VFS-made changes invalidate, so host changes made outside the runtime during a run stay invisible.
 **Verification**: Test
 
 ### WIN32-OBJECT-9 Shared small heap blocks

@@ -573,6 +573,293 @@ fn move_ex_replaces_a_save_without_changing_live_source_identity() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(not(windows))]
+#[test]
+// spec: WIN32-OBJECT-8
+fn move_aw_rotates_read_only_saves_and_transfers_live_owners() {
+    use std::io::{Read, Seek, SeekFrom};
+    for api in ["MoveFileA", "MoveFileW", "MoveFileExA", "MoveFileExW"] {
+        for shadow in [false, true] {
+            let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+            machine
+                .spawn("authored save rotation", CODE, &[], 65536)
+                .unwrap();
+            let wide = api.ends_with('W');
+            let extended = api.contains("Ex");
+            let source = if wide { "保存01.dat" } else { "slot01.dat" };
+            let target = if wide { "保存02.dat" } else { "slot02.dat" };
+            adv_os::vfs::host::write(&root.join("game").join(source), b"base1234").unwrap();
+            adv_os::vfs::host::write(&root.join("game").join(target), b"previous").unwrap();
+            if shadow {
+                adv_os::vfs::host::write(&root.join("data/overlay").join(source), b"edit5678")
+                    .unwrap();
+            }
+            let first =
+                crate::kernel32::open_with_share(&mut env(&mut machine), source, 0x80000000, 3, 5);
+            let second =
+                crate::kernel32::open_with_share(&mut env(&mut machine), source, 0x80000000, 3, 5);
+            assert_ne!(first, u32::MAX);
+            assert_ne!(second, u32::MAX);
+            let alias = machine.sys.objects.duplicate(first).unwrap();
+            for (h, offset) in [(first, 2), (second, 4)] {
+                machine
+                    .sys
+                    .objects
+                    .host_mut::<crate::FileObj>(h)
+                    .unwrap()
+                    .file
+                    .seek(SeekFrom::Start(offset))
+                    .unwrap();
+            }
+            let owner = machine.sys.objects.host::<crate::FileObj>(first).unwrap();
+            let old_identity = owner.file.cached_identity();
+            let section = machine
+                .ext
+                .get::<Win32>()
+                .vfs
+                .sections
+                .file(owner.file.host().unwrap().try_clone().unwrap(), 8, false)
+                .unwrap();
+            for (offset, name) in [(0, source), (128, target)] {
+                let bytes: Vec<_> = if wide {
+                    name.encode_utf16()
+                        .chain([0])
+                        .flat_map(u16::to_le_bytes)
+                        .collect()
+                } else {
+                    [name.as_bytes(), &[0]].concat()
+                };
+                machine.cpu.write(DATA + offset, &bytes).unwrap();
+            }
+            let mut code = Asm::new(CODE);
+            if extended {
+                code.push_imm(9); // REPLACE_EXISTING | WRITE_THROUGH
+            } else {
+                code.push_imm(DATA + 128).call(
+                    machine
+                        .resolve_import(
+                            "kernel32.dll",
+                            if wide { "DeleteFileW" } else { "DeleteFileA" },
+                        )
+                        .unwrap(),
+                );
+            }
+            code.push_imm(DATA + 128)
+                .push_imm(DATA)
+                .call(machine.resolve_import("kernel32.dll", api).unwrap())
+                .mov_mem_eax(DATA + 256);
+            code.bytes.extend([0x31, 0xc0]);
+            code.ret();
+            machine.cpu.write(CODE, &code.bytes).unwrap();
+            let run = machine.run_virtual(1_000_000);
+            assert!(matches!(run, RunResult::Exited(0)), "{run:?}");
+            assert_eq!(
+                machine.cpu.read_u32(DATA + 256).unwrap(),
+                1,
+                "{api}, shadow={shadow}"
+            );
+            let vfs = &machine.ext.get::<Win32>().vfs;
+            assert!(vfs.lookup(source).is_none());
+            let path = vfs.lookup(target).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                if shadow { b"edit5678" } else { b"base1234" }
+            );
+            let new_identity = machine
+                .sys
+                .objects
+                .host::<crate::FileObj>(first)
+                .unwrap()
+                .file
+                .cached_identity();
+            assert_eq!(old_identity == new_identity, shadow);
+            assert!(std::rc::Rc::ptr_eq(
+                &section,
+                &vfs.sections.lookup(new_identity.unwrap()).unwrap()
+            ));
+            for (h, offset) in [(first, 2), (alias, 2), (second, 4)] {
+                let file = machine.sys.objects.host::<crate::FileObj>(h).unwrap();
+                assert_eq!(file.file.cached_identity(), new_identity);
+                assert_eq!(file.file.stream_position().unwrap(), offset);
+                assert_eq!(file.guest_path, format!(r"C:\Game\{target}"));
+            }
+            adv_os::vfs::host::write(&path, b"next9012").unwrap();
+            assert_eq!(&section.page(0).snapshot().unwrap()[..8], b"next9012");
+            let mut bytes = [0; 8];
+            let file = &mut machine
+                .sys
+                .objects
+                .host_mut::<crate::FileObj>(alias)
+                .unwrap()
+                .file;
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"next9012");
+            assert_eq!(
+                std::fs::read(root.join("game").join(source)).unwrap(),
+                b"base1234"
+            );
+            assert_eq!(
+                std::fs::read(root.join("game").join(target)).unwrap(),
+                b"previous"
+            );
+            drop(section);
+            drop(machine);
+            let cfg = crate::Win32Config::new(root.join("game"), "authored.exe", root.join("data"));
+            let vfs = adv_os::Vfs::new(&cfg.os);
+            assert!(vfs.lookup(source).is_none());
+            assert_eq!(
+                std::fs::read(vfs.lookup(target).unwrap()).unwrap(),
+                b"next9012"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+// spec: WIN32-OBJECT-8
+fn read_only_save_move_failures_preserve_names_and_contents() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("authored save failures", PARK_ADDR, &[], 65536)
+        .unwrap();
+    for (name, content) in [("source.dat", b"source"), ("target.dat", b"target")] {
+        adv_os::vfs::host::write(&root.join("game").join(name), content).unwrap();
+    }
+    assert_eq!(
+        returned(rename(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "target.dat".into()
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 183);
+    let h =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "source.dat", 0x80000000, 3, 1);
+    assert_eq!(
+        returned(rename(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "new.dat".into()
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 32);
+    crate::ntdll::file::close(&mut env(&mut machine), Handle(h));
+    let h =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "target.dat", 0x80000000, 3, 7);
+    assert_eq!(
+        returned(move_ex(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            Some("target.dat".into()),
+            1
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 5);
+    crate::ntdll::file::close(&mut env(&mut machine), Handle(h));
+    assert_eq!(
+        returned(rename(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "missing/new.dat".into()
+        )),
+        0
+    );
+    assert_eq!(last(&mut machine), 3);
+    assert!(!root.join("data/overlay/source.dat").exists());
+    // A failed whiteout write must not publish a replacement or lose either save.
+    std::fs::create_dir(root.join("data/whiteouts")).unwrap();
+    assert_eq!(
+        returned(move_ex(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            Some("target.dat".into()),
+            1
+        )),
+        0
+    );
+    let vfs = &machine.ext.get::<Win32>().vfs;
+    assert_eq!(
+        std::fs::read(vfs.lookup("source.dat").unwrap()).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        std::fs::read(vfs.lookup("target.dat").unwrap()).unwrap(),
+        b"target"
+    );
+    assert!(!root.join("data/overlay/target.dat").exists());
+    assert_eq!(
+        std::fs::read(root.join("game/source.dat")).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        std::fs::read(root.join("game/target.dat")).unwrap(),
+        b"target"
+    );
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+// spec: WIN32-OBJECT-8
+fn read_only_mode_source_renames_without_requesting_write_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("authored read-only save", PARK_ADDR, &[], 65536)
+        .unwrap();
+    let original = root.join("game/source.dat");
+    adv_os::vfs::host::write(&original, b"source").unwrap();
+    std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let handle =
+        crate::kernel32::open_with_share(&mut env(&mut machine), "source.dat", 0x80000000, 3, 5);
+    let file = machine
+        .sys
+        .objects
+        .host::<crate::FileObj>(handle)
+        .unwrap()
+        .file
+        .host()
+        .unwrap()
+        .try_clone()
+        .unwrap();
+    let section = machine
+        .ext
+        .get::<Win32>()
+        .vfs
+        .sections
+        .file(file, 6, false)
+        .unwrap();
+    assert_eq!(
+        returned(rename(
+            &mut env(&mut machine),
+            "source.dat".into(),
+            "renamed.dat".into()
+        )),
+        1
+    );
+    let target = machine
+        .ext
+        .get::<Win32>()
+        .vfs
+        .lookup("renamed.dat")
+        .unwrap();
+    // Change only the fixture's writable copy to prove lazy mapped reads use it.
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    adv_os::vfs::host::write(&target, b"target").unwrap();
+    assert_eq!(&section.page(0).snapshot().unwrap()[..6], b"target");
+    assert_eq!(std::fs::read(&original).unwrap(), b"source");
+    drop(section);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn move_ex_refuses_live_destination_and_unsupported_flags_before_mutation() {
     let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap());
