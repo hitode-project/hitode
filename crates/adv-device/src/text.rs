@@ -536,6 +536,11 @@ pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// Each cached native font owns a font and a private measurement DC. Glyph
 /// results are immutable and remain valid after the native owner is evicted.
 pub const FONT_CACHE_CAPACITY: usize = 128;
+/// Start the installed-font scan before the guest first needs it.
+pub fn prefetch_system_fonts() {
+    #[cfg(not(windows))]
+    portable::prefetch_system_fonts();
+}
 impl Text {
     pub fn set_overrides(&mut self, overrides: Overrides) {
         self.invalidate_fonts();

@@ -193,6 +193,7 @@ impl<B: Backend> Runtime<B> {
         height: u32,
         codec: crate::vorbis::Policy,
     ) -> Result<Self, String> {
+        adv_device::text::prefetch_system_fonts();
         let exe_path = exe_path
             .as_ref()
             .canonicalize()
