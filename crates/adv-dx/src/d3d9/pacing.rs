@@ -74,6 +74,8 @@ pub(super) fn finish(
         Some(time) if time > env.sys.clock.now_us() => {
             // This remains the single Machine timed-wait path. GPU fence/object
             // waits retain their distinct, non-skippable completion semantics.
+            // Display boundaries are not timer ticks.
+            env.sys.keep_exact_deadline();
             Outcome::block_then_return(Wait::Until(time), result)
         }
         _ => Outcome::Return(result),
