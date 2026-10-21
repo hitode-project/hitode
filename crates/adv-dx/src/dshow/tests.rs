@@ -252,6 +252,45 @@ fn graph_faces_share_identity_and_report_state() {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-1
+fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let splitter = activate(&mut m, CLSID_MPEG1_SPLITTER, IID_IBASEFILTER);
+    let decoder = activate(&mut m, CLSID_MPEG_VIDEO_CODEC, IID_IBASEFILTER);
+    for filter in [splitter, decoder] {
+        assert_eq!(
+            method(&mut m, "IFilterGraph2::AddFilter", &[graph, filter, 0]),
+            S_OK
+        );
+    }
+    assert_eq!(
+        method(&mut m, "IFilterGraph2::EnumFilters", &[graph, DATA]),
+        S_OK
+    );
+    let filters = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(
+        method(&mut m, "IFilterGraph2::RemoveFilter", &[graph, splitter]),
+        S_OK
+    );
+    assert_eq!(
+        method(&mut m, "IEnumFilters::Next", &[filters, 1, DATA + 16, 0]),
+        VFW_E_ENUM_OUT_OF_SYNC
+    );
+    assert_eq!(
+        method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
+        VFW_E_ENUM_OUT_OF_SYNC
+    );
+    // Reset takes the live list, which now holds only the decoder.
+    assert_eq!(method(&mut m, "IEnumFilters::Reset", &[filters]), S_OK);
+    assert_eq!(method(&mut m, "IEnumFilters::Skip", &[filters, 1]), S_OK);
+    assert_eq!(
+        method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
+        E_INVALIDARG
+    );
+}
+
+#[test]
 fn system_filters_expose_pins_and_join_the_graph() {
     let mut m = machine();
     let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);

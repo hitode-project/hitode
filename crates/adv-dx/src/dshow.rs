@@ -43,6 +43,7 @@ pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;
 pub(crate) const VFW_E_NOT_COMMITTED: u32 = 0x8004_0211;
 pub(crate) const VFW_E_WRONG_STATE: u32 = 0x8004_0227;
 pub(crate) const VFW_E_NOT_FOUND: u32 = 0x8004_0216;
+pub(crate) const VFW_E_ENUM_OUT_OF_SYNC: u32 = 0x8004_0203;
 pub(crate) const VFW_E_UNSUPPORTED_STREAM: u32 = 0x8004_0265;
 
 /// A GUID in its in-memory (little-endian first three fields) byte order.
@@ -269,7 +270,10 @@ pub(crate) enum Obj {
     Graph,
     Filter,
     Pin,
+    /// A snapshot of `graph`'s filters; quartz reports VFW_E_ENUM_OUT_OF_SYNC
+    /// once the graph changes, until Reset takes a new snapshot.
     EnumFilters {
+        graph: u32,
         list: Vec<u32>,
         position: usize,
     },
