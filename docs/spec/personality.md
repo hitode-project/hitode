@@ -198,4 +198,11 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock DLL aliases MUST reuse initialization state and local arithmetic.
 **Verification**: Test
 
+## Filesystem identity
+
+### PERS-FILE-1 Invariant filesystem names
+
+**Rule**: Filesystem name matching MUST use the shared invariant UTF-16 case mapping on every host. Non-ASCII names MUST use the same directory index and invalidation rules as ASCII names.
+**Verification**: Test
+
 Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9

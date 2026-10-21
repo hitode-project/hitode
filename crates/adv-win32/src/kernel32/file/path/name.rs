@@ -357,6 +357,7 @@ mod tests {
         std::fs::write(root.join("game/Mix Dir/表データ.dat"), b"base").unwrap();
         std::fs::create_dir_all(root.join("data/overlay/mix dir")).unwrap();
         std::fs::write(root.join("data/overlay/mix dir/表データ.dat"), b"overlay").unwrap();
+        std::fs::write(root.join("game/Mix Dir/😀.dat"), b"unicode").unwrap();
         let path = "MIX DIR\\表データ.dat";
         let expected = "mix dir\\表データ.dat";
         for wide in [false, true] {
@@ -372,7 +373,7 @@ mod tests {
             );
             assert_eq!(read(&mut machine, 0x410100, wide), expected);
         }
-        std::fs::write(root.join("game/Mix Dir/😀.dat"), b"unicode").unwrap();
+
         let path = "MIX DIR\\😀.dat";
         let expected = "mix dir\\😀.dat";
         assert_eq!(
@@ -418,7 +419,13 @@ mod tests {
                 } else {
                     machine.ext.get::<Win32>().codec.encode(expected).len()
                 } as u32;
-                assert_eq!(call(&mut machine, input, wide, true, 128, 0x410100), length);
+                let actual = call(&mut machine, input, wide, true, 128, 0x410100);
+                assert_eq!(
+                    actual,
+                    length,
+                    "input={input:?}, wide={wide}, error={}",
+                    crate::util::last_error(&env(&mut machine))
+                );
                 assert_eq!(read(&mut machine, 0x410100, wide), expected);
             }
         }

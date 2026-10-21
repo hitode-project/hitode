@@ -20,7 +20,7 @@ pub(super) enum Kind {
 
 /// Folded name to the entries spelled that way, in enumeration order.
 /// `None` records a directory that does not exist or cannot be listed.
-type Listing = Option<HashMap<String, Vec<(OsString, Kind)>>>;
+type Listing = Option<HashMap<Vec<u16>, Vec<(OsString, Kind)>>>;
 
 #[derive(Default)]
 struct Index {
@@ -45,12 +45,14 @@ pub(super) fn uncached() -> u64 {
     UNCACHED.load(Ordering::Relaxed)
 }
 
-fn key(name: &str) -> String {
-    name.to_ascii_lowercase()
+fn key(name: &str) -> Vec<u16> {
+    name.encode_utf16()
+        .map(|unit| crate::nls::unit_case(unit, true))
+        .collect()
 }
 
 fn read(dir: &Path) -> Listing {
-    let mut names: HashMap<String, Vec<(OsString, Kind)>> = HashMap::new();
+    let mut names: HashMap<Vec<u16>, Vec<(OsString, Kind)>> = HashMap::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let kind = match entry.file_type() {
             Ok(kind) if kind.is_dir() => Kind::Dir,
@@ -87,14 +89,14 @@ fn listing(dir: &Path) -> Arc<Listing> {
     listing
 }
 
-/// Names the host resolves itself: non-ASCII folding, and on Windows short
-/// names and the trailing dots and spaces Win32 strips.
+/// Windows-only filesystem aliases that cannot be answered from directory
+/// entries. Unicode spelling belongs to the shared invariant name index.
 fn host_resolved(name: &str) -> bool {
-    !name.is_ascii() || cfg!(windows) && (name.contains('~') || name.ends_with(['.', ' ']))
+    cfg!(windows) && (name.contains('~') || name.ends_with(['.', ' ']))
 }
 
-/// Host entry in `dir` whose name matches `name` ASCII case-insensitively.
-/// An ASCII name never matches a non-ASCII entry under Windows upcasing.
+/// Host entry in `dir` whose name matches the shared Windows invariant casing.
+/// A case-sensitive host must not resolve Unicode paths with different rules.
 pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
     if host_resolved(name) {
         if INDEX.lock().unwrap().volatile.iter().any(|v| v == dir) {
@@ -161,7 +163,7 @@ pub(super) mod tests {
     pub(in crate::vfs) static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
     #[test]
-    // spec: WIN32-OBJECT-8
+    // spec: WIN32-OBJECT-8, PERS-FILE-1
     fn the_index_answers_until_its_directory_is_invalidated() {
         let _held = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -208,8 +210,18 @@ pub(super) mod tests {
         volatile(&root.join("Sub"));
         std::fs::write(root.join("Sub/X"), b"").unwrap();
         assert_eq!(find(&root.join("Sub"), "x"), file(&root.join("Sub/X")));
+        assert_eq!(find(&root, "é.txt"), None);
         std::fs::write(root.join("É.TXT"), b"unicode").unwrap();
-        assert_eq!(find(&root, "é.txt").is_some(), root.join("é.txt").exists());
+        assert_eq!(
+            find(&root, "é.txt"),
+            None,
+            "Unicode host writes also stay invisible"
+        );
+        invalidate(&root.join("É.TXT"));
+        assert_eq!(find(&root, "é.txt"), file(&root.join("É.TXT")));
+        std::fs::write(root.join("表a.BIN"), b"mixed Unicode and ASCII").unwrap();
+        invalidate(&root.join("表a.BIN"));
+        assert_eq!(find(&root, "表A.bin"), file(&root.join("表a.BIN")));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
