@@ -610,11 +610,12 @@ fn command(e: &mut Env<'_>, id: u32, d: Device, message: u32, flags: u32, p: u32
             }
             let item = e.cpu.read_u32(p + 8).unwrap_or(0);
             match item {
-                4 | 5 | 6 | 7 | 0x4001 => {
+                4 | 5 | 6 | 7 | 0x4001 | 0x4019 => {
                     let value = match item {
                         4 => d.mode,
                         5 | 7 => 1,
                         6 => d.format,
+                        0x4019 => d.volume[0].max(d.volume[1]),
                         _ => d.window,
                     };
                     Outcome::Return(

@@ -203,4 +203,9 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 **Rule**: Other MCI devices, string verbs outside digital video, and unsupported commands or flags MUST fail explicitly with MCI parser or device errors. MCI front ends MUST NOT invoke host MCI.
 **Verification**: Test
 
+### MEDIA-MCI-4 MCIWnd lifecycle
+
+**Rule**: MCIWndCreateA/W and MCIWndRegisterClass MUST share a USER class and MCI digital-video lifecycle, with x86 cdecl entry points. Failed opens MUST retain an empty window and queryable error, and destruction MUST close its device. Unsupported toolbar, recording, caption, notification, and window commands MUST fail explicitly.
+**Verification**: Test
+
 Withdrawn: none

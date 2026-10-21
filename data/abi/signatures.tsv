@@ -3796,6 +3796,9 @@ msvfw32.dll	DrawDibDraw	stdcall	i32	Windows.Win32.Foundation.BOOL	hdd:Windows.Wi
 msvfw32.dll	DrawDibOpen	stdcall	handle	Windows.Win32.Foundation.HANDLE	
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
+msvfw32.dll	MCIWndCreateA	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:Windows.Win32.Foundation.HWND:handle:1|hInstance:Windows.Win32.Foundation.HINSTANCE:handle:1|dwStyle:u32:u32:1|szFile:Windows.Win32.Foundation.PCSTR:str8:1
+msvfw32.dll	MCIWndCreateW	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:Windows.Win32.Foundation.HWND:handle:1|hInstance:Windows.Win32.Foundation.HINSTANCE:handle:1|dwStyle:u32:u32:1|szFile:Windows.Win32.Foundation.PCWSTR:str16:1
+msvfw32.dll	MCIWndRegisterClass	cdecl	i32	Windows.Win32.Foundation.BOOL	
 ntdll.dll	CsrClientCallServer	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Message:void*:ptr:1|CaptureBuffer:void*:ptr:1|ApiNumber:u32:u32:1|DataLength:u32:u32:1
 ntdll.dll	LdrGetProcedureAddress	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1
 ntdll.dll	LdrLoadDll	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllPath:Windows.Win32.Foundation.PCWSTR:str16:1|DllCharacteristics:u32*:ptr:1|DllName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|DllHandle:void**:ptr:1

@@ -190,6 +190,7 @@ pub struct Class {
 /// Per-window state of built-in controls and dialogs.
 #[derive(Default)]
 pub struct ControlState {
+    pub(crate) mci: Option<crate::vfw::mciwnd::State>,
     pub(crate) properties: Vec<(u16, u32, bool)>,
     pub(crate) update: super::update::UpdateRegion,
     pub(crate) scrolls: Option<[super::scroll::ScrollState; 2]>,
@@ -1194,7 +1195,7 @@ pub fn create_window(
 
 /// A/W creation shares one lifecycle. Registered guest classes retain their ABI;
 /// dual-encoding built-in classes inherit the caller's encoding.
-pub(super) fn create_window_encoded(
+pub(crate) fn create_window_encoded(
     env: &mut Env<'_>,
     mut p: CreateParams,
     wide: bool,
