@@ -122,6 +122,18 @@ which are also absent from the pinned WinMD. `sdk-com-source.json` records the
 installed `um/dxdiag.h` header hash. These declarations merge into the same
 `com.tsv`; the generator rejects duplicate, reordered or incomplete slots.
 
+## CRT export catalog
+
+WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports:
+msvcrt, msvcrt20/40, msvcr70 through msvcr120, ucrtbase, vcruntime140, msvcp60 and the UCRT API-set contracts.
+Names and the data flag come from the public-domain mingw-w64-crt module definitions, preprocessed for i386; `crt-exports-source.json` pins the commit and file hashes.
+The catalog states existence only, never a convention or implementation promise; `tools/survey/coverage.py` compares it and `signatures.tsv` against registered APIs.
+
+```sh
+python tools/abi/crt_exports.py --mingw <mingw-w64-checkout> --check
+python -m unittest discover -s tools/abi -p test_crt_exports.py
+```
+
 ## SDK CRT declarations
 
 WinMD omits CRT exports. `data/abi/crt-input.tsv` supplies supported x86 scalar
