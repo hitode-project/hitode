@@ -3,10 +3,13 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) struct Whiteouts {
     index: PathBuf,
     paths: Mutex<BTreeSet<String>>,
+    /// Advances after every committed change.
+    generation: AtomicU64,
 }
 
 fn key(rel: &[String]) -> String {
@@ -29,7 +32,12 @@ impl Whiteouts {
         Self {
             index,
             paths: Mutex::new(paths),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub(super) fn contains(&self, rel: &[String]) -> bool {
@@ -57,6 +65,7 @@ impl Whiteouts {
         std::fs::write(&staged, text)?; // host-only: whiteout index
         std::fs::rename(&staged, &self.index)?; // host-only: whiteout index
         *paths = next;
+        self.generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 }
