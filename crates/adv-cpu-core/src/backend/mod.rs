@@ -459,6 +459,12 @@ pub trait Backend: Guest {
     /// Drop any translated code overlapping `[addr, addr+len)` (after the host patches code).
     fn invalidate_code(&mut self, addr: u32, len: u32);
 
+    /// Guest instructions completed so far, telling loop iterations apart
+    /// (PROC-CLOCK-5). Zero when the backend does not count them.
+    fn retired_instructions(&self) -> u64 {
+        0
+    }
+
     /// Count executed translation blocks (measurement only; it slows execution).
     fn set_block_counting(&mut self, _on: bool) {}
 

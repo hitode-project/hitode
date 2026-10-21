@@ -25,11 +25,16 @@ use crate::{ExecutionContext, Executor};
 /// Queue capacity of a background service the CPU starts itself.
 const CAPACITY: usize = 8;
 
+/// Instructions one executor call may complete; the deadline bounds a run instead.
+const FUEL: u64 = u64::MAX >> 2;
+
 pub struct Cpu {
     inner: Executor,
     park: u32,
     budget: Option<Duration>,
     native: bool,
+    /// Guest instructions completed by finished runs.
+    retired: u64,
     wake: Option<WakeEvent>,
     sender: Option<LocalSender>,
     service: Option<Rc<Service>>,
@@ -48,6 +53,7 @@ impl Cpu {
             park,
             budget: Some(Duration::from_secs(5)),
             native,
+            retired: 0,
             wake: None,
             sender: None,
             service: None,
@@ -558,7 +564,8 @@ impl Backend for Cpu {
                 handler,
                 images: &images,
             };
-            let result = m.run_with_traps(self.park, u64::MAX >> 2, &mut raw, !self.native);
+            let result = m.run_with_traps(self.park, FUEL, &mut raw, !self.native);
+            self.retired += FUEL - m.state.fuel;
             let kind = match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;
@@ -593,6 +600,9 @@ impl Backend for Cpu {
                 pc: m.state.eip,
             });
         }
+    }
+    fn retired_instructions(&self) -> u64 {
+        self.retired
     }
     fn invalidate_code(&mut self, addr: u32, len: u32) {
         let memory = &mut self.inner.memory;
