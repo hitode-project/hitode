@@ -24,6 +24,7 @@ mod mutation;
 mod names;
 #[cfg(not(windows))]
 pub use mutation::sync_move;
+mod installer_state;
 mod optical;
 mod portable_saves;
 mod section;
@@ -156,6 +157,11 @@ impl Vfs {
         } else {
             root
         };
+        names::clear();
+        if let Err(e) = installer_state::complete(cfg) {
+            log::warn!("completing the copied game's installer state failed: {e}");
+        }
+        // Installer discovery must not seed the run's directory snapshot.
         names::clear();
         let portable_saves = cfg.write_game
             && match portable_saves::migrate(cfg) {

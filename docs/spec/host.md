@@ -342,6 +342,11 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Rule**: With `MOVEFILE_WRITE_THROUGH`, a cross-volume move MUST flush the copy before deleting the source. A failed flush or a denied delete MUST keep the source.
 **Verification**: Test
 
+### HOST-SAVE-5 Copied installer state
+
+**Rule**: A game folder holding an empty Silky's Plus `<exe>_inst.xml` template MUST get the installer's per-user state on first run. The filled file MUST name the guest game root and executable, and the `save` template MUST be copied beside it unless portable saves serve it.
+**Verification**: Test
+
 ## macOS packaging
 
 ### HOST-PKG-1 FFmpeg build
