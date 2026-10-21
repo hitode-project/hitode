@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 const MAX_DIRECTORIES: usize = 4096;
@@ -32,6 +33,17 @@ struct Index {
 }
 
 static INDEX: LazyLock<Mutex<Index>> = LazyLock::new(Mutex::default);
+/// Counts answers the index does not hold: volatile or racing listings and
+/// entries that resolve through the host. Callers memoize only without them.
+static UNCACHED: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn generation() -> u64 {
+    INDEX.lock().unwrap().generation
+}
+
+pub(super) fn uncached() -> u64 {
+    UNCACHED.load(Ordering::Relaxed)
+}
 
 fn key(name: &str) -> String {
     name.to_ascii_lowercase()
@@ -69,6 +81,8 @@ fn listing(dir: &Path) -> Arc<Listing> {
             index.dirs.clear();
         }
         index.dirs.insert(dir.to_owned(), listing.clone());
+    } else {
+        UNCACHED.fetch_add(1, Ordering::Relaxed);
     }
     listing
 }
@@ -83,6 +97,9 @@ fn host_resolved(name: &str) -> bool {
 /// An ASCII name never matches a non-ASCII entry under Windows upcasing.
 pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
     if host_resolved(name) {
+        if INDEX.lock().unwrap().volatile.iter().any(|v| v == dir) {
+            UNCACHED.fetch_add(1, Ordering::Relaxed);
+        }
         let path = dir.join(name);
         let metadata = std::fs::metadata(&path).ok()?;
         let kind = if metadata.is_dir() {
@@ -99,6 +116,9 @@ pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
         .iter()
         .find(|(spelling, _)| spelling.as_os_str() == name)
         .unwrap_or(&spellings[0]);
+    if *kind == Kind::Other {
+        UNCACHED.fetch_add(1, Ordering::Relaxed);
+    }
     Some((dir.join(spelling), *kind))
 }
 
@@ -133,12 +153,12 @@ pub(super) fn volatile(dir: &Path) {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// Parallel tests construct Vfs instances, whose `clear` would drop the
     /// cached listings this test relies on to ignore unannounced changes.
-    pub(super) static EXCLUSIVE: Mutex<()> = Mutex::new(());
+    pub(in crate::vfs) static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
     #[test]
     // spec: WIN32-OBJECT-8

@@ -11,8 +11,9 @@
 //! * The VFS owns the guest namespace: host entries change only through `host`,
 //!   so directory lookups are answered from memory (WIN32-OBJECT-8).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::OsConfig;
@@ -90,6 +91,18 @@ pub struct Vfs {
     install: Option<PathBuf>,
     other: PathBuf,
     optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
+    memo: Mutex<Memo>,
+}
+
+const MEMO_ENTRIES: usize = 4096;
+
+/// Entries by raw guest path, valid for one names index generation, whiteout
+/// generation and current directory.
+#[derive(Default)]
+struct Memo {
+    stamp: (u64, u64),
+    cwd: String,
+    entries: HashMap<String, Option<(PathBuf, bool)>>,
 }
 
 /// Existing host entry for `comps` under `base` and whether it is a directory,
@@ -167,6 +180,7 @@ impl Vfs {
             install: cfg.install_dir.clone(),
             other: cfg.data_dir.join("c"),
             optical: BTreeMap::new(),
+            memo: Mutex::default(),
         }
     }
 
@@ -268,11 +282,39 @@ impl Vfs {
         self.entry(guest).map(|(path, _)| path)
     }
 
-    /// Existing host entry and whether it is a directory.
+    /// Existing host entry and whether it is a directory. Answers stay
+    /// memoized while every name they depend on comes from the index.
     fn entry(&self, guest: &str) -> Option<(PathBuf, bool)> {
         if self.is_optical_path(guest) {
             return None;
         }
+        let stamp = (names::generation(), self.whiteouts.generation());
+        let uncached = names::uncached();
+        {
+            let mut memo = self.memo.lock().unwrap();
+            if memo.stamp != stamp || memo.cwd != self.cwd {
+                memo.entries.clear();
+                memo.stamp = stamp;
+                memo.cwd.clone_from(&self.cwd);
+            }
+            if let Some(entry) = memo.entries.get(guest) {
+                return entry.clone();
+            }
+        }
+        let entry = self.resolve(guest);
+        if names::uncached() == uncached {
+            let mut memo = self.memo.lock().unwrap();
+            if memo.stamp == stamp && memo.cwd == self.cwd {
+                if memo.entries.len() >= MEMO_ENTRIES {
+                    memo.entries.clear();
+                }
+                memo.entries.insert(guest.to_owned(), entry.clone());
+            }
+        }
+        entry
+    }
+
+    fn resolve(&self, guest: &str) -> Option<(PathBuf, bool)> {
         match self.locate(guest)? {
             Loc::Game(rel) => ci_entry(&self.overlay, &rel).or_else(|| {
                 if self.whiteouts.contains(&rel) {
@@ -654,6 +696,48 @@ mod tests {
             1
         );
         assert!(names.iter().any(|n| n == "Save"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    // spec: WIN32-OBJECT-8
+    fn memoized_entries_follow_the_index_whiteouts_directory_and_volatile_listings() {
+        let tmp = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch/vfs-memo")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("game/Sub")).unwrap();
+        std::fs::write(tmp.join("game/Base.dat"), "base").unwrap();
+        let mut v = vfs(&tmp);
+        // Held after construction: parallel Vfs::new would clear the index.
+        let _held = names::tests::EXCLUSIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let game = tmp.join("game");
+        for _ in 0..2 {
+            assert_eq!(v.lookup("base.dat"), Some(game.join("Base.dat")));
+        }
+        assert!(v.memo.lock().unwrap().entries.contains_key("base.dat"));
+        assert_eq!(v.lookup("new.dat"), None);
+        host::write(&game.join("New.dat"), b"").unwrap();
+        assert_eq!(v.lookup("new.dat"), Some(game.join("New.dat")));
+        host::remove_file(&game.join("New.dat")).unwrap();
+        assert_eq!(v.lookup("new.dat"), None);
+        // Relative names follow the current directory.
+        host::write(&game.join("Sub/Base.dat"), b"").unwrap();
+        v.cwd = r"C:\Game\Sub".into();
+        assert_eq!(v.lookup("base.dat"), Some(game.join("Sub/Base.dat")));
+        v.cwd = r"C:\Game".into();
+        assert_eq!(v.lookup("base.dat"), Some(game.join("Base.dat")));
+        // A whiteout hides the memoized read-only file.
+        v.delete_file("base.dat").unwrap();
+        assert_eq!(v.lookup("base.dat"), None);
+        // Volatile listings are never memoized.
+        host::volatile(&game.join("Sub"));
+        assert_eq!(v.lookup(r"sub\v.dat"), None);
+        std::fs::write(game.join("Sub/V.dat"), "").unwrap();
+        assert_eq!(v.lookup(r"sub\v.dat"), Some(game.join("Sub/V.dat")));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
