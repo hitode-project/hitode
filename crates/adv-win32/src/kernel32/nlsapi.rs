@@ -208,6 +208,10 @@ fn lc_map_string_a(env: &mut Env<'_>) -> Outcome {
 
 fn get_string_type_w(env: &mut Env<'_>) -> Outcome {
     let (ty, src, len, out) = (env.arg(0), env.arg(1), env.arg(2) as i32, env.arg(3));
+    string_type_w(env, ty, src, len, out)
+}
+
+pub(crate) fn string_type_w(env: &mut Env<'_>, ty: u32, src: u32, len: i32, out: u32) -> Outcome {
     let units = units_or_wstr(env.cpu, src, len);
     let types: Vec<u16> = match ty {
         1 => units.iter().map(|&u| ctype1(u)).collect(),
