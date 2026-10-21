@@ -44,6 +44,8 @@ void mainCRTStartup(void) {
     }
     audio_ready=CreateEventA(NULL,0,0,NULL);done=CreateEventA(NULL,1,0,NULL);
     thread=CreateThread(NULL,0,audio_consumer,NULL,0,NULL);
+    /* Virtual time reaches this deadline only after the consumer has blocked. */
+    Sleep(1);
     emit(timeSetEvent(10,0,callback,0,0)!=0);emit(timeSetEvent(10,0,callback,0,0)!=0);
     /* Both callbacks are already due when the worker resumes. */
     advance_guest(100000);
