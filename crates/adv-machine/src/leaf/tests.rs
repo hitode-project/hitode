@@ -325,3 +325,21 @@ fn env_leaf_rejects_unsynchronized_register_reads() {
     let mut machine = fixture(Conv::Stdcall { argc: 2 }, false);
     crate::env_leaf::Cpu(&mut machine.cpu).reg(Reg::Eax);
 }
+
+// spec: A64-CTL-12
+#[test]
+fn env_leaf_forwards_memory_queries_to_the_backend() {
+    let mut machine = fixture(Conv::Stdcall { argc: 2 }, false);
+    machine.cpu.map(0x500000, 0x2000, Prot::RW).unwrap();
+    machine.cpu.write(0x500000, &[1, 2, 3, 4]).unwrap();
+    let epoch = machine.cpu.private_copy_epoch();
+    let next = machine.cpu.next_mapped_page(0x4ff000, 0x502000).unwrap();
+    let mut leaf = crate::env_leaf::Cpu(&mut machine.cpu);
+    assert_eq!(leaf.private_copy_epoch(), epoch);
+    assert!(epoch.is_some());
+    assert_eq!(leaf.file_page_copy_on_write(0x500000), None);
+    assert_eq!(leaf.next_mapped_page(0x4ff000, 0x502000).unwrap(), next);
+    assert!(!leaf.has_locked_pages(0x500000, 0x1000));
+    leaf.copy_memory(0x500000, 0x501000, 4).unwrap();
+    assert_eq!(machine.cpu.read_u32(0x501000).unwrap(), 0x0403_0201);
+}

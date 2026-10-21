@@ -43,6 +43,21 @@ impl Guest for Cpu<'_> {
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.0.shared_bytes(addr, len)
     }
+    fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
+        self.0.file_page_copy_on_write(addr)
+    }
+    fn private_copy_epoch(&self) -> Option<u64> {
+        self.0.private_copy_epoch()
+    }
+    fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
+        self.0.copy_memory(src, dst, len)
+    }
+    fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        self.0.next_mapped_page(addr, limit)
+    }
+    fn has_locked_pages(&self, addr: u32, len: u32) -> bool {
+        self.0.has_locked_pages(addr, len)
+    }
     fn map(&mut self, _: u32, _: u32, _: Prot) -> Result<(), MemFault> {
         panic!("EnvLeaf mapping change")
     }
