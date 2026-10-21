@@ -35,6 +35,8 @@ pub(crate) struct Session {
     discontinuity: bool,
     segment: i64,
     pending_audio: VecDeque<AudioFrame>,
+    /// The mixer stream was told the graph paused; queued PCM must not play on.
+    audio_paused: bool,
 }
 
 enum End {
@@ -130,6 +132,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             discontinuity: true,
             segment: 0,
             pending_audio: VecDeque::new(),
+            audio_paused: false,
         },
     );
     apply_volume(env, graph);
@@ -234,6 +237,10 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
         return end_of_stream(env, id);
     }
     let paused = graph_state == Some(graph::PAUSED);
+    if !sync_audio_pause(env, id, paused) {
+        let deadline = env.sys.clock.now_us() + POLL_US;
+        return wait(env, id, Some(deadline));
+    }
     if ended || (paused && prerolled) {
         return wait(env, id, None);
     }
@@ -245,6 +252,27 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
         .and_then(|f| f.source.as_mut()?.decoder.as_mut())
         .map(|decoder| decoder.frame_at(media_us));
     process_update(env, id, update, position, paused)
+}
+
+/// Pause or resume queued PCM with the graph; the mixer shifts the stream's
+/// timeline by the paused time. False means the command must be retried.
+fn sync_audio_pause(env: &mut Env<'_>, id: u32, paused: bool) -> bool {
+    let s = session(env, id);
+    let (Some(stream), current) = (s.audio, s.audio_paused) else {
+        return true;
+    };
+    if current == paused {
+        return true;
+    }
+    let now = env.sys.clock.now_us();
+    let Some(sound) = env.ext.try_get_mut::<Sound>() else {
+        return true;
+    };
+    if !sound.audio.pause_pcm(stream, paused, now) {
+        return false;
+    }
+    session(env, id).audio_paused = paused;
+    true
 }
 
 fn process_update(
@@ -393,6 +421,9 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.prerolled = false;
     s.discontinuity = true;
     s.pending_audio.clear();
+    if flush {
+        s.audio_paused = false;
+    }
     s.segment = position;
     let mut calls = VecDeque::new();
     if let Some(VideoTarget::Guest(pin)) = video {
@@ -632,6 +663,7 @@ mod tests {
                 discontinuity: true,
                 segment: 0,
                 pending_audio: VecDeque::new(),
+                audio_paused: false,
             },
         );
         (m, graph, events, wake)
@@ -811,6 +843,26 @@ mod tests {
         assert!(!m.ext.get::<State>().sessions.contains_key(&1));
         assert!(m.sys.objects.get(wake).is_none());
         assert_eq!(audio.stream().metrics().removals, 1);
+    }
+
+    // spec: MEDIA-STREAM-3
+    #[test]
+    fn graph_pause_holds_queued_pcm_and_resume_plays_it() {
+        let (mut m, _, audio, mut reader) = audio_session();
+        // A saturated command queue leaves the pause to the next pass.
+        assert!(!sync_audio_pause(&mut env(&mut m), 1, true));
+        assert!(!m.ext.get::<State>().sessions[&1].audio_paused);
+        recover(&audio, &mut reader);
+        assert!(sync_audio_pause(&mut env(&mut m), 1, true));
+        assert!(m.ext.get::<State>().sessions[&1].audio_paused);
+        let mut out = [1.0; 8];
+        reader.read(&mut out, 0);
+        audio.maintain();
+        assert_eq!(out, [0.0; 8]);
+        assert!(sync_audio_pause(&mut env(&mut m), 1, false));
+        assert!(!m.ext.get::<State>().sessions[&1].audio_paused);
+        reader.read(&mut out, 0);
+        assert!(out.iter().any(|sample| *sample != 0.0), "{out:?}");
     }
 
     #[test]

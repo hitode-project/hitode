@@ -3,7 +3,10 @@
 use adv_device::media::{Decoder, Error};
 
 fn pcm_wave() -> Vec<u8> {
-    let samples = 400u32;
+    pcm_wave_of(400)
+}
+
+fn pcm_wave_of(samples: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&(36 + samples * 2).to_le_bytes());
@@ -66,6 +69,21 @@ fn audio_only_media_decodes_once_and_finishes_at_source_time() {
         400
     );
     assert!(!restarted.ended);
+}
+
+#[test]
+// spec: MEDIA-STREAM-3
+fn audio_only_media_decodes_about_a_second_ahead() {
+    // Three seconds at 8 kHz: the first request reads at least one second,
+    // not the whole file, and the next one only tops the lead back up.
+    let mut decoder = Decoder::open_memory(pcm_wave_of(24_000)).unwrap();
+    let count = |update: adv_device::media::Update| -> usize {
+        update.audio.iter().map(|frame| frame.samples.len()).sum()
+    };
+    let first = count(decoder.frame_at(0).unwrap());
+    assert!((8_000..16_000).contains(&first), "{first}");
+    let next = count(decoder.frame_at(500_000).unwrap());
+    assert!(first + next >= 12_000 && first + next < 20_000, "{next}");
 }
 
 #[test]
