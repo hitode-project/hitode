@@ -78,6 +78,80 @@ impl crate::GuestArg for RECT {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BLENDFUNCTION {
+    pub BlendOp: u8,
+    pub BlendFlags: u8,
+    pub SourceConstantAlpha: u8,
+    pub AlphaFormat: u8,
+}
+const _: () = assert!(core::mem::size_of::<BLENDFUNCTION>() == 4);
+const _: () = assert!(core::mem::align_of::<BLENDFUNCTION>() == 1);
+const _: () = assert!(core::mem::offset_of!(BLENDFUNCTION, BlendOp) == 0);
+const _: () = assert!(core::mem::offset_of!(BLENDFUNCTION, BlendFlags) == 1);
+const _: () = assert!(core::mem::offset_of!(BLENDFUNCTION, SourceConstantAlpha) == 2);
+const _: () = assert!(core::mem::offset_of!(BLENDFUNCTION, AlphaFormat) == 3);
+impl crate::GuestArg for BLENDFUNCTION {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 1;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TRIVERTEX {
+    pub x: i32,
+    pub y: i32,
+    pub Red: u16,
+    pub Green: u16,
+    pub Blue: u16,
+    pub Alpha: u16,
+}
+const _: () = assert!(core::mem::size_of::<TRIVERTEX>() == 16);
+const _: () = assert!(core::mem::align_of::<TRIVERTEX>() == 4);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, x) == 0);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, y) == 4);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, Red) == 8);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, Green) == 10);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, Blue) == 12);
+const _: () = assert!(core::mem::offset_of!(TRIVERTEX, Alpha) == 14);
+impl crate::GuestArg for TRIVERTEX {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GRADIENT_RECT {
+    pub UpperLeft: u32,
+    pub LowerRight: u32,
+}
+const _: () = assert!(core::mem::size_of::<GRADIENT_RECT>() == 8);
+const _: () = assert!(core::mem::align_of::<GRADIENT_RECT>() == 4);
+const _: () = assert!(core::mem::offset_of!(GRADIENT_RECT, UpperLeft) == 0);
+const _: () = assert!(core::mem::offset_of!(GRADIENT_RECT, LowerRight) == 4);
+impl crate::GuestArg for GRADIENT_RECT {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 2;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GRADIENT_TRIANGLE {
+    pub Vertex1: u32,
+    pub Vertex2: u32,
+    pub Vertex3: u32,
+}
+const _: () = assert!(core::mem::size_of::<GRADIENT_TRIANGLE>() == 12);
+const _: () = assert!(core::mem::align_of::<GRADIENT_TRIANGLE>() == 4);
+const _: () = assert!(core::mem::offset_of!(GRADIENT_TRIANGLE, Vertex1) == 0);
+const _: () = assert!(core::mem::offset_of!(GRADIENT_TRIANGLE, Vertex2) == 4);
+const _: () = assert!(core::mem::offset_of!(GRADIENT_TRIANGLE, Vertex3) == 8);
+impl crate::GuestArg for GRADIENT_TRIANGLE {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
     pub lpSecurityDescriptor: u32,

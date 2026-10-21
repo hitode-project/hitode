@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers the DirectDraw and Direct3D 9 API front ends: capabilities, shaders, vertex input, samplers, buffers, caches, numerical behavior and Effects. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches, numerical behavior and Effects. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -25,6 +25,18 @@ This spec covers the DirectDraw and Direct3D 9 API front ends: capabilities, sha
 
 **Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
 **Verification**: Test
+
+### GFX-BLIT-1 Alpha and color-key transfers
+
+**Rule**: MSIMG32 alpha and color-key transfers and GDI32 aliases MUST share DC mapping, clipping, surfaces, and format conversion. Alpha transfers MUST use premultiplied source colors. Invalid blends, source bounds, and overlapping same-surface rectangles MUST fail before pixel writes.
+**Verification**: Test
+**Basis**: [AlphaBlend](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-alphablend), [BLENDFUNCTION](https://learn.microsoft.com/windows/win32/api/wingdi/ns-wingdi-blendfunction), and [TransparentBlt](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-transparentblt).
+
+### GFX-BLIT-2 Gradient meshes
+
+**Rule**: Gradient meshes MUST interpolate 16-bit vertex colors through shared surfaces and DC clipping, ignoring vertex alpha. Invalid mesh indices and unsupported low-color dithering MUST fail before painting. Rectangles and triangles MUST use exclusive rectangle bounds and top-left triangle edges.
+**Verification**: Test
+**Basis**: [GradientFill](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-gradientfill).
 
 ## Native programmable execution
 

@@ -562,18 +562,154 @@ fn midi_boundary<B: Backend>(cpu: B) {
     );
     assert!(
         m.ext
-            .get::<ApiDiagnostics>()
-            .warnings
-            .keys()
-            .any(|(api, _)| api == "midiStreamOpen")
+            .try_get::<ApiDiagnostics>()
+            .is_none_or(|d| d.warnings.is_empty())
     );
 }
 
 #[test]
+// spec: MEDIA-AUDIO-5
 fn midi_absent_device_count_caps_and_stream_errors_preserve_buffers_and_callbacks() {
     midi_boundary(JitCpu::new(PARK_ADDR, false).unwrap());
     midi_boundary(JitCpu::new(PARK_ADDR, true).unwrap());
     midi_boundary(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn midi_absent_operations<B: Backend>(cpu: B) {
+    let mut m = machine(cpu);
+    m.cpu.write(DATA, &[0x77; 512]).unwrap();
+    let mut code = start();
+    let mut cases: Vec<(&str, Vec<u32>, u32)> = vec![
+        ("midiInGetNumDevs", vec![], 0),
+        ("midiOutOpen", vec![DATA, 0, CALLBACK, MARKER, 0x30000], 2),
+        ("midiOutOpen", vec![DATA + 4, u32::MAX, 0, 0, 0], 6),
+        (
+            "midiInOpen",
+            vec![DATA + 8, 0, CALLBACK, MARKER, 0x30020],
+            2,
+        ),
+        ("midiInOpen", vec![DATA + 12, u32::MAX, 0, 0, 0], 2),
+        ("midiOutOpen", vec![READ_ONLY, 0, 0, 0, 0], 11),
+        ("midiInOpen", vec![0, 0, 0, 0, 0], 11),
+        ("midiOutOpen", vec![DATA, 0, 0, 0, 1], 10),
+        ("midiInOpen", vec![DATA + 8, 0, 0, 0, 0x40000], 10),
+        ("midiInGetDevCapsA", vec![0, DATA + 128, 44], 2),
+        ("midiInGetDevCapsW", vec![u32::MAX, DATA + 128, 76], 2),
+        ("midiInGetDevCapsA", vec![0, 0, 0], 0),
+        ("midiInGetDevCapsW", vec![0, READ_ONLY, 76], 11),
+    ];
+    cases.push((
+        "midiConnect",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiDisconnect",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiInAddBuffer",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiInClose", vec![0xdead_beef], 5));
+    cases.push(("midiInGetID", vec![0xdead_beef, 0xdead_beef], 5));
+    cases.push((
+        "midiInMessage",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiInPrepareHeader",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiInReset", vec![0xdead_beef], 5));
+    cases.push(("midiInStart", vec![0xdead_beef], 5));
+    cases.push(("midiInStop", vec![0xdead_beef], 5));
+    cases.push((
+        "midiInUnprepareHeader",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiOutCacheDrumPatches",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiOutCachePatches",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiOutClose", vec![0xdead_beef], 5));
+    cases.push(("midiOutGetID", vec![0xdead_beef, 0xdead_beef], 5));
+    cases.push(("midiOutGetVolume", vec![0xdead_beef, 0xdead_beef], 2));
+    cases.push((
+        "midiOutLongMsg",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiOutMessage",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiOutPrepareHeader",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiOutReset", vec![0xdead_beef], 5));
+    cases.push(("midiOutSetVolume", vec![0xdead_beef, 0xdead_beef], 2));
+    cases.push(("midiOutShortMsg", vec![0xdead_beef, 0xdead_beef], 5));
+    cases.push((
+        "midiOutUnprepareHeader",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiStreamClose", vec![0xdead_beef], 5));
+    cases.push((
+        "midiStreamOut",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiStreamPause", vec![0xdead_beef], 5));
+    cases.push((
+        "midiStreamPosition",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push((
+        "midiStreamProperty",
+        vec![0xdead_beef, 0xdead_beef, 0xdead_beef],
+        5,
+    ));
+    cases.push(("midiStreamRestart", vec![0xdead_beef], 5));
+    cases.push(("midiStreamStop", vec![0xdead_beef], 5));
+    for (index, (name, args, _)) in cases.iter().enumerate() {
+        call(&mut m, &mut code, name, args, index as u32);
+    }
+    run(&mut m, code);
+    for (index, (_, _, expected)) in cases.iter().enumerate() {
+        result(&m, index as u32, *expected);
+    }
+    assert_eq!(bytes(&m, DATA, 16), vec![0; 16]);
+    assert_eq!(bytes(&m, DATA + 16, 496), vec![0x77; 496]);
+    assert!(
+        m.ext
+            .try_get::<ApiDiagnostics>()
+            .is_none_or(|d| d.warnings.is_empty())
+    );
+}
+
+#[test]
+// spec: MEDIA-AUDIO-5
+fn midi_input_output_and_stream_families_share_absent_devices() {
+    midi_absent_operations(JitCpu::new(PARK_ADDR, false).unwrap());
+    midi_absent_operations(JitCpu::new(PARK_ADDR, true).unwrap());
+    midi_absent_operations(UnicornCpu::new(PARK_ADDR).unwrap());
 }
 
 #[cfg(windows)]
@@ -646,4 +782,75 @@ fn mixer_queries_without_a_device_fail_before_touching_their_structures() {
     mixer_boundary(JitCpu::new(PARK_ADDR, false).unwrap());
     mixer_boundary(JitCpu::new(PARK_ADDR, true).unwrap());
     mixer_boundary(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn midi_error_descriptions<B: Backend>(cpu: B) {
+    let mut m = machine(cpu);
+    m.cpu.write(DATA, &[0x77; 512]).unwrap();
+    let mut code = start();
+    let mut expected = Vec::new();
+    for (n, name) in [
+        "midiOutGetErrorTextA",
+        "midiOutGetErrorTextW",
+        "midiInGetErrorTextA",
+        "midiInGetErrorTextW",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = DATA + n as u32 * 64;
+        for (error, pointer, capacity, result) in [
+            (5, output + 4, 16, 0),
+            (5, output + 40, 1, 0),
+            (5, 0, 0, 0),
+            (0xffff, 0, 0, 0),
+            (5, READ_ONLY, 16, 11),
+            (0xffff, output + 48, 4, 9),
+        ] {
+            call(
+                &mut m,
+                &mut code,
+                name,
+                &[error, pointer, capacity],
+                expected.len() as u32,
+            );
+            expected.push(result);
+        }
+    }
+    run(&mut m, code);
+    for (index, expected) in expected.into_iter().enumerate() {
+        result(&m, index as u32, expected);
+    }
+    for n in 0..4 {
+        let output = DATA + n * 64;
+        let mut expected = vec![0x77; 64];
+        let message = b"The specified d\0";
+        let (encoded, terminator) = if n % 2 == 0 {
+            (message.to_vec(), vec![0])
+        } else {
+            (
+                message
+                    .iter()
+                    .flat_map(|b| u16::from(*b).to_le_bytes())
+                    .collect(),
+                vec![0, 0],
+            )
+        };
+        expected[4..4 + encoded.len()].copy_from_slice(&encoded);
+        expected[40..40 + terminator.len()].copy_from_slice(&terminator);
+        assert_eq!(bytes(&m, output, 64), expected);
+    }
+    assert!(
+        m.ext
+            .try_get::<ApiDiagnostics>()
+            .is_none_or(|d| d.warnings.is_empty())
+    );
+}
+
+#[test]
+// spec: MEDIA-AUDIO-6
+fn midi_error_text_is_bounded_terminated_and_shared_by_input_and_output() {
+    midi_error_descriptions(JitCpu::new(PARK_ADDR, false).unwrap());
+    midi_error_descriptions(JitCpu::new(PARK_ADDR, true).unwrap());
+    midi_error_descriptions(UnicornCpu::new(PARK_ADDR).unwrap());
 }
