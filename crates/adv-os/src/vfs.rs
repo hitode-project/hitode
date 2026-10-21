@@ -161,6 +161,8 @@ impl Vfs {
         if let Err(e) = installer_state::complete(cfg) {
             log::warn!("completing the copied game's installer state failed: {e}");
         }
+        // Installer discovery must not seed the run's directory snapshot.
+        names::clear();
         let portable_saves = cfg.write_game
             && match portable_saves::migrate(cfg) {
                 Ok(()) => true,
