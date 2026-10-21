@@ -143,7 +143,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             texture: None,
             render_target: None,
             buffers: buffers::Bindings::default(),
-            fixed: fixed::Fixed::new(16, 12),
+            fixed: fixed::CachedFixed::new(16, 12),
             shaders: shaders::Bindings::default(),
             recording: None,
             versions: [0; 15],

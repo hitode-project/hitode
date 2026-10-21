@@ -8,6 +8,39 @@ use adv_device::gpu::{
 use adv_device::surface::Rect;
 mod input;
 
+pub(super) struct CachedFixed {
+    state: Fixed,
+    key: std::cell::Cell<Option<u128>>,
+}
+impl CachedFixed {
+    pub(super) fn new(width: u32, height: u32) -> Self {
+        Self {
+            state: Fixed::new(width, height),
+            key: std::cell::Cell::new(None),
+        }
+    }
+    pub(super) fn key(&self) -> u128 {
+        if let Some(key) = self.key.get() {
+            return key;
+        }
+        let key = super::recording::fixed_key(&self.state);
+        self.key.set(Some(key));
+        key
+    }
+}
+impl std::ops::Deref for CachedFixed {
+    type Target = Fixed;
+    fn deref(&self) -> &Fixed {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for CachedFixed {
+    fn deref_mut(&mut self) -> &mut Fixed {
+        self.key.set(None);
+        &mut self.state
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Fixed {
     pub(super) fvf: u32,

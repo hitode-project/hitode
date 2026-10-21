@@ -84,6 +84,7 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Upload admission assigns a fresh identity. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
+Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
