@@ -470,6 +470,8 @@ pub struct User {
     pub cursor_count: i32,
     pub cursor_handle: u32,
     pub locked_window: Option<u32>,
+    /// The button release consumed after a press restored a minimized window.
+    pub(super) restore_release: Option<u32>,
 }
 
 /// Handles of USER objects loaded from the system (IDC_*, IDI_*), by resource id.
@@ -512,6 +514,7 @@ impl User {
             cursor_count: 0,
             cursor_handle: 0,
             locked_window: None,
+            restore_release: None,
         };
         let desktop = u.add_class_raw("#32769", 0, 0, 0, 0);
         u.desktop = u.alloc_hwnd()?;

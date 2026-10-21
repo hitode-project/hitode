@@ -352,3 +352,82 @@ fn input_view_reports_the_windows_and_hit_target_host_input_would_address() {
         (top, 0x24, "Start")
     );
 }
+
+#[test]
+// spec: WIN32-USER-19
+fn host_restore_or_first_press_restores_a_window_the_guest_minimized() {
+    use crate::user32::window::WS_MINIMIZE;
+    let mut f = Fixture::new("host-restore");
+    let hwnd = f.m.ext.get::<Win32>().user.desktop;
+    f.m.ext.get_mut::<Win32>().user.top.push(hwnd);
+    let set_minimized = |f: &mut Fixture, minimized: bool| {
+        let window =
+            f.m.ext
+                .get_mut::<Win32>()
+                .user
+                .windows
+                .get_mut(&mut f.m.sys.objects, &hwnd)
+                .unwrap();
+        if minimized {
+            window.style |= WS_MINIMIZE;
+        } else {
+            window.style &= !WS_MINIMIZE;
+        }
+    };
+    let posted = |f: &mut Fixture| -> Vec<_> {
+        f.m.ext
+            .get_mut::<Win32>()
+            .user
+            .queues
+            .get_mut(&0)
+            .map_or(Vec::new(), |queue| {
+                queue
+                    .posted
+                    .drain(..)
+                    .map(|event| (event.hwnd, event.msg, event.wparam))
+                    .collect()
+            })
+    };
+    let time = Instant::now();
+    // Not minimized: a host minimize still reports WM_SIZE.
+    assert!(post_at(&mut env(&mut f.m), 5, 1, 0, time));
+    assert_eq!(posted(&mut f), [(hwnd, 5, 1)]);
+    assert!(!minimized(&f.m.ext.get::<Win32>().user, &f.m.sys.objects));
+    // The guest's ShowWindow(SW_SHOWMINIMIZED) result.
+    set_minimized(&mut f, true);
+    assert!(minimized(&f.m.ext.get::<Win32>().user, &f.m.sys.objects));
+    // The host mirroring the guest's minimize is not reported back.
+    assert!(!post_at(&mut env(&mut f.m), 5, 1, 0, time));
+    assert_eq!(posted(&mut f), []);
+    // The first press restores; it and its release reach no window.
+    assert!(!post_at(
+        &mut env(&mut f.m),
+        0x201,
+        1,
+        make_long(5, 5),
+        time
+    ));
+    assert!(!post_at(
+        &mut env(&mut f.m),
+        0x202,
+        0,
+        make_long(5, 5),
+        time
+    ));
+    assert_eq!(posted(&mut f), [(hwnd, 0x112, 0xf120)]);
+    assert_eq!(f.m.ext.get::<Win32>().user.keys[1], 0);
+    // A host restore does the same.
+    assert!(!post_at(
+        &mut env(&mut f.m),
+        5,
+        0,
+        make_long(640, 480),
+        time
+    ));
+    assert_eq!(posted(&mut f), [(hwnd, 0x112, 0xf120)]);
+    // Once restored, presses reach the window again.
+    set_minimized(&mut f, false);
+    assert!(post_at(&mut env(&mut f.m), 0x201, 1, make_long(5, 5), time));
+    assert_eq!(posted(&mut f).last().map(|event| event.1), Some(0x201));
+    f.cleanup();
+}

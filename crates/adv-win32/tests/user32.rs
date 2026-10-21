@@ -69,6 +69,34 @@ fn set_parent_preserves_child_style_and_updates_queries_without_cycles() {
 }
 
 #[test]
+// spec: WIN32-USER-19
+fn def_window_proc_restores_a_minimized_window_on_sc_restore() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let proc = t.wndproc(|_| {});
+    let class = t.class(&mut a, proc);
+    let window = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    t.call(&mut a, "ShowWindow", &[M(window), I(2)]); // SW_SHOWMINIMIZED
+    let minimized = t.call(&mut a, "IsIconic", &[M(window)]);
+    t.call(
+        &mut a,
+        "SendMessageA",
+        &[M(window), I(wm::SYSCOMMAND), I(0xf120), I(0)],
+    );
+    let restored = t.call(&mut a, "IsIconic", &[M(window)]);
+    t.run(a);
+    assert_eq!((t.u32(minimized), t.u32(restored)), (1, 0));
+    let hwnd = t.u32(window);
+    let sizes: Vec<_> = t
+        .log()
+        .into_iter()
+        .filter(|&[h, msg, _, _]| h == hwnd && msg == wm::SIZE)
+        .map(|[_, _, kind, _]| kind)
+        .collect();
+    assert_eq!(sizes.last(), Some(&0)); // SIZE_RESTORED
+}
+
+#[test]
 fn drag_accept_files_updates_the_existing_window_style() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);

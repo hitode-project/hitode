@@ -3,7 +3,7 @@
 use adv_machine::Env;
 
 use super::User;
-use super::window::{make_long, wm};
+use super::window::{WS_MINIMIZE, make_long, wm};
 use crate::Win32;
 
 /// Involutive mapping between physical L/R and logical primary/secondary.
@@ -39,6 +39,9 @@ fn post_at(
 ) -> bool {
     if message == wm::ACTIVATEAPP {
         return activate_app(env, wparam != 0);
+    }
+    if let Some(posted) = restore_minimized(env, message, wparam) {
+        return posted;
     }
     let user = &mut env.ext.get_mut::<Win32>().user;
     let Some((top, mut hwnd)) = target(user, &env.sys.objects, message) else {
@@ -108,6 +111,52 @@ fn post_at(
     }
     super::mouse_tracking::poll(env);
     super::message::post_input(env, hwnd, message, wparam, lparam)
+}
+
+const SIZE_MINIMIZED: u32 = 1;
+const SC_RESTORE: u32 = 0xf120;
+
+/// The host has no taskbar button for a window the guest minimized itself.
+/// Restoring the host window, or the first press in it, does what clicking that
+/// button does on Windows: WM_SYSCOMMAND SC_RESTORE. That press and its release
+/// reach no window, and the host's minimize report for it is not repeated.
+fn restore_minimized(env: &mut Env<'_>, message: u32, wparam: u32) -> Option<bool> {
+    let user = &mut env.ext.get_mut::<Win32>().user;
+    if user.restore_release == Some(message) {
+        user.restore_release = None;
+        return Some(false);
+    }
+    let release = match message {
+        0x201 | 0x203 => 0x202,
+        0x204 | 0x206 => 0x205,
+        0x207 | 0x209 => 0x208,
+        wm::SIZE => 0,
+        _ => return None,
+    };
+    let (top, _) = target(user, &env.sys.objects, message)?;
+    if !minimized_window(user, &env.sys.objects, top) {
+        return None;
+    }
+    if message == wm::SIZE && wparam == SIZE_MINIMIZED {
+        return Some(false);
+    }
+    if release != 0 {
+        user.restore_release = Some(release);
+    }
+    super::message::post_input(env, top, wm::SYSCOMMAND, SC_RESTORE, 0);
+    Some(false)
+}
+
+fn minimized_window(user: &User, objects: &adv_machine::Objects, hwnd: u32) -> bool {
+    user.windows
+        .get(objects, &hwnd)
+        .is_some_and(|window| window.style & WS_MINIMIZE != 0)
+}
+
+/// Whether the displayed top-level window is minimized, which a host with
+/// minimizable windows mirrors.
+pub fn minimized(user: &User, objects: &adv_machine::Objects) -> bool {
+    target(user, objects, 0).is_some_and(|(top, _)| minimized_window(user, objects, top))
 }
 
 /// The host application gained or lost activation. Windows tells the active

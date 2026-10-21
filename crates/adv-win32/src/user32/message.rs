@@ -2410,6 +2410,10 @@ pub(super) fn def_window_proc_encoded(
             // SC_CLOSE
             return send(env, hwnd, wm::CLOSE, 0, 0, move |env, _| then(env, 0));
         }
+        wm::SYSCOMMAND if wp & 0xfff0 == 0xf120 => {
+            // SC_RESTORE
+            return window::show_window(env, hwnd, window::SW_RESTORE, move |env, _| then(env, 0));
+        }
         wm::SYSKEYDOWN if wp == 0x73 => {
             // Alt+F4
             return send(env, hwnd, wm::SYSCOMMAND, 0xf060, 0, move |env, _| {

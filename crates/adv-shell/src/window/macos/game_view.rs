@@ -230,6 +230,12 @@ impl GameView {
         self.setHidden(true);
         self.hub().occluded.set(true);
     }
+    /// The window goes to the Dock; deminiaturizing it restores the guest.
+    pub(crate) fn minimize(&self) {
+        if let Some(window) = self.window() {
+            window.miniaturize(None);
+        }
+    }
     /// With a display link, presentation happens only inside its callback.
     pub(crate) fn refresh_ready(&self) -> bool {
         let hub = self.hub();

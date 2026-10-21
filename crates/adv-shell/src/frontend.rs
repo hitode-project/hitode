@@ -19,6 +19,7 @@ type SinkTarget = window::Window;
 
 enum Request {
     Hide,
+    Minimize,
     Input(u32, u32, u32),
 }
 enum Delivery {
@@ -202,6 +203,11 @@ impl Worker {
     }
     pub fn hide(&mut self) {
         let _ = self.requests.push(Request::Hide);
+        self.ui_wake.signal();
+    }
+    /// The guest minimized the displayed window.
+    pub fn minimize(&mut self) {
+        let _ = self.requests.push(Request::Minimize);
         self.ui_wake.signal();
     }
     pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
@@ -404,6 +410,7 @@ impl Ui {
         while let Some(request) = self.requests.pop() {
             match request {
                 Request::Hide => window.hide(),
+                Request::Minimize => window.minimize(),
                 Request::Input(m, w, l) => window.post_input(m, w, l)?,
             }
         }
@@ -539,6 +546,7 @@ impl Ui {
             while let Some(request) = self.requests.pop() {
                 match request {
                     Request::Hide => window.hide(),
+                    Request::Minimize => window.minimize(),
                     Request::Input(m, w, l) => window.post_input(m, w, l)?,
                 }
             }
