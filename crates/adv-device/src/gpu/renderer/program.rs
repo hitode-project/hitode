@@ -904,15 +904,17 @@ impl Gpu {
         }
         #[cfg(target_vendor = "apple")]
         if let Some(mut metal) = pending.metal.take() {
-            let result = metal.draw(
-                self,
-                &mut pending,
-                target,
-                draw,
-                state,
-                &key,
-                initialization_target,
-            );
+            let result = objc2::rc::autoreleasepool(|_| {
+                metal.draw(
+                    self,
+                    &mut pending,
+                    target,
+                    draw,
+                    state,
+                    &key,
+                    initialization_target,
+                )
+            });
             pending.metal = Some(metal);
             return result;
         }

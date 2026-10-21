@@ -343,7 +343,7 @@ fn ring_wraps_and_busy_leaves_draw_state_and_uploads_unchanged() {
         }
     }
     let release = Release(device.newSharedEvent().unwrap());
-    let blocker = queue.commandBuffer().unwrap();
+    let blocker = objc2::rc::autoreleasepool(|_| queue.commandBuffer().unwrap());
     blocker.encodeWaitForEvent_value(release.0.as_ref(), 1);
     blocker.commit();
     let mut draw = draw();

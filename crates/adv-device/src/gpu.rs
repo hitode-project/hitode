@@ -1,5 +1,7 @@
 //! Neutral GPU drawing and ownership of submitted resources. This module has
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
+//! Apple device requests, native draws, copies and compilation drain their
+//! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
 mod clear;
 pub mod compile;
