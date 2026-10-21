@@ -10,7 +10,7 @@ const ACCOUNTED: u32 = 1 << 23;
 pub(super) const HEADS: u32 = 0x110;
 pub(super) const RANGES: u32 = 0x310;
 const SLAB: u32 = 0x4000;
-const MAX_SLAB: u32 = 1024 * 1024;
+const MAX_SLAB: u32 = 16 * 1024 * 1024;
 const LIMIT: usize = 128;
 const REGISTRY_GATE: u32 = 0xb10;
 const REGISTRY_ACTIVE: u32 = 0xb14;
@@ -89,16 +89,20 @@ impl Heap {
                 return None;
             }
             // Grow only exhausted classes; short-lived classes keep their first
-            // small slab while live bursts need fewer registry slots.
-            let capacity = self
-                .slabs
-                .as_ref()?
-                .iter()
-                .rev()
-                .find(|slab| slab.class == class)
-                .map_or(SLAB, |slab| {
-                    ((slab.end - slab.base).next_power_of_two() * 2).min(MAX_SLAB)
-                });
+            // small slab. A replenishment covers at least an eighth of all slab
+            // memory, so the bounded range table fills only logarithmically.
+            let slabs = self.slabs.as_ref()?;
+            let total: u32 = slabs.iter().map(|slab| slab.end - slab.base).sum();
+            let capacity =
+                slabs
+                    .iter()
+                    .rev()
+                    .find(|slab| slab.class == class)
+                    .map_or(SLAB, |slab| {
+                        ((slab.end - slab.base).next_power_of_two() * 4)
+                            .max((total / 8).next_power_of_two())
+                            .min(MAX_SLAB)
+                    });
             if self.free_by_size.range((capacity, 0)..).next().is_none() {
                 self.grow(cpu, vm, capacity).ok()?;
             }

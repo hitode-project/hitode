@@ -556,3 +556,22 @@ fn live_small_block_bursts_leave_room_for_other_guest_size_classes() {
         assert!(m.ext.get::<Heaps>().validate(&m.cpu, heap, 0));
     }
 }
+
+#[test]
+// spec: WIN32-OBJECT-9
+fn live_small_blocks_replenish_without_filling_the_slab_table() {
+    let mut m = machine(true, true);
+    let heaps = m.ext.get_mut::<Heaps>();
+    let heap = heaps.process_heap;
+    // 32 MiB of live blocks across three size classes stay on slabs.
+    for _ in 0..(32 << 20) / 3 / 256 {
+        for size in [32, 100, 500] {
+            let pointer = heaps
+                .alloc(&mut m.cpu, &mut m.sys.vm, heap, size, false)
+                .unwrap();
+            assert!(heaps.owner(&m.cpu, pointer).is_some());
+        }
+    }
+    let slabs = m.cpu.read_u32(heap + 0x10c).unwrap();
+    assert!(slabs <= 24, "{slabs} slabs");
+}
