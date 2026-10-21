@@ -2062,6 +2062,190 @@ fn x87_runs_publish_their_state_at_a_fault() {
     }
 }
 
+/// Runs translated under precision 24 keep arithmetic native: single and
+/// double operands, ties, inexact and exact results, wide exponents and
+/// every arithmetic form leave the interpreter's state, status words and
+/// memory.
+// spec: A64F-FP-7
+#[cfg(native)]
+#[test]
+fn x87_runs_at_precision_24_match_the_interpreter() {
+    let singles = [
+        1.0f32,
+        3.0,
+        0.1,
+        -0.75,
+        16777215.0,
+        1.0e-30,
+        3.0e30,
+        0.333_333_34,
+        -7.5,
+        1.5e-5,
+    ];
+    let doubles = [
+        0.1f64,
+        1.0 + f64::EPSILON,
+        1.0e200,
+        -2.5,
+        16777217.0,
+        1.0e-200,
+    ];
+    for seed in 0..48u64 {
+        let mut rng = Rng(seed * 0x9e37_79b9 + 1);
+        let mut a = CodeAssembler::new(32).unwrap();
+        for (i, value) in singles.iter().enumerate() {
+            a.mov(dword_ptr(ebx + 0x600 + 4 * i as i32), value.to_bits())
+                .unwrap();
+        }
+        for (i, value) in doubles.iter().enumerate() {
+            let bits = value.to_bits();
+            let at = 0x640 + 8 * i as i32;
+            a.mov(dword_ptr(ebx + at), bits as u32).unwrap();
+            a.mov(dword_ptr(ebx + at + 4), (bits >> 32) as u32).unwrap();
+        }
+        let single = |rng: &mut Rng| ebx + 0x600 + 4 * rng.below(singles.len()) as i32;
+        let double = |rng: &mut Rng| ebx + 0x640 + 8 * rng.below(doubles.len()) as i32;
+        a.fld(dword_ptr(single(&mut rng))).unwrap();
+        a.fld(dword_ptr(single(&mut rng))).unwrap();
+        a.fld(dword_ptr(single(&mut rng))).unwrap();
+        for step in 0..24 {
+            match rng.below(16) {
+                // The status word records PE and C1 of the step before.
+                14 | 15 => a.fnstsw(word_ptr(ebx + 0xa00 + 2 * step)).unwrap(),
+                0 => a.fadd(dword_ptr(single(&mut rng))).unwrap(),
+                1 => a.fsub(dword_ptr(single(&mut rng))).unwrap(),
+                2 => a.fmul(dword_ptr(single(&mut rng))).unwrap(),
+                3 => a.fdiv(dword_ptr(single(&mut rng))).unwrap(),
+                4 => a.fsubr(dword_ptr(single(&mut rng))).unwrap(),
+                5 => a.fdivr(dword_ptr(single(&mut rng))).unwrap(),
+                6 => a.fmul(qword_ptr(double(&mut rng))).unwrap(),
+                7 => a.fadd(qword_ptr(double(&mut rng))).unwrap(),
+                8 => a.fadd_2(st0, STS[1 + rng.below(2)]).unwrap(),
+                9 => a.fmul_2(STS[1 + rng.below(2)], st0).unwrap(),
+                10 => a.fsub_2(st0, STS[1 + rng.below(2)]).unwrap(),
+                11 => a.fdiv_2(STS[1 + rng.below(2)], st0).unwrap(),
+                12 => {
+                    a.fst(dword_ptr(ebx + 0x700 + 4 * step)).unwrap();
+                    a.mov(edx, dword_ptr(ebx + 0x700 + 4 * step)).unwrap();
+                    a.mov(dword_ptr(ebx + 0x780 + 4 * step), edx).unwrap();
+                }
+                _ => {
+                    a.fst(qword_ptr(ebx + 0x800 + 8 * step)).unwrap();
+                    a.fld(dword_ptr(single(&mut rng))).unwrap();
+                    a.faddp(st1, st0).unwrap();
+                }
+            }
+        }
+        a.fstp(dword_ptr(ebx + 0x900)).unwrap();
+        a.fstp(qword_ptr(ebx + 0x908)).unwrap();
+        a.nop().unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.x87.control = 0x007f;
+        state.regs[3] = DATA;
+        state.regs[4] = STACK_TOP;
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code,
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
+        assert_eq!(executor.state.x87, state.x87, "seed {seed}");
+        assert_eq!(executor.state.regs, state.regs, "seed {seed}");
+        assert!(snapshot(executor.memory()) == memory, "seed {seed}");
+    }
+}
+
+/// Integer loads and stores between x87 instructions stay inside the run;
+/// a fault at one, after flags an integer instruction left lazy, leaves
+/// the interpreter's state before it.
+// spec: A64F-FP-7
+#[cfg(native)]
+#[test]
+fn x87_runs_span_integer_memory_accesses_and_publish_at_their_faults() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    // Faulting at a load, a store, or a read-modify-write after a carry.
+    for fault in [None, Some(0), Some(1), Some(2)] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(dword_ptr(ebx + 0x710), 2.5f32.to_bits()).unwrap();
+        a.mov(dword_ptr(ebx + 0x700), 7).unwrap();
+        a.mov(eax, HOLE).unwrap();
+        a.fninit().unwrap();
+        a.fld1().unwrap();
+        a.mov(edx, dword_ptr(ebx + 0x700)).unwrap();
+        a.fadd(dword_ptr(ebx + 0x710)).unwrap();
+        a.fld(st0).unwrap();
+        a.fistp(dword_ptr(ebx + 0x704)).unwrap();
+        a.add(edx, dword_ptr(ebx + 0x704)).unwrap();
+        a.fmul_2(st0, st0).unwrap();
+        a.mov(dword_ptr(ebx + 0x708), edx).unwrap();
+        a.and(edx, 0x13).unwrap();
+        match fault {
+            Some(0) => a.mov(ecx, dword_ptr(eax)).unwrap(),
+            Some(1) => a.mov(dword_ptr(eax), edx).unwrap(),
+            Some(_) => {
+                a.add(edx, -1).unwrap();
+                a.add(dword_ptr(eax), edx).unwrap();
+            }
+            None => a.movzx(ecx, byte_ptr(ebx + 0x708)).unwrap(),
+        }
+        a.fadd(dword_ptr(ebx + 0x710)).unwrap();
+        a.fstp(dword_ptr(ebx + 0x714)).unwrap();
+        a.nop().unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[3] = DATA;
+        state.regs[4] = STACK_TOP;
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code,
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
+        assert_eq!(executor.state.eip, state.eip, "{fault:?}");
+        assert_eq!(executor.state.regs, state.regs, "{fault:?}");
+        assert_eq!(executor.state.eflags, state.eflags, "{fault:?}");
+        assert_eq!(executor.state.x87, state.x87, "{fault:?}");
+        assert!(snapshot(executor.memory()) == memory);
+        if fault.is_some() {
+            assert!(executor.native.as_ref().unwrap().unchecked_faults > 0);
+            continue;
+        }
+        let base = executor
+            .native
+            .as_ref()
+            .unwrap()
+            .unit_address(CODE)
+            .unwrap();
+        let (_, marks) = units_of(CODE)
+            .into_iter()
+            .rfind(|&(unit, _)| unit == base)
+            .expect("the unit was recorded");
+        let entries = marks.iter().filter(|m| m.part == Part::X87Entry).count();
+        assert_eq!(entries, 1, "one run: {marks:?}");
+    }
+}
+
 /// Samplers see which guest instruction and which part of its code a
 /// host address of a unit is in: an x87 run's entry checks, its body, its
 /// integer arithmetic path, its publication and its out-of-line paths.

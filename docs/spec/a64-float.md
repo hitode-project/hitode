@@ -43,7 +43,7 @@ This spec covers how `adv-cpu-a64` runs x87, MMX and SSE instructions. The rest 
 
 ### A64F-FP-7 x87 runs
 
-**Rule**: A run MAY span x87 instructions, integer instructions that neither observe x87 state nor fault, and forward edges to merges reached only from the run. It MAY keep stack values in v24–v31 as exact binary64 pairs, renaming copies, with arithmetic specialized to the translation-time control word behind a guard. It MUST check relied-on tags at entry and fetched values, and MUST publish at exits, helpers and faults as before the faulting instruction.
+**Rule**: A run MAY span x87 instructions, integer instructions without x87 state or checked accesses, and forward edges to merges reached only from the run. It MAY keep stack values in v24–v31 as exact binary64 pairs, renaming copies, with arithmetic specialized to the translation-time control word behind a guard. It MUST check relied-on tags at entry and fetched values, and MUST publish at exits, helpers and faults as before the faulting instruction.
 **Applies to**: AArch64
 **Verification**: Test
 

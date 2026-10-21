@@ -1,8 +1,9 @@
 //! x87 runs whose stack lives in host registers (A64F-FP-7).
 //!
 //! A run is a stretch of x87 instructions without a head after the first,
-//! and the integer instructions between them that neither observe nor
-//! fault: no memory access, helper or transfer other than a forward jcc. A
+//! and the integer instructions between them that do not observe x87
+//! state: no helper, checked or segment access, stack operation or
+//! transfer other than a forward jcc. A
 //! merge inside it is reached only from the run, by arrivals that agree on
 //! which slots hold values; there every value moves to the host register
 //! of its slot, values only some arrivals hold are fetched, and stale ones
@@ -27,8 +28,10 @@
 //! still match, or runs every later x87 instruction through its helper
 //! when they fail, leaving the unit at an integer one; a fault at a site
 //! resumes in a stub that publishes the state before the instruction and
-//! then leaves as the fault stub does. Instructions that may change w13
-//! before such an exit keep the status word before them in w14.
+//! then leaves as the fault stub does. Integer instructions with a site
+//! make the flags canonical first, so that stub keeps only NZCV. Instructions
+//! that may change w13 before such an exit keep the status word before them
+//! in w14.
 
 use adv_cpu_core::floating::fast::{Fast, Source};
 
@@ -39,7 +42,7 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime;
 
-use super::super::decode::{Cc, Op, Src};
+use super::super::decode::{self, Cc, Narrow8or16, Op, Src};
 use super::super::trace::{Edge, Next};
 use super::super::{
     Cold as UnitCold, RUNTIME, State, Translator, X0, X1, X2, X3, X13, X14, X15, X16, X17,
@@ -420,25 +423,28 @@ impl Translator<'_> {
     /// a jcc out of the trace.
     fn joins(&self, index: usize) -> bool {
         let inst = self.trace.insts[index];
-        if inst.effects.site {
+        // A checked access may call a helper, which keeps no vector register.
+        if inst.effects.site && (self.checked)(inst.pc) {
             return false;
         }
-        let register = |src: Src| !matches!(src, Src::Mem(_));
+        let register = |src: Src| !matches!(src, Src::Mem(mem) if mem.fs);
         match inst.op {
             Op::Nop
             | Op::Step(..)
             | Op::Neg(_)
             | Op::Not(_)
-            | Op::Extend(..)
             | Op::Cdq
             | Op::Jmp(_)
             | Op::Setcc(..)
             | Op::Shift(..)
-            | Op::Narrow(..)
             | Op::Direction(_) => true,
+            Op::Narrow(_, _, a, b) => [a, b]
+                .iter()
+                .all(|part| !matches!(part, decode::Part::Mem(mem) if mem.fs)),
             Op::Lea(_, mem) => !mem.fs,
             Op::Mov(a, b) | Op::Alu(_, a, b) => register(a) && register(b),
             Op::Cmov(_, _, src) | Op::Imul(_, src, _) | Op::Carry(_, _, src) => register(src),
+            Op::Extend(_, source, _) => !matches!(source, Narrow8or16::Mem(mem, _) if mem.fs),
             Op::Jcc(Cc::Flags(_), _) => match inst.taken {
                 Some(Edge::Exit(_)) => true,
                 Some(Edge::Internal(to)) => to > index,
@@ -691,6 +697,13 @@ impl Translator<'_> {
         let offset = index - self.x87.start;
         if !std::mem::take(&mut self.x87.bound) {
             self.asm.bind(self.x87.hot[offset]);
+        }
+        if self.trace.insts[index].effects.site {
+            // Its fault stub publishes the state as it is now.
+            self.x87_suspend();
+            self.canonicalize();
+            self.x87.before = self.x87.model;
+            self.x87.saved = false;
         }
         if index > self.x87.start && self.cacheable(index - 1).is_some() {
             self.push_cold(UnitCold::Leave {
@@ -1153,12 +1166,32 @@ impl Translator<'_> {
             label,
             model: self.x87.before,
             saved: self.x87.saved,
+            suspended: self.x87.suspended,
         });
     }
 
-    pub(in super::super) fn x87_fault(&mut self, label: Label, model: Model, saved: bool) {
+    /// A suspended site holds the canonical guest flags in NZCV, the
+    /// status word with TOP in `CpuState` and recipe temporaries in x7
+    /// and x8, which this leaves alone.
+    pub(in super::super) fn x87_fault(
+        &mut self,
+        label: Label,
+        model: Model,
+        saved: bool,
+        suspended: bool,
+    ) {
         self.asm.bind(label);
         self.remark(Part::X87Publish);
+        if suspended {
+            self.emit_all(&[
+                mrs_nzcv(X4),
+                ldr(X, X5, RUNTIME, runtime::CPU_STATE),
+                ldrh(X13, X5, runtime::X87_STATUS),
+                ubfx(W, X15, X13, 11, 3),
+                sub_imm(W, X15, X15, u32::from(model.delta), false),
+                and_imm(W, X15, X15, 7),
+            ]);
+        }
         self.x87_publish(model, if saved { X14 } else { X13 });
         self.emit(msr_nzcv(X4));
         self.far(self.stubs.fault);

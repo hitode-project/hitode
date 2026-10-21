@@ -9,16 +9,19 @@
 //!
 //! Arithmetic runs natively under the control word the guest had when the
 //! unit was translated, if it masks every exception, rounds to nearest and
-//! has precision 53 or 64; each instruction checks the control word is
+//! has precision 24, 53 or 64; each instruction checks the control word is
 //! still that one. Precision 53 takes narrow operands and rounds once in
-//! binary64. Precision 64 approximates the exact result as `H + t` from
+//! binary64. Precision 24 also needs single-exact operands, then rounds
+//! that double's significand to 24 bits in integers, keeping the extended
+//! exponent range; binary64 is wide enough that the second rounding is
+//! innocuous for these operations. Precision 64 approximates the exact result as `H + t` from
 //! fused and error-free operations, rounds `t` to the 64-bit grid of `H`
 //! with a magic constant, and leaves for the integer path unless the error
 //! bound keeps that rounding and the inexact flag certain. The integer path
 //! also takes every other case, in cold code, through the extended
 //! encoding.
 
-use adv_cpu_core::floating::fast::{Fast, Op as Arith, PE, Source};
+use adv_cpu_core::floating::fast::{Fast, Op as Arith, PE, SINGLE_TAIL, Source};
 
 use crate::asm::Label;
 use crate::encode::Shift::Lsl;
@@ -47,6 +50,7 @@ const fn v(n: u8) -> VReg {
 /// The precision a control word lets arithmetic run natively in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Precision {
+    Single,
     Double,
     Extended,
 }
@@ -56,6 +60,7 @@ fn precision(control: u16) -> Option<Precision> {
         return None;
     }
     match control >> 8 & 3 {
+        0 => Some(Precision::Single),
         2 => Some(Precision::Double),
         3 => Some(Precision::Extended),
         _ => None,
@@ -353,12 +358,13 @@ impl Translator<'_> {
         let (a, b) = if reverse { (s, d) } else { (d, s) };
         let precision = precision(self.control);
         match precision {
-            Some(Precision::Double) => self.pair_double(op, a, b, to, label, c1_dead),
+            Some(Precision::Single) => self.pair_double(op, a, b, to, label, c1_dead, true),
+            Some(Precision::Double) => self.pair_double(op, a, b, to, label, c1_dead, false),
             Some(Precision::Extended) => self.pair_extended(op, a, b, to, label, c1_dead),
             None => self.asm.b(label),
         }
         self.asm.bind(join);
-        let narrow = precision == Some(Precision::Double);
+        let narrow = matches!(precision, Some(Precision::Single | Precision::Double));
         self.x87_set(dest, to, narrow);
         if pop {
             self.x87_pop();
@@ -375,8 +381,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Precision 53: narrow operands, one rounding, the error from the
-    /// residual. Falls through to the join.
+    /// Precision 53, or 24 when `single`: narrow operands, one rounding,
+    /// the error from the residual, then for 24 the significand rounded.
+    /// Falls through to the join.
+    #[allow(clippy::too_many_arguments)]
     fn pair_double(
         &mut self,
         op: Arith,
@@ -385,6 +393,7 @@ impl Translator<'_> {
         to: u8,
         generic: Label,
         c1_dead: bool,
+        single: bool,
     ) {
         self.pair_guard(generic);
         match (a.narrow, b.narrow) {
@@ -401,6 +410,15 @@ impl Translator<'_> {
             self.emit(lsl_imm(X, X16, X16, 1));
             self.asm.cbz(X, true, X16, generic);
         }
+        if single {
+            self.emit_all(&[
+                fmov_from_v(X, X16, a.high),
+                fmov_from_v(X, X17, b.high),
+                orr(X, X16, X16, X17, Lsl, 0),
+                and_imm(X, X16, X16, SINGLE_TAIL),
+            ]);
+            self.asm.cbz(X, true, X16, generic);
+        }
         let float = match op {
             Arith::Add => Float::Fadd,
             Arith::Sub => Float::Fsub,
@@ -409,10 +427,13 @@ impl Translator<'_> {
         };
         let r = v(to);
         let (zero, exact, join) = (self.asm.label(), self.asm.label(), self.asm.label());
+        let round = if single { self.asm.label() } else { join };
         self.emit(dfloat(float, r, a.high, b.high));
-        self.pair_range(r, zero, (LOW, SPAN), generic);
+        // Rounding to 24 bits may carry into the next binade.
+        let span = if single { SPAN - 1 } else { SPAN };
+        self.pair_range(r, zero, (LOW, span), generic);
         if c1_dead {
-            self.asm.tbz(true, X13, 5, join);
+            self.asm.tbz(true, X13, 5, round);
         }
         // x16 the bits of the error, whose sign is that of exact - rounded.
         match op {
@@ -438,10 +459,14 @@ impl Translator<'_> {
         self.emit(lsl_imm(X, X17, X16, 1));
         self.asm.cbz(X, false, X17, exact);
         self.inexact(r, c1_dead);
-        self.asm.b(join);
+        self.asm.b(round);
         self.asm.bind(exact);
         if !c1_dead {
             self.clear_c1();
+        }
+        if single {
+            self.asm.bind(round);
+            self.pair_single(r, join, c1_dead);
         }
         self.asm.b(join);
         self.asm.bind(zero);
@@ -450,6 +475,30 @@ impl Translator<'_> {
             self.clear_c1();
         }
         self.asm.bind(join);
+    }
+
+    /// Rounds the significand of the double in `r` to 24 bits, to nearest
+    /// even; a change sets PE and, unless `c1_dead`, C1 if it grew. Uses
+    /// x0, x1, x3 and x17.
+    fn pair_single(&mut self, r: VReg, join: Label, c1_dead: bool) {
+        self.emit_all(&[fmov_from_v(X, X0, r), and_imm(X, X3, X0, SINGLE_TAIL)]);
+        self.asm.cbz(X, false, X3, join);
+        self.mov_imm(X1, (1 << 28) - 1);
+        self.emit_all(&[
+            ubfx(X, X17, X0, 29, 1),
+            add(X, X1, X0, X1, Lsl, 0),
+            add(X, X1, X1, X17, Lsl, 0),
+            and_imm(X, X1, X1, !SINGLE_TAIL),
+            orr_imm(W, X13, X13, u64::from(PE)),
+        ]);
+        if !c1_dead {
+            self.emit_all(&[
+                cmp(X, X1, X0, Lsl, 0),
+                cset(W, X17, Cond::Hi),
+                bfi(W, X13, X17, 9, 1),
+            ]);
+        }
+        self.emit(fmov_to_v(X, r, X1));
     }
 
     /// Sets PE and, unless `c1_dead`, C1 from the error bits in x16 and
