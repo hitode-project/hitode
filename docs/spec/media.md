@@ -103,6 +103,11 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 **Rule**: System splitter and decoder input pins MUST reject Receive and ReceiveMultiple with `E_NOTIMPL` and a capability warning. ReceiveMultiple MUST zero a valid processed output and return `E_POINTER` for an invalid output.
 **Verification**: Test
 
+### MEDIA-STREAM-3 Audio lead and pause
+
+**Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time.
+**Verification**: Test
+
 ## Windows Media decoder wrappers
 
 ### MEDIA-DMO-1 Decoder admission

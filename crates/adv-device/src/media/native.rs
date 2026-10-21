@@ -176,6 +176,10 @@ pub(super) struct Native {
 // Some ASF files interleave audio packets more than two seconds behind video packets.
 // Hold compressed video packets while reading just enough audio for the current time.
 const AUDIO_LEAD_US: u64 = 100_000;
+/// Audio-only streams have no interleaving to respect; decode about as far
+/// ahead as quartz's DirectSound renderer buffers (one second), so a busy
+/// execution thread during a load does not drain music that just started.
+const AUDIO_ONLY_LEAD_US: u64 = 1_000_000;
 const MAX_QUEUED_VIDEO_PACKETS: usize = 180;
 const MAX_QUEUED_VIDEO_BYTES: usize = 8 << 20;
 
@@ -515,7 +519,12 @@ impl Native {
     }
 
     fn read_ahead_audio(&mut self, media_us: u64) -> Result<(), Error> {
-        let target = media_us.saturating_add(AUDIO_LEAD_US);
+        let lead = if self.video.is_none() {
+            AUDIO_ONLY_LEAD_US
+        } else {
+            AUDIO_LEAD_US
+        };
+        let target = media_us.saturating_add(lead);
         let video_stream = self.video.as_ref().map(|v| v.stream);
         while self
             .audio
