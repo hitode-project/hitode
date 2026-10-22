@@ -443,19 +443,54 @@ fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_ca
 
 #[test]
 // spec: PERS-EXPORT-5
-fn discovery_refuses_unknown_failure_contract_instead_of_guessing_zero() {
+fn discovery_derives_failures_from_return_types_and_refuses_wide_returns() {
+    for (module, name, failure) in [
+        ("user32.dll", "MessageBeep", Some(0)),
+        ("advapi32.dll", "RegOpenKeyExA", Some(120)),
+        ("ntdll.dll", "LdrLoadDll", Some(0xc000_0002)),
+        ("kernel32.dll", "Sleep", Some(0)),
+        ("kernel32.dll", "GetModuleHandleA", Some(0)),
+        ("kernel32.dll", "WaitForSingleObject", Some(u32::MAX)),
+        ("gdi32.dll", "SetTextColor", Some(u32::MAX)),
+        ("winmm.dll", "waveOutOpen", Some(8)),
+        ("winmm.dll", "waveOutGetNumDevs", Some(0)),
+        ("ws2_32.dll", "connect", Some(u32::MAX)),
+        ("ws2_32.dll", "socket", Some(u32::MAX)),
+        ("ucrtbase.dll", "wcscat_s", Some(40)),
+        ("kernel32.dll", "GetTickCount64", None),
+        ("msvcrt.dll", "floor", None),
+    ] {
+        let signature = signature::lookup(module, name).unwrap();
+        assert_eq!(adv_abi::stub::derived_failure(signature), failure, "{name}");
+    }
     let mut registry = Registry::default();
     registry.set_mode(RunMode::Discovery);
     let mut machine = machine(registry);
     let thunk = machine
         .resolve_import("kernel32.dll", "GetTickCount")
         .unwrap();
+    machine.cpu.write_u32(DATA, 0x1234).unwrap();
+    let mut code = Asm::new(CODE);
+    code.call(thunk).mov_mem_eax(DATA);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0);
+    let context = &machine.sys.contexts[machine.sys.current as usize];
+    assert_eq!(
+        machine.cpu.read_u32(context.teb + teb::LAST_ERROR).unwrap(),
+        120
+    );
+    let mut registry = Registry::default();
+    registry.set_mode(RunMode::Discovery);
+    let mut wide = self::machine(registry);
+    let thunk = wide
+        .resolve_import("kernel32.dll", "GetTickCount64")
+        .unwrap();
     let mut code = Asm::new(CODE);
     code.call(thunk);
-    let RunResult::Failed(failure) = execute(&mut machine, code) else {
-        panic!("unknown failure was guessed");
+    let RunResult::Failed(failure) = execute(&mut wide, code) else {
+        panic!("a 64-bit failure was guessed");
     };
-    assert!(failure.message.contains("no reviewed failure contract"));
+    assert!(failure.message.contains("no derivable failure"));
 }
 
 #[test]

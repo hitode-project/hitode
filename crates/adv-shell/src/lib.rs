@@ -109,7 +109,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
-  --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
+  --api-mode strict|discovery   stop at the first API gap, or keep playing past gaps (default: discovery)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
@@ -193,7 +193,7 @@ impl Options {
             codec_kernels: adv_runtime::codec_kernels::Mode::Native,
             codec_kernels_explicit: false,
             codec_signatures: None,
-            api_mode: adv_runtime::RunMode::Strict,
+            api_mode: adv_runtime::RunMode::Discovery,
             time_skip: true,
         }
     }
