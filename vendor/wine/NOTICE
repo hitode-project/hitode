@@ -1,5 +1,6 @@
-Wine 11.0, the wineserver sources and the headers they include, plus the
-l_intl.nls case table the server loads at startup.
+Wine 11.0, the wineserver sources and the headers they include, the
+l_intl.nls case table the server loads at startup, and the system call table
+dlls/ntdll/ntsyscalls.h that numbers the calls ntdll.dll makes.
 Source: https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
 SHA-256: c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
 License: LGPL-2.1-or-later; see COPYING.LIB and AUTHORS.

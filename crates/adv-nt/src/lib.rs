@@ -5,8 +5,14 @@
 //! from the Hitode machine: NT system calls, process and thread startup, and
 //! the client side of the wineserver protocol (issue #58).
 //!
-//! So far it holds the server client.
+//! So far it starts ntdll.dll up to its first system call, and holds the
+//! server client.
 #![cfg(unix)]
 
+pub mod context;
+pub mod dispatch;
+pub mod image;
+pub mod process;
 pub mod protocol;
 pub mod server;
+pub mod syscalls;

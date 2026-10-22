@@ -207,8 +207,12 @@ dependencies = [
 name = "adv-nt"
 version = "0.1.2"
 dependencies = [
+ "adv-cpu",
+ "adv-machine",
+ "adv-pe",
  "adv-wineserver",
  "libc",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

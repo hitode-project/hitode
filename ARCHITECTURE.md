@@ -33,7 +33,7 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | Personality | `adv-win32`, `adv-dx` | Parameters, observable behavior and object state of Win32, the CRT and DirectX COM | Drawing, mixing, decoding |
 | System services | `adv-os` | Loader, synthetic PE images, PEB/TEB/LDR, virtual file system, registry, handles, COM | |
 | ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics | API behavior |
-| NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: so far the server protocol client | Windows behavior above the NT interface |
+| NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: image mapping, process startup, the system call and Unix call dispatchers, and the server protocol client | Windows behavior above the NT interface |
 | Wine server | `adv-wineserver` | Wine's server built in process for the Wine userland port ([#58](https://github.com/hitode-project/hitode/issues/58)): handles, namespace, registry and timers, resumed by its caller with time from its caller | Waiting, time, host processes and signals |
 | Machine | `adv-machine` | Guest contexts, scheduling, clocks, waits, callbacks, exception and trap dispatch | |
 | Execution | `adv-cpu`, `adv-cpu-core`, `adv-cpu-x64`, `adv-cpu-a64` | Running x86 code: CPU state, guest address space, code validity, translation | Anything about Win32 |

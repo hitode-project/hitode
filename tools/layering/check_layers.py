@@ -34,7 +34,7 @@ RULES: dict[str, set[str]] = {
     "adv-wineserver": set(),
     # The NT platform under Wine's userland; it talks to the server through
     # its protocol, so the server crate is a test dependency only.
-    "adv-nt": set(),
+    "adv-nt": {"adv-machine", "adv-pe"},
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},

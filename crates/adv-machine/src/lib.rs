@@ -102,6 +102,9 @@ pub struct Sys {
     /// device output, not a guest thread role or an engine-specific frame loop.
     pub completed_frames: u32,
     pub pid: u32,
+    /// The PEB new threads point at. A personality that lays out its own
+    /// process environment block moves it before the first spawn.
+    pub peb: u32,
     pub process_identity: std::sync::Arc<process::ProcessIdentity>,
     next_tid: u32,
     /// Mapped guest images, for backtraces and profiles; the OS layer's loader fills it.
@@ -302,7 +305,7 @@ impl Sys {
                 (teb::SELF, teb),
                 (teb::PROCESS_ID, self.pid),
                 (teb::THREAD_ID, tid),
-                (teb::PEB, PEB_ADDR),
+                (teb::PEB, self.peb),
             ] {
                 cpu.write_u32(teb + off, v)?;
             }
@@ -1865,6 +1868,7 @@ impl<B: Backend> Machine<B> {
             completed_frames: 0,
             frame_pacer: None,
             pid: 0x1000,
+            peb: PEB_ADDR,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),
