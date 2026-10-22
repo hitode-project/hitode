@@ -601,5 +601,16 @@
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
     ],
     "abi": "_getpid is cdecl int(void); _sleep is cdecl void(unsigned long). Both consume the existing Windows process/scheduler services through their live public entries. _sleep(0) requests one millisecond, matching the pinned VC90 x86 boundary (the deprecated SDK declaration does not specify the zero-duration edge)."
+  },
+  "export_kind_corrections": {
+    "input": "data/abi/crt-kind-overrides.tsv",
+    "source": "Microsoft Windows SDK 10.0.26100.0, x86 function declarations; PE export-section observations of the pinned Microsoft x86 runtime binaries. The import-library DATA markers intentionally suppress mingw function thunks for locally replaced functions and do not describe their actual DLL storage class. No export names are added by kind correction.",
+    "headers": {
+      "corecrt_math.h": "b3c3a0188db2bf985a5082c787ca1509cb7ce34c48a0b0613ee244f2d3192d1c",
+      "fenv.h": "12e9ee9809314ca1db03e7fb0e36e20cb9052df291c8367d580f600dea7546e3",
+      "float.h": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd",
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "native_sections": "The fourteen legacy math entries are in executable .text in VC80 and VC90. The three lgamma and nine fenv entries are in executable .text in SDK x86 UCRT. _HUGE and _iob remain writable .data in VC80/90. Existing native-ABI provenance records the binary hashes; UCRT SHA-256 is 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9. _cabs, _tzset and _fpreset are executable .text entries in VC80, VC90 and SDK x86 UCRT."
   }
 }

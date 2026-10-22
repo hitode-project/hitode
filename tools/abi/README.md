@@ -372,3 +372,10 @@ cdecl declarations and the live GetCurrentProcessId/Sleep entries. `_sleep(0)`
 requests one millisecond, matching the pinned VC90 x86 entry; suspension uses the
 Windows scheduler and clock. `crt_process` checks all runtime projections and
 the public runtime API set in interpreter and JIT.
+
+`crt-kind-overrides.tsv` corrects import-library `DATA` markers that mingw uses
+for replacement math/fenv, FP-reset and timezone functions. SDK declarations and Microsoft x86 PE
+sections establish these as code; `_HUGE`, `_iob` and genuine data remain data.
+The export generator applies evidence only to names already present in its
+source, records the evidence hash, and rejects attempts to invent an export.
+`crt-source.json` records the declaration and native-section provenance.
