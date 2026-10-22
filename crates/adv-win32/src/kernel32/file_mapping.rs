@@ -666,10 +666,12 @@ pub(crate) fn unmap_section(env: &mut Env<'_>, address: u32) -> Outcome {
 }
 
 /// Forget names whose objects are gone, after a handle closes.
+/// Releases what depended on objects a handle close dropped.
 pub(crate) fn prune(env: &mut Env<'_>) {
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
         state.prune(&env.sys.objects);
     }
+    super::file::delete_on_close::release(env, false);
 }
 
 pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide: bool) -> Outcome {
