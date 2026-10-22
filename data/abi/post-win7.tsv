@@ -1,0 +1,2 @@
+# Catalogued functions introduced after Windows 7; they stay unimplemented under the Windows 7 profile.
+# dll	name	minimum client	source (WinMD SupportedOSPlatform or Microsoft Learn requirements)
