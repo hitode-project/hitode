@@ -297,21 +297,30 @@ fn path_is_directory_a(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+/// A CSIDL's folder: under the user's profile when the path is relative.
+fn folder(csidl: u32) -> Option<&'static str> {
+    Some(match csidl & 0xff {
+        0x00 | 0x10 => "Desktop",
+        0x05 => "Documents",
+        0x1a => "AppData\\Roaming",
+        0x1c => "AppData\\Local",
+        0x23 => "C:\\ProgramData",
+        0x24 => "C:\\Windows",
+        0x25 => "C:\\Windows\\system32",
+        0x26 => "C:\\Program Files",
+        0x28 => "",
+        0x2e => "C:\\Users\\Public\\Documents",
+        _ => return None,
+    })
+}
+
 /// Guest path of a CSIDL folder, or `None` if unsupported.
 fn special_folder(w: &Win32, csidl: u32) -> Option<String> {
     let user = format!("C:\\Users\\{}", w.cfg.os.user_name);
-    Some(match csidl & 0xff {
-        0x00 | 0x10 => format!("{user}\\Desktop"),
-        0x05 => format!("{user}\\Documents"),
-        0x1a => format!("{user}\\AppData\\Roaming"),
-        0x1c => format!("{user}\\AppData\\Local"),
-        0x23 => "C:\\ProgramData".into(),
-        0x24 => "C:\\Windows".into(),
-        0x25 => "C:\\Windows\\system32".into(),
-        0x26 => "C:\\Program Files".into(),
-        0x28 => user,
-        0x2e => "C:\\Users\\Public\\Documents".into(),
-        _ => return None,
+    Some(match folder(csidl)? {
+        "" => user,
+        absolute if absolute.starts_with("C:") => absolute.into(),
+        relative => format!("{user}\\{relative}"),
     })
 }
 
@@ -433,6 +442,16 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHELL32, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
+    for (module, name, param) in [
+        (SHELL32, "SHGetFolderPathA", "csidl"),
+        (SHELL32, "SHGetFolderPathW", "csidl"),
+        (SHFOLDER, "SHGetFolderPathA", "csidl"),
+        (SHFOLDER, "SHGetFolderPathW", "csidl"),
+        (SHELL32, "SHGetSpecialFolderPathA", "csidl"),
+        (SHELL32, "SHGetSpecialFolderPathW", "csidl"),
+    ] {
+        reg.accept(module, name, param, |csidl| folder(csidl).is_some());
+    }
     common_dialogs::register(reg);
     directories::register(reg);
     folder_browse::register(reg);

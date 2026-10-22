@@ -7,6 +7,7 @@ const LOAD_WIDE: u32 = BASE + 0x3004;
 const PROC: u32 = BASE + 0x3008;
 const CLASS: u32 = BASE + 0x300c;
 const QUERY: u32 = BASE + 0x3010;
+const SEEK: u32 = BASE + 0x3014;
 const CLSID: [u8; 16] = [
     0x11, 0xf8, 0x90, 0x45, 0x3a, 0x1d, 0xd0, 0x11, 0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24,
 ];
@@ -15,7 +16,7 @@ fn at(offset: u32) -> i32 {
     (BASE + offset) as i32
 }
 
-// spec: PERS-EXPORT-9
+// spec: PERS-EXPORT-9, PERS-EXPORT-10
 #[test]
 fn constant_names_reach_lookups_through_common_call_shapes() {
     let mut a = CodeAssembler::new(32).unwrap();
@@ -44,6 +45,13 @@ fn constant_names_reach_lookups_through_common_call_shapes() {
     a.mov(dword_ptr(esp + 4), at(0x2020)).unwrap();
     a.mov(dword_ptr(esp), eax).unwrap();
     a.call(dword_ptr(PROC as i32)).unwrap();
+    // SetFilePointer(file, 0, NULL, FILE_END) with its result overwritten.
+    a.push(2).unwrap();
+    a.push(0).unwrap();
+    a.push(0).unwrap();
+    a.push(ebx).unwrap();
+    a.call(dword_ptr(SEEK as i32)).unwrap();
+    a.xor(eax, eax).unwrap();
     // CoCreateInstance(clsid, outer, context, iid, out) through an import thunk.
     a.push(0).unwrap();
     a.push(0).unwrap();
@@ -71,13 +79,25 @@ fn constant_names_reach_lookups_through_common_call_shapes() {
         bytes[0x2040 + 2 * i..0x2042 + 2 * i].copy_from_slice(&unit.to_le_bytes());
     }
     bytes[0x2100..0x2110].copy_from_slice(&CLSID);
-    let slots = HashMap::from([
-        (LOAD, Lookup::Load { wide: false }),
-        (LOAD_WIDE, Lookup::Load { wide: true }),
-        (QUERY, Lookup::Query { arg: 0 }),
-        (PROC, Lookup::Proc),
-        (CLASS, Lookup::Class),
-    ]);
+    let imports = [
+        (LOAD, "kernel32.dll", "LoadLibraryA"),
+        (LOAD_WIDE, "kernel32.dll", "LoadLibraryW"),
+        (PROC, "kernel32.dll", "GetProcAddress"),
+        (CLASS, "ole32.dll", "CoCreateInstance"),
+        (QUERY, "kernel32.dll", "GetModuleHandleA"),
+        (SEEK, "kernel32.dll", "SetFilePointer"),
+    ];
+    let imports = Imports {
+        slots: imports
+            .iter()
+            .enumerate()
+            .map(|(i, &(slot, ..))| (slot, i))
+            .collect(),
+        targets: imports
+            .iter()
+            .map(|&(_, dll, name)| Target::new(dll, name))
+            .collect(),
+    };
     let image = Image {
         base: BASE,
         bytes: &bytes,
@@ -86,7 +106,7 @@ fn constant_names_reach_lookups_through_common_call_shapes() {
     scan(
         &bytes[0x1000..0x1000 + code.len()],
         BASE + 0x1000,
-        &slots,
+        &imports,
         &image,
         &mut manifest,
     );
@@ -100,6 +120,19 @@ fn constant_names_reach_lookups_through_common_call_shapes() {
     );
     assert_eq!(manifest.classes, BTreeSet::from([CLSID]));
     assert_eq!((manifest.sites, manifest.open_sites), (9, 1));
+    let used = |dll: &str, name: &str, param, value, ignored| {
+        let key = (dll.to_owned(), name.to_owned(), param, Some(value));
+        (key, Calls { sites: 1, ignored })
+    };
+    assert_eq!(
+        manifest.uses,
+        BTreeMap::from([
+            used("kernel32.dll", "SetFilePointer", "dwMoveMethod", 2, 1),
+            used("kernel32.dll", "SetFilePointer", "lDistanceToMove", 0, 1),
+            // Returned to the caller, so not discarded.
+            used("ole32.dll", "CoCreateInstance", "dwClsContext", 1, 0),
+        ])
+    );
     assert_eq!(guid(&CLSID), "{4590f811-1d3a-11d0-891f-00aa004b2e24}");
 }
 
@@ -128,15 +161,27 @@ impl Provider for Fake {
     fn class(&self, clsid: &[u8; 16]) -> bool {
         clsid[0] == 1
     }
+    fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
+        ((module, name, param) == ("kernel32.dll", "Sleep", "dwMilliseconds"))
+            .then_some(|ms| ms < 100)
+    }
 }
 
 fn set<const N: usize>(items: [&str; N]) -> BTreeSet<String> {
     items.into_iter().map(str::to_owned).collect()
 }
 
-// spec: PERS-EXPORT-9
+// spec: PERS-EXPORT-9, PERS-EXPORT-10
 #[test]
 fn gaps_resolve_game_modules_before_host_modules_unless_replaced() {
+    let sleep = |ms| {
+        (
+            "kernel32.dll".to_owned(),
+            "Sleep".to_owned(),
+            "dwMilliseconds",
+            ms,
+        )
+    };
     let import = |dll: &str, name: &str| (dll.to_owned(), name.to_owned());
     let exe = Manifest {
         imports: BTreeSet::from([
@@ -152,6 +197,49 @@ fn gaps_resolve_game_modules_before_host_modules_unless_replaced() {
         classes: BTreeSet::from([[1; 16], [2; 16]]),
         sites: 5,
         open_sites: 1,
+        uses: BTreeMap::from([
+            (
+                sleep(Some(10)),
+                Calls {
+                    sites: 2,
+                    ignored: 2,
+                },
+            ),
+            (
+                sleep(Some(500)),
+                Calls {
+                    sites: 1,
+                    ignored: 1,
+                },
+            ),
+            (
+                sleep(None),
+                Calls {
+                    sites: 4,
+                    ignored: 0,
+                },
+            ),
+            (
+                (
+                    "kernel32.dll".into(),
+                    "SetErrorMode".into(),
+                    "uMode",
+                    Some(1),
+                ),
+                Calls {
+                    sites: 1,
+                    ignored: 0,
+                },
+            ),
+            // Bound to a game module, whose arguments are its own business.
+            (
+                ("game.dll".into(), "Exported".into(), "mode", Some(9)),
+                Calls {
+                    sites: 1,
+                    ignored: 0,
+                },
+            ),
+        ]),
         ..Manifest::default()
     };
     let dll = Manifest {
@@ -207,4 +295,19 @@ fn gaps_resolve_game_modules_before_host_modules_unless_replaced() {
         by(&[(guid(&[2; 16]).as_str(), &["game.exe"])])
     );
     assert_eq!((gaps.sites, gaps.open_sites), (5, 1));
+    assert_eq!(
+        gaps.unsupported_modes,
+        by(&[(
+            "kernel32.dll!Sleep dwMilliseconds=0x1f4 (result discarded)",
+            &["game.exe"]
+        )])
+    );
+    assert_eq!(
+        gaps.unreviewed_modes,
+        BTreeMap::from([(
+            "kernel32.dll!SetErrorMode uMode".to_owned(),
+            BTreeSet::from([1])
+        )])
+    );
+    assert_eq!((gaps.mode_sites, gaps.open_mode_sites), (7, 4));
 }

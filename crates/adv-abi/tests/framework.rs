@@ -625,3 +625,31 @@ fn audio_registration_rejects_both_leaf_kinds() {
         "waveOutWrite"
     ));
 }
+
+#[test]
+// spec: PERS-EXPORT-10
+fn mode_contracts_name_declared_scalar_parameters() {
+    let mut registry = Registry::default();
+    registry.accept("KERNEL32.dll", "SetFilePointer", "dwMoveMethod", |m| m <= 2);
+    let accepts = registry
+        .accepts("kernel32.dll", "SetFilePointer", "dwMoveMethod")
+        .unwrap();
+    assert!(accepts(2) && !accepts(3));
+    assert!(
+        registry
+            .accepts("kernel32.dll", "SetFilePointer", "lDistanceToMove")
+            .is_none()
+    );
+    for (name, param) in [
+        ("SetFilePointer", "lpDistanceToMoveHigh"),
+        ("SetFilePointer", "dwMode"),
+    ] {
+        let declared = std::panic::catch_unwind(|| {
+            Registry::default().accept("kernel32.dll", name, param, |_| true)
+        });
+        assert!(
+            declared.is_err(),
+            "{param} is not a declared scalar parameter"
+        );
+    }
+}

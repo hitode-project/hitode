@@ -3,11 +3,13 @@
 //! reach: static and delay imports, and the modules, functions and COM classes
 //! it names by constant at LoadLibrary, GetProcAddress and CoCreateInstance
 //! call sites. Diffing them against the runtime lists every gap in one run,
-//! not just the first one a player reaches.
+//! not just the first one a player reaches. Constant scalar arguments of
+//! every import call are checked against the runtime's mode contracts
+//! (PERS-EXPORT-10).
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use adv_abi::Registry;
 use adv_abi::personality::ExportClass;
+use adv_abi::{AbiKind, Accepts, Registry};
 use adv_cpu::backend::Backend;
 use adv_machine::Resolver;
 use adv_pe::{ImportName, Pe};
@@ -32,6 +34,57 @@ pub struct Manifest {
     pub sites: u32,
     /// Of those, the calls whose name or class argument is not a constant.
     pub open_sites: u32,
+    /// Scalar arguments of import calls, by (lowercase module, function,
+    /// parameter, constant value or None when not a constant).
+    pub uses: BTreeMap<Use, Calls>,
+}
+
+pub type Use = (String, String, &'static str, Option<u32>);
+
+/// Calls passing one argument value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Calls {
+    pub sites: u32,
+    /// Of those, calls whose result is overwritten before any use.
+    pub ignored: u32,
+}
+
+/// An import a call site can reach.
+struct Target {
+    module: String,
+    name: String,
+    lookup: Option<Lookup>,
+    /// Scalar parameters by argument index.
+    scalars: Vec<(usize, &'static str)>,
+    /// The function returns a value a caller can check.
+    returns: bool,
+}
+
+impl Target {
+    fn new(module: &str, name: &str) -> Self {
+        let signature = adv_abi::signature::lookup(module, name);
+        let mut scalars = Vec::new();
+        let mut index = 0;
+        for parameter in signature.map_or(&[][..], |s| &s.parameters) {
+            if parameter.words == 1 && matches!(parameter.kind, AbiKind::U32 | AbiKind::I32) {
+                scalars.push((index, parameter.name));
+            }
+            index += usize::from(parameter.words);
+        }
+        Self {
+            module: module.to_owned(),
+            name: name.to_owned(),
+            lookup: lookup(name),
+            scalars,
+            returns: signature.is_some_and(|s| s.return_kind != AbiKind::Void),
+        }
+    }
+}
+
+/// Import slots by virtual address, as indices into their targets.
+struct Imports {
+    slots: HashMap<u32, usize>,
+    targets: Vec<Target>,
 }
 
 /// A game file, by its path under the game folder, and its manifest.
@@ -73,7 +126,10 @@ pub fn analyze(file: &[u8]) -> Option<Manifest> {
         return None;
     }
     let mut manifest = Manifest::default();
-    let mut slots = HashMap::new();
+    let mut imported = Imports {
+        slots: HashMap::new(),
+        targets: Vec::new(),
+    };
     let imports = pe
         .imports()
         .unwrap_or_default()
@@ -88,10 +144,10 @@ pub fn analyze(file: &[u8]) -> Option<Manifest> {
     for (dll, imports) in imports {
         let dll = dll.to_ascii_lowercase();
         for import in imports {
-            if let ImportName::Name { name, .. } = &import.name
-                && let Some(kind) = lookup(name)
-            {
-                slots.insert(pe.image_base.wrapping_add(import.iat_rva), kind);
+            if let ImportName::Name { name, .. } = &import.name {
+                let slot = pe.image_base.wrapping_add(import.iat_rva);
+                imported.slots.insert(slot, imported.targets.len());
+                imported.targets.push(Target::new(&dll, name));
             }
             manifest
                 .imports
@@ -102,7 +158,7 @@ pub fn analyze(file: &[u8]) -> Option<Manifest> {
         manifest.exports.insert(format!("#{}", export.ordinal));
         manifest.exports.extend(export.name);
     }
-    if !slots.is_empty() {
+    if !imported.slots.is_empty() {
         let image = Image {
             base: pe.image_base,
             bytes: &pe.image,
@@ -114,7 +170,7 @@ pub fn analyze(file: &[u8]) -> Option<Manifest> {
                 .min(pe.image.len());
             if let Some(code) = pe.image.get(start..end) {
                 let ip = pe.image_base.wrapping_add(section.virtual_address);
-                scan(code, ip, &slots, &image, &mut manifest);
+                scan(code, ip, &imported, &image, &mut manifest);
             }
         }
     }
@@ -229,7 +285,7 @@ fn value(
     ins: &Instruction,
     operand: u32,
     state: &State,
-    slots: &HashMap<u32, Lookup>,
+    slots: &HashMap<u32, usize>,
 ) -> Option<Value> {
     match ins.op_kind(operand) {
         OpKind::Immediate32 => Some(Value::Const(ins.immediate32())),
@@ -271,31 +327,83 @@ const IMPLICIT: &[Mnemonic] = &[
     Mnemonic::Cmpxchg,
 ];
 
-/// Records the constant names reaching each lookup call in `code`. A linear
-/// sweep keeps register and argument constants only within straight-line
-/// code; jumps and returns forget them, conditional branches do not.
-fn scan(
-    code: &[u8],
-    ip: u32,
-    slots: &HashMap<u32, Lookup>,
-    image: &Image<'_>,
-    manifest: &mut Manifest,
-) {
+/// Whether the result of a call is discarded, from the next instruction that
+/// names EAX: Some(true) when it overwrites it first, Some(false) when it may
+/// read it, None when the instruction does neither.
+fn discards(ins: &Instruction) -> Option<bool> {
+    match ins.mnemonic() {
+        Mnemonic::Call => return Some(true),
+        Mnemonic::Ret | Mnemonic::Retf | Mnemonic::Jmp => return Some(false),
+        Mnemonic::Rdtsc
+        | Mnemonic::Cpuid
+        | Mnemonic::Popa
+        | Mnemonic::Popad
+        | Mnemonic::Lodsb
+        | Mnemonic::Lodsw
+        | Mnemonic::Lodsd => return Some(true),
+        mnemonic if IMPLICIT.contains(&mnemonic) => return Some(false),
+        _ => {}
+    }
+    let operands = 0..ins.op_count();
+    let addressed = operands.clone().any(|i| ins.op_kind(i) == OpKind::Memory)
+        && [ins.memory_base(), ins.memory_index()]
+            .into_iter()
+            .any(|register| written(register) == Some(0));
+    let named: Vec<u32> = operands
+        .filter(|&i| ins.op_kind(i) == OpKind::Register && written(ins.op_register(i)) == Some(0))
+        .collect();
+    match named.as_slice() {
+        _ if addressed => Some(false),
+        [] => None,
+        [0] if matches!(
+            ins.mnemonic(),
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Lea | Mnemonic::Pop
+        ) =>
+        {
+            Some(true)
+        }
+        [0, 1] if matches!(ins.mnemonic(), Mnemonic::Xor | Mnemonic::Sub) => Some(true),
+        _ => Some(false),
+    }
+}
+
+/// Records the constant names reaching each lookup call in `code`, and the
+/// scalar arguments of every import call. A linear sweep keeps register and
+/// argument constants only within straight-line code; jumps and returns
+/// forget them, conditional branches do not.
+fn scan(code: &[u8], ip: u32, imports: &Imports, image: &Image<'_>, manifest: &mut Manifest) {
+    let slots = &imports.slots;
     // Import thunks: `jmp [slot]`, called directly by incremental links.
     let mut thunks = HashMap::new();
     for (offset, window) in code.windows(6).enumerate() {
         if window[..2] == [0xff, 0x25] {
             let slot = u32::from_le_bytes([window[2], window[3], window[4], window[5]]);
-            if let Some(&kind) = slots.get(&slot) {
-                thunks.insert(ip.wrapping_add(offset as u32), kind);
+            if let Some(&target) = slots.get(&slot) {
+                thunks.insert(ip.wrapping_add(offset as u32), target);
             }
         }
     }
     let mut decoder = Decoder::with_ip(32, code, u64::from(ip), DecoderOptions::NONE);
     let mut ins = Instruction::default();
     let mut state = State::default();
+    // Arguments of the last call whose result use is not yet known.
+    let mut pending: Option<(Vec<Use>, u32)> = None;
+    let commit = |uses: Vec<Use>, ignored: bool, manifest: &mut Manifest| {
+        for key in uses {
+            let calls = manifest.uses.entry(key).or_default();
+            calls.sites += 1;
+            calls.ignored += u32::from(ignored);
+        }
+    };
     while decoder.can_decode() {
         decoder.decode_out(&mut ins);
+        if let Some((uses, seen)) = pending.take() {
+            match discards(&ins).filter(|_| !ins.is_invalid()) {
+                Some(ignored) => commit(uses, ignored, manifest),
+                None if seen < 8 => pending = Some((uses, seen + 1)),
+                None => commit(uses, false, manifest),
+            }
+        }
         if ins.is_invalid() {
             state = State::default();
             continue;
@@ -339,8 +447,26 @@ fn scan(
                     OpKind::NearBranch32 => thunks.get(&ins.near_branch32()).copied(),
                     _ => None,
                 };
-                if let Some(kind) = target {
-                    record(kind, &state, image, manifest);
+                if let Some(target) = target.map(|i| &imports.targets[i]) {
+                    if let Some(kind) = target.lookup {
+                        record(kind, &state, image, manifest);
+                    }
+                    let uses: Vec<Use> = target
+                        .scalars
+                        .iter()
+                        .map(|&(index, param)| {
+                            let constant = match state.arg(index) {
+                                Some(Value::Const(value)) => Some(value),
+                                _ => None,
+                            };
+                            (target.module.clone(), target.name.clone(), param, constant)
+                        })
+                        .collect();
+                    if target.returns && !uses.is_empty() {
+                        pending = Some((uses, 0));
+                    } else {
+                        commit(uses, false, manifest);
+                    }
                 }
                 state.after_call();
             }
@@ -369,6 +495,9 @@ fn scan(
                 }
             }
         }
+    }
+    if let Some((uses, _)) = pending {
+        commit(uses, false, manifest);
     }
 }
 
@@ -444,6 +573,8 @@ pub trait Provider {
     /// answered as on Windows 7.
     fn lookup(&self, name: &str) -> Vec<(String, bool)>;
     fn class(&self, clsid: &[u8; 16]) -> bool;
+    /// The mode contract of a parameter, when the runtime declares one.
+    fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts>;
 }
 
 /// Every requirement the runtime cannot satisfy, each with the files needing it.
@@ -464,6 +595,16 @@ pub struct Gaps {
     pub missing_classes: BTreeMap<String, BTreeSet<String>>,
     pub sites: u32,
     pub open_sites: u32,
+    /// `module!name param=value` constants outside the parameter's mode
+    /// contract, marked when a call discards the result.
+    pub unsupported_modes: BTreeMap<String, BTreeSet<String>>,
+    /// Constants passed to scalar parameters of host functions without a
+    /// mode contract, by `module!name param`.
+    pub unreviewed_modes: BTreeMap<String, BTreeSet<u32>>,
+    /// Calls passing a parameter with a contract, and of those the calls
+    /// passing no constant.
+    pub mode_sites: u32,
+    pub open_mode_sites: u32,
 }
 
 fn need(gaps: &mut BTreeMap<String, BTreeSet<String>>, item: String, file: &str) {
@@ -476,11 +617,38 @@ pub fn gaps(modules: &[Module], host: &dyn Provider) -> Gaps {
         .map(|module| (module_key(&module.file), &module.manifest))
         .collect();
     let exported = |name: &str| modules.iter().any(|m| m.manifest.exports.contains(name));
+    let hosted = |dll: &str| host.replaces(dll) || (!local.contains_key(dll) && host.provides(dll));
     let mut gaps = Gaps::default();
     for module in modules {
         let (manifest, file) = (&module.manifest, module.file.as_str());
         gaps.sites += manifest.sites;
         gaps.open_sites += manifest.open_sites;
+        for ((dll, name, param, constant), calls) in &manifest.uses {
+            if !hosted(dll) || !host.binds(dll, name) {
+                continue;
+            }
+            let Some(accepts) = host.accepts(dll, name, param) else {
+                if let Some(value) = constant {
+                    let key = format!("{dll}!{name} {param}");
+                    gaps.unreviewed_modes.entry(key).or_default().insert(*value);
+                }
+                continue;
+            };
+            gaps.mode_sites += calls.sites;
+            match constant {
+                None => gaps.open_mode_sites += calls.sites,
+                Some(value) if !accepts(*value) => {
+                    let discarded = if calls.ignored > 0 {
+                        " (result discarded)"
+                    } else {
+                        ""
+                    };
+                    let key = format!("{dll}!{name} {param}={value:#x}{discarded}");
+                    need(&mut gaps.unsupported_modes, key, file);
+                }
+                Some(_) => {}
+            }
+        }
         for (dll, name) in &manifest.imports {
             let game = local.get(dll).filter(|_| !host.replaces(dll));
             let bound = match game {
@@ -562,6 +730,9 @@ impl Provider for Host<'_> {
     fn class(&self, clsid: &[u8; 16]) -> bool {
         self.classes
             .is_some_and(|classes| classes.get(clsid).is_some())
+    }
+    fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
+        self.registry.accepts(module, name, param)
     }
 }
 

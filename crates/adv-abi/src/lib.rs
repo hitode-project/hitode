@@ -43,6 +43,9 @@ pub use stub::{
     RunMode, StubCall, warn_structural, warn_unavailable,
 };
 
+/// A mode contract: the values of a parameter handled as Windows 7 does.
+pub type Accepts = fn(u32) -> bool;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImplementationLevel {
     Implement,
@@ -83,6 +86,9 @@ pub struct Registry {
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
+    /// Mode contracts: the values of a scalar parameter an implementation
+    /// handles as Windows 7 does.
+    modes: HashMap<(String, String), Vec<(&'static str, Accepts)>>,
     /// Development probe: discovery exposes the whole fixed core catalog.
     expose_fixed_exports: bool,
 }
@@ -96,6 +102,7 @@ impl Default for Registry {
             data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
+            modes: HashMap::new(),
             expose_fixed_exports: std::env::var_os("ADV_PERSONALITY_STRICT")
                 .is_some_and(|value| value == "1"),
         }
@@ -341,6 +348,36 @@ impl Registry {
         }
         self.aliases.insert(key, target);
         Ok(())
+    }
+
+    /// Declare that `module!name` handles `param` as Windows 7 does exactly
+    /// for the values `accepts` passes (PERS-EXPORT-10). Other values reach the
+    /// implementation unchanged; the declaration lets a survey find them first.
+    pub fn accept(&mut self, module: &str, name: &str, param: &'static str, accepts: Accepts) {
+        assert!(
+            signature::lookup(module, name).is_some_and(|s| s
+                .parameters
+                .iter()
+                .any(|p| p.name == param
+                    && p.words == 1
+                    && matches!(p.kind, AbiKind::U32 | AbiKind::I32))),
+            "a mode contract needs a declared scalar parameter: {module}!{name} {param}"
+        );
+        let contracts = self
+            .modes
+            .entry((module.to_ascii_lowercase(), name.to_owned()))
+            .or_default();
+        contracts.retain(|&(p, _)| p != param);
+        contracts.push((param, accepts));
+    }
+
+    /// The mode contract of `param` of `module!name`, when one is declared.
+    pub fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
+        self.modes
+            .get(&(module.to_ascii_lowercase(), name.to_owned()))?
+            .iter()
+            .find(|&&(p, _)| p == param)
+            .map(|&(_, accepts)| accepts)
     }
 
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {

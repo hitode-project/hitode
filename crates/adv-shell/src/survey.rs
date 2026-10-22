@@ -73,13 +73,28 @@ pub(crate) fn write(path: &Path, modules: &[Module], gaps: &Gaps) -> Result<Stri
             .join(",");
         format!("{{{entries}}}")
     };
+    let values = |gaps: &BTreeMap<String, BTreeSet<u32>>| {
+        let entries = gaps
+            .iter()
+            .map(|(item, values)| {
+                let values = values
+                    .iter()
+                    .map(|v| format!("\"{v:#x}\""))
+                    .collect::<Vec<_>>();
+                format!("\n    {}: [{}]", json(item), values.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{{entries}}}")
+    };
     let files = modules.iter().map(|m| json(&m.file)).collect::<Vec<_>>();
     let text = format!(
         concat!(
             "{{\n  \"modules\": [{}],\n  \"lookup_sites\": {},\n  \"open_lookup_sites\": {},\n",
             "  \"missing_modules\": {},\n  \"missing_imports\": {},\n  \"absent_loads\": {},\n",
             "  \"unavailable_lookups\": {},\n  \"undeclared_lookups\": {},\n",
-            "  \"missing_classes\": {}\n}}\n"
+            "  \"missing_classes\": {},\n  \"mode_sites\": {},\n  \"open_mode_sites\": {},\n",
+            "  \"unsupported_modes\": {},\n  \"unreviewed_modes\": {}\n}}\n"
         ),
         files.join(", "),
         gaps.sites,
@@ -90,13 +105,17 @@ pub(crate) fn write(path: &Path, modules: &[Module], gaps: &Gaps) -> Result<Stri
         map(&gaps.unavailable_lookups),
         map(&gaps.undeclared_lookups),
         map(&gaps.missing_classes),
+        gaps.mode_sites,
+        gaps.open_mode_sites,
+        map(&gaps.unsupported_modes),
+        values(&gaps.unreviewed_modes),
     );
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(path, text).map_err(|e| format!("survey {}: {e}", path.display()))?;
     Ok(format!(
-        "survey: modules={} missing_modules={} missing_imports={} absent_loads={} unavailable_lookups={} undeclared_lookups={} missing_classes={} open_lookup_sites={}/{}",
+        "survey: modules={} missing_modules={} missing_imports={} absent_loads={} unavailable_lookups={} undeclared_lookups={} missing_classes={} unsupported_modes={} unreviewed_modes={} open_lookup_sites={}/{} open_mode_sites={}/{}",
         modules.len(),
         gaps.missing_modules.len(),
         gaps.missing_imports.len(),
@@ -104,7 +123,11 @@ pub(crate) fn write(path: &Path, modules: &[Module], gaps: &Gaps) -> Result<Stri
         gaps.unavailable_lookups.len(),
         gaps.undeclared_lookups.len(),
         gaps.missing_classes.len(),
+        gaps.unsupported_modes.len(),
+        gaps.unreviewed_modes.len(),
         gaps.open_sites,
         gaps.sites,
+        gaps.open_mode_sites,
+        gaps.mode_sites,
     ))
 }
