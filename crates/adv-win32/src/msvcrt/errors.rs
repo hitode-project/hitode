@@ -81,3 +81,18 @@ fn set_handler(env: &mut Env<'_>) -> Outcome {
 fn get_handler(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(invalid_handler(env))
 }
+
+/// Parameter checks share legacy errno and modern invalid-handler profiles.
+pub(super) fn invalid(env: &mut Env<'_>, result: u32) -> Outcome {
+    if let Err(fault) = floating::errno_address(env).write(env.cpu, 22) {
+        return memory_failure(fault);
+    }
+    if !versions::profile(&env.sys.thunks.get(env.thunk).module).invalid_parameters {
+        return Outcome::Return(result);
+    }
+    if invalid_handler(env) == 0 {
+        return invalid_parameter_noinfo(env);
+    }
+    let name = env.sys.thunks.get(env.thunk).name.clone();
+    invalid_parameter_result(env, &name, 22, result)
+}

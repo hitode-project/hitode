@@ -1413,3 +1413,173 @@ ucrtbase.dll	_NLG_Return2	cdecl	void	void
 vcruntime140.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 vcruntime140.dll	_EH_prolog	cdecl	void	void	
 vcruntime140.dll	_NLG_Return2	cdecl	void	void	
+
+# SDK mbctype.h/mbstring.h x86 cdecl multibyte traversal and independent code-page control.
+api-ms-win-crt-locale-l1-1-0.dll	_getmbcp	cdecl	i32	int	
+api-ms-win-crt-locale-l1-1-0.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_getmbcp	cdecl	i32	int	
+msvcr100.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr100.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr100.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr100.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr100.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr100.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr110.dll	_getmbcp	cdecl	i32	int	
+msvcr110.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr110.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr110.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr110.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr110.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr110.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr120.dll	_getmbcp	cdecl	i32	int	
+msvcr120.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr120.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr120.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr120.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr120.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr120.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr70.dll	_getmbcp	cdecl	i32	int	
+msvcr70.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr70.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr70.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr70.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr70.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr70.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr71.dll	_getmbcp	cdecl	i32	int	
+msvcr71.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr71.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr71.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr71.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr71.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr71.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr80.dll	_getmbcp	cdecl	i32	int	
+msvcr80.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr80.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr80.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr80.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr80.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr80.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcr90.dll	_getmbcp	cdecl	i32	int	
+msvcr90.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr90.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr90.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr90.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr90.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr90.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcrt.dll	_getmbcp	cdecl	i32	int	
+msvcrt.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcrt20.dll	_getmbcp	cdecl	i32	int	
+msvcrt20.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt20.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt20.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt20.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+msvcrt40.dll	_getmbcp	cdecl	i32	int	
+msvcrt40.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt40.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt40.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt40.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+ucrtbase.dll	_getmbcp	cdecl	i32	int	
+ucrtbase.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+ucrtbase.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+ucrtbase.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+ucrtbase.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1

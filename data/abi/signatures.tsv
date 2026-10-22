@@ -624,6 +624,20 @@ api-ms-win-crt-heap-l1-1-0.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:si
 api-ms-win-crt-heap-l1-1-0.dll	free	cdecl	void	void	block:void*:ptr:1
 api-ms-win-crt-heap-l1-1-0.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 api-ms-win-crt-heap-l1-1-0.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
+api-ms-win-crt-locale-l1-1-0.dll	_getmbcp	cdecl	i32	int	
+api-ms-win-crt-locale-l1-1-0.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+api-ms-win-crt-multibyte-l1-1-0.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 api-ms-win-crt-process-l1-1-0.dll	_execl	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
 api-ms-win-crt-process-l1-1-0.dll	_execle	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
 api-ms-win-crt-process-l1-1-0.dll	_execlp	variadic	i32	intptr_t	path:const char*:str8:1|arg0:const char*:str8:1
@@ -3622,9 +3636,22 @@ msvcr100.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcr100.dll	_get_purecall_handler	cdecl	ptr	callback	
 msvcr100.dll	_get_terminate	cdecl	ptr	callback	
 msvcr100.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr100.dll	_getmbcp	cdecl	i32	int	
 msvcr100.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr100.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr100.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr100.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr100.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr100.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcr100.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr100.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr100.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr100.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr100.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcr100.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcr100.dll	_purecall	cdecl	i32	int	
@@ -3634,6 +3661,7 @@ msvcr100.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:
 msvcr100.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr100.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr100.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr100.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr100.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr100.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr100.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -3720,9 +3748,22 @@ msvcr110.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcr110.dll	_get_purecall_handler	cdecl	ptr	callback	
 msvcr110.dll	_get_terminate	cdecl	ptr	callback	
 msvcr110.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr110.dll	_getmbcp	cdecl	i32	int	
 msvcr110.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr110.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr110.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr110.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr110.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr110.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcr110.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr110.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr110.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr110.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr110.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcr110.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcr110.dll	_purecall	cdecl	i32	int	
@@ -3732,6 +3773,7 @@ msvcr110.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:
 msvcr110.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr110.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr110.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr110.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr110.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr110.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr110.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -3818,9 +3860,22 @@ msvcr120.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcr120.dll	_get_purecall_handler	cdecl	ptr	callback	
 msvcr120.dll	_get_terminate	cdecl	ptr	callback	
 msvcr120.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr120.dll	_getmbcp	cdecl	i32	int	
 msvcr120.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr120.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr120.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr120.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr120.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr120.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcr120.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr120.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr120.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr120.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr120.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcr120.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcr120.dll	_purecall	cdecl	i32	int	
@@ -3830,6 +3885,7 @@ msvcr120.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:
 msvcr120.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr120.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr120.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr120.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr120.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr120.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr120.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -3903,13 +3959,27 @@ msvcr70.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const ch
 msvcr70.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr70.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr70.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_getmbcp	cdecl	i32	int	
 msvcr70.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr70.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr70.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr70.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr70.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr70.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr70.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr70.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr70.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr70.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcr70.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcr70.dll	_purecall	cdecl	i32	int	
 msvcr70.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr70.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr70.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr70.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr70.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr70.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -3981,14 +4051,28 @@ msvcr71.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const ch
 msvcr71.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr71.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr71.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_getmbcp	cdecl	i32	int	
 msvcr71.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr71.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr71.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr71.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr71.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr71.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr71.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr71.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr71.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr71.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcr71.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcr71.dll	_purecall	cdecl	i32	int	
 msvcr71.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr71.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr71.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr71.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr71.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr71.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcr71.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -4098,12 +4182,25 @@ msvcr80.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcr80.dll	_get_purecall_handler	cdecl	ptr	callback	
 msvcr80.dll	_get_terminate	cdecl	ptr	callback	
 msvcr80.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr80.dll	_getmbcp	cdecl	i32	int	
 msvcr80.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
 msvcr80.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr80.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
+msvcr80.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr80.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr80.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr80.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr80.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcr80.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
 msvcr80.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr80.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr80.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr80.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcr80.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -4117,6 +4214,7 @@ msvcr80.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:p
 msvcr80.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr80.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr80.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr80.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr80.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
 msvcr80.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
 msvcr80.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -4288,12 +4386,25 @@ msvcr90.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcr90.dll	_get_purecall_handler	cdecl	ptr	callback	
 msvcr90.dll	_get_terminate	cdecl	ptr	callback	
 msvcr90.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr90.dll	_getmbcp	cdecl	i32	int	
 msvcr90.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
 msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr90.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
+msvcr90.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcr90.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcr90.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr90.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcr90.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcr90.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
 msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcr90.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr90.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcr90.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcr90.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -4307,6 +4418,7 @@ msvcr90.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:p
 msvcr90.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr90.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcr90.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr90.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcr90.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
 msvcr90.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
 msvcr90.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -4468,12 +4580,25 @@ msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcrt.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcrt.dll	_get_terminate	cdecl	ptr	callback	
 msvcrt.dll	_get_unexpected	cdecl	ptr	callback	
+msvcrt.dll	_getmbcp	cdecl	i32	int	
 msvcrt.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
 msvcrt.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcrt.dll	_hypot	cdecl	f64	double	x:double:f64:2|y:double:f64:2
+msvcrt.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcrt.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 msvcrt.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
 msvcrt.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcrt.dll	_memicmp	cdecl	i32	int	left:const void*:ptr:1|right:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
@@ -4482,6 +4607,7 @@ msvcrt.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:st
 msvcrt.dll	_purecall	cdecl	i32	int	
 msvcrt.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcrt.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcrt.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -4597,13 +4723,27 @@ msvcrt20.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const c
 msvcrt20.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcrt20.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcrt20.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_getmbcp	cdecl	i32	int	
 msvcrt20.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcrt20.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt20.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt20.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt20.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcrt20.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcrt20.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt20.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt20.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcrt20.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcrt20.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcrt20.dll	_purecall	cdecl	i32	int	
 msvcrt20.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcrt20.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt20.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcrt20.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt20.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt20.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -4673,13 +4813,27 @@ msvcrt40.dll	_execv	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const c
 msvcrt40.dll	_execve	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcrt40.dll	_execvp	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcrt40.dll	_execvpe	cdecl	i32	intptr_t	path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_getmbcp	cdecl	i32	int	
 msvcrt40.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcrt40.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt40.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+msvcrt40.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt40.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 msvcrt40.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcrt40.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcrt40.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+msvcrt40.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcrt40.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 msvcrt40.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 msvcrt40.dll	_purecall	cdecl	i32	int	
 msvcrt40.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
 msvcrt40.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt40.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 msvcrt40.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt40.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 msvcrt40.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
@@ -6563,12 +6717,25 @@ ucrtbase.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 ucrtbase.dll	_get_purecall_handler	cdecl	ptr	callback	
 ucrtbase.dll	_get_terminate	cdecl	ptr	callback	
 ucrtbase.dll	_get_unexpected	cdecl	ptr	callback	
+ucrtbase.dll	_getmbcp	cdecl	i32	int	
 ucrtbase.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
 ucrtbase.dll	_initialize_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
 ucrtbase.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 ucrtbase.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
+ucrtbase.dll	_ismbblead	cdecl	i32	int	value:unsigned int:u32:1
+ucrtbase.dll	_ismbbtrail	cdecl	i32	int	value:unsigned int:u32:1
+ucrtbase.dll	_ismbslead	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+ucrtbase.dll	_ismbstrail	cdecl	i32	int	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
 ucrtbase.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
 ucrtbase.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+ucrtbase.dll	_mbsdec	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|current:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsinc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbslen	cdecl	u32	size_t	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsnbcnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|source:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
+ucrtbase.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	_o__get_terminate	cdecl	ptr	callback	
 ucrtbase.dll	_o__purecall	cdecl	i32	int	
 ucrtbase.dll	_o_set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
@@ -6583,6 +6750,7 @@ ucrtbase.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:
 ucrtbase.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	_set_se_translator	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+ucrtbase.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
 ucrtbase.dll	_spawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 ucrtbase.dll	_spawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1
 ucrtbase.dll	_spawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arg0:const char*:str8:1

@@ -567,5 +567,27 @@
       "notes": "ucrtbase.dll and vcruntime140.dll retain their actual memchr exports."
     },
     "winmd_platform_audit": "The pinned WinMD has no P/Invoke methods whose DLL/name pair matches the refreshed CRT catalog. No SupportedOSPlatform exclusions can be derived for this catalog from WinMD; undocumented internal entries are not excluded by release year alone."
+  },
+  "multibyte_traversal": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "headers": {
+      "mbctype.h": "d94ae0643bdd31201a2ffd173481164297ff6bee1d8e1ee8bd7d3442640468cf",
+      "mbstring.h": "71641796dab9103f67b47dd127d99bdd37360f6162fa8c63cf93873ebaab7f62"
+    },
+    "scope": "Cataloged non-locale-handle multibyte pointer/count/classification/copy entries and independent _setmbcp/_getmbcp code-page control. Shared locale storage preserves CRT-module ownership and public API-set aliases. Explicit locale handles and thread-locale configuration are separate work.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setmbcp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getmbcp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ismbblead-ismbblead-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ismbslead-ismbstrail-ismbslead-l-ismbstrail-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strlen-wcslen-mbslen-mbslen-l-mbstrlen-mbstrlen-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strinc-wcsinc-mbsinc-mbsinc-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strncnt-wcsncnt-mbsnbcnt-mbsnbcnt-l-mbsnccnt-mbsnccnt-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnextc-wcsnextc-mbsnextc-mbsnextc-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mbsnbcpy-mbsnbcpy-l"
+    ],
+    "legacy_utf8": "SDK mbctype.h explicitly identifies UTF-8 as unsupported by earlier CRT versions. The version profile rejects 65001 in legacy CRTs and accepts it in UCRT; its byte-lead classifiers remain false.",
+    "native_boundary_observations": "The pinned VC90 x86 entries return zero counts for a zero limit without dereferencing the input, omit a terminal lead byte from byte/character counts, increment a terminal lead by one byte in _mbsinc, and return its byte value in _mbsnextc. Context-sensitive lead/trail queries return -1 on a match, including a terminator immediately following a dangling lead. These are control-flow observations, not native Windows execution results.",
+    "ucrt_getmbcp": "Microsoft SDK 10.0.26100.0 Redist/ucrt/DLLs/x86/ucrtbase.dll, SHA-256 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9: the query returns zero when its DBCS flag is clear."
   }
 }

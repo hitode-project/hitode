@@ -355,3 +355,14 @@ The genuine `_time32`/`_time64` and UCRT/VCRuntime `memchr` entries remain separ
 exports. No matching CRT P/Invoke declarations exist in the pinned WinMD, so
 its SupportedOSPlatform attributes supply no CRT exclusions. Internal helpers
 are not classified as post-Windows-7 merely from a compiler release date.
+
+Multibyte pointer movement, byte/character counts, contextual classification and
+bounded copies now share one kernel across cataloged CRT versions. `_setmbcp`
+and `_getmbcp` use the existing module locale owner, independently of LC_CTYPE
+and Win32 ACP; public API-set fronts use UCRT state. Version profiles select
+legacy UTF-8 rejection and modern invalid-parameter handling. The lexical path
+splitter uses this same multibyte setting in both ordinary and secure fronts.
+Byte limits never read a partial pair's trailing byte; bounded copies clear
+incomplete final pairs and pad after NUL. `crt_mbcs` checks CP932/936, module
+isolation, API sets, invalid callbacks and page boundaries in interpreter/JIT.
+Explicit locale handles and thread-locale configuration are separate work.

@@ -207,3 +207,13 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: String writes MUST report inaccessible destination memory instead of successful partial copies. Bounded copy MUST pad after NUL, while bounded concatenation MUST append exactly one terminator. Searches MUST preserve terminator matches and return the first matching substring.
 **Verification**: Test
+
+### PERS-CRT-3 Multibyte code-page ownership
+
+**Rule**: CRT multibyte code-page controls MUST share their runtime's locale owner and default to the guest ACP. Public API-set calls MUST use UCRT state without changing another CRT or Win32 ACP. Single-byte and UTF-8 modes MUST report false byte-lead classifications.
+**Verification**: Test
+
+### PERS-CRT-4 Multibyte traversal boundaries
+
+**Rule**: Multibyte traversal MUST distinguish character and byte limits, preserve pair boundaries, and exclude terminal lead bytes from counts. Bounded copies MUST pad after NUL and suppress incomplete final pairs without reading beyond their count. Modern argument checks MUST use the runtime's invalid-parameter handler, and inaccessible destination writes MUST fail.
+**Verification**: Test

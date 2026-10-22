@@ -24,6 +24,7 @@ mod floating;
 mod heap;
 mod intrinsic_math;
 mod locale;
+mod mbcs;
 mod memory_ops;
 mod modern_stdio;
 mod modern_string;
@@ -183,6 +184,7 @@ pub fn register(r: &mut Registry) {
     heap::register(r);
     locale::register(r);
     memory_ops::register(r);
+    mbcs::register(r);
     modern_stdio::register(r);
     modern_string::register(r);
     wide_string::register(r);
@@ -220,10 +222,6 @@ pub fn register(r: &mut Registry) {
         ("_itoa", 3),
         ("_strdup", 1),
         ("strtoul", 3),
-        ("_mbsinc", 1),
-        ("_mbsnbcpy", 3),
-        ("_ismbblead", 1),
-        ("_ismbbtrail", 1),
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
@@ -298,16 +296,12 @@ pub fn register(r: &mut Registry) {
             ("_time32", 1),
             ("_gmtime32", 1),
             ("_localtime32", 1),
-            ("_ismbblead", 1),
-            ("_ismbbtrail", 1),
             ("memcpy", 3),
             ("memmove", 3),
             ("memset", 3),
             ("memcmp", 3),
             ("_strdup", 1),
             ("strtoul", 3),
-            ("_mbsinc", 1),
-            ("_mbsnbcpy", 3),
             ("_splitpath", 5),
             ("_makepath", 5),
             ("getenv", 1),
@@ -453,24 +447,6 @@ fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> O
         }
     }
     Outcome::Return(0)
-}
-fn split_path_a(path: &[u8]) -> (&[u8], &[u8], &[u8], &[u8]) {
-    let (drive, rest) = if path.len() >= 2 && path[1] == b':' {
-        (&path[..2], &path[2..])
-    } else {
-        (&[][..], path)
-    };
-    let last_slash = rest.iter().rposition(|&c| c == b'/' || c == b'\\');
-    let (dir, file_part) = match last_slash {
-        Some(idx) => (&rest[..=idx], &rest[idx + 1..]),
-        None => (&[][..], rest),
-    };
-    let last_dot = file_part.iter().rposition(|&c| c == b'.');
-    let (fname, ext) = match last_dot {
-        Some(idx) => (&file_part[..idx], &file_part[idx..]),
-        None => (file_part, &[][..]),
-    };
-    (drive, dir, fname, ext)
 }
 /// 'VC20', marking a `_setjmp3` buffer that carries an unwind function.
 const JMP_MAGIC: u32 = 0x5643_3230;
@@ -1163,68 +1139,30 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             val as u32
         }
-        "_mbsinc" => {
-            let Ok(b1) = e.cpu.read_u8(a) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            if (0x81..=0x9f).contains(&b1) || (0xe0..=0xfc).contains(&b1) {
-                a.wrapping_add(2)
-            } else {
-                a.wrapping_add(1)
-            }
-        }
-        "_ismbblead" => {
-            let acp = e.ext.get::<crate::Win32>().codec.acp;
-            let byte = a as u8;
-            let is_lead = a <= 0xff
-                && match acp {
-                    936 => (0x81..=0xfe).contains(&byte),
-                    _ => (0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte),
-                };
-            if is_lead { 1 } else { 0 }
-        }
-        "_ismbbtrail" => {
-            let acp = e.ext.get::<crate::Win32>().codec.acp;
-            let byte = a as u8;
-            let is_trail = a <= 0xff
-                && match acp {
-                    936 => (0x40..=0x7e).contains(&byte) || (0x80..=0xfe).contains(&byte),
-                    _ => (0x40..=0x7e).contains(&byte) || (0x80..=0xfc).contains(&byte),
-                };
-            if is_trail { 1 } else { 0 }
-        }
-        "_mbsnbcpy" => {
-            let n = c as usize;
-            let mut null_hit = false;
-            for i in 0..n {
-                let byte = if null_hit {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                        return Outcome::Fail("CRT string unmapped".into());
-                    };
-                    if val == 0 {
-                        null_hit = true;
-                    }
-                    val
-                };
-                if let Err(err) = e.cpu.write(a.wrapping_add(i as u32), &[byte]) {
-                    return Outcome::Fail(err.to_string());
-                }
-            }
-            a
-        }
         "_splitpath" => {
             let Ok(path) = e.cpu.read_cstr(a, 4096) else {
                 return Outcome::Fail("CRT path unmapped".into());
             };
-            let (drive, dir, fname, ext) = split_path_a(&path);
+            let units: Vec<_> = path.iter().map(|&byte| u16::from(byte)).collect();
+            let cp = locale::multibyte_codepage(e);
+            let ranges = match path::split_ranges(&units, |unit| mbcs::is_lead(cp, unit as u8)) {
+                Ok(ranges) => ranges,
+                Err(reason) => return Outcome::Fail(reason.into()),
+            };
             let ptrs = [b, c, e.arg(3), e.arg(4)];
-            let parts = [drive, dir, fname, ext];
+            let parts = ranges.map(|range| &path[range]);
             for (p, part) in ptrs.into_iter().zip(parts) {
-                if p != 0 {
-                    let _ = e.cpu.write(p, part);
-                    let _ = e.cpu.write(p.wrapping_add(part.len() as u32), &[0]);
+                if p != 0
+                    && let Err(fault) = adv_abi::guest::check_range(
+                        e.cpu,
+                        p,
+                        part.len() as u32 + 1,
+                        adv_cpu::backend::Prot::WRITE,
+                    )
+                    .and_then(|()| e.cpu.write(p, part))
+                    .and_then(|()| e.cpu.write(p + part.len() as u32, &[0]))
+                {
+                    return adv_abi::guest::memory_failure(fault);
                 }
             }
             0

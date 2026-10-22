@@ -65,20 +65,7 @@ fn failure(env: &mut Env<'_>, errno: i32, dos: Option<u32>, result: u32) -> Outc
 }
 
 fn invalid(env: &mut Env<'_>, result: u32) -> Outcome {
-    let thunk = env.sys.thunks.get(env.thunk);
-    if versions::profile(&thunk.module).invalid_parameters {
-        let name = thunk.name.clone();
-        if invalid_handler(env) == 0 {
-            let error = failure(env, 22, None, result);
-            if !matches!(error, Outcome::Return(_)) {
-                return error;
-            }
-            return invalid_parameter_noinfo(env);
-        }
-        invalid_parameter_result(env, &name, 22, result)
-    } else {
-        failure(env, 22, None, result)
-    }
+    errors::invalid(env, result)
 }
 
 fn system(env: &mut Env<'_>) -> Outcome {
