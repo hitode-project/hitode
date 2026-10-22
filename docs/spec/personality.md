@@ -304,9 +304,15 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 ### PERS-CRYPTO-8 Conversion output boundaries
 
-**Rule**: Binary conversion size queries MUST report the complete required output size without writing output buffers. Short buffers MUST report ERROR_MORE_DATA and the required size. Conversions MUST validate guest output permissions and preserve LastError on success.
+**Rule**: Binary conversion size queries MUST report the complete required output size without writing output buffers. Formatted conversions MUST report ERROR_MORE_DATA and the required size for short buffers. Conversions MUST validate guest output permissions and preserve LastError on success.
 **Verification**: Test
 **Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation.
+
+### PERS-CRYPTO-9 Raw binary copy lengths
+
+**Rule**: Raw CryptStringToBinary output MUST copy the caller's byte capacity from checked guest input, independently of its declared text length. Raw size queries MUST report the input character count, including for W calls. Raw binary-to-string copies MUST preserve input bytes and omit a terminator.
+**Verification**: Test
+**Basis**: Authored native A/W binary conversion controls in `crypt32_encoding_native`.
 
 ### PERS-SYNC-1 Signal and wait ownership
 

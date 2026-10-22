@@ -197,7 +197,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 #[test]
-// spec: PERS-CRYPTO-8
+// spec: PERS-CRYPTO-8, PERS-CRYPTO-9
 fn raw_binary_copies_match_native_buffer_and_length_rules() {
     use adv_cpu::{
         JitCpu,
@@ -214,7 +214,7 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
     let mut failures = Vec::new();
     for wide in [false, true] {
         for encoding in [false, true] {
-            for capacity in [0u32, 16] {
+            for capacity in [0u32, 3, 16] {
                 let mut native_output = [0xcd; 64];
                 let mut native_size = capacity;
                 let input_length = if encoding || !wide { 4 } else { 2 };

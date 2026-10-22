@@ -294,3 +294,83 @@ fn binary_conversion_sizes_and_guest_permissions_on_all_backends() {
     }
     guest(UnicornCpu::new(PARK_ADDR).unwrap());
 }
+
+fn raw_copies<B: Backend>(cpu: B) {
+    let mut registry = Registry::default();
+    crate::register(&mut registry);
+    let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    Win32::install(
+        &mut machine,
+        Win32Config::new(".", "fixture.exe", "target/crypt32-raw-tests"),
+    )
+    .unwrap();
+    machine.cpu.map(CODE, 16384, Prot::RX).unwrap();
+    machine.cpu.map(DATA, 16384, Prot::RW).unwrap();
+    machine
+        .cpu
+        .write(INPUT, b"ABCDEFGH\0\0\0\0\0\0\0\0")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    let mut expected = Vec::new();
+    for (wide, suffix) in [(false, "A"), (true, "W")] {
+        for capacity in [0u32, 3, 16] {
+            let target = machine
+                .resolve_import(DLL, &format!("CryptStringToBinary{suffix}"))
+                .unwrap();
+            let row = DATA + expected.len() as u32 * 128;
+            machine.cpu.write(row + 16, &[0xcd; 32]).unwrap();
+            code.mov_mem_imm(SIZE, capacity)
+                .push_imm(FORMAT)
+                .push_imm(SKIP)
+                .push_imm(SIZE)
+                .push_imm(if capacity == 0 { 0 } else { row + 16 })
+                .push_imm(2)
+                .push_imm(if wide { 2 } else { 4 })
+                .push_imm(INPUT)
+                .call(target)
+                .mov_mem_eax(row)
+                .mov_eax_mem(SIZE)
+                .mov_mem_eax(row + 4);
+            expected.push((capacity, wide));
+        }
+    }
+    code.mov_mem_imm(DATA + 0x3f00, 0)
+        .mov_eax_mem(DATA + 0x3f00)
+        .ret();
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.spawn("raw copies", CODE, &[], 65536).unwrap();
+    let result = machine.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    for (index, (capacity, wide)) in expected.into_iter().enumerate() {
+        let row = DATA + index as u32 * 128;
+        assert_eq!(machine.cpu.read_u32(row).unwrap(), 1);
+        assert_eq!(
+            machine.cpu.read_u32(row + 4).unwrap(),
+            if capacity != 0 {
+                capacity
+            } else if wide {
+                2
+            } else {
+                4
+            }
+        );
+        let mut bytes = [0; 32];
+        machine.cpu.read(row + 16, &mut bytes).unwrap();
+        let mut expected = [0xcd; 32];
+        expected[..capacity as usize]
+            .copy_from_slice(&b"ABCDEFGH\0\0\0\0\0\0\0\0"[..capacity as usize]);
+        assert_eq!(bytes, expected);
+    }
+    assert_eq!(machine.cpu.read_u32(FORMAT).unwrap(), 2);
+    assert_eq!(machine.cpu.read_u32(SKIP).unwrap(), 0);
+}
+#[test]
+// spec: PERS-CRYPTO-9
+fn raw_binary_uses_native_character_queries_and_checked_byte_copy_capacities() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        raw_copies(cpu);
+    }
+    raw_copies(UnicornCpu::new(PARK_ADDR).unwrap());
+}

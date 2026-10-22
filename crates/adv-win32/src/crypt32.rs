@@ -116,10 +116,22 @@ fn string_to_binary(env: &mut Env<'_>, wide: bool) -> Outcome {
     } else {
         binary.iter().copied().map(u16::from).collect()
     };
-    let (bytes, skipped, format) = match encoding::decode(&text, &binary, flags) {
+    let (mut bytes, skipped, format) = match encoding::decode(&text, &binary, flags) {
         Ok(value) => value,
         Err(error) => return fail(env, error),
     };
+    if format == 2 {
+        if output == 0 {
+            // The raw W size query reports characters, without widening this
+            // count into bytes. Actual raw copies instead use the byte capacity.
+            bytes.truncate(text.len());
+        } else {
+            bytes = match read(env, input, env.cpu.read_u32(size).unwrap()) {
+                Ok(bytes) => bytes,
+                Err(error) => return fail(env, error),
+            };
+        }
+    }
     let needed = bytes.len() as u32;
     if output != 0 && env.cpu.read_u32(size).unwrap() < needed {
         let _ = env.cpu.write_u32(size, needed);
