@@ -252,6 +252,7 @@ wtsapi32.dll	WTSEnableChildSessions	Windows 8	windows8.0
 wtsapi32.dll	WTSGetChildSessionId	Windows 8	windows8.0
 wtsapi32.dll	WTSIsChildSessionsEnabled	Windows 8	windows8.0
 wtsapi32.dll	WTSSetRenderHint	Windows 8	windows8.0
+xinput1_4.dll	#2	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetstate
 xinput1_4.dll	XInputEnable	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputenable
 xinput1_4.dll	XInputGetAudioDeviceIds	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetaudiodeviceids
 xinput1_4.dll	XInputGetBatteryInformation	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetbatteryinformation

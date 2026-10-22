@@ -27,6 +27,15 @@ pub fn register(registry: &mut Registry) {
             }
         }
     }
+    for (ordinal, target) in [
+        ("#2", "XInputGetState"),
+        ("#3", "XInputSetState"),
+        ("#5", "XInputEnable"),
+    ] {
+        registry
+            .register_alias("xinput1_3.dll", ordinal, target)
+            .expect("legacy native ordinals share the selected SDK ABI");
+    }
 }
 
 /// Native checks the slot and NULL pointer before looking for a device. With

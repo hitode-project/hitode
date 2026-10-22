@@ -9475,6 +9475,9 @@ xinput1_2.dll	XInputEnable	stdcall	void	void	enable:Windows.Win32.Foundation.BOO
 xinput1_2.dll	XInputGetCapabilities	stdcall	u32	u32	dwUserIndex:u32:u32:1|dwFlags:Windows.Win32.UI.Input.XboxController.XINPUT_FLAG:u32:1|pCapabilities:Windows.Win32.UI.Input.XboxController.XINPUT_CAPABILITIES*:ptr:1
 xinput1_2.dll	XInputGetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pState:Windows.Win32.UI.Input.XboxController.XINPUT_STATE*:ptr:1
 xinput1_2.dll	XInputSetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pVibration:Windows.Win32.UI.Input.XboxController.XINPUT_VIBRATION*:ptr:1
+xinput1_3.dll	#2	stdcall	u32	u32	dwUserIndex:u32:u32:1|pState:Windows.Win32.UI.Input.XboxController.XINPUT_STATE*:ptr:1
+xinput1_3.dll	#3	stdcall	u32	u32	dwUserIndex:u32:u32:1|pVibration:Windows.Win32.UI.Input.XboxController.XINPUT_VIBRATION*:ptr:1
+xinput1_3.dll	#5	stdcall	void	void	enable:Windows.Win32.Foundation.BOOL:i32:1
 xinput1_3.dll	XInputEnable	stdcall	void	void	enable:Windows.Win32.Foundation.BOOL:i32:1
 xinput1_3.dll	XInputGetBatteryInformation	stdcall	u32	u32	dwUserIndex:u32:u32:1|devType:Windows.Win32.UI.Input.XboxController.BATTERY_DEVTYPE:u32:1|pBatteryInformation:Windows.Win32.UI.Input.XboxController.XINPUT_BATTERY_INFORMATION*:ptr:1
 xinput1_3.dll	XInputGetCapabilities	stdcall	u32	u32	dwUserIndex:u32:u32:1|dwFlags:Windows.Win32.UI.Input.XboxController.XINPUT_FLAG:u32:1|pCapabilities:Windows.Win32.UI.Input.XboxController.XINPUT_CAPABILITIES*:ptr:1

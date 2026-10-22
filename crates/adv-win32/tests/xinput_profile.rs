@@ -50,7 +50,11 @@ fn absent_controllers<B: Backend>(cpu: B) {
     code.mov_mem_eax(DATA + 0xe00);
     let mut expected = Vec::new();
     for dll in DLLS {
-        for name in ["XInputGetState", "XInputSetState", "XInputGetCapabilities"] {
+        let mut names = vec!["XInputGetState", "XInputSetState", "XInputGetCapabilities"];
+        if dll == "xinput1_3.dll" {
+            names.extend(["#2", "#3"]);
+        }
+        for name in names {
             let function = m.resolve_import(dll, name).unwrap();
             let capabilities = name == "XInputGetCapabilities";
             let mut cases = vec![
@@ -82,6 +86,9 @@ fn absent_controllers<B: Backend>(cpu: B) {
         if dll != "xinput9_1_0.dll" {
             let function = m.resolve_import(dll, "XInputEnable").unwrap();
             code.push_imm(0).call(function).push_imm(1).call(function);
+            if dll == "xinput1_3.dll" {
+                assert_eq!(function, m.resolve_import(dll, "#5").unwrap());
+            }
         }
         if dll == "xinput1_3.dll" {
             extra.extend([
@@ -190,5 +197,16 @@ fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
         assert!(!registry.is_implemented("xinput1_4.dll", name));
     }
     assert!(registry.dynamic_available("xinput1_3.dll", "XInputGetKeystroke"));
+    for (ordinal, name) in [
+        ("#2", "XInputGetState"),
+        ("#3", "XInputSetState"),
+        ("#5", "XInputEnable"),
+    ] {
+        assert_eq!(
+            registry.canonical_name("xinput1_3.dll", ordinal),
+            Some(name)
+        );
+        assert!(registry.dynamic_available("xinput1_3.dll", ordinal));
+    }
     assert!(registry.signature_conflicts().is_empty());
 }

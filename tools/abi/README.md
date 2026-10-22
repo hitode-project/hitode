@@ -129,6 +129,12 @@ complete declarations; Wsock32 names are matched against the existing SDK
 ordinal-import catalog. Signatures describe ABI availability, not implemented
 behavior; coverage continues to report unresolved implementations.
 
+The closure's XInput 1.3 ordinals 2, 3 and 5 alias GetState, SetState and Enable.
+Their selected declarations reuse the corresponding named WinMD ABI and their mutable guest entries.
+Ordinal identities were verified from Microsoft's [June 2010 redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=8109), `APR2007_xinput_x86.cab`, XInput 1.3 version 9.18.944.0.
+The redistributable SHA-256 is `053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b`; the x86 DLL SHA-256 is `8d540d484ea41e374fd0107d55d253f87ded4ce780d515d8fd59bbe8c98970a7`.
+Only export metadata was read; binaries and instruction bytes remain outside the repository.
+
 ## CRT export catalog
 
 WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports:
