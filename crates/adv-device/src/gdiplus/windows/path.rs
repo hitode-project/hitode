@@ -62,6 +62,32 @@ pub(super) fn edit(path: *mut c_void, edit: PathEdit<'_>) -> Result<Reply, i32> 
                     gp::GdipAddPathLine2(path.cast(), points.as_ptr(), points.len() as i32)
                 }
             }
+            PathEdit::Curve {
+                points: input,
+                offset,
+                segments,
+                tension,
+                closed,
+            } => {
+                let points = points(input);
+                if closed {
+                    gp::GdipAddPathClosedCurve2(
+                        path.cast(),
+                        points.as_ptr(),
+                        points.len() as i32,
+                        tension,
+                    )
+                } else {
+                    gp::GdipAddPathCurve3(
+                        path.cast(),
+                        points.as_ptr(),
+                        points.len() as i32,
+                        offset,
+                        segments,
+                        tension,
+                    )
+                }
+            }
             PathEdit::Beziers(input) => {
                 let points = points(input);
                 gp::GdipAddPathBeziers(path.cast(), points.as_ptr(), points.len() as i32)

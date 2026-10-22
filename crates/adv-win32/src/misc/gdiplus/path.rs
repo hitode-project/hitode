@@ -1,9 +1,10 @@
 //! Flat geometry copies guest arrays into the existing device-owned path.
 #![allow(clippy::too_many_arguments)]
 use super::*;
+mod curves;
 use adv_device::gdiplus::PathEdit;
 
-fn numbers<const N: usize>(
+pub(super) fn numbers<const N: usize>(
     env: &Env<'_>,
     pointer: u32,
     count: i32,
@@ -513,6 +514,7 @@ fn gdipclearpathmarkers(env: &mut Env<'_>, path: GuestPtr<()>) -> Outcome {
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    curves::register(registry);
     for api in [
         types_ABI,
         path_data_ABI,

@@ -114,6 +114,13 @@ impl Path {
     pub fn edit(&mut self, edit: PathEdit<'_>) -> Result<(), i32> {
         match edit {
             PathEdit::Lines(points, polygon) => self.lines(points, polygon)?,
+            PathEdit::Curve {
+                points,
+                offset,
+                segments,
+                tension,
+                closed,
+            } => self.curve(points, offset, segments, tension, closed)?,
             PathEdit::Beziers(points) => {
                 if points.len() < 4
                     || points.len() % 3 != 1

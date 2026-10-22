@@ -1,5 +1,6 @@
 //! Owned path geometry shared by CPU coverage, bounds and gradient brushes.
 use zeno::{Command, Point};
+mod curves;
 mod editing;
 
 #[derive(Clone)]

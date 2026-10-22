@@ -16,6 +16,10 @@ mod test_cpu;
 use test_cpu::TestCpu;
 #[path = "gdiplus_portable/brush.rs"]
 mod brush;
+#[path = "gdiplus_portable/curves.rs"]
+mod curves;
+#[path = "gdiplus_portable/fill.rs"]
+mod fill;
 #[path = "gdiplus_portable/matrix.rs"]
 mod matrix;
 #[path = "gdiplus_portable/matrix_nonfinite.rs"]

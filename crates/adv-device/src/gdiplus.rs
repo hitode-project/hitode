@@ -124,6 +124,13 @@ pub enum Reply {
 pub enum PathEdit<'a> {
     Lines(&'a [[f32; 2]], bool),
     Beziers(&'a [[f32; 2]]),
+    Curve {
+        points: &'a [[f32; 2]],
+        offset: i32,
+        segments: i32,
+        tension: f32,
+        closed: bool,
+    },
     Rectangles(&'a [[f32; 4]]),
     Ellipse([f32; 4]),
     Pie([f32; 4], f32, f32),

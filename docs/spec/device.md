@@ -123,7 +123,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-5 CPU bitmap rendering
 
-**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing and filled paths through the shared device interface.
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing, filled paths and filled primitives through the shared device interface.
 **Verification**: Test
 **Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
 
@@ -168,7 +168,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-13 GDI+ path geometry
 
-**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Path shape edits MUST affect filled pixels through the shared raster backend. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
+**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Cardinal curves MUST preserve tension, neighboring-point tangents and closed joins in cubic control points that affect shared raster output. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
 **Verification**: Test
 **Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
 
