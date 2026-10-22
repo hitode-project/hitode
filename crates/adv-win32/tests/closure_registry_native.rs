@@ -244,3 +244,19 @@ fn native_authored_key_and_value_information_buffer_controls() {
     };
     show("value-end", 0, 128, status, needed, &buffer, false);
 }
+#[path = "support/native_sdk.rs"]
+mod native_sdk;
+#[test]
+fn native_x86_authored_registry_information_buffer_controls() {
+    let fixture = native_sdk::build(
+        "closure-registry-native.cpp",
+        &["kernel32.lib", "advapi32.lib"],
+    );
+    let output = String::from_utf8(fixture.output.stdout.clone()).unwrap();
+    assert!(output.lines().count() > 100);
+    assert!(fixture.root.is_dir());
+    for line in output.lines() {
+        assert!(line.starts_with("registry32-view operation="));
+        eprintln!("{line}");
+    }
+}
