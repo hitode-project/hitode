@@ -10,6 +10,7 @@ use crate::{Win32, stdcall};
 use adv_os::nls::{is_valid_codepage, lead_byte_ranges};
 
 mod character_types;
+pub(crate) use character_types::crt_string_type_w;
 mod collation;
 mod enumeration;
 pub(in crate::kernel32) mod locales;

@@ -88,6 +88,11 @@ fn classify(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
     let _ = env.cpu.write(output, &bytes);
     Outcome::Return(1)
 }
+/// msvcr90's internal `__crtGetStringTypeW` takes GetStringTypeExW's first five
+/// arguments; its code page and LCID serve only the narrow fallback.
+pub(crate) fn crt_string_type_w(env: &mut Env<'_>) -> Outcome {
+    classify(env, true, true)
+}
 pub(super) fn register(registry: &mut Registry) {
     crate::stdcall(registry, super::K32, "GetStringTypeW", 4, |e| {
         classify(e, true, false)
