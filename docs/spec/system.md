@@ -233,4 +233,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft AdjustTokenPrivileges, DuplicateTokenEx, ImpersonateLoggedOnUser and CreateProcessWithTokenW contracts.
 
+### SYS-AUTOMATION-1 Array storage and element ownership
+
+**Rule**: SAFEARRAY creation and indexing MUST use actual guest descriptors, bounds and process-heap storage. Variant array copies MUST retain independent elements through the shared BSTR allocator and real guest COM references. Array destruction MUST respect locks and release owned elements across yielding callbacks.
+**Verification**: Test
+**Basis**: Microsoft SAFEARRAY and VARIANT contracts; authored native dimension and stride controls.
+
 Withdrawn: none

@@ -55,17 +55,17 @@ fn supported(env: &mut Env<'_>, kind: u16, api: &'static str) -> Result<(), u32>
     {
         return Err(BAD_TYPE);
     }
-    if kind & 0x2000 != 0 || base == 36 {
+    if base == 36 {
         return Err(warn(
             env,
             api,
-            "SAFEARRAY/record ownership is not implemented; the variant is retained",
+            "record ownership is unavailable; the variant is retained",
             NOT_IMPLEMENTED,
         ));
     }
     Ok(())
 }
-fn method(env: &Env<'_>, this: u32, slot: u32) -> Result<u32, u32> {
+pub(super) fn method(env: &Env<'_>, this: u32, slot: u32) -> Result<u32, u32> {
     check_range(env.cpu, this, 4, Prot::READ).map_err(|_| INVALID)?;
     let table = env.cpu.read_u32(this).map_err(|_| INVALID)?;
     let address = table.checked_add(slot * 4).ok_or(INVALID)?;
@@ -80,7 +80,12 @@ fn empty(env: &mut Env<'_>, address: u32) -> Result<(), u32> {
     env.cpu.write(address, &[0, 0]).map_err(|_| INVALID)
 }
 
-fn clear_then(env: &mut Env<'_>, address: u32, api: &'static str, then: Then) -> Outcome {
+pub(super) fn clear_then(
+    env: &mut Env<'_>,
+    address: u32,
+    api: &'static str,
+    then: Then,
+) -> Outcome {
     let bytes = match read(env, address, true) {
         Ok(b) => b,
         Err(e) => return Outcome::Return(e),
@@ -95,6 +100,19 @@ fn clear_then(env: &mut Env<'_>, address: u32, api: &'static str, then: Then) ->
             Ok(()) => then(env),
             Err(e) => Outcome::Return(e),
         };
+    }
+    if kind & 0x2000 != 0 {
+        return super::safe_array::destroy_then(
+            env,
+            pointer(&bytes),
+            Box::new(move |env, result| match result {
+                Ok(()) => match empty(env, address) {
+                    Ok(()) => then(env),
+                    Err(error) => Outcome::Return(error),
+                },
+                Err(error) => Outcome::Return(error),
+            }),
+        );
     }
     let value = pointer(&bytes);
     if kind == 8 && value != 0 {
@@ -184,6 +202,26 @@ fn copy(env: &mut Env<'_>, destination: GuestPtr<Variant>, source: GuestPtr<Vari
                 return Outcome::Return(INVALID);
             }
             let value = pointer(&bytes);
+            if kind & 0x2000 != 0 && kind & 0x4000 == 0 {
+                return super::safe_array::clone_then(
+                    env,
+                    value,
+                    Box::new(move |env, result| match result {
+                        Ok(array) => {
+                            bytes[8..12].copy_from_slice(&array.to_le_bytes());
+                            if env.cpu.write(destination.addr(), &bytes).is_err() {
+                                return super::safe_array::destroy_then(
+                                    env,
+                                    array,
+                                    Box::new(move |_, _| Outcome::Return(INVALID)),
+                                );
+                            }
+                            Outcome::Return(0)
+                        }
+                        Err(error) => Outcome::Return(error),
+                    }),
+                );
+            }
             let mut allocated = 0;
             if kind == 8 && value != 0 {
                 if !owns_bstr(env, value) {
@@ -233,4 +271,56 @@ fn copy(env: &mut Env<'_>, destination: GuestPtr<Variant>, source: GuestPtr<Vari
             }
         }),
     )
+}
+
+// Internal operations pass typed arguments directly. Their continuation trees
+// preserve every HRESULT, callback and wait without another argument-stack view.
+pub(super) fn copy_value(env: &mut Env<'_>, destination: u32, source: u32) -> Outcome {
+    copy(env, GuestPtr::new(destination), GuestPtr::new(source))
+}
+pub(super) fn clear_value(env: &mut Env<'_>, value: u32) -> Outcome {
+    clear(env, GuestPtr::new(value))
+}
+type ScalarThen = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
+pub(super) fn complete(env: &mut Env<'_>, outcome: Outcome, then: ScalarThen) -> Outcome {
+    match outcome {
+        Outcome::Return(value) => then(env, value),
+        Outcome::Call {
+            target,
+            args,
+            then: next,
+            stack,
+            unwindable,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            unwindable,
+            then: Box::new(move |env, value| {
+                let outcome = next(env, value);
+                complete(env, outcome, then)
+            }),
+        },
+        Outcome::Block {
+            wait,
+            then: next,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, value| {
+                let outcome = next(env, value);
+                complete(env, outcome, then)
+            }),
+        },
+        Outcome::Defer { then: next } => Outcome::defer(move |env| {
+            let outcome = next(env);
+            complete(env, outcome, then)
+        }),
+        Outcome::HostRequest { then: next } => Outcome::host_request(move |env| {
+            let outcome = next(env);
+            complete(env, outcome, then)
+        }),
+        terminal => terminal,
+    }
 }

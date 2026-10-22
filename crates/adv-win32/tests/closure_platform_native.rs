@@ -763,3 +763,20 @@ fn native_authored_automation_scalar_controls() {
         );
     }
 }
+#[repr(C, align(8))]
+struct NativeVariant([u8; 32]);
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn VariantCopy(destination: *mut NativeVariant, source: *const NativeVariant) -> i32;
+    fn VariantClear(value: *mut NativeVariant) -> i32;
+}
+#[test]
+fn native_null_array_variant_controls() {
+    let mut source = NativeVariant([0; 32]);
+    source.0[..2].copy_from_slice(&0x2003u16.to_le_bytes());
+    let mut destination = NativeVariant([0; 32]);
+    assert_eq!(unsafe { VariantCopy(&mut destination, &source) }, 0);
+    assert_eq!(&destination.0[..2], &0x2003u16.to_le_bytes());
+    assert_eq!(unsafe { VariantClear(&mut source) }, 0);
+    assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
+}
