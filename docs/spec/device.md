@@ -113,13 +113,30 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-3 GDI+ platform boundary
 
-**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Platforms without the device implementation MUST return an explicit not-implemented result.
-**Verification**: Review — Windows image tests do not verify pointer isolation or non-Windows rejection across GDI+ entry points.
+**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Missing device operations MUST return an explicit not-implemented result identifying the calling flat API.
+**Verification**: Review — native pointer isolation and complete capability diagnostics require adapter review.
 
 ### DEV-IMAGE-4 GDI+ storage bounds
 
 **Rule**: GDI+ images MUST be limited to 64 MiB each, with at most 256 MiB of independent front-end backing.
 **Verification**: Review — no existing test reaches either GDI+ storage admission boundary.
+
+### DEV-IMAGE-5 CPU bitmap rendering
+
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing and filled paths through the shared device interface.
+**Verification**: Test
+**Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
+
+### DEV-IMAGE-6 GDI+ value queries
+
+**Rule**: Image queries MUST report actual dimensions, bounds, pixels and bitmap type. Path and string-format clones MUST retain independent state and reject invalid receiver kinds.
+**Verification**: Test
+
+### DEV-IMAGE-7 GDI+ path pixel centers
+
+**Rule**: Aliased paths MUST test pixel centers using their fill rule. Antialiased path coverage MUST honor integer and half-integer pixel-center modes.
+**Verification**: Test
+**Basis**: [PixelOffsetMode](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-pixeloffsetmode).
 
 ## Audio ownership
 

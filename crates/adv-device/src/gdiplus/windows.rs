@@ -412,6 +412,46 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
                 status(gp::GdipSetStringFormatLineAlign(p.cast(), value))?;
                 Ok(Reply::None)
             }
+            Op::StringProperty(index) => {
+                require(object, Kind::Format)?;
+                let mut value = 0;
+                status(match index {
+                    0 => gp::GdipGetStringFormatFlags(p.cast(), &mut value),
+                    1 => {
+                        let mut language = 0u16;
+                        let result = gp::GdipGetStringFormatDigitSubstitution(
+                            p.cast(),
+                            &mut language,
+                            &mut value,
+                        );
+                        value = i32::from(language);
+                        result
+                    }
+                    2 => gp::GdipGetStringFormatAlign(p.cast(), &mut value),
+                    3 => gp::GdipGetStringFormatLineAlign(p.cast(), &mut value),
+                    _ => return Err(2),
+                })?;
+                Ok(Reply::Count(value))
+            }
+            Op::StringFlags(value) => {
+                require(object, Kind::Format)?;
+                status(gp::GdipSetStringFormatFlags(p.cast(), value))?;
+                Ok(Reply::None)
+            }
+            Op::PathFill(value) => {
+                require(object, Kind::Path)?;
+                if let Some(value) = value {
+                    status(gp::GdipSetPathFillMode(p.cast(), value))?;
+                }
+                let mut mode = 0;
+                status(gp::GdipGetPathFillMode(p.cast(), &mut mode))?;
+                Ok(Reply::Count(mode))
+            }
+            Op::ResetPath => {
+                require(object, Kind::Path)?;
+                status(gp::GdipResetPath(p.cast()))?;
+                Ok(Reply::None)
+            }
             Op::PathLine([x1, y1, x2, y2]) => {
                 require(object, Kind::Path)?;
                 status(gp::GdipAddPathLine(p.cast(), x1, y1, x2, y2))?;
@@ -582,6 +622,15 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
                 require(object, Kind::Graphics)?;
                 status(gp::GdipSetTextRenderingHint(p.cast(), value))?;
                 Ok(Reply::None)
+            }
+            Op::PixelOffset(value) => {
+                require(object, Kind::Graphics)?;
+                if let Some(value) = value {
+                    status(gp::GdipSetPixelOffsetMode(p.cast(), value))?;
+                }
+                let mut mode = 0;
+                status(gp::GdipGetPixelOffsetMode(p.cast(), &mut mode))?;
+                Ok(Reply::Count(mode))
             }
         }
     }
