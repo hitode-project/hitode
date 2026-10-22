@@ -12,7 +12,10 @@
 pub mod context;
 pub mod dispatch;
 pub mod image;
+pub mod memory;
+pub mod params;
 pub mod process;
 pub mod protocol;
 pub mod server;
+pub mod status;
 pub mod syscalls;

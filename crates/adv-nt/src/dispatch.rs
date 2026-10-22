@@ -5,10 +5,39 @@
 //! one for Unix library calls. Here both are Hitode thunks, so a system call
 //! is a single host call with no Unix side in between.
 
+use std::sync::LazyLock;
+
 use adv_cpu::backend::Reg;
 use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
+use crate::memory;
 use crate::syscalls::SYSCALLS;
+
+/// A system call, given its arguments.
+type Syscall = fn(&mut Env<'_>, &[u32]) -> Outcome;
+
+const IMPLEMENTED: &[(&str, Syscall)] = &[
+    ("NtAllocateVirtualMemory", memory::allocate),
+    ("NtFreeVirtualMemory", memory::free),
+    ("NtProtectVirtualMemory", memory::protect),
+    ("NtQueryVirtualMemory", memory::query),
+];
+
+/// The implementation of each system call, by number.
+static TABLE: LazyLock<[Option<Syscall>; SYSCALLS.len()]> = LazyLock::new(|| {
+    let mut table = [None; SYSCALLS.len()];
+    for &(name, call) in IMPLEMENTED {
+        let number = SYSCALLS
+            .iter()
+            .position(|&(known, _)| known == name)
+            .unwrap_or_else(|| panic!("{name} is not a system call"));
+        table[number] = Some(call);
+    }
+    table
+});
+
+/// No system call takes more arguments.
+const MAX_ARGUMENTS: usize = 16;
 
 /// The module the dispatchers are registered under; it stands in for
 /// ntdll.so.
@@ -51,11 +80,19 @@ impl Resolver for Platform {
 /// stub's return address at `[esp]` and its caller's frame above it, so
 /// argument `i` is `env.arg(i + 1)`.
 fn syscall(env: &mut Env<'_>) -> Outcome {
-    let number = env.cpu.reg(Reg::Eax);
-    match SYSCALLS.get(number as usize) {
-        Some((name, _)) => Outcome::Fail(format!("system call {name} is not implemented")),
-        None => Outcome::Fail(format!("unknown system call {number:#x}")),
+    let number = env.cpu.reg(Reg::Eax) as usize;
+    let Some(&(name, bytes)) = SYSCALLS.get(number) else {
+        return Outcome::Fail(format!("unknown system call {number:#x}"));
+    };
+    let Some(call) = TABLE[number] else {
+        return Outcome::Fail(format!("system call {name} is not implemented"));
+    };
+    let mut args = [0; MAX_ARGUMENTS];
+    let count = bytes as usize / 4;
+    for (index, arg) in args[..count].iter_mut().enumerate() {
+        *arg = env.arg(index as u32 + 1);
     }
+    call(env, &args[..count])
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {

@@ -8,11 +8,13 @@
 
 use std::collections::HashMap;
 
-use adv_cpu::backend::{Backend, GuestExt, MemFault, Prot};
+use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
 use adv_machine::{CtxId, Machine};
 use adv_pe::{ExportTarget, Pe, PeError};
 
+use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
+use crate::params::{self, Startup};
 use crate::{context, dispatch, image};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
@@ -22,6 +24,26 @@ const TEB_SYSCALL_DISPATCHER: u32 = 0xc0;
 /// at `PEB + PAGE`, and the main thread's start CONTEXT.
 const BLOCK_SIZE: u32 = 3 * PAGE;
 const START_CONTEXT: u32 = 2 * PAGE;
+
+/// Guest threads share one host thread.
+const PROCESSORS: u32 = 1;
+const VER_PLATFORM_WIN32_NT: u32 = 2;
+
+/// PEB fields (i386) the platform sets, as Wine's `init_peb` and
+/// `load_global_options` do.
+mod peb {
+    pub const PROCESS_PARAMETERS: u32 = 0x10;
+    pub const NUMBER_OF_PROCESSORS: u32 = 0x64;
+    pub const HEAP_SEGMENT_RESERVE: u32 = 0x78;
+    pub const HEAP_SEGMENT_COMMIT: u32 = 0x7c;
+    pub const HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD: u32 = 0x80;
+    pub const HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u32 = 0x84;
+    pub const OS_MAJOR_VERSION: u32 = 0xa4;
+    pub const OS_MINOR_VERSION: u32 = 0xa8;
+    /// With OSCSDVersion, zero, in its high half.
+    pub const OS_BUILD_NUMBER: u32 = 0xac;
+    pub const OS_PLATFORM_ID: u32 = 0xb0;
+}
 
 /// x87 control word and MXCSR of a new thread.
 const FPU_CONTROL: u16 = 0x27f;
@@ -67,10 +89,21 @@ pub struct Process {
 
 /// Maps ntdll.dll and prepares the main thread, which runs once the machine
 /// does. `machine` must use [`dispatch::Platform`].
-pub fn start<B: Backend>(machine: &mut Machine<B>, ntdll: &[u8]) -> Result<Process, Error> {
+pub fn start<B: Backend>(
+    machine: &mut Machine<B>,
+    ntdll: &[u8],
+    startup: &Startup<'_>,
+) -> Result<Process, Error> {
     let pe = Pe::parse(ntdll)?;
     let base = pe.image_base;
-    image::map(&mut machine.cpu, &mut machine.sys.vm, &pe, base)?;
+    let mut memory = Memory::default();
+    image::map(
+        &mut machine.cpu,
+        &mut machine.sys.vm,
+        &mut memory,
+        &pe,
+        base,
+    )?;
     let exports = pe
         .exports()?
         .into_iter()
@@ -94,14 +127,38 @@ pub fn start<B: Backend>(machine: &mut Machine<B>, ntdll: &[u8]) -> Result<Proce
         .cpu
         .write(ntdll.export("__wine_unixlib_handle")?, &1u64.to_le_bytes())?;
 
-    let block = machine
-        .sys
-        .vm
-        .alloc(&mut machine.cpu, BLOCK_SIZE, Prot::RW)
-        .map_err(|_| Error::AddressSpace)?;
+    let block = memory::allocate_committed(
+        &mut machine.cpu,
+        &mut machine.sys.vm,
+        &mut memory,
+        BLOCK_SIZE,
+    )
+    .ok_or(Error::AddressSpace)?;
     // Zeroed, the debug channel table is empty and every channel is off.
     let peb = block;
     machine.sys.peb = peb;
+    let size = params::size(startup);
+    let parameters =
+        memory::allocate_committed(&mut machine.cpu, &mut machine.sys.vm, &mut memory, size)
+            .ok_or(Error::AddressSpace)?;
+    let pid = machine.sys.pid;
+    machine
+        .cpu
+        .write(parameters, &params::build(startup, parameters, pid))?;
+    for (offset, value) in [
+        (peb::PROCESS_PARAMETERS, parameters),
+        (peb::NUMBER_OF_PROCESSORS, PROCESSORS),
+        (peb::HEAP_SEGMENT_RESERVE, 0x10_0000),
+        (peb::HEAP_SEGMENT_COMMIT, 0x1_0000),
+        (peb::HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD, 0x1_0000),
+        (peb::HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD, 0x1000),
+        (peb::OS_MAJOR_VERSION, 10),
+        (peb::OS_MINOR_VERSION, 0),
+        (peb::OS_BUILD_NUMBER, 19045),
+        (peb::OS_PLATFORM_ID, VER_PLATFORM_WIN32_NT),
+    ] {
+        machine.cpu.write_u32(peb + offset, value)?;
+    }
 
     let start_context = block + START_CONTEXT;
     let main = machine.spawn(
@@ -112,6 +169,12 @@ pub fn start<B: Backend>(machine: &mut Machine<B>, ntdll: &[u8]) -> Result<Proce
     )?;
     let thread = &machine.sys.contexts[main as usize];
     let (teb, stack_base) = (thread.teb, thread.stack_hi);
+    // The machine's stack: a guard page under the committed pages.
+    let stack = thread.stack_lo - PAGE;
+    let mut pages = vec![Some(PAGE_READWRITE); ((stack_base - stack) / PAGE) as usize];
+    pages[0] = Some(PAGE_GUARD_READWRITE);
+    memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
+    machine.ext.insert(memory);
     machine
         .cpu
         .write_u32(teb + TEB_SYSCALL_DISPATCHER, syscall)?;
