@@ -23,6 +23,7 @@ pub(super) struct Graphics {
     target: Arc<Object>,
     clip: Option<Vec<[f32; 4]>>,
     smoothing: i32,
+    compositing: i32,
     text_hint: i32,
     pixel_offset: i32,
     world: matrix::Matrix,
@@ -59,7 +60,8 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
                 Data::Graphics(Graphics {
                     target: image.clone(),
                     clip: None,
-                    smoothing: 0,
+                    smoothing: 3,
+                    compositing: 0,
                     text_hint: 0,
                     pixel_offset: 0,
                     world: matrix::Matrix::IDENTITY,

@@ -647,6 +647,27 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
                 }
                 Ok(Reply::None)
             }
+            Op::GraphicsProperty(kind, value) => {
+                require(object, Kind::Graphics)?;
+                if let Some(value) = value {
+                    status(match kind {
+                        GraphicsProperty::CompositingMode => {
+                            gp::GdipSetCompositingMode(p.cast(), value)
+                        }
+                        GraphicsProperty::Smoothing => gp::GdipSetSmoothingMode(p.cast(), value),
+                        GraphicsProperty::TextHint => gp::GdipSetTextRenderingHint(p.cast(), value),
+                    })?;
+                }
+                let mut mode = 0;
+                status(match kind {
+                    GraphicsProperty::CompositingMode => {
+                        gp::GdipGetCompositingMode(p.cast(), &mut mode)
+                    }
+                    GraphicsProperty::Smoothing => gp::GdipGetSmoothingMode(p.cast(), &mut mode),
+                    GraphicsProperty::TextHint => gp::GdipGetTextRenderingHint(p.cast(), &mut mode),
+                })?;
+                Ok(Reply::Count(mode))
+            }
             Op::Smoothing(value) => {
                 require(object, Kind::Graphics)?;
                 status(gp::GdipSetSmoothingMode(p.cast(), value))?;

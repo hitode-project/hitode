@@ -123,7 +123,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-5 CPU bitmap rendering
 
-**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing, filled paths and filled primitives through the shared device interface.
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, image drawing with retained compositing modes, filled paths and filled primitives through the shared device interface.
 **Verification**: Test
 **Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
 
@@ -183,6 +183,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Icon and image list drawing MUST apply packed AND/XOR masks or premultiplied source-over through shared surfaces, mappings and clipping. Icon extraction MUST preserve independent pixels and monochrome double-height mask layout. Invalid destination storage MUST preserve pixels and damage versions.
 **Verification**: Test
 **Basis**: [DrawIconEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-drawiconex), [ICONINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-iconinfo), Microsoft ImageList_Draw and ImageList_GetIcon contracts.
+
+### DEV-IMAGE-16 GDI+ compositing and graphics properties
+
+**Rule**: Graphics compositing MUST select source-over blending or source-copy replacement without changing pixels outside primitive coverage. Smoothing getters MUST report normalized aliases, while text hint getters MUST report the retained device setting. Compositing MUST quantize premultiplied color and alpha channels before conversion to straight-alpha image pixels.
+**Verification**: Test
+**Basis**: Microsoft CompositingMode and SmoothingMode contracts and native-backed System.Drawing GraphicsTests pixel expectations.
 
 ## Audio ownership
 

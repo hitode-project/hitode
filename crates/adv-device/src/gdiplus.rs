@@ -50,7 +50,14 @@ pub enum Create<'a> {
     Gradient(&'a Object),
     Clone(&'a Object),
 }
+#[derive(Clone, Copy)]
+pub enum GraphicsProperty {
+    CompositingMode,
+    Smoothing,
+    TextHint,
+}
 pub enum Op<'a> {
+    GraphicsProperty(GraphicsProperty, Option<i32>),
     PathEdit(PathEdit<'a>),
     PathData,
     Pixels,

@@ -43,18 +43,9 @@ pub(super) fn execute(
                 g.clip = Some(rectangles);
             }
         }
-        Op::Smoothing(value) | Op::TextHint(value) => {
-            if !(0..=5).contains(&value) {
-                return Err(2);
-            }
-            if let Data::Graphics(g) = &mut *object.data.lock().map_err(|_| 1)? {
-                if matches!(operation, Op::Smoothing(_)) {
-                    g.smoothing = value;
-                } else {
-                    g.text_hint = value;
-                }
-            }
-        }
+        Op::Smoothing(value) => return property(object, GraphicsProperty::Smoothing, Some(value)),
+        Op::TextHint(value) => return property(object, GraphicsProperty::TextHint, Some(value)),
+        Op::GraphicsProperty(kind, value) => return property(object, kind, value),
         Op::PixelOffset(value) => {
             if let Some(value) = value {
                 if !(0..=4).contains(&value) {
@@ -69,7 +60,7 @@ pub(super) fn execute(
         }
         Op::Clear(color) => {
             let color = color.to_le_bytes();
-            paint(&graphics, |_, _| Some((color, true)))?;
+            paint(&graphics, |_, _| Some((color, true, 255)))?;
         }
         Op::FillPath(brush, path) => {
             let color = match &*brush.data.lock().map_err(|_| 1)? {
@@ -94,9 +85,7 @@ pub(super) fn execute(
             };
             paint(&graphics, |x, y| {
                 let coverage = mask[y as usize * width as usize + x as usize];
-                let mut pixel = color;
-                pixel[3] = ((u16::from(pixel[3]) * u16::from(coverage) + 127) / 255) as u8;
-                Some((pixel, false))
+                (coverage != 0).then_some((color, false, coverage))
             })?;
         }
         Op::DrawImage(image, [dx, dy, dw, dh]) => {
@@ -133,9 +122,11 @@ pub(super) fn execute(
                         v * height as f32 - 0.5,
                     ),
                     false,
+                    255,
                 ))
             })?;
         }
+        Op::DrawString { .. } if graphics.compositing == 1 => return Err(2),
         Op::DrawString { .. } | Op::Measure { .. } => return Err(6),
         _ => return Err(2),
     }
@@ -188,7 +179,7 @@ fn dimensions(graphics: &Graphics) -> Result<(u32, u32), i32> {
 }
 fn paint(
     graphics: &Graphics,
-    mut source: impl FnMut(u32, u32) -> Option<([u8; 4], bool)>,
+    mut source: impl FnMut(u32, u32) -> Option<([u8; 4], bool, u8)>,
 ) -> Result<(), i32> {
     let canvas = graphics.target.kind == Kind::Canvas;
     let mut target = graphics.target.data.lock().map_err(|_| 1)?;
@@ -212,10 +203,16 @@ fn paint(
             if !visible {
                 continue;
             }
-            if let Some((mut color, replace)) = source(x, y) {
+            if let Some((mut color, replace, coverage)) = source(x, y) {
                 let pixel = &mut pixels[(y as usize * *width as usize + x as usize) * 4..][..4];
                 if !replace {
-                    color = blend(color, (&*pixel).try_into().unwrap(), canvas);
+                    color = blend(
+                        color,
+                        (&*pixel).try_into().unwrap(),
+                        coverage,
+                        canvas,
+                        graphics.compositing == 0,
+                    );
                 }
                 if canvas {
                     color[3] = 0;
@@ -226,22 +223,62 @@ fn paint(
     }
     Ok(())
 }
-fn blend(source: [u8; 4], dest: [u8; 4], canvas: bool) -> [u8; 4] {
+fn blend(source: [u8; 4], dest: [u8; 4], coverage: u8, canvas: bool, over: bool) -> [u8; 4] {
+    if !over && coverage == 255 {
+        return source;
+    }
+    let scale = |value: u32, factor: u32| (value * factor + 127) / 255;
     let sa = u32::from(source[3]);
     let da = if canvas { 255 } else { u32::from(dest[3]) };
-    let alpha = sa * 255 + da * (255 - sa);
+    let coverage = u32::from(coverage);
+    let source_alpha = scale(sa, coverage);
+    let remaining = if over {
+        255 - source_alpha
+    } else {
+        255 - coverage
+    };
+    let alpha = source_alpha + scale(da, remaining);
     if alpha == 0 {
-        return dest;
+        return if over { dest } else { [0; 4] };
     }
     let mut result = [0; 4];
     for channel in 0..3 {
-        result[channel] = ((u32::from(source[channel]) * sa * 255
-            + u32::from(dest[channel]) * da * (255 - sa)
-            + alpha / 2)
-            / alpha) as u8;
+        let source = scale(scale(u32::from(source[channel]), sa), coverage);
+        let dest = scale(scale(u32::from(dest[channel]), da), remaining);
+        result[channel] = ((source + dest) * 255 + alpha / 2)
+            .checked_div(alpha)
+            .unwrap_or(0)
+            .min(255) as u8;
     }
-    result[3] = ((alpha + 127) / 255) as u8;
+    result[3] = alpha.min(255) as u8;
     result
+}
+fn property(object: &Object, kind: GraphicsProperty, value: Option<i32>) -> Result<Reply, i32> {
+    let mut data = object.data.lock().map_err(|_| 1)?;
+    let Data::Graphics(graphics) = &mut *data else {
+        return Err(2);
+    };
+    let property = match kind {
+        GraphicsProperty::CompositingMode => &mut graphics.compositing,
+        GraphicsProperty::Smoothing => &mut graphics.smoothing,
+        GraphicsProperty::TextHint => &mut graphics.text_hint,
+    };
+    if let Some(value) = value {
+        let maximum = if matches!(kind, GraphicsProperty::CompositingMode) {
+            1
+        } else {
+            5
+        };
+        if !(0..=maximum).contains(&value) {
+            return Err(2);
+        }
+        *property = match (kind, value) {
+            (GraphicsProperty::Smoothing, 0 | 1) => 3,
+            (GraphicsProperty::Smoothing, 2) => 4,
+            _ => value,
+        };
+    }
+    Ok(Reply::Count(*property))
 }
 fn sample(pixels: &[u8], width: u32, height: u32, x: f32, y: f32) -> [u8; 4] {
     let (left, top) = (x.floor() as i64, y.floor() as i64);

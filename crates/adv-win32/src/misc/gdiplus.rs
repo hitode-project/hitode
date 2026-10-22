@@ -9,6 +9,7 @@ use adv_device::{
 use adv_machine::{Env, Namespace, Outcome};
 use adv_os::{Heaps, com::task_alloc, gdi::GdiObj};
 use std::sync::Arc;
+mod compositing;
 mod fill;
 mod front;
 mod matrix;
@@ -682,6 +683,7 @@ fn stream_chunk(
     )
 }
 pub(super) fn register(reg: &mut Registry) {
+    compositing::register(reg);
     front::register(reg);
     fill::register(reg);
     path::register(reg);
