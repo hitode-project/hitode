@@ -5,6 +5,34 @@
 //! delivered the same way to both: an [`Outcome::Call`] on the current context (see
 //! [`super::message::send`]). Coordinates follow Win32: a top-level window's rect is in
 //! screen coordinates, a child's in its parent's client coordinates.
+//!
+//! Top-level state transitions (visibility, enablement and placement are independent):
+//!
+//! | State | Entry | Exit | Notifications |
+//! | --- | --- | --- | --- |
+//! | Normal | ShowWindow(SW_SHOWNORMAL), SC_RESTORE from maximized | Minimize, maximize, hide, destroy | Placement chain, SIZE_RESTORED |
+//! | Minimized | ShowWindow(SW_SHOWMINIMIZED/SW_MINIMIZE/SW_SHOWMINNOACTIVE), CloseWindow, SC_MINIMIZE | OpenIcon, SW_RESTORE, SW_SHOWNORMAL, SC_RESTORE, maximize | Placement chain, SIZE_MINIMIZED; restore remembers maximized placement |
+//! | Maximized | ShowWindow(SW_MAXIMIZE), SC_MAXIMIZE, restore-to-maximized | SW_SHOWNORMAL, SW_RESTORE, SC_RESTORE, minimize | Placement chain, SIZE_MAXIMIZED or SIZE_RESTORED |
+//! | Hidden | SW_HIDE, SetWindowPos(SWP_HIDEWINDOW), AnimateWindow(AW_HIDE), owner hiding | ShowWindow show commands, SWP_SHOWWINDOW, owner showing | WM_SHOWWINDOW where documented, position and activation chains |
+//! | Disabled | EnableWindow(FALSE), WS_DISABLED at creation | EnableWindow(TRUE) | WM_CANCELMODE before WM_ENABLE(FALSE); WM_ENABLE(TRUE) on exit |
+//! | Topmost | SetWindowPos(HWND_TOPMOST), WS_EX_TOPMOST at creation | SetWindowPos(HWND_NOTOPMOST) | WM_WINDOWPOSCHANGING then WM_WINDOWPOSCHANGED; maintain topmost z-order band |
+//! | Full-screen popup | WS_POPUP plus SetWindowPos covering the virtual screen | Restore saved style/geometry with SetWindowLong and SetWindowPos | WM_STYLECHANGING/CHANGED for style mutation, then position chain |
+//! | Capture | SetCapture on a current-thread window | ReleaseCapture, SetCapture to another window, default WM_CANCELMODE, destruction | Old owner receives WM_CAPTURECHANGED, lParam=new capture or NULL |
+//! | Foreground | SetForegroundWindow, allowed activation, host activation | Another foreground window, application deactivation, destruction | Application changes use WM_ACTIVATEAPP; window changes use activation chain |
+//! | Active | SetActiveWindow, activating ShowWindow/SetWindowPos, mouse activation | Activate another window, hide/minimize/disable/destroy | Old WM_NCACTIVATE(FALSE), WM_ACTIVATE(WA_INACTIVE); new WM_NCACTIVATE(TRUE), WM_ACTIVATE |
+//! | Focus | SetFocus, default WM_ACTIVATE on an enabled non-minimized window | SetFocus(NULL/other), disable/destroy, queue deactivation | Old WM_KILLFOCUS(new), new WM_SETFOCUS(old) |
+//!
+//! Position chain: WM_WINDOWPOSCHANGING (unless SWP_NOSENDCHANGING), applicable
+//! WM_NCCALCSIZE, WM_WINDOWPOSCHANGED. DefWindowProc emits WM_MOVE and WM_SIZE
+//! for changed client geometry; handling WINDOWPOSCHANGED without delegation suppresses them.
+//! WM_SYSCOMMAND precedes command-driven transitions: default SC_MINIMIZE,
+//! SC_MAXIMIZE and SC_RESTORE select the corresponding placement operation.
+//! WM_SHOWWINDOW has documented ShowWindow exclusions, so it is not a substitute
+//! for WINDOWPOS notifications. NOACTIVATE show/position requests preserve activation.
+//! Host restore follows SC_RESTORE, and host application activation follows
+//! WIN32-USER-19. A popup covering the screen is ordinary window geometry;
+//! it does not create an exclusive display mode. SetWindowLong style writes send
+//! style notifications but do not substitute for ShowWindow or EnableWindow side effects.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -50,6 +78,7 @@ pub mod wm {
     pub const SETFOCUS: u32 = 0x07;
     pub const KILLFOCUS: u32 = 0x08;
     pub const ENABLE: u32 = 0x0a;
+    pub const CANCELMODE: u32 = 0x1f;
     pub const SETTEXT: u32 = 0x0c;
     pub const GETTEXT: u32 = 0x0d;
     pub const GETTEXTLENGTH: u32 = 0x0e;
@@ -86,6 +115,7 @@ pub mod wm {
     pub const RBUTTONDOWN: u32 = 0x204;
     pub const RBUTTONUP: u32 = 0x205;
     pub const MOUSEWHEEL: u32 = 0x20a;
+    pub const CAPTURECHANGED: u32 = 0x215;
     pub const PARENTNOTIFY: u32 = 0x210;
     pub const IME_CHAR: u32 = 0x286;
     pub const DWMNCRENDERINGCHANGED: u32 = 0x31f;
@@ -2030,8 +2060,9 @@ fn set_active_window(env: &mut Env<'_>) -> Outcome {
     activate_window(env, hwnd, move |_| Outcome::Return(old))
 }
 
-fn enable_window(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, enable) = (env.arg(0), env.arg(1) != 0);
+#[win32(user32, name = "EnableWindow", level = state)]
+fn enable_window(env: &mut Env<'_>, hwnd: AbiHandle, enable: i32) -> Outcome {
+    let (hwnd, enable) = (hwnd.0, enable != 0);
     let Some(w) = env
         .ext
         .get::<crate::Win32>()
@@ -2050,9 +2081,16 @@ fn enable_window(env: &mut Env<'_>) -> Outcome {
     } else {
         w.style |= WS_DISABLED;
     }
-    send(env, hwnd, wm::ENABLE, u32::from(enable), 0, move |_, _| {
-        Outcome::Return(u32::from(was_disabled))
-    })
+    let notify = move |env: &mut Env<'_>| {
+        send(env, hwnd, wm::ENABLE, u32::from(enable), 0, move |_, _| {
+            Outcome::Return(u32::from(was_disabled))
+        })
+    };
+    if enable {
+        notify(env)
+    } else {
+        send(env, hwnd, wm::CANCELMODE, 0, 0, move |env, _| notify(env))
+    }
 }
 
 // ---- queries ----
@@ -3027,21 +3065,44 @@ fn window_text(
 
 // ---- capture ----
 
-fn set_capture(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    let ctx = env.context;
-    Outcome::Return(std::mem::replace(
-        &mut user_mut(env).queue(ctx).capture,
-        hwnd,
-    ))
+#[win32(user32, name = "SetCapture", level = state)]
+fn set_capture(env: &mut Env<'_>, hwnd: AbiHandle) -> Outcome {
+    let hwnd = hwnd.0;
+    if hwnd != 0 {
+        let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+            set_last_error(env, 1400);
+            return Outcome::Return(0);
+        };
+        if window.thread != env.context {
+            return Outcome::Return(0);
+        }
+    }
+    change_capture(env, hwnd, |_, old| Outcome::Return(old))
 }
 
+/// Publish the new owner before callbacks, preserving reentrant capture changes.
+pub(super) fn change_capture(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let ctx = env.context;
+    let old = std::mem::replace(&mut user_mut(env).queue(ctx).capture, hwnd);
+    if old != 0 && old != hwnd {
+        send(env, old, wm::CAPTURECHANGED, 0, hwnd, move |env, _| {
+            then(env, old)
+        })
+    } else {
+        then(env, old)
+    }
+}
+
+#[win32(user32, name = "ReleaseCapture", level = state)]
 fn release_capture(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.context;
-    user_mut(env).queue(ctx).capture = 0;
-    Outcome::Return(1)
+    change_capture(env, 0, |_, _| Outcome::Return(1))
 }
 
+#[win32(user32, name = "GetCapture", level = state)]
 fn get_capture(env: &mut Env<'_>) -> Outcome {
     let ctx = env.context;
     Outcome::Return(user_mut(env).queue(ctx).capture)
@@ -3077,7 +3138,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "GetActiveWindow", 0, get_active_window);
     s(reg, "GetForegroundWindow", 0, get_foreground_window);
     s(reg, "SetForegroundWindow", 1, set_foreground_window);
-    s(reg, "EnableWindow", 2, enable_window);
+    reg.register(enable_window_ABI);
     s(reg, "GetWindowRect", 2, get_window_rect);
     s(reg, "GetClientRect", 2, get_client_rect);
     s(reg, "ClientToScreen", 2, client_to_screen);
@@ -3124,9 +3185,9 @@ pub fn register(reg: &mut Registry) {
     reg.register(set_window_text_w_ABI);
     reg.register(get_window_text_w_ABI);
     reg.register(get_window_text_length_w_ABI);
-    s(reg, "SetCapture", 1, set_capture);
-    s(reg, "ReleaseCapture", 0, release_capture);
-    s(reg, "GetCapture", 0, get_capture);
+    reg.register(set_capture_ABI);
+    reg.register(release_capture_ABI);
+    reg.register(get_capture_ABI);
 }
 
 #[cfg(test)]

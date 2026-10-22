@@ -302,6 +302,15 @@ pub(super) fn release_front(env: &mut Env<'_>, kind: Kind) -> Outcome {
     } else {
         (0, 0)
     };
+    release_at(env, kind, handle, count, previous)
+}
+pub(super) fn release_at(
+    env: &mut Env<'_>,
+    kind: Kind,
+    handle: u32,
+    count: u32,
+    previous: u32,
+) -> Outcome {
     match crate::native::overridden(env, kind.release()) {
         Ok(Some(target)) => {
             let args = if matches!(kind, Kind::Semaphore) {

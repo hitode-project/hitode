@@ -763,3 +763,27 @@ fn define_dos_device_is_denied_and_leaves_drives_unchanged() {
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
+    let vfs = &env.ext.get::<Win32>().vfs;
+    if vfs.is_optical_path(guest) {
+        let mut bytes = Vec::new();
+        vfs.open_optical_file(guest)?.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    let Some(path) = vfs.lookup(guest) else {
+        return Ok(Vec::new());
+    };
+    let mut file = std::fs::File::open(path)?;
+    let content = if vfs.sections.has_entries() {
+        vfs.sections.lookup(adv_os::vfs::file_identity(&file)?)
+    } else {
+        None
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if let Some(content) = content {
+        content.merge_read(0, &mut bytes)?;
+    }
+    Ok(bytes)
+}

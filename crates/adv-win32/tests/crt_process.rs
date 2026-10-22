@@ -526,7 +526,7 @@ fn nonexistent_legacy_time_and_string_contract_memchr_stay_hidden_from_guest_loo
     }
 }
 
-// spec: PERS-CRT-5
+// spec: CRT-LIB-5
 #[test]
 fn identity_and_sleep_fronts_share_windows_processes_and_virtual_scheduling() {
     for jit in [false, true] {

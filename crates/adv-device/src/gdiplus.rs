@@ -1,7 +1,10 @@
 //! Offscreen vector/text/image rendering. Device objects contain no guest handles.
-//! Windows uses its system GDI+ rasterizer; other hosts report unavailable until
-//! a portable implementation of the same service is supplied.
+//! Windows uses its system GDI+ rasterizer; other hosts use owned CPU images
+//! and zeno paths behind the same device objects.
 use std::sync::Arc;
+pub mod matrix;
+#[cfg(not(windows))]
+mod portable;
 #[cfg(windows)]
 mod windows;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +32,8 @@ pub struct Object {
     _backing: Option<Arc<Object>>,
     #[cfg(windows)]
     canvas: Option<windows::Canvas>,
+    #[cfg(not(windows))]
+    data: std::sync::Mutex<portable::Data>,
 }
 pub enum Create<'a> {
     Image(u32, u32, &'a [u8]),
@@ -38,6 +43,7 @@ pub enum Create<'a> {
     SansSerif,
     Font(&'a Object, f32, i32, i32),
     Format(i32, u16),
+    GenericFormat(bool),
     Solid(u32),
     Path(i32),
     Gradient(&'a Object),
@@ -49,6 +55,15 @@ pub enum Op<'a> {
     Size,
     Align(i32),
     LineAlign(i32),
+    StringProperty(u8),
+    StringFlags(i32),
+    Hotkey(i32),
+    Trimming(i32),
+    Digits(Option<(u16, i32)>),
+    Tabs(Option<(f32, &'a [f32])>),
+    CharacterRanges(&'a [[i32; 2]]),
+    PathFill(Option<i32>),
+    ResetPath,
     PathLine([f32; 4]),
     PathArc([f32; 4], f32, f32),
     ClosePath,
@@ -85,8 +100,16 @@ pub enum Op<'a> {
     Clip(Vec<[f32; 4]>),
     Smoothing(i32),
     TextHint(i32),
+    PixelOffset(Option<i32>),
+    BrushType,
+    SolidColor(Option<u32>),
+    World(Option<matrix::Matrix>),
+    ComposeWorld(matrix::Matrix, bool),
 }
 pub enum Reply {
+    Digits(u16, i32),
+    Tabs(f32, Vec<f32>),
+    Matrix(matrix::Matrix),
     None,
     Pixels(Vec<u8>),
     Size(u32, u32),
@@ -102,7 +125,7 @@ impl Runtime {
         }
         #[cfg(not(windows))]
         {
-            Err(6)
+            Ok(Arc::new(Self {}))
         }
     }
     pub fn create(self: &Arc<Self>, create: Create<'_>) -> Result<Arc<Object>, i32> {
@@ -112,8 +135,7 @@ impl Runtime {
         }
         #[cfg(not(windows))]
         {
-            let _ = create;
-            Err(6)
+            portable::create(self, create)
         }
     }
 }
@@ -125,8 +147,7 @@ impl Object {
         }
         #[cfg(not(windows))]
         {
-            let _ = operation;
-            Err(6)
+            portable::execute(self, operation)
         }
     }
 }

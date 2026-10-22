@@ -772,14 +772,15 @@ mod tests {
         std::fs::write(tmp.join("game/Base.dat"), "base").unwrap();
         let mut v = vfs(&tmp);
         // Held after construction: parallel Vfs::new would clear the index.
-        let _held = names::tests::EXCLUSIVE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _held = names::tests::exclusive();
         let game = tmp.join("game");
         for _ in 0..2 {
             assert_eq!(v.lookup("base.dat"), Some(game.join("Base.dat")));
         }
-        assert!(v.memo.lock().unwrap().entries.contains_key("base.dat"));
+        // Another test's invalidation can clear the memo; a quiet lookup stores it.
+        while !v.memo.lock().unwrap().entries.contains_key("base.dat") {
+            assert_eq!(v.lookup("base.dat"), Some(game.join("Base.dat")));
+        }
         assert_eq!(v.lookup("new.dat"), None);
         host::write(&game.join("New.dat"), b"").unwrap();
         assert_eq!(v.lookup("new.dat"), Some(game.join("New.dat")));

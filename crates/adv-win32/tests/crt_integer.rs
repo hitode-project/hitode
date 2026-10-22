@@ -106,7 +106,7 @@ fn text(m: &mut Machine<JitCpu>, value: &str, wide: bool, address: u32) {
     m.cpu.write(address, &bytes).unwrap();
 }
 
-// spec: PERS-CRT-11, PERS-ABI-1
+// spec: CRT-LIB-11, PERS-ABI-1
 #[test]
 fn every_cataloged_conversion_front_uses_real_width_and_runtime_errno() {
     let modules = [
@@ -186,7 +186,7 @@ fn every_cataloged_conversion_front_uses_real_width_and_runtime_errno() {
     }
 }
 
-// spec: PERS-CRT-11
+// spec: CRT-LIB-11
 #[test]
 fn signed_unsigned_limits_radices_and_unicode_digits_preserve_exact_end_positions() {
     for jit in [false, true] {
@@ -284,7 +284,7 @@ fn signed_unsigned_limits_radices_and_unicode_digits_preserve_exact_end_position
     }
 }
 
-// spec: PERS-CRT-12
+// spec: CRT-LIB-12
 #[test]
 fn conversion_access_stops_at_a_nondigit_or_known_overflow_without_an_end_output() {
     for jit in [false, true] {
@@ -317,7 +317,7 @@ fn conversion_access_stops_at_a_nondigit_or_known_overflow_without_an_end_output
     }
 }
 
-// spec: PERS-CRT-12
+// spec: CRT-LIB-12
 #[test]
 fn invalid_parameter_callbacks_observe_initialized_end_and_full_width_zero_returns() {
     for jit in [false, true] {

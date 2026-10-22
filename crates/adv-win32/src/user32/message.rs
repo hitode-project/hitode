@@ -2372,6 +2372,13 @@ pub(super) fn def_window_proc_encoded(
                 other => other,
             };
         }
+        wm::CANCELMODE => {
+            let ctx = env.context;
+            if user_mut(env).queue(ctx).capture == hwnd {
+                return window::change_capture(env, 0, move |env, _| then(env, 0));
+            }
+            0
+        }
         wm::NCHITTEST => 1, // HTCLIENT
         wm::IME_CHAR => {
             // DefWindowProcA posts a packed DBCS character as lead then trail byte.

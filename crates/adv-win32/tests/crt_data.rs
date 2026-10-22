@@ -169,7 +169,7 @@ fn case<B: Backend>(cpu: B, module: &str) {
         statics["cmdline_a"]
     );
 }
-// spec: PERS-EXPORT-6, PERS-CRT-6
+// spec: PERS-EXPORT-6, CRT-LIB-6
 #[test]
 fn static_and_dynamic_crt_data_are_writable_cells_not_function_thunks() {
     for module in [
@@ -235,7 +235,7 @@ fn win32_only_install_does_not_register_or_seed_crt_exports() {
     assert!(!registry.is_implemented("msvcrt.dll", "_adjust_fdiv"));
 }
 
-// spec: PERS-EXPORT-6, PERS-CRT-6
+// spec: PERS-EXPORT-6, CRT-LIB-6
 fn numeric_cells<B: Backend>(cpu: B, module: &str) {
     let adjusted = include_str!("../../../data/abi/crt-exports.tsv")
         .lines()
@@ -342,7 +342,7 @@ fn numeric_cells<B: Backend>(cpu: B, module: &str) {
     );
 }
 
-// spec: PERS-EXPORT-6, PERS-CRT-6
+// spec: PERS-EXPORT-6, CRT-LIB-6
 #[test]
 fn every_legacy_runtime_exports_real_double_and_fdiv_data_cells() {
     for module in [

@@ -73,7 +73,7 @@ fn clean(m: &Machine<JitCpu>) {
     }
 }
 
-// spec: PERS-CRT-3, PERS-CRT-4
+// spec: CRT-LIB-3, CRT-LIB-4
 #[test]
 fn cp932_and_cp936_traversal_counts_context_and_copy_share_all_version_fronts() {
     for jit in [false, true] {
@@ -190,7 +190,7 @@ fn cp932_and_cp936_traversal_counts_context_and_copy_share_all_version_fronts() 
     }
 }
 
-// spec: PERS-CRT-3
+// spec: CRT-LIB-3
 #[test]
 fn codepage_controls_preserve_crt_ownership_api_aliases_ctype_and_win32_acp() {
     for jit in [false, true] {
@@ -257,7 +257,7 @@ fn codepage_controls_preserve_crt_ownership_api_aliases_ctype_and_win32_acp() {
     }
 }
 
-// spec: PERS-CRT-4
+// spec: CRT-LIB-4
 #[test]
 fn limits_and_dangling_leads_do_not_read_unmapped_tails_or_invent_characters() {
     for jit in [false, true] {
@@ -323,7 +323,7 @@ fn limits_and_dangling_leads_do_not_read_unmapped_tails_or_invent_characters() {
     }
 }
 
-// spec: PERS-CRT-4
+// spec: CRT-LIB-4
 #[test]
 fn null_arguments_enter_modern_invalid_handlers_and_readonly_copy_destinations_fail() {
     for jit in [false, true] {
@@ -397,7 +397,7 @@ fn null_arguments_enter_modern_invalid_handlers_and_readonly_copy_destinations_f
     }
 }
 
-// spec: PERS-CRT-3, PERS-CRT-4
+// spec: CRT-LIB-3, CRT-LIB-4
 #[test]
 fn ordinary_and_secure_path_splits_use_the_explicit_multibyte_codepage() {
     for jit in [false, true] {

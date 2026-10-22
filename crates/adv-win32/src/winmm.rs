@@ -18,6 +18,7 @@ const SYNCHRONOUS: u32 = 0x100;
 // fail, and a subsequent timer API reaps an abandoned active payload. Without
 // another API, that bounded charge lasts until the process's Objects is dropped.
 const WORKER: &str = "__pal_multimedia_timer_worker";
+mod error_text;
 mod joystick;
 mod mci;
 mod midi;
@@ -41,6 +42,7 @@ pub fn register(registry: &mut Registry) {
     mci::register(registry);
     joystick::register(registry);
     midi::register(registry);
+    error_text::register(registry);
     sound::register(registry);
     registry.add_env_leaf(
         "winmm.dll",
@@ -102,7 +104,8 @@ fn mixer_open(env: &mut Env<'_>) -> Outcome {
 }
 
 fn mixer_close(_env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0) // MMSYSERR_NOERROR
+    // No successful mixerOpen can publish a handle in this profile.
+    Outcome::Return(INVALHANDLE)
 }
 
 // No mixer device exists, so queries fail as winmm does without one: a bad

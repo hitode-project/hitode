@@ -87,7 +87,7 @@ fn clean(m: &Machine<JitCpu>) {
     }
 }
 
-// spec: PERS-CRT-7, PERS-CRT-8
+// spec: CRT-LIB-7, CRT-LIB-8
 #[test]
 fn all_versions_allocate_resize_query_and_release_the_same_heap_objects() {
     for jit in [false, true] {
@@ -242,7 +242,7 @@ fn all_versions_allocate_resize_query_and_release_the_same_heap_objects() {
     }
 }
 
-// spec: PERS-CRT-8
+// spec: CRT-LIB-8
 #[test]
 fn null_size_queries_and_expansion_use_the_runtime_invalid_parameter_profile() {
     for jit in [false, true] {

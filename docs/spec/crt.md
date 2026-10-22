@@ -1,0 +1,69 @@
+# C runtime
+
+ID prefix: CRT
+
+This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvcr version, ucrtbase and its API-set contracts. `adv-win32` implements them through one shared implementation per function. [personality.md](personality.md) covers export structure and CRT process identity cells.
+
+## Shared runtime functions
+
+### CRT-LIB-1 String version exports
+
+**Rule**: Cataloged CRT byte and UTF-16 string exports MUST select one shared implementation through generated ABI declarations. Counts MUST measure bytes or UTF-16 code units respectively. Bounded operations MUST NOT read beyond their count or a string terminator.
+**Verification**: Test
+
+### CRT-LIB-2 String writes and searches
+
+**Rule**: String writes MUST report inaccessible destination memory instead of successful partial copies. Bounded copy MUST pad after NUL, while bounded concatenation MUST append exactly one terminator. Searches MUST preserve terminator matches and return the first matching substring.
+**Verification**: Test
+
+### CRT-LIB-3 Multibyte code-page ownership
+
+**Rule**: CRT multibyte code-page controls MUST share their runtime's locale owner and default to the guest ACP. Public API-set calls MUST use UCRT state without changing another CRT or Win32 ACP. Single-byte and UTF-8 modes MUST report false byte-lead classifications.
+**Verification**: Test
+
+### CRT-LIB-4 Multibyte traversal boundaries
+
+**Rule**: Multibyte traversal MUST distinguish character and byte limits, preserve pair boundaries, and exclude terminal lead bytes from counts. Bounded copies MUST pad after NUL and suppress incomplete final pairs without reading beyond their count. Modern argument checks MUST use the runtime's invalid-parameter handler, and inaccessible destination writes MUST fail.
+**Verification**: Test
+
+### CRT-LIB-5 Process identity and delay
+
+**Rule**: CRT process identity MUST match the existing Windows process owner. CRT sleep MUST use the existing Windows scheduler, converting a zero duration to one millisecond. Every version and public API-set alias MUST preserve these semantics.
+**Verification**: Test
+
+### CRT-LIB-6 Legacy numeric and command-line data
+
+**Rule**: Legacy `_HUGE` data MUST be an eight-byte double initialized to positive infinity. Cataloged `_adjust_fdiv` cells MUST start at zero for the conforming virtual processor. CRT command-line pointer cells MUST reference the Win32 command-line owner while retaining independent, writable module storage.
+**Verification**: Test
+
+### CRT-LIB-7 Heap ownership and resizing
+
+**Rule**: CRT allocation fronts and size queries MUST share the existing heap owner and declared version exports. Reallocation failure MUST preserve the old block, and `_expand` MUST resize without moving. Zero-sized `realloc` MUST release a nonnull block.
+**Verification**: Test
+
+### CRT-LIB-8 Heap error contracts
+
+**Rule**: Public allocation failure and product overflow MUST publish ENOMEM. NULL size-query and expansion inputs MUST use the runtime's parameter-validation profile. Zero-sized allocation requests MUST retain distinct live blocks that can be freed.
+**Verification**: Test
+
+### CRT-LIB-9 Aligned allocation views
+
+**Rule**: Aligned CRT allocations MUST retain real backing blocks in the shared heap, with recoverable guest headers. The requested view plus offset MUST satisfy its alignment, and size queries MUST recover the requested extent. Resizing MUST preserve old contents on success and retain the original allocation on failure.
+**Verification**: Test
+
+### CRT-LIB-10 Aligned zeroing and validation
+
+**Rule**: Aligned recalloc MUST zero newly added bytes and reject overflowing products with ENOMEM. Invalid inputs MUST follow the version's parameter-validation profile and native zero-alignment policy. Zero-sized resizing of a nonnull view MUST release its backing block before alignment validation.
+**Verification**: Test
+
+### CRT-LIB-11 Integer conversion boundaries
+
+**Rule**: CRT integer conversions MUST use x86 result widths, saturate overflow with ERANGE, and preserve errno on successful conversion. End pointers MUST identify the first unconsumed unit, or the original pointer when no digit was converted. Narrow and wide fronts MUST share checked scanning while observing their runtime's locale owner.
+**Verification**: Test
+
+### CRT-LIB-12 Integer validation and access order
+
+**Rule**: Integer conversions MUST initialize nonnull end outputs before validating source and radix. Invalid parameters MUST use the runtime's validation profile, with full-width zero results when execution continues. Prefix scanning MUST stop at the first unrecognized unit and avoid reading a suffix after overflow when no end position was requested.
+**Verification**: Test
+
+Withdrawn: none

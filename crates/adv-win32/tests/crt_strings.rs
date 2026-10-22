@@ -82,7 +82,7 @@ fn read(m: &Machine<JitCpu>, p: u32, count: u32, wide: bool) -> Vec<u16> {
         })
         .collect()
 }
-// spec: PERS-CRT-1, PERS-CRT-2
+// spec: CRT-LIB-1, CRT-LIB-2
 #[test]
 fn length_comparison_search_and_copy_are_shared_by_every_cataloged_runtime() {
     for jit in [false, true] {
@@ -152,7 +152,7 @@ fn length_comparison_search_and_copy_are_shared_by_every_cataloged_runtime() {
         }
     }
 }
-// spec: PERS-CRT-1, PERS-CRT-2
+// spec: CRT-LIB-1, CRT-LIB-2
 #[test]
 fn bounded_operations_stop_at_count_and_searches_stop_before_an_unmapped_tail() {
     for jit in [false, true] {
@@ -227,7 +227,7 @@ fn bounded_operations_stop_at_count_and_searches_stop_before_an_unmapped_tail() 
         }
     }
 }
-// spec: PERS-CRT-2
+// spec: CRT-LIB-2
 #[test]
 fn copy_to_read_only_destination_fails_instead_of_returning_success() {
     for jit in [false, true] {

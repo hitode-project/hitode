@@ -7,7 +7,7 @@ fn backing(m: &Machine<JitCpu>, pointer: u32) -> u32 {
     m.cpu.read_u32((pointer & !3) - 4).unwrap()
 }
 
-// spec: PERS-CRT-9, PERS-CRT-10
+// spec: CRT-LIB-9, CRT-LIB-10
 #[test]
 fn aligned_views_resize_zero_and_release_real_backings_across_all_versions() {
     for jit in [false, true] {
@@ -198,7 +198,7 @@ fn aligned_views_resize_zero_and_release_real_backings_across_all_versions() {
     }
 }
 
-// spec: PERS-CRT-9, PERS-CRT-10, PERS-CRT-8
+// spec: CRT-LIB-9, CRT-LIB-10, CRT-LIB-8
 #[test]
 fn aligned_failures_preserve_contents_and_apply_version_validation_before_effects() {
     for jit in [false, true] {
