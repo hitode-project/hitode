@@ -1,7 +1,11 @@
 //! CRT path mutations call the existing live Windows file owner. UCRT narrow
 //! paths use the existing codec and heap to retain its wide Windows boundary.
 use super::*;
-use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure};
+use adv_abi::{
+    AnsiStr, GuestPtr,
+    guest::{check_range, memory_failure},
+};
+use adv_cpu::backend::Prot;
 
 pub(super) fn register(registry: &mut Registry) {
     versions::register(
@@ -127,7 +131,9 @@ fn convert_next(
                 return finish(env, buffers, result);
             }
             buffers.push(buffer);
-            if let Err(fault) = env.cpu.write(buffer, &bytes) {
+            if let Err(fault) = check_range(env.cpu, buffer, bytes.len() as u32, Prot::WRITE)
+                .and_then(|_| env.cpu.write(buffer, &bytes))
+            {
                 return finish(env, buffers, memory_failure(fault));
             }
             args.push(buffer);

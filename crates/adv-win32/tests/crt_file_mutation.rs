@@ -67,27 +67,33 @@ fn configured_machine(
     config.os.codepage = cp;
     Win32::install(&mut m, config).unwrap();
     if fail_allocation {
-        let (win32, modules) = m.ext.get2_mut::<Win32, adv_os::Modules>();
-        let mut loader = adv_os::Loader::new(&mut m.cpu, &mut m.sys, modules, &win32.vfs);
-        let id = loader.load("ntdll.dll").unwrap();
-        let entry = loader
-            .resolve_dynamic(
-                id,
-                &adv_pe::ImportName::Name {
-                    hint: 0,
-                    name: "RtlAllocateHeap".into(),
-                },
-            )
-            .unwrap()
-            .0;
-        m.cpu.write(entry, &[0x31, 0xc0, 0xc2, 12, 0]).unwrap();
+        allocation_result(&mut m, 0);
     }
-
     m.cpu.map(CODE, 65536, Prot::RX).unwrap();
     m.cpu.map(DATA, 65536, Prot::RW).unwrap();
     m.ext.insert(Provider::default());
     m
 }
+fn allocation_result(m: &mut Machine<JitCpu>, value: u32) {
+    let (win32, modules) = m.ext.get2_mut::<Win32, adv_os::Modules>();
+    let mut loader = adv_os::Loader::new(&mut m.cpu, &mut m.sys, modules, &win32.vfs);
+    let id = loader.load("ntdll.dll").unwrap();
+    let entry = loader
+        .resolve_dynamic(
+            id,
+            &adv_pe::ImportName::Name {
+                hint: 0,
+                name: "RtlAllocateHeap".into(),
+            },
+        )
+        .unwrap()
+        .0;
+    let mut bytes = vec![0xb8];
+    bytes.extend_from_slice(&value.to_le_bytes());
+    bytes.extend_from_slice(&[0xc2, 12, 0]);
+    m.cpu.write(entry, &bytes).unwrap();
+}
+
 fn invoke(
     m: &mut Machine<JitCpu>,
     a: &mut Asm,
@@ -238,6 +244,7 @@ fn cataloged_mutations_share_real_overlay_operations_in_both_filename_codepages(
 
 #[derive(Default)]
 struct Provider {
+    forced: Option<(u32, u32)>,
     seen: Vec<(String, Vec<Option<String>>, Vec<u32>)>,
 }
 fn provided(env: &mut Env<'_>) -> Outcome {
@@ -274,7 +281,7 @@ fn provided(env: &mut Env<'_>) -> Outcome {
     let state = env.ext.get_mut::<Provider>();
     let index = state.seen.len() % CASES.len();
     state.seen.push((name, paths, pointers));
-    let (value, error) = CASES[index];
+    let (value, error) = state.forced.unwrap_or(CASES[index]);
     adv_win32::util::set_last_error(env, error);
     Outcome::Return(value)
 }
@@ -578,6 +585,85 @@ fn modern_conversion_allocation_failure_preserves_dos_error_and_never_mutates_a_
             assert_eq!(m.cpu.read_u32(DATA + 0x400c + i * 16).unwrap(), 73);
         }
         assert!(m.ext.get::<Provider>().seen.is_empty());
+        drop(m);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// spec: CRT-LIB-24, PERS-ABI-1
+#[test]
+fn a_heap_provider_cannot_turn_a_readonly_conversion_buffer_into_writable_storage() {
+    for jit in [false, true] {
+        let root = root();
+        let mut m = machine(jit, &root, 936, true);
+        let buffer = DATA + 0x9000;
+        m.cpu.write(buffer, &[0xaa; 32]).unwrap();
+        m.cpu.protect(buffer, 4096, Prot::READ).unwrap();
+        allocation_result(&mut m, buffer);
+        text(&mut m, DATA, "保存.dat", false);
+        let mut a = Asm::new(CODE);
+        reset_errors(&mut m, &mut a, "ucrtbase.dll");
+        invoke(
+            &mut m,
+            &mut a,
+            "ucrtbase.dll",
+            "remove",
+            &[DATA],
+            DATA + 0x4000,
+        );
+        a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+        m.cpu.write(CODE, &a.bytes).unwrap();
+        m.spawn("protected CRT conversion", CODE, &[], 65536)
+            .unwrap();
+        let result = m.run_virtual(1_000_000);
+        assert!(matches!(result, RunResult::Failed(_)), "{jit}: {result:?}");
+        assert!(m.ext.get::<Provider>().seen.is_empty());
+        assert_eq!(m.cpu.read_u32(buffer).unwrap(), 0xaaaaaaaa);
+        drop(m);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+fn protect_errors(env: &mut Env<'_>) -> Outcome {
+    let pointer = env.cpu.read_u32(DATA + 0x7000).unwrap();
+    env.cpu.protect(pointer & !4095, 4096, Prot::READ).unwrap();
+    Outcome::Return(0)
+}
+// spec: CRT-LIB-22, CRT-LIB-23, PERS-ABI-1
+#[test]
+fn dos_translation_obeys_guest_protection_instead_of_publishing_through_controller_writes() {
+    for jit in [false, true] {
+        let root = root();
+        let mut m = machine(jit, &root, 936, true);
+        m.ext.get_mut::<Provider>().forced = Some((0, 5));
+        m.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+            "authored-crt-mutation",
+            "protect-errors",
+            Conv::Cdecl { argc: 0 },
+            protect_errors,
+        );
+        text(&mut m, DATA, "保存.dat", false);
+        let mut a = Asm::new(CODE);
+        reset_errors(&mut m, &mut a, "msvcr90.dll");
+        a.call(
+            m.resolve_import("authored-crt-mutation", "protect-errors")
+                .unwrap(),
+        );
+        invoke(
+            &mut m,
+            &mut a,
+            "msvcr90.dll",
+            "remove",
+            &[DATA],
+            DATA + 0x4000,
+        );
+        a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+        m.cpu.write(CODE, &a.bytes).unwrap();
+        m.spawn("protected CRT errors", CODE, &[], 65536).unwrap();
+        let result = m.run_virtual(1_000_000);
+        assert!(matches!(result, RunResult::Failed(_)), "{jit}: {result:?}");
+        let pointer = m.cpu.read_u32(DATA + 0x7000).unwrap();
+        assert_eq!(m.cpu.read_u32(pointer).unwrap(), 71);
+        assert_eq!(m.cpu.read_u32(pointer + 4).unwrap(), 83);
         drop(m);
         std::fs::remove_dir_all(root).unwrap();
     }

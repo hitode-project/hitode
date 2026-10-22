@@ -140,8 +140,7 @@ pub(super) fn map_dos(env: &mut Env<'_>, code: u32, result: u32) -> Outcome {
     } else {
         dos_errno(code)
     };
-    let pair = [(errno as u32).to_le_bytes(), code.to_le_bytes()].concat();
-    match env.cpu.write(pointer, &pair) {
+    match GuestPtr::<[u32; 2]>::new(pointer).write(env.cpu, [errno as u32, code]) {
         Ok(()) => Outcome::Return(result),
         Err(fault) => memory_failure(fault),
     }
