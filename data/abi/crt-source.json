@@ -465,5 +465,33 @@
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-errno",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-doserrno"
     ]
+  },
+  "corecrt_terminate.h": {
+    "header": "ucrt/corecrt_terminate.h",
+    "sha256": "c8dc9a2497bcae0a9084eb1120f25660a575c7957997301c4f017fc44c908f54",
+    "projection": "x86 cdecl zero-word terminate and one-word set_terminate function-pointer parameter/results. Historical C++ aliases retain one-word pointer or int-null argument encodings."
+  },
+  "cpp_runtime_callbacks": {
+    "source": "Microsoft Learn CRT declarations; SDK stdlib.h/corecrt_terminate.h; public x86 decorated-name ABI for legacy aliases and __std_terminate. No header or native code is copied.",
+    "abi": "All entries are x86 cdecl. terminate/unexpected/__std_terminate take no stack arguments and do not return. set_terminate/set_unexpected/_set_se_translator/_set_purecall_handler take one callback pointer and return the previous callback; legacy H overloads take a 32-bit null integer. Getters have zero arguments. _purecall is int(void), nonreturning in this environment. UCRT _o_ wrappers preserve their public target ABI.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-terminate-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/terminate-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-unexpected-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-se-translator",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/purecall",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-purecall-handler",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-purecall-handler"
+    ]
+  },
+  "x86_seh_runtime": {
+    "source": "Microsoft Learn CRT/internal-CRT API documentation and public MSVC x86 EH registration/scope-table ABI. These internal entries are explicitly declared; no implementation code or headers are imported.",
+    "abi": "_except_handler2/3 are four-pointer x86 cdecl EXCEPTION_DISPOSITION functions. _except_handler4_common adds cookie-address and security-check-callback pointers before those four arguments. _global_unwind2 is void cdecl(frame); _local_unwind2 is void cdecl(frame,int state); _local_unwind4 adds a leading cookie-address argument. Filter/finally funclets use establisher+16 as EBP. EH4 cookie-check callbacks receive their checked value in ECX.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/except-handler3",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-exception_registration_record",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlunwind"
+    ]
   }
 }

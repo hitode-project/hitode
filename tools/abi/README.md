@@ -161,6 +161,22 @@ fail with ENOENT and publish no handles or streams. A `system(NULL)` query retur
 zero without changing the error cells. `test-crt-input.ps1` verifies regeneration
 and rejection of changed process-list and binary-math ABI contracts.
 
+CRT runtime callback declarations additionally project terminate, unexpected,
+translator and purecall aliases, including VC14's `__std_terminate`. Terminate,
+unexpected and translator handlers use the existing CRT/thread owner; purecall
+handlers use CRT-global state. VC14's standard terminate entry uses UCRT's slot.
+Returning terminate handlers take the abort path, and returning unexpected handlers
+enter terminate. Their callbacks execute as guest code, preserving explicit exits.
+
+The x86 internal SEH helpers use explicit ABI rows: EH2/EH3 take four cdecl
+arguments, EH4 common takes six, and local/global helpers retain caller cleanup.
+EH4 scope tables decode with the supplied cookie and invoke the supplied ECX
+security-check callback. Scope filters and finally funclets receive the guest
+establisher's EBP. Accepted filters call the live public `RtlUnwind` entry before
+local cleanup and resume through a machine checkpoint that validates stack and
+continuation ancestry. No host exception substitutes for guest SEH dispatch.
+`crt_cpp_runtime` and `crt_seh` exercise these paths in both execution modes.
+
 `python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
 `crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
 iostream families, including their data exports. `--check` detects stale entries.

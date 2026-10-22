@@ -40,3 +40,25 @@ This spec covers structured exception dispatch in the Win32 personality: SEH sea
 
 **Rule**: First-chance exhaustion MUST enter live `NtRaiseException(FALSE)`. Without a debugger, second chance MUST terminate with the exception status without repeating VEH, SEH, or top-level filters.
 **Verification**: Test
+
+## CRT handlers
+
+### EXC-CRT-1 Handler ownership
+
+**Rule**: Terminate, unexpected and SE translator handlers MUST use runtime/thread state, while purecall handlers MUST use runtime-global state. Setters MUST return the previous handler. Aliases MUST share state and preserve errno and LastError.
+**Verification**: Test
+
+### EXC-CRT-2 Termination paths
+
+**Rule**: Returning or recursively entered terminate handlers MUST end through abort. A returning unexpected handler MUST enter terminate. VC14 `__std_terminate` MUST use UCRT's terminate handler, and a handler's explicit process exit MUST retain its code.
+**Verification**: Test
+
+### EXC-CRT-3 CRT SEH scopes
+
+**Rule**: CRT EH2/EH3/EH4 filters MUST run with the establisher's frame and exception pointers. Accepted scopes MUST run live global unwinding, then inner finally blocks in order, before entering their handler. Local unwind helpers MUST publish outer scope state before cleanup and stop at the requested state.
+**Verification**: Test
+
+### EXC-CRT-4 EH4 security callbacks
+
+**Rule**: EH4 MUST decode the scope table with the supplied cookie. Enabled GS/EH checks MUST call the supplied security callback with the decoded value in ECX before searching scopes. The callback's terminating failure MUST prevent filter execution.
+**Verification**: Test

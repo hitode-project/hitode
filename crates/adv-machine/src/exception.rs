@@ -106,6 +106,33 @@ impl Env<'_> {
     pub fn checkpoint(&mut self) -> Result<Checkpoint, StateError> {
         Checkpoint::capture(self.cpu, self.sys)
     }
+
+    /// Capture a nonlocal resume after personality-owned cleanup has completed.
+    /// Only callbacks explicitly declared unwindable may be retired. Retained
+    /// ancestry remains pinned and is checked again when the checkpoint resumes.
+    pub fn checkpoint_for_stack_unwind(&mut self, stack: u32) -> Result<Checkpoint, String> {
+        let context = self.sys.current_context();
+        if stack < context.stack_lo || stack >= context.stack_hi || stack < self.cpu.reg(Reg::Esp) {
+            return Err("stack unwind target is outside the active upward stack range".into());
+        }
+        let mut depth = context.frames.len();
+        while let Some(frame) = depth.checked_sub(1).and_then(|i| context.frames.get(i)) {
+            if stack < frame.stack {
+                break;
+            }
+            if !frame.unwindable {
+                return Err("stack unwind crosses a non-unwindable continuation".into());
+            }
+            depth -= 1;
+        }
+        let ancestor = depth.checked_sub(1).map(|i| context.frames[i].id);
+        let mut checkpoint = Checkpoint::capture(self.cpu, self.sys).map_err(|e| e.to_string())?;
+        checkpoint.depth = depth;
+        checkpoint.frame = ancestor;
+        checkpoint.unwind_descendants = true;
+        checkpoint.state.regs[4] = stack;
+        Ok(checkpoint)
+    }
 }
 
 impl Checkpoint {
@@ -304,5 +331,60 @@ mod tests {
                 .contains("boundary")
         );
         assert_eq!(other.cpu.capture_architecture().unwrap(), before);
+    }
+
+    // spec: PROC-MACH-11
+    #[test]
+    fn stack_unwind_retires_only_explicitly_unwindable_callbacks_above_the_live_ancestor() {
+        let mut machine = machine();
+        let high = machine.sys.contexts[0].stack_hi;
+        for (id, offset, unwindable) in [(1, 0x40, false), (2, 0x100, false), (3, 0x200, true)] {
+            let mut f = frame(id);
+            f.stack = high - offset;
+            f.unwindable = unwindable;
+            machine.sys.contexts[0].frames.push(f);
+        }
+        machine.cpu.set_reg(Reg::Esp, high - 0x300);
+        let checkpoint = Env {
+            context: 0,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        }
+        .checkpoint_for_stack_unwind(high - 0x180)
+        .unwrap();
+        assert_eq!(machine.sys.contexts[0].frames.len(), 3);
+        checkpoint
+            .restore(&mut machine.cpu, &mut machine.sys)
+            .unwrap();
+        assert_eq!(machine.sys.contexts[0].frames.len(), 2);
+        assert_eq!(machine.sys.contexts[0].frames[1].id, 2);
+        assert_eq!(machine.cpu.reg(Reg::Esp), high - 0x180);
+    }
+
+    // spec: PROC-MACH-11
+    #[test]
+    fn stack_unwind_rejects_nonunwindable_frames_and_invalid_targets_before_any_mutation() {
+        let mut machine = machine();
+        let high = machine.sys.contexts[0].stack_hi;
+        let low = machine.sys.contexts[0].stack_lo;
+        let mut f = frame(1);
+        f.stack = high - 0x200;
+        machine.sys.contexts[0].frames.push(f);
+        machine.cpu.set_reg(Reg::Esp, high - 0x300);
+        let before = machine.cpu.capture_architecture().unwrap();
+        for target in [high - 0x100, high, low - 1, high - 0x400] {
+            let mut env = Env {
+                context: 0,
+                cpu: &mut machine.cpu,
+                sys: &mut machine.sys,
+                ext: &mut machine.ext,
+                thunk: 0,
+            };
+            assert!(env.checkpoint_for_stack_unwind(target).is_err());
+            assert_eq!(env.cpu.capture_architecture().unwrap(), before);
+            assert_eq!(env.ctx().frames.len(), 1);
+        }
     }
 }

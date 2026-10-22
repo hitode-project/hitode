@@ -10,6 +10,7 @@ mod byte_set;
 mod byte_sort;
 mod convert;
 mod cpp_alloc;
+mod cpp_runtime;
 mod data;
 mod directory;
 mod errors;
@@ -37,6 +38,7 @@ mod scalar_scale;
 mod scalar_split;
 mod scan;
 mod secure_memory;
+mod seh;
 mod shared_file;
 mod startup;
 mod stream_position;
@@ -56,6 +58,8 @@ struct CrtState {
     invalid_handlers: HashMap<String, u32>,
     files: HashMap<u32, CrtFile>,
     locales: HashMap<String, locale::LocaleState>,
+    cpp_threads: HashMap<(String, u32), cpp_runtime::Thread>,
+    purecall_handlers: HashMap<String, u32>,
 }
 
 // The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
@@ -164,9 +168,11 @@ pub fn register(r: &mut Registry) {
     startup::register(r);
     convert::register(r);
     cpp_alloc::register(r);
+    cpp_runtime::register(r);
     scan::register(r);
     wide_scan::register(r);
     secure_memory::register(r);
+    seh::register(r);
     shared_file::register(r);
     stream_position::register(r);
     thread::register(r);
@@ -380,6 +386,10 @@ pub fn register(r: &mut Registry) {
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    let context = env.context;
+    if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_threads.retain(|(_, id), _| *id != context);
+    }
     random::release(env, Some(env.context));
     time64::release(env, Some(env.context))?;
     release_errno(env, Some(env.context))
@@ -387,6 +397,10 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_threads.clear();
+        state.purecall_handlers.clear();
+    }
     random::release(env, None);
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
@@ -1668,7 +1682,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "longjmp" => return long_jump(e, a, b),
         // R6025: no `_set_purecall_handler` exists in this CRT, so it ends the
         // process the way `_amsg_exit` does.
-        "_purecall" => return crate::kernel32::exit_process(e, 255),
+        "_purecall" => return cpp_runtime::purecall(e),
         "getenv" => 0,
         "_makepath" => {
             let mut out = Vec::new();

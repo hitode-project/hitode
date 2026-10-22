@@ -835,3 +835,193 @@ ucrtbase.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str
 ucrtbase.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 ucrtbase.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 ucrtbase.dll	system	cdecl	i32	int	command:const char*:str8:1
+# CRT termination and translator callbacks, including explicit legacy C++ aliases.
+api-ms-win-crt-runtime-l1-1-0.dll	_get_terminate	cdecl	ptr	callback	
+api-ms-win-crt-runtime-l1-1-0.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	terminate	cdecl	void	void	
+msvcr100.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr100.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr100.dll	?set_terminate@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr100.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr100.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr100.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr100.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr100.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr100.dll	_get_purecall_handler	cdecl	ptr	callback	
+msvcr100.dll	_get_terminate	cdecl	ptr	callback	
+msvcr100.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr100.dll	_purecall	cdecl	i32	int	
+msvcr100.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr110.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr110.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr110.dll	?set_terminate@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr110.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr110.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr110.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr110.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr110.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr110.dll	_get_purecall_handler	cdecl	ptr	callback	
+msvcr110.dll	_get_terminate	cdecl	ptr	callback	
+msvcr110.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr110.dll	_purecall	cdecl	i32	int	
+msvcr110.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr120.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr120.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr120.dll	?set_terminate@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr120.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr120.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr120.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr120.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr120.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr120.dll	_get_purecall_handler	cdecl	ptr	callback	
+msvcr120.dll	_get_terminate	cdecl	ptr	callback	
+msvcr120.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr120.dll	_purecall	cdecl	i32	int	
+msvcr120.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr70.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr70.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr70.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr70.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr70.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr70.dll	_purecall	cdecl	i32	int	
+msvcr71.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr71.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr71.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr71.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr71.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr71.dll	_purecall	cdecl	i32	int	
+msvcr71.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr80.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr80.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr80.dll	?set_terminate@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr80.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr80.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr80.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr80.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr80.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr80.dll	_get_purecall_handler	cdecl	ptr	callback	
+msvcr80.dll	_get_terminate	cdecl	ptr	callback	
+msvcr80.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr80.dll	_purecall	cdecl	i32	int	
+msvcr80.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr90.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr90.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr90.dll	?set_terminate@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr90.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr90.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
+msvcr90.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr90.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcr90.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr90.dll	_get_purecall_handler	cdecl	ptr	callback	
+msvcr90.dll	_get_terminate	cdecl	ptr	callback	
+msvcr90.dll	_get_unexpected	cdecl	ptr	callback	
+msvcr90.dll	_purecall	cdecl	i32	int	
+msvcr90.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcrt.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcrt.dll	_get_terminate	cdecl	ptr	callback	
+msvcrt.dll	_get_unexpected	cdecl	ptr	callback	
+msvcrt.dll	_purecall	cdecl	i32	int	
+msvcrt20.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt20.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt20.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt20.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcrt20.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcrt20.dll	_purecall	cdecl	i32	int	
+msvcrt40.dll	?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt40.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt40.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
+msvcrt40.dll	?terminate@@YAXXZ	cdecl	void	void	
+msvcrt40.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcrt40.dll	_purecall	cdecl	i32	int	
+ucrtbase.dll	__std_terminate	cdecl	void	void	
+ucrtbase.dll	_get_purecall_handler	cdecl	ptr	callback	
+ucrtbase.dll	_get_terminate	cdecl	ptr	callback	
+ucrtbase.dll	_get_unexpected	cdecl	ptr	callback	
+ucrtbase.dll	_o__get_terminate	cdecl	ptr	callback	
+ucrtbase.dll	_o__purecall	cdecl	i32	int	
+ucrtbase.dll	_o_set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	_o_terminate	cdecl	void	void	
+ucrtbase.dll	_purecall	cdecl	i32	int	
+ucrtbase.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	_set_se_translator	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	set_unexpected	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	terminate	cdecl	void	void	
+ucrtbase.dll	unexpected	cdecl	void	void	
+vcruntime140.dll	__std_terminate	cdecl	void	void	
+vcruntime140.dll	_get_purecall_handler	cdecl	ptr	callback	
+vcruntime140.dll	_get_unexpected	cdecl	ptr	callback	
+vcruntime140.dll	_purecall	cdecl	i32	int	
+vcruntime140.dll	_set_purecall_handler	cdecl	ptr	callback	handler:callback:ptr:1
+vcruntime140.dll	_set_se_translator	cdecl	ptr	callback	handler:callback:ptr:1
+vcruntime140.dll	set_unexpected	cdecl	ptr	callback	handler:callback:ptr:1
+vcruntime140.dll	unexpected	cdecl	void	void	
+# Explicit x86 compiler-runtime SEH interfaces; ABI notes in crt-source.json.
+msvcr100.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr100.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr100.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr100.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr100.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr100.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr110.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr110.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr110.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr110.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr110.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr110.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr120.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr120.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr120.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr120.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr120.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr120.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr70.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr70.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr70.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr70.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr71.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr71.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr71.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr71.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr80.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr80.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr80.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr80.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr80.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr80.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcr90.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr90.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr90.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr90.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcr90.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcr90.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcrt.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcrt.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcrt.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+msvcrt20.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt20.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt20.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcrt20.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+msvcrt40.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt40.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt40.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+msvcrt40.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+ucrtbase.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+ucrtbase.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+ucrtbase.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+ucrtbase.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+ucrtbase.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+ucrtbase.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1
+vcruntime140.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+vcruntime140.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+vcruntime140.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+vcruntime140.dll	_global_unwind2	cdecl	void	void	frame:void*:ptr:1
+vcruntime140.dll	_local_unwind2	cdecl	void	void	frame:void*:ptr:1|state:int:i32:1
+vcruntime140.dll	_local_unwind4	cdecl	void	void	cookie:unsigned int*:ptr:1|frame:void*:ptr:1|state:int:i32:1

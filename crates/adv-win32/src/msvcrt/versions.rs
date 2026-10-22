@@ -56,6 +56,10 @@ pub(super) const PROFILES: &[Profile] = &[
         module: "ucrtbase.dll",
         invalid_parameters: true,
     },
+    Profile {
+        module: "vcruntime140.dll",
+        invalid_parameters: true,
+    },
 ];
 
 fn catalog() -> &'static HashSet<(&'static str, &'static str)> {
