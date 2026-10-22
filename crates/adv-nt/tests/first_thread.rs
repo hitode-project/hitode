@@ -48,11 +48,12 @@ fn first_thread_gets_ids_and_the_i386_machine() {
     let clock = TestClock(Cell::new(0));
     let config = Config {
         prefix,
+        server_dir: root.join("server"),
         install: root.join("install"),
         debug: 0,
     };
     let mut server = Server::start(&config, &clock).unwrap();
-    let socket = server.socket_path().unwrap();
+    let socket = server.socket_dir().unwrap();
     let mut runtime = Runtime {
         server: &mut server,
         clock: &clock,

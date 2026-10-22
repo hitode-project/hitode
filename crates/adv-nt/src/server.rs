@@ -487,11 +487,30 @@ struct Channel {
 impl Connection {
     /// Connects a new process to the server and registers its first thread.
     pub fn connect(
-        socket: &Path,
+        socket_dir: &Path,
         progress: &mut dyn Progress,
         time: Time,
     ) -> Result<(Connection, FirstThread), Error> {
-        let socket = UnixStream::connect(socket)?;
+        #[cfg(not(target_vendor = "apple"))]
+        let socket = UnixStream::connect(socket_dir.join("socket"))?;
+        #[cfg(target_vendor = "apple")]
+        let socket = {
+            let directory = std::fs::File::open(socket_dir)?;
+            // Darwin has no connectat; a helper thread resolves the relative
+            // name without changing the process or the caller's thread cwd.
+            std::thread::spawn(move || {
+                unsafe extern "C" {
+                    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+                }
+                // SAFETY: directory is live; the thread exits after connect.
+                if unsafe { pthread_fchdir_np(directory.as_raw_fd()) } == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                UnixStream::connect("socket")
+            })
+            .join()
+            .expect("socket connector")?
+        };
         socket.set_nonblocking(true)?;
         let (version, request) = receive_fd(&socket, progress, time)?;
         if version != PROTOCOL_VERSION {

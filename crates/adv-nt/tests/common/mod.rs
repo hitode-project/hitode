@@ -52,7 +52,11 @@ struct Runtime {
 impl Progress for Runtime {
     fn run_server(&mut self, time: Time) {
         self.clock.0.set(time);
+        #[cfg(target_os = "macos")]
+        let cwd = std::env::current_dir().unwrap();
         let state = self.server.step(&self.clock);
+        #[cfg(target_os = "macos")]
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
         assert!(
             matches!(state, State::Waiting(_)),
             "server stopped: {state:?}"
@@ -76,7 +80,15 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
     let ntdll = std::fs::read(&ntdll_path)
         .unwrap_or_else(|error| panic!("{}: {error}", ntdll_path.display()));
 
+    #[cfg(target_os = "macos")]
+    let cwd = std::env::current_dir().unwrap();
     let root = std::env::temp_dir().join(format!("adv-nt-{name}-{}", std::process::id()));
+    #[cfg(target_os = "ios")]
+    let root = root.join(
+        "container-path-for-prefix-and-server-runtime-files-longer-than-the-unix-socket-address-capacity-of-104-bytes",
+    );
+    #[cfg(target_os = "ios")]
+    assert!(root.as_os_str().len() > 104);
     let prefix = root.join("prefix");
     std::fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
     std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
@@ -102,11 +114,14 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
     let clock = GuestClock(Cell::new(Time::now(&mut machine_clock)));
     let config = Config {
         prefix: prefix.clone(),
+        server_dir: root.join("server"),
         install: dist,
         debug: 0,
     };
     let server = Server::start(&config, &clock).unwrap();
-    let socket = server.socket_path().unwrap();
+    #[cfg(target_os = "macos")]
+    assert_eq!(std::env::current_dir().unwrap(), cwd);
+    let socket = server.socket_dir().unwrap();
     let runtime = Runtime { server, clock };
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
@@ -142,5 +157,7 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
         }
     };
     std::fs::remove_dir_all(&root).unwrap();
+    #[cfg(target_os = "macos")]
+    assert_eq!(std::env::current_dir().unwrap(), cwd);
     Some(result)
 }

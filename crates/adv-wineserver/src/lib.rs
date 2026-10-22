@@ -8,7 +8,7 @@
 //!
 //! The server keeps its state in C globals, so one server runs per host
 //! process. It listens on Wine's usual master socket, which clients find
-//! through [`Server::socket_path`].
+//! through [`Server::socket_dir`].
 //!
 //! Only Apple targets build the server for now; elsewhere the crate is empty.
 #![cfg(target_vendor = "apple")]
@@ -40,6 +40,8 @@ pub trait Clock {
 pub struct Config {
     /// The Wine prefix; it must exist and belong to the current user.
     pub prefix: PathBuf,
+    /// The absolute private directory for the server's runtime files.
+    pub server_dir: PathBuf,
     /// The root of the Wine installation, which holds `share/wine/nls`.
     pub install: PathBuf,
     /// The server's debug level (`wineserver -d`); traces go to stderr.
@@ -76,6 +78,7 @@ pub struct Server {
 struct Environment {
     prefix: CString,
     executable: CString,
+    server_root: CString,
 }
 
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +104,7 @@ impl Server {
         };
         let environment = Environment {
             prefix: c_path(&config.prefix)?,
+            server_root: c_path(&config.server_dir)?,
             executable: c_path(&config.install.join("wineserver"))?,
         };
         if STARTED.swap(true, Ordering::SeqCst) {
@@ -153,15 +157,15 @@ impl Server {
         self.state
     }
 
-    /// The master socket clients connect to.
-    pub fn socket_path(&self) -> Option<PathBuf> {
+    /// The directory holding the master socket named `socket`.
+    pub fn socket_dir(&self) -> Option<PathBuf> {
         // SAFETY: the server sets `server_dir` once, before it first waits,
         // and never frees it.
         let dir = unsafe { server_dir };
         (!dir.is_null()).then(|| {
             // SAFETY: a NUL-terminated string from asprintf.
             let dir = unsafe { CStr::from_ptr(dir) };
-            Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes())).join("socket")
+            PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()))
         })
     }
 }
@@ -227,5 +231,14 @@ extern "C" fn hitode_host_executable() -> *const c_char {
         .get()
         .expect("server environment")
         .executable
+        .as_ptr()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn hitode_host_server_root() -> *const c_char {
+    ENVIRONMENT
+        .get()
+        .expect("server environment")
+        .server_root
         .as_ptr()
 }

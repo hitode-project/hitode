@@ -5,7 +5,17 @@
  * the runtime owns waiting, time and the server's lifetime. */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -23,6 +33,190 @@ extern uint64_t hitode_host_ticks( enum hitode_clock clock );
 extern void hitode_host_exit( int status ) __attribute__((noreturn));
 extern const char *hitode_host_getenv( const char *name );
 extern const char *hitode_host_executable( void );
+extern const char *hitode_host_server_root( void );
+extern int pthread_fchdir_np( int fd );
+
+static int current_dir = AT_FDCWD;
+
+/* Wine constructs its per-user base here; the caller owns that directory. */
+int hitode_asprintf( char **str, const char *format, ... )
+{
+    va_list args;
+    int ret;
+
+    if (!strcmp( format, "/tmp/.wine-%u" ))
+    {
+        *str = strdup( hitode_host_server_root() );
+        return *str ? strlen( *str ) : -1;
+    }
+    va_start( args, format );
+    ret = vasprintf( str, format, args );
+    va_end( args );
+    return ret;
+}
+
+int hitode_chdir( const char *path )
+{
+    int fd = openat( current_dir, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC );
+
+    if (fd == -1) return -1;
+    if (current_dir != AT_FDCWD) close( current_dir );
+    current_dir = fd;
+    return 0;
+}
+
+int hitode_fchdir( int fd )
+{
+    struct stat st;
+    int copy;
+
+    if (fstat( fd, &st ) == -1) return -1;
+    if (!S_ISDIR(st.st_mode))
+    {
+        errno = ENOTDIR;
+        return -1;
+    }
+    if ((copy = fcntl( fd, F_DUPFD_CLOEXEC, 0 )) == -1) return -1;
+    if (current_dir != AT_FDCWD) close( current_dir );
+    current_dir = copy;
+    return 0;
+}
+
+int hitode_open( const char *path, int flags, ... )
+{
+    va_list args;
+    mode_t mode = 0;
+
+    if (flags & O_CREAT)
+    {
+        va_start( args, flags );
+        mode = va_arg( args, int );
+        va_end( args );
+    }
+    return openat( current_dir, path, flags, mode );
+}
+
+/* The server opens streams only for reading registry files. */
+FILE *hitode_fopen( const char *path, const char *mode )
+{
+    int fd = openat( current_dir, path, O_RDONLY );
+    FILE *file;
+
+    if (fd == -1) return NULL;
+    if (!(file = fdopen( fd, mode ))) close( fd );
+    return file;
+}
+
+int hitode_stat( const char *path, struct stat *st )
+{
+    return fstatat( current_dir, path, st, 0 );
+}
+
+int hitode_lstat( const char *path, struct stat *st )
+{
+    return fstatat( current_dir, path, st, AT_SYMLINK_NOFOLLOW );
+}
+
+int hitode_mkdir( const char *path, mode_t mode )
+{
+    return mkdirat( current_dir, path, mode );
+}
+
+int hitode_unlink( const char *path )
+{
+    return unlinkat( current_dir, path, 0 );
+}
+
+int hitode_rmdir( const char *path )
+{
+    return unlinkat( current_dir, path, AT_REMOVEDIR );
+}
+
+int hitode_rename( const char *from, const char *to )
+{
+    return renameat( current_dir, from, current_dir, to );
+}
+
+int hitode_link( const char *from, const char *to )
+{
+    return linkat( current_dir, from, current_dir, to, AT_SYMLINK_FOLLOW );
+}
+
+ssize_t hitode_readlink( const char *path, char *buf, size_t size )
+{
+    return readlinkat( current_dir, path, buf, size );
+}
+
+int hitode_chmod( const char *path, mode_t mode )
+{
+    return fchmodat( current_dir, path, mode, 0 );
+}
+
+char *hitode_realpath( const char *path, char *resolved )
+{
+    char dir[PATH_MAX], *absolute, *ret;
+
+    if (path[0] == '/' || current_dir == AT_FDCWD) return realpath( path, resolved );
+    if (fcntl( current_dir, F_GETPATH, dir ) == -1) return NULL;
+    if (asprintf( &absolute, "%s/%s", dir, path ) == -1) return NULL;
+    ret = realpath( absolute, resolved );
+    free( absolute );
+    return ret;
+}
+
+/* Darwin has no bindat/connectat. Resolve relative Unix socket names on a
+ * helper thread so neither the process nor the caller's thread cwd changes. */
+struct socket_call
+{
+    int (*func)( int, const struct sockaddr *, socklen_t );
+    int dir, fd;
+    const struct sockaddr *addr;
+    socklen_t len;
+    int ret, error;
+};
+
+static void *socket_call_thread( void *arg )
+{
+    struct socket_call *call = arg;
+
+    call->ret = pthread_fchdir_np( call->dir );
+    if (!call->ret) call->ret = call->func( call->fd, call->addr, call->len );
+    call->error = errno;
+    return NULL;
+}
+
+static int socket_call_at( struct socket_call *call )
+{
+    pthread_t thread;
+    int error;
+
+    if ((error = pthread_create( &thread, NULL, socket_call_thread, call )))
+    {
+        errno = error;
+        return -1;
+    }
+    pthread_join( thread, NULL );
+    errno = call->error;
+    return call->ret;
+}
+
+int hitode_bind( int fd, const struct sockaddr *addr, socklen_t len )
+{
+    struct socket_call call = { bind, current_dir, fd, addr, len, 0, 0 };
+
+    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/')
+        return bind( fd, addr, len );
+    return socket_call_at( &call );
+}
+
+int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len )
+{
+    struct socket_call call = { connect, current_dir, fd, addr, len, 0, 0 };
+
+    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/')
+        return connect( fd, addr, len );
+    return socket_call_at( &call );
+}
 
 /* The server asks once for ready descriptors. With none ready it returns to
  * the runtime, which resumes it on new input or at the timeout; the server
