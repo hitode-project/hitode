@@ -648,3 +648,118 @@ fn native_public_sid_and_descriptor_output_controls() {
         );
     }
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ArrayBound {
+    count: u32,
+    lower: i32,
+}
+#[repr(C)]
+struct NativeArray {
+    dimensions: u16,
+    features: u16,
+    element: u32,
+    locks: u32,
+    data: *mut u8,
+    bounds: [ArrayBound; 2],
+}
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn SafeArrayCreate(kind: u16, dimensions: u32, bounds: *const ArrayBound) -> *mut NativeArray;
+    fn SafeArrayDestroy(array: *mut NativeArray) -> i32;
+    fn SafeArrayGetLBound(array: *const NativeArray, dimension: u32, value: *mut i32) -> i32;
+    fn SafeArrayPtrOfIndex(
+        array: *mut NativeArray,
+        indices: *const i32,
+        value: *mut *mut u8,
+    ) -> i32;
+    fn VarBstrFromBool(value: i16, locale: u32, flags: u32, output: *mut *mut u16) -> i32;
+    fn VarBstrFromDate(value: f64, locale: u32, flags: u32, output: *mut *mut u16) -> i32;
+    fn VarR8FromStr(text: *const u16, locale: u32, flags: u32, output: *mut f64) -> i32;
+    fn VarCyFromStr(text: *const u16, locale: u32, flags: u32, output: *mut i64) -> i32;
+    fn SysStringLen(text: *const u16) -> u32;
+    fn SysFreeString(text: *mut u16);
+}
+#[test]
+fn native_authored_safe_array_dimension_controls() {
+    let bounds = [
+        ArrayBound {
+            count: 2,
+            lower: -3,
+        },
+        ArrayBound { count: 3, lower: 7 },
+    ];
+    let array = unsafe { SafeArrayCreate(3, 2, bounds.as_ptr()) };
+    assert!(!array.is_null());
+    let value = unsafe { &*array };
+    eprintln!(
+        "array-created dims={} flags={:x} element={} first={},{} second={},{}",
+        value.dimensions,
+        value.features,
+        value.element,
+        value.bounds[0].count,
+        value.bounds[0].lower,
+        value.bounds[1].count,
+        value.bounds[1].lower
+    );
+    for dimension in [1, 2] {
+        let mut lower = 0;
+        assert_eq!(
+            unsafe { SafeArrayGetLBound(array, dimension, &mut lower) },
+            0
+        );
+        eprintln!("array-bound dim={dimension} lower={lower}");
+    }
+    for index in [[-3, 7], [-2, 7], [-3, 8]] {
+        let mut pointer = std::ptr::null_mut();
+        let result = unsafe { SafeArrayPtrOfIndex(array, index.as_ptr(), &mut pointer) };
+        assert_eq!(result, 0);
+        eprintln!(
+            "array-index index={index:?} offset={}",
+            pointer as usize - value.data as usize
+        );
+    }
+    assert_eq!(unsafe { SafeArrayDestroy(array) }, 0);
+}
+#[test]
+fn native_authored_automation_scalar_controls() {
+    for locale in [0x409, 0x411, 0x804] {
+        for flags in [0, 0x10] {
+            for value in [0, -1, 7] {
+                let mut text = std::ptr::null_mut();
+                let result = unsafe { VarBstrFromBool(value, locale, flags, &mut text) };
+                assert_eq!(result, 0);
+                let n = unsafe { SysStringLen(text) };
+                let value_text = String::from_utf16_lossy(unsafe {
+                    std::slice::from_raw_parts(text, n as usize)
+                });
+                unsafe { SysFreeString(text) };
+                eprintln!(
+                    "automation-bool locale={locale:x} flags={flags:x} value={value} text={value_text}"
+                );
+            }
+        }
+        for value in [0.0, 0.5, -1.25, 45292.0] {
+            let mut text = std::ptr::null_mut();
+            let result = unsafe { VarBstrFromDate(value, locale, 0, &mut text) };
+            assert_eq!(result, 0);
+            let n = unsafe { SysStringLen(text) };
+            let value_text =
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, n as usize) });
+            unsafe { SysFreeString(text) };
+            eprintln!("automation-date locale={locale:x} value={value} text={value_text}");
+        }
+    }
+    for text in [
+        "1,234.5", "(12.5)", "1e3", "&H10", "$1.5", "0.00005", "0.00015",
+    ] {
+        let units = text.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut number = 0.0;
+        let mut currency = 0i64;
+        let numeric = unsafe { VarR8FromStr(units.as_ptr(), 0x409, 0, &mut number) } as u32;
+        let monetary = unsafe { VarCyFromStr(units.as_ptr(), 0x409, 0, &mut currency) } as u32;
+        eprintln!(
+            "automation-number text={text} r8-status={numeric:x} r8={number} cy-status={monetary:x} cy={currency}"
+        );
+    }
+}
