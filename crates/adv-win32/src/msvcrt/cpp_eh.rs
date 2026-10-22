@@ -54,6 +54,7 @@ pub(super) fn register(registry: &mut Registry) {
         registry,
         &[
             ("_CxxThrowException", throw),
+            ("__CxxLongjmpUnwind", longjmp_unwind),
             ("__uncaught_exception", uncaught),
             ("__uncaught_exceptions", uncaught_count),
             ("__CxxFrameHandler", frame_handler),
@@ -75,6 +76,24 @@ fn word(env: &Env<'_>, address: u32) -> Result<u32, MemFault> {
 }
 fn put(env: &mut Env<'_>, address: u32, value: u32) -> Result<(), MemFault> {
     GuestPtr::new(address).write(env.cpu, value)
+}
+
+fn longjmp_unwind(env: &mut Env<'_>) -> Outcome {
+    let buffer = env.arg(0);
+    let [frame, stop, _, _, info] = match read(env, buffer.wrapping_add(24)) {
+        Ok(words) => words,
+        Err(fault) => return memory_failure(fault),
+    };
+    match function(env, frame, info) {
+        Ok(function) => unwind(
+            env,
+            function,
+            stop as i32,
+            0,
+            Box::new(|_| Outcome::Return(0)),
+        ),
+        Err(fault) => memory_failure(fault),
+    }
 }
 
 fn throw(env: &mut Env<'_>) -> Outcome {

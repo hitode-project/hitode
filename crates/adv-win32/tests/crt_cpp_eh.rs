@@ -557,3 +557,64 @@ fn cleanup_can_catch_its_own_exception_while_original_throw_remains_pending() {
         clean(&m);
     }
 }
+
+// spec: EXC-CPP-7, EXC-CPP-2
+#[test]
+fn longjmp_runs_intervening_and_target_cpp_unwind_maps_before_resuming_setjmp() {
+    for jit in [false, true] {
+        let module = "msvcr90.dll";
+        let mut m = machine(jit, module, "__CxxFrameHandler3", 0x19930522);
+        let setjmp = m.resolve_import(module, "_setjmp3").unwrap();
+        let longjmp = m.resolve_import(module, "longjmp").unwrap();
+        let callback = m.resolve_import(module, "__CxxLongjmpUnwind").unwrap();
+        let frame = m.resolve_import(module, "__CxxFrameHandler3").unwrap();
+        let buffer = DATA + 0xc00;
+        words(
+            &mut m,
+            INNER_FUNC,
+            &[0x19930522, 3, UNWIND + 64, 0, 0, 0, 0, 0, 0],
+        );
+        words(
+            &mut m,
+            UNWIND + 64,
+            &[u32::MAX, 0, 0, CLEAN + 192, 1, CLEAN + 256],
+        );
+        let mut s = Asm::new(STUB + 64);
+        imm(&mut s, &[0xb8], INNER_FUNC);
+        s.jmp(frame);
+        store(&mut m, STUB + 64, s);
+        let mut c = Asm::new(CLEAN + 256);
+        log(&mut c, 4);
+        c.ret();
+        store(&mut m, CLEAN + 256, c);
+        let mut inner = Asm::new(INNER);
+        prologue(&mut inner, STUB + 64, 2);
+        inner
+            .push_imm(0)
+            .push_imm(buffer)
+            .call(longjmp)
+            .bytes
+            .push(0xcc);
+        store(&mut m, INNER, inner);
+        let mut a = Asm::new(CODE);
+        prologue(&mut a, STUB, 0);
+        a.push_imm(FUNC)
+            .push_imm(0)
+            .push_imm(callback)
+            .push_imm(3)
+            .push_imm(buffer)
+            .call(setjmp)
+            .add_esp(20)
+            .mov_mem_eax(DATA + 64);
+        a.bytes.extend_from_slice(&[0x85, 0xc0, 0x0f, 0x85]);
+        let relative = CONT.wrapping_sub(CODE + a.bytes.len() as u32 + 4);
+        a.bytes.extend_from_slice(&relative.to_le_bytes());
+        a.bytes.extend_from_slice(&[0xc7, 0x45, 0xfc, 2, 0, 0, 0]);
+        a.call(INNER).bytes.push(0xcc);
+        let result = run(&mut m, a);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        assert_eq!(logs(&m), vec![4, 3, 2, 1]);
+        assert_eq!(m.cpu.read_u32(DATA + 64).unwrap(), 1);
+        clean(&m);
+    }
+}

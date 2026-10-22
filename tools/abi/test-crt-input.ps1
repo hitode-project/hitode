@@ -52,4 +52,6 @@ Reject-Change 'pow-result' "msvcrt.dll`tpow" 3 'i32' 'binary math stack contract
 Reject-Change 'hypot-width' "msvcrt.dll`t_hypot" 5 'x:double:f64:1|y:double:f64:2' 'binary math stack contract'
 Reject-Change 'throw-convention' "msvcr90.dll`t_CxxThrowException" 2 'cdecl' 'C++ throw stack contract'
 Reject-Change 'throw-width' "msvcr90.dll`t_CxxThrowException" 5 'object:void*:ptr:1' 'C++ throw stack contract'
-Write-Output 'CRT inputs: reproducible generation and eight malformed process/math/throw contracts verified.'
+Reject-Change 'setjmp-convention' "msvcr90.dll`t_setjmp3" 2 'cdecl' 'setjmp stack contract'
+Reject-Change 'setjmp-prefix' "msvcr90.dll`t_setjmp3" 5 'buffer:jmp_buf:ptr:1' 'setjmp stack contract'
+Write-Output 'CRT inputs: reproducible generation and ten malformed process/math/throw/jump contracts verified.'

@@ -421,3 +421,58 @@ fn eh4_decodes_scope_tables_and_calls_real_security_checks_before_filtering() {
         }
     }
 }
+
+// spec: EXC-CPP-7, EXC-CRT-3
+#[test]
+fn longjmp_uses_live_global_unwind_then_default_local_seh_cleanup() {
+    for jit in [false, true] {
+        let mut m = machine(jit);
+        let module = "msvcr90.dll";
+        let handler = m.resolve_import(module, "_except_handler3").unwrap();
+        let setjmp = m.resolve_import(module, "_setjmp3").unwrap();
+        let longjmp = m.resolve_import(module, "longjmp").unwrap();
+        let buffer = DATA + 0x1200;
+        scope(&mut m, TABLE, 0, -1, FILTER, CATCH);
+        scope(&mut m, TABLE, 1, 0, 0, FINALLY + 64);
+        scope(&mut m, TABLE, 2, 1, 0, FINALLY + 128);
+        scope(&mut m, INNER_TABLE, 0, -1, 0, FINALLY + 192);
+        scope(&mut m, INNER_TABLE, 1, 0, 0, FINALLY + 256);
+        let mut inner = Asm::new(INNER);
+        prologue(
+            &mut inner,
+            handler,
+            INNER_TABLE,
+            1,
+            INNER_FRAME,
+            false,
+            false,
+        );
+        inner
+            .push_imm(0)
+            .push_imm(buffer)
+            .call(longjmp)
+            .bytes
+            .push(0xcc);
+        m.cpu.write(INNER, &inner.bytes).unwrap();
+        let mut a = Asm::new(CODE);
+        prologue(&mut a, handler, TABLE, 0, OUTER_FRAME, false, false);
+        a.push_imm(0)
+            .push_imm(buffer)
+            .call(setjmp)
+            .add_esp(8)
+            .mov_mem_eax(NORMAL);
+        a.bytes.extend_from_slice(&[0x85, 0xc0, 0x0f, 0x85]);
+        let relative = CATCH.wrapping_sub(CODE + a.bytes.len() as u32 + 4);
+        a.bytes.extend_from_slice(&relative.to_le_bytes());
+        a.bytes.extend_from_slice(&[0xc7, 0x45, 0xfc, 2, 0, 0, 0]);
+        a.call(INNER).bytes.push(0xcc);
+        let result = run(&mut m, a);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        assert_eq!(m.cpu.read_u32(NORMAL).unwrap(), 1);
+        let events: Vec<_> = (0..m.cpu.read_u32(COUNT).unwrap())
+            .map(|i| m.cpu.read_u32(LOG + i * 4).unwrap())
+            .collect();
+        assert_eq!(events, vec![4, 3, 2, 1, 9]);
+        no_gap(&m);
+    }
+}

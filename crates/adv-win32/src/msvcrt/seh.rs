@@ -82,6 +82,13 @@ fn local(env: &mut Env<'_>) -> Outcome {
     }
 }
 
+pub(super) fn unwind_to(env: &mut Env<'_>, frame: u32, stop: i32, then: Done) -> Outcome {
+    match table(env, frame, None) {
+        Ok(table) => unwind_local(env, table, stop, 0, then),
+        Err(fault) => memory_failure(fault),
+    }
+}
+
 fn unwind_local(
     env: &mut Env<'_>,
     table: Table,

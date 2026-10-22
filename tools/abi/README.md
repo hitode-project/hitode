@@ -198,6 +198,16 @@ the first match. Invalid destination writes fail instead of reporting a successf
 partial copy. `crt_strings` checks all CRT versions and public API-set projections,
 including page-end input and read-only output, in interpreter and JIT.
 
+`_setjmp`, `_setjmp3` and `longjmp` now share version selection and the MSVC
+sixteen-DWORD x86 jump-buffer layout. The variadic `_setjmp3` declaration retains
+only its mandatory buffer/count prefix. Global unwinding calls live `RtlUnwind`
+before a compiler-provided local callback or the default SEH scope cleanup.
+`__CxxLongjmpUnwind` reads saved FuncInfo from UnwindData and the saved target state.
+Jump restoration uses the same checked stack-directed continuation protocol as
+catch entry, preserving saved nonvolatile registers and the zero-to-one result rule.
+Guest buffer writes are checked. C++ and SEH fixtures cover cross-frame cleanup
+before the saved continuation resumes in both execution modes.
+
 `python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
 `crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
 iostream families, including their data exports. `--check` detects stale entries.

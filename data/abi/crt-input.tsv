@@ -1334,3 +1334,53 @@ vcruntime140.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 vcruntime140.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
 vcruntime140.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
 vcruntime140.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+
+# MSVC x86 _JUMP_BUFFER local C++ unwind callback.
+msvcr100.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr110.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr120.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr70.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr71.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr80.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcr90.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcrt.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcrt20.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+msvcrt40.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+ucrtbase.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+vcruntime140.dll	__CxxLongjmpUnwind	cdecl	void	void	buffer:_JUMP_BUFFER*:ptr:1
+
+# x86 setjmp prefixes and longjmp follow the MSVC jump-buffer declarations.
+msvcr100.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr100.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr100.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr110.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr110.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr110.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr120.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr120.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr120.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr70.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr70.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr70.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr71.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr71.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr71.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr80.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr80.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr80.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcr90.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcr90.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcr90.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcrt.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcrt.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcrt20.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcrt20.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt20.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+msvcrt40.dll	_setjmp	cdecl	i32	int	buffer:jmp_buf:ptr:1
+msvcrt40.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+msvcrt40.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+ucrtbase.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+ucrtbase.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+vcruntime140.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
+vcruntime140.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1

@@ -94,3 +94,8 @@ This spec covers structured exception dispatch in the Win32 personality: SEH sea
 
 **Rule**: Uncaught queries MUST reflect CRT throws awaiting catch entry in the current runtime/thread. Raw Windows dispatch and unwind MUST NOT invent C++ processing counts. Catch entry MUST decrement processing counts before the catch body executes.
 **Verification**: Test
+
+### EXC-CPP-7 Nonlocal jumps
+
+**Rule**: Longjmp MUST unwind intervening registrations through live RtlUnwind before local cleanup. Compiler C++ callbacks MUST interpret the saved FuncInfo and target state. Jump restoration MUST validate continuation ancestry and return one when the requested value is zero.
+**Verification**: Test

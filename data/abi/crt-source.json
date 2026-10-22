@@ -507,6 +507,11 @@
       "source": "Microsoft VC 14.29.30037 ehdata.h, declaration/layout-only mirror. Registration frame, FuncInfo, TryBlockMapEntry and HandlerType fields were checked without importing any header or implementation.",
       "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/ehdata.h",
       "sha256": "17f494086d8e9cbc855027a0f798036eb1270dda488e896776c26f2a5c7bc33a"
+    },
+    "jump_buffer": {
+      "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/setjmp.h",
+      "sha256": "95195f814fdacf95114667d73f7d4d8b3fbf33ac711f2c152f682b612c0357d0",
+      "layout": "x86 _JUMP_BUFFER is sixteen DWORDs: Ebp/Ebx/Edi/Esi/Esp/Eip/Registration/TryLevel/Cookie/UnwindFunc/UnwindData[6]. __CxxLongjmpUnwind is a cdecl one-buffer local unwind callback. Compiler C++ UnwindData[0] supplies FuncInfo."
     }
   },
   "versioned_string_operations": {

@@ -188,6 +188,10 @@ pub fn register(r: &mut Registry) {
     wide_string::register(r);
     process::register(r);
     strings::register(r);
+    versions::register(
+        r,
+        &[("_setjmp", call), ("_setjmp3", call), ("longjmp", call)],
+    );
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -333,21 +337,7 @@ pub fn register(r: &mut Registry) {
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
-        r.add(
-            module,
-            "_setjmp3",
-            adv_machine::Conv::CdeclVariadic { fixed: 2 },
-            call,
-        );
-        r.add(module, "longjmp", Conv::Cdecl { argc: 2 }, call);
     }
-    r.add(
-        "msvcrt.dll",
-        "_setjmp3",
-        adv_machine::Conv::CdeclVariadic { fixed: 2 },
-        call,
-    );
-    r.add("msvcrt.dll", "longjmp", Conv::Cdecl { argc: 2 }, call);
     file::leaves::register(r);
     crate::guest_code::install_crt(r);
 }
@@ -486,42 +476,59 @@ fn split_path_a(path: &[u8]) -> (&[u8], &[u8], &[u8], &[u8]) {
 /// 'VC20', marking a `_setjmp3` buffer that carries an unwind function.
 const JMP_MAGIC: u32 = 0x5643_3230;
 
-/// longjmp over a `_setjmp3` buffer, after Wine msvcrt `MSVCRT_longjmp`. The
-/// buffer's unwind function runs first; a jump that would need a global SEH
-/// unwind or a local `__try` unwind without one stops instead of skipping it.
+/// MSVC x86 jump buffers retain the target registration and local unwind
+/// callback. Global unwinding precedes the compiler-supplied local cleanup.
 fn long_jump(e: &mut Env<'_>, buffer: u32, value: u32) -> Outcome {
     let mut words = [0; 10];
     for (index, word) in words.iter_mut().enumerate() {
         match e.cpu.read_u32(buffer.wrapping_add(4 * index as u32)) {
             Ok(read) => *word = read,
-            Err(error) => return Outcome::Fail(format!("longjmp buffer: {error}")),
+            Err(error) => return adv_abi::guest::memory_failure(error),
         }
     }
-    let [.., registration, try_level, cookie, unwind] = words;
-    let teb = e.ctx().teb;
-    let current = e.cpu.read_u32(teb).unwrap_or(u32::MAX);
+    let registration = words[6];
+    let current = match e.cpu.read_u32(e.ctx().teb) {
+        Ok(frame) => frame,
+        Err(error) => return adv_abi::guest::memory_failure(error),
+    };
+    let value = if value == 0 { 1 } else { value };
     if registration != current {
-        return Outcome::Fail(format!(
-            "longjmp across SEH frames {current:#010x}..{registration:#010x} needs a global unwind"
-        ));
+        return seh::unwind_global(
+            e,
+            if registration == u32::MAX {
+                0
+            } else {
+                registration
+            },
+            0,
+            Box::new(move |e| jump_local(e, buffer, words, value)),
+        );
     }
-    let value = value.max(1);
-    if registration != u32::MAX && cookie == JMP_MAGIC && unwind != 0 {
-        return Outcome::call(unwind, [buffer], move |e, _| restore_jump(e, words, value));
+    jump_local(e, buffer, words, value)
+}
+
+fn jump_local(e: &mut Env<'_>, buffer: u32, words: [u32; 10], value: u32) -> Outcome {
+    let [.., registration, try_level, cookie, unwind] = words;
+    if registration == u32::MAX {
+        return restore_jump(e, words, value);
     }
-    if registration != u32::MAX
-        && e.cpu.read_u32(registration + 12).unwrap_or(try_level) != try_level
-    {
-        return Outcome::Fail("longjmp out of a __try block needs a local unwind".into());
+    if cookie == JMP_MAGIC && unwind != 0 {
+        return Outcome::call(unwind, [buffer], move |e, _| restore_jump(e, words, value))
+            .unwindable();
     }
-    restore_jump(e, words, value)
+    seh::unwind_to(
+        e,
+        registration,
+        try_level as i32,
+        Box::new(move |e| restore_jump(e, words, value)),
+    )
 }
 
 fn restore_jump(e: &mut Env<'_>, words: [u32; 10], value: u32) -> Outcome {
     let [ebp, ebx, edi, esi, esp, eip, ..] = words;
-    let mut checkpoint = match e.checkpoint() {
+    let mut checkpoint = match e.checkpoint_for_stack_unwind(esp) {
         Ok(checkpoint) => checkpoint,
-        Err(error) => return Outcome::Fail(error.to_string()),
+        Err(reason) => return Outcome::Fail(format!("longjmp continuation: {reason}")),
     };
     let regs = &mut checkpoint.state.regs;
     (regs[0], regs[3], regs[4], regs[5], regs[6], regs[7]) = (value, ebx, esp, ebp, esi, edi);
@@ -1223,43 +1230,61 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             0
         }
-        "_setjmp3" => {
-            let jmp_buf = a;
-            let count = b;
-            if jmp_buf != 0 {
-                let teb = e.ctx().teb;
-                let exception_list = e.cpu.read_u32(teb).unwrap_or(u32::MAX);
-                let esp = e.cpu.reg(Reg::Esp);
-                let caller = e.caller();
-
-                let _ = e.cpu.write_u32(jmp_buf, e.cpu.reg(Reg::Ebp));
-                let _ = e.cpu.write_u32(jmp_buf + 4, e.cpu.reg(Reg::Ebx));
-                let _ = e.cpu.write_u32(jmp_buf + 8, e.cpu.reg(Reg::Edi));
-                let _ = e.cpu.write_u32(jmp_buf + 12, e.cpu.reg(Reg::Esi));
-                let _ = e.cpu.write_u32(jmp_buf + 16, esp.wrapping_add(4));
-                let _ = e.cpu.write_u32(jmp_buf + 20, caller);
-                let _ = e.cpu.write_u32(jmp_buf + 24, exception_list);
-                // Wine msvcrt `_setjmp3`: TryLevel, the 'VC20' cookie, the optional
-                // unwind function and up to six words of its data follow.
-                let try_level = if exception_list == u32::MAX {
-                    u32::MAX
-                } else if count > 1 {
-                    e.arg(3)
-                } else {
-                    e.cpu.read_u32(exception_list + 12).unwrap_or(u32::MAX)
-                };
-                let unwind = if count > 0 && exception_list != u32::MAX {
+        "_setjmp" | "_setjmp3" => {
+            let count = if name == "_setjmp3" { b } else { 0 };
+            use adv_abi::{
+                GuestPtr,
+                guest::{check_range, memory_failure},
+            };
+            if let Err(fault) = check_range(e.cpu, a, 64, adv_cpu::backend::Prot::WRITE) {
+                return memory_failure(fault);
+            }
+            let frame = match e.cpu.read_u32(e.ctx().teb) {
+                Ok(frame) => frame,
+                Err(fault) => return memory_failure(fault),
+            };
+            let level = if frame == u32::MAX {
+                u32::MAX
+            } else if count > 1 {
+                e.arg(3)
+            } else {
+                match e.cpu.read_u32(frame.wrapping_add(12)) {
+                    Ok(level) => level,
+                    Err(fault) => return memory_failure(fault),
+                }
+            };
+            // MSVC setjmp.h's x86 _JUMP_BUFFER is sixteen DWORDs. Compiler
+            // arguments select the local unwind callback and its metadata.
+            let prefix = [
+                e.cpu.reg(Reg::Ebp),
+                e.cpu.reg(Reg::Ebx),
+                e.cpu.reg(Reg::Edi),
+                e.cpu.reg(Reg::Esi),
+                e.cpu.reg(Reg::Esp).wrapping_add(4),
+                e.caller(),
+                frame,
+                level,
+                JMP_MAGIC,
+                if count > 0 && frame != u32::MAX {
                     e.arg(2)
                 } else {
                     0
-                };
-                let _ = e.cpu.write_u32(jmp_buf + 28, try_level);
-                let _ = e.cpu.write_u32(jmp_buf + 32, JMP_MAGIC);
-                let _ = e.cpu.write_u32(jmp_buf + 36, unwind);
-                if exception_list != u32::MAX {
-                    for i in 0..count.saturating_sub(2).min(6) {
-                        let val = e.arg(4 + i);
-                        let _ = e.cpu.write_u32(jmp_buf + 40 + i * 4, val);
+                },
+            ];
+            for (index, word) in prefix.into_iter().enumerate() {
+                if let Err(fault) =
+                    GuestPtr::new(a.wrapping_add(index as u32 * 4)).write(e.cpu, word)
+                {
+                    return memory_failure(fault);
+                }
+            }
+            if frame != u32::MAX {
+                for index in 0..count.saturating_sub(2).min(6) {
+                    let word = e.arg(4 + index);
+                    if let Err(fault) =
+                        GuestPtr::new(a.wrapping_add(40 + index * 4)).write(e.cpu, word)
+                    {
+                        return memory_failure(fault);
                     }
                 }
             }
