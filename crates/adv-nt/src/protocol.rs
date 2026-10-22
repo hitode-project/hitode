@@ -103,3 +103,38 @@ impl Request for InitProcessDoneRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateFileRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub sharing: u32,
+    pub create: i32,
+    pub options: u32,
+    pub attrs: u32,
+}
+const _: () = assert!(size_of::<CreateFileRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(CreateFileRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateFileRequest, sharing) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateFileRequest, create) == 20);
+const _: () = assert!(std::mem::offset_of!(CreateFileRequest, options) == 24);
+const _: () = assert!(std::mem::offset_of!(CreateFileRequest, attrs) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateFileReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateFileReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateFileReply, handle) == 8);
+
+impl Request for CreateFileRequest {
+    const NUMBER: i32 = 44;
+    type Reply = CreateFileReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

@@ -198,7 +198,7 @@ fn find_free(vm: &Vm, size: u32, top_down: bool) -> Option<u32> {
 }
 
 fn finish(result: Result<(), Status>) -> Outcome {
-    Outcome::Return(result.err().unwrap_or(status::SUCCESS))
+    status::finish(result.map_err(status::Error::from))
 }
 
 /// NtAllocateVirtualMemory(process, *base, zero_bits, *size, type, protection)

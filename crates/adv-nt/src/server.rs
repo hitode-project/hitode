@@ -33,6 +33,23 @@ pub struct Link {
     pub progress: Box<dyn Progress>,
 }
 
+/// Sends a request on behalf of a system call. A status the server
+/// returns is in the reply header; a broken connection stops the machine.
+pub fn request<R: Request>(
+    env: &mut adv_machine::Env<'_>,
+    request: &mut R,
+    data: &[&[u8]],
+    reply_data: &mut [u8],
+) -> Result<(R::Reply, usize), crate::status::Error> {
+    let link = env
+        .ext
+        .try_get_mut::<Link>()
+        .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))?;
+    link.connection
+        .call(&mut *link.progress, request, data, reply_data)
+        .map_err(|error| crate::status::Error::Unsupported(format!("server: {error}")))
+}
+
 impl Link {
     pub fn call_raw(
         &mut self,

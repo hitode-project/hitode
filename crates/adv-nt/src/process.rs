@@ -14,6 +14,7 @@ use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
 use adv_machine::{CtxId, Machine};
 use adv_pe::{ExportTarget, Pe, PeError};
 
+use crate::file::Files;
 use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
 use crate::protocol::InitProcessDoneRequest;
@@ -98,12 +99,14 @@ pub struct Process {
 
 /// Connects to the server at `socket`, maps ntdll.dll and prepares the main
 /// thread, which runs once the machine does. `machine` must use
-/// [`dispatch::Platform`]; `progress` runs the server whenever the process
-/// waits for it.
+/// [`dispatch::Platform`]; `prefix` is the Wine prefix whose drives the
+/// process sees; `progress` runs the server whenever the process waits for
+/// it.
 pub fn start<B: Backend>(
     machine: &mut Machine<B>,
     ntdll: &[u8],
     startup: &Startup<'_>,
+    prefix: &Path,
     socket: &Path,
     mut progress: Box<dyn Progress>,
 ) -> Result<Process, Error> {
@@ -223,6 +226,9 @@ pub fn start<B: Backend>(
     if reply.header.error != 0 {
         return Err(Error::Status("init_process_done", reply.header.error));
     }
+    machine.ext.insert(Files {
+        dosdevices: prefix.join("dosdevices"),
+    });
     machine.ext.insert(Link {
         connection,
         progress,

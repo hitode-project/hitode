@@ -1,5 +1,5 @@
 //! Wine's ntdll.dll starts the main thread, with the in-process server, and
-//! runs until it needs a file.
+//! opens its current directory.
 //!
 //! The test needs a Wine 11.0 i386 build: `ADV_WINE_DIST` names the directory
 //! that holds `lib/wine/i386-windows`. Without it the test is skipped.
@@ -43,7 +43,7 @@ impl Progress for Runtime {
 }
 
 #[test]
-fn loader_runs_until_it_opens_a_file() {
+fn loader_opens_its_current_directory() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
         return;
@@ -54,10 +54,12 @@ fn loader_runs_until_it_opens_a_file() {
 
     let root = std::env::temp_dir().join(format!("adv-nt-ntdll-start-{}", std::process::id()));
     let prefix = root.join("prefix");
-    std::fs::create_dir_all(&prefix).unwrap();
+    std::fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
+    std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+    std::os::unix::fs::symlink("../drive_c", prefix.join("dosdevices/c:")).unwrap();
     let clock = TestClock(Cell::new(0));
     let config = Config {
-        prefix,
+        prefix: prefix.clone(),
         install: dist,
         debug: 0,
     };
@@ -73,17 +75,25 @@ fn loader_runs_until_it_opens_a_file() {
         directory: r"C:\windows\system32\",
         environment: &[("SystemDrive", "C:"), ("SystemRoot", r"C:\windows")],
     };
-    let started =
-        process::start(&mut machine, &ntdll, &startup, &socket, Box::new(runtime)).unwrap();
+    let started = process::start(
+        &mut machine,
+        &ntdll,
+        &startup,
+        &prefix,
+        &socket,
+        Box::new(runtime),
+    )
+    .unwrap();
     assert_ne!(started.thread.pid, 0);
 
     // The loader creates the process heap and moves the process parameters
-    // into it, then opens the current directory: the first file it needs.
+    // into it, then opens the current directory and asks what device it is
+    // on.
     let result = machine.run();
     std::fs::remove_dir_all(&root).unwrap();
     match result {
         RunResult::Failed(error) => assert_eq!(
-            error.message, "system call NtOpenFile is not implemented",
+            error.message, "system call NtQueryVolumeInformationFile is not implemented",
             "{error}"
         ),
         other => panic!("the loader did not stop at a system call: {other:?}"),

@@ -11,9 +11,12 @@
 
 pub mod context;
 pub mod dispatch;
+pub mod file;
 pub mod image;
 pub mod memory;
+pub mod object;
 pub mod params;
+pub mod path;
 pub mod process;
 pub mod protocol;
 pub mod server;
