@@ -279,3 +279,19 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: MsiGetFileHash MUST compute the real MD5 of guest file bytes through the existing VFS and coherent file readers. A/W paths MUST share that implementation. Invalid hash structures and failed reads MUST preserve hash output.
 **Verification**: Test
 **Basis**: Microsoft MsiGetFileHash documentation and RFC 1321.
+
+### PERS-NET-3 Offline provider routing
+
+**Rule**: MPR connection and external-resource requests MUST fail ordinarily in the offline profile without publishing redirects. Connected and remembered-resource enumerators MUST be real Objects aliases over the profile's empty resource lists. Provider names and current-user queries MUST use local configuration independently of transport availability.
+**Verification**: Test
+
+### PERS-NET-4 Provider extended errors
+
+**Rule**: WNetSetLastError and WNetGetLastError MUST share extended error codes and UTF-16 strings per guest thread. A/W conversion MUST use the existing process codec. Extended-error queries MUST truncate strings with terminators without replacing another thread's information.
+**Verification**: Test
+**Basis**: Microsoft WNetSetLastError, WNetGetLastError and WNetGetUser documentation.
+
+### PERS-NET-5 Provider capability refusal
+
+**Rule**: Network-provider capability/version queries MUST report a capability gap when provider DLL dispatch is unavailable. They MUST NOT fabricate successful provider structures.
+**Verification**: Test

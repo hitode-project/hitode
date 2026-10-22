@@ -450,12 +450,6 @@ pub fn register(reg: &mut Registry) {
         Outcome::Return(0)
     });
     imm::register(reg);
-    stdcall(reg, "mpr.dll", "WNetGetUniversalNameA", 4, |_| {
-        Outcome::Return(2250) // ERROR_NOT_CONNECTED
-    });
-    stdcall(reg, "mpr.dll", "WNetGetUniversalNameW", 4, |_| {
-        Outcome::Return(2250) // ERROR_NOT_CONNECTED
-    });
     stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| {
         Outcome::Return(0)
     });
