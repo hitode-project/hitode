@@ -27,16 +27,26 @@ OUTPUT = ROOT / "crates/adv-nt/src/protocol.rs"
 REQUESTS = [
     "init_first_thread",
     "init_process_done",
+    "terminate_process",
     "create_file",
     "get_handle_fd",
     "close_handle",
     "create_mapping",
     "get_mapping_info",
     "map_image_view",
+    "map_view",
+    "unmap_view",
     "open_key",
     "create_key",
+    "enum_key",
     "get_key_value",
     "set_key_value",
+    "get_token_sid",
+    "open_directory",
+    "open_mapping",
+    "get_process_info",
+    "get_next_thread",
+    "get_thread_info",
 ]
 
 INTEGERS = {
@@ -81,7 +91,13 @@ def layout(handlers: str, struct: str, header_size: int) -> tuple[dict[str, int]
 KEYWORDS = {"type", "match", "ref", "move", "loop", "box", "fn", "mod", "use", "where", "impl"}
 
 
+# Keywords that cannot be raw identifiers take a trailing underscore.
+UNRAW = {"self", "super", "crate", "Self"}
+
+
 def ident(name: str) -> str:
+    if name in UNRAW:
+        return f"{name}_"
     return f"r#{name}" if name in KEYWORDS else name
 
 

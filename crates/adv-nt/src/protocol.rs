@@ -106,6 +106,36 @@ impl Request for InitProcessDoneRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateProcessRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub exit_code: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<TerminateProcessRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(TerminateProcessRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(TerminateProcessRequest, exit_code) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateProcessReply {
+    pub header: ReplyHeader,
+    pub self_: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<TerminateProcessReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(TerminateProcessReply, self_) == 8);
+
+impl Request for TerminateProcessRequest {
+    const NUMBER: i32 = 7;
+    type Reply = TerminateProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CreateFileRequest {
     pub header: RequestHeader,
     pub access: u32,
@@ -305,6 +335,64 @@ impl Request for MapImageViewRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct MapViewRequest {
+    pub header: RequestHeader,
+    pub mapping: u32,
+    pub access: u32,
+    pub _pad0: [u8; 4],
+    pub base: u64,
+    pub size: u64,
+    pub start: u64,
+}
+const _: () = assert!(size_of::<MapViewRequest>() == 48);
+const _: () = assert!(std::mem::offset_of!(MapViewRequest, mapping) == 12);
+const _: () = assert!(std::mem::offset_of!(MapViewRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(MapViewRequest, base) == 24);
+const _: () = assert!(std::mem::offset_of!(MapViewRequest, size) == 32);
+const _: () = assert!(std::mem::offset_of!(MapViewRequest, start) == 40);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MapViewReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<MapViewReply>() == 8);
+
+impl Request for MapViewRequest {
+    const NUMBER: i32 = 67;
+    type Reply = MapViewReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnmapViewRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub base: u64,
+}
+const _: () = assert!(size_of::<UnmapViewRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(UnmapViewRequest, base) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnmapViewReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<UnmapViewReply>() == 8);
+
+impl Request for UnmapViewRequest {
+    const NUMBER: i32 = 71;
+    type Reply = UnmapViewReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OpenKeyRequest {
     pub header: RequestHeader,
     pub parent: u32,
@@ -366,6 +454,52 @@ impl Request for CreateKeyRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct EnumKeyRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+    pub index: i32,
+    pub info_class: i32,
+}
+const _: () = assert!(size_of::<EnumKeyRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(EnumKeyRequest, hkey) == 12);
+const _: () = assert!(std::mem::offset_of!(EnumKeyRequest, index) == 16);
+const _: () = assert!(std::mem::offset_of!(EnumKeyRequest, info_class) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnumKeyReply {
+    pub header: ReplyHeader,
+    pub subkeys: i32,
+    pub max_subkey: i32,
+    pub max_class: i32,
+    pub values: i32,
+    pub max_value: i32,
+    pub max_data: i32,
+    pub modif: i64,
+    pub total: u32,
+    pub namelen: u32,
+}
+const _: () = assert!(size_of::<EnumKeyReply>() == 48);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, subkeys) == 8);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, max_subkey) == 12);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, max_class) == 16);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, values) == 20);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, max_value) == 24);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, max_data) == 28);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, modif) == 32);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, total) == 40);
+const _: () = assert!(std::mem::offset_of!(EnumKeyReply, namelen) == 44);
+
+impl Request for EnumKeyRequest {
+    const NUMBER: i32 = 90;
+    type Reply = EnumKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GetKeyValueRequest {
     pub header: RequestHeader,
     pub hkey: u32,
@@ -415,6 +549,230 @@ const _: () = assert!(size_of::<SetKeyValueReply>() == 8);
 impl Request for SetKeyValueRequest {
     const NUMBER: i32 = 91;
     type Reply = SetKeyValueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenSidRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub which_sid: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenSidRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetTokenSidRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetTokenSidRequest, which_sid) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenSidReply {
+    pub header: ReplyHeader,
+    pub sid_len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenSidReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenSidReply, sid_len) == 8);
+
+impl Request for GetTokenSidRequest {
+    const NUMBER: i32 = 228;
+    type Reply = GetTokenSidReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenDirectoryRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub rootdir: u32,
+}
+const _: () = assert!(size_of::<OpenDirectoryRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenDirectoryRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenDirectoryRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenDirectoryRequest, rootdir) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenDirectoryReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenDirectoryReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenDirectoryReply, handle) == 8);
+
+impl Request for OpenDirectoryRequest {
+    const NUMBER: i32 = 240;
+    type Reply = OpenDirectoryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenMappingRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub rootdir: u32,
+}
+const _: () = assert!(size_of::<OpenMappingRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenMappingRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenMappingRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenMappingRequest, rootdir) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenMappingReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenMappingReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenMappingReply, handle) == 8);
+
+impl Request for OpenMappingRequest {
+    const NUMBER: i32 = 64;
+    type Reply = OpenMappingReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetProcessInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetProcessInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetProcessInfoReply {
+    pub header: ReplyHeader,
+    pub pid: u32,
+    pub ppid: u32,
+    pub affinity: u64,
+    pub peb: u64,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub session_id: u32,
+    pub exit_code: i32,
+    pub priority: u16,
+    pub base_priority: u16,
+    pub disable_boost: u16,
+    pub machine: u16,
+}
+const _: () = assert!(size_of::<GetProcessInfoReply>() == 64);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, pid) == 8);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, ppid) == 12);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, affinity) == 16);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, peb) == 24);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, start_time) == 32);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, end_time) == 40);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, session_id) == 48);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, exit_code) == 52);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, priority) == 56);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, base_priority) == 58);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, disable_boost) == 60);
+const _: () = assert!(std::mem::offset_of!(GetProcessInfoReply, machine) == 62);
+
+impl Request for GetProcessInfoRequest {
+    const NUMBER: i32 = 9;
+    type Reply = GetProcessInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNextThreadRequest {
+    pub header: RequestHeader,
+    pub process: u32,
+    pub last: u32,
+    pub access: u32,
+    pub attributes: u32,
+    pub flags: u32,
+}
+const _: () = assert!(size_of::<GetNextThreadRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadRequest, process) == 12);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadRequest, last) == 16);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadRequest, access) == 20);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadRequest, attributes) == 24);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadRequest, flags) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNextThreadReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetNextThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetNextThreadReply, handle) == 8);
+
+impl Request for GetNextThreadRequest {
+    const NUMBER: i32 = 294;
+    type Reply = GetNextThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub access: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetThreadInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoRequest, access) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadInfoReply {
+    pub header: ReplyHeader,
+    pub pid: u32,
+    pub tid: u32,
+    pub teb: u64,
+    pub entry_point: u64,
+    pub affinity: u64,
+    pub exit_code: i32,
+    pub priority: i32,
+    pub base_priority: i32,
+    pub suspend_count: i32,
+    pub flags: u32,
+    pub desc_len: u32,
+}
+const _: () = assert!(size_of::<GetThreadInfoReply>() == 64);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, pid) == 8);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, tid) == 12);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, teb) == 16);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, entry_point) == 24);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, affinity) == 32);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, exit_code) == 40);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, priority) == 44);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, base_priority) == 48);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, suspend_count) == 52);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, flags) == 56);
+const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, desc_len) == 60);
+
+impl Request for GetThreadInfoRequest {
+    const NUMBER: i32 = 14;
+    type Reply = GetThreadInfoReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }

@@ -11,7 +11,10 @@ use adv_cpu::backend::Reg;
 use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
-use crate::{exception, file, memory, object, registry, section, unix};
+use crate::{
+    exception, file, information, kuser, memory, nls, object, process, registry, section, system,
+    token, unix,
+};
 
 /// A system call, given its arguments.
 type Syscall = fn(&mut Env<'_>, &[u32]) -> Outcome;
@@ -23,16 +26,36 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtCreateFile", file::create),
     ("NtCreateKey", registry::create),
     ("NtCreateSection", section::create),
+    ("NtOpenDirectoryObject", object::open_directory),
     ("NtOpenFile", file::open),
     ("NtOpenKey", registry::open),
     ("NtOpenKeyEx", registry::open_ex),
+    ("NtOpenSection", section::open),
     ("NtFreeVirtualMemory", memory::free),
+    ("NtFsControlFile", file::control),
+    ("NtGetNextThread", information::next_thread),
+    ("NtGetNlsSectionPtr", nls::section),
+    ("NtInitializeNlsFiles", nls::initialize),
     ("NtMapViewOfSection", section::map_view),
     ("NtProtectVirtualMemory", memory::protect),
+    ("NtQueryAttributesFile", file::query_attributes),
+    ("NtQueryDefaultLocale", nls::default_locale),
+    ("NtQueryInformationProcess", information::query_process),
+    ("NtQueryInformationThread", information::query_thread),
+    ("NtQueryInformationToken", token::query),
+    ("NtQuerySection", section::query),
+    ("NtQuerySystemInformation", system::query),
+    ("NtQuerySystemTime", system::query_time),
     ("NtQueryValueKey", registry::query_value),
     ("NtQueryVirtualMemory", memory::query),
     ("NtRaiseException", exception::raise),
     ("NtSetValueKey", registry::set_value),
+    ("NtTerminateProcess", process::terminate),
+    ("NtUnmapViewOfSection", section::unmap_view),
+    (
+        "NtWow64IsProcessorFeaturePresent",
+        kuser::is_processor_feature_present,
+    ),
     ("NtQueryVolumeInformationFile", file::query_volume),
 ];
 
@@ -100,6 +123,7 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
     let Some(call) = TABLE[number] else {
         return Outcome::Fail(format!("system call {name} is not implemented"));
     };
+    kuser::refresh(env);
     let mut args = [0; MAX_ARGUMENTS];
     let count = bytes as usize / 4;
     for (index, arg) in args[..count].iter_mut().enumerate() {

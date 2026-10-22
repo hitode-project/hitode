@@ -118,6 +118,18 @@ fn descriptor(base: u32, code: bool, dpl: u64) -> u64 {
         | ((base >> 24) << 56)
 }
 
+/// Whether a bit scan searches from the top. TZCNT and LZCNT are
+/// REP-prefixed BSF and BSR, which a processor without BMI1 and LZCNT, as
+/// this one reports itself, runs as BSF and BSR.
+pub fn reverse_scan(mnemonic: iced_x86::Mnemonic) -> bool {
+    use iced_x86::Mnemonic as M;
+    match mnemonic {
+        M::Bsf | M::Tzcnt => false,
+        M::Bsr | M::Lzcnt => true,
+        _ => unreachable!("{mnemonic:?} is not a bit scan"),
+    }
+}
+
 /// CPUID result in architectural EAX, EBX, ECX, EDX order.
 pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
     let vendor = PROCESSOR_IDENTITY.vendor.as_bytes();

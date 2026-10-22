@@ -5,6 +5,11 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+/// NT system time of 1970-01-01.
+pub const UNIX_EPOCH_SYSTEM_TIME: u64 = 116_444_736_000_000_000;
+/// Wall-clock start for virtual-time runs: 2020-01-01T00:00:00Z (deterministic).
+const VIRTUAL_START_UNIX: u64 = 1_577_836_800;
+
 /// Maximum unplanned wall-time advance. Expected idle waits are credited in
 /// full; time discarded after a stall is never repaid as catch-up work.
 pub const MAX_PASSIVE_STEP_US: u64 = 50_000;
@@ -160,6 +165,22 @@ impl Clock {
             *t += 1;
         }
         self.now_us()
+    }
+
+    /// The guest's UTC time as an NT system time (100 ns units since 1601).
+    /// Virtual runs start at a fixed date; real runs read the host's wall
+    /// clock.
+    pub fn system_time(&mut self) -> u64 {
+        let unix_us = if self.is_virtual() {
+            VIRTUAL_START_UNIX * 1_000_000 + self.guest_now_us() - self.epoch_us
+        } else {
+            let _ = self.guest_now_us();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0)
+        };
+        UNIX_EPOCH_SYSTEM_TIME + unix_us * 10
     }
 
     /// Virtual mode: move time forward to `us` (never backwards). Real mode: no-op.

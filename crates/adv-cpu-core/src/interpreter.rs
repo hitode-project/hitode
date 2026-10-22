@@ -1592,7 +1592,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
             }
             Action::Bit(i.mnemonic(), dst, index, i.op1_kind() == OpKind::Immediate8)
         }
-        M::Bsf | M::Bsr => {
+        M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
             let (dst, src) = pair()?;
             if !matches!(dst, Operand::Register(_)) {
                 return None;
@@ -2066,7 +2066,7 @@ impl Transaction {
                     self.store(
                         memory,
                         dst,
-                        if kind == M::Bsf {
+                        if !crate::cpu_profile::reverse_scan(kind) {
                             value.trailing_zeros()
                         } else {
                             31 - value.leading_zeros()

@@ -168,7 +168,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
                 && (i.op1_kind() == OpKind::Immediate8
                     || i.op0_kind() == OpKind::Register && register(i, 1))
         }
-        M::Bsf | M::Bsr => {
+        M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
             i.op_count() == 2
                 && i.op0_kind() == OpKind::Register
                 && operand(i, 0, &[2, 4])
@@ -507,7 +507,7 @@ impl Emitter<'_> {
             M::Bt | M::Bts | M::Btr | M::Btc => return self.bit_test(i),
             M::Xlatb => return self.translate(i),
             M::Rcl | M::Rcr => return self.rotate_through_carry(i),
-            M::Bsf | M::Bsr => return self.bit_scan(i),
+            M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => return self.bit_scan(i),
             _ => {}
         }
         if let Some(condition) = move_condition(i) {
@@ -1256,7 +1256,7 @@ impl Emitter<'_> {
         let value = self.read(i, 1);
         let old = self.read(i, 0);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, value, 0);
-        let index = if i.mnemonic() == M::Bsf {
+        let index = if !crate::cpu_profile::reverse_scan(i.mnemonic()) {
             self.b.ins().ctz(value)
         } else {
             let leading = self.b.ins().clz(value);

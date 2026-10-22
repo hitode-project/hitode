@@ -39,7 +39,7 @@ const PAGE_NOCACHE: u32 = 0x200;
 const PAGE_WRITECOMBINE: u32 = 0x400;
 
 /// The highest address of the user address space.
-const USER_END: u32 = 0x7fff_0000;
+pub const USER_END: u32 = 0x7fff_0000;
 /// `NtCurrentProcess()`.
 pub const CURRENT_PROCESS: u32 = u32::MAX;
 const BASIC_INFORMATION: u32 = 0;
@@ -141,6 +141,52 @@ pub fn allocate_committed(
         vec![Some(PAGE_READWRITE); (size / PAGE) as usize],
     );
     Some(base)
+}
+
+/// Maps `bytes`, zero-filled to `size`, as a view of a data section with
+/// `protection`, and returns its base.
+pub fn map_view(
+    cpu: &mut dyn Guest,
+    vm: &mut Vm,
+    memory: &mut Memory,
+    bytes: &[u8],
+    size: u32,
+    protection: u32,
+) -> Result<u32, Status> {
+    let prot = memory.prot(protection)?;
+    let size = align_up(size, PAGE);
+    let base = find_free(vm, size, false).ok_or(status::NO_MEMORY)?;
+    if !vm.reserve_at(base, size) {
+        return Err(status::NO_MEMORY);
+    }
+    let mapped = cpu.map(base, size, Prot::RW).is_ok()
+        && cpu.write(base, bytes).is_ok()
+        && cpu.protect(base, size, prot).is_ok();
+    if !mapped {
+        let _ = vm.free(cpu, base);
+        return Err(status::NO_MEMORY);
+    }
+    memory.insert(
+        base,
+        Kind::Mapped,
+        protection,
+        vec![Some(protection); (size / PAGE) as usize],
+    );
+    Ok(base)
+}
+
+/// The base of the section view that holds `address`.
+pub fn view_base(memory: &mut Memory, address: u32) -> Option<u32> {
+    memory
+        .region_of(address)
+        .filter(|(_, region)| region.kind != Kind::Private)
+        .map(|(base, _)| base)
+}
+
+/// Unmaps the view at `base`.
+pub fn remove_view(cpu: &mut dyn Guest, vm: &mut Vm, memory: &mut Memory, base: u32) {
+    memory.regions.remove(&base);
+    let _ = vm.free(cpu, base);
 }
 
 fn memory<'a>(env: &'a mut Env<'_>) -> &'a mut Memory {

@@ -1,5 +1,6 @@
-//! Process startup: what Wine's ntdll.so does before the first instruction
-//! of ntdll.dll runs (`start_main_thread` and `init_syscall_frame`).
+//! Process startup, what Wine's ntdll.so does before the first instruction
+//! of ntdll.dll runs (`start_main_thread` and `init_syscall_frame`), and
+//! process exit.
 //!
 //! ntdll.dll is mapped at its preferred base and its dispatcher pointers are
 //! bound to the platform's thunks. The main thread starts in
@@ -17,21 +18,28 @@ use adv_pe::{ExportTarget, Pe, PeError};
 use crate::file::{self, Files};
 use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
-use crate::protocol::InitProcessDoneRequest;
+use crate::protocol::{InitProcessDoneRequest, TerminateProcessRequest};
 use crate::section::{self, View};
 use crate::server::{self, Connection, FirstThread, Link, Progress};
-use crate::{context, dispatch, exception, image, status};
+use crate::{context, debug, dispatch, exception, image, kuser, nls, status, system};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
 /// through this field.
 const TEB_SYSCALL_DISPATCHER: u32 = 0xc0;
-/// The process block holds the PEB, the debug channel table ntdll.dll reads
-/// at `PEB + PAGE`, and the main thread's start CONTEXT.
-const BLOCK_SIZE: u32 = 3 * PAGE;
-const START_CONTEXT: u32 = 2 * PAGE;
+/// TEB.ActivationContextStack, its FrameListCache, and the pointer to it.
+const TEB_ACTIVATION_CONTEXT_STACK: u32 = 0x184;
+const TEB_ACTIVATION_FRAME_LIST: u32 = 0x188;
+const TEB_ACTIVATION_CONTEXT_STACK_POINTER: u32 = 0x1a8;
+/// TEB.StaticUnicodeString and the 261 characters of its buffer.
+const TEB_STATIC_UNICODE_STRING: u32 = 0xbf8;
+const TEB_STATIC_UNICODE_BUFFER: u32 = 0xc00;
+const STATIC_UNICODE_BUFFER_SIZE: u32 = 261 * 2;
+/// The process block holds the PEB and the debug channel table ntdll.dll
+/// reads at `PEB + PAGE`.
+const BLOCK_SIZE: u32 = 2 * PAGE;
 
 /// Guest threads share one host thread.
-const PROCESSORS: u32 = 1;
+pub const PROCESSORS: u32 = 1;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 
 /// PEB fields (i386) the platform sets, as Wine's `init_peb` and
@@ -138,14 +146,14 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
     let mapping = section::create_mapping(
         env,
         SECTION_ACCESS,
-        0,
+        None,
         0,
         memory::PAGE_EXECUTE_READ,
         SEC_IMAGE,
         file,
     );
     server::close(env, file).map_err(|error| failed("main image", error))?;
-    let mapping = mapping.map_err(|error| failed("main image section", error))?;
+    let (mapping, _) = mapping.map_err(|error| failed("main image section", error))?;
     let view = section::map_image(env, mapping);
     server::close(env, mapping).map_err(|error| failed("main image", error))?;
     let view = view.map_err(|error| failed("main image view", error))?;
@@ -209,6 +217,11 @@ pub fn start<B: Backend>(
     // Zeroed, the debug channel table is empty and every channel is off.
     let peb = block;
     machine.sys.peb = peb;
+    let app_name = startup.image.rsplit(['\\', '/']).next().unwrap_or_default();
+    machine.cpu.write(
+        block + PAGE,
+        &debug::table(startup.debug, app_name, PAGE as usize),
+    )?;
     let size = params::size(startup);
     let parameters =
         memory::allocate_committed(&mut machine.cpu, &mut machine.sys.vm, &mut memory, size)
@@ -232,29 +245,44 @@ pub fn start<B: Backend>(
         machine.cpu.write_u32(peb + offset, value)?;
     }
 
-    let start_context = block + START_CONTEXT;
     let main = machine.spawn(
         "main",
         ntdll.export("LdrInitializeThunk")?,
-        &[start_context, 0, 0, 0],
+        &[],
         DEFAULT_STACK,
     )?;
     let thread = &machine.sys.contexts[main as usize];
-    let (teb, stack_base) = (thread.teb, thread.stack_hi);
+    let (teb, stack_base, stack_lo) = (thread.teb, thread.stack_hi, thread.stack_lo);
+    // As Wine's `init_syscall_frame`: the start CONTEXT tops the stack, and
+    // LdrInitializeThunk(context, 0, 0, 0) is called under it, so the
+    // stack ntdll.dll clears before it continues lies below the CONTEXT.
+    let start_context = ((stack_base - STACK_TOP_RESERVE) & !3) - context::SIZE as u32;
+    let frame = start_context - 20;
+    let return_address = machine.cpu.read_u32(stack_base - STACK_TOP_RESERVE - 4)?;
+    for (index, value) in [return_address, start_context, 0, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
+        machine.cpu.write_u32(frame + 4 * index as u32, value)?;
+    }
+    machine.sys.set_start_stack(main, frame);
     // The machine's stack: a guard page under the committed pages.
-    let stack = thread.stack_lo - PAGE;
+    let stack = stack_lo - PAGE;
     let mut pages = vec![Some(PAGE_READWRITE); ((stack_base - stack) / PAGE) as usize];
     pages[0] = Some(PAGE_GUARD_READWRITE);
     memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
     machine.ext.insert(memory);
-    machine
-        .cpu
-        .write_u32(teb + teb::THREAD_ID, registered.tid)?;
-    machine
-        .cpu
-        .write_u32(teb + TEB_SYSCALL_DISPATCHER, syscall)?;
+    init_teb(&mut machine.cpu, teb, registered.tid, syscall)?;
+    let features = machine.cpu.cpuid_features();
+    kuser::map(
+        &mut machine.cpu,
+        features,
+        system::physical_pages(),
+        PROCESSORS,
+    )?;
     debug_assert_eq!(machine.cpu.read_u32(teb + teb::PEB)?, peb);
 
+    machine.ext.insert(nls::Locale(startup.locale));
     machine.ext.insert(Files {
         dosdevices: prefix.join("dosdevices"),
     });
@@ -318,4 +346,62 @@ pub fn start<B: Backend>(
         main,
         thread: registered,
     })
+}
+
+/// The TEB fields Wine's `init_teb` sets beyond the machine's, and the
+/// thread's server id and system call entry.
+fn init_teb<B: Backend>(cpu: &mut B, teb: u32, tid: u32, syscall: u32) -> Result<(), MemFault> {
+    let frames = teb + TEB_ACTIVATION_FRAME_LIST;
+    for (offset, value) in [
+        (teb::THREAD_ID, tid),
+        (TEB_SYSCALL_DISPATCHER, syscall),
+        (
+            TEB_ACTIVATION_CONTEXT_STACK_POINTER,
+            teb + TEB_ACTIVATION_CONTEXT_STACK,
+        ),
+        (TEB_ACTIVATION_FRAME_LIST, frames),
+        (TEB_ACTIVATION_FRAME_LIST + 4, frames),
+        (TEB_STATIC_UNICODE_STRING, STATIC_UNICODE_BUFFER_SIZE << 16),
+        (
+            TEB_STATIC_UNICODE_STRING + 4,
+            teb + TEB_STATIC_UNICODE_BUFFER,
+        ),
+    ] {
+        cpu.write_u32(teb + offset, value)?;
+    }
+    Ok(())
+}
+
+/// NtTerminateProcess(process, exit_code): ntdll.dll first ends the other
+/// threads (process 0), then the process itself.
+pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[process, exit_code] = args else {
+        unreachable!()
+    };
+    let mut request = TerminateProcessRequest {
+        handle: process,
+        exit_code: exit_code as i32,
+        ..Default::default()
+    };
+    let reply = match server::request(env, &mut request, &[], &mut []) {
+        Ok((reply, _)) => reply,
+        Err(error) => return status::finish(Err(error)),
+    };
+    if reply.self_ == 0 {
+        return adv_machine::Outcome::Return(reply.header.error);
+    }
+    if process == 0 {
+        let others = env
+            .sys
+            .contexts
+            .iter()
+            .filter(|context| !context.is_done())
+            .count()
+            > 1;
+        if others {
+            return adv_machine::Outcome::Fail("ending a process's other threads".into());
+        }
+        return adv_machine::Outcome::Return(reply.header.error);
+    }
+    adv_machine::Outcome::ExitProcess(exit_code)
 }

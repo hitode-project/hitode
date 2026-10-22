@@ -4,6 +4,7 @@
 use adv_cpu::backend::GuestExt;
 use adv_machine::Env;
 
+use crate::protocol::OpenDirectoryRequest;
 use crate::status::{self, Error, Status};
 
 /// OBJECT_ATTRIBUTES (i386).
@@ -81,6 +82,12 @@ impl Attributes {
         })
     }
 
+    /// The name as the server takes it.
+    pub fn name_bytes(&self) -> Vec<u8> {
+        let name = self.name.as_deref().unwrap_or_default();
+        name.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    }
+
     /// `struct object_attributes` followed by the name, DWORD-aligned.
     pub fn wire(&self) -> Vec<u8> {
         let name = self.name.as_deref().unwrap_or_default();
@@ -99,4 +106,26 @@ impl Attributes {
 /// NtClose(handle)
 pub fn close(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     status::finish(crate::server::close(env, args[0]))
+}
+
+/// NtOpenDirectoryObject(*handle, access, *attributes)
+pub fn open_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[handle, access, attributes] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let attributes = Attributes::read(env, attributes)?;
+        let mut request = OpenDirectoryRequest {
+            access,
+            attributes: attributes.attributes,
+            rootdir: attributes.root,
+            ..Default::default()
+        };
+        let (reply, _) =
+            crate::server::request(env, &mut request, &[&attributes.name_bytes()], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, handle, reply.handle)?;
+        Ok(())
+    })())
 }

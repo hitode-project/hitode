@@ -258,6 +258,21 @@ impl Sys {
         context.suspend_count += 1;
         Some(old)
     }
+    /// Moves the initial stack pointer of a context that has not started: a
+    /// personality that lays out its own start frame on the stack.
+    pub fn set_start_stack(&mut self, id: CtxId, sp: u32) -> bool {
+        match self
+            .contexts
+            .get_mut(id as usize)
+            .and_then(|c| c.start.as_mut())
+        {
+            Some(start) => {
+                start.0 = sp;
+                true
+            }
+            None => false,
+        }
+    }
     pub fn resume_context(&mut self, id: CtxId) -> Option<u32> {
         let context = self.contexts.get_mut(id as usize)?;
         if context.is_done() {

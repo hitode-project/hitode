@@ -444,7 +444,8 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
         .into_iter()
         .chain((0..32).map(|bit| 1 << bit))
         .collect();
-    for reverse in [false, true] {
+    // TZCNT and LZCNT run as BSF and BSR on this processor.
+    for (reverse, counted) in [(false, false), (true, false), (false, true), (true, true)] {
         for word in [false, true] {
             for dst in 0..8 {
                 for source in 0..3 {
@@ -455,10 +456,11 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
                         let words = [ax, cx, dx, bx, sp, bp, si, di];
                         macro_rules! scan {
                             ($d:expr, $s:expr) => {
-                                if reverse {
-                                    a.bsr($d, $s)
-                                } else {
-                                    a.bsf($d, $s)
+                                match (reverse, counted) {
+                                    (false, false) => a.bsf($d, $s),
+                                    (true, false) => a.bsr($d, $s),
+                                    (false, true) => a.tzcnt($d, $s),
+                                    (true, true) => a.lzcnt($d, $s),
                                 }
                                 .unwrap()
                             };
@@ -488,7 +490,7 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
                             assert_eq!(left, 98);
                             assert_eq!(
                                 got, want,
-                                "reverse={reverse}, word={word}, dst={dst}, source={source}, value={value}, flagm={flagm}"
+                                "reverse={reverse}, counted={counted}, word={word}, dst={dst}, source={source}, value={value}, flagm={flagm}"
                             );
                         }
                     }

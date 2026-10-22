@@ -171,7 +171,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
             }
             Integer::ShiftCl(kind, dst.number() as u8)
         }
-        M::Bsf | M::Bsr => {
+        M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
             let dst = instruction.op0_register();
             let width = if dst.is_gpr16() {
                 2
@@ -193,7 +193,12 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
                 }
                 _ => return None,
             };
-            Integer::Scan(mnemonic == M::Bsr, dst.number() as u8, src, width as u8)
+            Integer::Scan(
+                adv_cpu_core::cpu_profile::reverse_scan(mnemonic),
+                dst.number() as u8,
+                src,
+                width as u8,
+            )
         }
         M::Rcl | M::Rcr if instruction.op_kind(1) == OpKind::Immediate8 => {
             match u32::from(instruction.immediate8()) & 31 {

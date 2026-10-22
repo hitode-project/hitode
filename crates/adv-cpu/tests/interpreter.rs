@@ -1096,6 +1096,28 @@ fn bit_scans_strings_and_double_shifts_match_reference() {
 }
 
 #[test]
+fn trailing_and_leading_zero_counts_run_as_bit_scans() {
+    // TZCNT and LZCNT eax, ecx: the processor reports neither BMI1 nor
+    // LZCNT, so they are BSF and BSR.
+    for (bytes, scan) in [
+        ([0xf3, 0x0f, 0xbc, 0xc1], vec![0x0f, 0xbc, 0xc1]),
+        ([0xf3, 0x0f, 0xbd, 0xc1], vec![0x0f, 0xbd, 0xc1]),
+    ] {
+        for value in [0u32, 1, 0x80, 0x8000_0000] {
+            let mut counted = state();
+            counted.regs[0] = 0x55;
+            counted.regs[1] = value;
+            let mut scanned = counted.clone();
+            Interpreter::new().step(&mut counted, &mut memory(&bytes));
+            Interpreter::new().step(&mut scanned, &mut memory(&scan));
+            assert_eq!(counted.regs, scanned.regs, "{bytes:02x?} of {value:#x}");
+            assert_eq!(counted.eflags & 0x40, scanned.eflags & 0x40);
+            assert_eq!(counted.eip, scanned.eip + 1);
+        }
+    }
+}
+
+#[test]
 fn pushad_popad_word_stack_and_loop_forms_match_reference() {
     for form in 0..12 {
         let bytes = if form == 11 {

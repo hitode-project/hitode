@@ -13,6 +13,10 @@ pub struct Startup<'a> {
     pub directory: &'a str,
     /// `NAME=value` pairs.
     pub environment: &'a [(&'a str, &'a str)],
+    /// The LCID of the system and user locales.
+    pub locale: u32,
+    /// Wine debug channels, in WINEDEBUG syntax.
+    pub debug: &'a str,
 }
 
 const SIZE: u32 = 0x2a4;

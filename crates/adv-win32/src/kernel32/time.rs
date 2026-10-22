@@ -12,22 +12,10 @@ use crate::{Win32, stdcall, util::write_units};
 
 /// FILETIME of 1970-01-01.
 const UNIX_EPOCH_FT: u64 = 116_444_736_000_000_000;
-/// Wall-clock start for virtual-time runs: 2020-01-01T00:00:00Z (deterministic).
-const VIRTUAL_START_UNIX: u64 = 1_577_836_800;
 
 /// Current UTC time as FILETIME (100 ns units since 1601).
 pub fn filetime_now(env: &mut Env<'_>) -> u64 {
-    let clock = &mut env.sys.clock;
-    let unix_us = if clock.is_virtual() {
-        VIRTUAL_START_UNIX * 1_000_000 + clock.guest_now_us() - clock.epoch_us
-    } else {
-        let _ = clock.guest_now_us();
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
-    };
-    UNIX_EPOCH_FT + unix_us * 10
+    env.sys.clock.system_time()
 }
 
 fn local_offset_ft(env: &Env<'_>) -> i64 {

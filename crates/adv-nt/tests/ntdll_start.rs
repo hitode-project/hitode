@@ -1,8 +1,10 @@
-//! Wine's ntdll.dll starts the main thread, with the in-process server, and
-//! starts a Wine program, reading the registry.
+//! Wine's ntdll.dll starts a program, the gate-1 probe, with the in-process
+//! server.
 //!
-//! The test needs a Wine 11.0 i386 build: `ADV_WINE_DIST` names the directory
-//! that holds `lib/wine/i386-windows`. Without it the test is skipped.
+//! The test needs a Wine 11.0 i386 build and the probe built from
+//! `tests/probe/gate1.c`: `ADV_WINE_DIST` names the directory that holds
+//! `lib/wine/i386-windows` and `share/wine/nls`, and `ADV_WINE_PROBE` the
+//! probe. Without them the test is skipped.
 #![cfg(target_vendor = "apple")]
 
 use std::cell::Cell;
@@ -27,6 +29,21 @@ impl Clock for TestClock {
     }
 }
 
+/// Wine's debug output, on standard error.
+struct WineLog;
+
+impl log::Log for WineLog {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "wine"
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}", record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 struct Runtime {
     server: Server,
     clock: TestClock,
@@ -43,9 +60,14 @@ impl Progress for Runtime {
 }
 
 #[test]
-fn loader_starts_a_wine_program_and_reads_the_registry() {
+fn loader_starts_the_probe() {
+    let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
+        return;
+    };
+    let Some(probe) = std::env::var_os("ADV_WINE_PROBE").map(PathBuf::from) else {
+        eprintln!("skipped: ADV_WINE_PROBE is not set");
         return;
     };
     let ntdll_path = dist.join("lib/wine/i386-windows/ntdll.dll");
@@ -57,12 +79,23 @@ fn loader_starts_a_wine_program_and_reads_the_registry() {
     std::fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
     std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
     std::os::unix::fs::symlink("../drive_c", prefix.join("dosdevices/c:")).unwrap();
-    // A real Wine program is the main image.
-    std::fs::copy(
-        dist.join("lib/wine/i386-windows/hostname.exe"),
-        prefix.join("drive_c/windows/system32/hostname.exe"),
-    )
-    .unwrap();
+    // system32 links to Wine's modules and locale data, as a prefix holds
+    // them.
+    let windows = prefix.join("drive_c/windows");
+    std::fs::create_dir_all(windows.join("globalization/sorting")).unwrap();
+    for directory in ["lib/wine/i386-windows", "share/wine/nls"] {
+        for entry in std::fs::read_dir(dist.join(directory)).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let target = if name == "sortdefault.nls" {
+                windows.join("globalization/sorting").join(name)
+            } else {
+                windows.join("system32").join(name)
+            };
+            std::os::unix::fs::symlink(entry.path(), target).unwrap();
+        }
+    }
+    std::fs::copy(&probe, prefix.join("drive_c/gate1.exe")).unwrap();
     let clock = TestClock(Cell::new(0));
     let config = Config {
         prefix: prefix.clone(),
@@ -76,10 +109,13 @@ fn loader_starts_a_wine_program_and_reads_the_registry() {
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, Platform, adv_machine::Clock::virtual_time()).unwrap();
     let startup = Startup {
-        image: r"C:\windows\system32\hostname.exe",
-        command_line: "hostname.exe",
-        directory: r"C:\windows\system32\",
+        image: r"C:\gate1.exe",
+        command_line: "gate1.exe",
+        directory: r"C:\",
         environment: &[("SystemDrive", "C:"), ("SystemRoot", r"C:\windows")],
+        // en-US
+        locale: 0x409,
+        debug: &std::env::var("WINEDEBUG").unwrap_or_default(),
     };
     let started = process::start(
         &mut machine,
@@ -92,17 +128,15 @@ fn loader_starts_a_wine_program_and_reads_the_registry() {
     .unwrap();
     assert_ne!(started.thread.pid, 0);
 
-    // The loader creates the process heap, moves the process parameters into
-    // it, opens the current directory, asks what device it is on and reads
-    // the main image's headers, and reads its options from the registry.
-    // Then it asks about the system.
+    // The probe starts through the loader, which loads its imports and a
+    // library and runs its TLS callback, then sleeps.
     let result = machine.run();
     std::fs::remove_dir_all(&root).unwrap();
     match result {
         RunResult::Failed(error) => assert_eq!(
-            error.message, "system call NtQuerySystemInformation is not implemented",
+            error.message, "system call NtDelayExecution is not implemented",
             "{error}"
         ),
-        other => panic!("the loader did not stop: {other:?}"),
+        other => panic!("the probe did not stop: {other:?}"),
     }
 }

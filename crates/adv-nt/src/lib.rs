@@ -10,11 +10,15 @@
 #![cfg(unix)]
 
 pub mod context;
+pub mod debug;
 pub mod dispatch;
 pub mod exception;
 pub mod file;
 pub mod image;
+pub mod information;
+pub mod kuser;
 pub mod memory;
+pub mod nls;
 pub mod object;
 pub mod params;
 pub mod path;
@@ -25,4 +29,7 @@ pub mod section;
 pub mod server;
 pub mod status;
 pub mod syscalls;
+pub mod system;
+pub mod timezone;
+pub mod token;
 pub mod unix;

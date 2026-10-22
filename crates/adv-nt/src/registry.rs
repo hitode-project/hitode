@@ -4,16 +4,22 @@
 use adv_machine::{Env, Outcome};
 
 use crate::object::{Attributes, read_unicode_string, write_bytes, write_u32};
-use crate::protocol::{CreateKeyRequest, GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest};
+use crate::protocol::{
+    CreateKeyRequest, EnumKeyRequest, GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest,
+};
 use crate::server;
 use crate::status::{self, Error, Status};
 
 const OBJ_OPENIF: u32 = 0x80;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
-const OBJECT_NAME_EXISTS: Status = 0x4000_0000;
 const OBJECT_PATH_SYNTAX_BAD: Status = 0xc000_003b;
 const BUFFER_OVERFLOW: Status = 0x8000_0005;
 const BUFFER_TOO_SMALL: Status = 0xc000_0023;
+const NO_MORE_ENTRIES: Status = 0x8000_001a;
+const KEY_READ: u32 = 0x2_0019;
+const KEY_BASIC_INFORMATION: i32 = 0;
+/// The longest key name, in bytes.
+const MAX_KEY_NAME: usize = 255 * 2;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 /// The longest value name, in bytes.
@@ -37,17 +43,87 @@ pub fn open_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 fn open_key(env: &mut Env<'_>, key: u32, access: u32, attributes: u32) -> Result<(), Error> {
     write_u32(env, key, 0)?;
     let attributes = Attributes::read(env, attributes)?;
-    let name = attributes.name.unwrap_or_default();
-    let mut request = OpenKeyRequest {
-        parent: attributes.root,
+    let opened = open_named(
+        env,
+        attributes.root,
         access,
-        attributes: attributes.attributes | OBJ_CASE_INSENSITIVE,
+        attributes.attributes,
+        &attributes.name_bytes(),
+    )?;
+    write_u32(env, key, opened)?;
+    Ok(())
+}
+
+fn open_named(
+    env: &mut Env<'_>,
+    parent: u32,
+    access: u32,
+    attributes: u32,
+    name: &[u8],
+) -> Result<u32, Error> {
+    let mut request = OpenKeyRequest {
+        parent,
+        access,
+        attributes: attributes | OBJ_CASE_INSENSITIVE,
         ..Default::default()
     };
-    let (reply, _) = server::request(env, &mut request, &[&bytes(&name)], &mut [])?;
+    let (reply, _) = server::request(env, &mut request, &[name], &mut [])?;
     status::check(reply.header.error)?;
-    write_u32(env, key, reply.hkey)?;
-    Ok(())
+    Ok(reply.hkey)
+}
+
+/// Opens key `name` under `parent`, or a full `\Registry` path, for the
+/// platform's own reads.
+pub fn open_for_reading(env: &mut Env<'_>, parent: u32, name: &str) -> Result<u32, Error> {
+    let name: Vec<u16> = name.encode_utf16().collect();
+    open_named(env, parent, KEY_READ, 0, &bytes(&name))
+}
+
+/// The name of subkey `index` of `key`, or `None` past the last one.
+pub fn subkey(env: &mut Env<'_>, key: u32, index: u32) -> Result<Option<Vec<u16>>, Error> {
+    let mut request = EnumKeyRequest {
+        hkey: key,
+        index: index as i32,
+        info_class: KEY_BASIC_INFORMATION,
+        ..Default::default()
+    };
+    let mut name = vec![0u8; MAX_KEY_NAME];
+    let (reply, size) = server::request(env, &mut request, &[], &mut name)?;
+    match reply.header.error {
+        NO_MORE_ENTRIES => return Ok(None),
+        error => status::check(error)?,
+    }
+    let size = size.min(reply.namelen as usize);
+    Ok(Some(
+        name[..size]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect(),
+    ))
+}
+
+/// The type and data of value `name` of `key`, if it exists and holds at
+/// most `limit` bytes.
+pub fn value(
+    env: &mut Env<'_>,
+    key: u32,
+    name: &str,
+    limit: usize,
+) -> Result<Option<(u32, Vec<u8>)>, Error> {
+    let name: Vec<u16> = name.encode_utf16().collect();
+    let mut request = GetKeyValueRequest {
+        hkey: key,
+        ..Default::default()
+    };
+    let mut data = vec![0u8; limit];
+    let (reply, size) = server::request(env, &mut request, &[&bytes(&name)], &mut data)?;
+    if reply.header.error != status::SUCCESS || reply.total as usize > limit {
+        return Ok(None);
+    }
+    data.truncate(size);
+    Ok(Some((reply.r#type as u32, data)))
 }
 
 /// NtCreateKey(*key, access, *attributes, index, *class, options, *disposition)
@@ -75,7 +151,7 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let (reply, _) = server::request(env, &mut request, &[&objattr, &class], &mut [])?;
         let created = match reply.header.error {
             status::SUCCESS => REG_CREATED_NEW_KEY,
-            OBJECT_NAME_EXISTS => REG_OPENED_EXISTING_KEY,
+            status::OBJECT_NAME_EXISTS => REG_OPENED_EXISTING_KEY,
             error => return Err(error.into()),
         };
         write_u32(env, key, reply.hkey)?;

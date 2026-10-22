@@ -7,6 +7,7 @@ use adv_machine::{Env, Outcome};
 use crate::protocol::FIXED_SIZE;
 use crate::server::Link;
 
+const WINE_DBG_WRITE: u32 = 2;
 const WINE_SERVER_CALL: u32 = 3;
 
 /// `struct __server_request_info` (i386): the fixed part, then the data
@@ -20,8 +21,28 @@ const REPLY_SIZE: usize = 8;
 /// __wine_unix_call_dispatcher(handle, code, args)
 pub fn call(env: &mut Env<'_>, code: u32, args: u32) -> Outcome {
     match code {
+        WINE_DBG_WRITE => debug_write(env, args),
         WINE_SERVER_CALL => server_call(env, args),
         _ => Outcome::Fail(format!("unix call {code} is not implemented")),
+    }
+}
+
+/// Wine's debug output, which ntdll.so writes to standard error; here it
+/// goes to the host log. `struct wine_dbg_write_params { str, len }`.
+fn debug_write(env: &mut Env<'_>, params: u32) -> Outcome {
+    let text = (|| {
+        let pointer = env.cpu.read_u32(params)?;
+        let length = env.cpu.read_u32(params + 4)?;
+        let mut bytes = vec![0; length as usize];
+        env.cpu.read(pointer, &mut bytes)?;
+        Ok::<_, adv_cpu::backend::MemFault>(bytes)
+    })();
+    match text {
+        Ok(bytes) => {
+            log::warn!(target: "wine", "{}", String::from_utf8_lossy(&bytes).trim_end());
+            Outcome::Return(bytes.len() as u32)
+        }
+        Err(error) => Outcome::Fail(format!("debug output: {error}")),
     }
 }
 

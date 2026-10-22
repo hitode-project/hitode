@@ -9,18 +9,27 @@ use adv_pe::Pe;
 
 use crate::image;
 use crate::memory::{self, CURRENT_PROCESS, Memory};
-use crate::object::{Attributes, read_u32, write_u32};
-use crate::protocol::{CreateMappingRequest, GetMappingInfoRequest, MapImageViewRequest};
+use crate::object::{Attributes, read_u32, write_bytes, write_u32};
+use crate::protocol::{
+    CreateMappingRequest, GetMappingInfoRequest, MapImageViewRequest, MapViewRequest,
+    OpenMappingRequest, UnmapViewRequest,
+};
 use crate::server;
 use crate::status::{self, Error, Status};
 
 const SEC_IMAGE: u32 = 0x100_0000;
+const SECTION_QUERY: u32 = 0x0001;
+const SECTION_MAP_WRITE: u32 = 0x0002;
 const SECTION_MAP_READ: u32 = 0x0004;
+const SECTION_MAP_EXECUTE: u32 = 0x0008;
 const FILE_READ_DATA: u32 = 0x0001;
 const FILE_WRITE_DATA: u32 = 0x0002;
 const IMAGE_NOT_AT_BASE: Status = 0x4000_0003;
 const IMAGE_MACHINE_TYPE_MISMATCH: Status = 0x4000_002e;
+const SECTION_NOT_IMAGE: Status = 0xc000_0049;
 const MACHINE_I386: u16 = 0x014c;
+const MACHINE_AMD64: u16 = 0x8664;
+const MACHINE_ARM64: u16 = 0xaa64;
 
 /// The parts of `struct pe_image_info` the platform reads.
 pub struct ImageInfo {
@@ -35,7 +44,8 @@ pub struct ImageInfo {
     pub machine: u16,
 }
 
-const IMAGE_INFO_SIZE: usize = 96;
+/// `struct pe_image_info`.
+pub const PE_IMAGE_INFO_SIZE: usize = 96;
 
 impl ImageInfo {
     fn parse(bytes: &[u8]) -> ImageInfo {
@@ -55,6 +65,45 @@ impl ImageInfo {
         }
     }
 }
+
+/// SECTION_IMAGE_INFORMATION for `struct pe_image_info`, as Wine's
+/// `virtual_fill_image_information`.
+pub fn image_information(pe_info: &[u8]) -> [u8; IMAGE_INFORMATION_SIZE] {
+    let u32_at =
+        |offset: usize| u32::from_le_bytes(pe_info[offset..offset + 4].try_into().unwrap());
+    let info = ImageInfo::parse(pe_info);
+    let (mut transfer, mut stack_size, mut stack_commit) = (
+        u32_at(0).wrapping_add(info.entry_point),
+        u32_at(16),
+        u32_at(24),
+    );
+    // A 32-bit process is not told 64-bit values.
+    if matches!(info.machine, MACHINE_AMD64 | MACHINE_ARM64) {
+        (transfer, stack_size, stack_commit) = (0x8123_1234, 0x10_0000, 0x1_0000);
+    }
+    let mut out = [0u8; IMAGE_INFORMATION_SIZE];
+    let words = [
+        (0x00, transfer),
+        (0x04, u32_at(44)),
+        (0x08, stack_size),
+        (0x0c, stack_commit),
+        (0x10, info.subsystem),
+        (0x24, u32_at(68)),
+        (0x28, u32_at(80)),
+        (0x2c, u32_at(84)),
+    ];
+    for (offset, value) in words {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    // Subsystem and OS versions, characteristics and machine are laid out
+    // alike in both; then the code flag and the image flags.
+    out[0x14..0x22].copy_from_slice(&pe_info[52..66]);
+    out[0x22] = pe_info[66] & 1;
+    out[0x23] = pe_info[67];
+    out
+}
+
+pub const IMAGE_INFORMATION_SIZE: usize = 0x30;
 
 /// A mapped image view.
 pub struct View {
@@ -76,22 +125,122 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             0 => 0,
             size => u64::from(read_u32(env, size)?) | u64::from(read_u32(env, size + 4)?) << 32,
         };
-        let created = create_mapping(env, access, attributes, size, protection, flags, file)?;
+        let attributes = match attributes {
+            0 => None,
+            attributes => Some(Attributes::read(env, attributes)?),
+        };
+        let (created, status) = create_mapping(
+            env,
+            access,
+            attributes.as_ref(),
+            size,
+            protection,
+            flags,
+            file,
+        )?;
         write_u32(env, handle, created)?;
+        status::check(status)
+    })())
+}
+
+/// NtOpenSection(*handle, access, *attributes)
+pub fn open(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let attributes = Attributes::read(env, attributes)?;
+        let opened = open_mapping(env, access, &attributes)?;
+        write_u32(env, handle, opened)?;
         Ok(())
     })())
 }
 
-/// Creates a section in the server and returns its handle.
+/// Opens a named section and returns its handle.
+pub fn open_mapping(env: &mut Env<'_>, access: u32, attributes: &Attributes) -> Result<u32, Error> {
+    let mut request = OpenMappingRequest {
+        access,
+        attributes: attributes.attributes,
+        rootdir: attributes.root,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(env, &mut request, &[&attributes.name_bytes()], &mut [])?;
+    status::check(reply.header.error)?;
+    Ok(reply.handle)
+}
+
+/// Maps a read-only view of all of data section `mapping`; returns its base
+/// and size.
+pub fn map_read_only(env: &mut Env<'_>, mapping: u32) -> Result<(u32, u32), Error> {
+    let mut request = GetMappingInfoRequest {
+        handle: mapping,
+        access: SECTION_MAP_READ,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    status::check(reply.header.error)?;
+    map_data(env, mapping, reply.size, 0, crate::memory::PAGE_READONLY)
+}
+
+const SECTION_BASIC_INFORMATION: u32 = 0;
+const SECTION_IMAGE_INFORMATION: u32 = 1;
+const BASIC_INFORMATION_SIZE: u32 = 16;
+
+/// NtQuerySection(handle, class, *info, size, *result_size)
+pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, class, info, size, result_size] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let needed = match class {
+            SECTION_BASIC_INFORMATION => BASIC_INFORMATION_SIZE,
+            SECTION_IMAGE_INFORMATION => IMAGE_INFORMATION_SIZE as u32,
+            class => {
+                return Err(Error::Unsupported(format!(
+                    "section information class {class}"
+                )));
+            }
+        };
+        if size < needed {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = GetMappingInfoRequest {
+            handle,
+            access: SECTION_QUERY,
+            ..Default::default()
+        };
+        let mut pe_info = vec![0u8; PE_IMAGE_INFO_SIZE];
+        let (reply, _) = server::request(env, &mut request, &[], &mut pe_info)?;
+        status::check(reply.header.error)?;
+        if class == SECTION_BASIC_INFORMATION {
+            let mut out = [0u8; BASIC_INFORMATION_SIZE as usize];
+            out[4..8].copy_from_slice(&reply.flags.to_le_bytes());
+            out[8..16].copy_from_slice(&reply.size.to_le_bytes());
+            write_bytes(env, info, &out)?;
+        } else if reply.flags & SEC_IMAGE != 0 {
+            write_bytes(env, info, &image_information(&pe_info))?;
+        } else {
+            return Err(SECTION_NOT_IMAGE.into());
+        }
+        if result_size != 0 {
+            write_u32(env, result_size, needed)?;
+        }
+        Ok(())
+    })())
+}
+
+/// Creates a section in the server and returns its handle, with
+/// OBJECT_NAME_EXISTS when a named section was opened instead.
 pub fn create_mapping(
     env: &mut Env<'_>,
     access: u32,
-    attributes: u32,
+    attributes: Option<&Attributes>,
     size: u64,
     protection: u32,
     flags: u32,
     file: u32,
-) -> Result<u32, Error> {
+) -> Result<(u32, Status), Error> {
     use crate::memory::*;
     let file_access = match protection & 0xff {
         PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY => {
@@ -102,10 +251,7 @@ pub fn create_mapping(
         PAGE_EXECUTE | PAGE_NOACCESS => 0,
         _ => return Err(status::INVALID_PAGE_PROTECTION.into()),
     };
-    let objattr = match attributes {
-        0 => Vec::new(),
-        attributes => Attributes::read(env, attributes)?.wire(),
-    };
+    let objattr = attributes.map(Attributes::wire).unwrap_or_default();
     let mut request = CreateMappingRequest {
         access,
         flags,
@@ -115,14 +261,28 @@ pub fn create_mapping(
         ..Default::default()
     };
     let (reply, _) = server::request(env, &mut request, &[&objattr], &mut [])?;
-    status::check(reply.header.error)?;
-    Ok(reply.handle)
+    match reply.header.error {
+        status::SUCCESS | status::OBJECT_NAME_EXISTS => Ok((reply.handle, reply.header.error)),
+        error => Err(error.into()),
+    }
 }
 
 /// NtMapViewOfSection(handle, process, *base, zero_bits, commit_size,
 /// *offset, *size, inherit, allocation_type, protection)
 pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    let &[handle, process, base_out, _, _, offset, size_out, _, _, _] = args else {
+    let &[
+        handle,
+        process,
+        base_out,
+        _,
+        _,
+        offset,
+        size_out,
+        _,
+        _,
+        protection,
+    ] = args
+    else {
         unreachable!()
     };
     status::finish((|| {
@@ -139,6 +299,20 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if offset != 0 && (read_u32(env, offset)? != 0 || read_u32(env, offset + 4)? != 0) {
             return Err(Error::Unsupported("mapping a view at an offset".into()));
         }
+        let mut request = GetMappingInfoRequest {
+            handle,
+            access: view_access(protection)?,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        if reply.flags & SEC_IMAGE == 0 {
+            let requested = read_u32(env, size_out)?;
+            let (base, size) = map_data(env, handle, reply.size, requested, protection)?;
+            write_u32(env, base_out, base)?;
+            write_u32(env, size_out, size)?;
+            return Ok(());
+        }
         let view = map_image(env, handle)?;
         write_u32(env, base_out, view.base)?;
         write_u32(env, size_out, view.size)?;
@@ -148,6 +322,93 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if view.info.machine != MACHINE_I386 {
             return Err(IMAGE_MACHINE_TYPE_MISMATCH.into());
         }
+        Ok(())
+    })())
+}
+
+/// The section access a view with `protection` needs.
+fn view_access(protection: u32) -> Result<u32, Error> {
+    use crate::memory::*;
+    Ok(match protection & 0xff {
+        PAGE_NOACCESS => 0,
+        PAGE_READONLY | PAGE_WRITECOPY => SECTION_MAP_READ,
+        PAGE_READWRITE => SECTION_MAP_READ | SECTION_MAP_WRITE,
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_WRITECOPY => {
+            SECTION_MAP_READ | SECTION_MAP_EXECUTE
+        }
+        PAGE_EXECUTE_READWRITE => SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_MAP_EXECUTE,
+        _ => return Err(status::INVALID_PAGE_PROTECTION.into()),
+    })
+}
+
+/// Maps a view of a data section with its file's contents. The view is a
+/// copy, so a writable view, whose writes other views and the file would
+/// see, is not supported.
+fn map_data(
+    env: &mut Env<'_>,
+    mapping: u32,
+    section_size: u64,
+    requested: u32,
+    protection: u32,
+) -> Result<(u32, u32), Error> {
+    use crate::memory::*;
+    if matches!(protection & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
+        return Err(Error::Unsupported(
+            "mapping a writable view of a data section".into(),
+        ));
+    }
+    let size = match requested {
+        0 => u32::try_from(section_size).map_err(|_| status::NO_MEMORY)?,
+        requested if u64::from(requested) > section_size => {
+            return Err(status::INVALID_VIEW_SIZE.into());
+        }
+        requested => requested,
+    };
+    let fd = server::handle_fd(env, mapping)?;
+    let mut bytes =
+        read_file(fd.fd).map_err(|error| Error::Unsupported(format!("section file: {error}")))?;
+    drop(fd);
+    bytes.truncate(size as usize);
+    let memory = env.ext.get_or_default::<Memory>();
+    let base = memory::map_view(env.cpu, &mut env.sys.vm, memory, &bytes, size, protection)?;
+    let mut request = MapViewRequest {
+        mapping,
+        access: view_access(protection)?,
+        base: u64::from(base),
+        size: u64::from(align_up(size, PAGE)),
+        start: 0,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    if let Err(error) = status::check(reply.header.error) {
+        let memory = env.ext.get_or_default::<Memory>();
+        memory::remove_view(env.cpu, &mut env.sys.vm, memory, base);
+        return Err(error);
+    }
+    Ok((base, align_up(size, PAGE)))
+}
+
+/// NtUnmapViewOfSection(process, address)
+pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, address] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if process != CURRENT_PROCESS {
+            return Err(Error::Unsupported(
+                "unmapping a view of another process".into(),
+            ));
+        }
+        let memory = env.ext.get_or_default::<Memory>();
+        let base = memory::view_base(memory, address).ok_or(status::NOT_MAPPED_VIEW)?;
+        let mut request = UnmapViewRequest {
+            base: u64::from(base),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        let memory = env.ext.get_or_default::<Memory>();
+        memory::remove_view(env.cpu, &mut env.sys.vm, memory, base);
         Ok(())
     })())
 }
@@ -165,7 +426,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     if reply.shared_file != 0 {
         return Err(Error::Unsupported("images with shared sections".into()));
     }
-    if size < IMAGE_INFO_SIZE {
+    if size < PE_IMAGE_INFO_SIZE {
         return Err(Error::Unsupported(
             "mapping a view of a data section".into(),
         ));

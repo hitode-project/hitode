@@ -213,6 +213,7 @@ dependencies = [
  "adv-wineserver",
  "iced-x86",
  "libc",
+ "log",
  "thiserror 2.0.21",
 ]
 
