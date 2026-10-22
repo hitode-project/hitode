@@ -135,12 +135,12 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-USER-6 Window placement and coordinates
 
-**Rule**: SetWindowPlacement MUST validate complete structures and lengths before changing state through shared USER geometry, visibility and activation callbacks. Normal windows MUST recover offscreen placement into the virtual work area, while tool windows preserve screen coordinates. Coordinate mapping and child hit tests MUST follow `User::client_origin`, mirroring and immediate-child z-order.
+**Rule**: SetWindowPlacement MUST validate complete structures and lengths before changing state through shared USER geometry, visibility and activation callbacks. Deferred positioning MUST publish all guest-edited geometry before change notifications. Coordinate mapping and child hit tests MUST follow `User::client_origin`, mirroring and immediate-child z-order.
 **Verification**: Test
 
 ### WIN32-USER-7 Placement state and limits
 
-**Rule**: Placement MUST retain minimum position and restore-to-maximized state in the window owner. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly. Z-order operations MUST preserve topmost bands and ownership constraints, retaining foreground identity when activation is suppressed.
+**Rule**: Placement MUST retain minimum positions and restore-to-maximized state, recovering offscreen normal rectangles into the work area while preserving tool-window screen coordinates. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly. Z-order operations MUST preserve topmost bands and ownership constraints, retaining foreground identity when activation is suppressed.
 **Verification**: Test
 
 ### WIN32-USER-8 Physical double clicks

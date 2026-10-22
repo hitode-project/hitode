@@ -45,6 +45,7 @@ use super::message::{send, send_all};
 use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr, set_last_error};
 use crate::{Win32, stdcall};
+mod position;
 mod style;
 mod z_order;
 
@@ -478,6 +479,7 @@ pub struct User {
     /// Last foreground identity survives host deactivation, independently of z-order.
     pub(super) foreground: u32,
     pub(super) foreground_active: bool,
+    deferred_positions: Option<Namespace>,
     next_hwnd: u32,
     pub desktop: u32,
     pub queues: HashMap<CtxId, Queue>,
@@ -533,6 +535,7 @@ impl User {
             top: Vec::new(),
             foreground: 0,
             foreground_active: false,
+            deferred_positions: None,
             next_hwnd: HWND_BASE,
             desktop: 0,
             queues: HashMap::new(),
@@ -1934,101 +1937,10 @@ pub fn set_window_pos(
     hwnd: u32,
     after: u32,
     rect: Rect,
-    mut flags: u32,
+    flags: u32,
     then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
 ) -> Outcome {
-    let u = &mut env.ext.get_mut::<crate::Win32>().user;
-    let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
-        set_last_error(env, 1400);
-        return then(env, false);
-    };
-    if flags & SWP_NOZORDER == 0 && !z_order::valid(u, &env.sys.objects, hwnd, after) {
-        set_last_error(env, 1400);
-        return then(env, false);
-    }
-    let old = w.rect;
-    let (x, y) = if flags & SWP_NOMOVE != 0 {
-        (old.left, old.top)
-    } else {
-        (rect.left, rect.top)
-    };
-    let (cx, cy) = if flags & SWP_NOSIZE != 0 {
-        (old.width(), old.height())
-    } else {
-        (rect.width(), rect.height())
-    };
-    if (x, y) == (old.left, old.top) && flags & SWP_FRAMECHANGED == 0 {
-        flags |= SWP_NOMOVE | SWP_NOCLIENTMOVE;
-    }
-    if (cx, cy) == (old.width(), old.height()) && flags & SWP_FRAMECHANGED == 0 {
-        flags |= SWP_NOSIZE | SWP_NOCLIENTSIZE;
-    }
-    // WINDOWPOS: hwnd, hwndInsertAfter, x, y, cx, cy, flags.
-    let wp = temp_alloc(env, 28);
-    if wp == 0 {
-        set_last_error(env, 8);
-        return then(env, false);
-    }
-    for (i, v) in [hwnd, after, x as u32, y as u32, cx as u32, cy as u32, flags]
-        .into_iter()
-        .enumerate()
-    {
-        if env.cpu.write_u32(wp + 4 * i as u32, v).is_err() {
-            temp_free(env, wp);
-            set_last_error(env, 8);
-            return then(env, false);
-        }
-    }
-    let apply = move |env: &mut Env<'_>, _: u32| {
-        // The window procedure may have adjusted the position.
-        let r = |i: u32| env.cpu.read_u32(wp + 4 * i).unwrap_or(0) as i32;
-        let (x, y, cx, cy) = (r(2), r(3), r(4), r(5));
-        let flags = r(6) as u32;
-        let u = &mut env.ext.get_mut::<crate::Win32>().user;
-        let after = env.cpu.read_u32(wp + 4).unwrap_or(after);
-        if !u.windows.contains_key(&env.sys.objects, &hwnd)
-            || flags & SWP_NOZORDER == 0 && !z_order::valid(u, &env.sys.objects, hwnd, after)
-        {
-            temp_free(env, wp);
-            set_last_error(env, 1400);
-            return then(env, false);
-        }
-        if let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) {
-            w.rect = Rect::new(x, y, cx, cy);
-            super::placement::position_changed(w);
-            if flags & SWP_NOSIZE == 0 {
-                w.invalidate_client(true);
-            }
-        }
-        if flags & SWP_NOZORDER == 0 && !z_order::place(u, &mut env.sys.objects, hwnd, after) {
-            temp_free(env, wp);
-            set_last_error(env, 1400);
-            return then(env, false);
-        }
-        send(env, hwnd, wm::WINDOWPOSCHANGED, 0, wp, move |env, _| {
-            temp_free(env, wp);
-            let show = if flags & SWP_SHOWWINDOW != 0 {
-                Some(if flags & SWP_NOACTIVATE != 0 {
-                    SW_SHOWNA
-                } else {
-                    SW_SHOW
-                })
-            } else if flags & SWP_HIDEWINDOW != 0 {
-                Some(SW_HIDE)
-            } else {
-                None
-            };
-            match show {
-                Some(cmd) => show_window(env, hwnd, cmd, move |env, _| then(env, true)),
-                None => then(env, true),
-            }
-        })
-    };
-    if flags & 0x400 != 0 {
-        apply(env, 0)
-    } else {
-        send(env, hwnd, wm::WINDOWPOSCHANGING, 0, wp, apply)
-    }
+    position::single(env, hwnd, after, rect, flags, then)
 }
 
 /// Default handling of WM_WINDOWPOSCHANGED: WM_MOVE and WM_SIZE.
@@ -2069,7 +1981,14 @@ fn set_window_pos_api(env: &mut Env<'_>) -> Outcome {
         env.arg(5) as i32,
         env.arg(6),
     );
-    set_window_pos(env, hwnd, after, Rect::new(x, y, cx, cy), flags, |_, ok| {
+    let rect = match position::requested(env, hwnd, x, y, cx, cy, flags) {
+        Ok(rect) => rect,
+        Err(error) => {
+            set_last_error(env, error);
+            return Outcome::Return(0);
+        }
+    };
+    set_window_pos(env, hwnd, after, rect, flags, |_, ok| {
         Outcome::Return(u32::from(ok))
     })
 }
@@ -2082,11 +2001,18 @@ fn move_window(env: &mut Env<'_>) -> Outcome {
         env.arg(3) as i32,
         env.arg(4) as i32,
     );
+    let rect = match position::requested(env, hwnd, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) {
+        Ok(rect) => rect,
+        Err(error) => {
+            set_last_error(env, error);
+            return Outcome::Return(0);
+        }
+    };
     set_window_pos(
         env,
         hwnd,
         0,
-        Rect::new(x, y, w, h),
+        rect,
         SWP_NOZORDER | SWP_NOACTIVATE,
         |_, ok| Outcome::Return(u32::from(ok)),
     )
@@ -3227,6 +3153,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "ShowOwnedPopups", 2, show_owned_popups);
     s(reg, "UpdateWindow", 1, update_window);
     s(reg, "LockWindowUpdate", 1, lock_window_update);
+    position::register(reg);
     s(reg, "SetWindowPos", 7, set_window_pos_api);
     reg.register(bring_to_top_ABI);
     s(reg, "MoveWindow", 6, move_window);
