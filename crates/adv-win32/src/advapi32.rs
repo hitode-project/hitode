@@ -2,6 +2,7 @@
 use std::collections::BTreeMap;
 
 mod crypto;
+pub(crate) use crypto::digest::Digest;
 mod groups;
 mod identity;
 mod scm;

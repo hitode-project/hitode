@@ -1,7 +1,7 @@
 //! CryptoAPI contexts and streaming hashes. CSP handles live in Objects' own
 //! alias namespace, distinct from CloseHandle's kernel handles.
 mod cipher;
-mod digest;
+pub(super) mod digest;
 mod hash;
 mod hmac;
 mod key;

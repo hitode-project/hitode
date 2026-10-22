@@ -2,14 +2,14 @@
 //! All arithmetic and padding live here; the guest API only owns lifecycle.
 
 #[derive(Clone)]
-pub(super) struct Digest {
+pub(crate) struct Digest {
     algorithm: u32,
     state: [u64; 8],
     pending: Vec<u8>,
     length: u128,
 }
 impl Digest {
-    pub(super) fn new(algorithm: u32) -> Option<Self> {
+    pub(crate) fn new(algorithm: u32) -> Option<Self> {
         let state = match algorithm {
             0x8003 => [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0, 0, 0, 0],
             0x8004 => [
@@ -67,7 +67,7 @@ impl Digest {
             _ => 64,
         }
     }
-    pub(super) fn update(&mut self, mut bytes: &[u8]) {
+    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
         self.length = self.length.wrapping_add(bytes.len() as u128);
         let block = self.block_size();
         if !self.pending.is_empty() {
@@ -93,7 +93,7 @@ impl Digest {
             _ => sha512(&mut self.state, block),
         }
     }
-    pub(super) fn finish(&self) -> Vec<u8> {
+    pub(crate) fn finish(&self) -> Vec<u8> {
         let mut value = self.clone();
         let block = self.block_size();
         let length_bytes = if block == 128 { 16 } else { 8 };

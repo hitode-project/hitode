@@ -17,6 +17,7 @@ mod guest_code;
 pub(crate) mod heap_lock;
 pub mod kernel32;
 mod misc;
+mod msi;
 mod native;
 mod native_heap;
 mod network;
@@ -217,6 +218,7 @@ pub fn register(reg: &mut Registry) {
     imm32::register(reg);
     version::register(reg);
     psapi::register(reg);
+    msi::register(reg);
     vfw::register(reg);
     winsock::register(reg);
     winhttp::register(reg);

@@ -266,3 +266,16 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: AllocConsole MUST fail and report a capability gap when no host console transport is provided. It MUST NOT publish a console window or valid console handles.
 **Verification**: Test
+
+## Installer discovery
+
+### PERS-INSTALL-1 Empty installed state
+
+**Rule**: MSI discovery MUST report the profile's empty installed product and component sets without capability warnings. Queries MUST distinguish unknown products, unknown components and malformed identifiers. Unknown-item failures MUST preserve output buffers and direct-status APIs MUST preserve LastError.
+**Verification**: Test
+
+### PERS-INSTALL-2 Installer file hashes
+
+**Rule**: MsiGetFileHash MUST compute the real MD5 of guest file bytes through the existing VFS and coherent file readers. A/W paths MUST share that implementation. Invalid hash structures and failed reads MUST preserve hash output.
+**Verification**: Test
+**Basis**: Microsoft MsiGetFileHash documentation and RFC 1321.
