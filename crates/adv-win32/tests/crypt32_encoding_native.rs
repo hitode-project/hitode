@@ -36,18 +36,21 @@ fn byte_encodings_match_native_crypt32() {
             for ending in [0, 0x40000000, 0x80000000] {
                 let flags = format | ending;
                 let mut size = 0;
-                assert_ne!(
-                    unsafe {
-                        CryptBinaryToStringA(
-                            input.as_ptr(),
-                            length as u32,
-                            flags,
-                            std::ptr::null_mut(),
-                            &mut size,
-                        )
-                    },
-                    0
-                );
+                let query = unsafe {
+                    CryptBinaryToStringA(
+                        input.as_ptr(),
+                        length as u32,
+                        flags,
+                        std::ptr::null_mut(),
+                        &mut size,
+                    )
+                };
+                if query == 0 {
+                    let error = unsafe { GetLastError() };
+                    assert_eq!(length, 0, "flags={flags:x} error={error}");
+                    eprintln!("empty encoding flags={flags:x} error={error}");
+                    continue;
+                }
                 let mut native = vec![0xcd; size as usize];
                 assert_ne!(
                     unsafe {
@@ -106,32 +109,57 @@ fn decoding_and_detection_match_native_crypt32() {
         "preamble\r\n-----BEGIN PUBLIC KEY-----\r\nZm9v\r\n-----END DIFFERENT-----\r\n",
     ] {
         let units = input.encode_utf16().collect::<Vec<_>>();
-        let terminated = input.bytes().chain([0]).collect::<Vec<_>>();
+        // Some native binary-copy paths use the output count as the copy
+        // length. Keep every possible source byte inside an authored zeroed
+        // allocation, query the exact size, and never log beyond that extent.
+        let mut terminated = vec![0u8; 4096];
+        terminated[..input.len()].copy_from_slice(input.as_bytes());
         for format in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
             for strict in [0, 0x20000000] {
                 let flags = format | strict;
-                let mut size = 4096;
+                let mut size = 0;
                 let mut skip = u32::MAX;
                 let mut detected = u32::MAX;
-                let mut output = vec![0xcd; size as usize];
-                let result = unsafe {
+                let query = unsafe {
                     CryptStringToBinaryA(
                         terminated.as_ptr(),
                         input.len() as u32,
                         flags,
-                        output.as_mut_ptr(),
+                        std::ptr::null_mut(),
                         &mut size,
                         &mut skip,
                         &mut detected,
                     )
                 };
-                let error = unsafe { GetLastError() };
-                output.truncate(size as usize);
-                let native = if result == 0 {
-                    Err(error)
+                assert!(size <= terminated.len() as u32);
+                let native = if query == 0 {
+                    Err(unsafe { GetLastError() })
                 } else {
-                    Ok((output, skip, detected))
+                    let mut output = vec![0xcd; (size as usize).max(1)];
+                    let result = unsafe {
+                        CryptStringToBinaryA(
+                            terminated.as_ptr(),
+                            input.len() as u32,
+                            flags,
+                            output.as_mut_ptr(),
+                            &mut size,
+                            &mut skip,
+                            &mut detected,
+                        )
+                    };
+                    assert!(size as usize <= output.len());
+                    if result == 0 {
+                        Err(unsafe { GetLastError() })
+                    } else {
+                        output.truncate(size as usize);
+                        Ok((output, skip, detected))
+                    }
                 };
+                // URI Base64 is a later Windows extension outside the Win7
+                // format set. Do not use that path as a Win7 reference.
+                if native.as_ref().is_ok_and(|(_, _, format)| *format == 13) {
+                    continue;
+                }
                 let guest = encoding::decode(&units, input.as_bytes(), flags);
                 if native != guest {
                     eprintln!("input={input:?} flags={flags:x} native={native:?} guest={guest:?}");
