@@ -7,8 +7,10 @@ come from docs/host-call-boundary.tsv. A UCRT API-set name counts as covered whe
 ucrtbase.dll registers it. Data exports are not host calls and are absent from the
 table; they are counted apart and never reported as missing code. Functions
 data/abi/post-win7.tsv lists were introduced after Windows 7, stay unimplemented
-so discovery hides them, and are counted as excluded. Without DLL arguments every
-catalog module is listed, most missing first; --missing also prints the missing names.
+so discovery hides them, and are counted as excluded. --closure replaces the
+catalogs with data/abi/closure.tsv, the functions sample games import or look up.
+Without DLL arguments every module is listed, most missing first; --missing also
+prints the missing names.
 """
 import argparse
 import collections
@@ -51,8 +53,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dlls", nargs="*")
     parser.add_argument("--missing", action="store_true")
+    parser.add_argument("--closure", action="store_true")
     args = parser.parse_args()
     have, exports, later = where.registered(), catalog(), post_win7()
+    if args.closure:
+        sampled = collections.defaultdict(dict)
+        for dll, name, _ in rows(ABI / "closure.tsv"):
+            sampled[dll][name] = exports.get(dll, {}).get(name, "code")
+        exports = sampled
     selected = [dll.lower() for dll in args.dlls] or list(exports)
     unknown = [dll for dll in selected if dll not in exports]
     if unknown:
