@@ -19,7 +19,7 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $validOutput 'signatures.t
     $fields = $line.Split("`t")
     $rows[$fields[0] + '!' + $fields[1]] = $fields
 }
-$expectedScope = @{ 'ntdll.dll' = 3; 'shfolder.dll' = 2; 'imagehlp.dll' = 1 }
+$expectedScope = @{ 'ntdll.dll' = 4; 'shfolder.dll' = 2; 'imagehlp.dll' = 1 }
 foreach ($module in $expectedScope.Keys) {
     if (($rows.Keys | Where-Object { $_.StartsWith($module + '!') }).Count -ne $expectedScope[$module]) { throw "Selection widened $module" }
 }

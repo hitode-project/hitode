@@ -354,3 +354,15 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: Local printer enumeration MUST return zero installed or connected printers with checked count outputs. OpenPrinter MUST distinguish the real local server from absent printer devices and enforce ordinary-user access. Printer-device queries MUST fail without fabricating device modes or modifying their output buffers.
 **Verification**: Test
 **Basis**: Microsoft OpenPrinter, EnumPrinters and DocumentProperties contracts and the configured printer-free profile.
+
+### PERS-REG-1 Shared registry entry points
+
+**Rule**: Legacy, extended, and native registry entry points MUST share keys, names, access checks and deleted-handle state. Enumeration MUST use stored spellings and bounded output buffers.
+**Verification**: Test
+**Basis**: Microsoft RegEnumKey, RegDeleteKeyEx and NtOpenKey contracts.
+
+### PERS-STR-1 Counted RTL conversion
+
+**Rule**: Counted ANSI-to-Unicode conversion MUST use the guest ACP and explicit byte length. Insufficient supplied storage MUST preserve the destination descriptor and payload. Allocated strings MUST use the process heap and remain releasable by RtlFreeUnicodeString.
+**Verification**: Test
+**Basis**: Microsoft RtlAnsiStringToUnicodeString and authored native capacity controls.
