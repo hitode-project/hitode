@@ -313,3 +313,20 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: SignalObjectAndWait MUST signal an existing event, release an owned mutex or increment a semaphore before waiting through the shared scheduler. Invalid wait handles MUST leave the signal object unchanged. Alertable waits MUST dispatch queued APCs and report WAIT_IO_COMPLETION.
 **Verification**: Test
 **Basis**: Microsoft SignalObjectAndWait documentation.
+
+### PERS-PROFILEFILE-1 File-backed INI mutations
+
+**Rule**: Profile queries and writers MUST share the INI parser, VFS layout and coherent file owners. Section replacement MUST preserve unrelated sections. Writers MUST retain UTF-16LE files and encode other files through the guest ANSI code page.
+**Verification**: Test
+**Basis**: Microsoft GetPrivateProfileSection, WritePrivateProfileSection and WritePrivateProfileString documentation.
+
+### PERS-PROFILEFILE-2 Checksummed profile structures
+
+**Rule**: Profile structure writers MUST store the actual bytes with their checksum. Readers MUST validate size and checksum before writing guest output. Invalid data and inaccessible outputs MUST preserve output bytes.
+**Verification**: Test
+**Basis**: Microsoft GetPrivateProfileStruct and WritePrivateProfileStruct documentation.
+
+### PERS-PROFILEFILE-3 Native profile writes
+
+**Rule**: Modified native file entries MUST control profile opens, writes, truncation and closes. Failed writes MUST NOT truncate the file. Temporary native handles and guest scratch MUST be released after synchronous completion.
+**Verification**: Test
