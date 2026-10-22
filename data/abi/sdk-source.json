@@ -454,5 +454,33 @@
       "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-mciwndregisterclass",
       "https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/Vfw.h"
     ]
+  },
+  "equal_guid": {
+    "scope": "ole32.dll!IsEqualGUID only; the pinned WinMD omits the exported macro helper",
+    "source": "Microsoft Windows SDK 10.0.26100.1 x86 Ole32.Lib and the pinned Microsoft guiddef.h declarations",
+    "header_url": "https://raw.githubusercontent.com/microsoft/win32metadata/2f767671802301cf043c717d66bf004ed7863487/generation/WinSDK/RecompiledIdlHeaders/shared/guiddef.h",
+    "header_sha256": "7b0ff3b03ace4b2b26f2765ff7b68a925242ee13f678672491c4b347b0dcbff6",
+    "sdk_package": "Microsoft.Windows.SDK.CPP.x86 10.0.26100.1; c/um/x86/Ole32.Lib",
+    "sdk_library_sha256": "fe24373081cef2457627c82307ae7ac785e1f1907e8cb6a641d174b5f1161bca",
+    "target": "SDK import symbols _IsEqualGUID@8 and __imp__IsEqualGUID@8 establish x86 stdcall with two GUID pointers and a BOOL result",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/guiddef/nf-guiddef-isequalguid"
+  },
+  "legacy_d3dx_graphics_helpers": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "url": "https://www.nuget.org/packages/Microsoft.DXSDK.D3DX/9.29.952.8",
+    "headers_sha256": {
+      "d3dx9core.h": "7e360611940e9520c9dd983dbe9e48a78df8b723d95de1a57a63580de52a0207",
+      "d3dx9shape.h": "481ce5fc79bba00750dce857e6d0507cb0b7b82013bcea1728b1abfdc5fe9a7b",
+      "d3dx9tex.h": "64dfa1f26d6df792f6cf261c79f737e6e5c7670787ba6abfe0f76aba348e9422",
+      "d3dx9mesh.h": "9430487b9a0f6cbbb6839e27811bb70bbcd2d958666fc75c8da9d20ccc60bc41"
+    },
+    "scope": "D3DXCreateLine, D3DXCreateSphere, D3DXCreateTextureFromFileInMemory and D3DXLoadMeshFromXInMemory in d3dx9_43.dll only",
+    "target": "x86 WINAPI stdcall, HRESULT returns; two, six, four and nine stack words respectively; Sphere Radius is FLOAT, not an integer word",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreateline",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatesphere",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemory",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxloadmeshfromxinmemory"
+    ]
   }
 }

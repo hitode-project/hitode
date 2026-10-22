@@ -1123,6 +1123,7 @@ fn create_visible_windows_notifies_parent_then_shows_and_activates() {
             (parent, wm::MOVE),
             (parent, wm::SHOWWINDOW),
             (parent, wm::ACTIVATEAPP),
+            (parent, wm::NCACTIVATE),
             (parent, wm::ACTIVATE),
             (parent, wm::SETFOCUS),
             (child, wm::NCCREATE),
@@ -1136,7 +1137,9 @@ fn create_visible_windows_notifies_parent_then_shows_and_activates() {
             (other, wm::SIZE),
             (other, wm::MOVE),
             (other, wm::SHOWWINDOW),
+            (parent, wm::NCACTIVATE),
             (parent, wm::ACTIVATE),
+            (other, wm::NCACTIVATE),
             (other, wm::ACTIVATE),
             (parent, wm::KILLFOCUS),
             (other, wm::SETFOCUS),
@@ -1146,11 +1149,11 @@ fn create_visible_windows_notifies_parent_then_shows_and_activates() {
     assert_eq!(log[2], [parent, wm::SIZE, 0, 120 | (80 << 16)]);
     assert_eq!(log[3], [parent, wm::MOVE, 0, 20 | (30 << 16)]);
     assert_eq!(
-        log[12],
+        log[13],
         [parent, wm::PARENTNOTIFY, wm::CREATE | (42 << 16), child]
     );
-    assert_eq!(log[19], [parent, wm::ACTIVATE, 0, other]);
-    assert_eq!(log[20], [other, wm::ACTIVATE, 1, parent]);
+    assert_eq!(log[21], [parent, wm::ACTIVATE, 0, other]);
+    assert_eq!(log[23], [other, wm::ACTIVATE, 1, parent]);
 }
 
 #[test]

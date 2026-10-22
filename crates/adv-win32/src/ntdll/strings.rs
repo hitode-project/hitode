@@ -6,6 +6,7 @@ use adv_machine::Env;
 pub(super) fn register(registry: &mut Registry) {
     registry.register(equal_ABI);
     registry.register(init_ansi_ABI);
+    registry.register(ansi_to_unicode_ABI);
 }
 
 fn descriptor(env: &Env<'_>, pointer: GuestPtr<()>) -> Result<(u16, u32), MemFault> {
@@ -74,4 +75,75 @@ fn init_ansi(env: &mut Env<'_>, output: GuestPtr<()>, source: AnsiStr) -> Result
         descriptor[4..].copy_from_slice(&source.0.addr().to_le_bytes());
     }
     env.cpu.write(output.addr(), &descriptor)
+}
+
+#[win32(ntdll, name = "RtlAnsiStringToUnicodeString", level = implement)]
+fn ansi_to_unicode(
+    env: &mut Env<'_>,
+    destination: GuestPtr<()>,
+    source: GuestPtr<()>,
+    allocate: u32,
+) -> i32 {
+    let result = (|| -> Result<(), u32> {
+        const ACCESS_VIOLATION: u32 = 0xc0000005;
+        check_range(env.cpu, destination.addr(), 8, Prot::RW).map_err(|_| ACCESS_VIOLATION)?;
+        let (length, input) = descriptor(env, source).map_err(|_| ACCESS_VIOLATION)?;
+        check_range(env.cpu, input, u32::from(length), Prot::READ).map_err(|_| ACCESS_VIOLATION)?;
+        let mut bytes = vec![0; usize::from(length)];
+        if length != 0 {
+            env.cpu
+                .read(input, &mut bytes)
+                .map_err(|_| ACCESS_VIOLATION)?;
+        }
+        let units = env.ext.get::<crate::Win32>().codec.to_utf16(0, &bytes);
+        let needed = units.len() * 2 + 2;
+        if needed > usize::from(u16::MAX) {
+            return Err(0xc00000f0);
+        }
+        let output = units
+            .into_iter()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut record = [0; 8];
+        env.cpu
+            .read(destination.addr(), &mut record)
+            .map_err(|_| ACCESS_VIOLATION)?;
+        let heap = env.ext.get::<adv_os::Heaps>().process_heap;
+        let allocated = allocate & 0xff != 0;
+        let pointer = if allocated {
+            env.ext
+                .get_mut::<adv_os::Heaps>()
+                .alloc(env.cpu, &mut env.sys.vm, heap, needed as u32, false)
+                .ok_or(0xc0000017u32)?
+        } else {
+            let capacity = u16::from_le_bytes(record[2..4].try_into().unwrap());
+            if usize::from(capacity) < needed {
+                return Err(0x80000005);
+            }
+            u32::from_le_bytes(record[4..].try_into().unwrap())
+        };
+        if check_range(env.cpu, pointer, needed as u32, Prot::WRITE).is_err()
+            || env.cpu.write(pointer, &output).is_err()
+        {
+            if allocated {
+                env.ext
+                    .get_mut::<adv_os::Heaps>()
+                    .free(env.cpu, &mut env.sys.vm, heap, pointer);
+            }
+            return Err(ACCESS_VIOLATION);
+        }
+        record[..2].copy_from_slice(&((needed - 2) as u16).to_le_bytes());
+        if allocated {
+            record[2..4].copy_from_slice(&(needed as u16).to_le_bytes());
+            record[4..].copy_from_slice(&pointer.to_le_bytes());
+        }
+        // Copy the source before publishing the descriptor, including when
+        // the two descriptors alias. Counted NULs are data, never terminators.
+        env.cpu
+            .write(destination.addr(), &record)
+            .map_err(|_| ACCESS_VIOLATION)?;
+        Ok(())
+    })();
+    result.err().unwrap_or(0) as i32
 }

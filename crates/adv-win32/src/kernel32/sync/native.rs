@@ -142,6 +142,39 @@ pub(super) fn wait_front(env: &mut Env<'_>, handle: u32, ms: u32, alertable: boo
     }
 }
 
+/// Signaling and waiting share the existing scheduler owners. Windows does not
+/// guarantee an atomic transition: already blocked waiters can receive the signal
+/// before this caller starts waiting, including when both handles alias an object.
+pub(super) fn signal_wait_front(env: &mut Env<'_>) -> Outcome {
+    let (signal, wait, milliseconds, alertable) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3) != 0);
+    if let Err(status) = valid(env, wait) {
+        return front_result(env, status);
+    }
+    let signaled = match env.sys.objects.get(signal) {
+        Some(Object::Event { .. }) => event::state_front(env, true),
+        Some(Object::Mutex { .. }) => owned::release_at(env, owned::Kind::Mutant, signal, 0, 0),
+        Some(Object::Semaphore { .. }) => {
+            owned::release_at(env, owned::Kind::Semaphore, signal, 1, 0)
+        }
+        _ => {
+            set_last_error(env, err::INVALID_HANDLE);
+            return Outcome::Return(WAIT_FAILED);
+        }
+    };
+    native_thread::map_status(
+        env,
+        signaled,
+        Box::new(move |env, succeeded| {
+            if succeeded == 0 {
+                Outcome::Return(WAIT_FAILED)
+            } else {
+                wait_front(env, wait, milliseconds, alertable)
+            }
+        }),
+    )
+}
+
 fn handles(env: &Env<'_>, count: u32, pointer: u32, all: bool) -> Result<Vec<u32>, u32> {
     if count == 0 || count > 64 {
         return Err(0xc000000d);

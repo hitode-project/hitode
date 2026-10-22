@@ -18,7 +18,7 @@ impl<B: Backend> Runtime<B> {
     pub fn latest_cpu_fault(&self) -> Option<&adv_machine::exception::CpuFaultSnapshot> {
         self.machine.sys.latest_cpu_fault.as_ref()
     }
-    fn api_registry(&self) -> &adv_abi::Registry {
+    pub(crate) fn api_registry(&self) -> &adv_abi::Registry {
         (self.machine.sys.thunks.resolver() as &dyn std::any::Any)
             .downcast_ref()
             .expect("runtime ABI registry")

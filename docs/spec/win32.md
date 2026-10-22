@@ -133,14 +133,14 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 > Note: HOST-MENU-1 and HOST-MENU-3 in [host.md](host.md) cover the native menu side.
 
-### WIN32-USER-6 Window placement
+### WIN32-USER-6 Window placement and coordinates
 
-**Rule**: SetWindowPlacement MUST validate the complete structure and length before changing state, then use USER geometry, visibility, and activation callbacks. Normal windows MUST recover offscreen placement into the virtual work area; tool windows MUST preserve screen coordinates.
+**Rule**: SetWindowPlacement MUST validate complete structures and lengths before changing state through shared USER geometry, visibility and activation callbacks. Deferred positioning MUST publish all guest-edited geometry before change notifications. Coordinate mapping and child hit tests MUST follow `User::client_origin`, mirroring and immediate-child z-order.
 **Verification**: Test
 
 ### WIN32-USER-7 Placement state and limits
 
-**Rule**: Placement MUST retain minimum position and restore-to-maximized state in the window owner. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly.
+**Rule**: Placement MUST retain minimum positions and restore-to-maximized state, recovering offscreen normal rectangles into the work area while preserving tool-window screen coordinates. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly. Z-order operations MUST preserve topmost bands and ownership constraints, retaining foreground identity when activation is suppressed.
 **Verification**: Test
 
 ### WIN32-USER-8 Physical double clicks
@@ -153,9 +153,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Double-click APIs and metrics MUST share guest USER configuration, with timing independent of execution speed. They MUST NOT change host settings or transform guest-posted mouse messages.
 **Verification**: Test
 
-### WIN32-USER-10 Class state
+### WIN32-USER-10 USER metadata
 
-**Rule**: A/W class operations MUST share one owner and class-owned menu strings. Replacing a procedure MUST preserve the old procedure's encoding. Unsupported cross-encoding procedure thunks MUST fail explicitly.
+**Rule**: A/W metadata MUST share owners, retain class-owned menu strings, preserve replaced procedure encodings and avoid clearing LastError after successful writes. Style writes MUST send WM_STYLECHANGING and WM_STYLECHANGED, applying guest edits to STYLESTRUCT before publishing state. Unsupported cross-encoding procedure thunks MUST fail explicitly.
 **Verification**: Test
 
 ### WIN32-USER-11 Timed messages
@@ -168,9 +168,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Committed text MUST reach keyboard focus as UTF-16 or packed ANSI `WM_IME_CHAR`, skipping unrepresentable characters. DefWindowProcA MUST split double-byte characters into lead and trail `WM_CHAR`; DefWindowProcW MUST preserve each unit.
 **Verification**: Test
 
-### WIN32-USER-13 IME boundaries
+### WIN32-USER-13 Input capability boundaries
 
-**Rule**: The personality MUST NOT fabricate IME windows or input contexts. Composition and `ImmGetCompositionString` MUST remain explicitly unavailable.
+**Rule**: Missing IME providers and touch/gesture packets MUST NOT produce fabricated windows, contexts, composition data or input handles. `ImmIsIME` MUST report false for non-IME and unknown layouts without changing LastError. Touch registration MUST validate window ownership and flags, retaining changes in the shared window owner independently of device presence.
 **Verification**: Test
 
 ### WIN32-USER-14 Owner-draw button projection
@@ -198,26 +198,26 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: The ListBox class MUST keep items, item data, selection and top index, inserting in case-insensitive order under LBS_SORT. A host selection MUST update the guest selection and notify the parent with LBN_SELCHANGE only under LBS_NOTIFY. Multiple selection and string-less owner-drawn lists MUST warn.
 **Verification**: Test
 
-### WIN32-USER-19 Host activation and restore
+### WIN32-USER-19 Activation and host restore
 
-**Rule**: Host application activation MUST reach the active top-level window as WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE. Deactivation MUST use the reverse order. A host restore or first button press MUST restore a minimized displayed window through WM_SYSCOMMAND SC_RESTORE, which DefWindowProc performs, and consume that press.
+**Rule**: Activation MUST honor nonclient notifications, vetoes and nested activations, while NULL or another thread's window MUST deactivate the calling queue and clear focus. Host application activation MUST deliver WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE, reversing that order on deactivation. A host restore or first button press MUST restore a minimized displayed window through WM_SYSCOMMAND SC_RESTORE and consume that press.
 **Verification**: Test
 
 ### WIN32-USER-20 Input inspection
 
-**Rule**: The host input view MUST report the displayed top-level window and its thread's focus, active and capture windows. A host hit test at a point of the displayed window MUST name the window that ordinary mouse input there reaches.
+**Rule**: Focus MUST activate its root, reject disabled ancestry and unattached queues, and clear when disabling an ancestor. Host input inspection MUST report displayed, active, focus and capture windows, with hit tests identifying the ordinary mouse target. Capture changes MUST notify old owners, including default WM_CANCELMODE release before WM_ENABLE when disabling a window.
 **Verification**: Test
 
 ## Drawing and text
 
 ### WIN32-GDI-1 Virtual display
 
-**Rule**: Basic and extended A/W display queries MUST describe one virtual primary display using complete SDK DEVMODE layouts. They MUST NOT expose host driver-private bytes.
+**Rule**: Basic and extended A/W display queries MUST describe one virtual primary display using complete SDK DEVMODE layouts. They MUST NOT expose host driver-private bytes. DC-origin and system-palette queries MUST reflect shared USER geometry and the true-color display profile independently of viewport mapping.
 **Verification**: Test
 
 ### WIN32-GDI-2 Regions
 
-**Rule**: GDI regions MUST use bounded nonoverlapping rectangles under one object owner, scan-converting curves and polygons per row. Rotating or shearing ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
+**Rule**: GDI and update regions MUST retain exact bounded rectangle unions under existing object owners, preserving old state on capacity failure. GDI curve and polygon regions MUST scan-convert per row, while rotating or shearing ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
 **Verification**: Test
 
 ### WIN32-GDI-3 Presentation canvas
@@ -257,7 +257,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-GDI-10 Selected font metrics
 
-**Rule**: Glyph widths, ABC spacing, and Unicode coverage MUST use the selected device font. Windows MUST preserve native fallback and bitmap-font outcomes; portable measurements MUST use outline advances, hinted bounds, and primary-face coverage.
+**Rule**: Glyph widths, ABC spacing, Unicode coverage and legacy/Point32 A/W text extents MUST share selected device fonts and validation of counted text. Windows MUST preserve native fallback and bitmap-font outcomes; portable measurements MUST use outline advances, hinted bounds, and primary-face coverage.
 **Verification**: Test
 
 ### WIN32-GDI-11 Character placement
@@ -289,7 +289,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-API-2 Absent controllers
 
-**Rule**: XInput 9.1.0, 1.3, and 1.4 MUST report no configured controller without modifying output buffers. Named and supported ordinal entries MUST share identity.
+**Rule**: XInput 1.1, 1.2, 1.3, and 9.1.0 MUST report no configured controller without modifying output buffers. XInput 1.4 entries MUST remain absent under the Windows 7 profile. Named functions and supported ordinals MUST share their mutable entry.
 **Verification**: Test
 
 ### WIN32-API-3 Directory notifications
@@ -312,9 +312,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Ideal-processor APIs MUST share thread identity and the single-CPU profile, accepting processor 0 and using 32 to query the prior value. Ex APIs MUST validate group fields, allow overlapping input/output, and preserve distinct query-output and setter-pointer failures. They MUST NOT bind host threads.
 **Verification**: Test
 
-### WIN32-API-7 Wide strings
+### WIN32-API-7 String boundaries
 
-**Rule**: Wide APIs MUST preserve UTF-16 units, including embedded nulls and raw font-name fields. Zero-capacity LoadStringW MUST return the original resource pointer. CharNextW MUST follow the fixed USER32 traversal table rather than Unicode grapheme boundaries.
+**Rule**: Wide APIs MUST preserve UTF-16 units, including embedded nulls and raw font-name fields. Zero-capacity LoadStringW MUST return the original resource pointer, and CharNextW MUST follow the fixed USER32 traversal table. ANSI traversal MUST preserve DBCS boundaries, and OEM conversions MUST use configured code pages while retaining in-place bytes and terminators.
 **Verification**: Test
 
 ### WIN32-API-8 Absent consoles and devices

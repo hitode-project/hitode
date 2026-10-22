@@ -331,3 +331,24 @@ fn composition_and_window_fronts_fail_without_a_context_and_never_touch_buffers(
     composition(UnicornCpu::new(PARK_ADDR).unwrap());
     composition(JitCpu::new(PARK_ADDR, true).unwrap());
 }
+
+fn installed_layout<B: TestCpu>(cpu: B) {
+    let mut f = Fixture::new(cpu);
+    let layout = f.call("user32.dll!GetKeyboardLayout", &[V(0)]);
+    let mut results = vec![f.checked("ImmIsIME", &[S(layout)])];
+    for hkl in [0, 0x04090409, 0xe0010411, u32::MAX] {
+        results.push(f.checked("ImmIsIME", &[V(hkl)]));
+    }
+    f.run();
+    for result in results {
+        f.assert_result(result, 0, MARKER);
+    }
+    assert!(f.m.ext.get::<adv_abi::ApiDiagnostics>().warnings.is_empty());
+}
+#[test]
+// spec: WIN32-USER-13
+fn non_ime_and_unknown_layouts_preserve_last_error_without_contexts() {
+    installed_layout(UnicornCpu::new(PARK_ADDR).unwrap());
+    installed_layout(JitCpu::new(PARK_ADDR, false).unwrap());
+    installed_layout(JitCpu::new(PARK_ADDR, true).unwrap());
+}

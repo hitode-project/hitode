@@ -62,7 +62,13 @@ fn bmp() -> Vec<u8> {
 #[test]
 // spec: DEV-IMAGE-1
 fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifetime() {
-    let mut m = super::super::tests::machine();
+    for native in [false, true] {
+        image_front(native);
+    }
+}
+
+fn image_front(native: bool) {
+    let mut m = super::super::tests::machine_with_native(native);
     m.sys.objects = Objects::default();
     m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
     let registry = m.sys.thunks.resolver_mut::<Registry>().unwrap();
@@ -144,7 +150,7 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
     call(&mut code, create, &args(OUTPUT, READ_ONLY));
     code.mov_mem_eax(RESULT + 12);
     let mut unsupported = args(OUTPUT, INFO);
-    unsupported[9] = 4;
+    unsupported[9] = 4 | 0x200000; // sRGB input conversion remains a capability boundary.
     call(&mut code, create, &unsupported);
     code.mov_mem_eax(RESULT + 40);
     call(&mut code, create, &args(OUTPUT, INFO));
@@ -164,6 +170,10 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
     code.mov_mem_eax(RESULT + 84);
     call(&mut code, stop, &[]);
     m.cpu.write(CODE, &code.bytes).unwrap();
+    m.cpu
+        .executor_mut()
+        .add_region(adv_cpu::Region::new(CODE, code.bytes.len()))
+        .unwrap();
     m.spawn("authored D3DX texture", CODE, &[], 65536).unwrap();
     let initial = m.sys.objects.object_count();
     let result = m.run_virtual(1_000_000);
@@ -277,4 +287,61 @@ fn guest_image_front_preserves_pixels_typed_abi_guards_and_shared_com_heap_lifet
     assert_eq!(release(&mut env(&mut m), pointer), 0);
     assert!(m.ext.get::<Images>().targets.is_empty());
     assert_eq!(m.sys.objects.object_count(), initial);
+
+    // The documented non-Ex defaults round 3x1 up to 4x1, use managed
+    // storage, and generate the complete 4x1, 2x1, 1x1 chain. Constant
+    // source pixels survive both the triangle reconstruction and box mips.
+    let create_default = m
+        .resolve_import("d3dx9_43.dll", "D3DXCreateTextureFromFileInMemory")
+        .unwrap();
+    let entry = CODE + 2048;
+    let mut code = Asm::new(entry);
+    call(
+        &mut code,
+        create_default,
+        &[device, SOURCE, bytes.len() as u32, OUTPUT],
+    );
+    code.mov_mem_eax(RESULT + 100);
+    method(&mut code, 13, &[]); // GetLevelCount
+    code.mov_mem_eax(RESULT + 104);
+    for level in 0..3 {
+        method(&mut code, 19, &[level, LOCK, 0, 0x10]);
+        code.mov_mem_eax(RESULT + 108 + level * 12);
+        code.mov_eax_mem(LOCK)
+            .mov_mem_eax(RESULT + 112 + level * 12);
+        code.mov_eax_mem(LOCK + 4)
+            .mov_eax_ptr_eax()
+            .mov_mem_eax(RESULT + 116 + level * 12);
+        method(&mut code, 20, &[level]);
+    }
+    method(&mut code, 2, &[]);
+    code.mov_mem_eax(RESULT + 144);
+    call(&mut code, stop, &[]);
+    m.cpu.write(entry, &code.bytes).unwrap();
+    m.cpu
+        .executor_mut()
+        .add_region(adv_cpu::Region::new(entry, code.bytes.len()))
+        .unwrap();
+    m.spawn("default memory texture", entry, &[], 65536)
+        .unwrap();
+    let default_objects = m.sys.objects.object_count();
+    let outcome = m.run_virtual(1_000_000);
+    assert!(matches!(outcome, RunResult::Exited(0)), "{outcome:?}");
+    assert_eq!(m.cpu.read_u32(RESULT + 100).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(RESULT + 104).unwrap(), 3);
+    for level in 0..3 {
+        assert_eq!(m.cpu.read_u32(RESULT + 108 + level * 12).unwrap(), 0);
+        assert_eq!(
+            m.cpu.read_u32(RESULT + 112 + level * 12).unwrap(),
+            4 * (4 >> level)
+        );
+        assert_eq!(
+            m.cpu.read_u32(RESULT + 116 + level * 12).unwrap(),
+            0xff285078
+        );
+    }
+    assert_eq!(m.cpu.read_u32(RESULT + 144).unwrap(), 0);
+    assert!(m.ext.get::<Images>().targets.is_empty());
+    assert!(m.ext.get::<Loading>().pending.is_empty());
+    assert_eq!(m.sys.objects.object_count(), default_objects);
 }

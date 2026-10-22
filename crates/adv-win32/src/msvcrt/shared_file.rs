@@ -49,14 +49,7 @@ fn invalid(env: &mut Env<'_>, clear_dos: bool) -> Outcome {
 }
 
 pub(super) fn dos_errno(dos: u32) -> i32 {
-    match dos {
-        2 | 3 | 15 | 18 | 123 | 206 => 2,
-        5 | 16 | 32 | 33 | 65 => 13,
-        8 | 14 => 12,
-        80 | 183 => 17,
-        112 => 28,
-        _ => 22,
-    }
+    errors::dos_errno(dos)
 }
 
 fn open(env: &mut Env<'_>, filename: u32, mode: u32, share: i32, wide: bool) -> Outcome {

@@ -163,6 +163,31 @@ fn enum_key(env: &mut Env<'_>, wide: bool) -> Outcome {
     })();
     Outcome::Return(result.unwrap_or_else(|error| error))
 }
+
+fn enum_key_legacy_a(env: &mut Env<'_>) -> Outcome {
+    let result = (|| -> Result<u32, u32> {
+        let (handle, index, buffer, capacity) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+        let opened = opened(env, handle)?;
+        if opened.access & ENUMERATE == 0 {
+            return Err(ACCESS_DENIED);
+        }
+        if buffer == 0 {
+            return Err(INVALID_PARAMETER);
+        }
+        let metadata = children(state(env), &opened.key)
+            .nth(index as usize)
+            .map(|(_, metadata)| metadata.clone())
+            .ok_or(NO_MORE_ITEMS)?;
+        let (bytes, length) = text(env, &metadata.display_name, false);
+        if capacity as usize <= length {
+            return Err(MORE_DATA);
+        }
+        range(env, buffer, bytes.len(), false)?;
+        env.cpu.write(buffer, &bytes).map_err(|_| NOACCESS)?;
+        Ok(0)
+    })();
+    Outcome::Return(result.unwrap_or_else(|error| error))
+}
 fn enum_value(env: &mut Env<'_>, wide: bool) -> Outcome {
     let result = (|| -> Result<u32, u32> {
         if env.arg(4) != 0 {
@@ -415,6 +440,28 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
     })();
     Outcome::Return(result.unwrap_or_else(|error| error))
 }
+
+fn delete_key_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let access = env.arg(2);
+    if env.arg(3) != 0 || access & !0x300 != 0 {
+        return Outcome::Return(INVALID_PARAMETER);
+    }
+    if let Err(error) = super::desired_access(access) {
+        if error == super::NOT_SUPPORTED {
+            adv_abi::warn_unavailable(
+                env,
+                if wide {
+                    "advapi32.dll!RegDeleteKeyExW"
+                } else {
+                    "advapi32.dll!RegDeleteKeyExA"
+                },
+                "the explicit 64-bit registry view is unavailable",
+            );
+        }
+        return Outcome::Return(error);
+    }
+    delete_key(env, wide)
+}
 pub(super) fn register(registry: &mut Registry) {
     for (name, argc, handler) in [
         (
@@ -423,6 +470,7 @@ pub(super) fn register(registry: &mut Registry) {
             (|e: &mut Env<'_>| enum_key(e, false)) as adv_machine::Handler,
         ),
         ("RegEnumKeyExW", 8, |e| enum_key(e, true)),
+        ("RegEnumKeyA", 4, enum_key_legacy_a),
         ("RegEnumValueA", 8, |e| enum_value(e, false)),
         ("RegEnumValueW", 8, |e| enum_value(e, true)),
         ("RegQueryInfoKeyA", 12, |e| query_info(e, false)),
@@ -431,7 +479,12 @@ pub(super) fn register(registry: &mut Registry) {
         ("RegDeleteValueW", 2, |e| delete_value(e, true)),
         ("RegDeleteKeyA", 2, |e| delete_key(e, false)),
         ("RegDeleteKeyW", 2, |e| delete_key(e, true)),
+        ("RegDeleteKeyExA", 4, |e| delete_key_ex(e, false)),
+        ("RegDeleteKeyExW", 4, |e| delete_key_ex(e, true)),
     ] {
         stdcall(registry, "advapi32.dll", name, argc, handler);
     }
 }
+
+#[cfg(test)]
+mod closure_tests;

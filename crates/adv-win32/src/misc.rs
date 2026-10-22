@@ -8,6 +8,7 @@ use adv_machine::{Env, Outcome};
 
 mod common_dialogs;
 mod directories;
+mod dispatch_call;
 mod dwm;
 mod folder_browse;
 mod gdiplus;
@@ -16,6 +17,7 @@ mod image_list;
 pub(crate) mod imm;
 mod internet;
 mod ole_memory;
+pub(crate) use ole_memory::parse_guid;
 mod path_match;
 mod property_sheet;
 mod safe_array;
@@ -297,21 +299,37 @@ fn path_is_directory_a(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+/// A CSIDL's folder: under the user's profile when the path is relative.
+fn folder(csidl: u32) -> Option<&'static str> {
+    Some(match csidl & 0xff {
+        0x00 | 0x10 => "Desktop",
+        0x05 => "Documents",
+        0x0d => "Music",
+        0x0e => "Videos",
+        0x1a => "AppData\\Roaming",
+        0x1c => "AppData\\Local",
+        0x20 => "AppData\\Local\\Microsoft\\Windows\\Temporary Internet Files",
+        0x21 => "AppData\\Roaming\\Microsoft\\Windows\\Cookies",
+        0x22 => "AppData\\Local\\Microsoft\\Windows\\History",
+        0x23 => "C:\\ProgramData",
+        0x24 => "C:\\Windows",
+        0x25 => "C:\\Windows\\system32",
+        0x26 => "C:\\Program Files",
+        0x27 => "Pictures",
+        0x28 => "",
+        0x2b => "C:\\Program Files\\Common Files",
+        0x2e => "C:\\Users\\Public\\Documents",
+        _ => return None,
+    })
+}
+
 /// Guest path of a CSIDL folder, or `None` if unsupported.
 fn special_folder(w: &Win32, csidl: u32) -> Option<String> {
     let user = format!("C:\\Users\\{}", w.cfg.os.user_name);
-    Some(match csidl & 0xff {
-        0x00 | 0x10 => format!("{user}\\Desktop"),
-        0x05 => format!("{user}\\Documents"),
-        0x1a => format!("{user}\\AppData\\Roaming"),
-        0x1c => format!("{user}\\AppData\\Local"),
-        0x23 => "C:\\ProgramData".into(),
-        0x24 => "C:\\Windows".into(),
-        0x25 => "C:\\Windows\\system32".into(),
-        0x26 => "C:\\Program Files".into(),
-        0x28 => user,
-        0x2e => "C:\\Users\\Public\\Documents".into(),
-        _ => return None,
+    Some(match folder(csidl)? {
+        "" => user,
+        absolute if absolute.starts_with("C:") => absolute.into(),
+        relative => format!("{user}\\{relative}"),
     })
 }
 
@@ -433,6 +451,16 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHELL32, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
+    for (module, name, param) in [
+        (SHELL32, "SHGetFolderPathA", "csidl"),
+        (SHELL32, "SHGetFolderPathW", "csidl"),
+        (SHFOLDER, "SHGetFolderPathA", "csidl"),
+        (SHFOLDER, "SHGetFolderPathW", "csidl"),
+        (SHELL32, "SHGetSpecialFolderPathA", "csidl"),
+        (SHELL32, "SHGetSpecialFolderPathW", "csidl"),
+    ] {
+        reg.accept(module, name, param, |csidl| folder(csidl).is_some());
+    }
     common_dialogs::register(reg);
     directories::register(reg);
     folder_browse::register(reg);
@@ -442,6 +470,7 @@ pub fn register(reg: &mut Registry) {
     safe_array::register(reg);
     task_allocator::register(reg);
     variant::register(reg);
+    dispatch_call::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
         let flags = e.arg(0);
@@ -450,12 +479,6 @@ pub fn register(reg: &mut Registry) {
         Outcome::Return(0)
     });
     imm::register(reg);
-    stdcall(reg, "mpr.dll", "WNetGetUniversalNameA", 4, |_| {
-        Outcome::Return(2250) // ERROR_NOT_CONNECTED
-    });
-    stdcall(reg, "mpr.dll", "WNetGetUniversalNameW", 4, |_| {
-        Outcome::Return(2250) // ERROR_NOT_CONNECTED
-    });
     stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| {
         Outcome::Return(0)
     });
@@ -506,6 +529,36 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn user_and_shared_folders_resolve_to_their_windows_7_paths() {
+        use adv_cpu::backend::Guest;
+        let mut f = crate::misc::test_support::Fixture::new("special-folders");
+        let buf = crate::misc::test_support::DATA;
+        for (csidl, path) in [
+            (0x0d, r"\Music"),
+            (0x0e, r"\Videos"),
+            (
+                0x20,
+                r"\AppData\Local\Microsoft\Windows\Temporary Internet Files",
+            ),
+            (0x21, r"\AppData\Roaming\Microsoft\Windows\Cookies"),
+            (0x22, r"\AppData\Local\Microsoft\Windows\History"),
+            (0x27 | 0x8000, r"\Pictures"),
+            (0x2b, r"C:\Program Files\Common Files"),
+        ] {
+            assert_eq!(
+                f.call("shell32.dll", "SHGetFolderPathA", &[0, csidl, 0, 0, buf]),
+                0
+            );
+            let mut bytes = vec![0; 260];
+            f.m.cpu.read(buf, &mut bytes).unwrap();
+            let end = bytes.iter().position(|&b| b == 0).unwrap();
+            let text = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            assert!(text.ends_with(path), "{csidl:#x}: {text}");
+        }
+        f.cleanup();
     }
 
     #[test]

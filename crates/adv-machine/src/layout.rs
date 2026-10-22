@@ -34,7 +34,9 @@ pub const GDT_ADDR: u32 = 0x7e11_0000;
 /// Reserved arena for guest-readable synthetic system PE images. Modules use
 /// as many granules as their complete export tables require.
 pub const HOST_MODULE_BASE: u32 = 0x7e40_0000;
-pub const HOST_MODULE_CAP: u32 = 0x40;
+// Full CRT versions and their API-set contracts need more than 64 granules.
+// This stays below the separate TEB/PEB range and outside guest image space.
+pub const HOST_MODULE_CAP: u32 = 0x100;
 /// OS loader records have their own arena so loading metadata cannot consume a
 /// guest DLL's preferred base in the ordinary VirtualAlloc range.
 pub const LDR_BASE: u32 = 0x7e20_0000;

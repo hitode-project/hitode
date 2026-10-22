@@ -339,17 +339,24 @@ fn image_size(env: &mut Env<'_>, handle: u32, out: u32, height: bool) -> Outcome
 }
 #[win32(gdiplus,name="GdipSetStringFormatAlign",level=state)]
 fn align(env: &mut Env<'_>, handle: GuestPtr<()>, align: i32) -> Outcome {
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::Align(align))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::Align(align))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipSetStringFormatLineAlign",level=state)]
 fn line_align(env: &mut Env<'_>, handle: GuestPtr<()>, align: i32) -> Outcome {
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::LineAlign(align))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::LineAlign(align))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipAddPathLineI",level=state)]
 fn line_i(env: &mut Env<'_>, handle: GuestPtr<()>, x1: i32, y1: i32, x2: i32, y2: i32) -> Outcome {
     result(
         object(env, handle.addr())
             .and_then(|o| o.execute(Op::PathLine([x1 as f32, y1 as f32, x2 as f32, y2 as f32]))),
+        env,
     )
 }
 #[win32(gdiplus,name="GdipAddPathLine",level=state)]
@@ -357,7 +364,10 @@ fn line(env: &mut Env<'_>, handle: GuestPtr<()>, x1: f32, y1: f32, x2: f32, y2: 
     if [x1, y1, x2, y2].iter().any(|v| !v.is_finite()) {
         return Outcome::Return(2);
     }
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::PathLine([x1, y1, x2, y2]))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::PathLine([x1, y1, x2, y2]))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipAddPathArcI",level=state)]
 fn arc_i(
@@ -401,11 +411,15 @@ fn arc(
     result(
         object(env, handle.addr())
             .and_then(|o| o.execute(Op::PathArc([x, y, width, height], start, sweep))),
+        env,
     )
 }
 #[win32(gdiplus,name="GdipClosePathFigure",level=state)]
 fn close_path(env: &mut Env<'_>, handle: GuestPtr<()>) -> Outcome {
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::ClosePath)))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::ClosePath)),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipAddPathString",level=state)]
 fn path_string(
@@ -434,7 +448,7 @@ fn path_string(
             format: fmt.as_deref(),
         })
     })();
-    result(result_value)
+    result(result_value, env)
 }
 #[win32(gdiplus,name="GdipGetPathWorldBounds",level=state)]
 fn path_bounds(
@@ -478,18 +492,27 @@ fn gradient_points(env: &mut Env<'_>, handle: GuestPtr<()>, out: GuestPtr<i32>) 
 }
 #[win32(gdiplus,name="GdipSetPathGradientCenterColor",level=state)]
 fn center(env: &mut Env<'_>, handle: GuestPtr<()>, color: u32) -> Outcome {
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::CenterColor(color))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::CenterColor(color))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipSetPathGradientFocusScales",level=state)]
 fn focus(env: &mut Env<'_>, handle: GuestPtr<()>, x: f32, y: f32) -> Outcome {
     if !x.is_finite() || !y.is_finite() {
         return Outcome::Return(2);
     }
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::Focus(x, y))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::Focus(x, y))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipSetPathGradientGammaCorrection",level=state)]
 fn gamma(env: &mut Env<'_>, handle: GuestPtr<()>, enabled: i32) -> Outcome {
-    result(object(env, handle.addr()).and_then(|o| o.execute(Op::Gamma(enabled != 0))))
+    result(
+        object(env, handle.addr()).and_then(|o| o.execute(Op::Gamma(enabled != 0))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipSetPathGradientSurroundColorsWithCount",level=state)]
 fn surround(
@@ -689,11 +712,17 @@ fn clear_graphics(env: &mut Env<'_>, graphics: GuestPtr<()>, color: u32) -> Outc
 }
 #[win32(gdiplus,name="GdipSetSmoothingMode",level=state)]
 fn smoothing(env: &mut Env<'_>, graphics: GuestPtr<()>, value: i32) -> Outcome {
-    result(object(env, graphics.addr()).and_then(|o| o.execute(Op::Smoothing(value))))
+    result(
+        object(env, graphics.addr()).and_then(|o| o.execute(Op::Smoothing(value))),
+        env,
+    )
 }
 #[win32(gdiplus,name="GdipSetTextRenderingHint",level=state)]
 fn text_hint(env: &mut Env<'_>, graphics: GuestPtr<()>, value: i32) -> Outcome {
-    result(object(env, graphics.addr()).and_then(|o| o.execute(Op::TextHint(value))))
+    result(
+        object(env, graphics.addr()).and_then(|o| o.execute(Op::TextHint(value))),
+        env,
+    )
 }
 
 #[win32(gdiplus,name="GdipDeleteGraphics",level=state)]
@@ -732,6 +761,10 @@ fn dispose(env: &mut Env<'_>, object: GuestPtr<()>) -> i32 {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    world::register(reg);
+    string_format::register(reg);
+    matrix::register(reg);
+    properties::register(reg);
     for api in [
         startup_ABI,
         shutdown_ABI,

@@ -12,6 +12,7 @@ use crate::util::{INVALID_HANDLE_VALUE, cstr, err, out_u32, set_last_error, wstr
 use crate::{FileObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod attributes;
 mod change_notification;
+pub(crate) mod delete_on_close;
 mod legacy;
 pub(crate) mod native;
 
@@ -30,6 +31,11 @@ const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// The CreateFile flags and attributes modeled or needing no model:
+/// attributes, caching hints and delete on close. Overlapped I/O, backup
+/// semantics and the remaining flags are ignored.
+const MODELED_FLAGS: u32 =
+    0xffff | 0x8000_0000 | 0x2000_0000 | 0x1000_0000 | 0x0800_0000 | delete_on_close::FLAG;
 
 fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
     let files = env
@@ -122,30 +128,6 @@ fn replace_contents(
     result.map_err(|e| io_code(&e))
 }
 
-fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
-    let vfs = &env.ext.get::<Win32>().vfs;
-    if vfs.is_optical_path(guest) {
-        let mut bytes = Vec::new();
-        vfs.open_optical_file(guest)?.read_to_end(&mut bytes)?;
-        return Ok(bytes);
-    }
-    let Some(path) = vfs.lookup(guest) else {
-        return Ok(Vec::new());
-    };
-    let mut file = std::fs::File::open(path)?;
-    let content = if vfs.sections.has_entries() {
-        vfs.sections.lookup(adv_os::vfs::file_identity(&file)?)
-    } else {
-        None
-    };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    if let Some(content) = content {
-        content.merge_read(0, &mut bytes)?;
-    }
-    Ok(bytes)
-}
-
 /// Opens a Win32 name that selects a DOS device instead of a file. The null
 /// device accepts every create disposition and reports no prior existence.
 fn open_device(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> Option<u32> {
@@ -205,9 +187,18 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
         }
         return Outcome::Return(handle);
     }
+    let deletes = env.arg(5) & delete_on_close::FLAG != 0;
+    let access = if deletes {
+        access | delete_on_close::DELETE
+    } else {
+        access
+    };
     let handle = open_with_share(env, &path, access, disposition, share);
     if handle != INVALID_HANDLE_VALUE {
         super::handle::set_inherit(env, handle, inherit);
+        if deletes {
+            delete_on_close::watch(env, handle);
+        }
     }
     Outcome::Return(handle)
 }
@@ -1141,192 +1132,12 @@ fn find_next_file(env: &mut Env<'_>, wide: bool) -> Outcome {
 // ---- .ini profiles -------------------------------------------------------------------------
 
 /// Guest path of a profile file: bare names live in the Windows directory.
-fn profile_path(env: &Env<'_>, p: u32) -> String {
-    let name = path_a(env, p);
-    if name.contains(['\\', '/']) {
-        name
-    } else {
-        format!("C:\\Windows\\{name}")
-    }
-}
-
-struct Ini {
-    lines: Vec<Vec<u8>>,
-}
-
-fn trim(b: &[u8]) -> &[u8] {
-    let s = b
-        .iter()
-        .position(|c| !c.is_ascii_whitespace())
-        .unwrap_or(b.len());
-    let e = b
-        .iter()
-        .rposition(|c| !c.is_ascii_whitespace())
-        .map_or(s, |i| i + 1);
-    &b[s..e]
-}
-
-fn section_name(line: &[u8]) -> Option<&[u8]> {
-    let t = trim(line);
-    (t.first() == Some(&b'[')).then(|| {
-        let end = t.iter().position(|&c| c == b']').unwrap_or(t.len());
-        trim(&t[1..end])
-    })
-}
-
-impl Ini {
-    fn from_bytes(data: &[u8]) -> Ini {
-        Ini {
-            lines: data
-                .split(|&c| c == b'\n')
-                .map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec())
-                .collect(),
-        }
-    }
-
-    /// Line range of a section's body.
-    fn section(&self, name: &[u8]) -> Option<(usize, usize)> {
-        let start = self
-            .lines
-            .iter()
-            .position(|l| section_name(l).is_some_and(|s| s.eq_ignore_ascii_case(name)))?
-            + 1;
-        let end = self.lines[start..]
-            .iter()
-            .position(|l| section_name(l).is_some())
-            .map_or(self.lines.len(), |i| start + i);
-        Some((start, end))
-    }
-
-    fn entries(&self, section: &[u8]) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
-        let Some((s, e)) = self.section(section) else {
-            return Vec::new();
-        };
-        (s..e)
-            .filter_map(|i| {
-                let l = &self.lines[i];
-                let t = trim(l);
-                if t.is_empty() || t[0] == b';' {
-                    return None;
-                }
-                let eq = l.iter().position(|&c| c == b'=')?;
-                let mut v = trim(&l[eq + 1..]).to_vec();
-                if v.len() >= 2 && (v[0] == b'"' && v[v.len() - 1] == b'"') {
-                    v = v[1..v.len() - 1].to_vec();
-                }
-                Some((i, trim(&l[..eq]).to_vec(), v))
-            })
-            .collect()
-    }
-}
-
 fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
-    write_private_profile_string(env, false)
+    profile::write_string(env, false)
 }
 
 fn write_private_profile_string(env: &mut Env<'_>, wide: bool) -> Outcome {
-    let (sec_p, key_p, val_p) = (env.arg(0), env.arg(1), env.arg(2));
-    let file = if wide {
-        let name = path_w(env, env.arg(3));
-        if name.contains(['\\', '/']) {
-            name
-        } else {
-            format!("C:\\Windows\\{name}")
-        }
-    } else {
-        profile_path(env, env.arg(3))
-    };
-    let encoded = |env: &Env<'_>, pointer| {
-        if wide {
-            env.ext
-                .get::<Win32>()
-                .codec
-                .from_utf16(0, &crate::util::wstr(env.cpu, pointer))
-                .0
-        } else {
-            cstr(env.cpu, pointer)
-        }
-    };
-    let mut ini = match read_contents(env, &file) {
-        Ok(bytes) if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) => {
-            adv_abi::warn_unavailable(
-                env,
-                if wide {
-                    "kernel32.dll!WritePrivateProfileStringW"
-                } else {
-                    "kernel32.dll!WritePrivateProfileStringA"
-                },
-                "Unicode profile-file writes are unavailable; preserving the existing encoded file",
-            );
-            set_last_error(env, 50);
-            return Outcome::Return(0);
-        }
-        Ok(bytes) => Ini::from_bytes(&bytes),
-        Err(error) => {
-            io_error(env, &error);
-            return Outcome::Return(0);
-        }
-    };
-    if ini.lines.last().is_some_and(Vec::is_empty) {
-        ini.lines.pop();
-    }
-    let sec = encoded(env, sec_p);
-    match ini.section(&sec) {
-        None if key_p == 0 || val_p == 0 => {}
-        None => {
-            ini.lines.push([b"[", &sec[..], b"]"].concat());
-            ini.lines
-                .push([&encoded(env, key_p)[..], b"=", &encoded(env, val_p)[..]].concat());
-        }
-        Some((s, e)) if key_p == 0 => {
-            ini.lines.drain(s - 1..e);
-        }
-        Some((s, e)) => {
-            let key = encoded(env, key_p);
-            let existing = ini
-                .entries(&sec)
-                .into_iter()
-                .find(|(_, k, _)| k.eq_ignore_ascii_case(&key))
-                .map(|(i, _, _)| i);
-            match (existing, val_p) {
-                (Some(i), 0) => {
-                    ini.lines.remove(i);
-                }
-                (Some(i), v) => ini.lines[i] = [&key[..], b"=", &encoded(env, v)[..]].concat(),
-                (None, 0) => {}
-                (None, v) => {
-                    // Append after the section's last non-empty line.
-                    let at = (s..e)
-                        .rev()
-                        .find(|&i| !trim(&ini.lines[i]).is_empty())
-                        .map_or(s, |i| i + 1);
-                    ini.lines
-                        .insert(at, [&key[..], b"=", &encoded(env, v)[..]].concat());
-                }
-            }
-        }
-    }
-    let mut out = ini.lines.join(&b"\r\n"[..]);
-    out.extend_from_slice(b"\r\n");
-    match replace_contents(
-        env,
-        &file,
-        out.len() as u64,
-        false,
-        |destination, content| {
-            if let Some(content) = content {
-                content.write_to(destination, 0, &out)
-            } else {
-                destination.write_all(&out)
-            }
-        },
-    ) {
-        Ok(()) => Outcome::Return(1),
-        Err(code) => {
-            set_last_error(env, code);
-            Outcome::Return(0)
-        }
-    }
+    profile::write_string(env, wide)
 }
 
 /// Fixed guest system volume plus explicitly attached optical media.
@@ -1393,6 +1204,20 @@ fn get_drive_type_w(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+/// The DOS drive's existing device identity, shared by QueryDosDevice and PSAPI.
+pub(crate) fn dos_device(env: &Env<'_>, drive: u8) -> Option<String> {
+    if drive.eq_ignore_ascii_case(&b'C') {
+        return Some(r"\Device\HarddiskVolume1".to_owned());
+    }
+    env.ext
+        .get::<Win32>()
+        .vfs
+        .optical_drives()
+        .enumerate()
+        .find(|(_, (letter, _))| letter.eq_ignore_ascii_case(&(drive as char)))
+        .map(|(index, _)| format!(r"\Device\CdRom{index}"))
+}
+
 fn query_dos_device(
     env: &mut Env<'_>,
     name: Option<String>,
@@ -1413,17 +1238,11 @@ fn query_dos_device(
             .collect(),
         Some(s) => {
             let trimmed = s.trim_end_matches('\\');
-            if trimmed.eq_ignore_ascii_case("C:") || trimmed.eq_ignore_ascii_case("C") {
-                vec![r"\Device\HarddiskVolume1".to_string()]
-            } else if let Some((index, _)) = env
-                .ext
-                .get::<Win32>()
-                .vfs
-                .optical_drives()
-                .enumerate()
-                .find(|(_, (letter, _))| trimmed.eq_ignore_ascii_case(&format!("{letter}:")))
+            let drive = trimmed.trim_end_matches(':');
+            if drive.len() == 1
+                && let Some(device) = dos_device(env, drive.as_bytes()[0])
             {
-                vec![format!(r"\Device\CdRom{index}")]
+                vec![device]
             } else {
                 set_last_error(env, ERROR_FILE_NOT_FOUND);
                 return Outcome::Return(0);
@@ -1726,6 +1545,11 @@ pub(super) fn register(reg: &mut Registry) {
         let p = path_w(e, e.arg(0));
         create_file(e, p)
     });
+    for name in ["CreateFileA", "CreateFileW"] {
+        reg.accept(K32, name, "dwFlagsAndAttributes", |flags| {
+            flags & !MODELED_FLAGS == 0
+        });
+    }
     stdcall(reg, K32, "ReadFile", 5, read_file);
     stdcall(reg, K32, "WriteFile", 5, write_file);
     stdcall(reg, K32, "SetFilePointer", 4, set_file_pointer);
@@ -1779,24 +1603,5 @@ pub(super) fn register(reg: &mut Registry) {
     );
     stdcall(reg, K32, "WritePrivateProfileStringW", 4, |env| {
         write_private_profile_string(env, true)
-    });
-    stdcall(reg, K32, "WriteConsoleA", 5, |e| {
-        let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
-        let mut data = vec![0u8; n as usize];
-        let _ = e.cpu.read(buf, &mut data);
-        let s = e.ext.get::<Win32>().codec.decode(&data);
-        log::info!("[guest console] {}", s.trim_end());
-        out_u32(e.cpu, written, n);
-        Outcome::Return(1)
-    });
-    stdcall(reg, K32, "WriteConsoleW", 5, |e| {
-        let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
-        let u = crate::util::units_or_wstr(e.cpu, buf, n as i32);
-        log::info!(
-            "[guest console] {}",
-            String::from_utf16_lossy(&u).trim_end()
-        );
-        out_u32(e.cpu, written, n);
-        Outcome::Return(1)
     });
 }

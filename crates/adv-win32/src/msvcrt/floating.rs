@@ -172,9 +172,10 @@ pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
         address
     } else {
         // One existing module/thread owner holds errno and its adjacent DWORD
-        // DOS error. The published _errno pointer remains the first int32 cell;
+        // DOS error, then the signal FP-code and exception-pointer cells.
+        // The published _errno pointer remains the first int32 cell;
         // the ordinary thread/process detach path frees this same allocation.
-        let address = allocate(env, 8, true);
+        let address = allocate(env, 16, true);
         if address != 0 {
             env.ext.get_mut::<CrtState>().errno.insert(key, address);
         }
@@ -192,7 +193,7 @@ fn errno_leaf(env: &mut Env<'_>) -> Option<u64> {
     Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(address))
 }
 
-fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
+pub(super) fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
     }

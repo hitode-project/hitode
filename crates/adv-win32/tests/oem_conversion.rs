@@ -8,6 +8,10 @@ use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
 
+#[path = "support/test_cpu.rs"]
+mod test_cpu;
+use test_cpu::TestCpu;
+
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const READ_ONLY: u32 = 0x420000;
@@ -36,9 +40,9 @@ fn machine<B: Backend>(cpu: B, codepage: u32) -> Machine<B> {
     machine.cpu.map(READ_ONLY, 4096, Prot::READ).unwrap();
     machine
 }
-fn conversions<B: Backend>(cpu: B, codepage: u32, in_place: bool) {
+fn conversions<B: TestCpu>(cpu: B, codepage: u32, in_place: bool, name: &str) {
     let mut machine = machine(cpu, codepage);
-    let convert = machine.resolve_import("user32.dll", "OemToCharA").unwrap();
+    let convert = machine.resolve_import("user32.dll", name).unwrap();
     let set_error = machine
         .resolve_import("kernel32.dll", "SetLastError")
         .unwrap();
@@ -61,6 +65,7 @@ fn conversions<B: Backend>(cpu: B, codepage: u32, in_place: bool) {
     code.bytes.extend_from_slice(&[0x31, 0xc0]);
     code.ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.cpu.code_region(CODE, code.bytes.len());
     machine.spawn("OEM bytes", CODE, &[], 65536).unwrap();
     assert!(matches!(
         machine.run_virtual(1_000_000),
@@ -90,22 +95,35 @@ fn conversions<B: Backend>(cpu: B, codepage: u32, in_place: bool) {
 }
 
 #[test]
+// spec: WIN32-API-7
 fn oem_conversion_writes_actual_bytes_and_nul_in_place_or_separate() {
-    for codepage in [932, 936, 1252] {
-        for in_place in [false, true] {
-            for jit in [false, true] {
-                conversions(JitCpu::new(PARK_ADDR, jit).unwrap(), codepage, in_place);
+    for name in ["OemToCharA", "CharToOemA"] {
+        for codepage in [932, 936, 1252] {
+            for in_place in [false, true] {
+                for jit in [false, true] {
+                    conversions(
+                        JitCpu::new(PARK_ADDR, jit).unwrap(),
+                        codepage,
+                        in_place,
+                        name,
+                    );
+                }
+                conversions(
+                    UnicornCpu::new(PARK_ADDR).unwrap(),
+                    codepage,
+                    in_place,
+                    name,
+                );
             }
-            conversions(UnicornCpu::new(PARK_ADDR).unwrap(), codepage, in_place);
         }
+        let reg = registry();
+        assert!(reg.dynamic_available("user32.dll", name));
+        assert_eq!(
+            reg.level("user32.dll", name),
+            Some(ImplementationLevel::Implement)
+        );
+        assert!(reg.signature_conflicts().is_empty());
     }
-    let reg = registry();
-    assert!(reg.dynamic_available("user32.dll", "OemToCharA"));
-    assert_eq!(
-        reg.level("user32.dll", "OemToCharA"),
-        Some(ImplementationLevel::Implement)
-    );
-    assert!(reg.signature_conflicts().is_empty());
 }
 
 fn protected<B: Backend>(cpu: B, output: u32) {
@@ -176,5 +194,54 @@ fn same_codepage_bytes_match_native_oem_conversion_without_locale_mutation() {
             expected[..length].copy_from_slice(&input[..length]);
             assert_eq!(if in_place { source } else { output }, expected);
         }
+    }
+}
+
+fn previous<B: TestCpu>(cpu: B, cp: u32) {
+    let mut m = machine(cpu, cp);
+    m.cpu.write(DATA, &[b'a', 0x81, 0x41, b'z', 0]).unwrap();
+    m.cpu.write(DATA + 16, &[b'a', 0x81, 0]).unwrap();
+    let api = m.resolve_import("user32.dll", "CharPrevA").unwrap();
+    let mut code = Asm::new(CODE);
+    for offset in 0..=4 {
+        code.push_imm(DATA + offset)
+            .push_imm(DATA)
+            .call(api)
+            .mov_mem_eax(DATA + 64 + offset * 4);
+    }
+    code.push_imm(DATA + 18)
+        .push_imm(DATA + 16)
+        .call(api)
+        .mov_mem_eax(DATA + 84);
+    code.push_imm(DATA - 1)
+        .push_imm(DATA)
+        .call(api)
+        .mov_mem_eax(DATA + 88);
+    code.ret();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.cpu.code_region(CODE, code.bytes.len());
+    m.spawn("character boundaries", CODE, &[], 65536).unwrap();
+    assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
+    let expected = if cp == 1252 {
+        [0, 0, 1, 2, 3]
+    } else {
+        [0, 0, 1, 1, 3]
+    };
+    for (i, offset) in expected.into_iter().enumerate() {
+        assert_eq!(
+            m.cpu.read_u32(DATA + 64 + i as u32 * 4).unwrap(),
+            DATA + offset
+        );
+    }
+    assert_eq!(m.cpu.read_u32(DATA + 84).unwrap(), DATA + 17);
+    assert_eq!(m.cpu.read_u32(DATA + 88).unwrap(), DATA);
+}
+#[test]
+// spec: WIN32-API-7
+fn previous_character_rescans_from_start_and_does_not_split_dbcs_pairs() {
+    for cp in [932, 936, 1252] {
+        previous(JitCpu::new(PARK_ADDR, false).unwrap(), cp);
+        previous(JitCpu::new(PARK_ADDR, true).unwrap(), cp);
+        previous(UnicornCpu::new(PARK_ADDR).unwrap(), cp);
     }
 }

@@ -195,6 +195,7 @@ fn add_window(machine: &mut Machine<JitCpu>, hwnd: u32, parent: u32, rect: Rect)
         id: 0,
         instance: 0,
         rect,
+        touch_flags: None,
         placement: super::super::PlacementState::new(rect),
         text: String::new(),
         extra: Vec::new(),

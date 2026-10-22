@@ -5,6 +5,9 @@ use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{CtxId, Env, Outcome, Wait};
 
 use super::K32;
+mod formatting;
+pub(crate) use formatting::format_picture as format_locale_picture;
+mod timezone;
 use crate::{Win32, stdcall, util::write_units};
 
 /// FILETIME of 1970-01-01.
@@ -214,158 +217,6 @@ fn get_local_time(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-/// Expand a GetDateFormat/GetTimeFormat picture over SYSTEMTIME `st` (year, month, weekday,
-/// day, hour, minute, second, ms). `'...'` is literal text (`''` a quote); names come out in
-/// English, as under an English user locale.
-fn format_picture(pic: &[u16], st: [u16; 8]) -> Vec<u16> {
-    const DAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
-    const MONTHS: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
-    let [year, month, wday, day, hour, minute, second, _] = st.map(u32::from);
-    let mut out = String::new();
-    let mut i = 0;
-    while i < pic.len() {
-        let c = pic[i];
-        let run = pic[i..].iter().take_while(|&&u| u == c).count();
-        i += run;
-        let num = |v: u32, pad: bool| {
-            if pad {
-                format!("{v:02}")
-            } else {
-                v.to_string()
-            }
-        };
-        let h12 = if hour % 12 == 0 { 12 } else { hour % 12 };
-        match char::from_u32(u32::from(c)).unwrap_or('\u{fffd}') {
-            '\'' => {
-                // Quoted text; a doubled quote inside (or as the whole run) is one quote.
-                i -= run - 1;
-                if run > 1 {
-                    out.push('\'');
-                    i += 1;
-                    continue;
-                }
-                while i < pic.len() {
-                    if pic[i] == u16::from(b'\'') {
-                        if pic.get(i + 1) == Some(&u16::from(b'\'')) {
-                            out.push('\'');
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    out.push(char::from_u32(u32::from(pic[i])).unwrap_or('\u{fffd}'));
-                    i += 1;
-                }
-            }
-            'd' => {
-                out += &match run {
-                    1 | 2 => num(day, run == 2),
-                    3 => DAYS[wday as usize % 7][..3].to_owned(),
-                    _ => DAYS[wday as usize % 7].to_owned(),
-                }
-            }
-            'M' => {
-                out += &match run {
-                    1 | 2 => num(month, run == 2),
-                    3 => MONTHS[(month as usize + 11) % 12][..3].to_owned(),
-                    _ => MONTHS[(month as usize + 11) % 12].to_owned(),
-                }
-            }
-            'y' => {
-                out += &match run {
-                    1 => (year % 100).to_string(),
-                    2 => format!("{:02}", year % 100),
-                    _ => year.to_string(),
-                }
-            }
-            'g' => {}
-            'h' => out += &num(h12, run >= 2),
-            'H' => out += &num(hour, run >= 2),
-            'm' => out += &num(minute, run >= 2),
-            's' => out += &num(second, run >= 2),
-            't' => out += &(if hour < 12 { "AM" } else { "PM" })[..run.min(2)],
-            other => out.extend(std::iter::repeat_n(other, run)),
-        }
-    }
-    out.encode_utf16().collect()
-}
-
-/// Get{Date,Time}FormatW(lcid, flags, SYSTEMTIME* (NULL: now, local), picture*, buf, cap).
-/// Without a picture the user locale's defaults apply (short/long date, H:mm:ss).
-fn get_date_time_format(env: &mut Env<'_>, time: bool, wide: bool) -> Outcome {
-    const DATE_LONGDATE: u32 = 2;
-    const TIME_NOMINUTESORSECONDS: u32 = 1;
-    const TIME_NOSECONDS: u32 = 2;
-    let (flags, st_p, pic_p, buf, cap) =
-        (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
-    let st = if st_p != 0 {
-        read_st(env.cpu, st_p)
-    } else {
-        local_systemtime(env)
-    };
-    let pic: Vec<u16> = if pic_p != 0 {
-        if wide {
-            crate::util::wstr(env.cpu, pic_p)
-        } else {
-            env.ext
-                .get::<crate::Win32>()
-                .codec
-                .to_utf16(0, &crate::util::cstr(env.cpu, pic_p))
-        }
-    } else {
-        let d = match (time, flags) {
-            (true, f) if f & TIME_NOMINUTESORSECONDS != 0 => "H",
-            (true, f) if f & TIME_NOSECONDS != 0 => "H:mm",
-            (true, _) => "H:mm:ss",
-            (false, f) if f & DATE_LONGDATE != 0 => "dddd, MMMM d, yyyy",
-            (false, _) => "yyyy/MM/dd",
-        };
-        d.encode_utf16().collect()
-    };
-    let out = format_picture(&pic, st);
-    let ansi = (!wide).then(|| env.ext.get::<crate::Win32>().codec.from_utf16(0, &out).0);
-    let n = ansi.as_ref().map_or(out.len(), Vec::len) as u32 + 1;
-    if cap == 0 {
-        return Outcome::Return(n);
-    }
-    // Required size is measured in the caller's encoding, including NUL.
-    if cap < n {
-        crate::util::set_last_error(env, crate::util::err::INSUFFICIENT_BUFFER);
-        return Outcome::Return(0);
-    }
-    let written = match ansi {
-        Some(bytes) => crate::util::put_cstr(env.cpu, buf, cap, &bytes),
-        None => crate::util::put_wstr(env.cpu, buf, cap, &out),
-    };
-    if written.is_none() {
-        crate::util::set_last_error(env, crate::util::err::INSUFFICIENT_BUFFER);
-        return Outcome::Return(0);
-    }
-    Outcome::Return(n)
-}
-
 fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     let ft = filetime_now(env) as i64 + local_offset_ft(env);
     filetime_to_systemtime(ft as u64)
@@ -487,6 +338,11 @@ fn get_tick_count(env: &mut Env<'_>) -> Outcome {
     poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
 }
 
+#[win32(kernel32, name = "GetTickCount64", level = implement)]
+fn get_tick_count64(env: &mut Env<'_>) -> Outcome {
+    poll_clock(env, |_, us| Outcome::Return64(us / 1000))
+}
+
 #[win32(kernel32, name = "QueryPerformanceCounter", level = implement)]
 fn query_performance_counter(env: &mut Env<'_>, out: GuestPtr<i64>) -> Outcome {
     poll_clock(env, move |env, us| {
@@ -556,6 +412,9 @@ fn get_time_zone_information(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    formatting::register(reg);
+    timezone::register(reg);
+    reg.register(get_tick_count64_ABI);
     reg.register(get_system_time_as_file_time_ABI);
     reg.register(file_time_to_dos_date_time_ABI);
     reg.register(dos_date_time_to_file_time_ABI);
@@ -564,18 +423,6 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(adv_abi::Api {
         env_leaf: Some(tick_leaf),
         ..get_tick_count_ABI
-    });
-    stdcall(reg, K32, "GetDateFormatW", 6, |e| {
-        get_date_time_format(e, false, true)
-    });
-    stdcall(reg, K32, "GetTimeFormatW", 6, |e| {
-        get_date_time_format(e, true, true)
-    });
-    stdcall(reg, K32, "GetDateFormatA", 6, |e| {
-        get_date_time_format(e, false, false)
-    });
-    stdcall(reg, K32, "GetTimeFormatA", 6, |e| {
-        get_date_time_format(e, true, false)
     });
     reg.register(adv_abi::Api {
         env_leaf: Some(counter_leaf),

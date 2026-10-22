@@ -4,34 +4,32 @@ use adv_abi::{GuestPtr, win32};
 use adv_cpu::backend::Prot;
 
 const MAX_BYTES: u32 = 1024 * 1024;
+#[cfg(test)]
 const RUNTIME: &str = "api-ms-win-crt-runtime-l1-1-0.dll";
 const PROCESS_TABLE: &str = "_onexit_table";
+const QUICK_TABLE: &str = "_quick_exit_table";
 
 pub(super) fn register(reg: &mut Registry) {
-    for api in [
-        initialize_ABI,
-        append_ABI,
-        execute_ABI,
-        initterm_ABI,
-        initterm_e_ABI,
-    ] {
-        reg.register(api);
-        reg.register(adv_abi::Api {
-            module: RUNTIME,
-            ..api
-        });
-    }
-    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
-        for api in [onexit_ABI, atexit_ABI, cexit_ABI, exit_ABI, fast_exit_ABI] {
-            reg.register(adv_abi::Api { module, ..api });
-        }
-    }
-    for module in ["ucrtbase.dll", RUNTIME] {
-        // Public UCRT _onexit/atexit are static shims, not DLL exports.
-        for api in [crt_atexit_ABI, cexit_ABI, exit_ABI, fast_exit_ABI] {
-            reg.register(adv_abi::Api { module, ..api });
-        }
-    }
+    versions::register(
+        reg,
+        &[
+            ("_initialize_onexit_table", initialize_ABI.handler),
+            ("_register_onexit_function", append_ABI.handler),
+            ("_execute_onexit_table", execute_ABI.handler),
+            ("_initterm", initterm_ABI.handler),
+            ("_initterm_e", initterm_e_ABI.handler),
+            ("_onexit", onexit_ABI.handler),
+            ("atexit", atexit_ABI.handler),
+            ("_crt_atexit", crt_atexit_ABI.handler),
+            ("_crt_at_quick_exit", crt_atexit_ABI.handler),
+            ("_cexit", cexit_ABI.handler),
+            ("_c_exit", quick_cleanup),
+            ("exit", exit_ABI.handler),
+            ("quick_exit", exit_ABI.handler),
+            ("_exit", fast_exit_ABI.handler),
+            ("_Exit", fast_exit_ABI.handler),
+        ],
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -73,12 +71,38 @@ fn finish(env: &mut Env<'_>, lock: u32, result: u32, action: Action) -> Outcome 
     env.sys.release_mutex(lock);
     match action {
         Action::OnExit(function) => Outcome::Return(if result == 0 { function } else { 0 }),
-        Action::Terminate(code) if result == 0 => crate::kernel32::exit_process(env, code),
+        Action::Cleanup | Action::Terminate(_) if result == 0 => {
+            let code = match action {
+                Action::Terminate(code) => Some(code),
+                _ => None,
+            };
+            if env.sys.thunks.get(env.thunk).name == "quick_exit" {
+                return crate::kernel32::exit_process(env, code.expect("quick termination"));
+            }
+            cleanup_streams(env, code)
+        }
         Action::Cleanup | Action::Terminate(_) if result != 0 => {
             Outcome::Fail("CRT exit table is invalid or inaccessible".into())
         }
         _ => Outcome::Return(result),
     }
+}
+
+fn cleanup_streams(env: &mut Env<'_>, code: Option<u32>) -> Outcome {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module).to_owned();
+    file::close_module(
+        env,
+        &module,
+        Box::new(move |env, _| match code {
+            Some(code) => crate::kernel32::exit_process(env, code),
+            None => Outcome::Return(0),
+        }),
+    )
+}
+
+fn quick_cleanup(_: &mut Env<'_>) -> Outcome {
+    // _c_exit returns without callbacks, flushing or closing streams.
+    Outcome::Return(0)
 }
 
 fn with_lock(env: &mut Env<'_>, pointer: GuestPtr<[u32; 3]>, action: Action) -> Outcome {
@@ -219,7 +243,14 @@ fn perform(env: &mut Env<'_>, pointer: GuestPtr<[u32; 3]>, action: Action, lock:
 fn process_table(env: &mut Env<'_>, create: bool) -> Option<GuestPtr<[u32; 3]>> {
     let key = (
         crt_module(&env.sys.thunks.get(env.thunk).module).to_owned(),
-        PROCESS_TABLE.to_owned(),
+        if matches!(
+            env.sys.thunks.get(env.thunk).name.as_str(),
+            "quick_exit" | "_crt_at_quick_exit"
+        ) {
+            QUICK_TABLE.to_owned()
+        } else {
+            PROCESS_TABLE.to_owned()
+        },
     );
     if let Some(pointer) = env.ext.get_or_default::<CrtState>().globals.get(&key) {
         return Some(GuestPtr::new(*pointer));
@@ -244,7 +275,7 @@ pub(super) fn release_process_tables(env: &mut Env<'_>) -> Result<(), String> {
     let headers: Vec<_> = state
         .globals
         .iter()
-        .filter(|((_, name), _)| name == PROCESS_TABLE)
+        .filter(|((_, name), _)| name == PROCESS_TABLE || name == QUICK_TABLE)
         .map(|(key, &address)| (key.clone(), address))
         .collect();
     for (key, address) in headers {
@@ -296,14 +327,17 @@ fn crt_atexit(env: &mut Env<'_>, callback: GuestPtr<()>) -> Outcome {
 fn cexit(env: &mut Env<'_>) -> Outcome {
     match process_table(env, false) {
         Some(pointer) => with_lock(env, pointer, Action::Cleanup),
-        None => Outcome::Return(0),
+        None => cleanup_streams(env, None),
     }
 }
 #[win32(msvcr90, name="exit", level=implement)]
 fn exit(env: &mut Env<'_>, status: i32) -> Outcome {
     match process_table(env, false) {
         Some(pointer) => with_lock(env, pointer, Action::Terminate(status as u32)),
-        None => crate::kernel32::exit_process(env, status as u32),
+        None if env.sys.thunks.get(env.thunk).name == "quick_exit" => {
+            crate::kernel32::exit_process(env, status as u32)
+        }
+        None => cleanup_streams(env, Some(status as u32)),
     }
 }
 #[win32(msvcr90, name="_exit", level=implement)]
@@ -325,11 +359,11 @@ fn execute(env: &mut Env<'_>, pointer: GuestPtr<[u32; 3]>) -> Outcome {
 }
 #[win32(ucrtbase, name="_initterm", level=implement)]
 fn initterm(env: &mut Env<'_>, begin: GuestPtr<u32>, end: GuestPtr<u32>) -> Outcome {
-    initializers(env, begin.addr(), end.addr(), false)
+    initializer_table(env, begin.addr(), end.addr(), false)
 }
 #[win32(ucrtbase, name="_initterm_e", level=implement)]
 fn initterm_e(env: &mut Env<'_>, begin: GuestPtr<u32>, end: GuestPtr<u32>) -> Outcome {
-    initializers(env, begin.addr(), end.addr(), true)
+    initializer_table(env, begin.addr(), end.addr(), true)
 }
 
 #[cfg(test)]
@@ -431,6 +465,7 @@ mod tests {
             ("msvcr90.dll", "_onexit"),
             ("ucrtbase.dll", "_crt_atexit"),
             (RUNTIME, "_crt_atexit"),
+            (RUNTIME, "_crt_at_quick_exit"),
         ] {
             let entry = machine.resolve_import(module, name).unwrap();
             let mut env = Env {
@@ -457,7 +492,7 @@ mod tests {
         let allocations: Vec<_> = state
             .globals
             .iter()
-            .filter(|((_, name), _)| name == PROCESS_TABLE)
+            .filter(|((_, name), _)| name == PROCESS_TABLE || name == QUICK_TABLE)
             .map(|((module, _), &header)| {
                 (
                     header,
@@ -468,7 +503,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(allocations.len(), 2); // UCRT/API-set share the same header.
+        assert_eq!(allocations.len(), 3); // API sets share normal/quick UCRT tables.
         let mut env = Env {
             context: machine.sys.current,
             cpu: &mut machine.cpu,

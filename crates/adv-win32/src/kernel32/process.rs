@@ -16,6 +16,7 @@ pub(crate) mod native_thread;
 mod parameters;
 mod pointer;
 mod processor;
+mod queries;
 #[cfg(test)]
 mod tests;
 mod thread_context;
@@ -413,7 +414,6 @@ struct Unwind {
     scratch: u32,
     /// EBX, ESI, EDI, EBP at entry, which the resumed context restores.
     saved: [u32; 4],
-    _phase: std::rc::Rc<super::exception::phase::Phase>,
 }
 
 const SAVED: [Reg; 4] = [Reg::Ebx, Reg::Esi, Reg::Edi, Reg::Ebp];
@@ -432,16 +432,11 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
             "RtlUnwind to {ip:#010x} from {ret:#010x}: only the return address is supported"
         ));
     }
-    let code = if record == 0 {
-        STATUS_UNWIND
-    } else {
-        match env.cpu.read_u32(record) {
-            Ok(code) => code,
-            Err(error) => {
-                return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
-            }
-        }
-    };
+    if record != 0
+        && let Err(error) = env.cpu.read_u32(record)
+    {
+        return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
+    }
     let heaps = env.ext.get_mut::<Heaps>();
     let Some(scratch) = heaps.alloc(env.cpu, &mut env.sys.vm, 0, SCRATCH, true) else {
         return Outcome::Fail("RtlUnwind: out of memory".into());
@@ -480,7 +475,6 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     for (off, v) in regs {
         let _ = env.cpu.write_u32(c + off, v);
     }
-    let active = super::exception::phase::enter(env, super::exception::phase::Phase::Unwind, code);
     unwind_step(
         env,
         Unwind {
@@ -489,7 +483,6 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
             record,
             scratch,
             saved,
-            _phase: active,
         },
     )
 }
@@ -942,52 +935,30 @@ fn global_memory_status_ex(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_computer_name(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let name = adv_os::identity::COMPUTER_NAME;
+    let needed = name.len() as u32 + 1;
     let (buf, size_p) = (env.arg(0), env.arg(1));
     let cap = env.cpu.read_u32(size_p).unwrap_or(0);
-    if cap < 8 {
-        out_u32(env.cpu, size_p, 8);
+    if cap < needed {
+        out_u32(env.cpu, size_p, needed);
         set_last_error(env, 111);
         return Outcome::Return(0);
     }
     match if wide {
-        crate::util::put_wstr(
-            env.cpu,
-            buf,
-            cap,
-            &"PAL-HLE".encode_utf16().collect::<Vec<_>>(),
-        )
+        crate::util::put_wstr(env.cpu, buf, cap, &name.encode_utf16().collect::<Vec<_>>())
     } else {
-        put_cstr(env.cpu, buf, cap, b"PAL-HLE")
+        put_cstr(env.cpu, buf, cap, name.as_bytes())
     } {
         Some(n) => {
             out_u32(env.cpu, size_p, n);
             Outcome::Return(1)
         }
         None => {
-            out_u32(env.cpu, size_p, 8);
+            out_u32(env.cpu, size_p, needed);
             set_last_error(env, 111); // ERROR_BUFFER_OVERFLOW
             Outcome::Return(0)
         }
     }
-}
-
-fn read_console(env: &mut Env<'_>) -> Outcome {
-    let output = env.arg(3);
-    out_u32(env.cpu, output, 0);
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
-}
-
-fn set_console_cp(env: &mut Env<'_>) -> Outcome {
-    // This personality has no console owner. ACP is process text configuration,
-    // not a console setting, and must not be changed by this failed operation.
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
-}
-
-fn get_console_cp(env: &mut Env<'_>) -> Outcome {
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
 }
 
 /// MAKELONG(minor, major) of the subsystem version in the mapped process
@@ -1019,6 +990,7 @@ fn get_process_version(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    queries::register(reg);
     error_mode::register(reg);
     pointer::register(reg);
     reg.register(get_console_window_ABI);
@@ -1028,13 +1000,8 @@ pub(super) fn register(reg: &mut Registry) {
         out_u32(e.cpu, p, 0);
         Outcome::Return(1)
     });
-    // There is no console: handlers never fire and reads fail.
-    stdcall(reg, K32, "SetConsoleCtrlHandler", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "ReadConsoleW", 5, read_console);
-    stdcall(reg, K32, "ReadConsoleA", 5, read_console);
-    stdcall(reg, K32, "SetConsoleCP", 1, set_console_cp);
-    stdcall(reg, K32, "SetConsoleOutputCP", 1, set_console_cp);
     stdcall(reg, K32, "GetProcessVersion", 1, get_process_version);
+    stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
     });
@@ -1087,11 +1054,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetStartupInfoW", 1, get_startup_info);
     stdcall(reg, K32, "GetStdHandle", 1, get_std_handle);
     stdcall(reg, K32, "SetStdHandle", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
-    stdcall(reg, K32, "GetConsoleMode", 2, |_| Outcome::Return(0));
-    stdcall(reg, K32, "SetConsoleMode", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "GetConsoleCP", 0, get_console_cp);
-    stdcall(reg, K32, "GetConsoleOutputCP", 0, get_console_cp);
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "CheckRemoteDebuggerPresent", 2, |e| {
         if let Err(error) = super::child_process::process_target(e, e.arg(0), 0x1000) {

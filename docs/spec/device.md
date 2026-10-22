@@ -103,7 +103,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-1 Image decoding
 
-**Rule**: Device image services MUST decode PNG, BMP, and DDS including DXT, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics.
+**Rule**: Device image services MUST decode PNG, BMP, and DDS including authored DXT mipmaps, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics. Default memory texture loading MUST publish a real complete mip chain through the shared D3D9 resource owner.
 **Verification**: Test
 
 ### DEV-IMAGE-2 GDI+ lifetime
@@ -113,13 +113,82 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-3 GDI+ platform boundary
 
-**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Platforms without the device implementation MUST return an explicit not-implemented result.
-**Verification**: Review — Windows image tests do not verify pointer isolation or non-Windows rejection across GDI+ entry points.
+**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Missing device operations MUST return an explicit not-implemented result identifying the calling flat API.
+**Verification**: Review — native pointer isolation and complete capability diagnostics require adapter review.
 
 ### DEV-IMAGE-4 GDI+ storage bounds
 
 **Rule**: GDI+ images MUST be limited to 64 MiB each, with at most 256 MiB of independent front-end backing.
 **Verification**: Review — no existing test reaches either GDI+ storage admission boundary.
+
+### DEV-IMAGE-5 CPU bitmap rendering
+
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, image drawing with retained compositing modes, filled paths and filled primitives through the shared device interface.
+**Verification**: Test
+**Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
+
+### DEV-IMAGE-6 GDI+ value queries
+
+**Rule**: Image queries MUST report actual dimensions, bounds, pixels and bitmap type. Path and string-format clones MUST retain independent state and reject invalid receiver kinds.
+**Verification**: Test
+
+### DEV-IMAGE-7 GDI+ path pixel centers
+
+**Rule**: Aliased paths MUST test pixel centers using their fill rule. Antialiased path coverage MUST honor integer and half-integer pixel-center modes.
+**Verification**: Test
+**Basis**: [PixelOffsetMode](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-pixeloffsetmode).
+
+### DEV-IMAGE-8 GDI+ affine matrices
+
+**Rule**: Matrices MUST retain IEEE nonfinite coefficients and compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
+**Verification**: Test
+**Basis**: [MatrixOrder](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-matrixorder).
+
+### DEV-IMAGE-9 GDI+ solid brush state
+
+**Rule**: Solid brush color changes MUST affect subsequent drawing. Cloned brushes MUST retain independent colors, and color access MUST reject non-solid receivers.
+**Verification**: Test
+
+### DEV-IMAGE-10 GDI+ world transforms
+
+**Rule**: Graphics world matrices MUST transform path and image drawing. Setting and querying world matrices MUST copy their values without sharing subsequent mutations. Singular world transforms MUST fail without changing graphics state.
+**Verification**: Test
+
+### DEV-IMAGE-11 GDI+ string layout settings
+
+**Rule**: String formats MUST preserve independent digit substitution, alignment, trimming, hotkey, tab and measurable-range settings when cloned. Generic formats MUST report native default and typographic settings. Setting more than 32 character ranges MUST return ValueOverflow without changing the previous ranges.
+**Verification**: Test
+**Basis**: [StringFormat](https://learn.microsoft.com/windows/win32/api/gdiplusstringformat/nl-gdiplusstringformat-stringformat).
+
+### DEV-IMAGE-12 Image list storage
+
+**Rule**: Image list duplication MUST copy independent pixels, alpha modes, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
+**Verification**: Test
+**Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
+
+### DEV-IMAGE-13 GDI+ path geometry
+
+**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Cardinal curves MUST preserve tension, neighboring-point tangents and closed joins in cubic control points that affect shared raster output. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
+**Verification**: Test
+**Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
+
+### DEV-IMAGE-14 Image list bitmap inputs
+
+**Rule**: Bitmap strips MUST append independent RGBA and mask snapshots through shared GDI bitmap storage and palettes. Replacement MUST preserve list dimensions and all other images. Color-key insertion MUST derive transparency from the specified or upper-left palette color without consuming source handles.
+**Verification**: Test
+**Basis**: Microsoft ImageList_Add, ImageList_AddMasked and ImageList_Replace contracts.
+
+### DEV-IMAGE-15 Icon and image list raster output
+
+**Rule**: Icon and image list drawing MUST apply packed AND/XOR masks or premultiplied source-over through shared surfaces, mappings and clipping. Icon extraction MUST preserve independent pixels and monochrome double-height mask layout. Invalid destination storage MUST preserve pixels and damage versions.
+**Verification**: Test
+**Basis**: [DrawIconEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-drawiconex), [ICONINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-iconinfo), Microsoft ImageList_Draw and ImageList_GetIcon contracts.
+
+### DEV-IMAGE-16 GDI+ compositing and graphics properties
+
+**Rule**: Graphics compositing MUST select source-over blending or source-copy replacement without changing pixels outside primitive coverage. Smoothing getters MUST report normalized aliases, while text hint getters MUST report the retained device setting. Compositing MUST quantize premultiplied color and alpha channels before conversion to straight-alpha image pixels.
+**Verification**: Test
+**Basis**: Microsoft CompositingMode and SmoothingMode contracts and native-backed System.Drawing GraphicsTests pixel expectations.
 
 ## Audio ownership
 

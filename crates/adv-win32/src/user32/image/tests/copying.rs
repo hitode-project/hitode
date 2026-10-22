@@ -103,6 +103,8 @@ fn copy_icon_preserves_real_payload_and_independent_lifetimes_with_native_invali
             &mut objects,
             "authored source".into(),
             IconImage {
+                alpha: true,
+                monochrome: false,
                 width: 1,
                 height: 1,
                 pixels: vec![1, 2, 3, 255],

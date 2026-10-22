@@ -4,6 +4,57 @@
 use adv_abi::{personality, signature, stub, system_exports};
 
 #[test]
+// spec: PERS-EXPORT-2
+fn later_client_package_b_exports_have_no_registered_frontend_or_review() {
+    let registry = adv_runtime::boot::api_registry(adv_runtime::vorbis::Policy::Guest);
+    let scope = [
+        "user32.dll",
+        "comctl32.dll",
+        "comdlg32.dll",
+        "imm32.dll",
+        "gdi32.dll",
+        "msimg32.dll",
+        "gdiplus.dll",
+        "ddraw.dll",
+        "d3d9.dll",
+        "winmm.dll",
+        "avifil32.dll",
+        "msacm32.dll",
+        "msvfw32.dll",
+        "dsound.dll",
+    ];
+    let later: Vec<_> = include_str!("../../../data/abi/post-win7.tsv")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4);
+            assert!(fields.iter().all(|field| !field.is_empty()));
+            (fields[0], fields[1])
+        })
+        .collect();
+    assert!(later.windows(2).all(|rows| rows[0] < rows[1]));
+    for (module, name) in later
+        .into_iter()
+        .filter(|(module, _)| scope.contains(module))
+    {
+        assert!(
+            !registry.is_implemented(module, name),
+            "later API registered: {module}!{name}"
+        );
+        assert!(
+            !personality::is_reviewed(module, name),
+            "later API reviewed: {module}!{name}"
+        );
+        assert!(
+            signature::lookup(module, name).is_some(),
+            "uncatalogued exclusion: {module}!{name}"
+        );
+        assert!(!registry.dynamic_available(module, name));
+    }
+}
+
+#[test]
 // spec: PERS-EXPORT-2, PERS-EXPORT-3
 fn discovery_exposes_only_implemented_or_completely_reviewed_names() {
     for policy in [

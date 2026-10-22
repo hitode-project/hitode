@@ -5,7 +5,11 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod composite;
+mod sprite;
+pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
+pub use composite::{Composite, CompositeError, GradientVertex};
 #[cfg(all(feature = "gpu", target_vendor = "apple"))]
 mod pixels;
 #[cfg(all(feature = "gpu", target_vendor = "apple"))]

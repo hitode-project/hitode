@@ -1,5 +1,6 @@
 //! LoadImage/LoadIcon fronts share guest paths, module resources and USER owners.
 pub(crate) mod decode;
+mod draw;
 
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::Prot;
@@ -542,11 +543,8 @@ fn copy_icon(env: &mut Env<'_>, icon: Handle) -> Handle {
     }
 }
 
-/// Color icons only: the AND mask as a 1-bit bitmap and the pixels as a
-/// 32-bit color bitmap the caller deletes, with the hotspot at the centre.
-/// Pixels are kept as decoded RGBA, so a monochrome resource also returns a
-/// color bitmap and its alpha bytes stay as decoded. Cursors and other
-/// identities without pixel data fail rather than invent bitmaps.
+/// Independent bitmaps retain monochrome AND/XOR layout and premultiplied
+/// color-icon storage. The caller owns their ordinary GDI lifetimes.
 #[win32(user32, name = "GetIconInfo", level = implement)]
 fn get_icon_info(env: &mut Env<'_>, icon: Handle, info: GuestPtr<()>) -> i32 {
     const API: &str = "user32.dll!GetIconInfo";
@@ -569,8 +567,9 @@ fn get_icon_info(env: &mut Env<'_>, icon: Handle, info: GuestPtr<()>) -> i32 {
     };
     let (width, height) = (image.width, image.height);
     let mask_stride = width.div_ceil(32) as usize * 4;
-    let mut mask = vec![0; mask_stride * height as usize];
-    let mut color = Vec::with_capacity(image.pixels.len());
+    let monochrome = image.monochrome;
+    let mut mask = vec![0; mask_stride * height as usize * if monochrome { 2 } else { 1 }];
+    let mut color = Vec::with_capacity(if monochrome { 0 } else { image.pixels.len() });
     for (index, (&and, rgba)) in image
         .mask
         .iter()
@@ -579,16 +578,42 @@ fn get_icon_info(env: &mut Env<'_>, icon: Handle, info: GuestPtr<()>) -> i32 {
     {
         let (x, y) = (index % width as usize, index / width as usize);
         mask[y * mask_stride + x / 8] |= (and & 1) << (7 - x % 8);
-        color.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+        if monochrome {
+            if rgba[0] != 0 {
+                mask[(y + height as usize) * mask_stride + x / 8] |= 1 << (7 - x % 8);
+            }
+        } else if image.alpha {
+            let premultiply =
+                |value: u8| ((u16::from(value) * u16::from(rgba[3]) + 127) / 255) as u8;
+            color.extend_from_slice(&[
+                premultiply(rgba[2]),
+                premultiply(rgba[1]),
+                premultiply(rgba[0]),
+                rgba[3],
+            ]);
+        } else {
+            color.extend_from_slice(&[rgba[2], rgba[1], rgba[0], 0]);
+        }
     }
-    let Some(mask) = crate::gdi32::bitmap_from_rows(env, width, height, 1, &mask) else {
+    let Some(mask) = crate::gdi32::bitmap_from_rows(
+        env,
+        width,
+        if monochrome { height * 2 } else { height },
+        1,
+        &mask,
+    ) else {
         set_last_error(env, 8);
         return 0;
     };
-    let Some(color) = crate::gdi32::bitmap_from_rows(env, width, height, 32, &color) else {
-        crate::gdi32::delete_object_value(env, mask);
-        set_last_error(env, 8);
-        return 0;
+    let color = if monochrome {
+        0
+    } else {
+        let Some(color) = crate::gdi32::bitmap_from_rows(env, width, height, 32, &color) else {
+            crate::gdi32::delete_object_value(env, mask);
+            set_last_error(env, 8);
+            return 0;
+        };
+        color
     };
     let mut bytes = [0; 20];
     for (word, output) in [1, width / 2, height / 2, mask, color]
@@ -607,6 +632,7 @@ fn get_icon_info(env: &mut Env<'_>, icon: Handle, info: GuestPtr<()>) -> i32 {
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    draw::register(registry);
     registry.register(load_a_ABI);
     registry.register(load_w_ABI);
     registry.register(load_icon_a_ABI);

@@ -14,6 +14,22 @@ use adv_win32::{
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const LOG: u32 = DATA + 0x8000;
+#[path = "window_creation/activation.rs"]
+mod activation;
+#[path = "window_creation/capture.rs"]
+mod capture;
+#[path = "window_creation/dc_origin.rs"]
+mod dc_origin;
+#[path = "window_creation/deferred.rs"]
+mod deferred;
+#[path = "window_creation/focus.rs"]
+mod focus;
+#[path = "window_creation/geometry.rs"]
+mod geometry;
+#[path = "window_creation/style.rs"]
+mod style;
+#[path = "window_creation/z_order.rs"]
+mod z_order;
 
 trait TestCpu: Backend {
     fn region(&mut self, _: u32, _: usize) {}

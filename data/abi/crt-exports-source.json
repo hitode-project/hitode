@@ -1,0 +1,154 @@
+{
+  "format": 1,
+  "source": {
+    "kind_overrides": {
+      "input": "data/abi/crt-kind-overrides.tsv",
+      "provenance": "data/abi/crt-source.json#export_kind_corrections",
+      "sha256": "545113e22ad59d7230b5f49f6cc9d8636961e6dba03f22d429c7a6caff3df6b5"
+    },
+    "license": "public domain (mingw-w64-crt/DISCLAIMER.PD)",
+    "mingw-w64": "62891fa4bf507d674c8c48822b596560b7cb506d",
+    "modules": {
+      "api-ms-win-crt-conio-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-conio-l1-1-0.def",
+        "exports": 30,
+        "sha256": "9d41333ca3a76a6540ec2191cda358c382e5717eb67fac4b1ec79b5cb0f9cc37"
+      },
+      "api-ms-win-crt-convert-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-convert-l1-1-0.def.in",
+        "exports": 122,
+        "sha256": "de76381eca0fc3204f7f99eee6fed18bbb426bc72615dfddb9820949cfc94d27"
+      },
+      "api-ms-win-crt-environment-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-environment-l1-1-0.def",
+        "exports": 18,
+        "sha256": "a00e0d36a8621b8f718fbe79c7c9a199bf34519bef5fb58820d39e681f8e65c0"
+      },
+      "api-ms-win-crt-filesystem-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-filesystem-l1-1-0.def.in",
+        "exports": 65,
+        "sha256": "f2bb0504b85f308d615b5185a174a1519cf00c872268f8ef5915731c0c867e91"
+      },
+      "api-ms-win-crt-heap-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-heap-l1-1-0.def",
+        "exports": 27,
+        "sha256": "1a5c1094b8d977e939a2a3f18a2412e19742a76ab7bbbcf5ba7e2f1cddedcfa7"
+      },
+      "api-ms-win-crt-locale-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-locale-l1-1-0.def",
+        "exports": 20,
+        "sha256": "6efa6cb28436c58cdaed806f58a215b7fe4ef212b9cdc226155b5a1a1698593a"
+      },
+      "api-ms-win-crt-math-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-math-l1-1-0.def.in",
+        "exports": 314,
+        "sha256": "8cd24e8f62a89afda40a96701913f99831d045acdfcaad15e233e73b563be8e7"
+      },
+      "api-ms-win-crt-multibyte-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-multibyte-l1-1-0.def",
+        "exports": 200,
+        "sha256": "d8f3f4f81b3de1470e8b1d28e4a199d746f68c33aee574600d8839c203ed9bc3"
+      },
+      "api-ms-win-crt-private-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-private-l1-1-0.def.in",
+        "exports": 1162,
+        "sha256": "454469cfb5ae2403bb1d111762afbc2e8e9a60877a258944a2bc1450aef880b9"
+      },
+      "api-ms-win-crt-process-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-process-l1-1-0.def",
+        "exports": 36,
+        "sha256": "9fa8518a8efc1030acea072645586400798c20795fea5390aad2803e43792d62"
+      },
+      "api-ms-win-crt-runtime-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-runtime-l1-1-0.def.in",
+        "exports": 107,
+        "sha256": "f181af9cb863e2f3902e35abb2db765310624cdaea652518e1f2fbfa16b9b7b8"
+      },
+      "api-ms-win-crt-stdio-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-stdio-l1-1-0.def",
+        "exports": 159,
+        "sha256": "c029e6964dfad38fcb2f986799e107a545b88b4c3125121796dc4fa642c8f4f0"
+      },
+      "api-ms-win-crt-string-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-string-l1-1-0.def",
+        "exports": 178,
+        "sha256": "2b812b2a034c0a4f4929a6c407f2e4a6dd095701308a9d8aec4f2d93d6640868"
+      },
+      "api-ms-win-crt-time-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-time-l1-1-0.def.in",
+        "exports": 72,
+        "sha256": "d2290cb35cad3b267c731e3476be88f2730928e42d9bd0510849e0e1c02680a4"
+      },
+      "api-ms-win-crt-utility-l1-1-0.dll": {
+        "definition": "lib-common/api-ms-win-crt-utility-l1-1-0.def",
+        "exports": 30,
+        "sha256": "a54f295059a17152abf02824000e488ffc5a4bc3317c9495cb927ebada80085f"
+      },
+      "msvcp60.dll": {
+        "definition": "lib32/msvcp60.def",
+        "exports": 10,
+        "sha256": "d22cfa60aae3ce29a00824954a9c3577ee39f5c20312d223062c81816e2d7a54"
+      },
+      "msvcr100.dll": {
+        "definition": "lib32/msvcr100.def.in",
+        "exports": 1621,
+        "sha256": "03ccbd28fc5701a1fd8a5bcbf654b83a21be84fb2ab81a12585628adb9bb4f06"
+      },
+      "msvcr110.dll": {
+        "definition": "lib32/msvcr110.def.in",
+        "exports": 1710,
+        "sha256": "ea906182b167088cc5168cd7d41d2ed6a2b0ae4f60a4775d27c80646ead9e415"
+      },
+      "msvcr120.dll": {
+        "definition": "lib32/msvcr120.def.in",
+        "exports": 1966,
+        "sha256": "44b82e5e983423c0092d8cb1797671f79d5371c3ea8aabf2479500cf532f2910"
+      },
+      "msvcr70.dll": {
+        "definition": "lib32/msvcr70.def.in",
+        "exports": 840,
+        "sha256": "495f2c32139fa481106015a4b1cc69588367725122c652221070d96509f71ad7"
+      },
+      "msvcr71.dll": {
+        "definition": "lib32/msvcr71.def.in",
+        "exports": 838,
+        "sha256": "49e779c7c307dc4b68ce92ef9041a51c1d218c76871b0b7e439dcf076de4d17e"
+      },
+      "msvcr80.dll": {
+        "definition": "lib32/msvcr80.def.in",
+        "exports": 1466,
+        "sha256": "e97bd39c1c877bd424e272a9f9346c3db35d00a09381a039f1b7fab41a23c137"
+      },
+      "msvcr90.dll": {
+        "definition": "lib32/msvcr90.def.in",
+        "exports": 1450,
+        "sha256": "9cdb033edcabd7a7c17c6b52086ebfc29dce667f7415c0960cf18788ee72bb29"
+      },
+      "msvcrt.dll": {
+        "definition": "lib-common/msvcrt.def.in",
+        "exports": 1423,
+        "sha256": "d9a2514ff787d4995f033feca5b90f02290ec382712bdbd3ae6d7fa8df6ecd78"
+      },
+      "msvcrt20.dll": {
+        "definition": "lib32/msvcrt20.def.in",
+        "exports": 1127,
+        "sha256": "3e4a024ca7c83cd9e76fa0a4e0a42a546a3e228d3350335de60efe4090d5b06b"
+      },
+      "msvcrt40.dll": {
+        "definition": "lib32/msvcrt40.def.in",
+        "exports": 1166,
+        "sha256": "87de1dcff3be6cce1a2d3872ae93c78bdb92289612910ce88ee493fbdcf42a1a"
+      },
+      "ucrtbase.dll": {
+        "definition": "lib-common/ucrtbase.def.in",
+        "exports": 2542,
+        "sha256": "5925e0dbb389af33fb552b248d9bb5c7a516f564549544ca4b0024943fe96298"
+      },
+      "vcruntime140.dll": {
+        "definition": "lib-common/vcruntime140.def.in",
+        "exports": 81,
+        "sha256": "700770ca60e712f1c0f08ee090fadfe3bb7ca3f9537d4c2a85cef8447205f4d6"
+      }
+    }
+  }
+}

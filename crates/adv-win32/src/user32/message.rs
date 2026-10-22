@@ -2372,6 +2372,13 @@ pub(super) fn def_window_proc_encoded(
                 other => other,
             };
         }
+        wm::CANCELMODE => {
+            let ctx = env.context;
+            if user_mut(env).queue(ctx).capture == hwnd {
+                return window::change_capture(env, 0, move |env, _| then(env, 0));
+            }
+            0
+        }
         wm::NCHITTEST => 1, // HTCLIENT
         wm::IME_CHAR => {
             // DefWindowProcA posts a packed DBCS character as lead then trail byte.
@@ -2397,9 +2404,9 @@ pub(super) fn def_window_proc_encoded(
             }
             0
         }
-        wm::MOUSEACTIVATE => 1,
-        wm::ACTIVATE if wp & 0xffff != 0 => {
-            return window::set_focus(env, hwnd, move |env, _| then(env, 0));
+        wm::MOUSEACTIVATE | wm::NCACTIVATE => 1,
+        wm::ACTIVATE if wp & 0xffff != 0 && wp >> 16 == 0 => {
+            return window::focus::activate(env, hwnd, move |env| then(env, 0));
         }
         wm::WINDOWPOSCHANGED => {
             let flags = env.cpu.read_u32(lp + 24).unwrap_or(0);

@@ -6,7 +6,7 @@ use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, types::RECT, win32};
 use adv_cpu::backend::Prot;
 
 pub(crate) const MAX_RECTS: usize = 64;
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct UpdateRegion {
     rects: Vec<[i32; 4]>,
     erase: bool,
@@ -268,6 +268,76 @@ fn validate_rect(env: &mut Env<'_>, hwnd: Handle, input: GuestPtr<RECT>) -> Outc
     super::message::queue_status_for(env, thread);
     Outcome::Return(1)
 }
+fn change_region(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    region: u32,
+    erase: bool,
+    validating: bool,
+    api: &str,
+) -> Outcome {
+    let rectangles = if region == 0 {
+        None
+    } else {
+        let Some(rects) = crate::gdi32::region::rectangles(env, region) else {
+            return failure(env, 6);
+        };
+        Some(rects.clone())
+    };
+    if hwnd == 0 && !validating {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "synchronous desktop-wide nonclient repaint has no shared raster target",
+        );
+        return failure(env, 50);
+    }
+    let Some(window) = env
+        .ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    else {
+        return failure(env, 1400);
+    };
+    let thread = window.thread;
+    let previous = window.control.update.clone();
+    let was_dirty = window.needs_paint;
+    let mut apply = |rect| {
+        if validating {
+            validate(window, rect)
+        } else {
+            invalidate(window, rect, erase)
+        }
+    };
+    let accepted = match rectangles {
+        None => apply(None),
+        Some(rects) => rects.into_iter().all(|rect| apply(Some(rect))),
+    };
+    if !accepted {
+        window.control.update = previous;
+        window.needs_paint = was_dirty;
+        return capacity(env, api);
+    }
+    super::message::queue_status_for(env, thread);
+    Outcome::Return(1)
+}
+#[win32(user32, name="InvalidateRgn", level=state)]
+fn invalidate_region(env: &mut Env<'_>, hwnd: Handle, region: Handle, erase: i32) -> Outcome {
+    change_region(
+        env,
+        hwnd.0,
+        region.0,
+        erase != 0,
+        false,
+        "user32.dll!InvalidateRgn",
+    )
+}
+#[win32(user32, name="ValidateRgn", level=state)]
+fn validate_region(env: &mut Env<'_>, hwnd: Handle, region: Handle) -> Outcome {
+    change_region(env, hwnd.0, region.0, false, true, "user32.dll!ValidateRgn")
+}
 #[win32(user32, name="GetUpdateRect", level=state)]
 fn get_update_rect(env: &mut Env<'_>, hwnd: Handle, output: GuestPtr<RECT>, erase: i32) -> Outcome {
     let Some(w) = env
@@ -312,4 +382,9 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(invalidate_rect_ABI);
     registry.register(validate_rect_ABI);
     registry.register(get_update_rect_ABI);
+    registry.register(invalidate_region_ABI);
+    registry.register(validate_region_ABI);
 }
+
+#[cfg(test)]
+mod tests;

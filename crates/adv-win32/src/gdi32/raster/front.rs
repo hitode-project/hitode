@@ -9,7 +9,9 @@ use adv_machine::{Ext, Machine, Objects};
 use adv_os::gdi::WINDOW_DC;
 
 mod display;
+mod image;
 mod mapped;
+mod queries;
 mod set_dib;
 pub mod surface_dc;
 
@@ -150,6 +152,8 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
 ];
 pub fn register(registry: &mut Registry) {
     display::register(registry);
+    queries::register(registry);
+    image::register(registry);
     super::fill::register(registry);
     super::clip::register(registry);
     super::color_table::register(registry);

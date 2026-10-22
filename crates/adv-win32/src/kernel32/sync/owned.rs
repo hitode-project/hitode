@@ -194,17 +194,38 @@ pub(super) fn release_native(
     0
 }
 pub(super) fn create_front(env: &mut Env<'_>, kind: Kind) -> Outcome {
-    let (security, initial) = (env.arg(0), env.arg(1));
     let (maximum, name) = match kind {
         Kind::Mutant => (0, env.arg(2)),
         Kind::Semaphore => (env.arg(2), env.arg(3)),
     };
+    create_values(
+        env,
+        kind,
+        [env.arg(0), env.arg(1), maximum, name, kind.full_access()],
+    )
+}
+pub(super) fn create_ex_front(env: &mut Env<'_>) -> Outcome {
+    if env.arg(4) != 0 {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    create_values(
+        env,
+        Kind::Semaphore,
+        [env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(5)],
+    )
+}
+fn create_values(env: &mut Env<'_>, kind: Kind, args: [u32; 5]) -> Outcome {
+    let [security, initial, maximum, name, desired] = args;
     let initial = if matches!(kind, Kind::Mutant) {
         u32::from(initial != 0)
     } else {
         initial
     };
     let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
+    if let Err(status) = access(env, desired, kind, kind.create()) {
+        return event::front_status(env, status, 0);
+    }
     let inherit = match super::super::handle::security_inherit(env, security) {
         Ok(inherit) => inherit,
         Err(code) => {
@@ -225,7 +246,7 @@ pub(super) fn create_front(env: &mut Env<'_>, kind: Kind) -> Outcome {
                 Ok(buffer) => buffer,
                 Err(outcome) => return outcome,
             };
-            let mut args = vec![buffer, kind.full_access(), buffer + 8, initial];
+            let mut args = vec![buffer, desired, buffer + 8, initial];
             if matches!(kind, Kind::Semaphore) {
                 args.push(maximum);
             }
@@ -302,6 +323,15 @@ pub(super) fn release_front(env: &mut Env<'_>, kind: Kind) -> Outcome {
     } else {
         (0, 0)
     };
+    release_at(env, kind, handle, count, previous)
+}
+pub(super) fn release_at(
+    env: &mut Env<'_>,
+    kind: Kind,
+    handle: u32,
+    count: u32,
+    previous: u32,
+) -> Outcome {
     match crate::native::overridden(env, kind.release()) {
         Ok(Some(target)) => {
             let args = if matches!(kind, Kind::Semaphore) {

@@ -288,8 +288,28 @@ pub(super) fn published(env: &mut Env<'_>, output: u32, status: u32, create: boo
     }
 }
 pub(super) fn create_front(env: &mut Env<'_>) -> Outcome {
-    let (security, manual, initial, name) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    create_values(
+        env,
+        [env.arg(0), env.arg(1), env.arg(2), env.arg(3), FULL_ACCESS],
+    )
+}
+pub(super) fn create_ex_front(env: &mut Env<'_>) -> Outcome {
+    let flags = env.arg(2);
+    if flags & !3 != 0 {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    create_values(
+        env,
+        [env.arg(0), flags & 1, flags & 2, env.arg(1), env.arg(3)],
+    )
+}
+fn create_values(env: &mut Env<'_>, args: [u32; 5]) -> Outcome {
+    let [security, manual, initial, name, desired] = args;
     let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
+    if let Err(status) = access(env, desired, "NtCreateEvent") {
+        return front_status(env, status, 0);
+    }
     let inherit = match super::super::handle::security_inherit(env, security) {
         Ok(inherit) => inherit,
         Err(code) => {
@@ -314,7 +334,7 @@ pub(super) fn create_front(env: &mut Env<'_>) -> Outcome {
                 target,
                 [
                     buffer,
-                    FULL_ACCESS,
+                    desired,
                     buffer + 8,
                     u32::from(manual == 0),
                     u32::from(initial != 0),

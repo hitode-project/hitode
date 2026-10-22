@@ -1,8 +1,12 @@
 //! D3DX NONE, POINT and LINEAR pixel resizing, measured against native D3DX9.
 //! POINT uses integer source cells; LINEAR samples pixel centers and wraps edges.
+mod area;
 /// Resize tightly packed BGRA8 pixels. Callers validate positive dimensions,
 /// source length and the bounded destination extent before calling.
 pub fn pixels(input: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, filter: super::Filter) -> Vec<u8> {
+    if matches!(filter, super::Filter::TriangleWrap | super::Filter::Box) {
+        return area::pixels(input, sw, sh, dw, dh, filter);
+    }
     let mut output = vec![0; dw as usize * dh as usize * 4];
     for y in 0..dh {
         for x in 0..dw {

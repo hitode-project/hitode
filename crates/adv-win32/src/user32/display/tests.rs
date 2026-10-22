@@ -39,6 +39,7 @@ fn fixture() -> Machine<JitCpu> {
         id: 0,
         instance: 0,
         rect: Rect::new(560, 240, 820, 643),
+        touch_flags: None,
         placement: super::super::placement::PlacementState::new(Rect::new(560, 240, 820, 643)),
         text: String::new(),
         extra: Vec::new(),

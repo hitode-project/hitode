@@ -19,7 +19,7 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $validOutput 'signatures.t
     $fields = $line.Split("`t")
     $rows[$fields[0] + '!' + $fields[1]] = $fields
 }
-$expectedScope = @{ 'mpr.dll' = 2; 'ntdll.dll' = 3; 'shfolder.dll' = 2; 'dbghelp.dll' = 1; 'imagehlp.dll' = 1 }
+$expectedScope = @{ 'ntdll.dll' = 4; 'shfolder.dll' = 2; 'imagehlp.dll' = 1 }
 foreach ($module in $expectedScope.Keys) {
     if (($rows.Keys | Where-Object { $_.StartsWith($module + '!') }).Count -ne $expectedScope[$module]) { throw "Selection widened $module" }
 }
@@ -30,6 +30,34 @@ foreach ($suffix in @('A', 'W')) {
 }
 if (($rows['kernel32.dll!lstrcpy'][2..5] -join "`t") -cne ($rows['kernel32.dll!lstrcpyA'][2..5] -join "`t")) { throw 'Legacy ANSI alias changed its source declaration' }
 if (($rows['imagehlp.dll!MakeSureDirectoryPathExists'][2..5] -join "`t") -cne ($rows['dbghelp.dll!MakeSureDirectoryPathExists'][2..5] -join "`t")) { throw 'ImageHlp alias changed its source declaration' }
+# Every selected alias retains the entire source ABI, including expanded DLLs.
+foreach ($selection in $selections) {
+    $fields = $selection.Split("`t")
+    $alias = $rows[$fields[0] + '!' + $fields[1]]
+    $original = $rows[$fields[2] + '!' + $fields[3]]
+    if (($alias[2..5] -join "`t") -cne ($original[2..5] -join "`t")) { throw 'Selected alias changed its source declaration' }
+}
+# The CY union has its own nested declaration, not another anonymous record's layout.
+if (!$rows['oleaut32.dll!VarBstrFromCy'][5].StartsWith('cyIn:Windows.Win32.System.Com.CY:aggregate:2|')) { throw 'Currency union lost its two-word x86 ABI' }
+$com = @(Get-Content -LiteralPath (Join-Path $validOutput 'com.tsv') | Where-Object { $_ -and !$_.StartsWith('#') })
+foreach ($expected in @{ ITypeLib = 13; ITypeInfo = 22; IFont = 27; IPicture = 17 }.GetEnumerator()) {
+    if (@($com | Where-Object { $_.StartsWith($expected.Key + "`t") }).Count -ne $expected.Value) { throw "COM inheritance changed: $($expected.Key)" }
+}
+# Existing binary64 CRT input must regenerate, but malformed stack widths and
+# unrelated binary64 declarations must not be admitted by that support.
+$crtLines = [IO.File]::ReadAllLines($crt)
+foreach ($name in @('pow', '_hypot')) {
+    $badCrt = $crtLines.Clone()
+    $index = [Array]::FindIndex($badCrt, [Predicate[string]] { param($line) $line.StartsWith("msvcrt.dll`t$name`t") })
+    if ($index -lt 0) { throw "Missing binary64 CRT input: $name" }
+    $badCrt[$index] = $badCrt[$index].Replace('x:double:f64:2', 'x:double:f64:1')
+    $badPath = Join-Path $cache ($name + '-bad-crt.tsv')
+    [IO.File]::WriteAllLines($badPath, $badCrt)
+    $rejected = $false
+    try { [AbiMetadata]::Generate($Winmd, (Join-Path $cache ($name + '-bad-crt')), $modules, $badPath, $valid) }
+    catch { if (!$_.Exception.ToString().Contains('CRT binary math stack contract changed')) { throw }; $rejected = $true }
+    if (!$rejected) { throw "Malformed binary64 CRT input accepted: $name" }
+}
 function Assert-Rejected([string]$Name, [string[]]$InputLines, [string]$Reason) {
     $inputPath = Join-Path $cache ($Name + '.tsv')
     [IO.File]::WriteAllLines($inputPath, $InputLines)
@@ -44,3 +72,16 @@ Assert-Rejected 'wrong-words' $wrongWords 'stack contract changed'
 Assert-Rejected 'duplicate' ($selections + $selections[0]) 'Duplicate selected'
 Assert-Rejected 'conflict' ($selections + "user32.dll`tGetWindowPlacement`tshell32.dll`tSHGetFolderPathA`t5") 'Conflicting selected'
 Write-Output 'Selected exports: exact DLL scope and complete aliases verified; missing source, changed stack width, duplicate destination and conflicting alias rejected.'
+
+# The exported GUID helper has SDK-proven stdcall pointers, despite its inline header spelling.
+$sdkLines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'data/abi/sdk-input.tsv'))
+Copy-Item (Join-Path $repoRoot 'data/abi/sdk-com-input.tsv') (Join-Path $cache 'sdk-com-input.tsv') -Force
+foreach ($replacement in @('rguid1:System.Guid*:u32:1', 'rguid1:System.Guid*:ptr:2')) {
+    $badSdk = @($sdkLines | ForEach-Object { $_.Replace('rguid1:System.Guid*:ptr:1', $replacement) })
+    $badPath = Join-Path $cache 'bad-guid-sdk.tsv'
+    [IO.File]::WriteAllLines($badPath, $badSdk)
+    $rejected = $false
+    try { [AbiMetadata]::Generate($Winmd, (Join-Path $cache 'bad-guid-sdk'), $modules, $crt, $valid, $badPath) }
+    catch { if (!$_.Exception.ToString().Contains('Invalid scoped SDK x86 signature')) { throw }; $rejected = $true }
+    if (!$rejected) { throw 'Malformed GUID helper SDK declaration accepted' }
+}

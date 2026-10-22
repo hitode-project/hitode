@@ -1,22 +1,27 @@
-//! UCRT/API-set heap fronts share the existing process heap.
+//! CRT allocation, sizing and in-place resizing share the existing RTL heap owner.
 use super::*;
 use adv_abi::{GuestPtr, GuestReturn, win32};
 use adv_cpu::backend::MemFault;
 
 const HEAP_MAXREQ: u32 = 0xffffffe0;
+type Done = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(calloc_crt_ABI);
-    for api in [malloc_ABI, calloc_ABI, realloc_ABI, free_ABI] {
-        registry.register(api);
-        registry.register(adv_abi::Api {
-            module: "api-ms-win-crt-heap-l1-1-0.dll",
-            ..api
-        });
-    }
+    versions::register(
+        registry,
+        &[
+            ("malloc", malloc_ABI.handler),
+            ("calloc", calloc_ABI.handler),
+            ("realloc", realloc_ABI.handler),
+            ("free", free_ABI.handler),
+            ("_msize", block_size),
+            ("_expand", expand),
+        ],
+    );
 }
 
-fn result(env: &mut Env<'_>, address: u32) -> Result<GuestPtr<()>, MemFault> {
+pub(super) fn result(env: &mut Env<'_>, address: u32) -> Result<GuestPtr<()>, MemFault> {
     if address == 0 {
         floating::errno_address(env).write(env.cpu, 12)?; // ENOMEM
     }
@@ -30,7 +35,7 @@ fn malloc(env: &mut Env<'_>, size: u32) -> Outcome {
     }
     crate::native_heap::allocate_then(
         env,
-        size,
+        size.max(1),
         false,
         Box::new(|env, address| result(env, address).into_outcome()),
     )
@@ -43,7 +48,7 @@ fn calloc(env: &mut Env<'_>, count: u32, size: u32) -> Outcome {
     };
     crate::native_heap::allocate_then(
         env,
-        size,
+        size.max(1),
         true,
         Box::new(|env, address| result(env, address).into_outcome()),
     )
@@ -104,6 +109,41 @@ fn realloc(env: &mut Env<'_>, pointer: GuestPtr<()>, size: u32) -> Outcome {
         env,
         pointer.addr(),
         size,
+        Box::new(|env, address| result(env, address).into_outcome()),
+    )
+}
+
+fn block_size(env: &mut Env<'_>) -> Outcome {
+    let pointer = env.arg(0);
+    if pointer == 0 {
+        return errors::invalid(env, u32::MAX);
+    }
+    size_then(env, pointer, Box::new(|_, size| Outcome::Return(size)))
+}
+
+pub(super) fn size_then(env: &mut Env<'_>, pointer: u32, then: Done) -> Outcome {
+    let heap = env.ext.get::<Heaps>().process_heap;
+    match crate::native::public_entry(env, "ntdll.dll", "RtlSizeHeap") {
+        Ok(entry) => Outcome::call(entry, [heap, 0, pointer], move |env, value| {
+            then(env, value.value())
+        }),
+        Err(reason) => Outcome::Fail(format!("CRT live RtlSizeHeap resolution: {reason}")),
+    }
+}
+
+fn expand(env: &mut Env<'_>) -> Outcome {
+    let (pointer, size) = (env.arg(0), env.arg(1));
+    if pointer == 0 {
+        return errors::invalid(env, 0);
+    }
+    if size > HEAP_MAXREQ {
+        return result(env, 0).into_outcome();
+    }
+    crate::native_heap::realloc_block_then(
+        env,
+        pointer,
+        size.max(1),
+        0x10, // HEAP_REALLOC_IN_PLACE_ONLY; a zero request keeps one live byte.
         Box::new(|env, address| result(env, address).into_outcome()),
     )
 }

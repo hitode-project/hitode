@@ -432,5 +432,13 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     env.sys.terminate_other_contexts(code);
     super::super::process::apc::retire_completed(env);
     let shutdown = shutdown_process(env);
-    after(env, shutdown, Box::new(move |_| Outcome::ExitProcess(code)))
+    after(
+        env,
+        shutdown,
+        Box::new(move |env| {
+            // Exiting closes every handle.
+            crate::kernel32::file::delete_on_close::release(env, true);
+            Outcome::ExitProcess(code)
+        }),
+    )
 }

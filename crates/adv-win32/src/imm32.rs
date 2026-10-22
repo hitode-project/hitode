@@ -4,6 +4,7 @@ use adv_machine::Env;
 
 pub fn register(registry: &mut Registry) {
     registry.register(get_context_ABI);
+    registry.register(is_ime_ABI);
     registry.register(get_status_position_ABI);
     registry.register(set_status_position_ABI);
 }
@@ -38,5 +39,12 @@ fn get_status_position(env: &mut Env<'_>, context: Handle, _output: GuestPtr<()>
 #[win32(imm32, name = "ImmSetStatusWindowPos", level = safe_fail)]
 fn set_status_position(env: &mut Env<'_>, _context: Handle, _position: GuestPtr<()>) -> i32 {
     crate::util::set_last_error(env, 6);
+    0
+}
+
+/// The installed keyboard profile has no IME layout. Unknown HKLs also return
+/// FALSE without changing LastError or creating input-context state.
+#[win32(imm32, name = "ImmIsIME", level = implement)]
+fn is_ime(_env: &mut Env<'_>, _layout: Handle) -> i32 {
     0
 }

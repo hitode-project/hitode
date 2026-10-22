@@ -117,10 +117,7 @@ pub(super) fn register(registry: &mut Registry) {
         "msvcr90.dll",
         "__crtGetStringTypeW",
         Conv::Cdecl { argc: 7 },
-        |env| {
-            let (ty, source, count, types) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-            crate::kernel32::string_type_w(env, ty, source, count as i32, types)
-        },
+        crate::kernel32::crt_string_type_w,
     );
     for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
         for api in [

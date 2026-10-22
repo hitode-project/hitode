@@ -1,20 +1,18 @@
-//! CRT data descriptors point at the Win32 process command-line owner.
+//! CRT globals use generated storage descriptors and the Win32 command-line owner.
 use super::*;
 use adv_cpu::backend::{Backend, MemFault};
 
-const MODULES: [&str; 3] = ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"];
-
 pub(super) fn register(registry: &mut Registry) {
-    for module in MODULES {
-        for name in ["_acmdln", "_wcmdln"] {
-            registry
-                .register_data(module, name, &[0; 4])
-                .expect("CRT data width matches its authoritative declaration");
-        }
-    }
-    registry
-        .register_data("msvcrt.dll", "_adjust_fdiv", &[0; 4])
-        .expect("legacy data width matches its authoritative declaration");
+    let huge = f64::INFINITY.to_bits().to_le_bytes();
+    versions::register_data(
+        registry,
+        &[
+            ("_acmdln", &[0; 4]),
+            ("_wcmdln", &[0; 4]),
+            ("_adjust_fdiv", &[0; 4]),
+            ("_HUGE", &huge),
+        ],
+    );
 }
 
 pub(crate) fn initialize<B: Backend>(
@@ -24,9 +22,10 @@ pub(crate) fn initialize<B: Backend>(
     let bindings: Vec<_> = (machine.sys.thunks.resolver() as &dyn std::any::Any)
         .downcast_ref::<Registry>()
         .map(|registry| {
-            MODULES
-                .into_iter()
-                .flat_map(|module| {
+            versions::PROFILES
+                .iter()
+                .flat_map(|profile| {
+                    let module = profile.module;
                     ["_acmdln", "_wcmdln"]
                         .into_iter()
                         .filter_map(move |name| registry.data(module, name).map(|_| (module, name)))
@@ -34,9 +33,6 @@ pub(crate) fn initialize<B: Backend>(
                 .collect()
         })
         .unwrap_or_default();
-    if bindings.is_empty() {
-        return Ok(());
-    }
     let mut env = Env {
         context: machine.sys.current,
         cpu: &mut machine.cpu,
@@ -66,5 +62,5 @@ pub(crate) fn initialize<B: Backend>(
             }
         }
     }
-    Ok(())
+    legacy_stdio::initialize(&mut env)
 }

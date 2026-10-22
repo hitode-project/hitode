@@ -67,7 +67,7 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-EXPORT-2 Discovery classification
 
-**Rule**: Dynamic discovery MUST expose only implemented or reviewed exports, except under `ADV_PERSONALITY_STRICT`. Forwarders MUST use their final target classification.
+**Rule**: Dynamic discovery MUST expose only implemented or reviewed exports, except under `ADV_PERSONALITY_STRICT`. Forwarders MUST use their final target classification. Exports introduced after Windows 7 MUST remain undiscoverable in both API modes.
 **Verification**: Test
 
 ### PERS-EXPORT-3 Review admission
@@ -82,8 +82,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-EXPORT-5 Diagnostic stubs
 
-**Rule**: Strict mode MUST stop at an unimplemented diagnostic stub. Discovery mode MUST return the registered failure and record the call. Missing failure contracts MUST NOT default to success.
+**Rule**: Strict mode MUST stop at an unimplemented diagnostic stub. Discovery mode MUST record the call and return its registered failure, else the failure below for its return type. Player runs MUST default to discovery, and returns with no derivable failure MUST stop.
 **Verification**: Test
+
+| Return type | Failure |
+|---|---|
+| void, BOOL, counts, handles, pointers, strings | 0 |
+| HRESULT, NTSTATUS, WIN32_ERROR, GDI+ Status, errno_t | Their not-implemented code |
+| SOCKET, COLORREF, WAIT_EVENT, untyped Winsock int | All bits set |
+| Untyped winmm result, except device counts | MMSYSERR_NOTSUPPORTED |
+| 64-bit, floating and aggregate | None |
 
 ### PERS-EXPORT-6 Data exports
 
@@ -99,6 +107,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 **Rule**: Personality diagnostics MUST distinguish rejected probes, reviewed calls, stub calls, and structural mismatches. Rejected names MUST be bounded to 256 entries with explicit dropped counts.
 **Verification**: Review — the complete personality report and its 256-name boundary lack a dedicated end-to-end test.
+
+### PERS-EXPORT-9 Static survey
+
+**Rule**: A survey MUST list, before guest code runs, every static import, constant-named module load or lookup and constant COM class the runtime cannot satisfy. It MUST resolve game modules before host modules, as the loader does, and count lookup sites naming no constant. It MUST omit gaps data/abi/absent.tsv reviews as harmless, each with its reason.
+**Verification**: Test
+
+### PERS-EXPORT-10 Mode contracts
+
+**Rule**: An implementation MAY declare, per scalar parameter, the values it handles as Windows 7 does. A survey MUST report each constant argument outside such a contract, marking calls that discard the result. It MUST list constant arguments to parameters without a contract.
+**Verification**: Test
 
 ## Observable API boundaries
 
@@ -167,6 +185,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 ### PERS-PROFILE-7 ANSI code page selection
 
 **Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. Markers are a name token `chs`, `cn`, `gb` or `zhcn`, a kana-free name with a GBK-only character, or GB2312 data text outnumbering Shift_JIS threefold. An explicit code page MUST replace the detected one before guest code runs.
+**Verification**: Test
+
+### PERS-PROFILE-8 CRT subprocess environment
+
+**Rule**: CRT `system(NULL)` queries MUST report no command processor without changing error cells. Valid `system`, `_spawn*`, `_exec*`, and `_popen` calls MUST fail with ENOENT in this environment. Ordinary subprocess failures MUST NOT emit capability warnings or publish process handles or streams.
+**Verification**: Test
+
+### PERS-PROFILE-9 CRT error cells
+
+**Rule**: CRT error pointers and getters/setters MUST share the existing module/thread cells. UCRT API-set calls MUST use UCRT's cells. Other CRT modules and threads MUST retain independent cells.
 **Verification**: Test
 
 ## ABI ownership

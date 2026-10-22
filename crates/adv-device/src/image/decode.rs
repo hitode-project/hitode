@@ -201,6 +201,7 @@ fn bmp_pixels(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(pixels)
 }
 
+#[derive(Clone, Copy)]
 struct Dds {
     info: Info,
     bits: u32,
@@ -297,12 +298,15 @@ fn channel(value: u32, mask: u32, absent: u8) -> u8 {
 }
 fn dds_pixels(bytes: &[u8]) -> Result<Vec<u8>> {
     let dds = dds_header(bytes)?;
+    dds_pixels_at(bytes, dds, 128)
+}
+fn dds_pixels_at(bytes: &[u8], dds: Dds, offset: usize) -> Result<Vec<u8>> {
     let image = dds.info;
     let mut pixels = vec![0; extent(image.width, image.height)?];
     if dds.block == 0 {
         for y in 0..image.height as usize {
             for x in 0..image.width as usize {
-                let at = 128 + y * dds.pitch + x * (dds.bits as usize / 8);
+                let at = offset + y * dds.pitch + x * (dds.bits as usize / 8);
                 let mut word = [0; 4];
                 word[..dds.bits as usize / 8]
                     .copy_from_slice(&bytes[at..at + dds.bits as usize / 8]);
@@ -318,7 +322,7 @@ fn dds_pixels(bytes: &[u8]) -> Result<Vec<u8>> {
     } else {
         for by in 0..image.height.div_ceil(4) {
             for bx in 0..image.width.div_ceil(4) {
-                let at = 128 + by as usize * dds.pitch + bx as usize * dds.block as usize;
+                let at = offset + by as usize * dds.pitch + bx as usize * dds.block as usize;
                 let block = &bytes[at..at + dds.block as usize];
                 let decoded = dxt(block, image.format);
                 for y in 0..4 {
@@ -335,6 +339,43 @@ fn dds_pixels(bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(pixels)
+}
+
+/// Decode authored DDS levels without replacing them with generated mip pixels.
+/// Other containers provide one image. Every declared DDS level must be present.
+pub fn decode_mipmaps(bytes: &[u8], file_format: FileFormat) -> Result<Vec<Vec<u8>>> {
+    if file_format != FileFormat::Dds {
+        return decode(bytes, file_format).map(|pixels| vec![pixels]);
+    }
+    let header = dds_header(bytes)?;
+    let mut images = Vec::new();
+    let mut offset = 128usize;
+    for level in 0..header.info.mips {
+        let mut dds = header;
+        dds.info.width = (header.info.width >> level).max(1);
+        dds.info.height = (header.info.height >> level).max(1);
+        let rows = if dds.block == 0 {
+            dds.info.height
+        } else {
+            dds.info.height.div_ceil(4)
+        };
+        if level > 0 {
+            dds.pitch = if dds.block == 0 {
+                dds.info.width as usize * (dds.bits / 8) as usize
+            } else {
+                dds.info.width.div_ceil(4) as usize * dds.block as usize
+            };
+        }
+        let end = dds
+            .pitch
+            .checked_mul(rows as usize)
+            .and_then(|size| offset.checked_add(size))
+            .ok_or(Error::Invalid)?;
+        bytes.get(offset..end).ok_or(Error::Invalid)?;
+        images.push(dds_pixels_at(bytes, dds, offset)?);
+        offset = end;
+    }
+    Ok(images)
 }
 fn dxt(block: &[u8], format: Format) -> [[u8; 4]; 16] {
     let color = if format == Format::Bc1 {

@@ -443,19 +443,54 @@ fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_ca
 
 #[test]
 // spec: PERS-EXPORT-5
-fn discovery_refuses_unknown_failure_contract_instead_of_guessing_zero() {
+fn discovery_derives_failures_from_return_types_and_refuses_wide_returns() {
+    for (module, name, failure) in [
+        ("user32.dll", "MessageBeep", Some(0)),
+        ("advapi32.dll", "RegOpenKeyExA", Some(120)),
+        ("ntdll.dll", "LdrLoadDll", Some(0xc000_0002)),
+        ("kernel32.dll", "Sleep", Some(0)),
+        ("kernel32.dll", "GetModuleHandleA", Some(0)),
+        ("kernel32.dll", "WaitForSingleObject", Some(u32::MAX)),
+        ("gdi32.dll", "SetTextColor", Some(u32::MAX)),
+        ("winmm.dll", "waveOutOpen", Some(8)),
+        ("winmm.dll", "waveOutGetNumDevs", Some(0)),
+        ("ws2_32.dll", "connect", Some(u32::MAX)),
+        ("ws2_32.dll", "socket", Some(u32::MAX)),
+        ("ucrtbase.dll", "wcscat_s", Some(40)),
+        ("kernel32.dll", "GetTickCount64", None),
+        ("msvcrt.dll", "floor", None),
+    ] {
+        let signature = signature::lookup(module, name).unwrap();
+        assert_eq!(adv_abi::stub::derived_failure(signature), failure, "{name}");
+    }
     let mut registry = Registry::default();
     registry.set_mode(RunMode::Discovery);
     let mut machine = machine(registry);
     let thunk = machine
         .resolve_import("kernel32.dll", "GetTickCount")
         .unwrap();
+    machine.cpu.write_u32(DATA, 0x1234).unwrap();
+    let mut code = Asm::new(CODE);
+    code.call(thunk).mov_mem_eax(DATA);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0);
+    let context = &machine.sys.contexts[machine.sys.current as usize];
+    assert_eq!(
+        machine.cpu.read_u32(context.teb + teb::LAST_ERROR).unwrap(),
+        120
+    );
+    let mut registry = Registry::default();
+    registry.set_mode(RunMode::Discovery);
+    let mut wide = self::machine(registry);
+    let thunk = wide
+        .resolve_import("kernel32.dll", "GetTickCount64")
+        .unwrap();
     let mut code = Asm::new(CODE);
     code.call(thunk);
-    let RunResult::Failed(failure) = execute(&mut machine, code) else {
-        panic!("unknown failure was guessed");
+    let RunResult::Failed(failure) = execute(&mut wide, code) else {
+        panic!("a 64-bit failure was guessed");
     };
-    assert!(failure.message.contains("no reviewed failure contract"));
+    assert!(failure.message.contains("no derivable failure"));
 }
 
 #[test]
@@ -548,6 +583,49 @@ fn gdiplus_status_failure_is_nonzero_and_generated_tables_have_no_duplicates() {
     }
 }
 
+#[test]
+// spec: PERS-ABI-1
+fn selected_d3dx_graphics_helpers_keep_sdk_scalar_and_pointer_abi_kinds() {
+    use signature::AbiKind::{F32, I32, Pointer, U32};
+    for (name, kinds) in [
+        ("D3DXCreateLine", &[Pointer, Pointer][..]),
+        (
+            "D3DXCreateSphere",
+            &[Pointer, F32, U32, U32, Pointer, Pointer][..],
+        ),
+        (
+            "D3DXCreateTextureFromFileInMemory",
+            &[Pointer, Pointer, U32, Pointer][..],
+        ),
+        (
+            "D3DXLoadMeshFromXInMemory",
+            &[
+                Pointer, U32, U32, Pointer, Pointer, Pointer, Pointer, Pointer, Pointer,
+            ][..],
+        ),
+    ] {
+        let signature = signature::lookup("d3dx9_43.dll", name).unwrap();
+        assert_eq!(signature.return_kind, I32);
+        assert_eq!(signature.return_type, "HRESULT");
+        assert_eq!(
+            signature.conv,
+            Some(Conv::Stdcall {
+                argc: kinds.len() as u8
+            })
+        );
+        assert_eq!(signature.stack_words(), kinds.len() as u16);
+        assert_eq!(
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.kind)
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        assert!(signature::lookup("d3dx9_29.dll", name).is_none());
+    }
+}
+
 // spec: EXEC-CORE-4
 #[test]
 fn audio_registration_rejects_both_leaf_kinds() {
@@ -589,4 +667,70 @@ fn audio_registration_rejects_both_leaf_kinds() {
         "fixture.dll",
         "waveOutWrite"
     ));
+}
+
+#[test]
+// spec: PERS-EXPORT-10
+fn mode_contracts_name_declared_scalar_parameters() {
+    let mut registry = Registry::default();
+    registry.accept("KERNEL32.dll", "SetFilePointer", "dwMoveMethod", |m| m <= 2);
+    let accepts = registry
+        .accepts("kernel32.dll", "SetFilePointer", "dwMoveMethod")
+        .unwrap();
+    assert!(accepts(2) && !accepts(3));
+    assert!(
+        registry
+            .accepts("kernel32.dll", "SetFilePointer", "lDistanceToMove")
+            .is_none()
+    );
+    for (name, param) in [
+        ("SetFilePointer", "lpDistanceToMoveHigh"),
+        ("SetFilePointer", "dwMode"),
+    ] {
+        let declared = std::panic::catch_unwind(|| {
+            Registry::default().accept("kernel32.dll", name, param, |_| true)
+        });
+        assert!(
+            declared.is_err(),
+            "{param} is not a declared scalar parameter"
+        );
+    }
+}
+
+// spec: PERS-ABI-1, PERS-EXPORT-6
+#[test]
+fn fixed_byte_arrays_retain_extent_and_cannot_be_called_or_resized_as_pointer_cells() {
+    use adv_machine::Resolver;
+    let declaration = signature::lookup("msvcr90.dll", "_iob").unwrap();
+    assert_eq!(declaration.data_size, Some(640));
+    assert_eq!(declaration.return_kind, adv_abi::AbiKind::Aggregate);
+    assert!(declaration.conv.is_none());
+    assert!(!declaration.callable());
+    assert!(declaration.parameters.is_empty());
+    let mut registry = Registry::default();
+    for size in [4, 128, 639, 641] {
+        assert!(
+            registry
+                .register_data("msvcr90.dll", "_iob", &vec![0; size])
+                .is_err()
+        );
+    }
+    let mut bytes = vec![0; 640];
+    bytes[639] = 0x5a;
+    registry
+        .register_data("msvcr90.dll", "_iob", &bytes)
+        .unwrap();
+    assert_eq!(registry.data_size("msvcr90.dll", "_iob"), Some(640));
+    assert_eq!(registry.data("msvcr90.dll", "_iob"), Some(bytes.as_slice()));
+    assert!(registry.dynamic_available("msvcr90.dll", "_iob"));
+    assert!(registry.get("msvcr90.dll", "_iob").is_none());
+    assert!(registry.set_data("msvcr90.dll", "_iob", &[0; 4]).is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.add("msvcr90.dll", "_iob", Conv::Cdecl { argc: 0 }, |_| {
+                Outcome::Return(0)
+            });
+        }))
+        .is_err()
+    );
 }

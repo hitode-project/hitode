@@ -251,7 +251,7 @@ fn contract<B: Backend>(cpu: B) {
         (76, 99),
         (80, 0),
         (84, 0),
-        (88, 0x80004001),
+        (88, 0),
         (92, 0x80020008),
         (96, 1),
         (100, 0x80070057),
@@ -296,13 +296,14 @@ fn contract<B: Backend>(cpu: B) {
     assert_eq!(m.cpu.read_u32(REFS).unwrap(), 0);
     assert_eq!(m.cpu.read_u32(ADD_SEEN).unwrap(), 13);
     assert_eq!(m.cpu.read_u32(SELF_RESULT).unwrap(), 0);
-    assert!(
-        m.ext
-            .get::<ApiDiagnostics>()
+    assert_eq!(m.cpu.read_u16(DEST).unwrap(), 0x2003);
+    assert_eq!(m.cpu.read_u32(DEST + 8).unwrap(), 0);
+    assert!(m.ext.try_get::<ApiDiagnostics>().is_none_or(|diagnostics| {
+        !diagnostics
             .warnings
             .keys()
             .any(|(api, reason)| api == "oleaut32.dll!VariantCopy" && reason.contains("SAFEARRAY"))
-    );
+    }));
     assert_eq!(m.cpu.read_u32(RO).unwrap(), 0xcccccccc);
 }
 

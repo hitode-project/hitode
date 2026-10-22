@@ -1,6 +1,7 @@
 //! Identity of the single ordinary account in each isolated guest OS profile.
 //! Renaming its display name does not change the account SID.
 const USER_SUBAUTHORITIES: [u32; 5] = [21, 0, 0, 0, 1000];
+pub const COMPUTER_NAME: &str = "PAL-HLE";
 
 pub fn current_user_sid() -> [u8; 28] {
     let mut sid = [0; 28];

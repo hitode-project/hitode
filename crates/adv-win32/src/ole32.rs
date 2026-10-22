@@ -2,10 +2,16 @@
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_machine::{Env, Outcome};
 
+mod activation;
+pub(crate) mod calls;
+mod runtime;
 pub mod tsf;
 
 pub fn register(registry: &mut Registry) {
     tsf::register(registry);
+    runtime::register(registry);
+    calls::register(registry);
+    activation::register(registry);
     for api in [
         initialize_ABI,
         initialize_ex_ABI,
@@ -22,15 +28,17 @@ pub fn install<B: adv_cpu::backend::Backend>(machine: &mut adv_machine::Machine<
 }
 
 #[win32(ole32, name = "CoInitialize", level = state)]
-fn initialize(_env: &mut Env<'_>, _reserved: GuestPtr<()>) -> i32 {
-    0
+fn initialize(env: &mut Env<'_>, reserved: GuestPtr<()>) -> u32 {
+    runtime::initialize(env, reserved.addr(), 2, false)
 }
 #[win32(ole32, name = "CoInitializeEx", level = state)]
-fn initialize_ex(_env: &mut Env<'_>, _reserved: GuestPtr<()>, _flags: u32) -> i32 {
-    0
+fn initialize_ex(env: &mut Env<'_>, reserved: GuestPtr<()>, flags: u32) -> u32 {
+    runtime::initialize(env, reserved.addr(), flags, false)
 }
 #[win32(ole32, name = "CoUninitialize", level = state)]
-fn uninitialize(_env: &mut Env<'_>) {}
+fn uninitialize(env: &mut Env<'_>) {
+    runtime::uninitialize(env, false);
+}
 #[win32(ole32, name = "CoFreeUnusedLibraries", level = state)]
 fn free_unused(_env: &mut Env<'_>) {
     // Activation uses installed personality factories. None owns a dynamically

@@ -24,7 +24,7 @@ fn unavailable(env: &mut Env<'_>, source: u16, target: u16, flags: u16, reason: 
     )
 }
 
-fn text(env: &Env<'_>, value: u32) -> Result<String, u32> {
+pub(super) fn text(env: &Env<'_>, value: u32) -> Result<String, u32> {
     if value == 0 {
         return Ok(String::new());
     }

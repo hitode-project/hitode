@@ -45,7 +45,12 @@ pub(super) fn descendant(user: &User, objects: &Objects, root: u32, point: (i32,
                     && child.enabled()
                     && !child.destroying
                     && !transparent_static(user, child)
-                    && contains(child, point, origin)
+                    && user.screen_rect(objects, *hwnd).is_some_and(|rect| {
+                        point.0 >= rect.left
+                            && point.0 < rect.right
+                            && point.1 >= rect.top
+                            && point.1 < rect.bottom
+                    })
             })
         });
         let Some(child) = child else {

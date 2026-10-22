@@ -1,8 +1,10 @@
-//! D3DX image metadata and one-level texture loading over the shared D3D9 owner.
+//! D3DX image metadata and mipmapped texture loading over the shared D3D9 owner.
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 mod decode;
+#[cfg(feature = "gpu")]
+mod mipmaps;
 #[cfg(any(feature = "gpu", test))]
 mod resize;
 
@@ -29,6 +31,7 @@ struct ImageInfo {
 pub(super) fn register(registry: &mut Registry) {
     registry.register(info_ABI);
     registry.register(create_ABI);
+    registry.register(create_default_ABI);
     // Legacy D3DX SDK export outside the pinned Win32 metadata projection.
     registry.register(adv_abi::Api {
         module: "d3dx9_43.dll",
@@ -41,11 +44,39 @@ pub(super) fn register(registry: &mut Registry) {
 }
 
 fn api(env: &Env<'_>) -> &'static str {
-    if env.sys.thunks.get(env.thunk).name == "D3DXGetImageInfoFromFileInMemory" {
-        "d3dx9_43.dll!D3DXGetImageInfoFromFileInMemory"
-    } else {
-        "d3dx9_43.dll!D3DXCreateTextureFromFileInMemoryEx"
+    match env.sys.thunks.get(env.thunk).name.as_str() {
+        "D3DXGetImageInfoFromFileInMemory" => "d3dx9_43.dll!D3DXGetImageInfoFromFileInMemory",
+        "D3DXCreateTextureFromFileInMemory" => "d3dx9_43.dll!D3DXCreateTextureFromFileInMemory",
+        _ => "d3dx9_43.dll!D3DXCreateTextureFromFileInMemoryEx",
     }
+}
+
+#[win32(d3dx9_43, name = "D3DXCreateTextureFromFileInMemory", level = implement)]
+fn create_default(
+    env: &mut Env<'_>,
+    device: GuestPtr<()>,
+    data: GuestPtr<()>,
+    size: u32,
+    output: GuestPtr<u32>,
+) -> Outcome {
+    create(
+        env,
+        device,
+        data,
+        size,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        0,
+        0,
+        1,
+        u32::MAX,
+        u32::MAX,
+        0,
+        GuestPtr::default(),
+        GuestPtr::default(),
+        output,
+    )
 }
 fn unavailable(env: &mut Env<'_>, reason: &str) -> u32 {
     adv_abi::warn_unavailable(env, api(env), reason);
@@ -157,10 +188,19 @@ fn create(
                 "loader supports Usage=0, ordinary D3D9 pools and no palette output",
             ));
         }
-        if mips != 1 || !matches!(filter, 1..=3) || !matches!(mip_filter, 1..=3) {
+        let filter = if filter == DEFAULT {
+            4 | 0x80000
+        } else {
+            filter
+        };
+        let mip_filter = if mip_filter == DEFAULT { 5 } else { mip_filter };
+        if !(1..=5).contains(&(filter & 0xffff)) || !(1..=5).contains(&(mip_filter & 0xffff)) {
+            return Outcome::Return(INVALID);
+        }
+        if filter & !0x80007 != 0 || mip_filter & !0x80007 != 0 {
             return Outcome::Return(unavailable(
                 env,
-                "loader supports one mip and NONE/POINT/LINEAR without extra filter flags",
+                "mirror, sRGB, diffusion dithering and skipped-source-level filter options are unavailable",
             ));
         }
         let bytes = match source(env, data, size) {
@@ -172,7 +212,7 @@ fn create(
             Err(e) => return Outcome::Return(decoded_error(env, &bytes, e)),
         };
         let dimension = |requested, source: u32| match requested {
-            NONPOW2 => Some(source),
+            NONPOW2 | 0xffff_fffd => Some(source),
             DEFAULT | 0 => source.checked_next_power_of_two(),
             n => Some(n),
         };
@@ -205,22 +245,45 @@ fn create(
                 ));
             }
         };
-        let mut pixels = match decode::decode(&bytes, image) {
+        if (filter | mip_filter) & 0x80000 != 0 && format == 26 {
+            return Outcome::Return(unavailable(
+                env,
+                "ordered dithering into packed A4R4G4B4 textures is unavailable",
+            ));
+        }
+        if filter & 7 == 5
+            && (width != (image.width / 2).max(1) || height != (image.height / 2).max(1))
+        {
+            return Outcome::Return(INVALID);
+        }
+        let maximum = 32 - width.max(height).leading_zeros();
+        let mips = match mips {
+            0 | DEFAULT => maximum,
+            0xffff_fffd if image.mips <= maximum => image.mips,
+            0xffff_fffd => return Outcome::Return(INVALID),
+            other => other.min(maximum),
+        };
+        let pixels = match mipmaps::pixels(
+            &bytes,
+            image,
+            [width, height],
+            mips,
+            filter & 7,
+            mip_filter & 7,
+            color_key,
+        ) {
             Ok(p) => p,
             Err(e) => return Outcome::Return(decoded_error(env, &bytes, e)),
         };
-        if color_key != 0 {
-            for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
-                if u32::from_le_bytes(*pixel) == color_key {
-                    pixel.fill(0);
-                }
-            }
-        }
-        if width != image.width || height != image.height {
-            pixels = resize::pixels(&pixels, image.width, image.height, width, height, filter);
-        }
-        let outcome =
-            crate::d3d9::loading::create(env, device.addr(), width, height, format, pool, pixels);
+        let outcome = crate::d3d9::loading::create_mipmaps(
+            env,
+            device.addr(),
+            width,
+            height,
+            format,
+            pool,
+            pixels,
+        );
         publish(env, output, image_info, image, outcome)
     }
 }

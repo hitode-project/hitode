@@ -15,7 +15,7 @@ const DATA: u32 = 0x410000;
 const COUNT: u32 = DATA + 1024;
 const HOOK_COUNT: u32 = DATA + 512;
 const HOOK_ARG: u32 = DATA + 544;
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 struct Empty;
 impl FileSource for Empty {
     fn read(&self, _: &str) -> Option<Vec<u8>> {
@@ -32,9 +32,9 @@ impl Test {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
             .join(format!(
-                "target/altered-library-{}-{}",
+                "target/altered-library-{}-{}-{jit}-{rejects}",
                 std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&root).unwrap();
         let body = if rejects {

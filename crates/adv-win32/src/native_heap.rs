@@ -57,14 +57,28 @@ pub(crate) fn realloc_then(env: &mut Env<'_>, pointer: u32, size: u32, then: Don
     if size == 0 {
         return free_then(env, pointer, Box::new(move |env, _| then(env, 0)));
     }
+    realloc_block_then(env, pointer, size, 0, then)
+}
+
+/// Resize a live block with explicit RTL flags, retaining the shared heap owner.
+/// CRT realloc handles NULL/zero before this boundary; expand keeps a live byte.
+pub(crate) fn realloc_block_then(
+    env: &mut Env<'_>,
+    pointer: u32,
+    size: u32,
+    flags: u32,
+    then: Done,
+) -> Outcome {
     let heap = env.ext.get::<Heaps>().process_heap;
     match crate::native::overridden(env, "RtlReAllocateHeap") {
-        Ok(Some(target)) => Outcome::call(target, [heap, 0, pointer, size], move |env, value| {
-            then(env, value.value())
-        }),
-        Ok(None) => crate::heap_lock::with_heap(env, heap, 0, move |env| {
+        Ok(Some(target)) => {
+            Outcome::call(target, [heap, flags, pointer, size], move |env, value| {
+                then(env, value.value())
+            })
+        }
+        Ok(None) => crate::heap_lock::with_heap(env, heap, flags, move |env| {
             let previous = crate::util::last_error(env);
-            match crate::kernel32::memory::reallocate(env, heap, 0, pointer, size) {
+            match crate::kernel32::memory::reallocate(env, heap, flags, pointer, size) {
                 Outcome::Return(pointer) => {
                     crate::util::set_last_error(env, previous);
                     then(env, pointer)
@@ -74,13 +88,4 @@ pub(crate) fn realloc_then(env: &mut Env<'_>, pointer: u32, size: u32, then: Don
         }),
         Err(_) => crate::native::unavailable(env, "RtlReAllocateHeap"),
     }
-}
-
-pub(crate) fn realloc(env: &mut Env<'_>, pointer: u32, size: u32) -> Outcome {
-    realloc_then(
-        env,
-        pointer,
-        size,
-        Box::new(|_, value| Outcome::Return(value)),
-    )
 }

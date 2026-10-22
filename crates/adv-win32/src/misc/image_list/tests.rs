@@ -17,6 +17,9 @@ enum Arg {
     Memory(u32),
 }
 use Arg::{Memory as M, Value as I};
+mod bitmap;
+mod draw;
+mod state;
 mod streams;
 
 struct Fixture {
@@ -121,6 +124,8 @@ impl Fixture {
                 &mut self.machine.sys.objects,
                 "authored decoded icon".into(),
                 crate::user32::IconImage {
+                    alpha: true,
+                    monochrome: false,
                     width,
                     height,
                     pixels: pixel.repeat((width * height) as usize),

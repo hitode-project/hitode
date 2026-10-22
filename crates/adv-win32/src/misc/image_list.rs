@@ -1,10 +1,15 @@
 //! Bounded color image lists own pixel snapshots in the ordinary Objects table.
 //! Headless icon identities without decoded pixels are never appended as images.
+//! Clones own independent snapshots; count and size changes retire their old entries.
 use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
+use adv_device::surface::SpriteAlpha;
 use adv_machine::{Env, Namespace, Objects, Outcome};
 
 use crate::{Win32, util::set_last_error};
+mod bitmap;
+mod draw;
+mod state;
 mod stream;
 
 const COLOR32: u32 = 0x20;
@@ -15,6 +20,7 @@ const MAX_LISTS: usize = 256;
 const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
 
 struct Image {
+    alpha: SpriteAlpha,
     rgba: Vec<u8>,
     mask: Option<Vec<u8>>,
 }
@@ -31,6 +37,7 @@ struct ImageList {
     mask: bool,
     grow: usize,
     images: Vec<Image>,
+    background: u32,
 }
 
 #[derive(Default)]
@@ -120,6 +127,7 @@ fn create(env: &mut Env<'_>, cx: i32, cy: i32, flags: u32, initial: i32, grow: i
         mask: flags & MASK != 0,
         grow: (grow as usize).max(1),
         images,
+        background: u32::MAX,
     };
     let lists = env.ext.get_or_default::<ImageLists>();
     if let Some(handle) = lists.insert(&mut env.sys.objects, list) {
@@ -254,7 +262,15 @@ fn replace_icon(env: &mut Env<'_>, handle: i32, index: i32, icon: Handle) -> i32
     } else {
         None
     };
-    let image = Image { rgba, mask };
+    let image = Image {
+        alpha: if source.alpha {
+            SpriteAlpha::Straight
+        } else {
+            SpriteAlpha::Ignore
+        },
+        rgba,
+        mask,
+    };
     let list = env
         .ext
         .get::<ImageLists>()
@@ -287,6 +303,9 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(get_size_ABI);
     registry.register(replace_icon_ABI);
     registry.register(read_ABI);
+    state::register(registry);
+    bitmap::register(registry);
+    draw::register(registry);
 }
 
 #[cfg(test)]
