@@ -105,6 +105,10 @@ pub struct Sys {
     /// The PEB new threads point at. A personality that lays out its own
     /// process environment block moves it before the first spawn.
     pub peb: u32,
+    /// The pages each thread's TEB block holds. A personality whose threads
+    /// keep data after the TEB, as Wine's keep their debug buffers, widens
+    /// it before the first spawn.
+    pub teb_pages: u32,
     pub process_identity: std::sync::Arc<process::ProcessIdentity>,
     next_tid: u32,
     /// Mapped guest images, for backtraces and profiles; the OS layer's loader fills it.
@@ -308,10 +312,11 @@ impl Sys {
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);
         let tid = self.next_tid;
-        let teb = teb_addr(slot);
+        let teb = teb_block_addr(slot, self.teb_pages);
+        let teb_size = self.teb_pages * PAGE;
         let mut mapped_teb = false;
         let result = (|| {
-            cpu.map(teb, PAGE, Prot::RW)?;
+            cpu.map(teb, teb_size, Prot::RW)?;
             mapped_teb = true;
             for (off, v) in [
                 (teb::EXCEPTION_LIST, u32::MAX),
@@ -347,7 +352,7 @@ impl Sys {
             Ok(sp) => sp,
             Err(error) => {
                 if mapped_teb {
-                    let _ = cpu.unmap(teb, PAGE);
+                    let _ = cpu.unmap(teb, teb_size);
                 }
                 let _ = self.vm.free(cpu, base);
                 return Err(error);
@@ -454,7 +459,7 @@ impl Sys {
                 self.vm.free(cpu, storage.stack)?;
                 storage.stack = 0;
             }
-            cpu.unmap(context.teb, PAGE)?;
+            cpu.unmap(context.teb, self.teb_pages * PAGE)?;
             context.storage = None;
             context.initial_registers.clear();
             context.bootstrap_pending = None;
@@ -1884,6 +1889,7 @@ impl<B: Backend> Machine<B> {
             frame_pacer: None,
             pid: 0x1000,
             peb: PEB_ADDR,
+            teb_pages: 1,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),

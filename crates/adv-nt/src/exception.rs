@@ -5,7 +5,7 @@
 
 mod mapping;
 
-use adv_cpu::backend::GuestExt;
+use adv_cpu::backend::{ArchitecturalState, GuestExt};
 use adv_machine::exception::{Checkpoint, Exception};
 use adv_machine::{Env, Outcome};
 
@@ -21,14 +21,17 @@ pub struct Record {
     pub information: [u32; 15],
 }
 
-/// Where ntdll.dll takes exceptions.
-pub struct Dispatcher(pub u32);
+/// Where ntdll.dll takes exceptions and user APCs.
+#[derive(Clone, Copy)]
+pub struct Dispatchers {
+    pub exception: u32,
+    pub apc: u32,
+}
 
 /// `struct exc_stack_layout`: the arguments, the record, the CONTEXT and its
 /// CONTEXT_EX, 64-byte aligned.
 const RECORD: u32 = 0x08;
 const CONTEXT: u32 = 0x58;
-const CONTEXT_EX: u32 = 0x324;
 const LAYOUT_SIZE: u32 = 0x340;
 /// Single step, direction and alignment check are clear in the dispatcher.
 const DISPATCH_CLEARED_FLAGS: u32 = 0x100 | 0x400 | 0x4_0000;
@@ -46,7 +49,11 @@ pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) 
 /// Resumes the thread in the dispatcher with `record` and the CONTEXT of
 /// `checkpoint` on its stack.
 fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Record) -> Outcome {
-    let Some(&Dispatcher(dispatcher)) = env.ext.try_get::<Dispatcher>() else {
+    let Some(&Dispatchers {
+        exception: dispatcher,
+        ..
+    }) = env.ext.try_get::<Dispatchers>()
+    else {
         return Outcome::Fail("no exception dispatcher".into());
     };
 
@@ -66,15 +73,7 @@ fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Reco
     for (index, value) in record.information[..record.count].iter().enumerate() {
         put(RECORD + 0x14 + 4 * index as u32, *value);
     }
-    // CONTEXT_EX without extended state, as Wine's context_init_xstate.
-    let size = context::SIZE as u32;
-    put(CONTEXT_EX, size.wrapping_neg());
-    put(CONTEXT_EX + 4, size + 24);
-    put(CONTEXT_EX + 8, size.wrapping_neg());
-    put(CONTEXT_EX + 12, size);
-    put(CONTEXT_EX + 20, 25);
-    let encoded = context::encode(&checkpoint.state);
-    frame[CONTEXT as usize..CONTEXT as usize + context::SIZE].copy_from_slice(&encoded);
+    put_context(&mut frame, CONTEXT as usize, &checkpoint.state);
     if let Err(error) = env.cpu.write(stack, &frame) {
         return Outcome::Fail(format!("exception frame: {error}"));
     }
@@ -87,20 +86,55 @@ fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Reco
     Outcome::ResumeExecution(checkpoint)
 }
 
-/// NtContinue(*context, alert): resumes the thread with the given CONTEXT.
+/// Writes `state` as a CONTEXT at `offset` of `frame`, followed by its
+/// CONTEXT_EX without extended state, as Wine's `context_init_xstate`.
+pub fn put_context(frame: &mut [u8], offset: usize, state: &ArchitecturalState) {
+    frame[offset..offset + context::SIZE].copy_from_slice(&context::encode(state));
+    let size = context::SIZE as u32;
+    let extension = offset + context::SIZE;
+    for (field, value) in [
+        (0, size.wrapping_neg()),
+        (4, size + 24),
+        (8, size.wrapping_neg()),
+        (12, size),
+        (20, 25),
+    ] {
+        frame[extension + field..extension + field + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// NtContinue(*context, alertable): resumes the thread with the given
+/// CONTEXT, after an APC that is due when alertable.
 pub fn resume(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[context, alertable] = args else {
+        unreachable!()
+    };
     let mut bytes = [0u8; context::SIZE];
-    if env.cpu.read(args[0], &mut bytes).is_err() {
+    if env.cpu.read(context, &mut bytes).is_err() {
         return Outcome::Return(crate::status::ACCESS_VIOLATION);
     }
-    let mut checkpoint = match env.checkpoint() {
-        Ok(checkpoint) => checkpoint,
+    let mut state = match env.checkpoint() {
+        Ok(checkpoint) => checkpoint.state,
         Err(error) => return Outcome::Fail(format!("NtContinue: {error}")),
     };
-    if let Err(error) = context::decode(&bytes, &mut checkpoint.state) {
+    if let Err(error) = context::decode(&bytes, &mut state) {
         return Outcome::Fail(format!("NtContinue: {error}"));
     }
-    Outcome::ResumeExecution(checkpoint)
+    if alertable as u8 != 0 {
+        return crate::sync::continue_alertable(env, state);
+    }
+    resume_with(env, state)
+}
+
+/// Resumes the thread with `state`.
+pub fn resume_with(env: &mut Env<'_>, state: Box<ArchitecturalState>) -> Outcome {
+    match env.checkpoint() {
+        Ok(mut checkpoint) => {
+            checkpoint.state = state;
+            Outcome::ResumeExecution(checkpoint)
+        }
+        Err(error) => Outcome::Fail(format!("NtContinue: {error}")),
+    }
 }
 
 const MAXIMUM_PARAMETERS: usize = 15;

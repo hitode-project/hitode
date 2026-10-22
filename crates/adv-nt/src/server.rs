@@ -13,9 +13,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+use adv_machine::sched::{Handle, Object};
+use adv_machine::{CtxId, Env, Sys};
+
 use crate::protocol::{
-    CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest, InitFirstThreadRequest, PROTOCOL_VERSION,
-    Request,
+    CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest, InitFirstThreadRequest, InitThreadRequest,
+    PROTOCOL_VERSION, Request,
 };
 
 /// i386, the machine of Hitode's prefixes.
@@ -52,11 +55,28 @@ impl Time {
 /// A process's connection with what drives its server, kept in the
 /// machine's extensions.
 pub struct Link {
-    pub connection: Connection,
+    socket: UnixStream,
     pub progress: Box<dyn Progress>,
+    /// The time the server sees when the client lets it run.
+    time: Time,
     /// Host descriptors of handles the server allows to cache, as Wine's
     /// fd cache keeps them: until the handle is closed.
     fds: HashMap<u32, Cached>,
+    threads: HashMap<CtxId, Thread>,
+}
+
+/// A guest thread as the server knows it.
+struct Thread {
+    tid: u32,
+    channel: Channel,
+    /// Set when the server ends the thread's wait while the thread is
+    /// blocked in the machine.
+    wake: Handle,
+    /// Whether the thread waits for a wake-up.
+    waiting: bool,
+    /// The wake-up the server sent, read from the pipe on the thread's
+    /// behalf.
+    pending: Option<WakeUp>,
 }
 
 struct Cached {
@@ -77,26 +97,115 @@ pub struct HandleFd {
 }
 
 impl Link {
-    pub fn new(connection: Connection, progress: Box<dyn Progress>) -> Link {
-        Link {
-            connection,
+    /// The link of a connected process whose first thread is `main`.
+    pub fn new(
+        connection: Connection,
+        progress: Box<dyn Progress>,
+        time: Time,
+        main: CtxId,
+        tid: u32,
+        sys: &mut Sys,
+    ) -> Link {
+        let mut link = Link {
+            socket: connection.socket,
             progress,
+            time,
             fds: HashMap::new(),
-        }
+            threads: HashMap::new(),
+        };
+        link.add_thread(main, tid, connection.channel, sys);
+        link
+    }
+
+    fn add_thread(&mut self, context: CtxId, tid: u32, channel: Channel, sys: &mut Sys) {
+        let wake = sys.objects.insert(Object::Event {
+            manual_reset: false,
+            signaled: false,
+        });
+        self.threads.insert(
+            context,
+            Thread {
+                tid,
+                channel,
+                wake,
+                waiting: false,
+                pending: None,
+            },
+        );
+    }
+
+    fn thread(&mut self, context: CtxId) -> Result<&mut Thread, Error> {
+        self.threads
+            .get_mut(&context)
+            .ok_or(Error::NoThread(context))
+    }
+
+    /// Sends a request from the thread of `context`; see [`Channel::call`].
+    pub fn call<R: Request>(
+        &mut self,
+        context: CtxId,
+        request: &mut R,
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<(R::Reply, usize), Error> {
+        let time = self.time;
+        let thread = self
+            .threads
+            .get_mut(&context)
+            .ok_or(Error::NoThread(context))?;
+        thread
+            .channel
+            .call(&mut *self.progress, time, request, data, reply_data)
+    }
+
+    /// Passes on a request the guest prepared.
+    pub fn call_raw(
+        &mut self,
+        context: CtxId,
+        fixed: &mut [u8; FIXED_SIZE],
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<usize, Error> {
+        let time = self.time;
+        let thread = self
+            .threads
+            .get_mut(&context)
+            .ok_or(Error::NoThread(context))?;
+        thread
+            .channel
+            .call_raw(&mut *self.progress, time, fixed, data, reply_data)
     }
 }
 
-fn link<'a>(env: &'a mut adv_machine::Env<'_>) -> Result<&'a mut Link, crate::status::Error> {
+fn link<'a>(env: &'a mut Env<'_>) -> Result<&'a mut Link, crate::status::Error> {
     env.ext
         .try_get_mut::<Link>()
         .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))
 }
 
 /// Shows the server the guest's clocks as they read now.
-pub fn set_time(env: &mut adv_machine::Env<'_>) {
+pub fn set_time(env: &mut Env<'_>) {
     let time = Time::now(&mut env.sys.clock);
     if let Some(link) = env.ext.try_get_mut::<Link>() {
-        link.connection.time = time;
+        link.time = time;
+    }
+}
+
+/// Wakes the blocked threads whose waits the server ended: their
+/// wake-ups are read now, so a thread that runs later finds its own.
+pub fn deliver(env: &mut Env<'_>) {
+    let Some(link) = env.ext.try_get_mut::<Link>() else {
+        return;
+    };
+    for thread in link.threads.values_mut() {
+        if !thread.waiting || thread.pending.is_some() {
+            continue;
+        }
+        // A broken pipe shows when the thread itself reads it.
+        if let Ok(Some(wake_up)) = thread.channel.wake_up() {
+            thread.pending = Some(wake_up);
+            env.sys.set_event(thread.wake);
+        }
     }
 }
 
@@ -109,13 +218,146 @@ pub struct WakeUp {
     pub signaled: u32,
 }
 
-/// Lets the server run at the current time, then takes the wake-up it
-/// sent the thread, if any.
-pub fn wake_up(env: &mut adv_machine::Env<'_>) -> Result<Option<WakeUp>, crate::status::Error> {
+/// Marks the current thread as waiting for a wake-up, and returns the
+/// machine object that is set when one arrives.
+pub fn begin_wait(env: &mut Env<'_>) -> Result<Handle, crate::status::Error> {
+    let context = env.context;
+    let thread = link(env)?.thread(context).map_err(broken)?;
+    thread.waiting = true;
+    Ok(thread.wake)
+}
+
+/// Takes the wake-up the server sent the current thread, letting the
+/// server run first at the current time if none has arrived.
+pub fn wake_up(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error> {
     set_time(env);
+    let context = env.context;
     let link = link(env)?;
-    link.progress.run_server(link.connection.time);
-    link.connection.wake_up().map_err(broken)
+    let time = link.time;
+    let thread = link
+        .threads
+        .get_mut(&context)
+        .ok_or(Error::NoThread(context));
+    let thread = thread.map_err(broken)?;
+    let wake_up = match thread.pending.take() {
+        Some(wake_up) => Some(wake_up),
+        None => {
+            link.progress.run_server(time);
+            let thread = link.thread(context).map_err(broken)?;
+            thread.channel.wake_up().map_err(broken)?
+        }
+    };
+    if wake_up.is_some() {
+        link.thread(context).map_err(broken)?.waiting = false;
+    }
+    deliver(env);
+    Ok(wake_up)
+}
+
+/// The machine context of the thread the server knows as `tid`.
+pub fn context_of(env: &mut Env<'_>, tid: u32) -> Option<CtxId> {
+    let link = env.ext.try_get::<Link>()?;
+    link.threads
+        .iter()
+        .find_map(|(&context, thread)| (thread.tid == tid).then_some(context))
+}
+
+/// The server id of the current thread.
+pub fn current_tid(env: &mut Env<'_>) -> Result<u32, crate::status::Error> {
+    let context = env.context;
+    Ok(link(env)?.thread(context).map_err(broken)?.tid)
+}
+
+/// A thread's request pipe, made before the server knows the thread.
+pub struct NewThread {
+    request: OwnedFd,
+    /// The server's end, which `new_thread` names.
+    server_request: OwnedFd,
+}
+
+impl NewThread {
+    /// The descriptor `new_thread` takes as `request_fd`.
+    pub fn request_fd(&self) -> i32 {
+        self.server_request.as_raw_fd()
+    }
+}
+
+/// Makes a request pipe for a new thread and sends the server its end, as
+/// Wine's `NtCreateThreadEx` does before `new_thread`.
+pub fn prepare_thread(env: &mut Env<'_>) -> Result<NewThread, crate::status::Error> {
+    let tid = current_tid(env)?;
+    let link = link(env)?;
+    let (server_request, request) = pipe().map_err(|error| broken(error.into()))?;
+    set_nonblocking(&request).map_err(|error| broken(error.into()))?;
+    send_fd(&link.socket, tid, server_request.as_raw_fd()).map_err(|error| broken(error.into()))?;
+    Ok(NewThread {
+        request,
+        server_request,
+    })
+}
+
+/// Registers the thread the server created as `tid`, which runs as machine
+/// context `context`, as Wine's `server_init_thread` does. Returns whether
+/// the server holds it suspended.
+pub fn init_thread(
+    env: &mut Env<'_>,
+    new: NewThread,
+    context: CtxId,
+    tid: u32,
+    teb: u32,
+    entry: u32,
+) -> Result<bool, crate::status::Error> {
+    let fail = |error: io::Error| broken(error.into());
+    let NewThread { request, .. } = new;
+    let (reply, reply_write) = pipe().map_err(fail)?;
+    let (wait, wait_write) = pipe().map_err(fail)?;
+    set_nonblocking(&reply).map_err(fail)?;
+    set_nonblocking(&wait).map_err(fail)?;
+    let Env { ext, sys, .. } = env;
+    let link = ext
+        .try_get_mut::<Link>()
+        .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))?;
+    send_fd(&link.socket, tid, reply_write.as_raw_fd()).map_err(fail)?;
+    send_fd(&link.socket, tid, wait_write.as_raw_fd()).map_err(fail)?;
+    link.add_thread(
+        context,
+        tid,
+        Channel {
+            request,
+            reply,
+            wait,
+        },
+        sys,
+    );
+    let mut init = InitThreadRequest {
+        unix_tid: tid as i32,
+        reply_fd: reply_write.as_raw_fd(),
+        wait_fd: wait_write.as_raw_fd(),
+        teb: u64::from(teb),
+        entry: u64::from(entry),
+        ..Default::default()
+    };
+    let (answer, _) = link
+        .call(context, &mut init, &[], &mut [])
+        .map_err(broken)?;
+    crate::status::check(answer.header.error)?;
+    Ok(answer.suspend != 0)
+}
+
+/// Forgets the current thread, which is ending: the server sees its pipes
+/// close and ends the thread, waking whoever waits for it.
+pub fn end_thread(env: &mut Env<'_>) {
+    set_time(env);
+    let context = env.context;
+    let Some(link) = env.ext.try_get_mut::<Link>() else {
+        return;
+    };
+    if let Some(thread) = link.threads.remove(&context) {
+        env.sys.objects.close(thread.wake);
+        drop(thread.channel);
+        link.progress.run_server(link.time);
+    }
+    deliver(env);
 }
 
 fn broken(error: Error) -> crate::status::Error {
@@ -123,10 +365,8 @@ fn broken(error: Error) -> crate::status::Error {
 }
 
 /// The host descriptor of `handle`, from the cache or the server.
-pub fn handle_fd(
-    env: &mut adv_machine::Env<'_>,
-    handle: u32,
-) -> Result<HandleFd, crate::status::Error> {
+pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::status::Error> {
+    let context = env.context;
     let link = link(env)?;
     if let Some(cached) = link.fds.get(&handle) {
         return Ok(HandleFd {
@@ -141,16 +381,10 @@ pub fn handle_fd(
         ..Default::default()
     };
     let (reply, _) = link
-        .connection
-        .call(&mut *link.progress, &mut request, &[], &mut [])
+        .call(context, &mut request, &[], &mut [])
         .map_err(broken)?;
     crate::status::check(reply.header.error)?;
-    let (tag, fd) = receive_fd(
-        &link.connection.socket,
-        &mut *link.progress,
-        link.connection.time,
-    )
-    .map_err(broken)?;
+    let (tag, fd) = receive_fd(&link.socket, &mut *link.progress, link.time).map_err(broken)?;
     if tag != handle {
         return Err(crate::status::Error::Unsupported(format!(
             "the server sent the descriptor of handle {tag:#x} for {handle:#x}"
@@ -170,6 +404,7 @@ pub fn handle_fd(
     } else {
         Some(fd)
     };
+    deliver(env);
     Ok(HandleFd {
         fd: raw,
         kind: reply.r#type,
@@ -179,45 +414,30 @@ pub fn handle_fd(
 }
 
 /// Closes `handle` in the server and forgets its descriptor.
-pub fn close(env: &mut adv_machine::Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
-    let link = link(env)?;
-    link.fds.remove(&handle);
+pub fn close(env: &mut Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
+    link(env)?.fds.remove(&handle);
     let mut request = CloseHandleRequest {
         handle,
         ..Default::default()
     };
-    let (reply, _) = link
-        .connection
-        .call(&mut *link.progress, &mut request, &[], &mut [])
-        .map_err(broken)?;
+    let (reply, _) = self::request(env, &mut request, &[], &mut [])?;
     crate::status::check(reply.header.error)
 }
 
 /// Sends a request on behalf of a system call. A status the server
 /// returns is in the reply header; a broken connection stops the machine.
 pub fn request<R: Request>(
-    env: &mut adv_machine::Env<'_>,
+    env: &mut Env<'_>,
     request: &mut R,
     data: &[&[u8]],
     reply_data: &mut [u8],
 ) -> Result<(R::Reply, usize), crate::status::Error> {
-    let link = link(env)?;
-    link.connection
-        .call(&mut *link.progress, request, data, reply_data)
-        .map_err(broken)
-}
-
-impl Link {
-    /// Passes on a request the guest prepared.
-    pub fn call_raw(
-        &mut self,
-        fixed: &mut [u8; FIXED_SIZE],
-        data: &[&[u8]],
-        reply_data: &mut [u8],
-    ) -> Result<usize, Error> {
-        self.connection
-            .call_raw(&mut *self.progress, fixed, data, reply_data)
-    }
+    let context = env.context;
+    let answer = link(env)?
+        .call(context, request, data, reply_data)
+        .map_err(broken)?;
+    deliver(env);
+    Ok(answer)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -231,6 +451,8 @@ pub enum Error {
     NoReply,
     #[error("the server closed the connection")]
     Closed,
+    #[error("context {0} is not a thread of the process")]
+    NoThread(CtxId),
 }
 
 /// What the server told the first thread of a new process.
@@ -247,15 +469,19 @@ pub struct FirstThread {
     pub machines: Vec<u16>,
 }
 
-/// One process's connection, used by its first thread.
+/// One process's connection: its socket, and the pipes of its first
+/// thread.
 pub struct Connection {
     socket: UnixStream,
+    channel: Channel,
+}
+
+/// A thread's pipes to the server.
+struct Channel {
     request: OwnedFd,
     reply: OwnedFd,
     /// The server writes here to end a wait the thread started with `select`.
     wait: OwnedFd,
-    /// The time the server sees when the client lets it run.
-    pub time: Time,
 }
 
 impl Connection {
@@ -279,12 +505,10 @@ impl Connection {
         // The first thread has no id yet; 0 names it.
         send_fd(&socket, 0, reply_write.as_raw_fd())?;
         send_fd(&socket, 0, wait_write.as_raw_fd())?;
-        let mut connection = Connection {
-            socket,
+        let mut channel = Channel {
             request,
             reply,
             wait,
-            time,
         };
 
         let mut init = InitFirstThreadRequest {
@@ -294,7 +518,7 @@ impl Connection {
             ..Default::default()
         };
         let mut machines = [0u8; 16];
-        let (answer, size) = connection.call(progress, &mut init, &[], &mut machines)?;
+        let (answer, size) = channel.call(progress, time, &mut init, &[], &mut machines)?;
         // The server holds its own copies now, as in Wine's client.
         drop((reply_write, wait_write));
         if answer.header.error != 0 {
@@ -317,15 +541,18 @@ impl Connection {
             info_size: answer.info_size,
             machines,
         };
-        Ok((connection, first))
+        Ok((Connection { socket, channel }, first))
     }
+}
 
+impl Channel {
     /// Sends a request with its variable data and returns the fixed reply and
     /// how many bytes of reply data were written to `reply_data`. The status
     /// is in the reply header.
-    pub fn call<R: Request>(
+    fn call<R: Request>(
         &mut self,
         progress: &mut dyn Progress,
+        time: Time,
         request: &mut R,
         data: &[&[u8]],
         reply_data: &mut [u8],
@@ -341,7 +568,7 @@ impl Connection {
                 size_of::<R>(),
             )
         };
-        let size = self.call_raw(progress, &mut fixed, data, reply_data)?;
+        let size = self.call_raw(progress, time, &mut fixed, data, reply_data)?;
         // SAFETY: the reply is a plain repr(C) layout no larger than the buffer.
         let reply: R::Reply = unsafe { std::ptr::read_unaligned(fixed.as_ptr().cast()) };
         Ok((reply, size))
@@ -350,9 +577,10 @@ impl Connection {
     /// Sends a request whose fixed part, with its number, is in `fixed`, and
     /// replaces it with the fixed reply. The sizes in the header are set
     /// here. Returns how many bytes of reply data were written.
-    pub fn call_raw(
+    fn call_raw(
         &mut self,
         progress: &mut dyn Progress,
+        time: Time,
         fixed: &mut [u8; FIXED_SIZE],
         data: &[&[u8]],
         reply_data: &mut [u8],
@@ -360,18 +588,18 @@ impl Connection {
         let request_size: u32 = data.iter().map(|part| part.len() as u32).sum();
         fixed[4..8].copy_from_slice(&request_size.to_ne_bytes());
         fixed[8..12].copy_from_slice(&(reply_data.len() as u32).to_ne_bytes());
-        self.write(progress, fixed)?;
+        self.write(progress, time, fixed)?;
         for part in data {
-            self.write(progress, part)?;
+            self.write(progress, time, part)?;
         }
-        progress.run_server(self.time);
+        progress.run_server(time);
 
-        self.read(progress, fixed)?;
+        self.read(progress, time, fixed)?;
         // SAFETY: every reply starts with the reply header.
         let header: crate::protocol::ReplyHeader =
             unsafe { std::ptr::read_unaligned(fixed.as_ptr().cast()) };
         let size = (header.reply_size as usize).min(reply_data.len());
-        self.read(progress, &mut reply_data[..size])?;
+        self.read(progress, time, &mut reply_data[..size])?;
         Ok(size)
     }
 
@@ -411,12 +639,12 @@ impl Connection {
         }))
     }
 
-    /// The process socket, over which the server sends file descriptors.
-    pub fn socket(&self) -> &UnixStream {
-        &self.socket
-    }
-
-    fn write(&mut self, progress: &mut dyn Progress, mut bytes: &[u8]) -> Result<(), Error> {
+    fn write(
+        &mut self,
+        progress: &mut dyn Progress,
+        time: Time,
+        mut bytes: &[u8],
+    ) -> Result<(), Error> {
         let mut idle = 0;
         while !bytes.is_empty() {
             // SAFETY: a valid descriptor and buffer.
@@ -431,7 +659,7 @@ impl Connection {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EAGAIN) if idle < PATIENCE => {
-                    progress.run_server(self.time);
+                    progress.run_server(time);
                     idle += 1;
                 }
                 Some(libc::EAGAIN) => return Err(Error::NoReply),
@@ -443,7 +671,12 @@ impl Connection {
         Ok(())
     }
 
-    fn read(&mut self, progress: &mut dyn Progress, mut buffer: &mut [u8]) -> Result<(), Error> {
+    fn read(
+        &mut self,
+        progress: &mut dyn Progress,
+        time: Time,
+        mut buffer: &mut [u8],
+    ) -> Result<(), Error> {
         let mut idle = 0;
         while !buffer.is_empty() {
             // SAFETY: a valid descriptor and buffer.
@@ -465,7 +698,7 @@ impl Connection {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EAGAIN) if idle < PATIENCE => {
-                    progress.run_server(self.time);
+                    progress.run_server(time);
                     idle += 1;
                 }
                 Some(libc::EAGAIN) => return Err(Error::NoReply),

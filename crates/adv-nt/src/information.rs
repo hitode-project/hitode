@@ -60,6 +60,8 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 const THREAD_BASIC_INFORMATION: u32 = 0;
 const THREAD_BASIC_INFORMATION_SIZE: usize = 28;
+const THREAD_AM_I_LAST_THREAD: u32 = 12;
+const GET_THREAD_INFO_FLAG_LAST: u32 = 0x04;
 
 /// NtQueryInformationThread(thread, class, *info, size, *result_size)
 pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
@@ -67,7 +69,7 @@ pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        if class != THREAD_BASIC_INFORMATION {
+        if class != THREAD_BASIC_INFORMATION && class != THREAD_AM_I_LAST_THREAD {
             return Err(Error::Unsupported(format!(
                 "thread information class {class}"
             )));
@@ -78,6 +80,17 @@ pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
+        if class == THREAD_AM_I_LAST_THREAD {
+            if size != 4 {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            let last = u32::from(reply.flags & GET_THREAD_INFO_FLAG_LAST != 0);
+            write_u32(env, info, last)?;
+            if result_size != 0 {
+                write_u32(env, result_size, 4)?;
+            }
+            return Ok(());
+        }
         // ExitStatus, TebBaseAddress, ClientId, AffinityMask, Priority and
         // BasePriority.
         let fields = [

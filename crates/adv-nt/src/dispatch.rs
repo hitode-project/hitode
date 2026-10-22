@@ -13,7 +13,7 @@ use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 use crate::syscalls::SYSCALLS;
 use crate::{
     exception, file, information, kuser, memory, nls, object, process, registry, section, server,
-    sync, system, token, unix,
+    sync, system, thread, token, unix,
 };
 
 /// A system call, given its arguments.
@@ -27,6 +27,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtCreateFile", file::create),
     ("NtCreateKey", registry::create),
     ("NtCreateSection", section::create),
+    ("NtCreateThreadEx", thread::create),
     ("NtDelayExecution", sync::delay),
     ("NtOpenDirectoryObject", object::open_directory),
     ("NtOpenFile", file::open),
@@ -41,6 +42,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtMapViewOfSection", section::map_view),
     ("NtProtectVirtualMemory", memory::protect),
     ("NtQueryAttributesFile", file::query_attributes),
+    ("NtQueueApcThread", sync::queue_apc),
     ("NtQueryDefaultLocale", nls::default_locale),
     ("NtQueryInformationProcess", information::query_process),
     ("NtQueryInformationThread", information::query_thread),
@@ -52,9 +54,11 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtQueryVirtualMemory", memory::query),
     ("NtRaiseException", exception::raise),
     ("NtResetEvent", sync::reset_event),
+    ("NtResumeThread", thread::resume),
     ("NtSetEvent", sync::set_event),
     ("NtSetValueKey", registry::set_value),
     ("NtTerminateProcess", process::terminate),
+    ("NtTerminateThread", thread::terminate),
     ("NtUnmapViewOfSection", section::unmap_view),
     ("NtWaitForMultipleObjects", sync::wait_multiple),
     ("NtWaitForSingleObject", sync::wait_single),

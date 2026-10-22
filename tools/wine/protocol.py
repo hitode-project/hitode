@@ -50,6 +50,11 @@ REQUESTS = [
     "select",
     "create_event",
     "event_op",
+    "new_thread",
+    "init_thread",
+    "resume_thread",
+    "terminate_thread",
+    "queue_apc",
 ]
 
 INTEGERS = {

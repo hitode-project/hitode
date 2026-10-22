@@ -601,6 +601,7 @@ mod active_tests {
             frame_pacer: None,
             pid: 0x1000,
             peb: crate::layout::PEB_ADDR,
+            teb_pages: 1,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),

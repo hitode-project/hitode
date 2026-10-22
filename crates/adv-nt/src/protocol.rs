@@ -874,3 +874,161 @@ impl Request for EventOpRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NewThreadRequest {
+    pub header: RequestHeader,
+    pub process: u32,
+    pub access: u32,
+    pub flags: u32,
+    pub request_fd: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<NewThreadRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(NewThreadRequest, process) == 12);
+const _: () = assert!(std::mem::offset_of!(NewThreadRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(NewThreadRequest, flags) == 20);
+const _: () = assert!(std::mem::offset_of!(NewThreadRequest, request_fd) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NewThreadReply {
+    pub header: ReplyHeader,
+    pub tid: u32,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<NewThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(NewThreadReply, tid) == 8);
+const _: () = assert!(std::mem::offset_of!(NewThreadReply, handle) == 12);
+
+impl Request for NewThreadRequest {
+    const NUMBER: i32 = 2;
+    type Reply = NewThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitThreadRequest {
+    pub header: RequestHeader,
+    pub unix_tid: i32,
+    pub reply_fd: i32,
+    pub wait_fd: i32,
+    pub teb: u64,
+    pub entry: u64,
+}
+const _: () = assert!(size_of::<InitThreadRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(InitThreadRequest, unix_tid) == 12);
+const _: () = assert!(std::mem::offset_of!(InitThreadRequest, reply_fd) == 16);
+const _: () = assert!(std::mem::offset_of!(InitThreadRequest, wait_fd) == 20);
+const _: () = assert!(std::mem::offset_of!(InitThreadRequest, teb) == 24);
+const _: () = assert!(std::mem::offset_of!(InitThreadRequest, entry) == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitThreadReply {
+    pub header: ReplyHeader,
+    pub suspend: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<InitThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(InitThreadReply, suspend) == 8);
+
+impl Request for InitThreadRequest {
+    const NUMBER: i32 = 6;
+    type Reply = InitThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeThreadRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<ResumeThreadRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(ResumeThreadRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeThreadReply {
+    pub header: ReplyHeader,
+    pub count: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ResumeThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(ResumeThreadReply, count) == 8);
+
+impl Request for ResumeThreadRequest {
+    const NUMBER: i32 = 18;
+    type Reply = ResumeThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateThreadRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub exit_code: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<TerminateThreadRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(TerminateThreadRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(TerminateThreadRequest, exit_code) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateThreadReply {
+    pub header: ReplyHeader,
+    pub self_: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<TerminateThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(TerminateThreadReply, self_) == 8);
+
+impl Request for TerminateThreadRequest {
+    const NUMBER: i32 = 8;
+    type Reply = TerminateThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueApcRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub reserve_handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<QueueApcRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(QueueApcRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(QueueApcRequest, reserve_handle) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueApcReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub self_: i32,
+}
+const _: () = assert!(size_of::<QueueApcReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(QueueApcReply, handle) == 8);
+const _: () = assert!(std::mem::offset_of!(QueueApcReply, self_) == 12);
+
+impl Request for QueueApcRequest {
+    const NUMBER: i32 = 19;
+    type Reply = QueueApcReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

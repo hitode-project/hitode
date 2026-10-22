@@ -77,13 +77,15 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
     let mut reply = vec![0; reply_size as usize];
 
     let parts: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+    let context = env.context;
     let link = env
         .ext
         .try_get_mut::<Link>()
         .ok_or("no server connection")?;
     let size = link
-        .call_raw(&mut fixed, &parts, &mut reply)
+        .call_raw(context, &mut fixed, &parts, &mut reply)
         .map_err(|error| format!("server call failed: {error}"))?;
+    crate::server::deliver(env);
     env.cpu.write(request, &fixed).map_err(fault)?;
     env.cpu
         .write(reply_pointer, &reply[..size])

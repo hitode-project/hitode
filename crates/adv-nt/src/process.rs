@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use adv_cpu::backend::{Backend, GuestExt, MemFault};
+use adv_cpu::backend::{ArchitecturalState, Backend, Guest, GuestExt, MemFault};
 use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
-use adv_machine::{CtxId, Env, Machine};
+use adv_machine::{CtxId, Env, Machine, Sys};
 use adv_pe::{ExportTarget, Pe, PeError};
 
 use crate::file::{self, Files};
@@ -34,6 +34,8 @@ const TEB_ACTIVATION_CONTEXT_STACK_POINTER: u32 = 0x1a8;
 const TEB_STATIC_UNICODE_STRING: u32 = 0xbf8;
 const TEB_STATIC_UNICODE_BUFFER: u32 = 0xc00;
 const STATIC_UNICODE_BUFFER_SIZE: u32 = 261 * 2;
+/// A thread's TEB and the debug buffers ntdll.dll keeps after it.
+const TEB_PAGES: u32 = 2;
 /// The process block holds the PEB and the debug channel table ntdll.dll
 /// reads at `PEB + PAGE`.
 const BLOCK_SIZE: u32 = 2 * PAGE;
@@ -246,34 +248,20 @@ pub fn start<B: Backend>(
         machine.cpu.write_u32(peb + offset, value)?;
     }
 
-    let main = machine.spawn(
-        "main",
-        ntdll.export("LdrInitializeThunk")?,
-        &[],
+    // ntdll.dll keeps each thread's debug buffers after its TEB.
+    machine.sys.teb_pages = TEB_PAGES;
+    let ldr_initialize_thunk = ntdll.export("LdrInitializeThunk")?;
+    let main = new_context(
+        &mut machine.cpu,
+        &mut machine.sys,
+        &mut memory,
+        ldr_initialize_thunk,
+        syscall,
+        registered.tid,
         DEFAULT_STACK,
     )?;
-    let thread = &machine.sys.contexts[main as usize];
-    let (teb, stack_base, stack_lo) = (thread.teb, thread.stack_hi, thread.stack_lo);
-    // As Wine's `init_syscall_frame`: the start CONTEXT tops the stack, and
-    // LdrInitializeThunk(context, 0, 0, 0) is called under it, so the
-    // stack ntdll.dll clears before it continues lies below the CONTEXT.
-    let start_context = ((stack_base - STACK_TOP_RESERVE) & !3) - context::SIZE as u32;
-    let frame = start_context - 20;
-    let return_address = machine.cpu.read_u32(stack_base - STACK_TOP_RESERVE - 4)?;
-    for (index, value) in [return_address, start_context, 0, 0, 0]
-        .into_iter()
-        .enumerate()
-    {
-        machine.cpu.write_u32(frame + 4 * index as u32, value)?;
-    }
-    machine.sys.set_start_stack(main, frame);
-    // The machine's stack: a guard page under the committed pages.
-    let stack = stack_lo - PAGE;
-    let mut pages = vec![Some(PAGE_READWRITE); ((stack_base - stack) / PAGE) as usize];
-    pages[0] = Some(PAGE_GUARD_READWRITE);
-    memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
+    let teb = machine.sys.contexts[main as usize].teb;
     machine.ext.insert(memory);
-    init_teb(&mut machine.cpu, teb, registered.tid, syscall)?;
     let features = machine.cpu.cpuid_features();
     kuser::map(
         &mut machine.cpu,
@@ -287,13 +275,21 @@ pub fn start<B: Backend>(
     machine.ext.insert(Files {
         dosdevices: prefix.join("dosdevices"),
     });
-    machine.ext.insert(Link::new(connection, progress));
-    machine.ext.insert(exception::Dispatcher(
-        ntdll.export("KiUserExceptionDispatcher")?,
+    machine.ext.insert(Link::new(
+        connection,
+        progress,
+        time,
+        main,
+        registered.tid,
+        &mut machine.sys,
     ));
+    machine.ext.insert(exception::Dispatchers {
+        exception: ntdll.export("KiUserExceptionDispatcher")?,
+        apc: ntdll.export("KiUserApcDispatcher")?,
+    });
     machine.sys.exception_handler = Some(exception::deliver);
 
-    let (view, mut state) = machine
+    let (view, initial) = machine
         .visit_context(Some(main), |env| {
             let view = load_main_image(env, startup.image)?;
             let state = env
@@ -318,26 +314,32 @@ pub fn start<B: Backend>(
         machine.cpu.write_u32(peb + offset, value)?;
     }
 
-    // RtlUserThreadStart(entry in EAX, argument in EBX); the main thread's
-    // argument is the PEB.
-    state.eip = ntdll.export("RtlUserThreadStart")?;
-    state.regs[0] = view.base + view.info.entry_point;
-    state.regs[3] = peb;
-    state.regs[4] = stack_base - STACK_TOP_RESERVE;
-    state.eflags = EFLAGS;
-    state.x87.control = FPU_CONTROL;
-    state.mxcsr = MXCSR;
-    machine.cpu.write(start_context, &context::encode(&state))?;
+    let start = ThreadStart {
+        initial,
+        ldr_initialize_thunk,
+        rtl_user_thread_start: ntdll.export("RtlUserThreadStart")?,
+        syscall,
+    };
+    // The main thread's argument is the PEB.
+    write_start_context(
+        &mut machine.cpu,
+        &machine.sys,
+        &start,
+        main,
+        view.base + view.info.entry_point,
+        peb,
+    )?;
+    machine.ext.insert(start);
 
     let mut done = InitProcessDoneRequest {
         teb: u64::from(teb),
         peb: u64::from(peb),
         ..Default::default()
     };
-    let link = machine.ext.get_mut::<Link>();
-    let (reply, _) = link
-        .connection
-        .call(&mut *link.progress, &mut done, &[], &mut [])?;
+    let (reply, _) = machine
+        .ext
+        .get_mut::<Link>()
+        .call(main, &mut done, &[], &mut [])?;
     if reply.header.error != 0 {
         return Err(Error::Status("init_process_done", reply.header.error));
     }
@@ -349,9 +351,118 @@ pub fn start<B: Backend>(
     })
 }
 
+/// What every thread starts from, as Wine's `call_init_thunk` prepares it.
+pub struct ThreadStart {
+    /// The registers of a thread that has not run, under the start CONTEXT
+    /// of every thread.
+    initial: ArchitecturalState,
+    ldr_initialize_thunk: u32,
+    rtl_user_thread_start: u32,
+    /// The system call entry, which each TEB holds.
+    syscall: u32,
+}
+
+/// Creates the machine context of thread `tid`, which starts in
+/// `LdrInitializeThunk` once [`write_start_context`] has written its
+/// CONTEXT.
+///
+/// As Wine's `call_init_thunk`, the start CONTEXT tops the stack, and
+/// LdrInitializeThunk(context, 0, 0, 0) is called under it, so the stack
+/// ntdll.dll clears before it continues lies below the CONTEXT.
+fn new_context(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    memory: &mut Memory,
+    ldr_initialize_thunk: u32,
+    syscall: u32,
+    tid: u32,
+    stack_size: u32,
+) -> Result<CtxId, MemFault> {
+    let context = sys.spawn(cpu, "thread", ldr_initialize_thunk, &[], stack_size)?;
+    let thread = &sys.contexts[context as usize];
+    let (teb, stack_base, stack_lo) = (thread.teb, thread.stack_hi, thread.stack_lo);
+    // The machine's stack: a guard page under the committed pages.
+    let stack = stack_lo - PAGE;
+    let mut pages = vec![Some(PAGE_READWRITE); ((stack_base - stack) / PAGE) as usize];
+    pages[0] = Some(PAGE_GUARD_READWRITE);
+    memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
+    init_teb(cpu, teb, tid, syscall)?;
+
+    let start_context = start_context(stack_base);
+    let frame = start_context - 20;
+    let return_address = cpu.read_u32(stack_base - STACK_TOP_RESERVE - 4)?;
+    for (index, value) in [return_address, start_context, 0, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
+        cpu.write_u32(frame + 4 * index as u32, value)?;
+    }
+    sys.set_start_stack(context, frame);
+    Ok(context)
+}
+
+fn start_context(stack_base: u32) -> u32 {
+    ((stack_base - STACK_TOP_RESERVE) & !3) - context::SIZE as u32
+}
+
+/// Writes the start CONTEXT of `context`, which resumes at
+/// RtlUserThreadStart(entry in EAX, argument in EBX).
+fn write_start_context(
+    cpu: &mut dyn Guest,
+    sys: &Sys,
+    start: &ThreadStart,
+    context: CtxId,
+    entry: u32,
+    argument: u32,
+) -> Result<(), MemFault> {
+    let stack_base = sys.contexts[context as usize].stack_hi;
+    let mut state = start.initial.clone();
+    state.eip = start.rtl_user_thread_start;
+    state.regs = [0; 8];
+    state.regs[0] = entry;
+    state.regs[3] = argument;
+    state.regs[4] = stack_base - STACK_TOP_RESERVE;
+    state.eflags = EFLAGS;
+    state.x87.control = FPU_CONTROL;
+    state.mxcsr = MXCSR;
+    cpu.write(start_context(stack_base), &context::encode(&state))
+}
+
+/// Creates thread `tid` of the process, which runs entry(argument) once
+/// the loader has attached it.
+pub fn create_thread(
+    env: &mut Env<'_>,
+    tid: u32,
+    entry: u32,
+    argument: u32,
+    stack_size: u32,
+) -> Result<CtxId, MemFault> {
+    let Env { cpu, sys, ext, .. } = env;
+    let start = ext.get::<ThreadStart>();
+    let (ldr_initialize_thunk, syscall) = (start.ldr_initialize_thunk, start.syscall);
+    let context = new_context(
+        *cpu,
+        sys,
+        ext.get_mut::<Memory>(),
+        ldr_initialize_thunk,
+        syscall,
+        tid,
+        stack_size.max(DEFAULT_STACK),
+    )?;
+    write_start_context(
+        *cpu,
+        sys,
+        ext.get::<ThreadStart>(),
+        context,
+        entry,
+        argument,
+    )?;
+    Ok(context)
+}
+
 /// The TEB fields Wine's `init_teb` sets beyond the machine's, and the
 /// thread's server id and system call entry.
-fn init_teb<B: Backend>(cpu: &mut B, teb: u32, tid: u32, syscall: u32) -> Result<(), MemFault> {
+fn init_teb(cpu: &mut dyn Guest, teb: u32, tid: u32, syscall: u32) -> Result<(), MemFault> {
     let frames = teb + TEB_ACTIVATION_FRAME_LIST;
     for (offset, value) in [
         (teb::THREAD_ID, tid),

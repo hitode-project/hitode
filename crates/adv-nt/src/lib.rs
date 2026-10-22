@@ -31,6 +31,7 @@ pub mod status;
 pub mod sync;
 pub mod syscalls;
 pub mod system;
+pub mod thread;
 pub mod timezone;
 pub mod token;
 pub mod unix;
