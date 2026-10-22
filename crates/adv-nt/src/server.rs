@@ -26,21 +26,36 @@ pub trait Progress {
     fn run_server(&mut self);
 }
 
-#[derive(Debug)]
-pub enum Error {
-    Io(io::Error),
-    /// The server speaks another protocol version.
-    Version(u32),
-    /// The server did not answer a request that it answers at once.
-    NoReply,
-    /// The server closed the connection.
-    Closed,
+/// A process's connection with what drives its server, kept in the
+/// machine's extensions.
+pub struct Link {
+    pub connection: Connection,
+    pub progress: Box<dyn Progress>,
 }
 
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Error::Io(error)
+impl Link {
+    pub fn call_raw(
+        &mut self,
+        fixed: &mut [u8; FIXED_SIZE],
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.connection
+            .call_raw(&mut *self.progress, fixed, data, reply_data)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("the server speaks protocol version {0}")]
+    Version(u32),
+    /// The server did not answer a request that it answers at once.
+    #[error("the server did not answer")]
+    NoReply,
+    #[error("the server closed the connection")]
+    Closed,
 }
 
 /// What the server told the first thread of a new process.
@@ -136,11 +151,7 @@ impl Connection {
         reply_data: &mut [u8],
     ) -> Result<(R::Reply, usize), Error> {
         const { assert!(size_of::<R>() <= FIXED_SIZE && size_of::<R::Reply>() <= FIXED_SIZE) };
-        let header = request.header();
-        header.req = R::NUMBER;
-        header.request_size = data.iter().map(|part| part.len() as u32).sum();
-        header.reply_size = reply_data.len() as u32;
-
+        request.header().req = R::NUMBER;
         let mut fixed = [0u8; FIXED_SIZE];
         // SAFETY: `R` is a plain repr(C) layout no larger than the buffer.
         unsafe {
@@ -150,21 +161,38 @@ impl Connection {
                 size_of::<R>(),
             )
         };
-        self.write(progress, &fixed)?;
+        let size = self.call_raw(progress, &mut fixed, data, reply_data)?;
+        // SAFETY: the reply is a plain repr(C) layout no larger than the buffer.
+        let reply: R::Reply = unsafe { std::ptr::read_unaligned(fixed.as_ptr().cast()) };
+        Ok((reply, size))
+    }
+
+    /// Sends a request whose fixed part, with its number, is in `fixed`, and
+    /// replaces it with the fixed reply. The sizes in the header are set
+    /// here. Returns how many bytes of reply data were written.
+    pub fn call_raw(
+        &mut self,
+        progress: &mut dyn Progress,
+        fixed: &mut [u8; FIXED_SIZE],
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<usize, Error> {
+        let request_size: u32 = data.iter().map(|part| part.len() as u32).sum();
+        fixed[4..8].copy_from_slice(&request_size.to_ne_bytes());
+        fixed[8..12].copy_from_slice(&(reply_data.len() as u32).to_ne_bytes());
+        self.write(progress, fixed)?;
         for part in data {
             self.write(progress, part)?;
         }
         progress.run_server();
 
-        self.read(progress, &mut fixed)?;
-        // SAFETY: the reply is a plain repr(C) layout no larger than the buffer.
-        let reply: R::Reply = unsafe { std::ptr::read_unaligned(fixed.as_ptr().cast()) };
+        self.read(progress, fixed)?;
         // SAFETY: every reply starts with the reply header.
         let header: crate::protocol::ReplyHeader =
             unsafe { std::ptr::read_unaligned(fixed.as_ptr().cast()) };
         let size = (header.reply_size as usize).min(reply_data.len());
         self.read(progress, &mut reply_data[..size])?;
-        Ok((reply, size))
+        Ok(size)
     }
 
     /// The process socket, over which the server sends file descriptors.

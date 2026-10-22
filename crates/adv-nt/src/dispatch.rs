@@ -10,8 +10,8 @@ use std::sync::LazyLock;
 use adv_cpu::backend::Reg;
 use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
-use crate::memory;
 use crate::syscalls::SYSCALLS;
+use crate::{memory, unix};
 
 /// A system call, given its arguments.
 type Syscall = fn(&mut Env<'_>, &[u32]) -> Outcome;
@@ -96,5 +96,6 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
-    Outcome::Fail(format!("unix call {} is not implemented", env.arg(2)))
+    let (code, args) = (env.arg(2), env.arg(3));
+    unix::call(env, code, args)
 }

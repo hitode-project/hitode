@@ -73,3 +73,33 @@ impl Request for InitFirstThreadRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitProcessDoneRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub teb: u64,
+    pub peb: u64,
+}
+const _: () = assert!(size_of::<InitProcessDoneRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(InitProcessDoneRequest, teb) == 16);
+const _: () = assert!(std::mem::offset_of!(InitProcessDoneRequest, peb) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitProcessDoneReply {
+    pub header: ReplyHeader,
+    pub suspend: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<InitProcessDoneReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(InitProcessDoneReply, suspend) == 8);
+
+impl Request for InitProcessDoneRequest {
+    const NUMBER: i32 = 4;
+    type Reply = InitProcessDoneReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

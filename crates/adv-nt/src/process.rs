@@ -7,6 +7,7 @@
 //! `RtlUserThreadStart`, as in Wine.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
@@ -15,6 +16,8 @@ use adv_pe::{ExportTarget, Pe, PeError};
 
 use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
+use crate::protocol::InitProcessDoneRequest;
+use crate::server::{self, Connection, FirstThread, Link, Progress};
 use crate::{context, dispatch, image};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
@@ -66,6 +69,10 @@ pub enum Error {
     Memory(#[from] MemFault),
     #[error("{0}")]
     Context(String),
+    #[error("server: {0}")]
+    Server(#[from] server::Error),
+    #[error("{0} failed with status {1:#x}")]
+    Status(&'static str, u32),
 }
 
 /// The mapped ntdll.dll.
@@ -85,15 +92,23 @@ pub struct Process {
     pub ntdll: Ntdll,
     pub peb: u32,
     pub main: CtxId,
+    /// The process and main thread as the server registered them.
+    pub thread: FirstThread,
 }
 
-/// Maps ntdll.dll and prepares the main thread, which runs once the machine
-/// does. `machine` must use [`dispatch::Platform`].
+/// Connects to the server at `socket`, maps ntdll.dll and prepares the main
+/// thread, which runs once the machine does. `machine` must use
+/// [`dispatch::Platform`]; `progress` runs the server whenever the process
+/// waits for it.
 pub fn start<B: Backend>(
     machine: &mut Machine<B>,
     ntdll: &[u8],
     startup: &Startup<'_>,
+    socket: &Path,
+    mut progress: Box<dyn Progress>,
 ) -> Result<Process, Error> {
+    let (mut connection, registered) = Connection::connect(socket, &mut *progress)?;
+    machine.sys.pid = registered.pid;
     let pe = Pe::parse(ntdll)?;
     let base = pe.image_base;
     let mut memory = Memory::default();
@@ -177,6 +192,9 @@ pub fn start<B: Backend>(
     machine.ext.insert(memory);
     machine
         .cpu
+        .write_u32(teb + teb::THREAD_ID, registered.tid)?;
+    machine
+        .cpu
         .write_u32(teb + TEB_SYSCALL_DISPATCHER, syscall)?;
     debug_assert_eq!(machine.cpu.read_u32(teb + teb::PEB)?, peb);
 
@@ -196,5 +214,23 @@ pub fn start<B: Backend>(
     state.mxcsr = MXCSR;
     machine.cpu.write(start_context, &context::encode(&state))?;
 
-    Ok(Process { ntdll, peb, main })
+    let mut done = InitProcessDoneRequest {
+        teb: u64::from(teb),
+        peb: u64::from(peb),
+        ..Default::default()
+    };
+    let (reply, _) = connection.call(&mut *progress, &mut done, &[], &mut [])?;
+    if reply.header.error != 0 {
+        return Err(Error::Status("init_process_done", reply.header.error));
+    }
+    machine.ext.insert(Link {
+        connection,
+        progress,
+    });
+    Ok(Process {
+        ntdll,
+        peb,
+        main,
+        thread: registered,
+    })
 }

@@ -26,6 +26,7 @@ OUTPUT = ROOT / "crates/adv-nt/src/protocol.rs"
 
 REQUESTS = [
     "init_first_thread",
+    "init_process_done",
 ]
 
 INTEGERS = {
