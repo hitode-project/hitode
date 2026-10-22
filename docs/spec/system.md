@@ -239,4 +239,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft SAFEARRAY and VARIANT contracts; authored native dimension and stride controls.
 
+### SYS-AUTOMATION-2 Scalar conversion ownership and precision
+
+**Rule**: Automation scalar conversions MUST share guest locale data and BSTR ownership. Integer and currency conversions MUST round decimal ties to even without losing integer precision. Failed conversion MUST preserve output bytes and LastError.
+**Verification**: Test
+**Basis**: Microsoft VarBoolFromStr, VarBstrFromDate, VarCyFromStr and related scalar conversion contracts; authored native scalar controls.
+
 Withdrawn: none

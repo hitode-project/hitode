@@ -5,6 +5,7 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::com::{MAX_BSTR_BYTES, copy_bstr, free_bstr, owns_bstr};
 mod coercion;
+mod conversion;
 
 const INVALID: u32 = 0x80070057;
 const BAD_TYPE: u32 = 0x80020008;
@@ -15,6 +16,7 @@ type Then = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
 
 pub(super) fn register(registry: &mut Registry) {
     coercion::register(registry);
+    conversion::register(registry);
     for (api, ordinal) in [(init_ABI, "#8"), (clear_ABI, "#9"), (copy_ABI, "#10")] {
         registry.register(api);
         registry.register(Api {

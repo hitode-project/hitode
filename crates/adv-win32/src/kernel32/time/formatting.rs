@@ -5,7 +5,7 @@ use adv_abi::{AnsiStr, WideStr, guest::check_range};
 use adv_cpu::backend::Prot;
 /// Expand a GetDateFormat/GetTimeFormat picture over SYSTEMTIME `st` (year, month, weekday,
 /// day, hour, minute, second, ms), using localized Gregorian names.
-fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale, time: bool) -> Vec<u16> {
+pub(crate) fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale, time: bool) -> Vec<u16> {
     let [year, month, wday, day, hour, minute, second, _] = st.map(u32::from);
     let mut out = String::new();
     let mut i = 0;
@@ -69,7 +69,7 @@ fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale, time: bool) -> Vec<
                 out += &match run {
                     1 => (year % 100).to_string(),
                     2 => format!("{:02}", year % 100),
-                    _ => year.to_string(),
+                    _ => format!("{year:04}"),
                 }
             }
             'g' => {

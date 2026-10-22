@@ -6,6 +6,7 @@ use adv_machine::{CtxId, Env, Outcome, Wait};
 
 use super::K32;
 mod formatting;
+pub(crate) use formatting::format_picture as format_locale_picture;
 mod timezone;
 use crate::{Win32, stdcall, util::write_units};
 

@@ -780,3 +780,70 @@ fn native_null_array_variant_controls() {
     assert_eq!(unsafe { VariantClear(&mut source) }, 0);
     assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
 }
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn VarBoolFromStr(text: *const u16, locale: u32, flags: u32, out: *mut i16) -> i32;
+    fn VarBstrFromCy(value: i64, locale: u32, flags: u32, out: *mut *mut u16) -> i32;
+    fn VarDateFromStr(text: *const u16, locale: u32, flags: u32, out: *mut f64) -> i32;
+    fn VarI4FromStr(text: *const u16, locale: u32, flags: u32, out: *mut i32) -> i32;
+    fn VarUI4FromStr(text: *const u16, locale: u32, flags: u32, out: *mut u32) -> i32;
+}
+#[test]
+fn native_authored_automation_decimal_boundaries_and_date_parsing() {
+    for value in [12500i64, i64::MIN, i64::MAX] {
+        let mut output = std::ptr::null_mut();
+        let status = unsafe { VarBstrFromCy(value, 0x409, 0, &mut output) } as u32;
+        let n = unsafe { SysStringLen(output) };
+        let text =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(output, n as usize) });
+        eprintln!("automation-currency value={value} status={status:x} text={text}");
+        unsafe { SysFreeString(output) };
+    }
+    for text in [
+        "2.5",
+        "1.5",
+        "-1.5",
+        "1.49999999999999999",
+        "2147483647",
+        "2147483648",
+        "4294967295",
+        "-1",
+        "1,2",
+        "1e-999",
+        "true",
+        "TrUe",
+        "922337203685477.5807",
+        "-922337203685477.5808",
+    ] {
+        let input = text.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let (mut signed, mut unsigned, mut boolean, mut currency) = (
+            0x55555555i32,
+            0x55555555u32,
+            0x5555i16,
+            0x5555555555555555i64,
+        );
+        let a = unsafe { VarI4FromStr(input.as_ptr(), 0x409, 0, &mut signed) } as u32;
+        let b = unsafe { VarUI4FromStr(input.as_ptr(), 0x409, 0, &mut unsigned) } as u32;
+        let c = unsafe { VarBoolFromStr(input.as_ptr(), 0x409, 0, &mut boolean) } as u32;
+        let d = unsafe { VarCyFromStr(input.as_ptr(), 0x409, 0, &mut currency) } as u32;
+        eprintln!(
+            "automation-boundary text={text} i4={a:x},{signed} ui4={b:x},{unsigned} bool={c:x},{boolean} cy={d:x},{currency}"
+        );
+    }
+    for (locale, text) in [
+        (0x409, "2/29/2024"),
+        (0x411, "2024年2月29日"),
+        (0x804, "2024/2/29"),
+        (0x409, "12/29/1899 6:00 AM"),
+        (0x409, "6:00 PM"),
+        (0x409, "2/29/2023"),
+        (0x411, "2024/2/29 午後6:00"),
+    ] {
+        let input = text.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut value = 555.0;
+        let status = unsafe { VarDateFromStr(input.as_ptr(), locale, 0, &mut value) } as u32;
+        eprintln!(
+            "automation-parse-date locale={locale:x} text={text} status={status:x} value={value}"
+        );
+    }
+}

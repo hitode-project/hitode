@@ -5,7 +5,7 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
 #[derive(Clone, Copy)]
-pub(in crate::kernel32) struct Locale {
+pub(crate) struct Locale {
     pub id: u32,
     pub name: &'static str,
     pub cp: u32,
@@ -58,7 +58,7 @@ pub(in crate::kernel32) fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
     set_last_error(env, error);
     Outcome::Return(0)
 }
-pub(in crate::kernel32) fn by_id(env: &Env<'_>, id: u32) -> Result<Locale, u32> {
+pub(crate) fn by_id(env: &Env<'_>, id: u32) -> Result<Locale, u32> {
     let id = if matches!(id, 0 | 0x400 | 0x800 | 0xc00 | 0x1400) {
         super::lcid(env)
     } else {
@@ -232,7 +232,7 @@ pub(in crate::kernel32) fn month_name(locale: Locale, month: u32, short: bool) -
         }
     }
 }
-pub(in crate::kernel32) fn info(locale: Locale, kind: u32) -> Option<String> {
+pub(crate) fn info(locale: Locale, kind: u32) -> Option<String> {
     let index = match locale.id {
         0x409 | 9 => 0,
         0x411 | 0x11 => 1,
