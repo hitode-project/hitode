@@ -44,8 +44,8 @@ api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:
 api-ms-win-crt-runtime-l1-1-0.dll	_execute_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
-ucrtbase.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
-api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
+ucrtbase.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
 ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 ucrtbase.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -1780,3 +1780,177 @@ ucrtbase.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size
 ucrtbase.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 ucrtbase.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 ucrtbase.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+
+# Shared signed/unsigned integer conversions: stdlib.h and corecrt_wstdlib.h.
+api-ms-win-crt-convert-l1-1-0.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	atol	cdecl	i32	long	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr100.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr100.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr100.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr100.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr100.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr100.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr110.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr110.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr110.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr110.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr110.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr110.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr120.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr120.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr120.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr120.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+msvcr120.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr120.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr120.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+msvcr120.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr70.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr70.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr70.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr70.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr70.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr70.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr71.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr71.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr71.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr71.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr71.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr71.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr80.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr80.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr80.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr80.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr80.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr80.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr90.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr90.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr90.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr90.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr90.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr90.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcrt.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcrt.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt20.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt20.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt20.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt20.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt20.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt20.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt20.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt20.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt40.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt40.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt40.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt40.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt40.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt40.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt40.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt40.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+ucrtbase.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+ucrtbase.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+ucrtbase.dll	atol	cdecl	i32	long	text:const char*:str8:1
+ucrtbase.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+ucrtbase.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1

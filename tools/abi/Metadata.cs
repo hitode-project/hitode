@@ -319,9 +319,31 @@ public static class AbiMetadata
                     || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
                     throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
             }
+            bool crtIntegerName = f.Length == 6 && new[] {
+                "atoi", "atol", "atoll", "_atoi64", "_wtoi", "_wtol", "_wtoll", "_wtoi64",
+                "strtol", "strtoul", "strtoll", "strtoull", "_strtoi64", "_strtoui64",
+                "wcstol", "wcstoul", "wcstoll", "wcstoull", "_wcstoi64", "_wcstoui64"
+            }.Contains(f[1]);
+            bool crtInteger = false;
+            if (crtIntegerName)
+            {
+                bool wide = f[1].StartsWith("_w") || f[1].StartsWith("wcs");
+                bool signed = !f[1].Contains('u');
+                bool bits64 = f[1].Contains("64") || f[1].EndsWith("ll");
+                bool decimalOnly = new[] { "atoi", "atol", "atoll", "_atoi64", "_wtoi", "_wtol", "_wtoll", "_wtoi64" }.Contains(f[1]);
+                string unit = wide ? "wchar_t" : "char";
+                string parameters = "text:const " + unit + "*:str" + (wide ? "16" : "8") + ":1";
+                if (!decimalOnly) parameters += "|end:" + unit + "**:ptr:1|base:int:i32:1";
+                string resultKind = (signed ? "i" : "u") + (bits64 ? "64" : "32");
+                string resultType = bits64 ? (f[1].Contains("64") ? "__int64" : "long long")
+                    : (f[1] == "atoi" || f[1] == "_wtoi" ? "int" : "long");
+                if (!signed) resultType = "unsigned " + resultType;
+                crtInteger = f[2] == "cdecl" && f[3] == resultKind && f[4] == resultType && f[5] == parameters;
+                if (!crtInteger) throw new InvalidDataException("CRT integer conversion stack contract changed: " + row);
+            }
             bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
                 && f[4] == "double" && f[5].Length == 0;
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtInteger && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

@@ -226,7 +226,9 @@ This scope manifest neither registers behavior nor changes export discovery;
 `tools/survey/coverage.py` continues to report the unfiltered catalogs.
 
 Declarations include floating controls, error cells, exit arrays and initializer
-ranges. Legacy `__getmainargs`/`__wgetmainargs` use Learn prototypes where SDK
+ranges. Integer conversions share checked narrow/UTF-16 scanning, x86-width
+saturation and module/thread errno, including EDX:EAX returns and native
+end-pointer validation order. Legacy startup entries use Learn prototypes where SDK
 headers omit them. Their guest argv/environment arrays consume Win32 strings and
 process environment, with per-CRT guest-heap snapshots released on process detach.
 Glob expansion requests containing wildcards explicitly fail rather than report
@@ -236,16 +238,14 @@ process heap. Allocation failure and multiplication overflow publish ENOMEM;
 zero-byte malloc/calloc retain distinct one-byte blocks. A nonnull zero-sized
 realloc releases its block, while `_expand` retains one live byte and uses the
 RTL in-place flag. Failed resizing preserves the old block. NULL `_msize/_expand`
-inputs use the runtime's parameter-validation profile. Interpreter/JIT tests
-exercise the aliases, shared block contents, size queries and error contracts.
+inputs use the runtime's parameter-validation profile. Tests check every alias.
 Aligned malloc/free/size/realloc/recalloc fronts and their offset variants retain
 the native x86 guest header pointing into the same process heap. Resizing keeps
 the old backing until allocation and copying succeed; recalloc zeros the added
 extent. VC80/VC90's native zero-alignment acceptance is a version parameter;
 UCRT and the other profiles require the documented nonzero power of two. Native
 aligned size queries validate NULL and require the original alignment/offset.
-Tests cover alignment geometry, all cataloged versions, zeroing, zero-sized
-release, overflow and callback ordering on both interpreter and JIT.
+Tests check all versions and zeroing, release and error contracts in both backends.
 Legacy scalar `operator new/delete` use that same heap, including distinct live
 zero-byte allocations. The throwing `new` overload explicitly stops on allocation
 failure because guest `std::bad_alloc`/new-handler dispatch is not implemented;

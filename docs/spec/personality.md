@@ -247,3 +247,13 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Aligned recalloc MUST zero newly added bytes and reject overflowing products with ENOMEM. Invalid inputs MUST follow the version's parameter-validation profile and native zero-alignment policy. Zero-sized resizing of a nonnull view MUST release its backing block before alignment validation.
 **Verification**: Test
+
+### PERS-CRT-11 Integer conversion boundaries
+
+**Rule**: CRT integer conversions MUST use x86 result widths, saturate overflow with ERANGE, and preserve errno on successful conversion. End pointers MUST identify the first unconsumed unit, or the original pointer when no digit was converted. Narrow and wide fronts MUST share checked scanning while observing their runtime's locale owner.
+**Verification**: Test
+
+### PERS-CRT-12 Integer validation and access order
+
+**Rule**: Integer conversions MUST initialize nonnull end outputs before validating source and radix. Invalid parameters MUST use the runtime's validation profile, with full-width zero results when execution continues. Prefix scanning MUST stop at the first unrecognized unit and avoid reading a suffix after overflow when no end position was requested.
+**Verification**: Test

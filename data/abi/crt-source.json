@@ -651,5 +651,29 @@
     "boundaries": "Native Microsoft VC80/VC90 accept zero alignment and normalize it to four, unlike pinned UCRT which rejects it; version parameters preserve this difference. Other version profiles follow the documented nonzero power-of-two precondition. Native VC80/VC90/UCRT accept zero-sized aligned requests with offset zero. Aligned size checks NULL and computes backing size minus max(alignment,4), (-offset)&3 and three bytes; alignment/offset must match the allocation.",
     "resizing": "Replacement allocations preserve the old block on failure and copy its available user bytes before release. Recalloc uses the native aligned-size zeroing boundary. Nonnull zero-sized resizing releases the old backing before alignment/offset validation; product overflow publishes ENOMEM before any resize.",
     "evidence": "Microsoft SDK declarations and Learn establish public contracts. The pinned native Microsoft x86 runtime binaries listed in the provenance establish guest header geometry, zero input differences and validation order; no native execution or Wine implementation is claimed."
+  },
+  "integer_conversions": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstdlib.h",
+        "sha256": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atoi-atoi-l-wtoi-wtoi-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atol-atol-l-wtol-wtol-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atoll-atoll-l-wtoll-wtoll-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtol-wcstol-strtol-l-wcstol-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoul-strtoul-l-wcstoul-wcstoul-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoi64-wcstoi64-strtoi64-l-wcstoi64-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoui64-wcstoui64-strtoui64-l-wcstoui64-l"
+    ],
+    "scope": "Cataloged narrow and wide signed/unsigned 32/64-bit conversions without explicit locale handles; one checked prefix kernel uses the existing CRT locale and errno owners.",
+    "behavior": "Saturate to x86-width bounds and publish ERANGE; unsigned negative conversion negates modulo width unless the magnitude overflowed. End pointers advance in bytes or UTF-16 units; no digits reset to the original pointer. NULL/radix failures initialize end before the version-specific parameter path, including full EDX:EAX zero on 64-bit returns.",
+    "native_evidence": "Pinned Microsoft VC90 initializes end before source/radix checks, consumes a 0x prefix even without following digits, and stops overflow scanning early only when no end pointer was requested. Its wide parser accepts the documented Unicode decimal blocks reflected in the shared digit kernel; no machine code is copied or native Windows execution claimed."
   }
 }

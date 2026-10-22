@@ -215,11 +215,9 @@ pub fn register(r: &mut Registry) {
         ("_time32", 1),
         ("gmtime", 1),
         ("localtime", 1),
-        ("atoi", 1),
         ("abs", 1),
         ("_itoa", 3),
         ("_strdup", 1),
-        ("strtoul", 3),
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
@@ -291,7 +289,6 @@ pub fn register(r: &mut Registry) {
             ("memset", 3),
             ("memcmp", 3),
             ("_strdup", 1),
-            ("strtoul", 3),
             ("_splitpath", 5),
             ("_makepath", 5),
             ("getenv", 1),
@@ -1066,13 +1063,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             ptr
         }
-        "atoi" => {
-            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
-            decimal_int(&wide) as u32
-        }
         "abs" => (a as i32).unsigned_abs(),
         "_itoa" => {
             if !(2..=36).contains(&c) {
@@ -1101,18 +1091,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail(error.to_string());
             }
             b
-        }
-        "strtoul" => {
-            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
-            let (val, consumed, _) = convert::parse(&wide, c as i32);
-            if b != 0 {
-                let end = a.wrapping_add(consumed as u32);
-                let _ = e.cpu.write_u32(b, end);
-            }
-            val as u32
         }
         "_splitpath" => {
             let Ok(path) = e.cpu.read_cstr(a, 4096) else {
@@ -1297,26 +1275,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
     };
     Outcome::Return(value)
-}
-
-/// `strtol(text, NULL, 10)`, saturating like the msvcrt `atoi`.
-fn decimal_int(text: &[u16]) -> i32 {
-    let (value, _, error) = convert::parse(text, 10);
-    let negative = text
-        .iter()
-        .find(|c| !matches!(c, 9..=13 | 32))
-        .is_some_and(|c| *c == u16::from(b'-'));
-    let magnitude = if negative {
-        value.wrapping_neg()
-    } else {
-        value
-    };
-    match (negative, error) {
-        (false, Some(_)) => i32::MAX,
-        (true, Some(_)) => i32::MIN,
-        (false, None) => magnitude.min(i32::MAX as u64) as i32,
-        (true, None) => (-(magnitude.min(1 << 31) as i64)) as i32,
-    }
 }
 
 #[cfg(test)]
