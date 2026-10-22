@@ -28,6 +28,7 @@ mod performance;
 mod session;
 #[cfg(any(host_view, all(windows, feature = "gpu"), all(test, feature = "gpu")))]
 mod software_frame;
+mod survey;
 pub mod window;
 #[cfg(host_view)]
 pub use session::Session;
@@ -88,6 +89,7 @@ pub struct Options {
     trace: Option<PathBuf>,
     host_profile: Option<PathBuf>,
     schedule_profile: Option<PathBuf>,
+    survey: Option<PathBuf>,
     auto_dialog_ms: Option<u32>,
     self_test_input: bool,
     profile: bool,
@@ -138,6 +140,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --trace PATH            write every completed guest API call to a local trace\n\
   --host-profile PATH     opt-in API service time CSV (also supports N=2)\n\
   --schedule-profile PATH opt-in scheduling and lock boundary TSV\n\
+  --survey PATH           write the static API gaps of every module in the game folder\n\
   --auto-dialog-ms N      explicitly auto-select dialog defaults after N guest ms\n\
   --self-test-input       post A key and left-click after the first idle\n\
   --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
@@ -182,6 +185,7 @@ impl Options {
             trace: None,
             host_profile: None,
             schedule_profile: None,
+            survey: None,
             auto_dialog_ms: None,
             self_test_input: false,
             profile: false,
@@ -317,6 +321,7 @@ impl Options {
                 "--trace" => options.trace = Some(value()?.into()),
                 "--host-profile" => options.host_profile = Some(value()?.into()),
                 "--schedule-profile" => options.schedule_profile = Some(value()?.into()),
+                "--survey" => options.survey = Some(value()?.into()),
                 "--auto-dialog-ms" => {
                     options.auto_dialog_ms =
                         Some(value()?.parse().map_err(|_| "invalid dialog delay")?)
@@ -1452,6 +1457,13 @@ fn run_execution(
     )?;
     for (drive, image) in &options.cdroms {
         runtime.mount_iso(*drive, image)?;
+    }
+    if let Some(path) = &options.survey {
+        let modules = survey::modules(&options.exe);
+        println!(
+            "{}",
+            survey::write(path, &modules, &runtime.survey(&modules))?
+        );
     }
     if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
         use std::io::Read;
