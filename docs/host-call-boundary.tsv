@@ -4035,6 +4035,8 @@ user32.dll!CharLowerBuffW	user cache or win32k	not excluded	not excluded	not exc
 user32.dll!CharLowerW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CharNextA	user cache or win32k	no	no	no	handler-owned state; same source	not required by fast path; ordinary not excluded	leaf	explicit nonblocking registration; decline before effects
 user32.dll!CharNextW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!CharPrevA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!CharToOemA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CharUpperA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CharUpperBuffA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CharUpperBuffW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -4238,6 +4240,7 @@ user32.dll!InsertMenuItemW	user cache or win32k	not excluded	not excluded	not ex
 user32.dll!InsertMenuW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!IntersectRect	user	no	no	no	guest memory/context	not required by fast path; ordinary not excluded	guest	authored guest body; ordinary implementation retained
 user32.dll!InvalidateRect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!InvalidateRgn	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!IsChild	user cache or win32k	no	no	no	handler-owned state; same source	not required by fast path; ordinary not excluded	leaf	explicit nonblocking registration; decline before effects
 user32.dll!IsClipboardFormatAvailable	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!IsDialogMessageA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -4384,6 +4387,7 @@ user32.dll!UpdateLayeredWindow	user cache or win32k	not excluded	not excluded	no
 user32.dll!UpdateLayeredWindowIndirect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!UpdateWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!ValidateRect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!ValidateRgn	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!WINNLSEnableIME	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!WaitMessage	user cache or win32k	yes/conditional	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!WindowFromPoint	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe

@@ -45,6 +45,7 @@ use super::message::{send, send_all};
 use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr, set_last_error};
 use crate::{Win32, stdcall};
+mod activation;
 mod position;
 mod style;
 mod z_order;
@@ -79,6 +80,7 @@ pub mod wm {
     pub const MOVE: u32 = 0x03;
     pub const SIZE: u32 = 0x05;
     pub const ACTIVATE: u32 = 0x06;
+    pub const NCACTIVATE: u32 = 0x86;
     pub const SETFOCUS: u32 = 0x07;
     pub const KILLFOCUS: u32 = 0x08;
     pub const ENABLE: u32 = 0x0a;
@@ -1865,35 +1867,7 @@ fn activate_window_request(
     foreground: bool,
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
-    let u = &mut env.ext.get_mut::<crate::Win32>().user;
-    let Some(thread) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.thread) else {
-        return then(env);
-    };
-    z_order::raise(u, &mut env.sys.objects, hwnd);
-    let was_foreground = u.foreground_active;
-    let foreground_queue = u
-        .windows
-        .get(&env.sys.objects, &u.foreground)
-        .map(|w| w.thread);
-    let update_foreground = foreground || was_foreground && foreground_queue == Some(thread);
-    if update_foreground {
-        u.foreground = hwnd;
-        u.foreground_active = true;
-    }
-    let q = u.queue(thread);
-    let old = q.active;
-    if old == hwnd {
-        return then(env);
-    }
-    q.active = hwnd;
-    let mut msgs = Vec::new();
-    if old != 0 {
-        msgs.push([old, wm::ACTIVATE, 0, hwnd]);
-    } else if update_foreground && !was_foreground {
-        msgs.push([hwnd, wm::ACTIVATEAPP, 1, 0]);
-    }
-    msgs.push([hwnd, wm::ACTIVATE, 1, old]); // WA_ACTIVE
-    send_all(env, msgs.into(), then)
+    activation::request(env, hwnd, foreground, move |env, _| then(env))
 }
 
 /// SetFocus: WM_KILLFOCUS to the old focus, WM_SETFOCUS to the new. `then` gets the old one.
@@ -2091,10 +2065,21 @@ fn bring_to_top(env: &mut Env<'_>, hwnd: AbiHandle) -> Outcome {
 }
 
 fn set_active_window(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
+    let mut hwnd = env.arg(0);
     let ctx = env.context;
     let old = user_mut(env).queue(ctx).active;
-    activate_window_request(env, hwnd, false, move |_| Outcome::Return(old))
+    if hwnd != 0 {
+        let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+            set_last_error(env, 1400);
+            return Outcome::Return(0);
+        };
+        if window.thread != ctx {
+            hwnd = 0;
+        }
+    }
+    activation::request(env, hwnd, false, move |_, accepted| {
+        Outcome::Return(if accepted { old } else { 0 })
+    })
 }
 
 #[win32(user32, name = "EnableWindow", level = state)]
@@ -2837,7 +2822,9 @@ fn set_foreground_window(env: &mut Env<'_>) -> Outcome {
     if !user(env).windows.contains_key(&env.sys.objects, &hwnd) {
         return Outcome::Return(0);
     }
-    activate_window(env, hwnd, |_| Outcome::Return(1))
+    activation::request(env, hwnd, true, |_, accepted| {
+        Outcome::Return(u32::from(accepted))
+    })
 }
 
 fn get_desktop_window(env: &mut Env<'_>) -> Outcome {

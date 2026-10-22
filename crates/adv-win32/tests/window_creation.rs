@@ -14,6 +14,8 @@ use adv_win32::{
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const LOG: u32 = DATA + 0x8000;
+#[path = "window_creation/activation.rs"]
+mod activation;
 #[path = "window_creation/capture.rs"]
 mod capture;
 #[path = "window_creation/dc_origin.rs"]

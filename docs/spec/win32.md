@@ -198,9 +198,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: The ListBox class MUST keep items, item data, selection and top index, inserting in case-insensitive order under LBS_SORT. A host selection MUST update the guest selection and notify the parent with LBN_SELCHANGE only under LBS_NOTIFY. Multiple selection and string-less owner-drawn lists MUST warn.
 **Verification**: Test
 
-### WIN32-USER-19 Host activation and restore
+### WIN32-USER-19 Activation and host restore
 
-**Rule**: Host application activation MUST reach the active top-level window as WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE. Deactivation MUST use the reverse order. A host restore or first button press MUST restore a minimized displayed window through WM_SYSCOMMAND SC_RESTORE, which DefWindowProc performs, and consume that press.
+**Rule**: Activation MUST honor nonclient notifications, vetoes and nested activations, while NULL or another thread's window MUST deactivate the calling queue and clear focus. Host application activation MUST deliver WM_ACTIVATEAPP, WM_NCACTIVATE, then WM_ACTIVATE, reversing that order on deactivation. A host restore or first button press MUST restore a minimized displayed window through WM_SYSCOMMAND SC_RESTORE and consume that press.
 **Verification**: Test
 
 ### WIN32-USER-20 Input inspection
@@ -217,7 +217,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-GDI-2 Regions
 
-**Rule**: GDI regions MUST use bounded nonoverlapping rectangles under one object owner, scan-converting curves and polygons per row. Rotating or shearing ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
+**Rule**: GDI and update regions MUST retain exact bounded rectangle unions under existing object owners, preserving old state on capacity failure. GDI curve and polygon regions MUST scan-convert per row, while rotating or shearing ExtCreateRegion transforms and shaped window regions MUST fail. NULL SetWindowRgn restoration and absent-region queries MUST NOT fabricate shapes.
 **Verification**: Test
 
 ### WIN32-GDI-3 Presentation canvas
@@ -312,9 +312,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Ideal-processor APIs MUST share thread identity and the single-CPU profile, accepting processor 0 and using 32 to query the prior value. Ex APIs MUST validate group fields, allow overlapping input/output, and preserve distinct query-output and setter-pointer failures. They MUST NOT bind host threads.
 **Verification**: Test
 
-### WIN32-API-7 Wide strings
+### WIN32-API-7 String boundaries
 
-**Rule**: Wide APIs MUST preserve UTF-16 units, including embedded nulls and raw font-name fields. Zero-capacity LoadStringW MUST return the original resource pointer. CharNextW MUST follow the fixed USER32 traversal table rather than Unicode grapheme boundaries.
+**Rule**: Wide APIs MUST preserve UTF-16 units, including embedded nulls and raw font-name fields. Zero-capacity LoadStringW MUST return the original resource pointer, and CharNextW MUST follow the fixed USER32 traversal table. ANSI traversal MUST preserve DBCS boundaries, and OEM conversions MUST use configured code pages while retaining in-place bytes and terminators.
 **Verification**: Test
 
 ### WIN32-API-8 Absent consoles and devices
