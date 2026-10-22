@@ -847,3 +847,91 @@ fn native_authored_automation_decimal_boundaries_and_date_parsing() {
         );
     }
 }
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn SysAllocStringLen(text: *const u16, length: u32) -> *mut u16;
+    fn VariantChangeTypeEx(
+        destination: *mut NativeVariant,
+        source: *const NativeVariant,
+        locale: u32,
+        flags: u16,
+        target: u16,
+    ) -> i32;
+    fn VariantCopyInd(destination: *mut NativeVariant, source: *const NativeVariant) -> i32;
+}
+fn native_scalar_variant(kind: u16, value: u64) -> NativeVariant {
+    let mut value_bytes = NativeVariant([0; 32]);
+    value_bytes.0[..2].copy_from_slice(&kind.to_le_bytes());
+    value_bytes.0[8..16].copy_from_slice(&value.to_le_bytes());
+    value_bytes
+}
+#[test]
+fn native_authored_extended_variant_scalar_and_indirect_controls() {
+    for (source, value, target, flags) in [
+        (3, 42, 5, 0),
+        (3, 42, 8, 0),
+        (11, u64::from(u16::MAX), 8, 0),
+        (11, u64::from(u16::MAX), 8, 2),
+        (11, 7, 8, 0),
+        (11, 7, 8, 2),
+        (0, 0, 8, 0),
+        (3, 42, 0, 0),
+        (0, 0, 1, 0),
+    ] {
+        let source_value = native_scalar_variant(source, value);
+        let mut destination = NativeVariant([0; 32]);
+        let status =
+            unsafe { VariantChangeTypeEx(&mut destination, &source_value, 0x409, flags, target) }
+                as u32;
+        let kind = u16::from_le_bytes(destination.0[..2].try_into().unwrap());
+        let value = if status == 0 && kind == 8 {
+            let pointer =
+                usize::from_le_bytes(destination.0[8..8 + size_of::<usize>()].try_into().unwrap())
+                    as *mut u16;
+            let n = unsafe { SysStringLen(pointer) };
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, n as usize) })
+        } else {
+            format!(
+                "{}",
+                u64::from_le_bytes(destination.0[8..16].try_into().unwrap())
+            )
+        };
+        eprintln!(
+            "automation-variant source={source} target={target} flags={flags:x} status={status:x} kind={kind} value={value}"
+        );
+        assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
+    }
+    for (text, target) in [
+        ("2.5", 6),
+        ("2/29/2024", 7),
+        ("2147483648", 3),
+        ("1e-999", 11),
+    ] {
+        let input = text.encode_utf16().collect::<Vec<_>>();
+        let pointer = unsafe { SysAllocStringLen(input.as_ptr(), input.len() as u32) };
+        assert!(!pointer.is_null());
+        let mut source = native_scalar_variant(8, pointer as usize as u64);
+        let mut destination = NativeVariant([0; 32]);
+        let status =
+            unsafe { VariantChangeTypeEx(&mut destination, &source, 0x409, 0, target) } as u32;
+        let payload = u64::from_le_bytes(destination.0[8..16].try_into().unwrap());
+        eprintln!(
+            "automation-variant-string text={text} target={target} status={status:x} payload={payload}"
+        );
+        assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
+        assert_eq!(unsafe { VariantClear(&mut source) }, 0);
+    }
+    let value = 42i32;
+    let source = native_scalar_variant(0x4003, &value as *const i32 as usize as u64);
+    let mut destination = NativeVariant([0; 32]);
+    assert_eq!(unsafe { VariantCopyInd(&mut destination, &source) }, 0);
+    assert_eq!(
+        u16::from_le_bytes(destination.0[..2].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        i32::from_le_bytes(destination.0[8..12].try_into().unwrap()),
+        42
+    );
+    assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
+}

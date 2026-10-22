@@ -245,4 +245,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft VarBoolFromStr, VarBstrFromDate, VarCyFromStr and related scalar conversion contracts; authored native scalar controls.
 
+### SYS-AUTOMATION-3 Indirect values and extended coercion
+
+**Rule**: Indirect VARIANT copies MUST resolve borrowed pointers and establish independent ownership before retiring an aliased destination. Extended coercion MUST compute its result before releasing destination resources. Guest reference callbacks MUST preserve conversion continuations across scheduler waits.
+**Verification**: Test
+**Basis**: Microsoft VariantCopyInd and VariantChangeTypeEx contracts.
+
 Withdrawn: none

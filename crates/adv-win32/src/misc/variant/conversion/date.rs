@@ -2,6 +2,9 @@
 use super::*;
 use crate::kernel32::{civil_from_days, days_from_civil, locale_info};
 const EPOCH: i64 = -25569; // 1899-12-30 relative to 1970-01-01.
+pub(super) fn validate(value: f64) -> Result<(), u32> {
+    parts(value).map(|_| ())
+}
 fn parts(value: f64) -> Result<[u16; 8], u32> {
     if !value.is_finite() || value <= -657435.0 || value >= 2958466.0 {
         return Err(OVERFLOW);

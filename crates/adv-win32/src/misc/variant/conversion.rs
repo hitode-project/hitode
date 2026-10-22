@@ -3,6 +3,7 @@ use super::*;
 use crate::kernel32::{Locale, locale_by_id};
 use adv_abi::WideStr;
 use adv_os::com::alloc_bstr;
+mod change;
 mod date;
 mod number;
 use number::Number;
@@ -19,6 +20,7 @@ const MISMATCH: u32 = 0x80020005;
 const OVERFLOW: u32 = 0x8002000a;
 
 pub(super) fn register(registry: &mut Registry) {
+    registry.register(change::change_ex_ABI);
     for api in [
         bool_from_ABI,
         bool_text_ABI,
@@ -112,8 +114,8 @@ fn boolean(text: &str, locale: Locale) -> Result<i16, u32> {
     if text.eq_ignore_ascii_case("false") {
         return Ok(0);
     }
-    // Keep exact mantissas, including nonzero values below the floating-point range.
-    Ok(if Number::parse(text, locale)?.nonzero() {
+    // Native Boolean string coercion follows the floating conversion, including underflow.
+    Ok(if Number::parse(text, locale)?.floating()? != 0.0 {
         -1
     } else {
         0

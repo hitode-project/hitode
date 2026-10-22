@@ -146,7 +146,13 @@ fn run<B: Backend>(cpu: B) {
         0,
         Value::Bytes(1.25f32.to_le_bytes().to_vec()),
     );
-    for (text, value) in [("TrUe", -1i16), ("false", 0), ("0", 0), ("-2", -1)] {
+    for (text, value) in [
+        ("TrUe", -1i16),
+        ("false", 0),
+        ("0", 0),
+        ("-2", -1),
+        ("1e-999", 0),
+    ] {
         f.string(
             "VarBoolFromStr",
             text,

@@ -150,6 +150,19 @@ impl Number {
         value.fraction = 4;
         value
     }
+    pub fn from_float(value: f64) -> Result<Self, u32> {
+        if !value.is_finite() {
+            return Err(OVERFLOW);
+        }
+        Self::parse(
+            &value.to_string(),
+            Locale {
+                id: 0x7f,
+                name: "",
+                cp: 1252,
+            },
+        )
+    }
     pub fn floating(&self) -> Result<f64, u32> {
         let exponent = self.exponent.saturating_sub(self.fraction);
         let number = format!(
