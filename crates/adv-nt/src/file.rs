@@ -78,6 +78,41 @@ pub fn open(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     status::finish(open.run(env))
 }
 
+/// Opens an existing file by NT name for the platform itself.
+pub fn open_path(
+    env: &mut Env<'_>,
+    name: Vec<u16>,
+    access: u32,
+    sharing: u32,
+    options: u32,
+) -> Result<u32, Error> {
+    let attributes = Attributes {
+        root: 0,
+        attributes: OBJ_CASE_INSENSITIVE,
+        name: Some(name),
+    };
+    let dosdevices = &env.ext.get::<Files>().dosdevices;
+    let host = match path::lookup(dosdevices, attributes.name.as_deref().unwrap_or_default())? {
+        Lookup::Found(host) => host,
+        Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
+        Lookup::Device => return Err(Error::Unsupported("opening a device".into())),
+    };
+    let mut request = CreateFileRequest {
+        access,
+        sharing,
+        create: FILE_OPEN as i32,
+        options,
+        ..Default::default()
+    };
+    let objattr = attributes.wire();
+    let host = host.as_os_str().as_bytes();
+    let (reply, _) = server::request(env, &mut request, &[&objattr, host], &mut [])?;
+    status::check(reply.header.error)?;
+    Ok(reply.handle)
+}
+
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
 struct Open {
     handle: u32,
     access: u32,

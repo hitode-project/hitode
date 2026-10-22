@@ -194,3 +194,111 @@ impl Request for CloseHandleRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMappingRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub flags: u32,
+    pub file_access: u32,
+    pub size: u64,
+    pub file_handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMappingRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(CreateMappingRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateMappingRequest, flags) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateMappingRequest, file_access) == 20);
+const _: () = assert!(std::mem::offset_of!(CreateMappingRequest, size) == 24);
+const _: () = assert!(std::mem::offset_of!(CreateMappingRequest, file_handle) == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMappingReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMappingReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateMappingReply, handle) == 8);
+
+impl Request for CreateMappingRequest {
+    const NUMBER: i32 = 63;
+    type Reply = CreateMappingReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetMappingInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub access: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetMappingInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoRequest, access) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetMappingInfoReply {
+    pub header: ReplyHeader,
+    pub size: u64,
+    pub flags: u32,
+    pub shared_file: u32,
+    pub name_len: u32,
+    pub total: u32,
+}
+const _: () = assert!(size_of::<GetMappingInfoReply>() == 32);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoReply, size) == 8);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoReply, flags) == 16);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoReply, shared_file) == 20);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoReply, name_len) == 24);
+const _: () = assert!(std::mem::offset_of!(GetMappingInfoReply, total) == 28);
+
+impl Request for GetMappingInfoRequest {
+    const NUMBER: i32 = 65;
+    type Reply = GetMappingInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MapImageViewRequest {
+    pub header: RequestHeader,
+    pub mapping: u32,
+    pub base: u64,
+    pub size: u64,
+    pub offset: u64,
+    pub entry: u32,
+    pub machine: u16,
+    pub _pad0: [u8; 2],
+}
+const _: () = assert!(size_of::<MapImageViewRequest>() == 48);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, mapping) == 12);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, base) == 16);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, size) == 24);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, offset) == 32);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, entry) == 40);
+const _: () = assert!(std::mem::offset_of!(MapImageViewRequest, machine) == 44);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MapImageViewReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<MapImageViewReply>() == 8);
+
+impl Request for MapImageViewRequest {
+    const NUMBER: i32 = 68;
+    type Reply = MapImageViewReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

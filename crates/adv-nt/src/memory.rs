@@ -171,7 +171,7 @@ fn pages(address: u32, size: u32) -> Result<(u32, u32), Status> {
 }
 
 /// A free granule-aligned range of `size` bytes in the dynamic area.
-fn find_free(vm: &Vm, size: u32, top_down: bool) -> Option<u32> {
+pub fn find_free(vm: &Vm, size: u32, top_down: bool) -> Option<u32> {
     let size = align_up(size, GRANULE);
     let mut cursor = DYN_START;
     let mut found = None;

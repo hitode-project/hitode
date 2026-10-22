@@ -22,6 +22,7 @@ pub const OBJECT_TYPE_MISMATCH: Status = 0xc000_0024;
 pub const OBJECT_NAME_INVALID: Status = 0xc000_0033;
 pub const OBJECT_NAME_NOT_FOUND: Status = 0xc000_0034;
 pub const OBJECT_PATH_NOT_FOUND: Status = 0xc000_003a;
+pub const INVALID_IMAGE_FORMAT: Status = 0xc000_007b;
 pub const BAD_DEVICE_TYPE: Status = 0xc000_00cb;
 
 /// Why a system call did not complete: a status for the guest, or a case

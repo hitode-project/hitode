@@ -20,6 +20,7 @@ pub mod params;
 pub mod path;
 pub mod process;
 pub mod protocol;
+pub mod section;
 pub mod server;
 pub mod status;
 pub mod syscalls;

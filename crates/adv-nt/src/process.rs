@@ -11,15 +11,16 @@ use std::path::Path;
 
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
-use adv_machine::{CtxId, Machine};
+use adv_machine::{CtxId, Env, Machine};
 use adv_pe::{ExportTarget, Pe, PeError};
 
-use crate::file::Files;
+use crate::file::{self, Files};
 use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
 use crate::protocol::InitProcessDoneRequest;
+use crate::section::{self, View};
 use crate::server::{self, Connection, FirstThread, Link, Progress};
-use crate::{context, dispatch, exception, image};
+use crate::{context, dispatch, exception, image, status};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
 /// through this field.
@@ -36,6 +37,7 @@ const VER_PLATFORM_WIN32_NT: u32 = 2;
 /// PEB fields (i386) the platform sets, as Wine's `init_peb` and
 /// `load_global_options` do.
 mod peb {
+    pub const IMAGE_BASE_ADDRESS: u32 = 0x08;
     pub const PROCESS_PARAMETERS: u32 = 0x10;
     pub const NUMBER_OF_PROCESSORS: u32 = 0x64;
     pub const HEAP_SEGMENT_RESERVE: u32 = 0x78;
@@ -47,7 +49,22 @@ mod peb {
     /// With OSCSDVersion, zero, in its high half.
     pub const OS_BUILD_NUMBER: u32 = 0xac;
     pub const OS_PLATFORM_ID: u32 = 0xb0;
+    pub const IMAGE_SUBSYSTEM: u32 = 0xb4;
+    pub const IMAGE_SUBSYSTEM_MAJOR: u32 = 0xb8;
+    pub const IMAGE_SUBSYSTEM_MINOR: u32 = 0xbc;
 }
+
+const GENERIC_READ: u32 = 0x8000_0000;
+const SYNCHRONIZE: u32 = 0x10_0000;
+const FILE_SHARE_READ: u32 = 1;
+const FILE_SHARE_DELETE: u32 = 4;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+/// STANDARD_RIGHTS_REQUIRED, SECTION_QUERY, SECTION_MAP_READ and
+/// SECTION_MAP_EXECUTE, as Wine opens images.
+const SECTION_ACCESS: u32 = 0xf_0000 | 1 | 4 | 8;
+const SEC_IMAGE: u32 = 0x100_0000;
+const IMAGE_FILE_DLL: u16 = 0x2000;
 
 /// x87 control word and MXCSR of a new thread.
 const FPU_CONTROL: u16 = 0x27f;
@@ -102,6 +119,42 @@ pub struct Process {
 /// [`dispatch::Platform`]; `prefix` is the Wine prefix whose drives the
 /// process sees; `progress` runs the server whenever the process waits for
 /// it.
+/// Maps the main image as Wine's `load_main_exe` does: through a section of
+/// the file, so the server knows the process's image.
+fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
+    let name: Vec<u16> = format!(r"\??\{image}").encode_utf16().collect();
+    let failed = |what: &str, error: status::Error| match error {
+        status::Error::Status(code) => Error::Status("main image", code),
+        status::Error::Unsupported(reason) => Error::Context(format!("{what}: {reason}")),
+    };
+    let file = file::open_path(
+        env,
+        name,
+        GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+    )
+    .map_err(|error| failed("main image", error))?;
+    let mapping = section::create_mapping(
+        env,
+        SECTION_ACCESS,
+        0,
+        0,
+        memory::PAGE_EXECUTE_READ,
+        SEC_IMAGE,
+        file,
+    );
+    server::close(env, file).map_err(|error| failed("main image", error))?;
+    let mapping = mapping.map_err(|error| failed("main image section", error))?;
+    let view = section::map_image(env, mapping);
+    server::close(env, mapping).map_err(|error| failed("main image", error))?;
+    let view = view.map_err(|error| failed("main image view", error))?;
+    if view.info.image_charact & IMAGE_FILE_DLL != 0 {
+        return Err(Error::Status("main image", status::INVALID_IMAGE_FORMAT));
+    }
+    Ok(view)
+}
+
 pub fn start<B: Backend>(
     machine: &mut Machine<B>,
     ntdll: &[u8],
@@ -110,7 +163,8 @@ pub fn start<B: Backend>(
     socket: &Path,
     mut progress: Box<dyn Progress>,
 ) -> Result<Process, Error> {
-    let (mut connection, registered) = Connection::connect(socket, &mut *progress)?;
+    // Connecting needs the server to run; `progress` drives it.
+    let (connection, registered) = Connection::connect(socket, &mut *progress)?;
     machine.sys.pid = registered.pid;
     let pe = Pe::parse(ntdll)?;
     let base = pe.image_base;
@@ -201,15 +255,44 @@ pub fn start<B: Backend>(
         .write_u32(teb + TEB_SYSCALL_DISPATCHER, syscall)?;
     debug_assert_eq!(machine.cpu.read_u32(teb + teb::PEB)?, peb);
 
-    let mut state = machine
-        .visit_context(Some(main), |env| env.cpu.capture_architecture())
-        .map_err(Error::Context)?
-        .map_err(|error| Error::Context(error.to_string()))?;
+    machine.ext.insert(Files {
+        dosdevices: prefix.join("dosdevices"),
+    });
+    machine.ext.insert(Link::new(connection, progress));
+    machine.ext.insert(exception::Dispatcher(
+        ntdll.export("KiUserExceptionDispatcher")?,
+    ));
+    machine.sys.exception_handler = Some(exception::deliver);
+
+    let (view, mut state) = machine
+        .visit_context(Some(main), |env| {
+            let view = load_main_image(env, startup.image)?;
+            let state = env
+                .cpu
+                .capture_architecture()
+                .map_err(|error| Error::Context(error.to_string()))?;
+            Ok::<_, Error>((view, state))
+        })
+        .map_err(Error::Context)??;
+    for (offset, value) in [
+        (peb::IMAGE_BASE_ADDRESS, view.base),
+        (peb::IMAGE_SUBSYSTEM, view.info.subsystem),
+        (
+            peb::IMAGE_SUBSYSTEM_MAJOR,
+            u32::from(view.info.subsystem_major),
+        ),
+        (
+            peb::IMAGE_SUBSYSTEM_MINOR,
+            u32::from(view.info.subsystem_minor),
+        ),
+    ] {
+        machine.cpu.write_u32(peb + offset, value)?;
+    }
+
+    // RtlUserThreadStart(entry in EAX, argument in EBX); the main thread's
+    // argument is the PEB.
     state.eip = ntdll.export("RtlUserThreadStart")?;
-    // RtlUserThreadStart(entry in EAX, argument in EBX). The main thread's
-    // argument is the PEB; its entry comes with the main module, which is
-    // not mapped yet.
-    state.regs[0] = 0;
+    state.regs[0] = view.base + view.info.entry_point;
     state.regs[3] = peb;
     state.regs[4] = stack_base - STACK_TOP_RESERVE;
     state.eflags = EFLAGS;
@@ -222,18 +305,13 @@ pub fn start<B: Backend>(
         peb: u64::from(peb),
         ..Default::default()
     };
-    let (reply, _) = connection.call(&mut *progress, &mut done, &[], &mut [])?;
+    let link = machine.ext.get_mut::<Link>();
+    let (reply, _) = link
+        .connection
+        .call(&mut *link.progress, &mut done, &[], &mut [])?;
     if reply.header.error != 0 {
         return Err(Error::Status("init_process_done", reply.header.error));
     }
-    machine.ext.insert(Files {
-        dosdevices: prefix.join("dosdevices"),
-    });
-    machine.ext.insert(Link::new(connection, progress));
-    machine.ext.insert(exception::Dispatcher(
-        ntdll.export("KiUserExceptionDispatcher")?,
-    ));
-    machine.sys.exception_handler = Some(exception::deliver);
     Ok(Process {
         ntdll,
         peb,

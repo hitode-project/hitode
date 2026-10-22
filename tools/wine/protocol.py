@@ -30,6 +30,9 @@ REQUESTS = [
     "create_file",
     "get_handle_fd",
     "close_handle",
+    "create_mapping",
+    "get_mapping_info",
+    "map_image_view",
 ]
 
 INTEGERS = {

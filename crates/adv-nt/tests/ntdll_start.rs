@@ -1,5 +1,5 @@
 //! Wine's ntdll.dll starts the main thread, with the in-process server, and
-//! runs until it needs the main image.
+//! starts a Wine program until it reads the registry.
 //!
 //! The test needs a Wine 11.0 i386 build: `ADV_WINE_DIST` names the directory
 //! that holds `lib/wine/i386-windows`. Without it the test is skipped.
@@ -43,7 +43,7 @@ impl Progress for Runtime {
 }
 
 #[test]
-fn loader_runs_until_it_needs_the_main_image() {
+fn loader_starts_a_wine_program_until_it_reads_the_registry() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
         return;
@@ -57,6 +57,12 @@ fn loader_runs_until_it_needs_the_main_image() {
     std::fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
     std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
     std::os::unix::fs::symlink("../drive_c", prefix.join("dosdevices/c:")).unwrap();
+    // A real Wine program is the main image.
+    std::fs::copy(
+        dist.join("lib/wine/i386-windows/hostname.exe"),
+        prefix.join("drive_c/windows/system32/hostname.exe"),
+    )
+    .unwrap();
     let clock = TestClock(Cell::new(0));
     let config = Config {
         prefix: prefix.clone(),
@@ -70,8 +76,8 @@ fn loader_runs_until_it_needs_the_main_image() {
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, Platform, adv_machine::Clock::virtual_time()).unwrap();
     let startup = Startup {
-        image: r"C:\windows\system32\probe.exe",
-        command_line: "probe.exe",
+        image: r"C:\windows\system32\hostname.exe",
+        command_line: "hostname.exe",
         directory: r"C:\windows\system32\",
         environment: &[("SystemDrive", "C:"), ("SystemRoot", r"C:\windows")],
     };
@@ -87,17 +93,14 @@ fn loader_runs_until_it_needs_the_main_image() {
     assert_ne!(started.thread.pid, 0);
 
     // The loader creates the process heap, moves the process parameters into
-    // it, opens the current directory and asks what device it is on. A
-    // fault it handles itself comes back through its exception handlers.
-    // It stops where it reads the headers of the main image, which is not
-    // mapped yet.
+    // it, opens the current directory, asks what device it is on and reads
+    // the main image's headers. Then it reads its options from the
+    // registry.
     let result = machine.run();
     std::fs::remove_dir_all(&root).unwrap();
     match result {
-        RunResult::Failed(error) => assert!(
-            error
-                .message
-                .starts_with("unhandled exception 0xc0000005 at "),
+        RunResult::Failed(error) => assert_eq!(
+            error.message, "system call NtOpenKey is not implemented",
             "{error}"
         ),
         other => panic!("the loader did not stop: {other:?}"),

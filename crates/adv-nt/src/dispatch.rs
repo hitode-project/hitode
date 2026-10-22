@@ -11,7 +11,7 @@ use adv_cpu::backend::Reg;
 use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
-use crate::{exception, file, memory, object, unix};
+use crate::{exception, file, memory, object, section, unix};
 
 /// A system call, given its arguments.
 type Syscall = fn(&mut Env<'_>, &[u32]) -> Outcome;
@@ -21,8 +21,10 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtClose", object::close),
     ("NtContinue", exception::resume),
     ("NtCreateFile", file::create),
+    ("NtCreateSection", section::create),
     ("NtOpenFile", file::open),
     ("NtFreeVirtualMemory", memory::free),
+    ("NtMapViewOfSection", section::map_view),
     ("NtProtectVirtualMemory", memory::protect),
     ("NtQueryVirtualMemory", memory::query),
     ("NtRaiseException", exception::raise),
