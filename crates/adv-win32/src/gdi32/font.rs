@@ -63,6 +63,8 @@ pub fn register(registry: &mut Registry) {
         set_rop2_ABI,
         get_rop2_ABI,
         extent_a_ABI,
+        legacy_extent_a_ABI,
+        legacy_extent_w_ABI,
         extent_w_ABI,
     ] {
         registry.register(api);
@@ -348,7 +350,7 @@ fn metrics_a(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> Outcome {
         {
             Outcome::Return(1)
         }
-        Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
+        Err(TextError::Unavailable) => unavailable_font(env, 0),
         _ => {
             set_last_error(env, 87);
             Outcome::Return(0)
@@ -625,6 +627,32 @@ fn extent_w(
 ) -> Outcome {
     extent(env, dc.0, input.0.addr(), count, output, false)
 }
+#[win32(gdi32,name="GetTextExtentPointA",level=implement)]
+fn legacy_extent_a(
+    env: &mut Env<'_>,
+    dc: Handle,
+    input: AnsiStr,
+    count: i32,
+    output: GuestPtr<[i32; 2]>,
+) -> Outcome {
+    extent_a(env, dc, input, count, output)
+}
+#[win32(gdi32,name="GetTextExtentPointW",level=implement)]
+fn legacy_extent_w(
+    env: &mut Env<'_>,
+    dc: Handle,
+    input: WideStr,
+    count: i32,
+    output: GuestPtr<[i32; 2]>,
+) -> Outcome {
+    extent_w(env, dc, input, count, output)
+}
+fn unavailable_font(env: &mut Env<'_>, failure: u32) -> Outcome {
+    let api = format!("gdi32.dll!{}", env.sys.thunks.get(env.thunk).name);
+    adv_abi::warn_unavailable(env, &api, "no font backend is available on this host");
+    set_last_error(env, 50);
+    Outcome::Return(failure)
+}
 fn extent(
     env: &mut Env<'_>,
     dc: u32,
@@ -683,7 +711,7 @@ fn extent(
     };
     match env.ext.get_mut::<Fonts>().text.extent(&request, input) {
         Ok(size) if output.write(env.cpu, [size.width, size.height]).is_ok() => Outcome::Return(1),
-        Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
+        Err(TextError::Unavailable) => unavailable_font(env, 0),
         _ => {
             set_last_error(env, 87);
             Outcome::Return(0)
@@ -823,7 +851,7 @@ fn glyph(
             }
             Outcome::Return(glyph.required_bytes)
         }
-        Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
+        Err(TextError::Unavailable) => unavailable_font(env, GDI_ERROR),
         Err(_) => fail(env),
     }
 }

@@ -15,7 +15,6 @@ fn rectangle(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
         bottom: y.checked_add(height.max(0))?,
     })
 }
-#[expect(clippy::too_many_arguments, reason = "WINDOWPOS request components")]
 pub(super) fn requested(
     env: &Env<'_>,
     hwnd: u32,

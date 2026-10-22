@@ -212,7 +212,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-GDI-1 Virtual display
 
-**Rule**: Basic and extended A/W display queries MUST describe one virtual primary display using complete SDK DEVMODE layouts. They MUST NOT expose host driver-private bytes.
+**Rule**: Basic and extended A/W display queries MUST describe one virtual primary display using complete SDK DEVMODE layouts. They MUST NOT expose host driver-private bytes. DC-origin and system-palette queries MUST reflect shared USER geometry and the true-color display profile independently of viewport mapping.
 **Verification**: Test
 
 ### WIN32-GDI-2 Regions
@@ -257,7 +257,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-GDI-10 Selected font metrics
 
-**Rule**: Glyph widths, ABC spacing, and Unicode coverage MUST use the selected device font. Windows MUST preserve native fallback and bitmap-font outcomes; portable measurements MUST use outline advances, hinted bounds, and primary-face coverage.
+**Rule**: Glyph widths, ABC spacing, Unicode coverage and legacy/Point32 A/W text extents MUST share selected device fonts and validation of counted text. Windows MUST preserve native fallback and bitmap-font outcomes; portable measurements MUST use outline advances, hinted bounds, and primary-face coverage.
 **Verification**: Test
 
 ### WIN32-GDI-11 Character placement

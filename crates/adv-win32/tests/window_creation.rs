@@ -16,6 +16,8 @@ const DATA: u32 = 0x410000;
 const LOG: u32 = DATA + 0x8000;
 #[path = "window_creation/capture.rs"]
 mod capture;
+#[path = "window_creation/dc_origin.rs"]
+mod dc_origin;
 #[path = "window_creation/deferred.rs"]
 mod deferred;
 #[path = "window_creation/geometry.rs"]
