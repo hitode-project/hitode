@@ -6,13 +6,17 @@
 //! as its clients, so the client never blocks on a descriptor: when it needs
 //! the server to act, it asks the runtime for [`Progress`] and tries again.
 
+use std::collections::HashMap;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::protocol::{FIXED_SIZE, InitFirstThreadRequest, PROTOCOL_VERSION, Request};
+use crate::protocol::{
+    CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest, InitFirstThreadRequest, PROTOCOL_VERSION,
+    Request,
+};
 
 /// i386, the machine of Hitode's prefixes.
 pub const MACHINE_I386: u16 = 0x014c;
@@ -31,6 +35,112 @@ pub trait Progress {
 pub struct Link {
     pub connection: Connection,
     pub progress: Box<dyn Progress>,
+    /// Host descriptors of handles the server allows to cache, as Wine's
+    /// fd cache keeps them: until the handle is closed.
+    fds: HashMap<u32, Cached>,
+}
+
+struct Cached {
+    fd: OwnedFd,
+    kind: i32,
+    options: u32,
+}
+
+/// A handle's host descriptor, valid for the system call that asked.
+pub struct HandleFd {
+    pub fd: RawFd,
+    /// The server's `enum server_fd_type`.
+    pub kind: i32,
+    pub options: u32,
+    /// Closed when this is dropped, for a descriptor the server does not
+    /// let the process cache.
+    _owned: Option<OwnedFd>,
+}
+
+impl Link {
+    pub fn new(connection: Connection, progress: Box<dyn Progress>) -> Link {
+        Link {
+            connection,
+            progress,
+            fds: HashMap::new(),
+        }
+    }
+}
+
+fn link<'a>(env: &'a mut adv_machine::Env<'_>) -> Result<&'a mut Link, crate::status::Error> {
+    env.ext
+        .try_get_mut::<Link>()
+        .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))
+}
+
+fn broken(error: Error) -> crate::status::Error {
+    crate::status::Error::Unsupported(format!("server: {error}"))
+}
+
+/// The host descriptor of `handle`, from the cache or the server.
+pub fn handle_fd(
+    env: &mut adv_machine::Env<'_>,
+    handle: u32,
+) -> Result<HandleFd, crate::status::Error> {
+    let link = link(env)?;
+    if let Some(cached) = link.fds.get(&handle) {
+        return Ok(HandleFd {
+            fd: cached.fd.as_raw_fd(),
+            kind: cached.kind,
+            options: cached.options,
+            _owned: None,
+        });
+    }
+    let mut request = GetHandleFdRequest {
+        handle,
+        ..Default::default()
+    };
+    let (reply, _) = link
+        .connection
+        .call(&mut *link.progress, &mut request, &[], &mut [])
+        .map_err(broken)?;
+    crate::status::check(reply.header.error)?;
+    let (tag, fd) = receive_fd(&link.connection.socket, &mut *link.progress).map_err(broken)?;
+    if tag != handle {
+        return Err(crate::status::Error::Unsupported(format!(
+            "the server sent the descriptor of handle {tag:#x} for {handle:#x}"
+        )));
+    }
+    let raw = fd.as_raw_fd();
+    let owned = if reply.cacheable != 0 {
+        link.fds.insert(
+            handle,
+            Cached {
+                fd,
+                kind: reply.r#type,
+                options: reply.options,
+            },
+        );
+        None
+    } else {
+        Some(fd)
+    };
+    Ok(HandleFd {
+        fd: raw,
+        kind: reply.r#type,
+        options: reply.options,
+        _owned: owned,
+    })
+}
+
+/// Closes `handle` in the server and forgets its descriptor.
+pub fn close(env: &mut adv_machine::Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
+    let link = link(env)?;
+    link.fds.remove(&handle);
+    let mut request = CloseHandleRequest {
+        handle,
+        ..Default::default()
+    };
+    let (reply, _) = link
+        .connection
+        .call(&mut *link.progress, &mut request, &[], &mut [])
+        .map_err(broken)?;
+    crate::status::check(reply.header.error)
 }
 
 /// Sends a request on behalf of a system call. A status the server
@@ -41,16 +151,14 @@ pub fn request<R: Request>(
     data: &[&[u8]],
     reply_data: &mut [u8],
 ) -> Result<(R::Reply, usize), crate::status::Error> {
-    let link = env
-        .ext
-        .try_get_mut::<Link>()
-        .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))?;
+    let link = link(env)?;
     link.connection
         .call(&mut *link.progress, request, data, reply_data)
-        .map_err(|error| crate::status::Error::Unsupported(format!("server: {error}")))
+        .map_err(broken)
 }
 
 impl Link {
+    /// Passes on a request the guest prepared.
     pub fn call_raw(
         &mut self,
         fixed: &mut [u8; FIXED_SIZE],

@@ -4,6 +4,7 @@ use adv_cpu::backend::ArchitecturalState;
 use adv_cpu::{X87Register, X87State};
 
 pub const SIZE: usize = 716;
+const CONTEXT_I386: u32 = 0x0001_0000;
 const FLAGS: u32 = 0x0001_002f; // control, integer, segments, x87, extended; no debug registers.
 fn put(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -113,13 +114,13 @@ fn extended(bytes: &[u8]) -> X87State {
 
 pub fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), String> {
     let flags = get(bytes, 0);
-    // This dispatch contract returns a full supported image. Partial CONTEXT
-    // restores and debug registers need a separate native-verified API contract;
-    // do not infer NtContinue behavior from SDK bit descriptions alone.
-    if flags != FLAGS {
-        return Err(format!(
-            "partial or extended x86 CONTEXT flags unsupported: {flags:#x}"
-        ));
+    // Any of control, integer, segments and extended registers restore their
+    // part; FloatSave is read only through the extended registers, as Wine's
+    // NtContinue takes it. Debug registers and XSTATE are not restored yet.
+    let parts = flags & !CONTEXT_I386;
+    let supported = parts & !(1 | 2 | 4 | 8 | 0x20) == 0 && (parts & 8 == 0 || parts & 0x20 != 0);
+    if flags & CONTEXT_I386 == 0 || !supported {
+        return Err(format!("x86 CONTEXT flags unsupported: {flags:#x}"));
     }
     let mut candidate = state.clone();
     if flags & 1 != 0 {
@@ -204,8 +205,20 @@ mod tests {
         assert_eq!(restored.xmm[0], [42; 16]);
     }
     #[test]
-    fn unsupported_partial_context_fails_before_any_architecture_is_published() {
-        for flags in [0, 0x10007, 0x1000f, 0x1003f, 0x1006f] {
+    fn partial_context_restores_only_its_parts() {
+        let original = state();
+        let mut bytes = encode(&original);
+        let mut restored = original.clone();
+        put(&mut bytes, 0, 0x1_0007);
+        put(&mut bytes, 0xb8, 0xdeadbeef);
+        put(&mut bytes, 0xcc + 24, 0x1f80 ^ original.mxcsr ^ 1);
+        decode(&bytes, &mut restored).unwrap();
+        assert_eq!(restored.eip, 0xdeadbeef);
+        assert_eq!(restored.mxcsr, original.mxcsr);
+    }
+    #[test]
+    fn unsupported_context_fails_before_any_architecture_is_published() {
+        for flags in [0, 0x7, 0x1000f, 0x1003f, 0x1006f] {
             let original = state();
             let mut bytes = encode(&original);
             let mut restored = original.clone();

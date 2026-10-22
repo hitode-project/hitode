@@ -138,3 +138,59 @@ impl Request for CreateFileRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetHandleFdRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetHandleFdRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetHandleFdRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetHandleFdReply {
+    pub header: ReplyHeader,
+    pub r#type: i32,
+    pub cacheable: i32,
+    pub access: u32,
+    pub options: u32,
+}
+const _: () = assert!(size_of::<GetHandleFdReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetHandleFdReply, r#type) == 8);
+const _: () = assert!(std::mem::offset_of!(GetHandleFdReply, cacheable) == 12);
+const _: () = assert!(std::mem::offset_of!(GetHandleFdReply, access) == 16);
+const _: () = assert!(std::mem::offset_of!(GetHandleFdReply, options) == 20);
+
+impl Request for GetHandleFdRequest {
+    const NUMBER: i32 = 48;
+    type Reply = GetHandleFdReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CloseHandleRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<CloseHandleRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(CloseHandleRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CloseHandleReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<CloseHandleReply>() == 8);
+
+impl Request for CloseHandleRequest {
+    const NUMBER: i32 = 21;
+    type Reply = CloseHandleReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

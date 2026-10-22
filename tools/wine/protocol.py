@@ -28,6 +28,8 @@ REQUESTS = [
     "init_first_thread",
     "init_process_done",
     "create_file",
+    "get_handle_fd",
+    "close_handle",
 ]
 
 INTEGERS = {
@@ -57,13 +59,23 @@ def fields(text: str, struct: str) -> list[tuple[str, str]]:
     return found
 
 
-def layout(handlers: str, struct: str) -> tuple[dict[str, int], int]:
+def layout(handlers: str, struct: str, header_size: int) -> tuple[dict[str, int], int]:
     offsets = {name: int(offset) for name, offset in re.findall(
         rf"C_ASSERT\( offsetof\(struct {struct}, (\w+)\) == (\d+) \);", handlers)}
     size = re.search(rf"C_ASSERT\( sizeof\(struct {struct}\) == (\d+) \);", handlers)
-    if not size:
+    if size:
+        return offsets, int(size.group(1))
+    # The server checks no size of a structure that is only its header.
+    if offsets:
         sys.exit(f"no size of struct {struct} in {HANDLERS.name}")
-    return offsets, int(size.group(1))
+    return offsets, header_size
+
+
+KEYWORDS = {"type", "match", "ref", "move", "loop", "box", "fn", "mod", "use", "where", "impl"}
+
+
+def ident(name: str) -> str:
+    return f"r#{name}" if name in KEYWORDS else name
 
 
 def camel(name: str) -> str:
@@ -73,7 +85,7 @@ def camel(name: str) -> str:
 def rust_struct(protocol: str, handlers: str, types: dict[str, str], name: str, kind: str) -> list[str]:
     struct = f"{name}_{kind}"
     header, header_size = ("RequestHeader", 12) if kind == "request" else ("ReplyHeader", 8)
-    offsets, size = layout(handlers, struct)
+    offsets, size = layout(handlers, struct, header_size)
     members = [(field, ctype, offsets[field]) for field, ctype in fields(protocol, struct)]
     lines = ["#[repr(C)]", "#[derive(Clone, Copy, Debug, Default)]",
              f"pub struct {camel(name)}{kind.capitalize()} {{", f"    pub header: {header},"]
@@ -85,7 +97,7 @@ def rust_struct(protocol: str, handlers: str, types: dict[str, str], name: str, 
         end = members[index + 1][2] if index + 1 < len(members) else size
         rust = types.get(ctype)
         width = int(rust[1:]) // 8 if rust else end - offset
-        lines.append(f"    pub {field}: {rust or f'[u8; {width}]'},")
+        lines.append(f"    pub {ident(field)}: {rust or f'[u8; {width}]'},")
         position = offset + width
     if size > position:
         lines.append(f"    pub _pad{pad}: [u8; {size - position}],")
@@ -93,7 +105,7 @@ def rust_struct(protocol: str, handlers: str, types: dict[str, str], name: str, 
     lines.append(f"const _: () = assert!(size_of::<{camel(name)}{kind.capitalize()}>() == {size});")
     for field, _, offset in members:
         lines.append(
-            f"const _: () = assert!(std::mem::offset_of!({camel(name)}{kind.capitalize()}, {field}) == {offset});")
+            f"const _: () = assert!(std::mem::offset_of!({camel(name)}{kind.capitalize()}, {ident(field)}) == {offset});")
     return lines
 
 

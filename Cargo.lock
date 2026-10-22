@@ -211,6 +211,7 @@ dependencies = [
  "adv-machine",
  "adv-pe",
  "adv-wineserver",
+ "iced-x86",
  "libc",
  "thiserror 2.0.21",
 ]

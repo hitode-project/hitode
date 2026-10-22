@@ -11,6 +11,7 @@
 
 pub mod context;
 pub mod dispatch;
+pub mod exception;
 pub mod file;
 pub mod image;
 pub mod memory;

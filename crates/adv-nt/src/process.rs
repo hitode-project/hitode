@@ -19,7 +19,7 @@ use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
 use crate::protocol::InitProcessDoneRequest;
 use crate::server::{self, Connection, FirstThread, Link, Progress};
-use crate::{context, dispatch, image};
+use crate::{context, dispatch, exception, image};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
 /// through this field.
@@ -229,10 +229,11 @@ pub fn start<B: Backend>(
     machine.ext.insert(Files {
         dosdevices: prefix.join("dosdevices"),
     });
-    machine.ext.insert(Link {
-        connection,
-        progress,
-    });
+    machine.ext.insert(Link::new(connection, progress));
+    machine.ext.insert(exception::Dispatcher(
+        ntdll.export("KiUserExceptionDispatcher")?,
+    ));
+    machine.sys.exception_handler = Some(exception::deliver);
     Ok(Process {
         ntdll,
         peb,

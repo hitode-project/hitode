@@ -89,3 +89,8 @@ impl Attributes {
         bytes
     }
 }
+
+/// NtClose(handle)
+pub fn close(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish(crate::server::close(env, args[0]))
+}

@@ -156,3 +156,62 @@ impl Open {
         })
     }
 }
+
+const FILE_FS_DEVICE_INFORMATION: u32 = 4;
+const FILE_DEVICE_DISK: u32 = 0x07;
+const FILE_DEVICE_NAMED_PIPE: u32 = 0x11;
+const FILE_DEVICE_NULL: u32 = 0x15;
+const FILE_DEVICE_UNKNOWN: u32 = 0x22;
+
+/// NtQueryVolumeInformationFile(handle, *io, *buffer, length, class)
+pub fn query_volume(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, io, buffer, length, class] = args else {
+        unreachable!()
+    };
+    status::finish(query_volume_in(env, handle, io, buffer, length, class))
+}
+
+fn query_volume_in(
+    env: &mut Env<'_>,
+    handle: u32,
+    io: u32,
+    buffer: u32,
+    length: u32,
+    class: u32,
+) -> Result<(), Error> {
+    if class != FILE_FS_DEVICE_INFORMATION {
+        return Err(Error::Unsupported(format!(
+            "volume information class {class}"
+        )));
+    }
+    if length < 8 {
+        return Err(status::INFO_LENGTH_MISMATCH.into());
+    }
+    let fd = server::handle_fd(env, handle)?;
+    let device = device_type(fd.fd);
+    drop(fd);
+    write_u32(env, buffer, device)?;
+    // No removable or read-only media.
+    write_u32(env, buffer + 4, 0)?;
+    write_u32(env, io, status::SUCCESS)?;
+    write_u32(env, io + 4, 8)?;
+    Ok(())
+}
+
+/// The NT device type of a host descriptor, as Wine's `get_device_info`
+/// decides it on macOS.
+fn device_type(fd: std::os::fd::RawFd) -> u32 {
+    // SAFETY: a zeroed stat is a valid buffer for fstat to fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor the server gave the process, and a valid buffer.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return FILE_DEVICE_UNKNOWN;
+    }
+    match stat.st_mode & libc::S_IFMT {
+        // /dev/null is character device 3, 2.
+        libc::S_IFCHR if stat.st_rdev == libc::makedev(3, 2) => FILE_DEVICE_NULL,
+        libc::S_IFCHR => FILE_DEVICE_UNKNOWN,
+        libc::S_IFIFO | libc::S_IFSOCK => FILE_DEVICE_NAMED_PIPE,
+        _ => FILE_DEVICE_DISK,
+    }
+}
