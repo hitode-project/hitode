@@ -618,5 +618,20 @@
     "huge": "Eight-byte IEEE binary64 double, initial positive infinity 0x7ff0000000000000. Pinned VC80 and VC90 PE exports hold these bytes in writable .data. Modern corecrt_math.h provides the corresponding HUGE_VAL expression; its managed-only _HUGE declaration is not claimed as a native legacy header declaration.",
     "adjust_fdiv": "32-bit int initially zero for the virtual conforming x87 processor; cataloged versions share one descriptor kernel. No Pentium FDIV erratum is modeled.",
     "command_line": "Each CRT has independent four-byte pointer cells initialized from the existing Win32 ANSI/UTF-16 command-line owner. Public data addresses are real non-executable PE storage, retain guest writes and are identical through static IAT and dynamic lookup."
+  },
+  "shared_heap_fronts": {
+    "header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_malloc.h",
+    "sha256": "44bd1bb518e730ba0be045f44a4735869e08f7d54ab85c298270770812fcff80",
+    "scope": "Cataloged malloc/calloc/realloc/free/_msize/_expand versions and public heap API-set fronts share the existing process heap and RTL boundaries. Internal _calloc_crt/_malloc_crt policy stays distinct.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/free",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/msize",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/expand"
+    ],
+    "behavior": "Allocation failure and size/product overflow publish ENOMEM. Zero malloc/calloc requests retain a distinct one-byte block; realloc of a nonnull block to zero releases it. _expand uses HEAP_REALLOC_IN_PLACE_ONLY, preserves the original block on failure and retains one byte for a zero request. NULL _msize/_expand calls use the existing version-specific invalid-parameter policy.",
+    "native_boundary": "The pinned VC90 default NT-heap _expand entry normalizes a zero size to one and calls HeapReAlloc with flag 0x10; no alternate heap owner is introduced."
   }
 }

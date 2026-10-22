@@ -195,10 +195,6 @@ pub fn register(r: &mut Registry) {
         &[("_setjmp", call), ("_setjmp3", call), ("longjmp", call)],
     );
     for (name, argc) in [
-        ("malloc", 1),
-        ("calloc", 2),
-        ("realloc", 2),
-        ("free", 1),
         ("memcpy", 3),
         ("memmove", 3),
         ("memset", 3),
@@ -280,15 +276,7 @@ pub fn register(r: &mut Registry) {
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
-        for (name, argc) in [
-            ("_malloc_crt", 1),
-            ("malloc", 1),
-            ("calloc", 2),
-            ("realloc", 2),
-            ("free", 1),
-        ] {
-            r.add(module, name, Conv::Cdecl { argc }, call);
-        }
+        r.add(module, "_malloc_crt", Conv::Cdecl { argc: 1 }, call);
         for (name, argc) in [
             ("_encode_pointer", 1),
             ("_decode_pointer", 1),
@@ -643,7 +631,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             e.sys.release_mutex(handle);
             0
         }
-        "malloc" | "_malloc_crt" | "??_U@YAPAXI@Z" => {
+        "_malloc_crt" | "??_U@YAPAXI@Z" => {
             if a > CRT_ALLOCATION_LIMIT {
                 return Outcome::Return(0);
             }
@@ -665,26 +653,11 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 |_, value| Outcome::Return(value.value()),
             );
         }
-        "calloc" => {
-            let Some(size) = a
-                .checked_mul(b)
-                .filter(|&size| size <= CRT_ALLOCATION_LIMIT)
-            else {
-                return Outcome::Return(0);
-            };
-            return crate::native_heap::allocate(e, size, true);
-        }
-        "free" | "??_V@YAXPAX@Z" => {
+        "??_V@YAXPAX@Z" => {
             if a == 0 {
                 return Outcome::Return(0);
             }
             return crate::native_heap::free(e, a);
-        }
-        "realloc" => {
-            if a == 0 && b > CRT_ALLOCATION_LIMIT {
-                return Outcome::Return(0);
-            }
-            return crate::native_heap::realloc(e, a, b);
         }
         "memcpy" | "memmove"
             if !e.cpu.accessible(b, c, adv_cpu::backend::Prot::READ)

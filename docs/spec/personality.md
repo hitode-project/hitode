@@ -227,3 +227,13 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Legacy `_HUGE` data MUST be an eight-byte double initialized to positive infinity. Cataloged `_adjust_fdiv` cells MUST start at zero for the conforming virtual processor. CRT command-line pointer cells MUST reference the Win32 command-line owner while retaining independent, writable module storage.
 **Verification**: Test
+
+### PERS-CRT-7 Heap ownership and resizing
+
+**Rule**: CRT allocation fronts and size queries MUST share the existing heap owner and declared version exports. Reallocation failure MUST preserve the old block, and `_expand` MUST resize without moving. Zero-sized `realloc` MUST release a nonnull block.
+**Verification**: Test
+
+### PERS-CRT-8 Heap error contracts
+
+**Rule**: Public allocation failure and product overflow MUST publish ENOMEM. NULL size-query and expansion inputs MUST use the runtime's parameter-validation profile. Zero-sized allocation requests MUST retain distinct live blocks that can be freed.
+**Verification**: Test

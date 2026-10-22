@@ -234,7 +234,14 @@ headers omit them; they are not invented as UCRT or API-set exports. Their guest
 argv/environment arrays consume the existing Win32 command-line buffers and
 process environment, with per-CRT guest-heap snapshots released on process detach.
 Glob expansion requests containing wildcards explicitly fail rather than report
-unexpanded arguments as success. Heap bindings reuse the existing process allocator.
+unexpanded arguments as success. Public `malloc/calloc/realloc/free/_msize/_expand`
+fronts in every cataloged runtime and public heap API set reuse the existing RTL
+process heap. Allocation failure and multiplication overflow publish ENOMEM;
+zero-byte malloc/calloc retain distinct one-byte blocks. A nonnull zero-sized
+realloc releases its block, while `_expand` retains one live byte and uses the
+RTL in-place flag. Failed resizing preserves the old block. NULL `_msize/_expand`
+inputs use the runtime's parameter-validation profile. Interpreter/JIT tests
+exercise the aliases, shared block contents, size queries and error contracts.
 Legacy scalar `operator new/delete` use that same heap, including distinct live
 zero-byte allocations. The throwing `new` overload explicitly stops on allocation
 failure because guest `std::bad_alloc`/new-handler dispatch is not implemented;
