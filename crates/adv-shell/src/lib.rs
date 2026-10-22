@@ -26,7 +26,7 @@ pub mod overlay;
 mod performance;
 #[cfg(host_view)]
 mod session;
-#[cfg(any(host_view, feature = "gpu"))]
+#[cfg(any(host_view, all(windows, feature = "gpu"), all(test, feature = "gpu")))]
 mod software_frame;
 pub mod window;
 #[cfg(host_view)]
