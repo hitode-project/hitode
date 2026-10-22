@@ -251,4 +251,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft VariantCopyInd and VariantChangeTypeEx contracts.
 
+### SYS-COM-1 Apartment and server lifetime
+
+**Rule**: COM and OLE initialization MUST maintain nesting and apartment mode per virtual thread. Conflicting modes MUST fail without changing initialization counts. Server references and class-publication suspension MUST belong to the guest process.
+**Verification**: Test
+**Basis**: Microsoft CoInitializeEx, OleInitialize, CoAddRefServerProcess and CoReleaseServerProcess contracts.
+
 Withdrawn: none

@@ -937,3 +937,38 @@ fn native_authored_extended_variant_scalar_and_indirect_controls() {
     );
     assert_eq!(unsafe { VariantClear(&mut destination) }, 0);
 }
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *mut c_void, flags: u32) -> i32;
+    fn CoUninitialize();
+    fn OleInitialize(reserved: *mut c_void) -> i32;
+    fn OleUninitialize();
+    fn CoAddRefServerProcess() -> u32;
+    fn CoReleaseServerProcess() -> u32;
+    fn CoResumeClassObjects() -> i32;
+    fn CoSuspendClassObjects() -> i32;
+}
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn GetErrorInfo(reserved: u32, output: *mut *mut c_void) -> i32;
+}
+#[test]
+fn native_authored_com_apartment_and_empty_error_controls() {
+    std::thread::spawn(||unsafe{
+  let first=CoInitializeEx(std::ptr::null_mut(),2);let repeated=CoInitializeEx(std::ptr::null_mut(),2);let ole=OleInitialize(std::ptr::null_mut());let repeated_ole=OleInitialize(std::ptr::null_mut());let changed=CoInitializeEx(std::ptr::null_mut(),0) as u32;
+  eprintln!("com-apartment first={first:x} repeat={repeated:x} ole={ole:x} repeat-ole={repeated_ole:x} changed={changed:x}");
+  OleUninitialize();OleUninitialize();CoUninitialize();CoUninitialize();
+  let mta=CoInitializeEx(std::ptr::null_mut(),0);let ole_in_mta=OleInitialize(std::ptr::null_mut())as u32;
+  eprintln!("com-apartment mta={mta:x} ole-in-mta={ole_in_mta:x}");CoUninitialize();
+  for reserved in [0,1]{let mut output=0x5555usize as *mut c_void;let status=GetErrorInfo(reserved,&mut output)as u32;eprintln!("com-error reserved={reserved} status={status:x} cleared={}",output.is_null());}
+ }).join().unwrap();
+    unsafe {
+        let a = CoAddRefServerProcess();
+        let b = CoAddRefServerProcess();
+        let c = CoReleaseServerProcess();
+        let d = CoReleaseServerProcess();
+        let suspended = CoSuspendClassObjects();
+        let resumed = CoResumeClassObjects();
+        eprintln!("com-server counts={a},{b},{c},{d} suspend={suspended:x} resume={resumed:x}");
+    }
+}

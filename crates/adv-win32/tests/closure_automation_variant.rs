@@ -143,6 +143,13 @@ fn run<B: Backend>(cpu: B) {
             row,
         );
     }
+    call(
+        &mut m,
+        &mut code,
+        "VariantChangeTypeEx",
+        &[DEST + 176, SOURCE + 176, 0x409, 0, 1],
+        13,
+    );
     code.mov_mem_imm(DATA + 0x800, 0)
         .mov_eax_mem(DATA + 0x800)
         .ret();
@@ -164,7 +171,7 @@ fn run<B: Backend>(cpu: B) {
         .unwrap();
     let result = m.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
-    for row in 0..13 {
+    for row in 0..14 {
         let expected = match row {
             4 | 5 => 0x80070057,
             10 => 0x8002000a,
@@ -185,6 +192,7 @@ fn run<B: Backend>(cpu: B) {
         assert_eq!(m.cpu.read_u16(address).unwrap(), 3);
         assert_eq!(m.cpu.read_u32(address + 8).unwrap(), 42);
     }
+    assert_eq!(m.cpu.read_u16(DEST + 176).unwrap(), 1);
     let copied = m.cpu.read_u32(DEST + 40).unwrap();
     assert_ne!(copied, shared);
     assert_eq!(text(&m, copied), "shared");

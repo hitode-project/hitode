@@ -91,7 +91,11 @@ fn convert(
         return Ok(Converted::scalar(0, vec![]));
     }
     if target == 1 {
-        return Err(MISMATCH);
+        return if source == 0 {
+            Ok(Converted::scalar(1, vec![]))
+        } else {
+            Err(MISMATCH)
+        };
     }
     if target == 7 && source == 8 {
         let text = super::super::coercion::text(env, pointer(bytes))?;

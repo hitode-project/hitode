@@ -1331,6 +1331,12 @@ IViewObject	5	Freeze	i32	Windows.Win32.Foundation.HRESULT	this:IViewObject*:ptr:
 IViewObject	6	Unfreeze	i32	Windows.Win32.Foundation.HRESULT	this:IViewObject*:ptr:1|dwFreeze:u32:u32:1
 IViewObject	7	SetAdvise	i32	Windows.Win32.Foundation.HRESULT	this:IViewObject*:ptr:1|aspects:Windows.Win32.System.Com.DVASPECT:u32:1|advf:u32:u32:1|pAdvSink:Windows.Win32.System.Com.IAdviseSink:ptr:1
 IViewObject	8	GetAdvise	i32	Windows.Win32.Foundation.HRESULT	this:IViewObject*:ptr:1|pAspects:u32*:ptr:1|pAdvf:u32*:ptr:1|ppAdvSink:Windows.Win32.System.Com.IAdviseSink*:ptr:1
+IClientSecurity	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IClientSecurity*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+IClientSecurity	1	AddRef	u32	u32	this:IClientSecurity*:ptr:1
+IClientSecurity	2	Release	u32	u32	this:IClientSecurity*:ptr:1
+IClientSecurity	3	QueryBlanket	i32	Windows.Win32.Foundation.HRESULT	this:IClientSecurity*:ptr:1|pProxy:Windows.Win32.System.Com.IUnknown:ptr:1|pAuthnSvc:u32*:ptr:1|pAuthzSvc:u32*:ptr:1|pServerPrincName:u16**:ptr:1|pAuthnLevel:Windows.Win32.System.Com.RPC_C_AUTHN_LEVEL*:ptr:1|pImpLevel:Windows.Win32.System.Com.RPC_C_IMP_LEVEL*:ptr:1|pAuthInfo:void**:ptr:1|pCapabilites:u32*:ptr:1
+IClientSecurity	4	SetBlanket	i32	Windows.Win32.Foundation.HRESULT	this:IClientSecurity*:ptr:1|pProxy:Windows.Win32.System.Com.IUnknown:ptr:1|dwAuthnSvc:u32:u32:1|dwAuthzSvc:u32:u32:1|pServerPrincName:Windows.Win32.Foundation.PWSTR:str16:1|dwAuthnLevel:Windows.Win32.System.Com.RPC_C_AUTHN_LEVEL:u32:1|dwImpLevel:Windows.Win32.System.Com.RPC_C_IMP_LEVEL:u32:1|pAuthInfo:void*:ptr:1|dwCapabilities:u32:u32:1
+IClientSecurity	5	CopyProxy	i32	Windows.Win32.Foundation.HRESULT	this:IClientSecurity*:ptr:1|pProxy:Windows.Win32.System.Com.IUnknown:ptr:1|ppCopy:Windows.Win32.System.Com.IUnknown*:ptr:1
 ID3DXBuffer	0	QueryInterface	i32	HRESULT	this:ID3DXBuffer*:ptr:1|riid:GUID*:ptr:1|ppvObj:void**:ptr:1
 ID3DXBuffer	1	AddRef	u32	ULONG	this:ID3DXBuffer*:ptr:1
 ID3DXBuffer	2	Release	u32	ULONG	this:ID3DXBuffer*:ptr:1

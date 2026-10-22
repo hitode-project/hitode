@@ -872,3 +872,39 @@ impl crate::GuestArg for PICTDESC {
     const WORDS: u8 = 5;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MULTI_QI {
+    pub pIID: u32,
+    pub pItf: u32,
+    pub hr: i32,
+}
+const _: () = assert!(core::mem::size_of::<MULTI_QI>() == 12);
+const _: () = assert!(core::mem::align_of::<MULTI_QI>() == 4);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, pIID) == 0);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, pItf) == 4);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, hr) == 8);
+impl crate::GuestArg for MULTI_QI {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct COSERVERINFO {
+    pub dwReserved1: u32,
+    pub pwszName: u32,
+    pub pAuthInfo: u32,
+    pub dwReserved2: u32,
+}
+const _: () = assert!(core::mem::size_of::<COSERVERINFO>() == 16);
+const _: () = assert!(core::mem::align_of::<COSERVERINFO>() == 4);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, dwReserved1) == 0);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, pwszName) == 4);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, pAuthInfo) == 8);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, dwReserved2) == 12);
+impl crate::GuestArg for COSERVERINFO {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
