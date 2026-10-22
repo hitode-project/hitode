@@ -37,6 +37,12 @@ foreach ($selection in $selections) {
     $original = $rows[$fields[2] + '!' + $fields[3]]
     if (($alias[2..5] -join "`t") -cne ($original[2..5] -join "`t")) { throw 'Selected alias changed its source declaration' }
 }
+# The CY union has its own nested declaration, not another anonymous record's layout.
+if (!$rows['oleaut32.dll!VarBstrFromCy'][5].StartsWith('cyIn:Windows.Win32.System.Com.CY:aggregate:2|')) { throw 'Currency union lost its two-word x86 ABI' }
+$com = @(Get-Content -LiteralPath (Join-Path $validOutput 'com.tsv') | Where-Object { $_ -and !$_.StartsWith('#') })
+foreach ($expected in @{ ITypeLib = 13; ITypeInfo = 22; IFont = 27; IPicture = 17 }.GetEnumerator()) {
+    if (@($com | Where-Object { $_.StartsWith($expected.Key + "`t") }).Count -ne $expected.Value) { throw "COM inheritance changed: $($expected.Key)" }
+}
 # Existing binary64 CRT input must regenerate, but malformed stack widths and
 # unrelated binary64 declarations must not be admitted by that support.
 $crtLines = [IO.File]::ReadAllLines($crt)
@@ -49,7 +55,7 @@ foreach ($name in @('pow', '_hypot')) {
     [IO.File]::WriteAllLines($badPath, $badCrt)
     $rejected = $false
     try { [AbiMetadata]::Generate($Winmd, (Join-Path $cache ($name + '-bad-crt')), $modules, $badPath, $valid) }
-    catch { if (!$_.Exception.ToString().Contains('Invalid supplemental x86 signature')) { throw }; $rejected = $true }
+    catch { if (!$_.Exception.ToString().Contains('CRT binary math stack contract changed')) { throw }; $rejected = $true }
     if (!$rejected) { throw "Malformed binary64 CRT input accepted: $name" }
 }
 function Assert-Rejected([string]$Name, [string[]]$InputLines, [string]$Reason) {
