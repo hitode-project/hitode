@@ -40,12 +40,12 @@ fn create(
     if driver.as_deref().is_some_and(|name| !is_display(name))
         || device.as_deref().is_some_and(|name| !is_display(name))
     {
-        adv_abi::warn_unavailable(
-            env,
-            api,
-            "requested printer or additional display device is unavailable",
-        );
-        return fail(env, 50);
+        // The configured spooler owns no printers. A missing printer name
+        // is an ordinary catalog lookup failure, not a missing raster service.
+        let unknown_driver = driver
+            .as_deref()
+            .is_some_and(|name| !is_display(name) && !name.eq_ignore_ascii_case("WINSPOOL"));
+        return fail(env, if unknown_driver { 1797 } else { 1801 });
     }
     // SDK DISPLAY initialization uses the current display mode. Matching or
     // custom DEVMODE profiles need validation beyond this default-mode path.

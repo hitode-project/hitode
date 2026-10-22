@@ -15,6 +15,7 @@ pub mod font;
 mod object_queries;
 mod palette;
 mod pen;
+mod printing;
 pub mod raster;
 mod readback;
 pub(crate) mod region;
@@ -1054,6 +1055,7 @@ pub fn register(reg: &mut Registry) {
     brush::register(reg);
     palette::register(reg);
     pen::register(reg);
+    printing::register(reg);
     readback::register(reg);
     for api in [
         get_stock_object_ABI,

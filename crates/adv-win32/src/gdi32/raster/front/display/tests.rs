@@ -335,6 +335,7 @@ fn ansi_and_unicode_display_dcs_share_pixels_and_fonts_but_have_independent_owne
 }
 
 #[test]
+// spec: SYS-PRINT-2
 fn invalid_strings_and_unsupported_devices_do_not_publish_dcs_or_mutate_guest_input() {
     let (mut machine, data) = fixture();
     let baseline = machine.sys.objects.object_count();
@@ -364,7 +365,7 @@ fn invalid_strings_and_unsupported_devices_do_not_publish_dcs_or_mutate_guest_in
         ),
         0
     );
-    assert_eq!(error(&mut machine), 50);
+    assert_eq!(error(&mut machine), 1801);
     let mut after = vec![0; bytes.len()];
     machine.cpu.read(printer, &mut after).unwrap();
     assert_eq!(after, bytes);
@@ -386,7 +387,7 @@ fn invalid_strings_and_unsupported_devices_do_not_publish_dcs_or_mutate_guest_in
     );
     assert_eq!(error(&mut machine), 87);
     let diagnostics = machine.ext.get::<adv_abi::ApiDiagnostics>();
-    assert_eq!(diagnostics.warnings.len(), 2);
+    assert_eq!(diagnostics.warnings.len(), 1);
     assert_eq!(diagnostics.stub_calls, 0);
     assert_eq!(machine.sys.objects.object_count(), baseline);
     assert!(machine.ext.get::<SurfaceStore>().primary_id().is_none());

@@ -170,7 +170,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-USER-13 IME boundaries
 
-**Rule**: The personality MUST NOT fabricate IME windows or input contexts. Composition and `ImmGetCompositionString` MUST remain explicitly unavailable.
+**Rule**: The personality MUST NOT fabricate IME windows or input contexts. Composition and `ImmGetCompositionString` MUST remain explicitly unavailable. `ImmIsIME` MUST report false for non-IME and unknown layouts without changing LastError.
 **Verification**: Test
 
 ### WIN32-USER-14 Owner-draw button projection
