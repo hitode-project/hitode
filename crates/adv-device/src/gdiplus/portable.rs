@@ -3,6 +3,7 @@ use super::*;
 use std::sync::Mutex;
 mod path;
 mod raster;
+mod string_format;
 use path::Path;
 
 #[derive(Clone)]
@@ -15,12 +16,7 @@ pub(super) enum Data {
     Graphics(Graphics),
     Solid(u32),
     Path(Path),
-    Format {
-        flags: i32,
-        language: u16,
-        align: i32,
-        line_align: i32,
-    },
+    Format(string_format::Format),
 }
 #[derive(Clone)]
 pub(super) struct Graphics {
@@ -73,14 +69,14 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
         }
         Create::Solid(color) => (Kind::Brush, Data::Solid(color), None),
         Create::Path(mode) => (Kind::Path, Data::Path(Path::new(mode)?), None),
-        Create::Format(flags, language) => (
+        Create::Format(flags, _) => (
             Kind::Format,
-            Data::Format {
-                flags,
-                language,
-                align: 0,
-                line_align: 0,
-            },
+            Data::Format(string_format::Format::new(flags)),
+            None,
+        ),
+        Create::GenericFormat(typographic) => (
+            Kind::Format,
+            Data::Format(string_format::Format::generic(typographic)),
             None,
         ),
         Create::Clone(object) => {
@@ -114,6 +110,7 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
     }
     let mut data = object.data.lock().map_err(|_| 1)?;
     match (&mut *data, operation) {
+        (Data::Format(format), op) => format.execute(op),
         (Data::Solid(_), Op::BrushType) => Ok(Reply::Count(0)),
         (Data::Solid(color), Op::SolidColor(value)) => {
             if let Some(value) = value {
@@ -128,36 +125,6 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
         }
         (Data::Image { width, height, .. }, Op::Size) if object.kind == Kind::Image => {
             Ok(Reply::Size(*width, *height))
-        }
-        (Data::Format { align, .. }, Op::Align(value)) if (0..=2).contains(&value) => {
-            *align = value;
-            Ok(Reply::None)
-        }
-        (Data::Format { line_align, .. }, Op::LineAlign(value)) if (0..=2).contains(&value) => {
-            *line_align = value;
-            Ok(Reply::None)
-        }
-        (
-            Data::Format {
-                flags,
-                language,
-                align,
-                line_align,
-            },
-            Op::StringProperty(index),
-        ) => {
-            let value = match index {
-                0 => *flags,
-                1 => i32::from(*language),
-                2 => *align,
-                3 => *line_align,
-                _ => return Err(2),
-            };
-            Ok(Reply::Count(value))
-        }
-        (Data::Format { flags, .. }, Op::StringFlags(value)) => {
-            *flags = value;
-            Ok(Reply::None)
         }
         (Data::Path(path), Op::PathFill(value)) => {
             if let Some(value) = value {

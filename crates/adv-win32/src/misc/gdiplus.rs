@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod front;
 mod matrix;
 mod properties;
+mod string_format;
 mod world;
 const INVALID: i32 = 2;
 const NOT_IMPLEMENTED: i32 = 6;

@@ -43,6 +43,7 @@ pub enum Create<'a> {
     SansSerif,
     Font(&'a Object, f32, i32, i32),
     Format(i32, u16),
+    GenericFormat(bool),
     Solid(u32),
     Path(i32),
     Gradient(&'a Object),
@@ -56,6 +57,11 @@ pub enum Op<'a> {
     LineAlign(i32),
     StringProperty(u8),
     StringFlags(i32),
+    Hotkey(i32),
+    Trimming(i32),
+    Digits(Option<(u16, i32)>),
+    Tabs(Option<(f32, &'a [f32])>),
+    CharacterRanges(&'a [[i32; 2]]),
     PathFill(Option<i32>),
     ResetPath,
     PathLine([f32; 4]),
@@ -101,6 +107,8 @@ pub enum Op<'a> {
     ComposeWorld(matrix::Matrix, bool),
 }
 pub enum Reply {
+    Digits(u16, i32),
+    Tabs(f32, Vec<f32>),
     Matrix(matrix::Matrix),
     None,
     Pixels(Vec<u8>),

@@ -2,6 +2,7 @@
 use super::*;
 use std::ffi::c_void;
 use windows_sys::Win32::Graphics::{Gdi as gdi, GdiPlus as gp};
+mod string_format;
 mod world;
 const ARGB: i32 = 0x26200a;
 fn status(result: i32) -> Result<(), i32> {
@@ -245,6 +246,16 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
                     (&mut pointer as *mut *mut c_void).cast(),
                 ),
             ),
+            Create::GenericFormat(typographic) => (
+                Kind::Format,
+                if typographic {
+                    gp::GdipStringFormatGetGenericTypographic(
+                        (&mut pointer as *mut *mut c_void).cast(),
+                    )
+                } else {
+                    gp::GdipStringFormatGetGenericDefault((&mut pointer as *mut *mut c_void).cast())
+                },
+            ),
             Create::Solid(color) => (
                 Kind::Brush,
                 gp::GdipCreateSolidFill(color, (&mut pointer as *mut *mut c_void).cast()),
@@ -444,27 +455,12 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
                 status(gp::GdipSetStringFormatLineAlign(p.cast(), value))?;
                 Ok(Reply::None)
             }
-            Op::StringProperty(index) => {
-                require(object, Kind::Format)?;
-                let mut value = 0;
-                status(match index {
-                    0 => gp::GdipGetStringFormatFlags(p.cast(), &mut value),
-                    1 => {
-                        let mut language = 0u16;
-                        let result = gp::GdipGetStringFormatDigitSubstitution(
-                            p.cast(),
-                            &mut language,
-                            &mut value,
-                        );
-                        value = i32::from(language);
-                        result
-                    }
-                    2 => gp::GdipGetStringFormatAlign(p.cast(), &mut value),
-                    3 => gp::GdipGetStringFormatLineAlign(p.cast(), &mut value),
-                    _ => return Err(2),
-                })?;
-                Ok(Reply::Count(value))
-            }
+            Op::StringProperty(_)
+            | Op::Hotkey(_)
+            | Op::Trimming(_)
+            | Op::Digits(_)
+            | Op::Tabs(_)
+            | Op::CharacterRanges(_) => string_format::execute(object, operation),
             Op::StringFlags(value) => {
                 require(object, Kind::Format)?;
                 status(gp::GdipSetStringFormatFlags(p.cast(), value))?;

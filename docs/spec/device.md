@@ -154,6 +154,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Graphics world matrices MUST transform path and image drawing. Setting and querying world matrices MUST copy their values without sharing subsequent mutations. Singular world transforms MUST fail without changing graphics state.
 **Verification**: Test
 
+### DEV-IMAGE-11 GDI+ string layout settings
+
+**Rule**: String formats MUST preserve independent digit substitution, alignment, trimming, hotkey, tab and measurable-range settings when cloned. Generic formats MUST report native default and typographic settings. Setting more than 32 character ranges MUST return ValueOverflow without changing the previous ranges.
+**Verification**: Test
+**Basis**: [StringFormat](https://learn.microsoft.com/windows/win32/api/gdiplusstringformat/nl-gdiplusstringformat-stringformat).
+
 ## Audio ownership
 
 ### DEV-AUDIO-1 Shared playback

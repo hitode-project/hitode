@@ -109,7 +109,12 @@ fn clone_path(env: &mut Env<'_>, path: GuestPtr<()>, out: GuestPtr<()>) -> Outco
 fn clone_format(env: &mut Env<'_>, format: GuestPtr<()>, out: GuestPtr<()>) -> Outcome {
     clone_object(env, format.addr(), out.addr(), Kind::Format)
 }
-fn property(env: &mut Env<'_>, handle: u32, out: GuestPtr<i32>, operation: Op<'_>) -> i32 {
+pub(super) fn property(
+    env: &mut Env<'_>,
+    handle: u32,
+    out: GuestPtr<i32>,
+    operation: Op<'_>,
+) -> i32 {
     if out.is_null() {
         return 2;
     }

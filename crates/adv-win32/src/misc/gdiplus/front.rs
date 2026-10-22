@@ -762,6 +762,7 @@ fn dispose(env: &mut Env<'_>, object: GuestPtr<()>) -> i32 {
 
 pub(super) fn register(reg: &mut Registry) {
     world::register(reg);
+    string_format::register(reg);
     matrix::register(reg);
     properties::register(reg);
     for api in [
