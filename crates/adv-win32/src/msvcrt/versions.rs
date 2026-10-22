@@ -75,8 +75,8 @@ pub(super) const PROFILES: &[Profile] = &[
     },
 ];
 
-fn catalog() -> &'static HashSet<(&'static str, &'static str)> {
-    static CATALOG: OnceLock<HashSet<(&str, &str)>> = OnceLock::new();
+fn catalog() -> &'static HashSet<(&'static str, &'static str, &'static str)> {
+    static CATALOG: OnceLock<HashSet<(&str, &str, &str)>> = OnceLock::new();
     CATALOG.get_or_init(|| {
         include_str!("../../../../data/abi/crt-exports.tsv")
             .lines()
@@ -84,7 +84,7 @@ fn catalog() -> &'static HashSet<(&'static str, &'static str)> {
             .filter_map(|line| {
                 let mut fields = line.split('\t');
                 let (module, name, kind) = (fields.next()?, fields.next()?, fields.next()?);
-                (kind == "code").then_some((module, name))
+                Some((module, name, kind))
             })
             .collect()
     })
@@ -108,7 +108,7 @@ pub(super) fn register(registry: &mut Registry, exports: &[(&str, Handler)]) {
         {
             continue;
         }
-        if !catalog().contains(&(declaration.module, declaration.name)) {
+        if !catalog().contains(&(declaration.module, declaration.name, "code")) {
             continue;
         }
         if registry
@@ -126,6 +126,25 @@ pub(super) fn register(registry: &mut Registry, exports: &[(&str, Handler)]) {
                 env_leaf: None,
                 level: ImplementationLevel::Implement,
             });
+        }
+    }
+}
+
+/// Storage declarations select the same version/catalog matrix as code.
+pub(super) fn register_data(registry: &mut Registry, exports: &[(&str, &[u8])]) {
+    for declaration in signature::signatures() {
+        if declaration.data_size.is_none()
+            || !PROFILES
+                .iter()
+                .any(|profile| profile.module == declaration.module)
+            || !catalog().contains(&(declaration.module, declaration.name, "data"))
+        {
+            continue;
+        }
+        if let Some((_, bytes)) = exports.iter().find(|(name, _)| *name == declaration.name) {
+            registry
+                .register_data(declaration.module, declaration.name, bytes)
+                .expect("CRT storage matches its generated declaration");
         }
     }
 }

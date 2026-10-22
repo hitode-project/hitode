@@ -3612,6 +3612,7 @@ msvcr100.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcr100.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcr100.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr100.dll	_EH_prolog	cdecl	void	void	
+msvcr100.dll	_HUGE	data	f64	double	
 msvcr100.dll	_NLG_Return2	cdecl	void	void	
 msvcr100.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3620,6 +3621,7 @@ msvcr100.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr100.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr100.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr100.dll	__uncaught_exception	cdecl	i32	int	
+msvcr100.dll	_acmdln	data	ptr	char*	
 msvcr100.dll	_errno	cdecl	ptr	int*	
 msvcr100.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3674,6 +3676,7 @@ msvcr100.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|a
 msvcr100.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr100.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr100.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr100.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr100.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr100.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr100.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -3726,6 +3729,7 @@ msvcr110.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcr110.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcr110.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr110.dll	_EH_prolog	cdecl	void	void	
+msvcr110.dll	_HUGE	data	f64	double	
 msvcr110.dll	_NLG_Return2	cdecl	void	void	
 msvcr110.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3734,6 +3738,7 @@ msvcr110.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr110.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr110.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr110.dll	__uncaught_exception	cdecl	i32	int	
+msvcr110.dll	_acmdln	data	ptr	char*	
 msvcr110.dll	_errno	cdecl	ptr	int*	
 msvcr110.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3788,6 +3793,7 @@ msvcr110.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|a
 msvcr110.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr110.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr110.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr110.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr110.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr110.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr110.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -3840,6 +3846,7 @@ msvcr120.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcr120.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcr120.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr120.dll	_EH_prolog	cdecl	void	void	
+msvcr120.dll	_HUGE	data	f64	double	
 msvcr120.dll	_NLG_Return2	cdecl	void	void	
 msvcr120.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3848,6 +3855,7 @@ msvcr120.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr120.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr120.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr120.dll	__uncaught_exception	cdecl	i32	int	
+msvcr120.dll	_acmdln	data	ptr	char*	
 msvcr120.dll	_errno	cdecl	ptr	int*	
 msvcr120.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3902,6 +3910,7 @@ msvcr120.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|a
 msvcr120.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr120.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr120.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr120.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr120.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr120.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr120.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -3951,11 +3960,14 @@ msvcr70.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcr70.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcr70.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr70.dll	_EH_prolog	cdecl	void	void	
+msvcr70.dll	_HUGE	data	f64	double	
 msvcr70.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr70.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr70.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr70.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr70.dll	__uncaught_exception	cdecl	i32	int	
+msvcr70.dll	_acmdln	data	ptr	char*	
+msvcr70.dll	_adjust_fdiv	data	i32	int	
 msvcr70.dll	_errno	cdecl	ptr	int*	
 msvcr70.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr70.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3998,6 +4010,7 @@ msvcr70.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|ar
 msvcr70.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr70.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr70.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr70.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr70.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr70.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr70.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -4045,11 +4058,14 @@ msvcr71.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcr71.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcr71.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr71.dll	_EH_prolog	cdecl	void	void	
+msvcr71.dll	_HUGE	data	f64	double	
 msvcr71.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr71.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr71.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr71.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr71.dll	__uncaught_exception	cdecl	i32	int	
+msvcr71.dll	_acmdln	data	ptr	char*	
+msvcr71.dll	_adjust_fdiv	data	i32	int	
 msvcr71.dll	_errno	cdecl	ptr	int*	
 msvcr71.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr71.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4093,6 +4109,7 @@ msvcr71.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|ar
 msvcr71.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcr71.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcr71.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcr71.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr71.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr71.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr71.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -4154,6 +4171,7 @@ msvcr80.dll	_CIsqrt	cdecl	void	void
 msvcr80.dll	_CItan	cdecl	void	void	
 msvcr80.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr80.dll	_EH_prolog	cdecl	void	void	
+msvcr80.dll	_HUGE	data	f64	double	
 msvcr80.dll	_NLG_Return2	cdecl	void	void	
 msvcr80.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr80.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4166,6 +4184,7 @@ msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|envir
 msvcr80.dll	__uncaught_exception	cdecl	i32	int	
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	_acmdln	data	ptr	char*	
+msvcr80.dll	_adjust_fdiv	data	i32	int	
 msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr80.dll	_cexit	cdecl	void	void	
 msvcr80.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
@@ -4356,6 +4375,7 @@ msvcr90.dll	_CIsqrt	cdecl	void	void
 msvcr90.dll	_CItan	cdecl	void	void	
 msvcr90.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr90.dll	_EH_prolog	cdecl	void	void	
+msvcr90.dll	_HUGE	data	f64	double	
 msvcr90.dll	_NLG_Return2	cdecl	void	void	
 msvcr90.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr90.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4371,6 +4391,7 @@ msvcr90.dll	__pctype_func	cdecl	ptr	const unsigned short*
 msvcr90.dll	__uncaught_exception	cdecl	u32	bool	
 msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	_acmdln	data	ptr	char*	
+msvcr90.dll	_adjust_fdiv	data	i32	int	
 msvcr90.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr90.dll	_cexit	cdecl	void	void	
@@ -4560,6 +4581,7 @@ msvcrt.dll	_CIsqrt	cdecl	void	void
 msvcrt.dll	_CItan	cdecl	void	void	
 msvcrt.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcrt.dll	_EH_prolog	cdecl	void	void	
+msvcrt.dll	_HUGE	data	f64	double	
 msvcrt.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4727,9 +4749,12 @@ msvcrt20.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callba
 msvcrt20.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcrt20.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcrt20.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcrt20.dll	_HUGE	data	f64	double	
 msvcrt20.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt20.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt20.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt20.dll	_acmdln	data	ptr	char*	
+msvcrt20.dll	_adjust_fdiv	data	i32	int	
 msvcrt20.dll	_errno	cdecl	ptr	int*	
 msvcrt20.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt20.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4772,6 +4797,7 @@ msvcrt20.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|a
 msvcrt20.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcrt20.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcrt20.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt20.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt20.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt20.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt20.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -4819,9 +4845,12 @@ msvcrt40.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcrt40.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcrt40.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcrt40.dll	_EH_prolog	cdecl	void	void	
+msvcrt40.dll	_HUGE	data	f64	double	
 msvcrt40.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt40.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt40.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt40.dll	_acmdln	data	ptr	char*	
+msvcrt40.dll	_adjust_fdiv	data	i32	int	
 msvcrt40.dll	_errno	cdecl	ptr	int*	
 msvcrt40.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt40.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4864,6 +4893,7 @@ msvcrt40.dll	_spawnv	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|a
 msvcrt40.dll	_spawnve	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
 msvcrt40.dll	_spawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1
 msvcrt40.dll	_spawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const char*:str8:1|arguments:const char* const*:ptr:1|environment:const char* const*:ptr:1
+msvcrt40.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt40.dll	_wexecl	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt40.dll	_wexecle	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt40.dll	_wexeclp	variadic	i32	intptr_t	path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1

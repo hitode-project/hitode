@@ -82,7 +82,7 @@
     "source": "Microsoft Visual C++ Build Tools 14.44.35207",
     "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h (included by SDK ucrt/corecrt_memory.h)",
     "sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
-    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles and vcruntime140.dll. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
+    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT profiles, ucrtbase.dll and vcruntime140.dll; the string API-set has no memchr export. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
   },
   "corecrt_memcpy_s.h": {
     "header": "ucrt/corecrt_memcpy_s.h",
@@ -106,7 +106,7 @@
     "scope": "Only vcruntime140.dll strrchr/wcsrchr and ucrtbase.dll plus api-ms-win-crt-string-l1-1-0.dll wcscpy_s/strcpy_s/strncpy_s. Typed checked ordinary NUL-terminated searches and valid-capacity copies delegate to the existing legacy memory kernels; invalid-parameter handling reuses the shared CRT owner. wchar_t is a16-bit code unit in one x86 stack word. Finite-count strncpy_s requires a checked NUL-terminated source; _TRUNCATE and arbitrary unterminated prefix inputs are not advertised. Existing typed wcscat_s is unchanged."
   },
   "legacy_data": {
-    "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
+    "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for each legacy runtime whose fixed export catalog contains these variables.",
     "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
   },
@@ -612,5 +612,11 @@
       "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
     },
     "native_sections": "The fourteen legacy math entries are in executable .text in VC80 and VC90. The three lgamma and nine fenv entries are in executable .text in SDK x86 UCRT. _HUGE and _iob remain writable .data in VC80/90. Existing native-ABI provenance records the binary hashes; UCRT SHA-256 is 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9. _cabs, _tzset and _fpreset are executable .text entries in VC80, VC90 and SDK x86 UCRT."
+  },
+  "versioned_data_cells": {
+    "source": "Cataloged legacy CRT exports. Command-line pointer declarations use the pinned corecrt_startup.h source; internal legacy data uses explicit x86 ABI evidence.",
+    "huge": "Eight-byte IEEE binary64 double, initial positive infinity 0x7ff0000000000000. Pinned VC80 and VC90 PE exports hold these bytes in writable .data. Modern corecrt_math.h provides the corresponding HUGE_VAL expression; its managed-only _HUGE declaration is not claimed as a native legacy header declaration.",
+    "adjust_fdiv": "32-bit int initially zero for the virtual conforming x87 processor; cataloged versions share one descriptor kernel. No Pentium FDIV erratum is modeled.",
+    "command_line": "Each CRT has independent four-byte pointer cells initialized from the existing Win32 ANSI/UTF-16 command-line owner. Public data addresses are real non-executable PE storage, retain guest writes and are identical through static IAT and dynamic lookup."
   }
 }

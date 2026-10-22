@@ -1609,3 +1609,35 @@ msvcrt40.dll	_getpid	cdecl	i32	int
 msvcrt40.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
 ucrtbase.dll	_getpid	cdecl	i32	int	
 ucrtbase.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+
+# Legacy CRT exported double/error-workaround/command-line cells; version presence follows the native catalog.
+msvcr100.dll	_HUGE	data	f64	double	
+msvcr100.dll	_acmdln	data	ptr	char*	
+msvcr100.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr110.dll	_HUGE	data	f64	double	
+msvcr110.dll	_acmdln	data	ptr	char*	
+msvcr110.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr120.dll	_HUGE	data	f64	double	
+msvcr120.dll	_acmdln	data	ptr	char*	
+msvcr120.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr70.dll	_HUGE	data	f64	double	
+msvcr70.dll	_acmdln	data	ptr	char*	
+msvcr70.dll	_adjust_fdiv	data	i32	int	
+msvcr70.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr71.dll	_HUGE	data	f64	double	
+msvcr71.dll	_acmdln	data	ptr	char*	
+msvcr71.dll	_adjust_fdiv	data	i32	int	
+msvcr71.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr80.dll	_HUGE	data	f64	double	
+msvcr80.dll	_adjust_fdiv	data	i32	int	
+msvcr90.dll	_HUGE	data	f64	double	
+msvcr90.dll	_adjust_fdiv	data	i32	int	
+msvcrt.dll	_HUGE	data	f64	double	
+msvcrt20.dll	_HUGE	data	f64	double	
+msvcrt20.dll	_acmdln	data	ptr	char*	
+msvcrt20.dll	_adjust_fdiv	data	i32	int	
+msvcrt20.dll	_wcmdln	data	ptr	wchar_t*	
+msvcrt40.dll	_HUGE	data	f64	double	
+msvcrt40.dll	_acmdln	data	ptr	char*	
+msvcrt40.dll	_adjust_fdiv	data	i32	int	
+msvcrt40.dll	_wcmdln	data	ptr	wchar_t*	

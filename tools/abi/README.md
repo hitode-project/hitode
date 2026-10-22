@@ -139,7 +139,7 @@ python -m unittest discover -s tools/abi -p test_crt_exports.py
 ## SDK CRT declarations
 
 WinMD omits CRT exports. `data/abi/crt-input.tsv` supplies supported x86 scalar
-and pointer declarations for __cdecl functions and data cells. SDK declarations
+and pointer declarations for CRT functions and data storage. SDK declarations
 come from 10.0.26100.0 float.h, stdlib.h,
 errno.h, process.h, corecrt_startup.h, corecrt_wstdlib.h, corecrt_malloc.h and corecrt_wstring.h.
 Secure byte-copy declarations use the same SDK's `corecrt_memcpy_s.h`.
@@ -250,11 +250,11 @@ process termination, and `_exit` bypasses the callbacks. Direct `ExitProcess` an
 raw PE-entry returns do not synthesize a C-main return. Pending arrays and headers
 are released at the existing process-detach boundary. UCRT `_onexit`/`atexit`
 are static shims and are not advertised as native DLL exports.
-The six legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in
+Cataloged legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in
 `corecrt_startup.h` and [Microsoft's command-line variable documentation](https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln).
-The existing MSVCRT `_adjust_fdiv` compatibility cell is also data, with a zero
+Cataloged `_adjust_fdiv` compatibility cells are also data, with a zero
 initial value; its data-section export was checked in the installed Microsoft
-x86 MSVCRT PE rather than represented by a function thunk. These seven rows use
+x86 MSVCRT PE rather than represented by a function thunk. Storage rows use
 convention `data`, a scalar/pointer cell width and no parameters. The generator
 rejects malformed data declarations; the function macro rejects them as callable
 signatures. Registry assembly initializes pointer descriptors from the single
@@ -379,3 +379,11 @@ sections establish these as code; `_HUGE`, `_iob` and genuine data remain data.
 The export generator applies evidence only to names already present in its
 source, records the evidence hash, and rejects attempts to invent an export.
 `crt-source.json` records the declaration and native-section provenance.
+
+Legacy data cells now use the same version/catalog selection as code. Each
+cataloged `_HUGE` is a real writable eight-byte double initialized to positive
+infinity; `_adjust_fdiv` is a zero-initialized int for the conforming virtual
+processor. All legacy command-line cells point to the existing Win32 string
+owner while retaining independent guest-writable pointer storage. `crt_data`
+checks static IATs and real dynamic lookup on all three CPU backends. The ABI
+generator accepts double data only as data and rejects function reinterpretation.

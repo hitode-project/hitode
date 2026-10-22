@@ -55,4 +55,6 @@ Reject-Change 'throw-width' "msvcr90.dll`t_CxxThrowException" 5 'object:void*:pt
 Reject-Change 'setjmp-convention' "msvcr90.dll`t_setjmp3" 2 'cdecl' 'setjmp stack contract'
 Reject-Change 'setjmp-prefix' "msvcr90.dll`t_setjmp3" 5 'buffer:jmp_buf:ptr:1' 'setjmp stack contract'
 Reject-Change 'cpp-jump-callback' "msvcr90.dll`t__CxxLongjmpUnwind" 2 'cdecl' 'C++ local unwind callback stack contract'
-Write-Output 'CRT inputs: reproducible generation and eleven malformed process/math/throw/jump contracts verified.'
+Reject-Change 'float-data-convention' "msvcr90.dll`t_HUGE" 2 'cdecl' 'Invalid supplemental x86 signature'
+Reject-Change 'float-data-width' "msvcr90.dll`t_HUGE" 3 'f32' 'Invalid supplemental x86 signature'
+Write-Output 'CRT inputs: reproducible generation and thirteen malformed process/math/throw/jump/data contracts verified.'

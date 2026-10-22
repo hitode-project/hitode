@@ -319,7 +319,9 @@ public static class AbiMetadata
                     || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
                     throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
             }
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
+            bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
+                && f[4] == "double" && f[5].Length == 0;
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

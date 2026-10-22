@@ -222,3 +222,8 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: CRT process identity MUST match the existing Windows process owner. CRT sleep MUST use the existing Windows scheduler, converting a zero duration to one millisecond. Every version and public API-set alias MUST preserve these semantics.
 **Verification**: Test
+
+### PERS-CRT-6 Legacy numeric and command-line data
+
+**Rule**: Legacy `_HUGE` data MUST be an eight-byte double initialized to positive infinity. Cataloged `_adjust_fdiv` cells MUST start at zero for the conforming virtual processor. CRT command-line pointer cells MUST reference the Win32 command-line owner while retaining independent, writable module storage.
+**Verification**: Test
