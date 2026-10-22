@@ -31,9 +31,11 @@ pub struct Report {
     pub failure: Option<Failure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<Perf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_gaps: Option<ApiGaps>,
 }
 impl Report {
-    /// Checks what serde cannot: the schema and the note length.
+    /// Checks what serde cannot: the schema, the note length and API names.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != SCHEMA {
             return Err(format!("unsupported report schema {:?}", self.schema));
@@ -44,6 +46,9 @@ impl Report {
             .is_some_and(|note| note.chars().count() > 2000)
         {
             return Err("report note exceeds 2000 characters".into());
+        }
+        if let Some(gaps) = &self.api_gaps {
+            gaps.validate()?;
         }
         Ok(())
     }
@@ -239,11 +244,72 @@ impl Perf {
     }
 }
 
+/// Unimplemented APIs a run met, as sorted `module!name` lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiGaps {
+    /// Called by the guest; discovery mode returned their failure.
+    pub called: Vec<String>,
+    /// Imported by a loaded module but not called.
+    pub imported: Vec<String>,
+}
+impl ApiGaps {
+    pub const MAX_NAMES: usize = 256;
+    const MAX_NAME_BYTES: usize = 160;
+
+    /// The gaps of a run, sorted and bounded; `None` when there are none.
+    pub fn new(
+        called: impl IntoIterator<Item = String>,
+        imported: impl IntoIterator<Item = String>,
+    ) -> Option<Self> {
+        let list = |names: &mut dyn Iterator<Item = String>, skip: &[String]| {
+            let mut names: Vec<String> = names
+                .filter(|name| api_name(name))
+                .map(|name| match name.split_once('!') {
+                    Some((module, export)) => format!("{}!{export}", module.to_ascii_lowercase()),
+                    None => name,
+                })
+                .filter(|name| !skip.contains(name))
+                .collect();
+            names.sort();
+            names.dedup();
+            names.truncate(Self::MAX_NAMES);
+            names
+        };
+        let called = list(&mut called.into_iter(), &[]);
+        let imported = list(&mut imported.into_iter(), &called);
+        (!called.is_empty() || !imported.is_empty()).then_some(Self { called, imported })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for names in [&self.called, &self.imported] {
+            if names.len() > Self::MAX_NAMES {
+                return Err(format!("report lists over {} API gaps", Self::MAX_NAMES));
+            }
+            if let Some(name) = names.iter().find(|name| !api_name(name)) {
+                return Err(format!("report API gap {name:?} is not module!name"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `module!name` in printable ASCII, so a gap cannot carry free text.
+fn api_name(name: &str) -> bool {
+    name.len() <= ApiGaps::MAX_NAME_BYTES
+        && name.bytes().all(|b| b.is_ascii_graphic())
+        && name
+            .split_once('!')
+            .is_some_and(|(module, export)| !module.is_empty() && !export.is_empty())
+}
+
 /// What a finished run contributes to a report, before the user describes it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub failure: Option<Failure>,
     pub perf: Option<Perf>,
+    #[serde(default)]
+    pub api_gaps: Option<ApiGaps>,
 }
 
 /// The report file, pretty-printed in wire order.
@@ -292,6 +358,13 @@ mod tests {
                 frame_ms_p95: 41.2,
                 frame_ms_p99: 88.5,
             }),
+            api_gaps: ApiGaps::new(
+                ["gdiplus.dll!GdipDrawCurve".into()],
+                [
+                    "gdiplus.dll!GdipDrawCurve".into(),
+                    "ole32.dll!CoCreateGuid".into(),
+                ],
+            ),
         }
     }
 
@@ -306,7 +379,8 @@ mod tests {
             &format!(r#""game":{{"exe_sha256":"{}","exe_size":1887437,"codepage":932}},"#, "ab".repeat(32)),
             r#""outcome":"failed","issues":[],"#,
             r#""failure":{"kind":"api","api":"d3d9.dll!IDirect3DDevice9::CreateVolumeTexture","cpu_fault":null,"after":"1m_10m"},"#,
-            r#""perf":{"frame_ms_p50":16.8,"frame_ms_p95":41.2,"frame_ms_p99":88.5}}"#,
+            r#""perf":{"frame_ms_p50":16.8,"frame_ms_p95":41.2,"frame_ms_p99":88.5},"#,
+            r#""api_gaps":{"called":["gdiplus.dll!GdipDrawCurve"],"imported":["ole32.dll!CoCreateGuid"]}}"#,
         ]
         .concat();
         assert_eq!(json, expected);
@@ -347,6 +421,39 @@ mod tests {
         };
         assert!(to_json(&note(2000)).is_ok());
         assert!(to_json(&note(2001)).is_err());
+    }
+
+    // spec: REPORT-GAP-1
+    #[test]
+    fn api_gaps_are_sorted_bounded_names() {
+        assert_eq!(ApiGaps::new([], []), None);
+        let gaps = ApiGaps::new(
+            ["b.dll!Two".into(), "A.dll!One".into(), "a.dll!One".into()],
+            [
+                "a.dll!One".into(),
+                "C:\\Games\\x.dll!Path is text".into(),
+                "no-module".into(),
+                "c.dll!?Name@@YAXXZ".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(gaps.called, ["a.dll!One", "b.dll!Two"]);
+        assert_eq!(gaps.imported, ["c.dll!?Name@@YAXXZ"]);
+        let many = ApiGaps::new((0..300).map(|i| format!("a.dll!F{i:03}")), []).unwrap();
+        assert_eq!(many.called.len(), ApiGaps::MAX_NAMES);
+        let with = |gaps: ApiGaps| Report {
+            api_gaps: Some(gaps),
+            ..report()
+        };
+        assert!(to_json(&with(many.clone())).is_ok());
+        let mut over = many;
+        over.called.push("a.dll!F999".into());
+        assert!(to_json(&with(over)).is_err());
+        let text = ApiGaps {
+            called: vec!["user note".into()],
+            imported: vec![],
+        };
+        assert!(to_json(&with(text)).is_err());
     }
 
     // spec: REPORT-FAIL-2

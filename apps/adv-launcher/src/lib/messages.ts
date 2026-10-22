@@ -159,6 +159,8 @@ export const messages: Record<string, [string, string]> = {
   "已是最新版本": ["Up to date", "最新バージョンです"],
   "平台": ["Platform", "プラットフォーム"],
   "失败信息": ["Failure details", "エラー詳細"],
+  "未实现接口": ["Unimplemented APIs", "未実装API"],
+  "已调用 {0} · 仅导入 {1}": ["{0} called · {1} imported only", "呼び出し {0} · インポートのみ {1}"],
   "性能": ["Performance", "性能"],
   "备注": ["Notes", "備考"],
   "存档管理需要桌面启动器": ["Saved data management requires the desktop launcher", "セーブデータ管理にはデスクトップランチャーが必要です"],

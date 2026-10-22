@@ -82,8 +82,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-EXPORT-5 Diagnostic stubs
 
-**Rule**: Strict mode MUST stop at an unimplemented diagnostic stub. Discovery mode MUST return the registered failure and record the call. Missing failure contracts MUST NOT default to success.
+**Rule**: Strict mode MUST stop at an unimplemented diagnostic stub. Discovery mode MUST record the call and return its registered failure, else the failure below for its return type. Player runs MUST default to discovery, and returns with no derivable failure MUST stop.
 **Verification**: Test
+
+| Return type | Failure |
+|---|---|
+| void, BOOL, counts, handles, pointers, strings | 0 |
+| HRESULT, NTSTATUS, WIN32_ERROR, GDI+ Status, errno_t | Their not-implemented code |
+| SOCKET, COLORREF, WAIT_EVENT, untyped Winsock int | All bits set |
+| Untyped winmm result, except device counts | MMSYSERR_NOTSUPPORTED |
+| 64-bit, floating and aggregate | None |
 
 ### PERS-EXPORT-6 Data exports
 
