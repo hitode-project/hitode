@@ -348,3 +348,9 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Internet reads and writes MUST clear their byte counts before handle validation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
 **Verification**: Test
 **Basis**: Microsoft WinINet handle types, InternetReadFile, InternetWriteFile and InternetSetOption contracts.
+
+### PERS-PRINT-1 Empty printer catalog
+
+**Rule**: Local printer enumeration MUST return zero installed or connected printers with checked count outputs. OpenPrinter MUST distinguish the real local server from absent printer devices and enforce ordinary-user access. Printer-device queries MUST fail without fabricating device modes or modifying their output buffers.
+**Verification**: Test
+**Basis**: Microsoft OpenPrinter, EnumPrinters and DocumentProperties contracts and the configured printer-free profile.

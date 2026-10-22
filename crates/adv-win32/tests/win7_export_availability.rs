@@ -80,12 +80,12 @@ fn probes<B: Backend>(cpu: B, mode: RunMode) {
     let mut code = Asm::new(CODE);
     for (index, name) in [
         "GetCurrentPackageId",
-        "SetHandleCount",
         "GetSystemTimePreciseAsFileTime",
         "CreateFile2",
         "FlsGetValue2",
         "AppPolicyGetProcessTerminationMethod",
         "GetCurrentProcessId",
+        "SetHandleCount",
     ]
     .into_iter()
     .enumerate()
@@ -101,6 +101,10 @@ fn probes<B: Backend>(cpu: B, mode: RunMode) {
             .mov_mem_eax(DATA + index as u32 * 8);
         code.call(error).mov_mem_eax(DATA + index as u32 * 8 + 4);
     }
+    let set_count = machine
+        .resolve_import("kernel32.dll", "SetHandleCount")
+        .unwrap();
+    code.push_imm(73).call(set_count).mov_mem_eax(DATA + 64);
     code.bytes.extend_from_slice(&[0x31, 0xc0]);
     code.ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();
@@ -109,11 +113,13 @@ fn probes<B: Backend>(cpu: B, mode: RunMode) {
         machine.run_virtual(1_000_000),
         RunResult::Exited(0)
     ));
-    for index in 0..6 {
+    for index in 0..5 {
         assert_eq!(machine.cpu.read_u32(DATA + index * 8).unwrap(), 0);
         assert_eq!(machine.cpu.read_u32(DATA + index * 8 + 4).unwrap(), 127);
     }
     assert_ne!(machine.cpu.read_u32(DATA + 48).unwrap(), 0);
+    assert_ne!(machine.cpu.read_u32(DATA + 40).unwrap(), 0);
+    assert_eq!(machine.cpu.read_u32(DATA + 64).unwrap(), 73);
 }
 
 #[test]

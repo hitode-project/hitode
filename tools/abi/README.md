@@ -140,6 +140,7 @@ FlsGetValue2 is gated by `_WIN32_WINNT_WIN10` in the SDK's `fibersapi.h`; its pr
 AppPolicyGetProcessTerminationMethod appears in the SDK's AppModel policy declarations and is absent from the published Win7 Kernel32 export catalog; its exact minimum remains undocumented.
 The cited Win7 catalog is build 6.1.7100.0, rather than an authored SP1 native test; this comparison does not claim SP1 differential verification.
 The post-Win7 rows pin the SDK header revision, and these names remain unregistered and unavailable to guest discovery.
+SetHandleCount remains implemented: the Win7 export catalog contains it despite Learn's modern minimum-client label, and Learn describes its Win32 behavior as having no effect.
 
 ## CRT export catalog
 

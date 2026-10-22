@@ -943,29 +943,26 @@ fn global_memory_status_ex(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_computer_name(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let name = adv_os::identity::COMPUTER_NAME;
+    let needed = name.len() as u32 + 1;
     let (buf, size_p) = (env.arg(0), env.arg(1));
     let cap = env.cpu.read_u32(size_p).unwrap_or(0);
-    if cap < 8 {
-        out_u32(env.cpu, size_p, 8);
+    if cap < needed {
+        out_u32(env.cpu, size_p, needed);
         set_last_error(env, 111);
         return Outcome::Return(0);
     }
     match if wide {
-        crate::util::put_wstr(
-            env.cpu,
-            buf,
-            cap,
-            &"PAL-HLE".encode_utf16().collect::<Vec<_>>(),
-        )
+        crate::util::put_wstr(env.cpu, buf, cap, &name.encode_utf16().collect::<Vec<_>>())
     } else {
-        put_cstr(env.cpu, buf, cap, b"PAL-HLE")
+        put_cstr(env.cpu, buf, cap, name.as_bytes())
     } {
         Some(n) => {
             out_u32(env.cpu, size_p, n);
             Outcome::Return(1)
         }
         None => {
-            out_u32(env.cpu, size_p, 8);
+            out_u32(env.cpu, size_p, needed);
             set_last_error(env, 111); // ERROR_BUFFER_OVERFLOW
             Outcome::Return(0)
         }
@@ -1012,6 +1009,7 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(1)
     });
     stdcall(reg, K32, "GetProcessVersion", 1, get_process_version);
+    stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
     });

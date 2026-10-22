@@ -169,7 +169,6 @@ kernel32.dll	ResizePseudoConsole	Windows 10 October 2018 Update (version 1809) \
 kernel32.dll	SetCachedSigningLevel	Windows 8 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-setcachedsigninglevel
 kernel32.dll	SetFirmwareEnvironmentVariableExA	Windows 8	windows8.0
 kernel32.dll	SetFirmwareEnvironmentVariableExW	Windows 8	windows8.0
-kernel32.dll	SetHandleCount	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-sethandlecount
 kernel32.dll	SetIoRateControlInformationJobObject	Windows 10 (10.0.10240)	windows10.0.10240
 kernel32.dll	SetProcessDefaultCpuSetMasks	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusetmasks
 kernel32.dll	SetProcessDefaultCpuSets	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusets

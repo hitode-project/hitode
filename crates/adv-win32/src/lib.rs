@@ -26,6 +26,7 @@ mod network;
 mod ntdll;
 pub mod personality;
 pub mod printf;
+mod printing;
 mod psapi;
 mod query_leaves;
 pub mod user32;
@@ -220,6 +221,7 @@ pub fn register(reg: &mut Registry) {
     imm32::register(reg);
     version::register(reg);
     psapi::register(reg);
+    printing::register(reg);
     msi::register(reg);
     crypt32::register(reg);
     mpr::register(reg);
