@@ -221,6 +221,37 @@ public static class AbiMetadata
         foreach (var row in File.ReadLines(supplement).Where(line => line.Length != 0 && !line.StartsWith('#')))
         {
             var f = row.Split('\t');
+            // process.h/corecrt_wprocess.h list forms have a mandatory pathname
+            // and arg0, preceded by mode for spawn. Do not project ellipsis as
+            // fixed arguments or infer a stack contract from the export name.
+            bool crtProcessName = f.Length == 6
+                && System.Text.RegularExpressions.Regex.IsMatch(f[1], "^_w?(exec|spawn)l(p?e?)$");
+            bool crtProcessList = crtProcessName && f[2] == "variadic" && f[3] == "i32" && f[4] == "intptr_t";
+            if (crtProcessName && !crtProcessList)
+                throw new InvalidDataException("CRT process list stack contract changed: " + row);
+            if (crtProcessList)
+            {
+                bool wide = f[1].StartsWith("_w"), spawn = f[1].Contains("spawn");
+                string character = wide ? "wchar_t" : "char", kind = wide ? "str16" : "str8";
+                string prefix = spawn ? "mode:int:i32:1|" : "";
+                if (f[5] != prefix + "path:const " + character + "*:" + kind + ":1|arg0:const " + character + "*:" + kind + ":1")
+                    throw new InvalidDataException("CRT process list stack contract changed: " + row);
+            }
+            bool crtSetjmpName = f.Length == 6 && f[1] == "_setjmp3";
+            bool crtSetjmp = crtSetjmpName && f[2] == "variadic" && f[3] == "i32" && f[4] == "int"
+                && f[5] == "buffer:jmp_buf:ptr:1|count:int:i32:1";
+            if (crtSetjmpName && !crtSetjmp)
+                throw new InvalidDataException("CRT setjmp stack contract changed: " + row);
+            bool crtJumpName = f.Length == 6 && f[1] == "__CxxLongjmpUnwind";
+            bool crtJump = crtJumpName && f[2] == "stdcall" && f[3] == "void" && f[4] == "void"
+                && f[5] == "buffer:_JUMP_BUFFER*:ptr:1";
+            if (crtJumpName && !crtJump)
+                throw new InvalidDataException("CRT C++ local unwind callback stack contract changed: " + row);
+            bool crtThrowName = f.Length == 6 && f[1] == "_CxxThrowException";
+            bool crtThrow = crtThrowName && f[2] == "stdcall" && f[3] == "void" && f[4] == "void"
+                && f[5] == "object:void*:ptr:1|info:_ThrowInfo*:ptr:1";
+            if (crtThrowName && !crtThrow)
+                throw new InvalidDataException("CRT C++ throw stack contract changed: " + row);
             bool crtVariadic = f.Length == 6 && new[] { "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && new[] { "sprintf_s", "_snprintf_s", "swprintf_s", "_snwprintf_s", "_scprintf", "_scwprintf" }.Contains(f[1])
                 && f[2] == "variadic" && f[3] == "i32" && f[4] == "int";
@@ -265,6 +296,12 @@ public static class AbiMetadata
             bool crtLdexp = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && f[1] == "ldexp" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
                 && f[5] == "value:double:f64:2|exponent:int:i32:1";
+            bool crtBinaryMath = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "pow", "_hypot" }.Contains(f[1]) && f[2] == "cdecl"
+                && f[3] == "f64" && f[4] == "double" && f[5] == "x:double:f64:2|y:double:f64:2";
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "pow", "_hypot" }.Contains(f[1]) && !crtBinaryMath)
+                throw new InvalidDataException("CRT binary math stack contract changed: " + row);
             if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && f[1] == "ldexp" && !crtLdexp)
                 throw new InvalidDataException("CRT binary64 scaling stack contract changed: " + row);
@@ -282,7 +319,9 @@ public static class AbiMetadata
                     || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
                     throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
             }
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp)
+            bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
+                && f[4] == "double" && f[5].Length == 0;
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
@@ -290,7 +329,7 @@ public static class AbiMetadata
                 var p = parameter.Split(':');
                 bool crtTime64Parameter = crtDifftime && p.Length == 4
                     && p[1] == "__time64_t" && p[2] == "u64" && p[3] == "2";
-                bool crtRoundParameter = (crtRound || crtModf || crtLdexp) && p.Length == 4
+                bool crtRoundParameter = (crtRound || crtModf || crtLdexp || crtBinaryMath) && p.Length == 4
                     && p[1] == "double" && p[2] == "f64" && p[3] == "2";
                 if (p.Length != 4 || ((!new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1") && !crtTime64Parameter && !crtRoundParameter))
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);

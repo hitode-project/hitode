@@ -26,6 +26,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: An API that needs a guest callback or a wait MUST save a continuation and resume it in the original thread context. Host object locks MUST NOT be held across guest execution or waits. Nonlocal unwinding MUST NOT be handled by relaxing continuation checks.
 **Verification**: Test
 
+### PROC-MACH-11 Checked stack unwind
+
+**Rule**: Stack-directed checkpoints MUST target the current thread's stack without crossing non-unwindable callbacks. Capture and restoration MUST retain and revalidate ancestor identity, retiring only explicitly unwindable descendants at restoration. Rejected targets MUST preserve registers and continuation ownership.
+**Verification**: Test
+
 ### PROC-MACH-4 Direct host services
 
 **Rule**: `Env::invoke_host_u32` MUST pass a validated argument snapshot to a registered implementation without running rewritable private thunks. Ordinary API front ends MUST NOT use it to bypass guest hooks.

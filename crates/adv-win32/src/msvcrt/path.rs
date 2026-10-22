@@ -66,7 +66,7 @@ fn write(env: &mut Env<'_>, output: Output, units: &[u16], width: u32) -> Result
     env.cpu.write(output.address, &bytes)
 }
 
-fn split_ranges(
+pub(super) fn split_ranges(
     path: &[u16],
     lead: impl Fn(u16) -> bool,
 ) -> Result<[Range<usize>; 4], &'static str> {
@@ -180,14 +180,13 @@ fn split(env: &mut Env<'_>, source: u32, outputs: [Output; 4], wide: bool) -> Ou
     } else {
         // Secure split uses the independent multibyte profile, not LC_CTYPE:
         // VC80 still treats a DBCS trail slash as data after setlocale(C/1252).
-        // No _setmbcp frontend is implemented; the supported default is the
-        // configured guest ACP, independent of host ACP and later CTYPE edits.
-        let win32 = env.ext.get::<crate::Win32>();
-        let cp = win32.cfg.os.codepage;
-        if !matches!(cp, 932 | 936 | 1252 | 65001) {
+        // Explicit _setmbcp changes use the same module-owned profile as
+        // multibyte traversal; later CTYPE edits remain independent.
+        let cp = locale::multibyte_codepage(env);
+        if cp != 0 && !adv_os::nls::is_valid_codepage(cp) {
             return unsupported(env, "default CRT multibyte path code page is unavailable");
         }
-        split_ranges(&path, |unit| win32.codec.is_lead_byte(cp, unit as u8))
+        split_ranges(&path, |unit| mbcs::is_lead(cp, unit as u8))
     };
     let ranges = match ranges {
         Ok(ranges) => ranges,

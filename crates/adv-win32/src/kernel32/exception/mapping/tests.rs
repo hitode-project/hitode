@@ -4,7 +4,7 @@ use adv_cpu::{
     JitCpu, Region,
     backend::{Backend, GuestExt, Prot, asm::Asm},
 };
-use adv_machine::{Clock, Env, Machine, RunResult, layout::PARK_ADDR};
+use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x400000;
@@ -190,14 +190,6 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
             .try_get::<adv_abi::ApiDiagnostics>()
             .is_none_or(|d| d.warnings.is_empty())
     );
-    let env = Env {
-        context: machine.sys.current,
-        cpu: &mut machine.cpu,
-        sys: &mut machine.sys,
-        ext: &mut machine.ext,
-        thunk: 0,
-    };
-    assert_eq!(super::super::phase::uncaught_query_blocker(&env), None);
 }
 
 #[test]

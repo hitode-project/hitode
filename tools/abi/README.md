@@ -139,7 +139,7 @@ python -m unittest discover -s tools/abi -p test_crt_exports.py
 ## SDK CRT declarations
 
 WinMD omits CRT exports. `data/abi/crt-input.tsv` supplies supported x86 scalar
-and pointer declarations for __cdecl functions and data cells. SDK declarations
+and pointer declarations for CRT functions and data storage. SDK declarations
 come from 10.0.26100.0 float.h, stdlib.h,
 errno.h, process.h, corecrt_startup.h, corecrt_wstdlib.h, corecrt_malloc.h and corecrt_wstring.h.
 Secure byte-copy declarations use the same SDK's `corecrt_memcpy_s.h`.
@@ -151,7 +151,81 @@ The macro and runtime consume that one result through the existing signature
 resolver; neither has an extra CRT table or parser. Empty parameter lists retain
 an empty sixth TSV column, so its final separator is intentional.
 
-The 99 declarations cover guest floating controls, modern invalid-parameter
+The process/error declarations additionally cover cataloged exports in all ten
+legacy CRT DLLs, UCRT and their API sets. `msvcrt::versions` selects those entries
+by both export presence and the generated declaration, using one implementation
+per function family. List-form exec/spawn entries use a variadic mandatory prefix;
+their signed x86 `intptr_t` result is 32 bits. Version profiles select legacy errno
+validation or modern invalid-parameter callbacks. Existing module/thread error
+cells remain the only errno/DOS-error owner, including API-set calls into UCRT.
+The virtual environment has no command processor, so valid subprocess requests
+fail with ENOENT and publish no handles or streams. A `system(NULL)` query returns
+zero without changing the error cells. `test-crt-input.ps1` verifies regeneration
+and rejection of changed process-list and binary-math ABI contracts.
+
+CRT runtime callback declarations additionally project terminate, unexpected,
+translator and purecall aliases, including VC14's `__std_terminate`. Terminate,
+unexpected and translator handlers use the existing CRT/thread owner; purecall
+handlers use CRT-global state. VC14's standard terminate entry uses UCRT's slot.
+Returning terminate handlers take the abort path, and returning unexpected handlers
+enter terminate. Their callbacks execute as guest code, preserving explicit exits.
+
+The x86 internal SEH helpers use explicit ABI rows: EH2/EH3 take four cdecl
+arguments, EH4 common takes six, and local/global helpers retain caller cleanup.
+EH4 scope tables decode with the supplied cookie and invoke the supplied ECX
+security-check callback. Scope filters and finally funclets receive the guest
+establisher's EBP. Accepted filters call the live public `RtlUnwind` entry before
+local cleanup and resume through a machine checkpoint that validates stack and
+continuation ancestry. No host exception substitutes for guest SEH dispatch.
+`crt_cpp_runtime` and `crt_seh` exercise these paths in both execution modes.
+
+C++ throw declarations preserve the documented two-pointer stdcall ABI, while
+frame handlers use four cdecl pointers and the internal x86 FuncInfo-in-EAX
+contract. Frame handlers interpret VC6/VC7/VC8+ absolute-pointer metadata, match
+qualified catchable types and PMD base adjustments, invoke guest copy constructors
+and unwind funclets, and retain exception objects across rethrows. Catch completion
+runs the object's destructor before a checked nonlocal continuation. Asynchronous
+frames invoke the installed thread translator with original Windows exception
+pointers. Active C++ local-unwind scopes supply uncaught queries, including UCRT
+queries of VC14 cleanup; constructing or delivering a throw record does not alter
+that count. Rethrow records retain the compiler's null object/ThrowInfo marker.
+These internal contracts were checked against published Microsoft x86 runtimes;
+`crt-source.json` records the binaries' versions, hashes and observations.
+`crt_cpp_eh` exercises real Windows delivery, nested/outer catches, cleanup,
+translator throws, object lifetimes and termination in both execution modes.
+
+Byte/UTF-16 length, comparison, search and non-secure copying declarations now
+project cataloged versions through the same metadata-driven export table.
+Their shared kernel checks every guest read/write, counts UTF-16 code units,
+stops bounded reads at their count, pads bounded copies after NUL, and terminates
+bounded concatenation. Substring search uses one linear prefix table and returns
+the first match. Invalid destination writes fail instead of reporting a successful
+partial copy. `crt_strings` checks all CRT versions and public API-set projections,
+including page-end input and read-only output, in interpreter and JIT.
+
+`_setjmp`, `_setjmp3` and `longjmp` now share version selection and the MSVC
+sixteen-DWORD x86 jump-buffer layout. The variadic `_setjmp3` declaration retains
+only its mandatory buffer/count prefix. Global unwinding calls live `RtlUnwind`
+before a compiler-provided local callback or the default SEH scope cleanup.
+`__CxxLongjmpUnwind` takes one jump-buffer pointer with stdcall cleanup and reads
+saved FuncInfo from UnwindData and the saved target state.
+Jump restoration uses the same checked stack-directed continuation protocol as
+catch entry, preserving saved nonvolatile registers and the zero-to-one result rule.
+Guest buffer writes are checked. C++ and SEH fixtures cover cross-frame cleanup
+before the saved continuation resumes in both execution modes. The x86
+`_EH_prolog` entry installs the EAX-supplied handler and preserves the compiler
+frame layout without an ordinary stack argument. `__CxxQueryExceptionSize`
+returns its sixteen-byte registration buffer size; `_NLG_Return2` preserves
+incoming registers and flags at the debugger return boundary. These internal
+contracts use the pinned Microsoft x86 runtime observations described above.
+
+`python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
+`crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
+iostream families, including their data exports. `--check` detects stale entries.
+This scope manifest neither registers behavior nor changes export discovery;
+`tools/survey/coverage.py` continues to report the unfiltered catalogs.
+
+The declarations cover guest floating controls, modern invalid-parameter
 callbacks and `_errno` for the supported msvcrt/msvcr80/msvcr90/ucrtbase profiles,
 plus UCRT exit arrays, initializer ranges, `wcstoull`, `wcscat_s` and the allocation family
 with their API-set aliases. The six legacy `__getmainargs`/`__wgetmainargs`
@@ -176,11 +250,11 @@ process termination, and `_exit` bypasses the callbacks. Direct `ExitProcess` an
 raw PE-entry returns do not synthesize a C-main return. Pending arrays and headers
 are released at the existing process-detach boundary. UCRT `_onexit`/`atexit`
 are static shims and are not advertised as native DLL exports.
-The six legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in
+Cataloged legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in
 `corecrt_startup.h` and [Microsoft's command-line variable documentation](https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln).
-The existing MSVCRT `_adjust_fdiv` compatibility cell is also data, with a zero
+Cataloged `_adjust_fdiv` compatibility cells are also data, with a zero
 initial value; its data-section export was checked in the installed Microsoft
-x86 MSVCRT PE rather than represented by a function thunk. These seven rows use
+x86 MSVCRT PE rather than represented by a function thunk. Storage rows use
 convention `data`, a scalar/pointer cell width and no parameters. The generator
 rejects malformed data declarations; the function macro rejects them as callable
 signatures. Registry assembly initializes pointer descriptors from the single
@@ -273,3 +347,43 @@ ordinal handlers take precedence. A table entry adds no implementation or guesse
 signature: if neither a known signature nor implementation exists, calling it
 still stops. The self-authored `api_stubs.c` fixture covers the real SDK's static
 `d2d1.dll!#1` import, strict stopping, discovery chaining and correct failure returns.
+
+The CRT export audit removes three nonexistent handwritten fronts: VC80/VC90
+`time` and the public string API-set's `memchr`. Microsoft x86 PE export tables
+verify their absence; `crt-source.json` records versions, sources and hashes.
+The genuine `_time32`/`_time64` and UCRT/VCRuntime `memchr` entries remain separate
+exports. No matching CRT P/Invoke declarations exist in the pinned WinMD, so
+its SupportedOSPlatform attributes supply no CRT exclusions. Internal helpers
+are not classified as post-Windows-7 merely from a compiler release date.
+
+Multibyte pointer movement, byte/character counts, contextual classification and
+bounded copies now share one kernel across cataloged CRT versions. `_setmbcp`
+and `_getmbcp` use the existing module locale owner, independently of LC_CTYPE
+and Win32 ACP; public API-set fronts use UCRT state. Version profiles select
+legacy UTF-8 rejection and modern invalid-parameter handling. The lexical path
+splitter uses this same multibyte setting in both ordinary and secure fronts.
+Byte limits never read a partial pair's trailing byte; bounded copies clear
+incomplete final pairs and pad after NUL. `crt_mbcs` checks CP932/936, module
+isolation, API sets, invalid callbacks and page boundaries in interpreter/JIT.
+Explicit locale handles and thread-locale configuration are separate work.
+
+Cataloged CRT process identity and delay fronts use SDK process.h/stdlib.h
+cdecl declarations and the live GetCurrentProcessId/Sleep entries. `_sleep(0)`
+requests one millisecond, matching the pinned VC90 x86 entry; suspension uses the
+Windows scheduler and clock. `crt_process` checks all runtime projections and
+the public runtime API set in interpreter and JIT.
+
+`crt-kind-overrides.tsv` corrects import-library `DATA` markers that mingw uses
+for replacement math/fenv, FP-reset and timezone functions. SDK declarations and Microsoft x86 PE
+sections establish these as code; `_HUGE`, `_iob` and genuine data remain data.
+The export generator applies evidence only to names already present in its
+source, records the evidence hash, and rejects attempts to invent an export.
+`crt-source.json` records the declaration and native-section provenance.
+
+Legacy data cells now use the same version/catalog selection as code. Each
+cataloged `_HUGE` is a real writable eight-byte double initialized to positive
+infinity; `_adjust_fdiv` is a zero-initialized int for the conforming virtual
+processor. All legacy command-line cells point to the existing Win32 string
+owner while retaining independent guest-writable pointer storage. `crt_data`
+checks static IATs and real dynamic lookup on all three CPU backends. The ABI
+generator accepts double data only as data and rejects function reinterpretation.

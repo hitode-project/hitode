@@ -1,6 +1,11 @@
 {
   "format": 1,
   "source": {
+    "kind_overrides": {
+      "input": "data/abi/crt-kind-overrides.tsv",
+      "provenance": "data/abi/crt-source.json#export_kind_corrections",
+      "sha256": "545113e22ad59d7230b5f49f6cc9d8636961e6dba03f22d429c7a6caff3df6b5"
+    },
     "license": "public domain (mingw-w64-crt/DISCLAIMER.PD)",
     "mingw-w64": "62891fa4bf507d674c8c48822b596560b7cb506d",
     "modules": {

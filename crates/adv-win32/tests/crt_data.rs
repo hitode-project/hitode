@@ -169,9 +169,21 @@ fn case<B: Backend>(cpu: B, module: &str) {
         statics["cmdline_a"]
     );
 }
+// spec: PERS-EXPORT-6, PERS-CRT-6
 #[test]
 fn static_and_dynamic_crt_data_are_writable_cells_not_function_thunks() {
-    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+    for module in [
+        "msvcrt20.dll",
+        "msvcrt40.dll",
+        "msvcrt.dll",
+        "msvcr70.dll",
+        "msvcr71.dll",
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
+    ] {
         for jit in [false, true] {
             case(JitCpu::new(PARK_ADDR, jit).unwrap(), module);
         }
@@ -203,11 +215,151 @@ fn win32_only_install_does_not_register_or_seed_crt_exports() {
     assert!(statics.contains_key("cmdline_w"));
     assert!(!statics.contains_key("cmdline_a"));
     let registry = machine.sys.thunks.resolver_mut::<Registry>().unwrap();
-    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+    for module in [
+        "msvcrt20.dll",
+        "msvcrt40.dll",
+        "msvcrt.dll",
+        "msvcr70.dll",
+        "msvcr71.dll",
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
+    ] {
         for name in ["_acmdln", "_wcmdln"] {
             assert!(!registry.is_implemented(module, name));
             assert!(registry.data(module, name).is_none());
         }
     }
     assert!(!registry.is_implemented("msvcrt.dll", "_adjust_fdiv"));
+}
+
+// spec: PERS-EXPORT-6, PERS-CRT-6
+fn numeric_cells<B: Backend>(cpu: B, module: &str) {
+    let adjusted = include_str!("../../../data/abi/crt-exports.tsv")
+        .lines()
+        .any(|line| line.starts_with(&format!("{module}\t_adjust_fdiv\tdata")));
+    let names = if adjusted {
+        vec!["_HUGE", "_adjust_fdiv"]
+    } else {
+        vec!["_HUGE"]
+    };
+    let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
+    adv_win32::msvcrt::register(&mut registry);
+    assert!(registry.signature_conflicts().is_empty());
+    let signature = adv_abi::signature::lookup(module, "_HUGE").unwrap();
+    assert_eq!(signature.data_size, Some(8));
+    assert_eq!(signature.return_kind, adv_abi::AbiKind::F64);
+    assert!(!signature.callable());
+    let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    Win32::install(
+        &mut m,
+        Win32Config::new(
+            "/nonexistent/crt-number-data",
+            "data.exe",
+            "/nonexistent/crt-number-profile",
+        ),
+    )
+    .unwrap();
+    let id = m
+        .load(&File(fixture::image(module, &names)), "data.exe")
+        .unwrap();
+    let cell = m.cpu.read_u32(fixture::IAT).unwrap();
+    assert_eq!(
+        adv_abi::GuestPtr::<u64>::new(cell).read(&m.cpu).unwrap(),
+        f64::INFINITY.to_bits()
+    );
+    assert!(m.cpu.accessible(cell, 8, Prot::RW));
+    assert!(!m.cpu.accessible(cell, 8, Prot::EXEC));
+    if adjusted {
+        let adjust = m.cpu.read_u32(fixture::IAT + 4).unwrap();
+        assert_ne!(cell, adjust);
+        assert_eq!(m.cpu.read_u32(adjust).unwrap(), 0);
+    }
+    let module_id = adv_os::modules(&m.ext).by_name(module).unwrap();
+    let base = adv_os::modules(&m.ext).get(module_id).base;
+    let lookup = m.resolve_import("kernel32.dll", "GetProcAddress").unwrap();
+    let load = m.resolve_import("kernel32.dll", "LoadLibraryA").unwrap();
+    let other = if module == "msvcr90.dll" {
+        "msvcrt.dll"
+    } else {
+        "msvcr90.dll"
+    };
+    m.cpu
+        .write(fixture::OUTPUT + 128, format!("{other}\0").as_bytes())
+        .unwrap();
+    let value = 42.5_f64.to_bits();
+    let mut a = Asm::new(fixture::ENTRY);
+    a.push_imm(fixture::name(0))
+        .push_imm(base)
+        .call(lookup)
+        .mov_mem_eax(fixture::OUTPUT);
+    // Guest writes the actual exported object; no host-side descriptor refresh
+    // is allowed to replace it with its initial infinity value on lookup.
+    a.bytes.extend_from_slice(&[0xc7, 0]);
+    a.bytes.extend_from_slice(&(value as u32).to_le_bytes());
+    a.bytes.extend_from_slice(&[0xc7, 0x40, 4]);
+    a.bytes
+        .extend_from_slice(&((value >> 32) as u32).to_le_bytes());
+    a.push_imm(fixture::name(0))
+        .push_imm(base)
+        .call(lookup)
+        .mov_mem_eax(fixture::OUTPUT + 4);
+    a.push_imm(fixture::OUTPUT + 128).call(load);
+    a.push_imm(fixture::name(0))
+        .push_eax()
+        .call(lookup)
+        .mov_mem_eax(fixture::OUTPUT + 8);
+    a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+    m.cpu.write(fixture::ENTRY, &a.bytes).unwrap();
+    m.start_process(id).unwrap();
+    let result = m.run_virtual(1_000_000);
+    assert!(
+        matches!(result, RunResult::Exited(0)),
+        "{module}: {result:?}"
+    );
+    assert_eq!(m.cpu.read_u32(fixture::OUTPUT).unwrap(), cell);
+    assert_eq!(m.cpu.read_u32(fixture::OUTPUT + 4).unwrap(), cell);
+    assert_eq!(
+        adv_abi::GuestPtr::<u64>::new(cell).read(&m.cpu).unwrap(),
+        value
+    );
+    let other_cell = m.cpu.read_u32(fixture::OUTPUT + 8).unwrap();
+    assert_ne!(other_cell, cell);
+    assert_eq!(
+        adv_abi::GuestPtr::<u64>::new(other_cell)
+            .read(&m.cpu)
+            .unwrap(),
+        f64::INFINITY.to_bits()
+    );
+    assert!(
+        !m.sys
+            .thunks
+            .iter()
+            .any(|(_, thunk)| thunk.module == module && names.contains(&thunk.name.as_str()))
+    );
+}
+
+// spec: PERS-EXPORT-6, PERS-CRT-6
+#[test]
+fn every_legacy_runtime_exports_real_double_and_fdiv_data_cells() {
+    for module in [
+        "msvcrt20.dll",
+        "msvcrt40.dll",
+        "msvcrt.dll",
+        "msvcr70.dll",
+        "msvcr71.dll",
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
+    ] {
+        for jit in [false, true] {
+            numeric_cells(JitCpu::new(PARK_ADDR, jit).unwrap(), module);
+        }
+        numeric_cells(UnicornCpu::new(PARK_ADDR).unwrap(), module);
+    }
 }
