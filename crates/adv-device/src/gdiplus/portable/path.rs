@@ -11,6 +11,17 @@ pub(in crate::gdiplus) struct Path {
     closed: bool,
 }
 impl Path {
+    pub fn transformed(&self, matrix: super::matrix::Matrix) -> Self {
+        let [a, b, c, d, x, y] = matrix.0;
+        let transform = zeno::Transform::new(a, b, c, d, x, y);
+        let mut path = self.clone();
+        for command in &mut path.commands {
+            *command = command.transform(&transform);
+        }
+        path.current = path.current.map(|point| transform.transform_point(point));
+        path.start = path.start.map(|point| transform.transform_point(point));
+        path
+    }
     pub fn new(mode: i32) -> Result<Self, i32> {
         if !(0..=1).contains(&mode) {
             return Err(2);

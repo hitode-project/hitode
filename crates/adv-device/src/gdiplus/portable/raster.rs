@@ -7,6 +7,34 @@ pub(super) fn execute(
     operation: Op<'_>,
 ) -> Result<Reply, i32> {
     match operation {
+        Op::World(value) => {
+            if let Some(matrix) = value {
+                if !matrix.invertible() {
+                    return Err(2);
+                }
+                if let Data::Graphics(g) = &mut *object.data.lock().map_err(|_| 1)? {
+                    g.world = matrix;
+                }
+                return Ok(Reply::None);
+            }
+            return Ok(Reply::Matrix(graphics.world));
+        }
+        Op::ComposeWorld(matrix, prepend) => {
+            if !matrix.finite() {
+                return Err(2);
+            }
+            let next = if prepend {
+                matrix.multiply(graphics.world)
+            } else {
+                graphics.world.multiply(matrix)
+            };
+            if !next.invertible() {
+                return Err(2);
+            }
+            if let Data::Graphics(g) = &mut *object.data.lock().map_err(|_| 1)? {
+                g.world = next;
+            }
+        }
         Op::Clip(rectangles) => {
             if rectangles.iter().flatten().any(|v| !v.is_finite()) {
                 return Err(2);
@@ -49,7 +77,7 @@ pub(super) fn execute(
                 _ => return Err(2),
             };
             let path = match &*path.data.lock().map_err(|_| 1)? {
-                Data::Path(p) => p.clone(),
+                Data::Path(p) => p.transformed(graphics.world),
                 _ => return Err(2),
             };
             let (width, height) = dimensions(&graphics)?;
@@ -86,9 +114,13 @@ pub(super) fn execute(
             if dw == 0. || dh == 0. {
                 return Ok(Reply::None);
             }
+            let Some(inverse) = graphics.world.inverse() else {
+                return Ok(Reply::None);
+            };
             paint(&graphics, |x, y| {
-                let u = (x as f32 + 0.5 - dx) / dw;
-                let v = (y as f32 + 0.5 - dy) / dh;
+                let [px, py] = inverse.point([x as f32 + 0.5, y as f32 + 0.5], false);
+                let u = (px - dx) / dw;
+                let v = (py - dy) / dh;
                 if !(0. ..1.).contains(&u) || !(0. ..1.).contains(&v) {
                     return None;
                 }

@@ -140,9 +140,19 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-8 GDI+ affine matrices
 
-**Rule**: Matrices MUST compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
+**Rule**: Matrices MUST retain IEEE nonfinite coefficients and compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
 **Verification**: Test
 **Basis**: [MatrixOrder](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-matrixorder).
+
+### DEV-IMAGE-9 GDI+ solid brush state
+
+**Rule**: Solid brush color changes MUST affect subsequent drawing. Cloned brushes MUST retain independent colors, and color access MUST reject non-solid receivers.
+**Verification**: Test
+
+### DEV-IMAGE-10 GDI+ world transforms
+
+**Rule**: Graphics world matrices MUST transform path and image drawing. Setting and querying world matrices MUST copy their values without sharing subsequent mutations. Singular world transforms MUST fail without changing graphics state.
+**Verification**: Test
 
 ## Audio ownership
 

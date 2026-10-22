@@ -2,6 +2,7 @@
 use super::*;
 use std::ffi::c_void;
 use windows_sys::Win32::Graphics::{Gdi as gdi, GdiPlus as gp};
+mod world;
 const ARGB: i32 = 0x26200a;
 fn status(result: i32) -> Result<(), i32> {
     if result == 0 { Ok(()) } else { Err(result) }
@@ -390,6 +391,37 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
     // buffers before calling the flat system API. Output structs stay private.
     unsafe {
         match operation {
+            Op::World(value) => {
+                require(object, Kind::Graphics)?;
+                match value {
+                    Some(matrix) => world::set(p, matrix),
+                    None => world::get(p),
+                }
+            }
+            Op::ComposeWorld(matrix, prepend) => {
+                require(object, Kind::Graphics)?;
+                world::compose(p, matrix, prepend)
+            }
+            Op::BrushType => {
+                let pointer = brush(object)?;
+                let mut kind = 0;
+                status(gp::GdipGetBrushType(pointer.cast(), &mut kind))?;
+                Ok(Reply::Count(kind))
+            }
+            Op::SolidColor(value) => {
+                let pointer = brush(object)?;
+                let mut kind = 0;
+                status(gp::GdipGetBrushType(pointer.cast(), &mut kind))?;
+                if kind != 0 {
+                    return Err(2);
+                }
+                if let Some(color) = value {
+                    status(gp::GdipSetSolidFillColor(pointer.cast(), color))?;
+                }
+                let mut color = 0;
+                status(gp::GdipGetSolidFillColor(pointer.cast(), &mut color))?;
+                Ok(Reply::Count(color as i32))
+            }
             Op::Pixels => Ok(Reply::Pixels(pixel_transfer(object, None)?)),
             Op::Upload(bytes) => {
                 pixel_transfer(object, Some(bytes))?;

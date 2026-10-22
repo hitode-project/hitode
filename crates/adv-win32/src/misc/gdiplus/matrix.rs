@@ -22,16 +22,16 @@ fn update(env: &Env<'_>, handle: u32, change: impl FnOnce(Matrix) -> Result<Matr
         let object = get(env, handle)?;
         let mut matrix = object.value.lock().map_err(|_| 1)?;
         let next = change(*matrix)?;
-        if !next.finite() {
-            return Err(11);
-        }
         *matrix = next;
         Ok(())
     })();
     result.err().unwrap_or(0)
 }
+pub(super) fn assign(env: &Env<'_>, handle: u32, matrix: Matrix) -> i32 {
+    update(env, handle, |_| Ok(matrix))
+}
 fn create(env: &mut Env<'_>, matrix: Matrix, out: GuestPtr<()>) -> Outcome {
-    if !clear(env, out.addr()) || !matrix.finite() {
+    if !clear(env, out.addr()) {
         return Outcome::Return(2);
     }
     let result = runtime(env).map(|runtime| {
@@ -166,9 +166,6 @@ fn write(
     y: f32,
 ) -> i32 {
     let next = Matrix([a, b, c, d, x, y]);
-    if !next.finite() {
-        return 2;
-    }
     update(env, matrix.addr(), |_| Ok(next))
 }
 fn query(

@@ -29,6 +29,7 @@ pub(super) struct Graphics {
     smoothing: i32,
     text_hint: i32,
     pixel_offset: i32,
+    world: matrix::Matrix,
 }
 
 pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<Object>, i32> {
@@ -65,6 +66,7 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
                     smoothing: 0,
                     text_hint: 0,
                     pixel_offset: 0,
+                    world: matrix::Matrix::IDENTITY,
                 }),
                 Some(image),
             )
@@ -112,6 +114,13 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
     }
     let mut data = object.data.lock().map_err(|_| 1)?;
     match (&mut *data, operation) {
+        (Data::Solid(_), Op::BrushType) => Ok(Reply::Count(0)),
+        (Data::Solid(color), Op::SolidColor(value)) => {
+            if let Some(value) = value {
+                *color = value;
+            }
+            Ok(Reply::Count(*color as i32))
+        }
         (Data::Image { pixels, .. }, Op::Pixels) => Ok(Reply::Pixels(pixels.clone())),
         (Data::Image { pixels, .. }, Op::Upload(bytes)) if pixels.len() == bytes.len() => {
             pixels.copy_from_slice(bytes);

@@ -2,7 +2,7 @@
 use super::*;
 
 fn combine(env: &Env<'_>, handle: u32, other: Matrix, order: i32) -> i32 {
-    if !(0..=1).contains(&order) || !other.finite() {
+    if !(0..=1).contains(&order) {
         return 2;
     }
     update(env, handle, |matrix| {
@@ -34,9 +34,6 @@ fn scale(env: &mut Env<'_>, matrix: GuestPtr<()>, x: f32, y: f32, order: i32) ->
 }
 #[win32(gdiplus, name = "GdipRotateMatrix", level = implement)]
 fn rotate(env: &mut Env<'_>, matrix: GuestPtr<()>, angle: f32, order: i32) -> i32 {
-    if !angle.is_finite() {
-        return 2;
-    }
     let (sin, cos) = f64::from(angle).to_radians().sin_cos();
     combine(
         env,

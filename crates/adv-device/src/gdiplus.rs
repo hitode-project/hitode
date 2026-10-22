@@ -95,8 +95,13 @@ pub enum Op<'a> {
     Smoothing(i32),
     TextHint(i32),
     PixelOffset(Option<i32>),
+    BrushType,
+    SolidColor(Option<u32>),
+    World(Option<matrix::Matrix>),
+    ComposeWorld(matrix::Matrix, bool),
 }
 pub enum Reply {
+    Matrix(matrix::Matrix),
     None,
     Pixels(Vec<u8>),
     Size(u32, u32),

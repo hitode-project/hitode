@@ -11,8 +11,14 @@ use adv_win32::{Win32, Win32Config};
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const REF: u32 = 0x7fab_0000;
+#[path = "gdiplus_portable/brush.rs"]
+mod brush;
 #[path = "gdiplus_portable/matrix.rs"]
 mod matrix;
+#[path = "gdiplus_portable/matrix_nonfinite.rs"]
+mod matrix_nonfinite;
+#[path = "gdiplus_portable/world.rs"]
+mod world;
 
 struct Fixture<B: Backend> {
     machine: Machine<B>,

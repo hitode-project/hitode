@@ -200,7 +200,26 @@ pub(super) fn register(registry: &mut Registry) {
         set_flags_ABI,
         pixel_offset_ABI,
         set_pixel_offset_ABI,
+        brush_type_ABI,
+        solid_color_ABI,
+        set_solid_color_ABI,
     ] {
         registry.register(api);
     }
+}
+
+#[win32(gdiplus, name = "GdipGetBrushType", level = implement)]
+fn brush_type(env: &mut Env<'_>, brush: GuestPtr<()>, out: GuestPtr<i32>) -> i32 {
+    property(env, brush.addr(), out, Op::BrushType)
+}
+#[win32(gdiplus, name = "GdipGetSolidFillColor", level = implement)]
+fn solid_color(env: &mut Env<'_>, brush: GuestPtr<()>, out: GuestPtr<u32>) -> i32 {
+    property(env, brush.addr(), out.cast(), Op::SolidColor(None))
+}
+#[win32(gdiplus, name = "GdipSetSolidFillColor", level = implement)]
+fn set_solid_color(env: &mut Env<'_>, brush: GuestPtr<()>, color: u32) -> Outcome {
+    result(
+        object(env, brush.addr()).and_then(|brush| brush.execute(Op::SolidColor(Some(color)))),
+        env,
+    )
 }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod front;
 mod matrix;
 mod properties;
+mod world;
 const INVALID: i32 = 2;
 const NOT_IMPLEMENTED: i32 = 6;
 const MAX_BYTES: usize = adv_device::image::LIMIT;
