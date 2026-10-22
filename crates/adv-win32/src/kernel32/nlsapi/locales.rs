@@ -110,6 +110,16 @@ pub(in crate::kernel32) fn put(
     capacity: u32,
     wide: bool,
 ) -> Outcome {
+    put_with_cp(env, text, output, capacity, wide, 0)
+}
+fn put_with_cp(
+    env: &mut Env<'_>,
+    text: &str,
+    output: u32,
+    capacity: u32,
+    wide: bool,
+    codepage: u32,
+) -> Outcome {
     if (capacity as i32) < 0 {
         return fail(env, 87);
     }
@@ -119,7 +129,12 @@ pub(in crate::kernel32) fn put(
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>()
     } else {
-        let mut bytes = env.ext.get::<Win32>().codec.encode(text);
+        let mut bytes = env
+            .ext
+            .get::<Win32>()
+            .codec
+            .from_utf16(codepage, &text.encode_utf16().collect::<Vec<_>>())
+            .0;
         bytes.push(0);
         bytes
     };
@@ -136,6 +151,87 @@ pub(in crate::kernel32) fn put(
     let _ = env.cpu.write(output, &bytes);
     Outcome::Return(needed)
 }
+pub(in crate::kernel32) fn day_name(locale: Locale, day: usize, short: bool) -> String {
+    let day = day % 7;
+    match locale.id & 0x3ff {
+        0x11 => {
+            let text = [
+                "日曜日",
+                "月曜日",
+                "火曜日",
+                "水曜日",
+                "木曜日",
+                "金曜日",
+                "土曜日",
+            ][day];
+            if short {
+                text.chars().take(1).collect()
+            } else {
+                text.into()
+            }
+        }
+        4 => {
+            let text = [
+                "星期日",
+                "星期一",
+                "星期二",
+                "星期三",
+                "星期四",
+                "星期五",
+                "星期六",
+            ][day];
+            if short {
+                text.replace("星期", "周")
+            } else {
+                text.into()
+            }
+        }
+        _ => {
+            let text = [
+                "Sunday",
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+            ][day];
+            if short { text[..3].into() } else { text.into() }
+        }
+    }
+}
+pub(in crate::kernel32) fn month_name(locale: Locale, month: u32, short: bool) -> String {
+    if !(1..=12).contains(&month) {
+        return String::new();
+    }
+    match (locale.id & 0x3ff, short) {
+        (0x11, true) => month.to_string(),
+        (0x11, false) | (4, true) => format!("{month}月"),
+        (4, false) => format!(
+            "{}月",
+            [
+                "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"
+            ][month as usize - 1]
+        ),
+        _ => {
+            let text = [
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December",
+            ][month as usize - 1];
+            if short { text[..3].into() } else { text.into() }
+        }
+    }
+}
 pub(in crate::kernel32) fn info(locale: Locale, kind: u32) -> Option<String> {
     let index = match locale.id {
         0x409 | 9 => 0,
@@ -144,6 +240,13 @@ pub(in crate::kernel32) fn info(locale: Locale, kind: u32) -> Option<String> {
         0x7f => 3,
         _ => return None,
     };
+    match kind {
+        0x2a..=0x30 => return Some(day_name(locale, ((kind - 0x2a + 1) % 7) as usize, false)),
+        0x31..=0x37 => return Some(day_name(locale, ((kind - 0x31 + 1) % 7) as usize, true)),
+        0x38..=0x43 => return Some(month_name(locale, kind - 0x38 + 1, false)),
+        0x44..=0x4f => return Some(month_name(locale, kind - 0x44 + 1, true)),
+        _ => (),
+    }
     let values = match kind {
         1 => return Some(format!("{:04x}", locale.id)),
         3 => ["ENU", "JPN", "CHS", "IVL"],
@@ -219,7 +322,14 @@ pub(in crate::kernel32) fn query(env: &mut Env<'_>, wide: bool, named: bool) -> 
         return fail(env, 1004);
     };
     if kind & 0x20000000 == 0 {
-        return put(env, &text, env.arg(2), env.arg(3), wide);
+        return put_with_cp(
+            env,
+            &text,
+            env.arg(2),
+            env.arg(3),
+            wide,
+            if kind & 0x40000000 != 0 { 0 } else { locale.cp },
+        );
     }
     let Ok(number) = u32::from_str_radix(&text, if kind & 0xffff == 1 { 16 } else { 10 }) else {
         return fail(env, 1004);

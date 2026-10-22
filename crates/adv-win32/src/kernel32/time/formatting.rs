@@ -5,61 +5,8 @@ use adv_abi::{AnsiStr, WideStr, guest::check_range};
 use adv_cpu::backend::Prot;
 /// Expand a GetDateFormat/GetTimeFormat picture over SYSTEMTIME `st` (year, month, weekday,
 /// day, hour, minute, second, ms), using localized Gregorian names.
-fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale) -> Vec<u16> {
-    const DAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
-    const MONTHS: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
+fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale, time: bool) -> Vec<u16> {
     let [year, month, wday, day, hour, minute, second, _] = st.map(u32::from);
-    let day_name = if locale.id == 0x411 {
-        [
-            "日曜日",
-            "月曜日",
-            "火曜日",
-            "水曜日",
-            "木曜日",
-            "金曜日",
-            "土曜日",
-        ][wday as usize % 7]
-            .to_owned()
-    } else if locale.id == 0x804 {
-        [
-            "星期日",
-            "星期一",
-            "星期二",
-            "星期三",
-            "星期四",
-            "星期五",
-            "星期六",
-        ][wday as usize % 7]
-            .to_owned()
-    } else {
-        DAYS[wday as usize % 7].to_owned()
-    };
-    let month_name = if matches!(locale.id, 0x411 | 0x804) {
-        format!("{month}月")
-    } else {
-        MONTHS[(month as usize + 11) % 12].to_owned()
-    };
     let mut out = String::new();
     let mut i = 0;
     while i < pic.len() {
@@ -74,7 +21,14 @@ fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale) -> Vec<u16> {
             }
         };
         let h12 = if hour % 12 == 0 { 12 } else { hour % 12 };
-        match char::from_u32(u32::from(c)).unwrap_or('\u{fffd}') {
+        let character = char::from_u32(u32::from(c)).unwrap_or('\u{fffd}');
+        if time && matches!(character, 'd' | 'M' | 'y' | 'g')
+            || !time && matches!(character, 'h' | 'H' | 'm' | 's' | 't')
+        {
+            out.extend(std::iter::repeat_n(character, run));
+            continue;
+        }
+        match character {
             '\'' => {
                 // Quoted text; a doubled quote inside (or as the whole run) is one quote.
                 i -= run - 1;
@@ -100,29 +54,15 @@ fn format_picture(pic: &[u16], st: [u16; 8], locale: Locale) -> Vec<u16> {
             'd' => {
                 out += &match run {
                     1 | 2 => num(day, run == 2),
-                    3 => {
-                        if locale.id == 0x411 {
-                            day_name.chars().take(1).collect()
-                        } else if locale.id == 0x804 {
-                            day_name.replace("星期", "周")
-                        } else {
-                            day_name[..3].to_owned()
-                        }
-                    }
-                    _ => day_name.clone(),
+                    3 => locales::day_name(locale, wday as usize, true),
+                    _ => locales::day_name(locale, wday as usize, false),
                 }
             }
             'M' => {
                 out += &match run {
                     1 | 2 => num(month, run == 2),
-                    3 => {
-                        if matches!(locale.id, 0x411 | 0x804) {
-                            month_name.clone()
-                        } else {
-                            month_name[..3].to_owned()
-                        }
-                    }
-                    _ => month_name.clone(),
+                    3 => locales::month_name(locale, month, true),
+                    _ => locales::month_name(locale, month, false),
                 }
             }
             'y' => {
@@ -251,7 +191,7 @@ fn query(env: &mut Env<'_>, time: bool, wide: bool, named: bool) -> Outcome {
         }
         text.encode_utf16().collect()
     };
-    let out = format_picture(&picture, st, locale);
+    let out = format_picture(&picture, st, locale, time);
     locales::put(
         env,
         &String::from_utf16_lossy(&out),

@@ -12,6 +12,7 @@ struct Enumeration {
     wide: bool,
     extended: bool,
     param: u32,
+    codepage: u32,
 }
 fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
     let Some((row, flags)) = state.rows.pop_front() else {
@@ -23,7 +24,12 @@ fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>()
     } else {
-        let mut bytes = env.ext.get::<crate::Win32>().codec.encode(&row);
+        let mut bytes = env
+            .ext
+            .get::<crate::Win32>()
+            .codec
+            .from_utf16(state.codepage, &row.encode_utf16().collect::<Vec<_>>())
+            .0;
         bytes.push(0);
         bytes
     };
@@ -42,7 +48,13 @@ fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
         }
     })
 }
-fn start(env: &mut Env<'_>, rows: Vec<(String, u32)>, wide: bool, extended: bool) -> Outcome {
+fn start(
+    env: &mut Env<'_>,
+    rows: Vec<(String, u32)>,
+    wide: bool,
+    extended: bool,
+    codepage: u32,
+) -> Outcome {
     let callback = env.arg(0);
     if callback == 0 {
         return locales::fail(env, 87);
@@ -68,6 +80,7 @@ fn start(env: &mut Env<'_>, rows: Vec<(String, u32)>, wide: bool, extended: bool
             wide,
             extended,
             param: if extended { env.arg(2) } else { 0 },
+            codepage,
         },
     )
 }
@@ -82,7 +95,7 @@ fn system(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
         }
         let category = flags & 0xf;
         if category != 0 && category & 1 == 0 {
-            return start(env, Vec::new(), true, true);
+            return start(env, Vec::new(), true, true, 0);
         }
         let selection = flags & 0x30;
         let rows = NEUTRAL_LOCALES
@@ -92,7 +105,7 @@ fn system(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
             .filter(|(_, kind)| selection == 0 || selection & kind & 0x30 != 0)
             .map(|(l, kind)| (l.name.to_owned(), kind))
             .collect();
-        return start(env, rows, true, true);
+        return start(env, rows, true, true, 0);
     }
     if !matches!(flags, 0..=2) {
         return locales::fail(env, 1004);
@@ -102,7 +115,7 @@ fn system(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
         .filter(|l| l.id != 0x7f)
         .map(|l| (format!("{:08X}", l.id), 0))
         .collect();
-    start(env, rows, wide, false)
+    start(env, rows, wide, false, 0)
 }
 fn calendar(env: &mut Env<'_>) -> Outcome {
     let locale = match locales::by_id(env, env.arg(1)) {
@@ -142,6 +155,12 @@ fn calendar(env: &mut Env<'_>) -> Outcome {
         .into(),
         5 => locales::info(locale, 0x1f).expect("short date"),
         6 => locales::info(locale, 0x20).expect("long date"),
+        7..=0xd => locales::day_name(locale, ((kind & 0xff) - 6) as usize, false),
+        0xe..=0x14 => locales::day_name(locale, ((kind & 0xff) - 0xd) as usize, true),
+        0x15..=0x20 => locales::month_name(locale, (kind & 0xff) - 0x14, false),
+        0x22..=0x2d => locales::month_name(locale, (kind & 0xff) - 0x21, true),
+        0x21 | 0x2e => String::new(),
+        0x2f => locales::info(locale, 0x1006).expect("year month"),
         0x30 => "2029".into(),
         _ => {
             adv_abi::warn_unavailable(
@@ -152,7 +171,7 @@ fn calendar(env: &mut Env<'_>) -> Outcome {
             return locales::fail(env, 1004);
         }
     };
-    start(env, vec![(text, 0)], false, false)
+    start(env, vec![(text, 0)], false, false, locale.cp)
 }
 pub(super) fn register(registry: &mut Registry) {
     crate::stdcall(registry, super::K32, "EnumSystemLocalesA", 2, |e| {

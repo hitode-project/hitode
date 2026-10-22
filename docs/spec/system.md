@@ -213,7 +213,7 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 **Rule**: Named and LCID date/time formatters MUST share Gregorian date validation, locale names and encoded output negotiation. Date formatting MUST derive the weekday from the supplied date. Failed formatting MUST preserve output bytes.
 **Verification**: Test
-**Basis**: Microsoft GetDateFormatEx and GetTimeFormatEx contracts.
+**Basis**: Microsoft GetDateFormatEx and GetTimeFormatEx contracts; authored fixed-locale native picture controls.
 
 ### SYS-CORE-2 UTC to local conversion
 

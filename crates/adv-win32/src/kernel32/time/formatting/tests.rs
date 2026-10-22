@@ -151,3 +151,23 @@ fn named_and_legacy_formatting_share_localized_gregorian_data_on_three_backends(
     }
     run(UnicornCpu::new(PARK_ADDR).unwrap());
 }
+
+#[test]
+// spec: SYS-NLS-3
+fn month_and_weekday_forms_match_authored_native_controls() {
+    let picture = "dddd MMMM MMM d".encode_utf16().collect::<Vec<_>>();
+    for (id, expected) in [
+        (0x409, "Thursday February Feb 29"),
+        (0x411, "木曜日 2月 2 29"),
+        (0x804, "星期四 二月 2月 29"),
+        (0x7f, "Thursday February Feb 29"),
+    ] {
+        let locale = locales::LOCALES
+            .iter()
+            .find(|l| l.id == id)
+            .copied()
+            .unwrap();
+        let actual = format_picture(&picture, [2024, 2, 4, 29, 13, 4, 5, 0], locale, false);
+        assert_eq!(String::from_utf16(&actual).unwrap(), expected);
+    }
+}
