@@ -53,7 +53,9 @@ stack widths for the DLL scope. It distinguishes parameter count from stack word
 `SetFilePointerEx` has four parameters and five words. Architecture attributes are
 filtered before type projection. Conflicting signatures stop generation.
 `structs.rs` contains the initial generated Pod structures, plus size, alignment and
-field-offset assertions. `com.tsv` flattens inherited COM slots, including guest
+field-offset assertions, including the by-value `BLENDFUNCTION` and gradient mesh records.
+The supplemental binary64 validation accepts the existing `pow` and `_hypot` declarations with two double-width x86 arguments.
+`com.tsv` flattens inherited COM slots, including guest
 `this`, for DDraw, DSound, DInput, D3D9 and DirectShow. `constants.tsv` preserves the referenced enum
 and flag values. The package and WinMD remain in `target/tmp/abi-metadata` only.
 

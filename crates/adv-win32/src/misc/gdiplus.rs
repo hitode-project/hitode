@@ -10,6 +10,10 @@ use adv_machine::{Env, Namespace, Outcome};
 use adv_os::{Heaps, com::task_alloc, gdi::GdiObj};
 use std::sync::Arc;
 mod front;
+mod matrix;
+mod properties;
+mod string_format;
+mod world;
 const INVALID: i32 = 2;
 const NOT_IMPLEMENTED: i32 = 6;
 const MAX_BYTES: usize = adv_device::image::LIMIT;
@@ -36,6 +40,7 @@ enum Value {
     Object(Arc<Object>),
     Image(Arc<Image>),
     Graphics(Graphics),
+    Matrix(Arc<matrix::MatrixOwner>),
 }
 #[derive(Default)]
 struct State {
@@ -125,6 +130,7 @@ fn clear(env: &mut Env<'_>, out: u32) -> bool {
 fn publish(env: &mut Env<'_>, out: u32, value: Result<Value, i32>) -> Outcome {
     let value = match value {
         Ok(v) => v,
+        Err(6) => return missing_device_operation(env),
         Err(status) => return Outcome::Return(status as u32),
     };
     let Some(handle) = insert(env, value) else {
@@ -155,8 +161,19 @@ fn fail(env: &mut Env<'_>, api: &str, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, api, reason);
     Outcome::Return(NOT_IMPLEMENTED as u32)
 }
-fn result(result: Result<Reply, i32>) -> Outcome {
-    Outcome::Return(result.map_or_else(|v| v as u32, |_| 0))
+fn missing_device_operation(env: &mut Env<'_>) -> Outcome {
+    let api = format!("gdiplus.dll!{}", env.sys.thunks.get(env.thunk).name);
+    fail(
+        env,
+        &api,
+        "the GDI+ device backend does not implement this operation",
+    )
+}
+fn result(result: Result<Reply, i32>, env: &mut Env<'_>) -> Outcome {
+    match result {
+        Err(6) => missing_device_operation(env),
+        other => Outcome::Return(other.map_or_else(|v| v as u32, |_| 0)),
+    }
 }
 fn units(env: &Env<'_>, pointer: u32, length: i32) -> Result<Vec<u16>, i32> {
     if pointer == 0 || !(-1..=16384).contains(&length) {
@@ -357,7 +374,11 @@ fn draw(env: &mut Env<'_>, handle: u32, operation: Op<'_>) -> Outcome {
         Err(v) => return Outcome::Return(v as u32),
     };
     if let Err(v) = g.object.execute(operation) {
-        return Outcome::Return(v as u32);
+        return if v == 6 {
+            missing_device_operation(env)
+        } else {
+            Outcome::Return(v as u32)
+        };
     }
     if let Some(dc) = g.dc {
         let (target, s) = match surface(env, dc) {
