@@ -3,6 +3,7 @@
 mod activation;
 pub(crate) mod atom;
 pub(crate) mod child_process;
+mod console;
 mod environment;
 mod exception;
 pub(crate) use exception::install as install_exceptions;
@@ -73,6 +74,7 @@ pub fn register(reg: &mut Registry) {
     registered_wait::register(reg);
     atom::register(reg);
     child_process::register(reg);
+    console::register(reg);
     environment::register(reg);
     exception::register(reg);
     file::register(reg);

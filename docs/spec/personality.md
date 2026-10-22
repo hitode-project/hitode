@@ -248,3 +248,21 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: PSAPI and K32 aliases MUST query the existing guest process, Loader and section owners. Module queries MUST enforce process query and VM-read rights, including local real handles. Reported paths MUST use owned LDR names or section paths and the same device mapping as QueryDosDevice.
 **Verification**: Test
+
+## Detached console
+
+### PERS-CONSOLE-1 Absent console handles
+
+**Rule**: Console input, output and buffer configuration MUST fail with ERROR_INVALID_HANDLE when no console is attached. Redirected standard streams MUST NOT constitute console buffers. Ordinary detached-console failures MUST NOT report capability gaps.
+**Verification**: Test
+
+### PERS-CONSOLE-2 Process control handlers
+
+**Rule**: SetConsoleCtrlHandler MUST maintain the process handler table and CTRL+C ignore attribute independently of console attachment. Removing an absent handler MUST fail. FreeConsole MUST succeed while detached and reset process control handlers.
+**Verification**: Test
+**Basis**: Microsoft FreeConsole and SetConsoleCtrlHandler documentation.
+
+### PERS-CONSOLE-3 Console creation capability
+
+**Rule**: AllocConsole MUST fail and report a capability gap when no host console transport is provided. It MUST NOT publish a console window or valid console handles.
+**Verification**: Test

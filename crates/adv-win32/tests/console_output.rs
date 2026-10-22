@@ -2,7 +2,7 @@
 use adv_abi::{ApiDiagnostics, Registry, RunMode};
 use adv_cpu::{
     JitCpu,
-    backend::{Guest, GuestExt, Prot, asm::Asm},
+    backend::{Backend, GuestExt, Prot, asm::Asm},
 };
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_win32::{Win32, Win32Config};
@@ -10,7 +10,7 @@ use adv_win32::{Win32, Win32Config};
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 
-fn call(machine: &mut Machine<JitCpu>, code: &mut Asm, name: &str, args: &[u32], out: u32) {
+fn call<B: Backend>(machine: &mut Machine<B>, code: &mut Asm, name: &str, args: &[u32], out: u32) {
     for arg in args.iter().rev() {
         code.push_imm(*arg);
     }
@@ -20,17 +20,11 @@ fn call(machine: &mut Machine<JitCpu>, code: &mut Asm, name: &str, args: &[u32],
     }
 }
 
-#[test]
-fn ansi_and_wide_console_writes_report_every_character_written() {
+fn writes<B: Backend>(cpu: B) {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
     registry.set_mode(RunMode::Strict);
-    let mut machine = Machine::new(
-        JitCpu::new(PARK_ADDR, false).unwrap(),
-        registry,
-        Clock::virtual_time(),
-    )
-    .unwrap();
+    let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
     Win32::install(
         &mut machine,
         Win32Config::new(
@@ -83,18 +77,37 @@ fn ansi_and_wide_console_writes_report_every_character_written() {
             .unwrap(),
     );
     code.mov_mem_eax(DATA + 20);
+    call(&mut machine, &mut code, "GetLastError", &[], DATA + 24);
     call(&mut machine, &mut code, "ExitProcess", &[0], 0);
     machine.cpu.write(CODE, &code.bytes).unwrap();
     machine.spawn("console fixture", CODE, &[], 65536).unwrap();
     let result = machine.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     for (out, value) in [
-        (DATA + 8, 7),
-        (DATA + 12, 7),
-        (DATA + 16, 1),
-        (DATA + 20, 1),
+        (DATA + 8, 0),
+        (DATA + 12, 0),
+        (DATA + 16, 0),
+        (DATA + 20, 0),
+        (DATA + 24, 6),
     ] {
         assert_eq!(machine.cpu.read_u32(out).unwrap(), value, "{out:#x}");
     }
     assert_eq!(machine.ext.get::<ApiDiagnostics>().stub_calls, 0);
+    assert!(
+        machine
+            .ext
+            .get::<ApiDiagnostics>()
+            .acceptance_eligible(RunMode::Strict)
+    );
+}
+
+#[test]
+// spec: PERS-CONSOLE-1
+fn ansi_and_wide_console_writes_fail_without_an_attached_console() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        writes(cpu);
+    }
+    writes(adv_unicorn::UnicornCpu::new(PARK_ADDR).unwrap());
 }

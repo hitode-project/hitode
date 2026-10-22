@@ -1788,23 +1788,4 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "WritePrivateProfileStringW", 4, |env| {
         write_private_profile_string(env, true)
     });
-    stdcall(reg, K32, "WriteConsoleA", 5, |e| {
-        let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
-        let mut data = vec![0u8; n as usize];
-        let _ = e.cpu.read(buf, &mut data);
-        let s = e.ext.get::<Win32>().codec.decode(&data);
-        log::info!("[guest console] {}", s.trim_end());
-        out_u32(e.cpu, written, n);
-        Outcome::Return(1)
-    });
-    stdcall(reg, K32, "WriteConsoleW", 5, |e| {
-        let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
-        let u = crate::util::units_or_wstr(e.cpu, buf, n as i32);
-        log::info!(
-            "[guest console] {}",
-            String::from_utf16_lossy(&u).trim_end()
-        );
-        out_u32(e.cpu, written, n);
-        Outcome::Return(1)
-    });
 }

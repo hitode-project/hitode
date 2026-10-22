@@ -971,25 +971,6 @@ fn get_computer_name(env: &mut Env<'_>, wide: bool) -> Outcome {
     }
 }
 
-fn read_console(env: &mut Env<'_>) -> Outcome {
-    let output = env.arg(3);
-    out_u32(env.cpu, output, 0);
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
-}
-
-fn set_console_cp(env: &mut Env<'_>) -> Outcome {
-    // This personality has no console owner. ACP is process text configuration,
-    // not a console setting, and must not be changed by this failed operation.
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
-}
-
-fn get_console_cp(env: &mut Env<'_>) -> Outcome {
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
-}
-
 /// MAKELONG(minor, major) of the subsystem version in the mapped process
 /// image header, read from guest memory as RtlImageNtHeader does.
 fn get_process_version(env: &mut Env<'_>) -> Outcome {
@@ -1028,12 +1009,6 @@ pub(super) fn register(reg: &mut Registry) {
         out_u32(e.cpu, p, 0);
         Outcome::Return(1)
     });
-    // There is no console: handlers never fire and reads fail.
-    stdcall(reg, K32, "SetConsoleCtrlHandler", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "ReadConsoleW", 5, read_console);
-    stdcall(reg, K32, "ReadConsoleA", 5, read_console);
-    stdcall(reg, K32, "SetConsoleCP", 1, set_console_cp);
-    stdcall(reg, K32, "SetConsoleOutputCP", 1, set_console_cp);
     stdcall(reg, K32, "GetProcessVersion", 1, get_process_version);
     stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
         Outcome::Return(e.sys.pid)
@@ -1088,10 +1063,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetStdHandle", 1, get_std_handle);
     stdcall(reg, K32, "SetStdHandle", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
-    stdcall(reg, K32, "GetConsoleMode", 2, |_| Outcome::Return(0));
-    stdcall(reg, K32, "SetConsoleMode", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "GetConsoleCP", 0, get_console_cp);
-    stdcall(reg, K32, "GetConsoleOutputCP", 0, get_console_cp);
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "CheckRemoteDebuggerPresent", 2, |e| {
         if let Err(error) = super::child_process::process_target(e, e.arg(0), 0x1000) {
