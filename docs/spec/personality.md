@@ -206,3 +206,38 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Verification**: Test
 
 Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
+
+## Cryptography
+
+### PERS-CRYPTO-1 Streaming digests
+
+**Rule**: CryptoAPI MD5, SHA-1, SHA-256, SHA-384 and SHA-512 MUST compute their standard digests across arbitrary input splits. Hash duplication MUST copy an independently writable stream. Successful hash-value retrieval MUST finalize that hash, while size queries and short buffers MUST preserve its stream.
+**Verification**: Test
+**Basis**: RFC 1321, FIPS 180-4, and Microsoft CryptGetHashParam documentation.
+
+### PERS-CRYPTO-2 CSP ownership
+
+**Rule**: CryptoAPI contexts and hashes MUST use typed aliases in the shared Objects owner. Context reference counts MUST control context lifetime. Invalid handles and failed input validation MUST preserve hash state and unrelated output bytes.
+**Verification**: Test
+
+### PERS-CRYPTO-3 Symmetric transforms
+
+**Rule**: CryptoAPI AES-128/192/256, DES, triple DES, RC2 and RC4 MUST perform their specified symmetric transforms. Key duplication MUST preserve an independent cipher state. Size queries and rejected calls MUST NOT advance cipher state.
+**Verification**: Test
+**Basis**: FIPS 197, FIPS 46-3, RFC 2268 and RFC 6229.
+
+### PERS-CRYPTO-4 HMAC and derived session keys
+
+**Rule**: CryptoAPI HMAC MUST compute RFC 2104 with the selected digest and supplied session key. CryptDeriveKey MUST finalize its base hash and use the documented CSP expansion for AES and triple DES. Plaintext key blobs MUST encode and recover the owned key material and export permissions.
+**Verification**: Test
+**Basis**: RFC 2104, RFC 4231 and Microsoft CryptDeriveKey documentation.
+
+### PERS-CRYPTO-5 Random output boundaries
+
+**Rule**: Random APIs MUST fill exactly the requested output range. Zero-length random requests MUST succeed without dereferencing a null buffer. Invalid output ranges MUST preserve guest bytes.
+**Verification**: Test
+
+### PERS-CRYPTO-6 Secure random source
+
+**Rule**: RtlGenRandom, CryptGenRandom and symmetric CryptGenKey MUST use the shared host OS entropy adapter. They MUST NOT substitute a deterministic generator when that source fails.
+**Verification**: Review — platform source selection and cryptographic entropy require review beyond statistical output tests.

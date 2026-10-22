@@ -16,6 +16,7 @@ fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
 }
 
 #[test]
+// spec: PERS-CRYPTO-5
 fn generated_bytes_fill_exact_lengths_and_reject_unwritable_buffers() {
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, false).unwrap(),
@@ -26,6 +27,7 @@ fn generated_bytes_fill_exact_lengths_and_reject_unwritable_buffers() {
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
     machine.cpu.map(READ_ONLY, 4096, Prot::READ).unwrap();
     machine.cpu.write(DATA, &[0xcc; 64]).unwrap();
+    assert_eq!(generate(&mut env(&mut machine), GuestPtr::new(0), 0), 1);
     assert_eq!(generate(&mut env(&mut machine), GuestPtr::new(DATA), 13), 1);
     assert_eq!(
         generate(&mut env(&mut machine), GuestPtr::new(DATA + 32), 13),

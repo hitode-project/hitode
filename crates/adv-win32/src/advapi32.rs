@@ -1,6 +1,7 @@
 //! Registry API over the private virtual registry in [`adv_os::registry`].
 use std::collections::BTreeMap;
 
+mod crypto;
 mod groups;
 mod identity;
 mod scm;
@@ -508,6 +509,7 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    crypto::register(reg);
     legacy::register(reg);
     random::register(reg);
     groups::register(reg);
