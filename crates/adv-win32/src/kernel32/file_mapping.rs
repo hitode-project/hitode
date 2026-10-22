@@ -55,6 +55,18 @@ pub(crate) fn view_extent(env: &Env<'_>, address: u32) -> Option<(u32, u32)> {
         .next_back()?;
     (address - base < view.len).then_some((base, view.len))
 }
+pub(crate) fn mapped_path(env: &Env<'_>, address: u32) -> Option<String> {
+    let (&base, view) = env
+        .ext
+        .try_get::<Mappings>()?
+        .views
+        .range(..=address)
+        .next_back()?;
+    if address - base >= view.len {
+        return None;
+    }
+    view.section.guest_path.clone()
+}
 impl SectionHandle {
     fn new(section: Rc<Section>, access: u32) -> Self {
         section.handles.set(section.handles.get() + 1);
@@ -81,6 +93,7 @@ impl Mappings {
     }
 }
 struct Section {
+    guest_path: Option<String>,
     backing: Rc<FileSection>,
     len: u64,
     protection: u32,
@@ -388,7 +401,13 @@ pub(crate) fn create_section(
     if len > u64::MAX - (PAGE - 1) {
         return fail(env, 87);
     }
+    let guest_path = env
+        .sys
+        .objects
+        .host::<FileObj>(file)
+        .map(|file| env.ext.get::<Win32>().vfs.normalize(&file.guest_path));
     let section = Rc::new(Section {
+        guest_path,
         backing,
         len: len.div_ceil(PAGE) * PAGE,
         protection,

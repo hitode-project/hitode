@@ -1393,6 +1393,20 @@ fn get_drive_type_w(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+/// The DOS drive's existing device identity, shared by QueryDosDevice and PSAPI.
+pub(crate) fn dos_device(env: &Env<'_>, drive: u8) -> Option<String> {
+    if drive.eq_ignore_ascii_case(&b'C') {
+        return Some(r"\Device\HarddiskVolume1".to_owned());
+    }
+    env.ext
+        .get::<Win32>()
+        .vfs
+        .optical_drives()
+        .enumerate()
+        .find(|(_, (letter, _))| letter.eq_ignore_ascii_case(&(drive as char)))
+        .map(|(index, _)| format!(r"\Device\CdRom{index}"))
+}
+
 fn query_dos_device(
     env: &mut Env<'_>,
     name: Option<String>,
@@ -1413,17 +1427,11 @@ fn query_dos_device(
             .collect(),
         Some(s) => {
             let trimmed = s.trim_end_matches('\\');
-            if trimmed.eq_ignore_ascii_case("C:") || trimmed.eq_ignore_ascii_case("C") {
-                vec![r"\Device\HarddiskVolume1".to_string()]
-            } else if let Some((index, _)) = env
-                .ext
-                .get::<Win32>()
-                .vfs
-                .optical_drives()
-                .enumerate()
-                .find(|(_, (letter, _))| trimmed.eq_ignore_ascii_case(&format!("{letter}:")))
+            let drive = trimmed.trim_end_matches(':');
+            if drive.len() == 1
+                && let Some(device) = dos_device(env, drive.as_bytes()[0])
             {
-                vec![format!(r"\Device\CdRom{index}")]
+                vec![device]
             } else {
                 set_last_error(env, ERROR_FILE_NOT_FOUND);
                 return Outcome::Return(0);

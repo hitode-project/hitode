@@ -241,3 +241,10 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: RtlGenRandom, CryptGenRandom and symmetric CryptGenKey MUST use the shared host OS entropy adapter. They MUST NOT substitute a deterministic generator when that source fails.
 **Verification**: Review — platform source selection and cryptographic entropy require review beyond statistical output tests.
+
+## Process status
+
+### PERS-PROCESS-1 Process and module queries
+
+**Rule**: PSAPI and K32 aliases MUST query the existing guest process, Loader and section owners. Module queries MUST enforce process query and VM-read rights, including local real handles. Reported paths MUST use owned LDR names or section paths and the same device mapping as QueryDosDevice.
+**Verification**: Test

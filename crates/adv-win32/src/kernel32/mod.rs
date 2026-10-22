@@ -26,7 +26,7 @@ pub(crate) use memory::protect_memory;
 pub(crate) use memory::query_memory;
 pub(crate) use memory::{allocate_local_memory, release_local_memory};
 pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
-mod module;
+pub(crate) mod module;
 pub(crate) use module::native_get_procedure;
 pub(crate) use module::native_load_library;
 pub(crate) use module::native_loader_mutex;

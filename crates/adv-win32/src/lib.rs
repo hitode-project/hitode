@@ -23,6 +23,7 @@ mod network;
 mod ntdll;
 pub mod personality;
 pub mod printf;
+mod psapi;
 mod query_leaves;
 pub mod user32;
 pub mod util;
@@ -215,6 +216,7 @@ pub fn register(reg: &mut Registry) {
     misc::register(reg);
     imm32::register(reg);
     version::register(reg);
+    psapi::register(reg);
     vfw::register(reg);
     winsock::register(reg);
     winhttp::register(reg);
