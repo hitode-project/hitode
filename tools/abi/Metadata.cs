@@ -150,6 +150,32 @@ public static class AbiMetadata
             }
         return true;
     }
+    public static string[] SupportedPlatforms(string winmd)
+    {
+        using var stream = File.OpenRead(winmd);
+        using var pe = new PEReader(stream);
+        var reader = pe.GetMetadataReader();
+        var rows = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var handle in reader.MethodDefinitions)
+        {
+            var method = reader.GetMethodDefinition(handle);
+            if ((method.Attributes & MethodAttributes.PinvokeImpl) == 0
+                || !X86(reader, method.GetCustomAttributes())) continue;
+            var import = method.GetImport();
+            string module = reader.GetString(reader.GetModuleReference(import.Module).Name).ToLowerInvariant();
+            if (!module.EndsWith(".dll") && !module.EndsWith(".drv")) module += ".dll";
+            string minimum = "";
+            foreach (var attribute in method.GetCustomAttributes())
+            {
+                if (AttributeName(reader, attribute) != "SupportedOSPlatformAttribute") continue;
+                var value = reader.GetBlobReader(reader.GetCustomAttribute(attribute).Value);
+                if (value.ReadUInt16() != 1) throw new InvalidDataException("platform attribute prologue");
+                minimum = value.ReadSerializedString() ?? "";
+            }
+            rows.Add(module + "\t" + reader.GetString(import.Name) + "\t" + minimum);
+        }
+        return rows.ToArray();
+    }
     static string Parameters(MetadataReader r, MethodDefinition m, MethodSignature<Ty> sig)
     {
         var names = m.GetParameters().Select(p => r.GetParameter(p)).Where(p => p.SequenceNumber > 0).ToDictionary(p => p.SequenceNumber, p => r.GetString(p.Name));

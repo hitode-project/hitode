@@ -132,6 +132,13 @@ Their x86 WINAPI declarations return HRESULT and take two, six, four and nine
 stack words respectively; the sphere radius retains its FLOAT argument kind.
 The generator accepts only the exact declarations in this selection.
 
+`AbiMetadata.SupportedPlatforms` reads per-method `SupportedOSPlatformAttribute`
+values from the same pinned WinMD, filtering to x86 import declarations.
+`post-win7.tsv` records verified later-client APIs as DLL, name, minimum client
+and raw attribute value; absent attributes require a Microsoft Learn requirements URL.
+Rows are sorted by DLL and name, and merges retain the union of verified rows.
+These declarations retain their ABI for diagnostics, while dynamic lookup hides them.
+
 ## CRT export catalog
 
 WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports:
