@@ -234,6 +234,28 @@ fn guest<B: Backend>(cpu: B) {
             MARKER,
         );
     }
+    let get_error = machine
+        .resolve_import("kernel32.dll", "GetLastError")
+        .unwrap();
+    for (index, suffix) in ["A", "W"].into_iter().enumerate() {
+        let row = DATA + 0x2000 + index as u32 * 128;
+        machine.cpu.write(row + 16, &[0xcd; 32]).unwrap();
+        let target = machine
+            .resolve_import(DLL, &format!("CryptBinaryToString{suffix}"))
+            .unwrap();
+        code.mov_mem_imm(SIZE, 3)
+            .push_imm(SIZE)
+            .push_imm(row + 16)
+            .push_imm(2)
+            .push_imm(4)
+            .push_imm(INPUT)
+            .call(target)
+            .mov_mem_eax(row)
+            .call(get_error)
+            .mov_mem_eax(row + 8)
+            .mov_eax_mem(SIZE)
+            .mov_mem_eax(row + 4);
+    }
     code.mov_mem_imm(DATA + 0x3f00, 0)
         .mov_eax_mem(DATA + 0x3f00)
         .ret();
@@ -265,6 +287,15 @@ fn guest<B: Backend>(cpu: B) {
     machine.cpu.read(OUTPUT + 128, &mut output).unwrap();
     assert_eq!(output, [0xcd; 6]);
     assert_eq!(machine.cpu.read_u32(SKIP).unwrap(), 0);
+    for index in 0..2 {
+        let row = DATA + 0x2000 + index * 128;
+        assert_eq!(machine.cpu.read_u32(row).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(row + 4).unwrap(), 3);
+        assert_eq!(machine.cpu.read_u32(row + 8).unwrap(), 234);
+        let mut bytes = [0; 32];
+        machine.cpu.read(row + 16, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xcd; 32]);
+    }
     assert_eq!(machine.cpu.read_u32(FORMAT).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA + 0x4000).unwrap(), 0xdeadbeef);
     let mut narrow = [0; 9];

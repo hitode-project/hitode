@@ -310,7 +310,7 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 ### PERS-CRYPTO-9 Raw binary copy lengths
 
-**Rule**: Raw CryptStringToBinary output MUST copy the caller's byte capacity from checked guest input, independently of its declared text length. Raw size queries MUST report the input character count, including for W calls. Raw binary-to-string copies MUST preserve input bytes and omit a terminator.
+**Rule**: Raw CryptStringToBinary output MUST copy the caller's byte capacity from checked guest input, independently of its declared text length. Raw size queries MUST report the input character count, including for W calls. Raw binary-to-string copies MUST omit terminators and preserve the length on insufficient capacity.
 **Verification**: Test
 **Basis**: Authored native A/W binary conversion controls in `crypt32_encoding_native`.
 

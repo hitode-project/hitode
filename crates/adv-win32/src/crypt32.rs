@@ -43,7 +43,9 @@ fn binary_to_string(env: &mut Env<'_>, wide: bool) -> Outcome {
         return Outcome::Return(1);
     }
     if env.cpu.read_u32(size).unwrap() < needed {
-        let _ = env.cpu.write_u32(size, needed);
+        if !binary {
+            let _ = env.cpu.write_u32(size, needed);
+        }
         return fail(env, 234);
     }
     let bytes = if binary {
