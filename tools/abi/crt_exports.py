@@ -38,6 +38,9 @@ HIDDEN = re.compile(r";\s*([A-Za-z_?$][\w@?$]*)\s*(?:;\s*(.*)|\s+((?:replaced|di
 # Reasons saying the plain i386 DLL lacks the name: removed exports, ARM64EC-hosted
 # CHPE builds and functions mingw supplies because i386 never exported them.
 ABSENT = re.compile(r"^removed|chpe|^i386 \S+ provided by emu", re.IGNORECASE)
+# An architecture macro that expanded to nothing leaves `; i386 name replaced by emu`
+# for a name newer i386 DLLs export and mingw replaces.
+ELIDED = re.compile(r";\s*i386 (?:and x64 )?([A-Za-z_][\w]*) replaced by emu\b.*")
 
 
 def undecorated(name):
@@ -49,6 +52,10 @@ def exports(text):
     result, hidden = {}, set()
     for line in text.splitlines():
         line = line.strip()
+        elided = ELIDED.fullmatch(line)
+        if elided:
+            hidden.add(elided.group(1))
+            continue
         comment = HIDDEN.fullmatch(line)
         if comment:
             if not ABSENT.search(comment.group(2) or comment.group(3) or ""):

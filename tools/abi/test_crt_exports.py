@@ -34,12 +34,16 @@ class CrtExportTests(unittest.TestCase):
             "; __C_specific_handler ; disabled i386-chpe32",
             "; sinf ; i386 sinf provided by emu",
             "; _get_pgmptr ; i386 and x64 _get_pgmptr replaced by emu",
+            " ; i386 _time64 replaced by emu",
+            " ; i386 and x64 memcpy_s replaced by emu",
+            "                                    ; i386 cosf provided by emu",
             "_environ DATA",
             "_environ_alias DATA == _environ",
         ])
         self.assertEqual(exports(text), {
             "exit": "code", "atexit": "code", "_onexit": "code", "isprint": "code",
-            "tmpfile": "code", "_get_pgmptr": "code", "_environ": "data",
+            "tmpfile": "code", "_get_pgmptr": "code", "_time64": "code", "memcpy_s": "code",
+            "_environ": "data",
         })
 
     def test_conflicting_kinds_are_rejected(self):

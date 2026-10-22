@@ -121,7 +121,7 @@
       },
       "msvcrt.dll": {
         "definition": "lib-common/msvcrt.def.in",
-        "exports": 1326,
+        "exports": 1423,
         "sha256": "d9a2514ff787d4995f033feca5b90f02290ec382712bdbd3ae6d7fa8df6ecd78"
       },
       "msvcrt20.dll": {
