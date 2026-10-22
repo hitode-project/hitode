@@ -4,7 +4,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
-// spec: PERS-CRYPTO-1
+// spec: SYS-CRYPTO-1
 fn published_digest_vectors_and_streaming_padding_boundaries() {
     let vectors = [
         (0x8003, 0, "d41d8cd98f00b204e9800998ecf8427e"),

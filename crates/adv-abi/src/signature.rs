@@ -137,7 +137,7 @@ pub fn signatures() -> &'static [Signature] {
                     conv,
                     data_size: (fields[2] == "data").then(|| match fields[3] {
                         "ptr" | "u32" | "i32" => 4,
-                        "u64" => 8,
+                        "u64" | "f64" => 8,
                         _ => panic!("invalid generated data kind"),
                     }),
                     com_slot: None,

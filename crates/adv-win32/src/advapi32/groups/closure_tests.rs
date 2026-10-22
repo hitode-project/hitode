@@ -278,7 +278,7 @@ fn shared<B: Backend>(cpu: B) {
     );
 }
 #[test]
-// spec: PERS-REG-1
+// spec: SYS-REG-1
 fn legacy_names_and_extended_deletion_share_a_w_nt_owners_on_three_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

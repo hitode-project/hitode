@@ -154,7 +154,7 @@ they exclude backend work and damage-history bookkeeping.
 | `--backend` | Diagnostic | `jit` (Tier 0 with the platform engine); `interpreter` optional |
 | `--row-workers` | Feature | Automatic, at most 3 helpers; `0` runs rows inline |
 | `--no-row-batching` | Diagnostic | Absent: proven batches enabled |
-| `--api-mode` | Diagnostic | `strict`; `discovery` optional |
+| `--api-mode` | Diagnostic | `discovery`: unimplemented APIs return their derived failure and are reported; `strict` stops at the first, for acceptance |
 | `--no-time-skip` | Diagnostic | Absent: Ctrl time skip allowed when its conditions hold |
 | `--compile` | Diagnostic | `fast`; `speed` optional |
 | `--no-tiering` | Diagnostic | Absent: Fast to Speed promotion allowed |

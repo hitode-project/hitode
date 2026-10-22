@@ -53,7 +53,7 @@ impl Hmac {
 mod tests {
     use super::*;
     #[test]
-    // spec: PERS-CRYPTO-4
+    // spec: SYS-CRYPTO-4
     fn rfc_hmac_known_answers() {
         for (algorithm, key, message, expected) in [
             (

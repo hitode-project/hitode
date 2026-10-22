@@ -75,7 +75,7 @@ unsafe extern "system" {
     fn InternetWriteFile(handle: Handle, input: *const u8, length: u32, count: *mut u32) -> i32;
 }
 #[test]
-// spec: PERS-PRINT-1
+// spec: SYS-PRINT-1
 fn absent_printer_failure_clears_handle_and_preserves_device_output() {
     let name = b"HitodeAuthoredAbsentPrinter-5E85A81D-6B28-42D2-9B8A-7E8DE280F437\0";
     let mut handle = 0x5555usize as Handle;
@@ -186,7 +186,7 @@ fn native_nonempty_transacted_open_control() {
     }
 }
 #[test]
-// spec: PERS-STR-1
+// spec: SYS-STR-1
 fn native_counted_ansi_destination_capacity_controls() {
     let mut input = [0u8; 64];
     input[..4].copy_from_slice(b"ab\0c");
@@ -244,7 +244,7 @@ impl Drop for Internet {
     }
 }
 #[test]
-// spec: PERS-NET-6
+// spec: SYS-NET-6
 fn native_session_option_and_wrong_request_type_controls() {
     let mut agent = [0u16; 64];
     agent[..7].copy_from_slice(&[115, 101, 99, 111, 110, 100, 0]);

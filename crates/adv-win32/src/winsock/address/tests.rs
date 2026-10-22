@@ -154,7 +154,7 @@ fn conversions<B: Backend>(cpu: B) {
 }
 
 #[test]
-// spec: PERS-NET-2
+// spec: SYS-NET-2
 fn local_address_operations_share_legacy_state_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

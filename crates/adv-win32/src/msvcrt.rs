@@ -10,8 +10,11 @@ mod byte_set;
 mod byte_sort;
 mod convert;
 mod cpp_alloc;
+pub(crate) mod cpp_eh;
+mod cpp_runtime;
 mod data;
 mod directory;
+mod errors;
 mod exceptions;
 mod file;
 mod find;
@@ -21,11 +24,13 @@ mod floating;
 mod heap;
 mod intrinsic_math;
 mod locale;
+mod mbcs;
 mod memory_ops;
 mod modern_stdio;
 mod modern_string;
 mod onexit;
 mod path;
+mod process;
 mod random;
 mod scalar_float;
 mod scalar_log;
@@ -35,11 +40,14 @@ mod scalar_scale;
 mod scalar_split;
 mod scan;
 mod secure_memory;
+mod seh;
 mod shared_file;
 mod startup;
 mod stream_position;
+mod strings;
 mod thread;
 mod time64;
+mod versions;
 mod wide_scan;
 mod wide_string;
 
@@ -53,6 +61,9 @@ struct CrtState {
     invalid_handlers: HashMap<String, u32>,
     files: HashMap<u32, CrtFile>,
     locales: HashMap<String, locale::LocaleState>,
+    cpp_eh_threads: HashMap<(String, u32), cpp_eh::Thread>,
+    cpp_threads: HashMap<(String, u32), cpp_runtime::Thread>,
+    purecall_handlers: HashMap<String, u32>,
 }
 
 // The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
@@ -146,6 +157,7 @@ pub fn register(r: &mut Registry) {
     find::register(r);
     formatting::register(r);
     floating::register(r);
+    errors::register(r);
     intrinsic_math::register(r);
     time64::register(r);
     random::register(r);
@@ -160,18 +172,28 @@ pub fn register(r: &mut Registry) {
     startup::register(r);
     convert::register(r);
     cpp_alloc::register(r);
+    cpp_runtime::register(r);
+    cpp_eh::register(r);
     scan::register(r);
     wide_scan::register(r);
     secure_memory::register(r);
+    seh::register(r);
     shared_file::register(r);
     stream_position::register(r);
     thread::register(r);
     heap::register(r);
     locale::register(r);
     memory_ops::register(r);
+    mbcs::register(r);
     modern_stdio::register(r);
     modern_string::register(r);
     wide_string::register(r);
+    process::register(r);
+    strings::register(r);
+    versions::register(
+        r,
+        &[("_setjmp", call), ("_setjmp3", call), ("longjmp", call)],
+    );
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -181,8 +203,6 @@ pub fn register(r: &mut Registry) {
         ("memmove", 3),
         ("memset", 3),
         ("memcmp", 3),
-        ("strlen", 1),
-        ("strcmp", 2),
         ("_initterm", 2),
         ("_initterm_e", 2),
         ("_lock", 1),
@@ -200,37 +220,16 @@ pub fn register(r: &mut Registry) {
         ("atoi", 1),
         ("abs", 1),
         ("_itoa", 3),
-        ("strncmp", 3),
-        ("strchr", 2),
-        ("strstr", 2),
         ("_strdup", 1),
         ("strtoul", 3),
-        ("_mbsinc", 1),
-        ("_mbsnbcpy", 3),
-        ("_ismbblead", 1),
-        ("_ismbbtrail", 1),
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
         ("_XcptFilter", 2),
         ("__setusermatherr", 1),
         ("getenv", 1),
-        ("strrchr", 2),
-        ("strcpy", 2),
-        ("strncpy", 3),
-        ("strcat", 2),
-        ("strncat", 3),
         ("??_U@YAPAXI@Z", 1),
         ("??_V@YAXPAX@Z", 1),
-        ("wcslen", 1),
-        ("wcscmp", 2),
-        ("wcsncmp", 3),
-        ("wcschr", 2),
-        ("wcsrchr", 2),
-        ("wcscpy", 2),
-        ("wcsncpy", 3),
-        ("wcscat", 2),
-        ("wcsstr", 2),
         ("_wcsicmp", 2),
         ("_wcsnicmp", 3),
         ("_wfopen_s", 3),
@@ -294,44 +293,20 @@ pub fn register(r: &mut Registry) {
             ("_encode_pointer", 1),
             ("_decode_pointer", 1),
             ("_encoded_null", 0),
-            ("time", 1),
             ("_time32", 1),
             ("_gmtime32", 1),
             ("_localtime32", 1),
-            ("_ismbblead", 1),
-            ("_ismbbtrail", 1),
             ("memcpy", 3),
             ("memmove", 3),
             ("memset", 3),
             ("memcmp", 3),
-            ("strlen", 1),
-            ("strcmp", 2),
-            ("strncmp", 3),
-            ("strchr", 2),
-            ("strrchr", 2),
-            ("strstr", 2),
             ("_strdup", 1),
             ("strtoul", 3),
-            ("_mbsinc", 1),
-            ("_mbsnbcpy", 3),
             ("_splitpath", 5),
             ("_makepath", 5),
             ("getenv", 1),
-            ("strcpy", 2),
-            ("strncpy", 3),
-            ("strcat", 2),
-            ("strncat", 3),
             ("??_U@YAPAXI@Z", 1),
             ("??_V@YAXPAX@Z", 1),
-            ("wcslen", 1),
-            ("wcscmp", 2),
-            ("wcsncmp", 3),
-            ("wcschr", 2),
-            ("wcsrchr", 2),
-            ("wcscpy", 2),
-            ("wcsncpy", 3),
-            ("wcscat", 2),
-            ("wcsstr", 2),
             ("_wcsicmp", 2),
             ("_wcsnicmp", 3),
             ("_wfopen_s", 3),
@@ -355,26 +330,17 @@ pub fn register(r: &mut Registry) {
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
-        r.add(
-            module,
-            "_setjmp3",
-            adv_machine::Conv::CdeclVariadic { fixed: 2 },
-            call,
-        );
-        r.add(module, "longjmp", Conv::Cdecl { argc: 2 }, call);
     }
-    r.add(
-        "msvcrt.dll",
-        "_setjmp3",
-        adv_machine::Conv::CdeclVariadic { fixed: 2 },
-        call,
-    );
-    r.add("msvcrt.dll", "longjmp", Conv::Cdecl { argc: 2 }, call);
     file::leaves::register(r);
     crate::guest_code::install_crt(r);
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    let context = env.context;
+    if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_eh_threads.retain(|(_, id), _| *id != context);
+        state.cpp_threads.retain(|(_, id), _| *id != context);
+    }
     random::release(env, Some(env.context));
     time64::release(env, Some(env.context))?;
     release_errno(env, Some(env.context))
@@ -382,6 +348,11 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_eh_threads.clear();
+        state.cpp_threads.clear();
+        state.purecall_handlers.clear();
+    }
     random::release(env, None);
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
@@ -477,63 +448,62 @@ fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> O
     }
     Outcome::Return(0)
 }
-fn split_path_a(path: &[u8]) -> (&[u8], &[u8], &[u8], &[u8]) {
-    let (drive, rest) = if path.len() >= 2 && path[1] == b':' {
-        (&path[..2], &path[2..])
-    } else {
-        (&[][..], path)
-    };
-    let last_slash = rest.iter().rposition(|&c| c == b'/' || c == b'\\');
-    let (dir, file_part) = match last_slash {
-        Some(idx) => (&rest[..=idx], &rest[idx + 1..]),
-        None => (&[][..], rest),
-    };
-    let last_dot = file_part.iter().rposition(|&c| c == b'.');
-    let (fname, ext) = match last_dot {
-        Some(idx) => (&file_part[..idx], &file_part[idx..]),
-        None => (file_part, &[][..]),
-    };
-    (drive, dir, fname, ext)
-}
 /// 'VC20', marking a `_setjmp3` buffer that carries an unwind function.
 const JMP_MAGIC: u32 = 0x5643_3230;
 
-/// longjmp over a `_setjmp3` buffer, after Wine msvcrt `MSVCRT_longjmp`. The
-/// buffer's unwind function runs first; a jump that would need a global SEH
-/// unwind or a local `__try` unwind without one stops instead of skipping it.
+/// MSVC x86 jump buffers retain the target registration and local unwind
+/// callback. Global unwinding precedes the compiler-supplied local cleanup.
 fn long_jump(e: &mut Env<'_>, buffer: u32, value: u32) -> Outcome {
     let mut words = [0; 10];
     for (index, word) in words.iter_mut().enumerate() {
         match e.cpu.read_u32(buffer.wrapping_add(4 * index as u32)) {
             Ok(read) => *word = read,
-            Err(error) => return Outcome::Fail(format!("longjmp buffer: {error}")),
+            Err(error) => return adv_abi::guest::memory_failure(error),
         }
     }
-    let [.., registration, try_level, cookie, unwind] = words;
-    let teb = e.ctx().teb;
-    let current = e.cpu.read_u32(teb).unwrap_or(u32::MAX);
+    let registration = words[6];
+    let current = match e.cpu.read_u32(e.ctx().teb) {
+        Ok(frame) => frame,
+        Err(error) => return adv_abi::guest::memory_failure(error),
+    };
+    let value = if value == 0 { 1 } else { value };
     if registration != current {
-        return Outcome::Fail(format!(
-            "longjmp across SEH frames {current:#010x}..{registration:#010x} needs a global unwind"
-        ));
+        return seh::unwind_global(
+            e,
+            if registration == u32::MAX {
+                0
+            } else {
+                registration
+            },
+            0,
+            Box::new(move |e| jump_local(e, buffer, words, value)),
+        );
     }
-    let value = value.max(1);
-    if registration != u32::MAX && cookie == JMP_MAGIC && unwind != 0 {
-        return Outcome::call(unwind, [buffer], move |e, _| restore_jump(e, words, value));
+    jump_local(e, buffer, words, value)
+}
+
+fn jump_local(e: &mut Env<'_>, buffer: u32, words: [u32; 10], value: u32) -> Outcome {
+    let [.., registration, try_level, cookie, unwind] = words;
+    if registration == u32::MAX {
+        return restore_jump(e, words, value);
     }
-    if registration != u32::MAX
-        && e.cpu.read_u32(registration + 12).unwrap_or(try_level) != try_level
-    {
-        return Outcome::Fail("longjmp out of a __try block needs a local unwind".into());
+    if cookie == JMP_MAGIC && unwind != 0 {
+        return Outcome::call(unwind, [buffer], move |e, _| restore_jump(e, words, value))
+            .unwindable();
     }
-    restore_jump(e, words, value)
+    seh::unwind_to(
+        e,
+        registration,
+        try_level as i32,
+        Box::new(move |e| restore_jump(e, words, value)),
+    )
 }
 
 fn restore_jump(e: &mut Env<'_>, words: [u32; 10], value: u32) -> Outcome {
     let [ebp, ebx, edi, esi, esp, eip, ..] = words;
-    let mut checkpoint = match e.checkpoint() {
+    let mut checkpoint = match e.checkpoint_for_stack_unwind(esp) {
         Ok(checkpoint) => checkpoint,
-        Err(error) => return Outcome::Fail(error.to_string()),
+        Err(reason) => return Outcome::Fail(format!("longjmp continuation: {reason}")),
     };
     let regs = &mut checkpoint.state.regs;
     (regs[0], regs[3], regs[4], regs[5], regs[6], regs[7]) = (value, ebx, esp, ebp, esi, edi);
@@ -737,23 +707,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             Ok(difference) => difference as u32,
             Err(error) => return Outcome::Fail(error.to_string()),
         },
-        "strlen" => match e.cpu.read_cstr(a, 16 * 1024 * 1024) {
-            Ok(s) => s.len() as u32,
-            Err(err) => return Outcome::Fail(err.to_string()),
-        },
-        "strcmp" => {
-            let (Ok(l), Ok(r)) = (
-                e.cpu.read_cstr(a, 16 * 1024 * 1024),
-                e.cpu.read_cstr(b, 16 * 1024 * 1024),
-            ) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            match l.cmp(&r) {
-                std::cmp::Ordering::Less => u32::MAX,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }
-        }
+        "strlen" | "strcmp" | "strncmp" | "strchr" | "strrchr" | "strstr" | "strcpy"
+        | "strncpy" | "strcat" | "strncat" | "wcslen" | "wcscmp" | "wcsncmp" | "wcschr"
+        | "wcsrchr" | "wcsstr" | "wcscpy" | "wcsncpy" | "wcscat" => return strings::call(e),
         "_initterm" | "_initterm_e" => {
             if b < a || b - a > 1024 * 1024 || !(b - a).is_multiple_of(4) {
                 return Outcome::Fail("invalid initializer range".into());
@@ -769,359 +725,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail(error.to_string());
             }
             unix_sec
-        }
-        "strncmp" => {
-            let n = c as usize;
-            if n == 0 {
-                return Outcome::Return(0);
-            }
-            let mut diff = 0i32;
-            for i in 0..n {
-                let Ok(b1) = e.cpu.read_u8(a.wrapping_add(i as u32)) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                let Ok(b2) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if b1 != b2 {
-                    diff = (b1 as i32) - (b2 as i32);
-                    break;
-                }
-                if b1 == 0 {
-                    break;
-                }
-            }
-            match diff.cmp(&0) {
-                std::cmp::Ordering::Less => u32::MAX,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }
-        }
-        "strchr" => {
-            let target = b as u8;
-            let mut ptr = a;
-            loop {
-                let Ok(byte) = e.cpu.read_u8(ptr) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if byte == target {
-                    return Outcome::Return(ptr);
-                }
-                if byte == 0 {
-                    return Outcome::Return(0);
-                }
-                ptr = ptr.wrapping_add(1);
-            }
-        }
-        "strrchr" => {
-            let target = b as u8;
-            let mut ptr = a;
-            let mut last = 0;
-            loop {
-                let Ok(byte) = e.cpu.read_u8(ptr) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if byte == target {
-                    last = ptr;
-                }
-                if byte == 0 {
-                    return Outcome::Return(last);
-                }
-                ptr = ptr.wrapping_add(1);
-            }
-        }
-        "strcpy" => {
-            let mut d = a;
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strcpy unmapped".into());
-                };
-                let _ = e.cpu.write(d, &[ch]);
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-            }
-            a
-        }
-        "strncpy" => {
-            let n = c as usize;
-            let mut null_hit = false;
-            for i in 0..n {
-                let byte = if null_hit {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                        return Outcome::Fail("CRT strncpy unmapped".into());
-                    };
-                    if val == 0 {
-                        null_hit = true;
-                    }
-                    val
-                };
-                let _ = e.cpu.write(a.wrapping_add(i as u32), &[byte]);
-            }
-            a
-        }
-        "strcat" => {
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(d) else {
-                    return Outcome::Fail("CRT strcat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-            }
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strcat src unmapped".into());
-                };
-                let _ = e.cpu.write(d, &[ch]);
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-            }
-            a
-        }
-        "strncat" => {
-            let n = c as usize;
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(d) else {
-                    return Outcome::Fail("CRT strncat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-            }
-            let mut s = b;
-            let mut copied = 0;
-            while copied < n {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strncat src unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                let _ = e.cpu.write(d, &[ch]);
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-                copied += 1;
-            }
-            let _ = e.cpu.write(d, &[0]);
-            a
-        }
-        "wcslen" => {
-            let mut ptr = a;
-            let mut len = 0u32;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcslen unmapped".into());
-                };
-                if unit == 0 {
-                    break;
-                }
-                len += 1;
-                ptr = ptr.wrapping_add(2);
-            }
-            len
-        }
-        "wcscmp" => {
-            let mut p1 = a;
-            let mut p2 = b;
-            loop {
-                let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
-                    return Outcome::Fail("CRT wcscmp unmapped".into());
-                };
-                if u1 != u2 {
-                    return match u1.cmp(&u2) {
-                        std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
-                        std::cmp::Ordering::Equal => Outcome::Return(0),
-                        std::cmp::Ordering::Greater => Outcome::Return(1),
-                    };
-                }
-                if u1 == 0 {
-                    return Outcome::Return(0);
-                }
-                p1 = p1.wrapping_add(2);
-                p2 = p2.wrapping_add(2);
-            }
-        }
-        "wcsncmp" => {
-            let n = c as usize;
-            if n == 0 {
-                return Outcome::Return(0);
-            }
-            let mut p1 = a;
-            let mut p2 = b;
-            for _ in 0..n {
-                let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
-                    return Outcome::Fail("CRT wcsncmp unmapped".into());
-                };
-                if u1 != u2 {
-                    return match u1.cmp(&u2) {
-                        std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
-                        std::cmp::Ordering::Equal => Outcome::Return(0),
-                        std::cmp::Ordering::Greater => Outcome::Return(1),
-                    };
-                }
-                if u1 == 0 {
-                    return Outcome::Return(0);
-                }
-                p1 = p1.wrapping_add(2);
-                p2 = p2.wrapping_add(2);
-            }
-            0
-        }
-        "wcschr" => {
-            let target = b as u16;
-            let mut ptr = a;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcschr unmapped".into());
-                };
-                if unit == target {
-                    return Outcome::Return(ptr);
-                }
-                if unit == 0 {
-                    return Outcome::Return(0);
-                }
-                ptr = ptr.wrapping_add(2);
-            }
-        }
-        "wcsrchr" => {
-            let target = b as u16;
-            let mut ptr = a;
-            let mut last = 0;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcsrchr unmapped".into());
-                };
-                if unit == target {
-                    last = ptr;
-                }
-                if unit == 0 {
-                    return Outcome::Return(last);
-                }
-                ptr = ptr.wrapping_add(2);
-            }
-        }
-        "wcscpy" => {
-            let mut d = a;
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(s) else {
-                    return Outcome::Fail("CRT wcscpy unmapped".into());
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-                s = s.wrapping_add(2);
-            }
-            a
-        }
-        "wcsncpy" => {
-            let n = c as usize;
-            let mut d = a;
-            let mut s = b;
-            let mut null_seen = false;
-            for _ in 0..n {
-                let ch = if null_seen {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u16(s) else {
-                        return Outcome::Fail("CRT wcsncpy unmapped".into());
-                    };
-                    if val == 0 {
-                        null_seen = true;
-                    } else {
-                        s = s.wrapping_add(2);
-                    }
-                    val
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                d = d.wrapping_add(2);
-            }
-            a
-        }
-        "wcscat" => {
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(d) else {
-                    return Outcome::Fail("CRT wcscat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-            }
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(s) else {
-                    return Outcome::Fail("CRT wcscat src unmapped".into());
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-                s = s.wrapping_add(2);
-            }
-            a
-        }
-        "wcsstr" => {
-            if b == 0 {
-                return Outcome::Return(a);
-            }
-            let Ok(first_needle) = e.cpu.read_u16(b) else {
-                return Outcome::Fail("CRT wcsstr unmapped".into());
-            };
-            if first_needle == 0 {
-                return Outcome::Return(a);
-            }
-            let mut hay = a;
-            loop {
-                let Ok(h_unit) = e.cpu.read_u16(hay) else {
-                    return Outcome::Fail("CRT wcsstr unmapped".into());
-                };
-                if h_unit == 0 {
-                    return Outcome::Return(0);
-                }
-                if h_unit == first_needle {
-                    let mut h_sub = hay.wrapping_add(2);
-                    let mut n_sub = b.wrapping_add(2);
-                    let found = loop {
-                        let Ok(n_val) = e.cpu.read_u16(n_sub) else {
-                            return Outcome::Fail("CRT wcsstr unmapped".into());
-                        };
-                        if n_val == 0 {
-                            break true;
-                        }
-                        let Ok(h_val) = e.cpu.read_u16(h_sub) else {
-                            return Outcome::Fail("CRT wcsstr unmapped".into());
-                        };
-                        if h_val != n_val {
-                            break false;
-                        }
-                        h_sub = h_sub.wrapping_add(2);
-                        n_sub = n_sub.wrapping_add(2);
-                    };
-                    if found {
-                        return Outcome::Return(hay);
-                    }
-                }
-                hay = hay.wrapping_add(2);
-            }
         }
         "_wcsicmp" => {
             let mut p1 = a;
@@ -1473,22 +1076,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             );
             0
         }
-        "strstr" => {
-            let Ok(needle) = e.cpu.read_cstr(b, 65536) else {
-                return Outcome::Fail("CRT needle unmapped".into());
-            };
-            if needle.is_empty() {
-                return Outcome::Return(a);
-            }
-            let Ok(haystack) = e.cpu.read_cstr(a, 16 * 1024 * 1024) else {
-                return Outcome::Fail("CRT haystack unmapped".into());
-            };
-            if let Some(pos) = haystack.windows(needle.len()).position(|w| w == needle) {
-                a.wrapping_add(pos as u32)
-            } else {
-                0
-            }
-        }
         "_strdup" => {
             if a == 0 {
                 return Outcome::Return(0);
@@ -1552,109 +1139,89 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             val as u32
         }
-        "_mbsinc" => {
-            let Ok(b1) = e.cpu.read_u8(a) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            if (0x81..=0x9f).contains(&b1) || (0xe0..=0xfc).contains(&b1) {
-                a.wrapping_add(2)
-            } else {
-                a.wrapping_add(1)
-            }
-        }
-        "_ismbblead" => {
-            let acp = e.ext.get::<crate::Win32>().codec.acp;
-            let byte = a as u8;
-            let is_lead = a <= 0xff
-                && match acp {
-                    936 => (0x81..=0xfe).contains(&byte),
-                    _ => (0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte),
-                };
-            if is_lead { 1 } else { 0 }
-        }
-        "_ismbbtrail" => {
-            let acp = e.ext.get::<crate::Win32>().codec.acp;
-            let byte = a as u8;
-            let is_trail = a <= 0xff
-                && match acp {
-                    936 => (0x40..=0x7e).contains(&byte) || (0x80..=0xfe).contains(&byte),
-                    _ => (0x40..=0x7e).contains(&byte) || (0x80..=0xfc).contains(&byte),
-                };
-            if is_trail { 1 } else { 0 }
-        }
-        "_mbsnbcpy" => {
-            let n = c as usize;
-            let mut null_hit = false;
-            for i in 0..n {
-                let byte = if null_hit {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                        return Outcome::Fail("CRT string unmapped".into());
-                    };
-                    if val == 0 {
-                        null_hit = true;
-                    }
-                    val
-                };
-                if let Err(err) = e.cpu.write(a.wrapping_add(i as u32), &[byte]) {
-                    return Outcome::Fail(err.to_string());
-                }
-            }
-            a
-        }
         "_splitpath" => {
             let Ok(path) = e.cpu.read_cstr(a, 4096) else {
                 return Outcome::Fail("CRT path unmapped".into());
             };
-            let (drive, dir, fname, ext) = split_path_a(&path);
+            let units: Vec<_> = path.iter().map(|&byte| u16::from(byte)).collect();
+            let cp = locale::multibyte_codepage(e);
+            let ranges = match path::split_ranges(&units, |unit| mbcs::is_lead(cp, unit as u8)) {
+                Ok(ranges) => ranges,
+                Err(reason) => return Outcome::Fail(reason.into()),
+            };
             let ptrs = [b, c, e.arg(3), e.arg(4)];
-            let parts = [drive, dir, fname, ext];
+            let parts = ranges.map(|range| &path[range]);
             for (p, part) in ptrs.into_iter().zip(parts) {
-                if p != 0 {
-                    let _ = e.cpu.write(p, part);
-                    let _ = e.cpu.write(p.wrapping_add(part.len() as u32), &[0]);
+                if p != 0
+                    && let Err(fault) = adv_abi::guest::check_range(
+                        e.cpu,
+                        p,
+                        part.len() as u32 + 1,
+                        adv_cpu::backend::Prot::WRITE,
+                    )
+                    .and_then(|()| e.cpu.write(p, part))
+                    .and_then(|()| e.cpu.write(p + part.len() as u32, &[0]))
+                {
+                    return adv_abi::guest::memory_failure(fault);
                 }
             }
             0
         }
-        "_setjmp3" => {
-            let jmp_buf = a;
-            let count = b;
-            if jmp_buf != 0 {
-                let teb = e.ctx().teb;
-                let exception_list = e.cpu.read_u32(teb).unwrap_or(u32::MAX);
-                let esp = e.cpu.reg(Reg::Esp);
-                let caller = e.caller();
-
-                let _ = e.cpu.write_u32(jmp_buf, e.cpu.reg(Reg::Ebp));
-                let _ = e.cpu.write_u32(jmp_buf + 4, e.cpu.reg(Reg::Ebx));
-                let _ = e.cpu.write_u32(jmp_buf + 8, e.cpu.reg(Reg::Edi));
-                let _ = e.cpu.write_u32(jmp_buf + 12, e.cpu.reg(Reg::Esi));
-                let _ = e.cpu.write_u32(jmp_buf + 16, esp.wrapping_add(4));
-                let _ = e.cpu.write_u32(jmp_buf + 20, caller);
-                let _ = e.cpu.write_u32(jmp_buf + 24, exception_list);
-                // Wine msvcrt `_setjmp3`: TryLevel, the 'VC20' cookie, the optional
-                // unwind function and up to six words of its data follow.
-                let try_level = if exception_list == u32::MAX {
-                    u32::MAX
-                } else if count > 1 {
-                    e.arg(3)
-                } else {
-                    e.cpu.read_u32(exception_list + 12).unwrap_or(u32::MAX)
-                };
-                let unwind = if count > 0 && exception_list != u32::MAX {
+        "_setjmp" | "_setjmp3" => {
+            let count = if name == "_setjmp3" { b } else { 0 };
+            use adv_abi::{
+                GuestPtr,
+                guest::{check_range, memory_failure},
+            };
+            if let Err(fault) = check_range(e.cpu, a, 64, adv_cpu::backend::Prot::WRITE) {
+                return memory_failure(fault);
+            }
+            let frame = match e.cpu.read_u32(e.ctx().teb) {
+                Ok(frame) => frame,
+                Err(fault) => return memory_failure(fault),
+            };
+            let level = if frame == u32::MAX {
+                u32::MAX
+            } else if count > 1 {
+                e.arg(3)
+            } else {
+                match e.cpu.read_u32(frame.wrapping_add(12)) {
+                    Ok(level) => level,
+                    Err(fault) => return memory_failure(fault),
+                }
+            };
+            // MSVC setjmp.h's x86 _JUMP_BUFFER is sixteen DWORDs. Compiler
+            // arguments select the local unwind callback and its metadata.
+            let prefix = [
+                e.cpu.reg(Reg::Ebp),
+                e.cpu.reg(Reg::Ebx),
+                e.cpu.reg(Reg::Edi),
+                e.cpu.reg(Reg::Esi),
+                e.cpu.reg(Reg::Esp).wrapping_add(4),
+                e.caller(),
+                frame,
+                level,
+                JMP_MAGIC,
+                if count > 0 && frame != u32::MAX {
                     e.arg(2)
                 } else {
                     0
-                };
-                let _ = e.cpu.write_u32(jmp_buf + 28, try_level);
-                let _ = e.cpu.write_u32(jmp_buf + 32, JMP_MAGIC);
-                let _ = e.cpu.write_u32(jmp_buf + 36, unwind);
-                if exception_list != u32::MAX {
-                    for i in 0..count.saturating_sub(2).min(6) {
-                        let val = e.arg(4 + i);
-                        let _ = e.cpu.write_u32(jmp_buf + 40 + i * 4, val);
+                },
+            ];
+            for (index, word) in prefix.into_iter().enumerate() {
+                if let Err(fault) =
+                    GuestPtr::new(a.wrapping_add(index as u32 * 4)).write(e.cpu, word)
+                {
+                    return memory_failure(fault);
+                }
+            }
+            if frame != u32::MAX {
+                for index in 0..count.saturating_sub(2).min(6) {
+                    let word = e.arg(4 + index);
+                    if let Err(fault) =
+                        GuestPtr::new(a.wrapping_add(40 + index * 4)).write(e.cpu, word)
+                    {
+                        return memory_failure(fault);
                     }
                 }
             }
@@ -1663,7 +1230,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "longjmp" => return long_jump(e, a, b),
         // R6025: no `_set_purecall_handler` exists in this CRT, so it ends the
         // process the way `_amsg_exit` does.
-        "_purecall" => return crate::kernel32::exit_process(e, 255),
+        "_purecall" => return cpp_runtime::purecall(e),
         "getenv" => 0,
         "_makepath" => {
             let mut out = Vec::new();

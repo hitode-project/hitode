@@ -126,6 +126,8 @@ pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
 
 /// Forget `path`, its parent and everything cached below it.
 pub(super) fn invalidate(path: &Path) {
+    #[cfg(all(test, unix))]
+    let _held = tests::wait();
     let mut index = INDEX.lock().unwrap();
     index.generation += 1;
     let parent = path.parent();
@@ -138,7 +140,7 @@ pub(super) fn invalidate(path: &Path) {
 /// between runs hosted by the same process.
 pub(super) fn clear() {
     #[cfg(all(test, unix))]
-    let _held = tests::EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = tests::wait();
     let mut index = INDEX.lock().unwrap();
     index.generation += 1;
     index.dirs.clear();
@@ -158,14 +160,38 @@ pub(super) fn volatile(dir: &Path) {
 pub(super) mod tests {
     use super::*;
 
-    /// Parallel tests construct Vfs instances, whose `clear` would drop the
-    /// cached listings this test relies on to ignore unannounced changes.
-    pub(in crate::vfs) static EXCLUSIVE: Mutex<()> = Mutex::new(());
+    /// Parallel tests clear and invalidate the shared index, which would drop
+    /// the cached listings a test relies on to ignore unannounced changes.
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Holds the index for one test; other tests' clears and invalidations wait.
+    pub(in crate::vfs) struct Exclusive(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    pub(in crate::vfs) fn exclusive() -> Exclusive {
+        let guard = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+        HELD.set(true);
+        Exclusive(guard)
+    }
+
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            HELD.set(false);
+        }
+    }
+
+    /// Waits while another thread holds the index.
+    pub(super) fn wait() -> Option<std::sync::MutexGuard<'static, ()>> {
+        (!HELD.get()).then(|| EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 
     #[test]
-    // spec: WIN32-OBJECT-8, PERS-FILE-1
+    // spec: WIN32-OBJECT-8, SYS-FILE-1
     fn the_index_answers_until_its_directory_is_invalidated() {
-        let _held = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = exclusive();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch/vfs-names")
             .join(format!(

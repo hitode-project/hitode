@@ -343,7 +343,7 @@ fn native_failure<B: Backend>(cpu: B) {
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
-// spec: PERS-PROFILEFILE-1, PERS-PROFILEFILE-2
+// spec: SYS-PROFILEFILE-1, SYS-PROFILEFILE-2
 fn whole_sections_structures_and_unicode_writes_share_profile_files_on_all_backends() {
     for jit in [false, true] {
         complete(JitCpu::new(PARK_ADDR, jit).unwrap());
@@ -351,7 +351,7 @@ fn whole_sections_structures_and_unicode_writes_share_profile_files_on_all_backe
     complete(UnicornCpu::new(PARK_ADDR).unwrap());
 }
 #[test]
-// spec: PERS-PROFILEFILE-3
+// spec: SYS-PROFILEFILE-3
 fn modified_native_writes_control_profile_failures_without_truncating_files() {
     for jit in [false, true] {
         native_failure(JitCpu::new(PARK_ADDR, jit).unwrap());

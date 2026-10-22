@@ -113,13 +113,58 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-3 GDI+ platform boundary
 
-**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Platforms without the device implementation MUST return an explicit not-implemented result.
-**Verification**: Review — Windows image tests do not verify pointer isolation or non-Windows rejection across GDI+ entry points.
+**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Missing device operations MUST return an explicit not-implemented result identifying the calling flat API.
+**Verification**: Review — native pointer isolation and complete capability diagnostics require adapter review.
 
 ### DEV-IMAGE-4 GDI+ storage bounds
 
 **Rule**: GDI+ images MUST be limited to 64 MiB each, with at most 256 MiB of independent front-end backing.
 **Verification**: Review — no existing test reaches either GDI+ storage admission boundary.
+
+### DEV-IMAGE-5 CPU bitmap rendering
+
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing and filled paths through the shared device interface.
+**Verification**: Test
+**Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
+
+### DEV-IMAGE-6 GDI+ value queries
+
+**Rule**: Image queries MUST report actual dimensions, bounds, pixels and bitmap type. Path and string-format clones MUST retain independent state and reject invalid receiver kinds.
+**Verification**: Test
+
+### DEV-IMAGE-7 GDI+ path pixel centers
+
+**Rule**: Aliased paths MUST test pixel centers using their fill rule. Antialiased path coverage MUST honor integer and half-integer pixel-center modes.
+**Verification**: Test
+**Basis**: [PixelOffsetMode](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-pixeloffsetmode).
+
+### DEV-IMAGE-8 GDI+ affine matrices
+
+**Rule**: Matrices MUST retain IEEE nonfinite coefficients and compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
+**Verification**: Test
+**Basis**: [MatrixOrder](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-matrixorder).
+
+### DEV-IMAGE-9 GDI+ solid brush state
+
+**Rule**: Solid brush color changes MUST affect subsequent drawing. Cloned brushes MUST retain independent colors, and color access MUST reject non-solid receivers.
+**Verification**: Test
+
+### DEV-IMAGE-10 GDI+ world transforms
+
+**Rule**: Graphics world matrices MUST transform path and image drawing. Setting and querying world matrices MUST copy their values without sharing subsequent mutations. Singular world transforms MUST fail without changing graphics state.
+**Verification**: Test
+
+### DEV-IMAGE-11 GDI+ string layout settings
+
+**Rule**: String formats MUST preserve independent digit substitution, alignment, trimming, hotkey, tab and measurable-range settings when cloned. Generic formats MUST report native default and typographic settings. Setting more than 32 character ranges MUST return ValueOverflow without changing the previous ranges.
+**Verification**: Test
+**Basis**: [StringFormat](https://learn.microsoft.com/windows/win32/api/gdiplusstringformat/nl-gdiplusstringformat-stringformat).
+
+### DEV-IMAGE-12 Image list storage
+
+**Rule**: Image list duplication MUST copy independent pixels, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
+**Verification**: Test
+**Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
 
 ## Audio ownership
 

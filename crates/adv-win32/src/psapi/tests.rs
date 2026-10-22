@@ -385,7 +385,7 @@ fn queries<B: Backend>(cpu: B) {
     );
 }
 #[test]
-// spec: PERS-PROCESS-1
+// spec: SYS-PROCESS-1
 fn psapi_and_k32_read_the_same_owners_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

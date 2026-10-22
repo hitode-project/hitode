@@ -156,7 +156,7 @@ fn counted<B: Backend>(cpu: B) {
     assert_eq!(m.cpu.read_u32(DATA + 0x1c00).unwrap(), 0x12345678);
 }
 #[test]
-// spec: PERS-STR-1
+// spec: SYS-STR-1
 fn counted_acp_conversion_capacity_and_heap_lifetime_on_three_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

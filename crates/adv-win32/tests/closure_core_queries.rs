@@ -137,7 +137,7 @@ fn queries<B: Backend>(cpu: B) {
 }
 
 #[test]
-// spec: PERS-CORE-1
+// spec: SYS-CORE-1
 fn shared_clock_memory_probes_and_x86_topology_run_on_three_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

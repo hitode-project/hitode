@@ -26,7 +26,7 @@ fn aes(mode: u32) -> Key {
     key
 }
 #[test]
-// spec: PERS-CRYPTO-3
+// spec: SYS-CRYPTO-3
 fn nist_chaining_vectors_split_calls_and_final_reset() {
     // NIST SP 800-38A F.2.1 (CBC) and F.3.1 (CFB8).
     let plain = bytes(
@@ -67,7 +67,7 @@ fn nist_chaining_vectors_split_calls_and_final_reset() {
     assert_eq!(apply(&mut key, Vec::new(), true, false).unwrap().len(), 16);
 }
 #[test]
-// spec: PERS-CRYPTO-4
+// spec: SYS-CRYPTO-4
 fn microsoft_csp_non_sha2_expansion_and_des_parity() {
     // The independent expected values apply the six documented CryptDeriveKey steps.
     for (algorithm, hash, expected) in [

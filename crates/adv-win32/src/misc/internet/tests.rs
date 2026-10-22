@@ -214,7 +214,7 @@ fn sessions<B: Backend>(cpu: B) {
 }
 
 #[test]
-// spec: PERS-NET-1
+// spec: SYS-NET-1
 fn offline_library_initialization_keeps_real_session_ownership() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

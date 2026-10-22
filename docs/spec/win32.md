@@ -205,7 +205,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-USER-20 Input inspection
 
-**Rule**: The host input view MUST report the displayed top-level window and its thread's focus, active and capture windows. A host hit test at a point of the displayed window MUST name the window that ordinary mouse input there reaches.
+**Rule**: The host input view MUST report the displayed top-level window and its thread's focus, active and capture windows. A host hit test at a point of the displayed window MUST name the window that ordinary mouse input there reaches. Capture changes MUST notify the old owner, including capture release by default WM_CANCELMODE before WM_ENABLE when disabling a window.
 **Verification**: Test
 
 ## Drawing and text

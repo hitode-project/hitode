@@ -341,7 +341,7 @@ fn session_keys<B: Backend>(cpu: B) {
     );
 }
 #[test]
-// spec: PERS-CRYPTO-2, PERS-CRYPTO-3, PERS-CRYPTO-4, PERS-CRYPTO-5
+// spec: SYS-CRYPTO-2, SYS-CRYPTO-3, SYS-CRYPTO-4, SYS-CRYPTO-5
 fn crypto_key_lifecycles_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

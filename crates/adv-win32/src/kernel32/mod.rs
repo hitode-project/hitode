@@ -9,7 +9,6 @@ mod exception;
 pub(crate) use exception::install as install_exceptions;
 pub(crate) use exception::raise_status;
 pub(crate) use exception::system_service::install as install_native_services;
-pub(crate) use exception::uncaught_query_blocker;
 pub(crate) mod file;
 pub(crate) mod file_mapping;
 mod format_message;

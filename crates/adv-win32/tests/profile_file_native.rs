@@ -41,7 +41,7 @@ fn units(value: &str) -> Vec<u16> {
     value.encode_utf16().chain([0]).collect()
 }
 #[test]
-// spec: PERS-PROFILEFILE-1, PERS-PROFILEFILE-2
+// spec: SYS-PROFILEFILE-1, SYS-PROFILEFILE-2
 fn ini_structure_bytes_and_section_buffers_match_native_windows() {
     for jit in [false, true] {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

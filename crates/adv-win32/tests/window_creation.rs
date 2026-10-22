@@ -14,6 +14,8 @@ use adv_win32::{
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const LOG: u32 = DATA + 0x8000;
+#[path = "window_creation/capture.rs"]
+mod capture;
 
 trait TestCpu: Backend {
     fn region(&mut self, _: u32, _: usize) {}

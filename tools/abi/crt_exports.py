@@ -7,7 +7,8 @@ only. WinMD omits the C runtimes, so this catalog lists which names each CRT DLL
 exports and whether an export is data. It records no calling convention, ordinal
 or implementation promise. mingw hides some real exports it replaces: in
 `alias == export` only the right side is a DLL export, and `; name ; reason`
-comments keep the name unless the reason says the i386 DLL lacks it.
+comments keep the name unless the reason says the i386 DLL lacks it. Explicit
+SDK/native kind evidence corrects DATA markers used for locally replaced code.
 """
 import argparse
 import hashlib
@@ -78,6 +79,35 @@ def exports(text):
     return result
 
 
+def kind_overrides(path):
+    """Explicit SDK/native kind evidence; import-library DATA can name code."""
+    result = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 4:
+            raise ValueError("invalid CRT kind override")
+        module, name, kind, source = fields
+        key = module, name
+        if not module.endswith(".dll") or not name or kind not in {"code", "data"} or not source or key in result:
+            raise ValueError("invalid or duplicate CRT kind override")
+        result[key] = kind
+    return result
+
+
+def correct_kinds(module, names, overrides):
+    """Correct existing exports only; kind evidence cannot create an export."""
+    result = dict(names)
+    for (owner, name), kind in overrides.items():
+        if owner != module:
+            continue
+        if name not in result:
+            raise ValueError("CRT kind override has no source export")
+        result[name] = kind
+    return result
+
+
 def preprocess(crt, path):
     command = ["cc", "-E", "-P", "-undef", "-D__i386__", "-x", "c",
                "-I", str(crt / "def-include"), "-I", str(crt / "lib-common"),
@@ -90,10 +120,14 @@ def project(mingw):
     modules = dict(MODULES)
     for path in sorted(crt.glob(API_SETS)):
         modules[path.name.split(".def")[0] + ".dll"] = str(path.relative_to(crt))
+    evidence = Path(__file__).resolve().parents[2] / "data" / "abi" / "crt-kind-overrides.tsv"
+    overrides = kind_overrides(evidence)
+    if any(module not in modules for module, _ in overrides):
+        raise ValueError("CRT kind override has no source module")
     rows, source = [], {}
     for module, definition in modules.items():
         path = crt / definition
-        names = exports(preprocess(crt, path))
+        names = correct_kinds(module, exports(preprocess(crt, path)), overrides)
         source[module] = {"definition": definition, "exports": len(names),
                           "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         rows += [(module, name, kind) for name, kind in names.items()]
@@ -101,7 +135,10 @@ def project(mingw):
                             capture_output=True, text=True).stdout.strip()
     rows.sort()
     return rows, {"mingw-w64": commit, "license": "public domain (mingw-w64-crt/DISCLAIMER.PD)",
-                  "modules": source}
+                  "modules": source,
+                  "kind_overrides": {"input": "data/abi/crt-kind-overrides.tsv",
+                                     "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                                     "provenance": "data/abi/crt-source.json#export_kind_corrections"}}
 
 
 def main():

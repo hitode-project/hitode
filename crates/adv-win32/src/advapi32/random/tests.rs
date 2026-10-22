@@ -16,7 +16,7 @@ fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
 }
 
 #[test]
-// spec: PERS-CRYPTO-5
+// spec: SYS-CRYPTO-5
 fn generated_bytes_fill_exact_lengths_and_reject_unwritable_buffers() {
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, false).unwrap(),

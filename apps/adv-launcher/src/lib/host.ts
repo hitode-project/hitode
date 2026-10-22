@@ -47,6 +47,8 @@ export interface RunSummary {
     frame_ms_p95: number;
     frame_ms_p99: number;
   } | null;
+  /** Missing in summaries saved before API gaps were recorded. */
+  api_gaps?: { called: string[]; imported: string[] } | null;
 }
 export type GameFinished =
   | { gameId: string; exitCode: number; summary: RunSummary }

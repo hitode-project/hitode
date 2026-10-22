@@ -82,7 +82,7 @@
     "source": "Microsoft Visual C++ Build Tools 14.44.35207",
     "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h (included by SDK ucrt/corecrt_memory.h)",
     "sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
-    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles and vcruntime140.dll. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
+    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT profiles, ucrtbase.dll and vcruntime140.dll; the string API-set has no memchr export. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
   },
   "corecrt_memcpy_s.h": {
     "header": "ucrt/corecrt_memcpy_s.h",
@@ -106,7 +106,7 @@
     "scope": "Only vcruntime140.dll strrchr/wcsrchr and ucrtbase.dll plus api-ms-win-crt-string-l1-1-0.dll wcscpy_s/strcpy_s/strncpy_s. Typed checked ordinary NUL-terminated searches and valid-capacity copies delegate to the existing legacy memory kernels; invalid-parameter handling reuses the shared CRT owner. wchar_t is a16-bit code unit in one x86 stack word. Finite-count strncpy_s requires a checked NUL-terminated source; _TRUNCATE and arbitrary unterminated prefix inputs are not advertised. Existing typed wcscat_s is unchanged."
   },
   "legacy_data": {
-    "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
+    "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for each legacy runtime whose fixed export catalog contains these variables.",
     "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
   },
@@ -425,5 +425,198 @@
     ],
     "projection": "double __cdecl pow(double, double) and _hypot(double, double): four x86 argument words, x87 double return. Only the three legacy CRT aliases.",
     "profile": "Finite normal operands and results within the _CIpow profile; domain, range and nonfinite CRT error handling warn and fail."
+  },
+  "process_environment": {
+    "headers": {
+      "process.h": {
+        "header": "ucrt/process.h",
+        "sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490"
+      },
+      "corecrt_wprocess.h": {
+        "header": "ucrt/corecrt_wprocess.h",
+        "sha256": "e75c5cdf244070ddcebac8920dd4cc96c33d0e21fdfbc82446c0374950e98487"
+      },
+      "stdlib.h": {
+        "header": "ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      "errno.h": {
+        "header": "ucrt/errno.h",
+        "sha256": "c64e8df96f057fdebc0474bd765cee3ae17de34a2b1fc9d197597321f2d1e447"
+      },
+      "stdio.h": {
+        "header": "ucrt/stdio.h",
+        "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6"
+      },
+      "corecrt_wstdio.h": {
+        "header": "ucrt/corecrt_wstdio.h",
+        "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+      }
+    },
+    "package": "Microsoft.Windows.SDK.CPP 10.0.26100.1",
+    "package_url": "https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP/10.0.26100.1",
+    "projection": "Catalog-filtered x86 cdecl process launch, pipe and error-cell declarations. intptr_t is a signed 32-bit integer; list forms retain only the mandatory mode/path/arg0 prefix. Implementations share per-module/thread error cells. Invalid-parameter handling is selected by the CRT version profile.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/system-wsystem",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/spawn-wspawn-functions",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/exec-wexec-functions",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/popen-wpopen",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/pclose",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-errno",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-doserrno"
+    ]
+  },
+  "corecrt_terminate.h": {
+    "header": "ucrt/corecrt_terminate.h",
+    "sha256": "c8dc9a2497bcae0a9084eb1120f25660a575c7957997301c4f017fc44c908f54",
+    "projection": "x86 cdecl zero-word terminate and one-word set_terminate function-pointer parameter/results. Historical C++ aliases retain one-word pointer or int-null argument encodings."
+  },
+  "cpp_runtime_callbacks": {
+    "source": "Microsoft Learn CRT declarations; SDK stdlib.h/corecrt_terminate.h; public x86 decorated-name ABI for legacy aliases and __std_terminate. No header or native code is copied.",
+    "abi": "All entries are x86 cdecl. terminate/unexpected/__std_terminate take no stack arguments and do not return. set_terminate/set_unexpected/_set_se_translator/_set_purecall_handler take one callback pointer and return the previous callback; legacy H overloads take a 32-bit null integer. Getters have zero arguments. _purecall is int(void), nonreturning in this environment. UCRT _o_ wrappers preserve their public target ABI.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-terminate-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/terminate-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-unexpected-crt",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-se-translator",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/purecall",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-purecall-handler",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-purecall-handler"
+    ]
+  },
+  "x86_seh_runtime": {
+    "source": "Microsoft Learn CRT/internal-CRT API documentation and public MSVC x86 EH registration/scope-table ABI. These internal entries are explicitly declared; no implementation code or headers are imported.",
+    "abi": "_except_handler2/3 are four-pointer x86 cdecl EXCEPTION_DISPOSITION functions. _except_handler4_common adds cookie-address and security-check-callback pointers before those four arguments. _global_unwind2 is void cdecl(frame); _local_unwind2 is void cdecl(frame,int state); _local_unwind4 adds a leading cookie-address argument. Filter/finally funclets use establisher+16 as EBP. EH4 cookie-check callbacks receive their checked value in ECX.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/except-handler3",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-exception_registration_record",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlunwind"
+    ]
+  },
+  "x86_cpp_eh": {
+    "source": "Microsoft Learn _CxxThrowException and __CxxFrameHandler declarations; public MSVC x86 FuncInfo/ThrowInfo ABI. Internal frame handlers receive FuncInfo in EAX in addition to four stack pointers. Metadata is interpreted, never copied as native implementation code.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cxxthrowexception",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cxxframehandler",
+      "https://www.openrce.org/articles/full_view/21",
+      "https://devblogs.microsoft.com/oldnewthing/20100730-00/?p=13273"
+    ],
+    "abi": "_CxxThrowException is void __stdcall(void*, _ThrowInfo*). __CxxFrameHandler/2/3 are four-pointer cdecl EXCEPTION_DISPOSITION with FuncInfo in EAX. x86 metadata uses absolute pointers. C++ code 0xe06d7363 carries magic, object, ThrowInfo.",
+    "corroboration": {
+      "source": "Microsoft VC 14.29.30037 ehdata.h, declaration/layout-only mirror. Registration frame, FuncInfo, TryBlockMapEntry and HandlerType fields were checked without importing any header or implementation.",
+      "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/ehdata.h",
+      "sha256": "17f494086d8e9cbc855027a0f798036eb1270dda488e896776c26f2a5c7bc33a"
+    },
+    "jump_buffer": {
+      "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/setjmp.h",
+      "sha256": "95195f814fdacf95114667d73f7d4d8b3fbf33ac711f2c152f682b612c0357d0",
+      "layout": "x86 _JUMP_BUFFER is sixteen DWORDs: Ebp/Ebx/Edi/Esi/Esp/Eip/Registration/TryLevel/Cookie/UnwindFunc/UnwindData[6]. __CxxLongjmpUnwind is a stdcall one-buffer local unwind callback. Compiler C++ UnwindData[0] supplies FuncInfo."
+    },
+    "native_abi_check": {
+      "source": "Microsoft Visual C++ 2008 SP1 Redistributable Security Update, x86 MSVCR90 9.0.30729.6161; Microsoft VCLibs x86 UWPDesktop 14.0.33321.0 VCRuntime140. Only ABI/control-flow observations and hashes are retained; no binary or native code is imported.",
+      "vc90_url": "https://download.microsoft.com/download/5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x86.exe",
+      "vc90_redist_sha256": "8742bcbf24ef328a72d2a27b693cc7071e38d3bb4b9b44dec42aa3d2c8d61d92",
+      "msvcr90_sha256": "8e7fe1a1f3550c479ffd86a77bc9d10686d47f8727025bb891d8f4f0259354c8",
+      "vclibs_url": "https://download.microsoft.com/download/4/7/c/47c6134b-d61f-4024-83bd-b9c9ea951c25/Microsoft.VCLibs.x86.14.00.Desktop.appx",
+      "vcruntime140_sha256": "ca29b6c032a397ee320189b47c4ccd12a914a2730820e5c32c7efbf8c7f2d02c",
+      "observations": "Both x86 __CxxLongjmpUnwind entries use callee cleanup of one stack word and take FuncInfo at jump-buffer +40. Both __CxxQueryExceptionSize entries return sixteen bytes. _EH_prolog takes the frame handler in EAX and creates an x86 C++ registration; _NLG_Return2 is a return boundary preserving incoming registers.",
+      "processing_throw": "VC90 local C++ unwinding increments the processingThrow field before cleanup and decrements after cleanup, including __CxxLongjmpUnwind. _CxxThrowException constructs/raises a record without changing that field. Rethrow retains null object/ThrowInfo arguments in the raised record and frame handlers resolve the active caught object. These are ABI/control-flow observations of the pinned Microsoft binary, not native Windows execution results."
+    }
+  },
+  "versioned_string_operations": {
+    "source": "Windows SDK 10.0.26100.0 ucrt string.h/corecrt_wstring.h and their included VCRuntime string declarations. Existing vcruntime_string.h provenance covers the included declarations.",
+    "headers": {
+      "string.h": {
+        "header": "ucrt/string.h",
+        "sha256": "796b2226809790078984b919542d818ce74190d2110b119f93c2a7c3882b5de5"
+      },
+      "corecrt_wstring.h": {
+        "header": "ucrt/corecrt_wstring.h",
+        "sha256": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
+      }
+    },
+    "projection": "Catalog-filtered x86 cdecl strlen/strnlen, strcmp/strncmp, strchr/strrchr/strstr, strcpy/strncpy/strcat/strncat and their wchar_t counterparts. wchar_t is a 16-bit code unit passed as a promoted one-word scalar; size_t and pointers are 32-bit. Byte comparisons use unsigned char.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strlen-wcslen-mbslen-mbslen-l-mbstrlen-mbstrlen-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnlen-strnlen-s",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcmp-wcscmp-mbscmp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strncpy-strncpy-l-wcsncpy-wcsncpy-l-mbsncpy-mbsncpy-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strstr-wcsstr-mbsstr-mbsstr-l"
+    ]
+  },
+  "absent_export_audit": {
+    "scope": "Remove handwritten registrations absent from real Microsoft x86 PE exports. ABI declarations do not imply a DLL export.",
+    "vc80": {
+      "url": "https://download.microsoft.com/download/8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE",
+      "version": "8.0.50727.6195",
+      "msvcr80_sha256": "c3ac989c8489a23bb96400b1856f5325ffc67e844f04651ea5d61bc20a991c6d",
+      "absent": "time",
+      "present": "_time32, _time64"
+    },
+    "vc90": {
+      "version": "9.0.30729.6161",
+      "msvcr90_sha256": "8e7fe1a1f3550c479ffd86a77bc9d10686d47f8727025bb891d8f4f0259354c8",
+      "absent": "time",
+      "present": "_time32, _time64"
+    },
+    "ucrt_string_contract": {
+      "source": "Microsoft.Windows.SDK.CPP 10.0.26100.0, Redist/ucrt/DLLs/x86/api-ms-win-crt-string-l1-1-0.dll",
+      "sha256": "f7522818c7a5368cb006889f0948979b91b99baba3482a65bb20ef929ba6bd99",
+      "absent": "memchr",
+      "notes": "ucrtbase.dll and vcruntime140.dll retain their actual memchr exports."
+    },
+    "winmd_platform_audit": "The pinned WinMD has no P/Invoke methods whose DLL/name pair matches the refreshed CRT catalog. No SupportedOSPlatform exclusions can be derived for this catalog from WinMD; undocumented internal entries are not excluded by release year alone."
+  },
+  "multibyte_traversal": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "headers": {
+      "mbctype.h": "d94ae0643bdd31201a2ffd173481164297ff6bee1d8e1ee8bd7d3442640468cf",
+      "mbstring.h": "71641796dab9103f67b47dd127d99bdd37360f6162fa8c63cf93873ebaab7f62"
+    },
+    "scope": "Cataloged non-locale-handle multibyte pointer/count/classification/copy entries and independent _setmbcp/_getmbcp code-page control. Shared locale storage preserves CRT-module ownership and public API-set aliases. Explicit locale handles and thread-locale configuration are separate work.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setmbcp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getmbcp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ismbblead-ismbblead-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ismbslead-ismbstrail-ismbslead-l-ismbstrail-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strlen-wcslen-mbslen-mbslen-l-mbstrlen-mbstrlen-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strinc-wcsinc-mbsinc-mbsinc-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strncnt-wcsncnt-mbsnbcnt-mbsnbcnt-l-mbsnccnt-mbsnccnt-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnextc-wcsnextc-mbsnextc-mbsnextc-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mbsnbcpy-mbsnbcpy-l"
+    ],
+    "legacy_utf8": "SDK mbctype.h explicitly identifies UTF-8 as unsupported by earlier CRT versions. The version profile rejects 65001 in legacy CRTs and accepts it in UCRT; its byte-lead classifiers remain false.",
+    "native_boundary_observations": "The pinned VC90 x86 entries return zero counts for a zero limit without dereferencing the input, omit a terminal lead byte from byte/character counts, increment a terminal lead by one byte in _mbsinc, and return its byte value in _mbsnextc. Context-sensitive lead/trail queries return -1 on a match, including a terminator immediately following a dangling lead. These are control-flow observations, not native Windows execution results.",
+    "ucrt_getmbcp": "Microsoft SDK 10.0.26100.0 Redist/ucrt/DLLs/x86/ucrtbase.dll, SHA-256 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9: the query returns zero when its DBCS flag is clear."
+  },
+  "crt_process_services": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "headers": {
+      "process.h": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
+      "stdlib.h": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getpid",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    ],
+    "abi": "_getpid is cdecl int(void); _sleep is cdecl void(unsigned long). Both consume the existing Windows process/scheduler services through their live public entries. _sleep(0) requests one millisecond, matching the pinned VC90 x86 boundary (the deprecated SDK declaration does not specify the zero-duration edge)."
+  },
+  "export_kind_corrections": {
+    "input": "data/abi/crt-kind-overrides.tsv",
+    "source": "Microsoft Windows SDK 10.0.26100.0, x86 function declarations; PE export-section observations of the pinned Microsoft x86 runtime binaries. The import-library DATA markers intentionally suppress mingw function thunks for locally replaced functions and do not describe their actual DLL storage class. No export names are added by kind correction.",
+    "headers": {
+      "corecrt_math.h": "b3c3a0188db2bf985a5082c787ca1509cb7ce34c48a0b0613ee244f2d3192d1c",
+      "fenv.h": "12e9ee9809314ca1db03e7fb0e36e20cb9052df291c8367d580f600dea7546e3",
+      "float.h": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd",
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "native_sections": "The fourteen legacy math entries are in executable .text in VC80 and VC90. The three lgamma and nine fenv entries are in executable .text in SDK x86 UCRT. _HUGE and _iob remain writable .data in VC80/90. Existing native-ABI provenance records the binary hashes; UCRT SHA-256 is 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9. _cabs, _tzset and _fpreset are executable .text entries in VC80, VC90 and SDK x86 UCRT."
+  },
+  "versioned_data_cells": {
+    "source": "Cataloged legacy CRT exports. Command-line pointer declarations use the pinned corecrt_startup.h source; internal legacy data uses explicit x86 ABI evidence.",
+    "huge": "Eight-byte IEEE binary64 double, initial positive infinity 0x7ff0000000000000. Pinned VC80 and VC90 PE exports hold these bytes in writable .data. Modern corecrt_math.h provides the corresponding HUGE_VAL expression; its managed-only _HUGE declaration is not claimed as a native legacy header declaration.",
+    "adjust_fdiv": "32-bit int initially zero for the virtual conforming x87 processor; cataloged versions share one descriptor kernel. No Pentium FDIV erratum is modeled.",
+    "command_line": "Each CRT has independent four-byte pointer cells initialized from the existing Win32 ANSI/UTF-16 command-line owner. Public data addresses are real non-executable PE storage, retain guest writes and are identical through static IAT and dynamic lookup."
   }
 }

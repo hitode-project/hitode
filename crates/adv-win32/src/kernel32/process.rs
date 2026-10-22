@@ -414,7 +414,6 @@ struct Unwind {
     scratch: u32,
     /// EBX, ESI, EDI, EBP at entry, which the resumed context restores.
     saved: [u32; 4],
-    _phase: std::rc::Rc<super::exception::phase::Phase>,
 }
 
 const SAVED: [Reg; 4] = [Reg::Ebx, Reg::Esi, Reg::Edi, Reg::Ebp];
@@ -433,16 +432,11 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
             "RtlUnwind to {ip:#010x} from {ret:#010x}: only the return address is supported"
         ));
     }
-    let code = if record == 0 {
-        STATUS_UNWIND
-    } else {
-        match env.cpu.read_u32(record) {
-            Ok(code) => code,
-            Err(error) => {
-                return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
-            }
-        }
-    };
+    if record != 0
+        && let Err(error) = env.cpu.read_u32(record)
+    {
+        return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
+    }
     let heaps = env.ext.get_mut::<Heaps>();
     let Some(scratch) = heaps.alloc(env.cpu, &mut env.sys.vm, 0, SCRATCH, true) else {
         return Outcome::Fail("RtlUnwind: out of memory".into());
@@ -481,7 +475,6 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     for (off, v) in regs {
         let _ = env.cpu.write_u32(c + off, v);
     }
-    let active = super::exception::phase::enter(env, super::exception::phase::Phase::Unwind, code);
     unwind_step(
         env,
         Unwind {
@@ -490,7 +483,6 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
             record,
             scratch,
             saved,
-            _phase: active,
         },
     )
 }

@@ -19,16 +19,7 @@ const MODULE: &str = "msvcr90.dll";
 // Inspect the real query from a guest callback, but allow that callback to
 // return so the test also observes the phase's normal/nonlocal end.
 fn observe(env: &mut Env<'_>) -> Outcome {
-    let expected = env.cpu.read_u32(DATA).unwrap();
-    let Outcome::Fail(reason) = uncaught(env) else {
-        panic!("an active/unknown phase must not return a fabricated bool");
-    };
-    assert!(reason.contains(match expected {
-        1 => "exception dispatch",
-        2 => "stack unwind",
-        3 => "C++ exception state is unknown",
-        _ => panic!("invalid observation selector"),
-    }));
+    assert!(matches!(uncaught(env), Outcome::Return(0)));
     let count = env.cpu.read_u32(DATA + 4).unwrap();
     env.cpu.write_u32(DATA + 4, count + 1).unwrap();
     Outcome::Return(0)
@@ -261,12 +252,7 @@ fn phase_guest<B: Backend>(cpu: B, mode: Mode) {
     } else {
         run(&mut machine, &code)
     };
-    if cpp {
-        assert!(
-            matches!(result, RunResult::Failed(ref reason) if reason.message.contains("C++ exception state is unknown")),
-            "{result:?}"
-        );
-    } else if mode == Mode::Exit {
+    if mode == Mode::Exit {
         assert!(matches!(result, RunResult::Exited(42)), "{result:?}");
     } else {
         assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
@@ -276,34 +262,13 @@ fn phase_guest<B: Backend>(cpu: B, mode: Mode) {
         machine.cpu.read_u32(DATA + 4).unwrap(),
         if mode == Mode::Blocked { 2 } else { 1 }
     );
-    let diagnostics = machine.ext.get::<adv_abi::ApiDiagnostics>();
-    assert_eq!(diagnostics.warnings.len(), 1);
-    assert_eq!(
-        *diagnostics.warnings.values().next().unwrap(),
-        if cpp || mode == Mode::Blocked { 2 } else { 1 }
+    assert!(
+        machine
+            .ext
+            .try_get::<adv_abi::ApiDiagnostics>()
+            .is_none_or(|d| d.warnings.is_empty() && d.stub_calls == 0)
     );
-    assert_eq!(diagnostics.stub_calls, 0);
-
-    // The phase has ended even when the callback never returned. C++ taint
-    // survives that end, but never belongs to a different guest thread.
-    let owner = machine.sys.current;
     let thunk = (query - THUNK_BASE) / THUNK_STRIDE;
-    let env = Env {
-        context: owner,
-        cpu: &mut machine.cpu,
-        sys: &mut machine.sys,
-        ext: &mut machine.ext,
-        thunk,
-    };
-    if cpp {
-        assert!(
-            crate::kernel32::uncaught_query_blocker(&env)
-                .unwrap()
-                .contains("C++ exception state is unknown")
-        );
-    } else {
-        assert_eq!(crate::kernel32::uncaught_query_blocker(&env), None);
-    }
     let other = machine
         .spawn("independent clean CRT thread", PARK_ADDR, &[], 65536)
         .unwrap();
@@ -333,7 +298,7 @@ fn dispatch_and_unwind_phases_end_on_return_nonlocal_escape_and_thread_exit() {
 }
 
 #[test]
-fn cpp_raise_and_external_unwind_record_remain_explicitly_unknown_per_thread() {
+fn raw_windows_cpp_status_does_not_invent_crt_processing_throw_state() {
     for mode in [Mode::CppRaise, Mode::CppUnwind] {
         phase_guest(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
         phase_guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);

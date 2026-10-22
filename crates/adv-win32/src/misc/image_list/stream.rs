@@ -114,6 +114,7 @@ struct Header {
     grow: usize,
     mask: bool,
     extended: bool,
+    background: u32,
 }
 
 pub(super) fn read(env: &mut Env<'_>, stream: u32) -> Outcome {
@@ -142,6 +143,7 @@ pub(super) fn read(env: &mut Env<'_>, stream: u32) -> Outcome {
                 height: u32::from(word(&bytes, 12)),
                 mask: word(&bytes, 18) & 1 != 0,
                 extended: word(&bytes, 18) & 0x1000 != 0,
+                background: dword(&bytes, 14),
             };
             if header.width == 0 || header.height == 0 || header.count > header.capacity {
                 return Outcome::Return(0);
@@ -399,6 +401,7 @@ fn finish(env: &mut Env<'_>, header: Header, color: Bitmap, mask: Option<Bitmap>
         mask: header.mask,
         grow: header.grow,
         images,
+        background: header.background,
     };
     // Recheck the process budget after callbacks, which may create sibling lists.
     let lists = env.ext.get_or_default::<ImageLists>();

@@ -9,7 +9,7 @@ fn bytes(value: &str) -> Vec<u8> {
         .collect()
 }
 #[test]
-// spec: PERS-CRYPTO-3
+// spec: SYS-CRYPTO-3
 fn nist_and_rfc_symmetric_known_answers() {
     // FIPS 197 Appendix C; DES canonical FIPS example; RFC 2268 section 5;
     // RFC 6229's 40-bit RC4 stream. Encryption and decryption use known answers.

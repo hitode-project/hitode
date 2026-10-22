@@ -431,7 +431,7 @@ fn profile<B: Backend>(cpu: B, capabilities: bool) {
     );
 }
 #[test]
-// spec: PERS-NET-3, PERS-NET-4
+// spec: SYS-NET-3, SYS-NET-4
 fn offline_router_owns_local_configuration_and_thread_errors_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
@@ -441,7 +441,7 @@ fn offline_router_owns_local_configuration_and_thread_errors_on_all_backends() {
     profile(UnicornCpu::new(PARK_ADDR).unwrap(), false);
 }
 #[test]
-// spec: PERS-NET-5
+// spec: SYS-NET-5
 fn provider_capability_queries_report_the_missing_provider_bridge() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

@@ -1,4 +1,4 @@
-//! Stubs return only a reviewed failure contract. No fabricated success or output objects.
+//! Stubs return a reviewed or return-type-derived failure. No fabricated success or output objects.
 use crate::{ExportClass, Registry, personality, signature, trace};
 use adv_machine::{Env, Outcome, layout::teb};
 use std::any::Any;
@@ -285,6 +285,40 @@ pub fn failure_value(signature: &signature::Signature) -> Option<u32> {
         })
 }
 
+/// What a discovery stub returns: the registered failure, else the failure its
+/// return type documents. Status types carry their not-implemented code, BOOL,
+/// counts, handles and pointers are zero, and sentinel types use their invalid
+/// value. Wide or floating returns have no derivable failure.
+pub fn derived_failure(signature: &signature::Signature) -> Option<u32> {
+    use signature::AbiKind;
+    if let Some(value) = failure_value(signature) {
+        return Some(value);
+    }
+    match signature.return_kind {
+        AbiKind::Void | AbiKind::Pointer | AbiKind::Handle => return Some(0),
+        AbiKind::AnsiString | AbiKind::WideString => return Some(0),
+        AbiKind::U32 | AbiKind::I32 => {}
+        _ => return None,
+    }
+    let module = |name: &str| signature.module.eq_ignore_ascii_case(name);
+    Some(match signature.return_type {
+        "HRESULT" => 0x8000_4001,
+        "Windows.Win32.Foundation.NTSTATUS" => 0xc000_0002, // STATUS_NOT_IMPLEMENTED
+        "Windows.Win32.Foundation.WIN32_ERROR" => 120,      // ERROR_CALL_NOT_IMPLEMENTED
+        "Windows.Win32.Graphics.GdiPlus.Status" => 6,       // NotImplemented
+        "errno_t" => 40,                                    // ENOSYS
+        // INVALID_SOCKET, CLR_INVALID and WAIT_FAILED.
+        "Windows.Win32.Networking.WinSock.SOCKET"
+        | "Windows.Win32.Foundation.COLORREF"
+        | "Windows.Win32.Foundation.WAIT_EVENT" => u32::MAX,
+        // Untyped winmm results are MMRESULT codes, except device counts.
+        _ if module("winmm.dll") && !signature.name.ends_with("GetNumDevs") => 8,
+        // Untyped Winsock int results report failure as SOCKET_ERROR.
+        "i32" if module("ws2_32.dll") || module("wsock32.dll") => u32::MAX,
+        _ => 0,
+    })
+}
+
 /// What a reviewed export returns: its registered failure, or nothing for a
 /// void ABI. None means the review is incomplete and the export stays a stub.
 pub fn reviewed_failure(signature: &signature::Signature) -> Option<u32> {
@@ -331,7 +365,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
         .downcast_ref::<Registry>()
         .expect("ABI registry resolved stub")
         .mode();
-    let failure = failure_value(signature);
+    let failure = derived_failure(signature);
     let call = StubCall {
         module: signature.module.to_owned(),
         name: signature.name.to_owned(),
@@ -360,7 +394,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
     }
     let Some(value) = failure else {
         return Outcome::Fail(format!(
-            "unimplemented: {}!{} (no reviewed failure contract; discovery cannot return)",
+            "unimplemented: {}!{} (return type has no derivable failure; discovery cannot return)",
             signature.module, signature.name
         ));
     };

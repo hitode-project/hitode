@@ -102,7 +102,7 @@ fn writes<B: Backend>(cpu: B) {
 }
 
 #[test]
-// spec: PERS-CONSOLE-1
+// spec: SYS-CONSOLE-1
 fn ansi_and_wide_console_writes_fail_without_an_attached_console() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

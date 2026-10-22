@@ -205,7 +205,7 @@ fn handshake<B: Backend>(cpu: B) {
     assert!(diagnostics.warnings.is_empty());
 }
 #[test]
-// spec: PERS-SYNC-1
+// spec: SYS-SYNC-1
 fn signal_and_wait_checks_objects_before_releasing_state_on_all_backends() {
     for jit in [false, true] {
         guarded(JitCpu::new(PARK_ADDR, jit).unwrap());
@@ -213,7 +213,7 @@ fn signal_and_wait_checks_objects_before_releasing_state_on_all_backends() {
     guarded(UnicornCpu::new(PARK_ADDR).unwrap());
 }
 #[test]
-// spec: PERS-SYNC-1
+// spec: SYS-SYNC-1
 fn signal_and_wait_blocks_delivers_apcs_and_uses_shared_acquisition_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

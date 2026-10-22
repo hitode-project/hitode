@@ -171,7 +171,7 @@ fn lifecycle<B: Backend>(cpu: B, wide: bool) {
     );
 }
 #[test]
-// spec: PERS-CRYPTO-1, PERS-CRYPTO-2
+// spec: SYS-CRYPTO-1, SYS-CRYPTO-2
 fn crypto_hashes_preserve_lifecycle_on_all_backends() {
     for wide in [false, true] {
         for jit in [false, true] {

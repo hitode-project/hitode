@@ -182,7 +182,7 @@ fn profile<B: Backend>(cpu: B) {
     std::fs::remove_dir_all(directory).unwrap();
 }
 #[test]
-// spec: PERS-INSTALL-1, PERS-INSTALL-2
+// spec: SYS-INSTALL-1, SYS-INSTALL-2
 fn empty_installer_queries_and_vfs_hashes_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

@@ -197,7 +197,7 @@ fn empty<B: Backend>(cpu: B) {
     );
 }
 #[test]
-// spec: PERS-PRINT-1
+// spec: SYS-PRINT-1
 fn empty_printer_catalog_and_local_server_lifetimes_on_three_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

@@ -262,7 +262,7 @@ fn offline<B: Backend>(cpu: B) {
     );
 }
 #[test]
-// spec: PERS-NET-6
+// spec: SYS-NET-6
 fn offline_requests_validate_session_types_and_preserve_outputs_on_three_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();

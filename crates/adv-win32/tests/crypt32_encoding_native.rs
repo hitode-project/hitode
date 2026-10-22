@@ -28,7 +28,7 @@ unsafe extern "system" {
     fn SetLastError(error: u32);
 }
 #[test]
-// spec: PERS-CRYPTO-7
+// spec: SYS-CRYPTO-7
 fn byte_encodings_match_native_crypt32() {
     let mut failures = Vec::new();
     for length in [0usize, 1, 2, 3, 8, 15, 16, 17, 47, 48, 49, 64, 255, 256] {
@@ -85,7 +85,7 @@ fn byte_encodings_match_native_crypt32() {
     );
 }
 #[test]
-// spec: PERS-CRYPTO-7
+// spec: SYS-CRYPTO-7
 fn decoding_and_detection_match_native_crypt32() {
     let mut failures = Vec::new();
     for input in [
@@ -198,7 +198,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 #[test]
-// spec: PERS-CRYPTO-8, PERS-CRYPTO-9
+// spec: SYS-CRYPTO-8, SYS-CRYPTO-9
 fn raw_binary_copies_match_native_buffer_and_length_rules() {
     use adv_cpu::{
         JitCpu,

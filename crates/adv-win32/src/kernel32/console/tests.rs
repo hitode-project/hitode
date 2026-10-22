@@ -129,7 +129,7 @@ fn profile<B: Backend>(cpu: B, allocation: bool) {
     );
 }
 #[test]
-// spec: PERS-CONSOLE-1, PERS-CONSOLE-2
+// spec: SYS-CONSOLE-1, SYS-CONSOLE-2
 fn detached_console_queries_and_control_state_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
@@ -139,7 +139,7 @@ fn detached_console_queries_and_control_state_on_all_backends() {
     profile(UnicornCpu::new(PARK_ADDR).unwrap(), false);
 }
 #[test]
-// spec: PERS-CONSOLE-3
+// spec: SYS-CONSOLE-3
 fn console_allocation_reports_the_missing_transport() {
     profile(JitCpu::new(PARK_ADDR, false).unwrap(), true);
 }

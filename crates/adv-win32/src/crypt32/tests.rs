@@ -8,7 +8,7 @@ use adv_cpu::{
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 #[test]
-// spec: PERS-CRYPTO-7
+// spec: SYS-CRYPTO-7
 fn encodings_match_rfc_vectors_and_preserve_header_detection() {
     for (bytes, base64) in [
         ("", ""),
@@ -316,7 +316,7 @@ fn guest<B: Backend>(cpu: B) {
     assert!(diagnostics.acceptance_eligible(RunMode::Strict));
 }
 #[test]
-// spec: PERS-CRYPTO-7, PERS-CRYPTO-8
+// spec: SYS-CRYPTO-7, SYS-CRYPTO-8
 fn binary_conversion_sizes_and_guest_permissions_on_all_backends() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
@@ -396,7 +396,7 @@ fn raw_copies<B: Backend>(cpu: B) {
     assert_eq!(machine.cpu.read_u32(SKIP).unwrap(), 0);
 }
 #[test]
-// spec: PERS-CRYPTO-9
+// spec: SYS-CRYPTO-9
 fn raw_binary_uses_native_character_queries_and_checked_byte_copy_capacities() {
     for jit in [false, true] {
         let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
