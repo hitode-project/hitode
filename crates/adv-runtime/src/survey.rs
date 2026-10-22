@@ -6,7 +6,7 @@
 //! not just the first one a player reaches. Constant scalar arguments of
 //! every import call are checked against the runtime's mode contracts
 //! (PERS-EXPORT-10).
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use adv_abi::personality::ExportClass;
 use adv_abi::{AbiKind, Accepts, Registry};
@@ -575,6 +575,9 @@ pub trait Provider {
     fn class(&self, clsid: &[u8; 16]) -> bool;
     /// The mode contract of a parameter, when the runtime declares one.
     fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts>;
+    /// A gap reviewed as harmless: `kind` is a `data/abi/absent.tsv` kind
+    /// and `item` the gap as reported.
+    fn absent(&self, kind: &str, item: &str) -> bool;
 }
 
 /// Every requirement the runtime cannot satisfy, each with the files needing it.
@@ -684,6 +687,16 @@ pub fn gaps(modules: &[Module], host: &dyn Provider) -> Gaps {
             }
         }
     }
+    for (kind, items) in [
+        ("module", &mut gaps.missing_modules),
+        ("import", &mut gaps.missing_imports),
+        ("load", &mut gaps.absent_loads),
+        ("lookup", &mut gaps.unavailable_lookups),
+        ("undeclared", &mut gaps.undeclared_lookups),
+        ("class", &mut gaps.missing_classes),
+    ] {
+        items.retain(|item, _| !host.absent(kind, item));
+    }
     gaps
 }
 
@@ -696,6 +709,8 @@ struct Host<'a> {
     declared: HashMap<&'a str, BTreeSet<String>>,
     /// Functions Windows 7 lacks, by module; a failed lookup is their native answer.
     later: HashMap<&'static str, BTreeSet<&'static str>>,
+    /// Reviewed harmless gaps by (kind, item), from `data/abi/absent.tsv`.
+    absent: HashSet<(&'static str, &'static str)>,
 }
 
 impl Provider for Host<'_> {
@@ -734,6 +749,9 @@ impl Provider for Host<'_> {
     fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
         self.registry.accepts(module, name, param)
     }
+    fn absent(&self, kind: &str, item: &str) -> bool {
+        self.absent.contains(&(kind, item))
+    }
 }
 
 impl<B: Backend> Runtime<B> {
@@ -762,12 +780,21 @@ impl<B: Backend> Runtime<B> {
                 later.entry(module).or_default().insert(name);
             }
         }
+        let absent = include_str!("../../../data/abi/absent.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                Some((fields.next()?, fields.next()?))
+            })
+            .collect();
         let host = Host {
             registry,
             sys: &self.machine.sys,
             classes: self.machine.ext.try_get(),
             declared,
             later,
+            absent,
         };
         gaps(modules, &host)
     }

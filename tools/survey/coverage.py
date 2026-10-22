@@ -10,7 +10,11 @@ data/abi/post-win7.tsv lists were introduced after Windows 7, stay unimplemented
 so discovery hides them, and are counted as excluded. --closure replaces the
 catalogs with data/abi/closure.tsv, the functions sample games import or look up.
 Without DLL arguments every module is listed, most missing first; --missing also
-prints the missing names.
+prints the missing names. --demand instead prints the open rows of
+data/abi/demand.tsv, the gaps sample game surveys found, less those
+data/abi/absent.tsv reviews as harmless: import and lookup rows the registered APIs
+or post-win7.tsv do not answer, and every module, load, class, undeclared and mode
+row. DLL arguments select rows by module; "class" and "undeclared" select those rows.
 """
 import argparse
 import collections
@@ -49,13 +53,33 @@ def covered(have, dll, name):
     return dll in dlls or (dll.startswith("api-ms-win-crt-") and "ucrtbase.dll" in dlls)
 
 
+def demand(selected, have, later):
+    absent = {(kind, item) for kind, item, *_ in rows(ABI / "absent.tsv")}
+    counts = collections.Counter()
+    for kind, item, value, games in rows(ABI / "demand.tsv"):
+        if kind == "unreviewed" or (kind, item) in absent:
+            continue
+        dll, _, name = item.partition("!")
+        if kind in ("import", "lookup") and ((dll, name) in later or covered(have, dll, name)):
+            continue
+        scope = kind if kind in ("class", "undeclared") else dll.split(" ")[0]
+        if selected and scope not in selected:
+            continue
+        print("\t".join((kind, item, value, games)))
+        counts[kind] += 1
+    print("open " + " ".join(f"{kind}={count}" for kind, count in sorted(counts.items())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dlls", nargs="*")
     parser.add_argument("--missing", action="store_true")
     parser.add_argument("--closure", action="store_true")
+    parser.add_argument("--demand", action="store_true")
     args = parser.parse_args()
     have, exports, later = where.registered(), catalog(), post_win7()
+    if args.demand:
+        return demand({dll.lower() for dll in args.dlls}, have, later)
     if args.closure:
         sampled = collections.defaultdict(dict)
         for dll, name, _ in rows(ABI / "closure.tsv"):

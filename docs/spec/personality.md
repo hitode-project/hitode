@@ -110,7 +110,7 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-EXPORT-9 Static survey
 
-**Rule**: A survey MUST list, before guest code runs, every static import, constant-named module load or lookup and constant COM class the runtime cannot satisfy. It MUST resolve game modules before host modules, as the loader does. It MUST count lookup call sites whose name or class is not a constant.
+**Rule**: A survey MUST list, before guest code runs, every static import, constant-named module load or lookup and constant COM class the runtime cannot satisfy. It MUST resolve game modules before host modules, as the loader does, and count lookup sites naming no constant. It MUST omit gaps data/abi/absent.tsv reviews as harmless, each with its reason.
 **Verification**: Test
 
 ### PERS-EXPORT-10 Mode contracts

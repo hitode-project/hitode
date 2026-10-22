@@ -161,6 +161,9 @@ impl Provider for Fake {
     fn class(&self, clsid: &[u8; 16]) -> bool {
         clsid[0] == 1
     }
+    fn absent(&self, kind: &str, item: &str) -> bool {
+        (kind, item) == ("load", "optional.dll")
+    }
     fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
         ((module, name, param) == ("kernel32.dll", "Sleep", "dwMilliseconds"))
             .then_some(|ms| ms < 100)
@@ -192,7 +195,7 @@ fn gaps_resolve_game_modules_before_host_modules_unless_replaced() {
             import("gone.dll", "Anything"),
             import("d3dx9_43.dll", "D3DXCreateSprite"),
         ]),
-        loads: set(["opt.dll", "game.dll", "kernel32.dll"]),
+        loads: set(["opt.dll", "optional.dll", "game.dll", "kernel32.dll"]),
         lookups: set(["Known", "Hidden", "Nowhere", "Exported"]),
         classes: BTreeSet::from([[1; 16], [2; 16]]),
         sites: 5,
