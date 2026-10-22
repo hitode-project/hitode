@@ -307,3 +307,9 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: Binary conversion size queries MUST report the complete required output size without writing output buffers. Short buffers MUST report ERROR_MORE_DATA and the required size. Conversions MUST validate guest output permissions and preserve LastError on success.
 **Verification**: Test
 **Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation.
+
+### PERS-SYNC-1 Signal and wait ownership
+
+**Rule**: SignalObjectAndWait MUST signal an existing event, release an owned mutex or increment a semaphore before waiting through the shared scheduler. Invalid wait handles MUST leave the signal object unchanged. Alertable waits MUST dispatch queued APCs and report WAIT_IO_COMPLETION.
+**Verification**: Test
+**Basis**: Microsoft SignalObjectAndWait documentation.
