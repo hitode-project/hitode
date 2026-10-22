@@ -10,6 +10,7 @@ use adv_machine::{Env, Namespace, Outcome};
 use adv_os::{Heaps, com::task_alloc, gdi::GdiObj};
 use std::sync::Arc;
 mod front;
+mod matrix;
 mod properties;
 const INVALID: i32 = 2;
 const NOT_IMPLEMENTED: i32 = 6;
@@ -37,6 +38,7 @@ enum Value {
     Object(Arc<Object>),
     Image(Arc<Image>),
     Graphics(Graphics),
+    Matrix(Arc<matrix::MatrixOwner>),
 }
 #[derive(Default)]
 struct State {

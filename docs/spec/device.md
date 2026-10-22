@@ -138,6 +138,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Verification**: Test
 **Basis**: [PixelOffsetMode](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-pixeloffsetmode).
 
+### DEV-IMAGE-8 GDI+ affine matrices
+
+**Rule**: Matrices MUST compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
+**Verification**: Test
+**Basis**: [MatrixOrder](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-matrixorder).
+
 ## Audio ownership
 
 ### DEV-AUDIO-1 Shared playback

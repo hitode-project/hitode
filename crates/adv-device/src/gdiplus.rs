@@ -2,6 +2,7 @@
 //! Windows uses its system GDI+ rasterizer; other hosts use owned CPU images
 //! and zeno paths behind the same device objects.
 use std::sync::Arc;
+pub mod matrix;
 #[cfg(not(windows))]
 mod portable;
 #[cfg(windows)]

@@ -761,6 +761,7 @@ fn dispose(env: &mut Env<'_>, object: GuestPtr<()>) -> i32 {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    matrix::register(reg);
     properties::register(reg);
     for api in [
         startup_ABI,
