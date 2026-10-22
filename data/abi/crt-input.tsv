@@ -1080,3 +1080,257 @@ ucrtbase.dll	__uncaught_exception	cdecl	i32	int
 ucrtbase.dll	__uncaught_exceptions	cdecl	u32	unsigned int	
 vcruntime140.dll	__uncaught_exception	cdecl	i32	int	
 vcruntime140.dll	__uncaught_exceptions	cdecl	u32	unsigned int	
+
+# SDK byte/UTF-16 string declarations projected through cataloged CRT versions.
+api-ms-win-crt-string-l1-1-0.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr100.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr100.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr100.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr100.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr100.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr100.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr100.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr100.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr100.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+msvcr100.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr100.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr100.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr100.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr100.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr100.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr100.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr100.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr100.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr100.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr100.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr100.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr100.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr110.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr110.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr110.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr110.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr110.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr110.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr110.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr110.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr110.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+msvcr110.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr110.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr110.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr110.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr110.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr110.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr110.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr110.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr110.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr110.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr110.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr110.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr110.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr120.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr120.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr120.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr120.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr120.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr120.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr120.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr120.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr120.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+msvcr120.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr120.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr120.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr120.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr120.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr120.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr120.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr120.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr120.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr120.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr120.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr120.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr120.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr70.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr70.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr70.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr70.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr70.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr70.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr70.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr70.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr70.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr70.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr70.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr70.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr70.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr70.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr70.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr70.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr70.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr70.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr70.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr70.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr71.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr71.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr71.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr71.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr71.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr71.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr71.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr71.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr71.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr71.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr71.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr71.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr71.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr71.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr71.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr71.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr71.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr71.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr71.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr71.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr80.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr80.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr80.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr80.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr80.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr80.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr80.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr80.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr80.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+msvcr80.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr80.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr80.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr80.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr80.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr80.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr80.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr80.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr80.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr80.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr80.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr80.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr80.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcr90.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr90.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr90.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcr90.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcr90.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcr90.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr90.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcr90.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcr90.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+msvcr90.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcr90.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcr90.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr90.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr90.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcr90.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcr90.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcr90.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr90.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr90.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr90.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+msvcr90.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcr90.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcrt.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcrt.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcrt.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcrt.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcrt.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcrt.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcrt.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcrt20.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt20.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt20.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcrt20.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt20.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcrt20.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt20.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcrt20.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt20.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt20.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcrt20.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt20.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt20.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcrt20.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt20.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcrt20.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt20.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt20.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt20.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt20.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+msvcrt40.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt40.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt40.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+msvcrt40.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+msvcrt40.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+msvcrt40.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt40.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+msvcrt40.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+msvcrt40.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+msvcrt40.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+msvcrt40.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt40.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt40.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+msvcrt40.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+msvcrt40.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+msvcrt40.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt40.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt40.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+msvcrt40.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+msvcrt40.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+ucrtbase.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+ucrtbase.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+ucrtbase.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
+ucrtbase.dll	strcpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
+ucrtbase.dll	strlen	cdecl	u32	size_t	text:const char*:str8:1
+ucrtbase.dll	strncat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+ucrtbase.dll	strncmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1|count:size_t:u32:1
+ucrtbase.dll	strncpy	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1|count:size_t:u32:1
+ucrtbase.dll	strnlen	cdecl	u32	size_t	text:const char*:str8:1|count:size_t:u32:1
+ucrtbase.dll	strrchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+ucrtbase.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+ucrtbase.dll	wcscat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+ucrtbase.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+ucrtbase.dll	wcscmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1
+ucrtbase.dll	wcscpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1
+ucrtbase.dll	wcslen	cdecl	u32	size_t	text:const wchar_t*:str16:1
+ucrtbase.dll	wcsncat	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+ucrtbase.dll	wcsncmp	cdecl	i32	int	left:const wchar_t*:str16:1|right:const wchar_t*:str16:1|count:size_t:u32:1
+ucrtbase.dll	wcsncpy	cdecl	ptr	wchar_t*	destination:wchar_t*:str16:1|source:const wchar_t*:str16:1|count:size_t:u32:1
+ucrtbase.dll	wcsnlen	cdecl	u32	size_t	text:const wchar_t*:str16:1|count:size_t:u32:1
+ucrtbase.dll	wcsrchr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+ucrtbase.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1
+vcruntime140.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
+vcruntime140.dll	strstr	cdecl	ptr	char*	text:const char*:str8:1|needle:const char*:str8:1
+vcruntime140.dll	wcschr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|value:wchar_t:u32:1
+vcruntime140.dll	wcsstr	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|needle:const wchar_t*:str16:1

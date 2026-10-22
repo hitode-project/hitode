@@ -43,6 +43,7 @@ mod seh;
 mod shared_file;
 mod startup;
 mod stream_position;
+mod strings;
 mod thread;
 mod time64;
 mod versions;
@@ -186,6 +187,7 @@ pub fn register(r: &mut Registry) {
     modern_string::register(r);
     wide_string::register(r);
     process::register(r);
+    strings::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -195,8 +197,6 @@ pub fn register(r: &mut Registry) {
         ("memmove", 3),
         ("memset", 3),
         ("memcmp", 3),
-        ("strlen", 1),
-        ("strcmp", 2),
         ("_initterm", 2),
         ("_initterm_e", 2),
         ("_lock", 1),
@@ -214,9 +214,6 @@ pub fn register(r: &mut Registry) {
         ("atoi", 1),
         ("abs", 1),
         ("_itoa", 3),
-        ("strncmp", 3),
-        ("strchr", 2),
-        ("strstr", 2),
         ("_strdup", 1),
         ("strtoul", 3),
         ("_mbsinc", 1),
@@ -229,22 +226,8 @@ pub fn register(r: &mut Registry) {
         ("_XcptFilter", 2),
         ("__setusermatherr", 1),
         ("getenv", 1),
-        ("strrchr", 2),
-        ("strcpy", 2),
-        ("strncpy", 3),
-        ("strcat", 2),
-        ("strncat", 3),
         ("??_U@YAPAXI@Z", 1),
         ("??_V@YAXPAX@Z", 1),
-        ("wcslen", 1),
-        ("wcscmp", 2),
-        ("wcsncmp", 3),
-        ("wcschr", 2),
-        ("wcsrchr", 2),
-        ("wcscpy", 2),
-        ("wcsncpy", 3),
-        ("wcscat", 2),
-        ("wcsstr", 2),
         ("_wcsicmp", 2),
         ("_wcsnicmp", 3),
         ("_wfopen_s", 3),
@@ -318,12 +301,6 @@ pub fn register(r: &mut Registry) {
             ("memmove", 3),
             ("memset", 3),
             ("memcmp", 3),
-            ("strlen", 1),
-            ("strcmp", 2),
-            ("strncmp", 3),
-            ("strchr", 2),
-            ("strrchr", 2),
-            ("strstr", 2),
             ("_strdup", 1),
             ("strtoul", 3),
             ("_mbsinc", 1),
@@ -331,21 +308,8 @@ pub fn register(r: &mut Registry) {
             ("_splitpath", 5),
             ("_makepath", 5),
             ("getenv", 1),
-            ("strcpy", 2),
-            ("strncpy", 3),
-            ("strcat", 2),
-            ("strncat", 3),
             ("??_U@YAPAXI@Z", 1),
             ("??_V@YAXPAX@Z", 1),
-            ("wcslen", 1),
-            ("wcscmp", 2),
-            ("wcsncmp", 3),
-            ("wcschr", 2),
-            ("wcsrchr", 2),
-            ("wcscpy", 2),
-            ("wcsncpy", 3),
-            ("wcscat", 2),
-            ("wcsstr", 2),
             ("_wcsicmp", 2),
             ("_wcsnicmp", 3),
             ("_wfopen_s", 3),
@@ -761,23 +725,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             Ok(difference) => difference as u32,
             Err(error) => return Outcome::Fail(error.to_string()),
         },
-        "strlen" => match e.cpu.read_cstr(a, 16 * 1024 * 1024) {
-            Ok(s) => s.len() as u32,
-            Err(err) => return Outcome::Fail(err.to_string()),
-        },
-        "strcmp" => {
-            let (Ok(l), Ok(r)) = (
-                e.cpu.read_cstr(a, 16 * 1024 * 1024),
-                e.cpu.read_cstr(b, 16 * 1024 * 1024),
-            ) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            match l.cmp(&r) {
-                std::cmp::Ordering::Less => u32::MAX,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }
-        }
+        "strlen" | "strcmp" | "strncmp" | "strchr" | "strrchr" | "strstr" | "strcpy"
+        | "strncpy" | "strcat" | "strncat" | "wcslen" | "wcscmp" | "wcsncmp" | "wcschr"
+        | "wcsrchr" | "wcsstr" | "wcscpy" | "wcsncpy" | "wcscat" => return strings::call(e),
         "_initterm" | "_initterm_e" => {
             if b < a || b - a > 1024 * 1024 || !(b - a).is_multiple_of(4) {
                 return Outcome::Fail("invalid initializer range".into());
@@ -793,359 +743,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail(error.to_string());
             }
             unix_sec
-        }
-        "strncmp" => {
-            let n = c as usize;
-            if n == 0 {
-                return Outcome::Return(0);
-            }
-            let mut diff = 0i32;
-            for i in 0..n {
-                let Ok(b1) = e.cpu.read_u8(a.wrapping_add(i as u32)) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                let Ok(b2) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if b1 != b2 {
-                    diff = (b1 as i32) - (b2 as i32);
-                    break;
-                }
-                if b1 == 0 {
-                    break;
-                }
-            }
-            match diff.cmp(&0) {
-                std::cmp::Ordering::Less => u32::MAX,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }
-        }
-        "strchr" => {
-            let target = b as u8;
-            let mut ptr = a;
-            loop {
-                let Ok(byte) = e.cpu.read_u8(ptr) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if byte == target {
-                    return Outcome::Return(ptr);
-                }
-                if byte == 0 {
-                    return Outcome::Return(0);
-                }
-                ptr = ptr.wrapping_add(1);
-            }
-        }
-        "strrchr" => {
-            let target = b as u8;
-            let mut ptr = a;
-            let mut last = 0;
-            loop {
-                let Ok(byte) = e.cpu.read_u8(ptr) else {
-                    return Outcome::Fail("CRT string unmapped".into());
-                };
-                if byte == target {
-                    last = ptr;
-                }
-                if byte == 0 {
-                    return Outcome::Return(last);
-                }
-                ptr = ptr.wrapping_add(1);
-            }
-        }
-        "strcpy" => {
-            let mut d = a;
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strcpy unmapped".into());
-                };
-                let _ = e.cpu.write(d, &[ch]);
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-            }
-            a
-        }
-        "strncpy" => {
-            let n = c as usize;
-            let mut null_hit = false;
-            for i in 0..n {
-                let byte = if null_hit {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
-                        return Outcome::Fail("CRT strncpy unmapped".into());
-                    };
-                    if val == 0 {
-                        null_hit = true;
-                    }
-                    val
-                };
-                let _ = e.cpu.write(a.wrapping_add(i as u32), &[byte]);
-            }
-            a
-        }
-        "strcat" => {
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(d) else {
-                    return Outcome::Fail("CRT strcat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-            }
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strcat src unmapped".into());
-                };
-                let _ = e.cpu.write(d, &[ch]);
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-            }
-            a
-        }
-        "strncat" => {
-            let n = c as usize;
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u8(d) else {
-                    return Outcome::Fail("CRT strncat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(1);
-            }
-            let mut s = b;
-            let mut copied = 0;
-            while copied < n {
-                let Ok(ch) = e.cpu.read_u8(s) else {
-                    return Outcome::Fail("CRT strncat src unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                let _ = e.cpu.write(d, &[ch]);
-                d = d.wrapping_add(1);
-                s = s.wrapping_add(1);
-                copied += 1;
-            }
-            let _ = e.cpu.write(d, &[0]);
-            a
-        }
-        "wcslen" => {
-            let mut ptr = a;
-            let mut len = 0u32;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcslen unmapped".into());
-                };
-                if unit == 0 {
-                    break;
-                }
-                len += 1;
-                ptr = ptr.wrapping_add(2);
-            }
-            len
-        }
-        "wcscmp" => {
-            let mut p1 = a;
-            let mut p2 = b;
-            loop {
-                let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
-                    return Outcome::Fail("CRT wcscmp unmapped".into());
-                };
-                if u1 != u2 {
-                    return match u1.cmp(&u2) {
-                        std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
-                        std::cmp::Ordering::Equal => Outcome::Return(0),
-                        std::cmp::Ordering::Greater => Outcome::Return(1),
-                    };
-                }
-                if u1 == 0 {
-                    return Outcome::Return(0);
-                }
-                p1 = p1.wrapping_add(2);
-                p2 = p2.wrapping_add(2);
-            }
-        }
-        "wcsncmp" => {
-            let n = c as usize;
-            if n == 0 {
-                return Outcome::Return(0);
-            }
-            let mut p1 = a;
-            let mut p2 = b;
-            for _ in 0..n {
-                let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
-                    return Outcome::Fail("CRT wcsncmp unmapped".into());
-                };
-                if u1 != u2 {
-                    return match u1.cmp(&u2) {
-                        std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
-                        std::cmp::Ordering::Equal => Outcome::Return(0),
-                        std::cmp::Ordering::Greater => Outcome::Return(1),
-                    };
-                }
-                if u1 == 0 {
-                    return Outcome::Return(0);
-                }
-                p1 = p1.wrapping_add(2);
-                p2 = p2.wrapping_add(2);
-            }
-            0
-        }
-        "wcschr" => {
-            let target = b as u16;
-            let mut ptr = a;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcschr unmapped".into());
-                };
-                if unit == target {
-                    return Outcome::Return(ptr);
-                }
-                if unit == 0 {
-                    return Outcome::Return(0);
-                }
-                ptr = ptr.wrapping_add(2);
-            }
-        }
-        "wcsrchr" => {
-            let target = b as u16;
-            let mut ptr = a;
-            let mut last = 0;
-            loop {
-                let Ok(unit) = e.cpu.read_u16(ptr) else {
-                    return Outcome::Fail("CRT wcsrchr unmapped".into());
-                };
-                if unit == target {
-                    last = ptr;
-                }
-                if unit == 0 {
-                    return Outcome::Return(last);
-                }
-                ptr = ptr.wrapping_add(2);
-            }
-        }
-        "wcscpy" => {
-            let mut d = a;
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(s) else {
-                    return Outcome::Fail("CRT wcscpy unmapped".into());
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-                s = s.wrapping_add(2);
-            }
-            a
-        }
-        "wcsncpy" => {
-            let n = c as usize;
-            let mut d = a;
-            let mut s = b;
-            let mut null_seen = false;
-            for _ in 0..n {
-                let ch = if null_seen {
-                    0
-                } else {
-                    let Ok(val) = e.cpu.read_u16(s) else {
-                        return Outcome::Fail("CRT wcsncpy unmapped".into());
-                    };
-                    if val == 0 {
-                        null_seen = true;
-                    } else {
-                        s = s.wrapping_add(2);
-                    }
-                    val
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                d = d.wrapping_add(2);
-            }
-            a
-        }
-        "wcscat" => {
-            let mut d = a;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(d) else {
-                    return Outcome::Fail("CRT wcscat dest unmapped".into());
-                };
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-            }
-            let mut s = b;
-            loop {
-                let Ok(ch) = e.cpu.read_u16(s) else {
-                    return Outcome::Fail("CRT wcscat src unmapped".into());
-                };
-                let _ = e.cpu.write(d, &ch.to_le_bytes());
-                if ch == 0 {
-                    break;
-                }
-                d = d.wrapping_add(2);
-                s = s.wrapping_add(2);
-            }
-            a
-        }
-        "wcsstr" => {
-            if b == 0 {
-                return Outcome::Return(a);
-            }
-            let Ok(first_needle) = e.cpu.read_u16(b) else {
-                return Outcome::Fail("CRT wcsstr unmapped".into());
-            };
-            if first_needle == 0 {
-                return Outcome::Return(a);
-            }
-            let mut hay = a;
-            loop {
-                let Ok(h_unit) = e.cpu.read_u16(hay) else {
-                    return Outcome::Fail("CRT wcsstr unmapped".into());
-                };
-                if h_unit == 0 {
-                    return Outcome::Return(0);
-                }
-                if h_unit == first_needle {
-                    let mut h_sub = hay.wrapping_add(2);
-                    let mut n_sub = b.wrapping_add(2);
-                    let found = loop {
-                        let Ok(n_val) = e.cpu.read_u16(n_sub) else {
-                            return Outcome::Fail("CRT wcsstr unmapped".into());
-                        };
-                        if n_val == 0 {
-                            break true;
-                        }
-                        let Ok(h_val) = e.cpu.read_u16(h_sub) else {
-                            return Outcome::Fail("CRT wcsstr unmapped".into());
-                        };
-                        if h_val != n_val {
-                            break false;
-                        }
-                        h_sub = h_sub.wrapping_add(2);
-                        n_sub = n_sub.wrapping_add(2);
-                    };
-                    if found {
-                        return Outcome::Return(hay);
-                    }
-                }
-                hay = hay.wrapping_add(2);
-            }
         }
         "_wcsicmp" => {
             let mut p1 = a;
@@ -1496,22 +1093,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 &[0, 0],
             );
             0
-        }
-        "strstr" => {
-            let Ok(needle) = e.cpu.read_cstr(b, 65536) else {
-                return Outcome::Fail("CRT needle unmapped".into());
-            };
-            if needle.is_empty() {
-                return Outcome::Return(a);
-            }
-            let Ok(haystack) = e.cpu.read_cstr(a, 16 * 1024 * 1024) else {
-                return Outcome::Fail("CRT haystack unmapped".into());
-            };
-            if let Some(pos) = haystack.windows(needle.len()).position(|w| w == needle) {
-                a.wrapping_add(pos as u32)
-            } else {
-                0
-            }
         }
         "_strdup" => {
             if a == 0 {

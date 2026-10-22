@@ -189,6 +189,15 @@ UCRT queries of VC14 throws; raw Windows dispatch does not alter that count.
 `crt_cpp_eh` exercises real Windows delivery, nested/outer catches, cleanup,
 translator throws, object lifetimes and termination in both execution modes.
 
+Byte/UTF-16 length, comparison, search and non-secure copying declarations now
+project cataloged versions through the same metadata-driven export table.
+Their shared kernel checks every guest read/write, counts UTF-16 code units,
+stops bounded reads at their count, pads bounded copies after NUL, and terminates
+bounded concatenation. Substring search uses one linear prefix table and returns
+the first match. Invalid destination writes fail instead of reporting a successful
+partial copy. `crt_strings` checks all CRT versions and public API-set projections,
+including page-end input and read-only output, in interpreter and JIT.
+
 `python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
 `crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
 iostream families, including their data exports. `--check` detects stale entries.

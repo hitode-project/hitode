@@ -197,3 +197,13 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Verification**: Test
 
 Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
+
+### PERS-CRT-1 String version exports
+
+**Rule**: Cataloged CRT byte and UTF-16 string exports MUST select one shared implementation through generated ABI declarations. Counts MUST measure bytes or UTF-16 code units respectively. Bounded operations MUST NOT read beyond their count or a string terminator.
+**Verification**: Test
+
+### PERS-CRT-2 String writes and searches
+
+**Rule**: String writes MUST report inaccessible destination memory instead of successful partial copies. Bounded copy MUST pad after NUL, while bounded concatenation MUST append exactly one terminator. Searches MUST preserve terminator matches and return the first matching substring.
+**Verification**: Test

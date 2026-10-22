@@ -508,5 +508,26 @@
       "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/ehdata.h",
       "sha256": "17f494086d8e9cbc855027a0f798036eb1270dda488e896776c26f2a5c7bc33a"
     }
+  },
+  "versioned_string_operations": {
+    "source": "Windows SDK 10.0.26100.0 ucrt string.h/corecrt_wstring.h and their included VCRuntime string declarations. Existing vcruntime_string.h provenance covers the included declarations.",
+    "headers": {
+      "string.h": {
+        "header": "ucrt/string.h",
+        "sha256": "796b2226809790078984b919542d818ce74190d2110b119f93c2a7c3882b5de5"
+      },
+      "corecrt_wstring.h": {
+        "header": "ucrt/corecrt_wstring.h",
+        "sha256": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
+      }
+    },
+    "projection": "Catalog-filtered x86 cdecl strlen/strnlen, strcmp/strncmp, strchr/strrchr/strstr, strcpy/strncpy/strcat/strncat and their wchar_t counterparts. wchar_t is a 16-bit code unit passed as a promoted one-word scalar; size_t and pointers are 32-bit. Byte comparisons use unsigned char.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strlen-wcslen-mbslen-mbslen-l-mbstrlen-mbstrlen-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnlen-strnlen-s",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcmp-wcscmp-mbscmp",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strncpy-strncpy-l-wcsncpy-wcsncpy-l-mbsncpy-mbsncpy-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strstr-wcsstr-mbsstr-mbsstr-l"
+    ]
   }
 }
