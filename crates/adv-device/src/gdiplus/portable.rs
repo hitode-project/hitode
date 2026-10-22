@@ -69,6 +69,11 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
         }
         Create::Solid(color) => (Kind::Brush, Data::Solid(color), None),
         Create::Path(mode) => (Kind::Path, Data::Path(Path::new(mode)?), None),
+        Create::PathPoints(points, types, mode) => (
+            Kind::Path,
+            Data::Path(Path::from_points(points, types, mode)?),
+            None,
+        ),
         Create::Format(flags, _) => (
             Kind::Format,
             Data::Format(string_format::Format::new(flags)),
@@ -110,6 +115,14 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
     }
     let mut data = object.data.lock().map_err(|_| 1)?;
     match (&mut *data, operation) {
+        (Data::Path(path), Op::PathData) => {
+            let (points, types) = path.data();
+            Ok(Reply::PathData(points, types))
+        }
+        (Data::Path(path), Op::PathEdit(edit)) => {
+            path.edit(edit)?;
+            Ok(Reply::None)
+        }
         (Data::Format(format), op) => format.execute(op),
         (Data::Solid(_), Op::BrushType) => Ok(Reply::Count(0)),
         (Data::Solid(color), Op::SolidColor(value)) => {

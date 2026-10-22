@@ -1,5 +1,44 @@
 use super::*;
 
+#[test]
+// spec: DEV-IMAGE-1
+fn authored_dds_mip_levels_keep_distinct_pixels_and_require_complete_payloads() {
+    let mut bytes = vec![0; 128];
+    bytes[..4].copy_from_slice(b"DDS ");
+    for (offset, value) in [
+        (4, 124u32),
+        (8, 8),
+        (12, 4),
+        (16, 4),
+        (20, 16),
+        (28, 3),
+        (76, 32),
+        (80, 0x41),
+        (88, 32),
+        (92, 0xff0000),
+        (96, 0xff00),
+        (100, 0xff),
+        (104, 0xff000000),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let levels = [
+        [10, 20, 30, 255].repeat(16),
+        [40, 50, 60, 128].repeat(4),
+        vec![70, 80, 90, 0],
+    ];
+    for level in &levels {
+        bytes.extend_from_slice(level);
+    }
+    assert_eq!(decode_mipmaps(&bytes, FileFormat::Dds).unwrap(), levels);
+    bytes.pop();
+    assert!(matches!(
+        decode_mipmaps(&bytes, FileFormat::Dds),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(decode(&bytes, FileFormat::Dds).unwrap(), levels[0]);
+}
+
 fn png_bytes(color: png::ColorType, samples: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     {

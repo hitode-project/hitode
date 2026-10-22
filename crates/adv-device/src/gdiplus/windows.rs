@@ -2,6 +2,7 @@
 use super::*;
 use std::ffi::c_void;
 use windows_sys::Win32::Graphics::{Gdi as gdi, GdiPlus as gp};
+mod path;
 mod string_format;
 mod world;
 const ARGB: i32 = 0x26200a;
@@ -260,6 +261,9 @@ pub(super) fn create(runtime: &Arc<Runtime>, create: Create<'_>) -> Result<Arc<O
                 Kind::Brush,
                 gp::GdipCreateSolidFill(color, (&mut pointer as *mut *mut c_void).cast()),
             ),
+            Create::PathPoints(points, types, mode) => {
+                (Kind::Path, path::create(points, types, mode, &mut pointer))
+            }
             Create::Path(mode) => (
                 Kind::Path,
                 gp::GdipCreatePath(mode, (&mut pointer as *mut *mut c_void).cast()),
@@ -402,6 +406,8 @@ pub(super) fn execute(object: &Object, operation: Op<'_>) -> Result<Reply, i32> 
     // buffers before calling the flat system API. Output structs stay private.
     unsafe {
         match operation {
+            Op::PathData => path::data(require(object, Kind::Path)?),
+            Op::PathEdit(edit) => path::edit(require(object, Kind::Path)?, edit),
             Op::World(value) => {
                 require(object, Kind::Graphics)?;
                 match value {

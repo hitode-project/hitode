@@ -103,7 +103,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-1 Image decoding
 
-**Rule**: Device image services MUST decode PNG, BMP, and DDS including DXT, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics.
+**Rule**: Device image services MUST decode PNG, BMP, and DDS including authored DXT mipmaps, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics. Default memory texture loading MUST publish a real complete mip chain through the shared D3D9 resource owner.
 **Verification**: Test
 
 ### DEV-IMAGE-2 GDI+ lifetime
@@ -165,6 +165,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Image list duplication MUST copy independent pixels, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
 **Verification**: Test
 **Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
+
+### DEV-IMAGE-13 GDI+ path geometry
+
+**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Path shape edits MUST affect filled pixels through the shared raster backend. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
+**Verification**: Test
+**Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
 
 ## Audio ownership
 

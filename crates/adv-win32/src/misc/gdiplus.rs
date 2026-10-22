@@ -11,6 +11,7 @@ use adv_os::{Heaps, com::task_alloc, gdi::GdiObj};
 use std::sync::Arc;
 mod front;
 mod matrix;
+mod path;
 mod properties;
 mod string_format;
 mod world;
@@ -681,4 +682,5 @@ fn stream_chunk(
 }
 pub(super) fn register(reg: &mut Registry) {
     front::register(reg);
+    path::register(reg);
 }

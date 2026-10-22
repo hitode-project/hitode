@@ -20,6 +20,8 @@ mod brush;
 mod matrix;
 #[path = "gdiplus_portable/matrix_nonfinite.rs"]
 mod matrix_nonfinite;
+#[path = "gdiplus_portable/path.rs"]
+mod path;
 #[path = "gdiplus_portable/string_format.rs"]
 mod string_format;
 #[path = "gdiplus_portable/world.rs"]
