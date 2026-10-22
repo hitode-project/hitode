@@ -84,7 +84,12 @@ fn offline<B: Backend>(cpu: B) {
         .call(open)
         .mov_mem_eax(HANDLE);
     let cases = [
-        ("HttpAddRequestHeadersW", vec![I(0), I(0), I(0)], false, 0),
+        (
+            "HttpAddRequestHeadersW",
+            vec![I(DATA + 0x1000), I(u32::MAX), I(0)],
+            false,
+            0,
+        ),
         ("HttpEndRequestW", vec![I(0), I(0), I(0)], false, 0),
         ("HttpOpenRequestW", vec![I(0); 7], false, 0),
         (
@@ -107,7 +112,12 @@ fn offline<B: Backend>(cpu: B) {
             false,
             u32::MAX,
         ),
-        ("InternetReadFile", vec![I(BUFFER), I(8), I(COUNT)], true, 0),
+        (
+            "InternetReadFile",
+            vec![I(BUFFER), I(8), I(COUNT)],
+            false,
+            0,
+        ),
         (
             "InternetWriteFile",
             vec![I(BUFFER), I(8), I(COUNT)],
@@ -124,11 +134,27 @@ fn offline<B: Backend>(cpu: B) {
             emit(&mut m, &mut code, name, &args, expected.len());
             expected.push((
                 *result,
-                Some(if valid { 12018 } else { 6 }),
-                if *clears { 0 } else { MARKER },
+                Some(if valid && *name != "InternetWriteFile" {
+                    12018
+                } else {
+                    6
+                }),
+                if valid && (*name == "InternetQueryDataAvailable" || *clears) {
+                    0
+                } else {
+                    MARKER
+                },
             ));
         }
     }
+    emit(
+        &mut m,
+        &mut code,
+        "InternetWriteFile",
+        &[L(HANDLE), I(BUFFER), I(0), I(COUNT)],
+        expected.len(),
+    );
+    expected.push((0, Some(87), MARKER));
     emit(
         &mut m,
         &mut code,
@@ -145,7 +171,7 @@ fn offline<B: Backend>(cpu: B) {
         ],
         expected.len(),
     );
-    expected.push((0, Some(12029), 0));
+    expected.push((0, Some(12029), MARKER));
     for reserved in [0, 1] {
         emit(
             &mut m,
@@ -154,7 +180,7 @@ fn offline<B: Backend>(cpu: B) {
             &[I(reserved)],
             expected.len(),
         );
-        expected.push((if reserved == 0 { 12029 } else { 87 }, None, 0));
+        expected.push((if reserved == 0 { 12029 } else { 87 }, None, MARKER));
     }
     emit(
         &mut m,
@@ -163,7 +189,7 @@ fn offline<B: Backend>(cpu: B) {
         &[I(0), L(HANDLE), I(0), I(0), I(0)],
         expected.len(),
     );
-    expected.push((12018, None, 0));
+    expected.push((0, None, MARKER));
     emit(
         &mut m,
         &mut code,
@@ -171,7 +197,7 @@ fn offline<B: Backend>(cpu: B) {
         &[I(0), I(0), I(0), I(0), I(0)],
         expected.len(),
     );
-    expected.push((0, None, 0));
+    expected.push((0, None, MARKER));
     code.mov_mem_imm(COUNT, 12345);
     emit(
         &mut m,
@@ -197,7 +223,7 @@ fn offline<B: Backend>(cpu: B) {
         &[L(HANDLE), I(2), I(COUNT), I(3)],
         expected.len(),
     );
-    expected.push((0, Some(87), 12345));
+    expected.push((0, Some(12010), 12345));
     emit(
         &mut m,
         &mut code,

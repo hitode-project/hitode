@@ -1,0 +1,165 @@
+//! Guest callbacks over the same installed locales and Gregorian profile data.
+use super::locales::{self, LOCALES};
+use adv_abi::Registry;
+use adv_cpu::backend::{Prot, Reg};
+use adv_machine::{Env, Outcome};
+use std::collections::VecDeque;
+
+struct Enumeration {
+    rows: VecDeque<String>,
+    callback: u32,
+    scratch: u32,
+    wide: bool,
+    extended: bool,
+    param: u32,
+}
+fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
+    let Some(row) = state.rows.pop_front() else {
+        return Outcome::Return(1);
+    };
+    let bytes = if state.wide {
+        row.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    } else {
+        let mut bytes = env.ext.get::<crate::Win32>().codec.encode(&row);
+        bytes.push(0);
+        bytes
+    };
+    if env.cpu.write(state.scratch, &bytes).is_err() {
+        return locales::fail(env, 998);
+    }
+    let mut args = vec![state.scratch];
+    if state.extended {
+        args.extend([0x11, state.param]);
+    }
+    Outcome::call_on_stack(state.callback, args, state.scratch, move |env, result| {
+        if result.value() == 0 {
+            Outcome::Return(1)
+        } else {
+            next(env, state)
+        }
+    })
+}
+fn start(env: &mut Env<'_>, rows: Vec<String>, wide: bool, extended: bool) -> Outcome {
+    let callback = env.arg(0);
+    if callback == 0 {
+        return locales::fail(env, 87);
+    }
+    const BYTES: u32 = 512;
+    let Some(scratch) = env
+        .cpu
+        .reg(Reg::Esp)
+        .checked_sub(BYTES + 15)
+        .map(|p| p & !15)
+    else {
+        return locales::fail(env, 8);
+    };
+    if scratch < env.ctx().stack_lo || !env.cpu.accessible(scratch, BYTES, Prot::RW) {
+        return locales::fail(env, 8);
+    }
+    next(
+        env,
+        Enumeration {
+            rows: rows.into(),
+            callback,
+            scratch,
+            wide,
+            extended,
+            param: if extended { env.arg(2) } else { 0 },
+        },
+    )
+}
+fn system(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
+    let flags = env.arg(1);
+    if extended {
+        if env.arg(3) != 0 {
+            return locales::fail(env, 87);
+        }
+        if flags & !0x7f != 0 {
+            return locales::fail(env, 1004);
+        }
+        // These are built-in specific locales; supplementary, alternate-sort
+        // and neutral-only selections have no rows in the portable data set.
+        if flags != 0 && flags & 0x11 == 0 {
+            return start(env, Vec::new(), true, true);
+        }
+    } else if !matches!(flags, 0..=2) {
+        return locales::fail(env, 1004);
+    }
+    let rows = LOCALES
+        .iter()
+        .filter(|l| l.id != 0x7f)
+        .map(|l| {
+            if extended {
+                l.name.to_owned()
+            } else {
+                format!("{:08X}", l.id)
+            }
+        })
+        .collect();
+    start(env, rows, wide, extended)
+}
+fn calendar(env: &mut Env<'_>) -> Outcome {
+    let locale = match locales::by_id(env, env.arg(1)) {
+        Ok(locale) => locale,
+        Err(error) => return locales::fail(env, error),
+    };
+    if env.arg(2) != 1 {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!EnumCalendarInfoA",
+            "non-Gregorian calendar enumeration has no profile data",
+        );
+        return locales::fail(env, 87);
+    }
+    let kind = env.arg(3);
+    if kind & !0x800000ff != 0 {
+        return locales::fail(env, 1004);
+    }
+    let text = match kind & 0xff {
+        1 => "1".into(),
+        2 => if locale.id == 0x411 {
+            "西暦 (日本語)"
+        } else if locale.id == 0x804 {
+            "公历"
+        } else {
+            "Gregorian Calendar"
+        }
+        .into(),
+        3 => "0".into(),
+        4 => if locale.id == 0x411 {
+            "西暦"
+        } else if locale.id == 0x804 {
+            "公元"
+        } else {
+            "A.D."
+        }
+        .into(),
+        5 => locales::info(locale, 0x1f).expect("short date"),
+        6 => locales::info(locale, 0x20).expect("long date"),
+        0x30 => "2029".into(),
+        _ => {
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!EnumCalendarInfoA",
+                "calendar information field has no profile data",
+            );
+            return locales::fail(env, 1004);
+        }
+    };
+    start(env, vec![text], false, false)
+}
+pub(super) fn register(registry: &mut Registry) {
+    crate::stdcall(registry, super::K32, "EnumSystemLocalesA", 2, |e| {
+        system(e, false, false)
+    });
+    crate::stdcall(registry, super::K32, "EnumSystemLocalesW", 2, |e| {
+        system(e, true, false)
+    });
+    crate::stdcall(registry, super::K32, "EnumSystemLocalesEx", 4, |e| {
+        system(e, true, true)
+    });
+    crate::stdcall(registry, super::K32, "EnumCalendarInfoA", 4, calendar);
+}

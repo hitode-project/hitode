@@ -7,6 +7,7 @@ mod groups;
 mod identity;
 mod scm;
 pub(crate) mod token;
+mod transactions;
 
 mod legacy;
 mod random;
@@ -510,6 +511,7 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    transactions::register(reg);
     crypto::register(reg);
     legacy::register(reg);
     random::register(reg);

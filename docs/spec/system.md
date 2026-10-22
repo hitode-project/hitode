@@ -13,7 +13,7 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 ### SYS-NET-2 Local network addresses
 
-**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock DLL aliases MUST reuse initialization state and local arithmetic.
+**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock aliases and socket closure MUST share initialization state, distinguishing uninitialized libraries from invalid sockets.
 **Verification**: Test
 
 ### SYS-NET-3 Offline provider routing
@@ -34,7 +34,7 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 ### SYS-NET-6 Offline request handles
 
-**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Internet reads and writes MUST clear their byte counts before handle validation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
+**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Read and write failures MUST preserve or clear byte counts according to their validated handle and operation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
 **Verification**: Test
 **Basis**: Microsoft WinINet handle types, InternetReadFile, InternetWriteFile and InternetSetOption contracts.
 
@@ -190,5 +190,17 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Rule**: Counted ANSI-to-Unicode conversion MUST use the guest ACP and explicit byte length. Insufficient supplied storage MUST preserve the destination descriptor and payload. Allocated strings MUST use the process heap and remain releasable by RtlFreeUnicodeString.
 **Verification**: Test
 **Basis**: Microsoft RtlAnsiStringToUnicodeString and authored native capacity controls.
+
+### SYS-NLS-1 Portable locale data
+
+**Rule**: Locale identifiers, names, information and enumerators MUST share the guest profile's locale data. Enumeration MUST invoke guest callbacks and honor early termination across yields. Locale queries MUST negotiate encoded output sizes and preserve output on failure.
+**Verification**: Test
+**Basis**: Microsoft locale name, GetLocaleInfo and enumeration contracts; authored native callback-stop controls.
+
+### SYS-NLS-2 Character classification
+
+**Rule**: ANSI classification MUST classify the decoded Unicode characters using the specified locale's code page. Explicit lengths MUST preserve embedded nulls, and terminated inputs MUST include the null character's classification. Unsupported classification tables MUST fail explicitly without modifying output.
+**Verification**: Test
+**Basis**: Microsoft GetStringTypeA and GetStringTypeEx contracts.
 
 Withdrawn: none

@@ -17,14 +17,22 @@ fn request(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(network::fail(env, error))
 }
 
-fn transfer(env: &mut Env<'_>) -> Outcome {
+fn write(env: &mut Env<'_>) -> Outcome {
+    if !network::valid(env, Library::WinInet, env.arg(0)) {
+        return Outcome::Return(network::fail(env, 6));
+    }
     let count = env.arg(3);
-    // Both SDK contracts clear this DWORD before work or handle validation.
-    if count == 0 || check_range(env.cpu, count, 4, Prot::WRITE).is_err() {
+    if env.arg(1) == 0
+        || env.arg(2) == 0
+        || count == 0
+        || check_range(env.cpu, count, 4, Prot::WRITE).is_err()
+    {
         return Outcome::Return(network::fail(env, 87));
     }
+    // Native clears writes after argument validation, then rejects the session
+    // as an invalid transfer handle. Reads reject its type without touching count.
     let _ = env.cpu.write_u32(count, 0);
-    request(env)
+    Outcome::Return(network::fail(env, 6))
 }
 
 fn connect(env: &mut Env<'_>) -> Outcome {
@@ -60,12 +68,12 @@ fn error_dialog(env: &mut Env<'_>) -> Outcome {
     {
         return Outcome::Return(6);
     }
+    if env.arg(2) == 0 {
+        return Outcome::Return(0);
+    }
     let handle = env.arg(1);
     if handle != 0 {
         return Outcome::Return(request_error(env, handle));
-    }
-    if env.arg(2) == 0 {
-        return Outcome::Return(0);
     }
     adv_abi::warn_unavailable(
         env,
@@ -77,13 +85,12 @@ fn error_dialog(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(registry: &mut Registry) {
     for (name, count) in [
-        ("HttpAddRequestHeadersW", 4),
         ("HttpEndRequestW", 4),
         ("HttpOpenRequestW", 8),
         ("HttpQueryInfoW", 5),
         ("HttpSendRequestExW", 5),
         ("HttpSendRequestW", 5),
-        ("InternetQueryDataAvailable", 4),
+        ("InternetReadFile", 4),
     ] {
         crate::stdcall(registry, "wininet.dll", name, count, request);
     }
@@ -98,9 +105,35 @@ pub(super) fn register(registry: &mut Registry) {
             Outcome::Return(u32::MAX)
         },
     );
-    for name in ["InternetReadFile", "InternetWriteFile"] {
-        crate::stdcall(registry, "wininet.dll", name, 4, transfer);
-    }
+    crate::stdcall(
+        registry,
+        "wininet.dll",
+        "HttpAddRequestHeadersW",
+        4,
+        |env| {
+            if env.arg(1) == 0 {
+                return Outcome::Return(network::fail(env, 87));
+            }
+            request(env)
+        },
+    );
+    crate::stdcall(
+        registry,
+        "wininet.dll",
+        "InternetQueryDataAvailable",
+        4,
+        |env| {
+            if !network::valid(env, Library::WinInet, env.arg(0)) {
+                return Outcome::Return(network::fail(env, 6));
+            }
+            if check_range(env.cpu, env.arg(1), 4, Prot::WRITE).is_err() {
+                return Outcome::Return(network::fail(env, 87));
+            }
+            let _ = env.cpu.write_u32(env.arg(1), 0);
+            request(env)
+        },
+    );
+    crate::stdcall(registry, "wininet.dll", "InternetWriteFile", 4, write);
     crate::stdcall(registry, "wininet.dll", "InternetConnectW", 8, connect);
     crate::stdcall(
         registry,
