@@ -885,9 +885,11 @@ fn native_authored_extended_variant_scalar_and_indirect_controls() {
                 as u32;
         let kind = u16::from_le_bytes(destination.0[..2].try_into().unwrap());
         let value = if status == 0 && kind == 8 {
-            let pointer =
-                usize::from_le_bytes(destination.0[8..8 + size_of::<usize>()].try_into().unwrap())
-                    as *mut u16;
+            let pointer = usize::from_le_bytes(
+                destination.0[8..8 + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            ) as *mut u16;
             let n = unsafe { SysStringLen(pointer) };
             String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, n as usize) })
         } else {
