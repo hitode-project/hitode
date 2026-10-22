@@ -366,3 +366,9 @@ Byte limits never read a partial pair's trailing byte; bounded copies clear
 incomplete final pairs and pad after NUL. `crt_mbcs` checks CP932/936, module
 isolation, API sets, invalid callbacks and page boundaries in interpreter/JIT.
 Explicit locale handles and thread-locale configuration are separate work.
+
+Cataloged CRT process identity and delay fronts use SDK process.h/stdlib.h
+cdecl declarations and the live GetCurrentProcessId/Sleep entries. `_sleep(0)`
+requests one millisecond, matching the pinned VC90 x86 entry; suspension uses the
+Windows scheduler and clock. `crt_process` checks all runtime projections and
+the public runtime API set in interpreter and JIT.

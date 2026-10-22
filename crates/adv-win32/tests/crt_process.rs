@@ -525,3 +525,59 @@ fn nonexistent_legacy_time_and_string_contract_memchr_stay_hidden_from_guest_loo
         }
     }
 }
+
+// spec: PERS-CRT-5
+#[test]
+fn identity_and_sleep_fronts_share_windows_processes_and_virtual_scheduling() {
+    for jit in [false, true] {
+        for module in [
+            "msvcrt20.dll",
+            "msvcrt40.dll",
+            "msvcrt.dll",
+            "msvcr70.dll",
+            "msvcr71.dll",
+            "msvcr80.dll",
+            "msvcr90.dll",
+            "msvcr100.dll",
+            "msvcr110.dll",
+            "msvcr120.dll",
+            "ucrtbase.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+        ] {
+            let mut m = machine(jit);
+            let tick = m.resolve_import("kernel32.dll", "GetTickCount").unwrap();
+            let pid = m
+                .resolve_import("kernel32.dll", "GetCurrentProcessId")
+                .unwrap();
+            let mut a = Asm::new(CODE);
+            a.call(tick).mov_mem_eax(RESULTS);
+            invoke(&mut m, &mut a, module, "_getpid", &[], RESULTS + 4);
+            a.call(pid).mov_mem_eax(RESULTS + 8);
+            invoke(&mut m, &mut a, module, "_sleep", &[0], RESULTS + 12);
+            a.call(tick).mov_mem_eax(RESULTS + 16);
+            invoke(&mut m, &mut a, module, "_sleep", &[5], RESULTS + 20);
+            a.call(tick).mov_mem_eax(RESULTS + 24);
+            a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+            m.cpu.write(CODE, &a.bytes).unwrap();
+            m.spawn("CRT process services", CODE, &[], 65536).unwrap();
+            let result = m.run_virtual(1_000_000);
+            assert!(
+                matches!(result, RunResult::Exited(0)),
+                "{module}: {result:?}"
+            );
+            assert_ne!(m.cpu.read_u32(RESULTS + 4).unwrap(), 0);
+            assert_eq!(
+                m.cpu.read_u32(RESULTS + 4).unwrap(),
+                m.cpu.read_u32(RESULTS + 8).unwrap()
+            );
+            assert_eq!(
+                m.cpu.read_u32(RESULTS + 16).unwrap() - m.cpu.read_u32(RESULTS).unwrap(),
+                1
+            );
+            assert_eq!(
+                m.cpu.read_u32(RESULTS + 24).unwrap() - m.cpu.read_u32(RESULTS + 16).unwrap(),
+                5
+            );
+        }
+    }
+}

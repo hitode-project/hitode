@@ -1,10 +1,13 @@
 //! The virtual CRT environment has no command processor. No host shell or
 //! process is started, and ordinary launch failures are not capability gaps.
+//! Identity and sleep calls use the live Windows services and scheduler.
 //! All versions and narrow/wide forms use the existing module/thread errno.
 use super::*;
 use adv_abi::guest::memory_failure;
 
 const EXPORTS: &[(&str, adv_machine::Handler)] = &[
+    ("_getpid", service),
+    ("_sleep", service),
     ("system", system),
     ("_wsystem", system),
     ("_popen", popen),
@@ -148,4 +151,22 @@ fn pclose(env: &mut Env<'_>) -> Outcome {
     // No successful popen can publish a pipe stream. A normal FILE is not a
     // pipe and retains its handle and ownership after this failure.
     failure(env, 9, None, u32::MAX) // EBADF
+}
+
+fn service(env: &mut Env<'_>) -> Outcome {
+    let sleep = env.sys.thunks.get(env.thunk).name == "_sleep";
+    let name = if sleep {
+        "Sleep"
+    } else {
+        "GetCurrentProcessId"
+    };
+    let args = if sleep {
+        vec![env.arg(0).max(1)]
+    } else {
+        vec![]
+    };
+    match crate::native::public_entry(env, "kernel32.dll", name) {
+        Ok(entry) => Outcome::call(entry, args, |_, value| Outcome::Return(value.value())),
+        Err(reason) => Outcome::Fail(format!("CRT live {name} resolution: {reason}")),
+    }
 }

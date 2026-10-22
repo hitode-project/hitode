@@ -217,3 +217,8 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Multibyte traversal MUST distinguish character and byte limits, preserve pair boundaries, and exclude terminal lead bytes from counts. Bounded copies MUST pad after NUL and suppress incomplete final pairs without reading beyond their count. Modern argument checks MUST use the runtime's invalid-parameter handler, and inaccessible destination writes MUST fail.
 **Verification**: Test
+
+### PERS-CRT-5 Process identity and delay
+
+**Rule**: CRT process identity MUST match the existing Windows process owner. CRT sleep MUST use the existing Windows scheduler, converting a zero duration to one millisecond. Every version and public API-set alias MUST preserve these semantics.
+**Verification**: Test

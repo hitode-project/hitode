@@ -589,5 +589,17 @@
     "legacy_utf8": "SDK mbctype.h explicitly identifies UTF-8 as unsupported by earlier CRT versions. The version profile rejects 65001 in legacy CRTs and accepts it in UCRT; its byte-lead classifiers remain false.",
     "native_boundary_observations": "The pinned VC90 x86 entries return zero counts for a zero limit without dereferencing the input, omit a terminal lead byte from byte/character counts, increment a terminal lead by one byte in _mbsinc, and return its byte value in _mbsnextc. Context-sensitive lead/trail queries return -1 on a match, including a terminator immediately following a dangling lead. These are control-flow observations, not native Windows execution results.",
     "ucrt_getmbcp": "Microsoft SDK 10.0.26100.0 Redist/ucrt/DLLs/x86/ucrtbase.dll, SHA-256 3d3b868ad1441c46ab0cdaf205927b1da75d458a9a0be74172256460503f49c9: the query returns zero when its DBCS flag is clear."
+  },
+  "crt_process_services": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "headers": {
+      "process.h": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
+      "stdlib.h": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getpid",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    ],
+    "abi": "_getpid is cdecl int(void); _sleep is cdecl void(unsigned long). Both consume the existing Windows process/scheduler services through their live public entries. _sleep(0) requests one millisecond, matching the pinned VC90 x86 boundary (the deprecated SDK declaration does not specify the zero-duration edge)."
   }
 }

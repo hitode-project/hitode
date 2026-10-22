@@ -1583,3 +1583,29 @@ ucrtbase.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:si
 ucrtbase.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 ucrtbase.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	_setmbcp	cdecl	i32	int	codepage:int:i32:1
+
+# SDK process.h _getpid and stdlib.h _sleep use x86 cdecl; sleep milliseconds are unsigned long.
+api-ms-win-crt-runtime-l1-1-0.dll	_getpid	cdecl	i32	int	
+api-ms-win-crt-runtime-l1-1-0.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr100.dll	_getpid	cdecl	i32	int	
+msvcr100.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr110.dll	_getpid	cdecl	i32	int	
+msvcr110.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr120.dll	_getpid	cdecl	i32	int	
+msvcr120.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr70.dll	_getpid	cdecl	i32	int	
+msvcr70.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr71.dll	_getpid	cdecl	i32	int	
+msvcr71.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr80.dll	_getpid	cdecl	i32	int	
+msvcr80.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcr90.dll	_getpid	cdecl	i32	int	
+msvcr90.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcrt.dll	_getpid	cdecl	i32	int	
+msvcrt.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcrt20.dll	_getpid	cdecl	i32	int	
+msvcrt20.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+msvcrt40.dll	_getpid	cdecl	i32	int	
+msvcrt40.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
+ucrtbase.dll	_getpid	cdecl	i32	int	
+ucrtbase.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
