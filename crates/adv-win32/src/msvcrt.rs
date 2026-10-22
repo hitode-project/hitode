@@ -73,6 +73,7 @@ struct CrtState {
 
 // The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
 struct CrtFile {
+    module: String,
     handle: u32,
     binary: bool,
     append: bool,
@@ -208,8 +209,6 @@ pub fn register(r: &mut Registry) {
         ("memmove", 3),
         ("memset", 3),
         ("memcmp", 3),
-        ("_initterm", 2),
-        ("_initterm_e", 2),
         ("_lock", 1),
         ("_unlock", 1),
         ("__dllonexit", 3),
@@ -263,9 +262,6 @@ pub fn register(r: &mut Registry) {
     // Whitelist implemented x86 cdecl constructor and heap helpers. Unknown
     // functions keep the loader's explicit unsupported handler.
     for module in ["msvcr80.dll", "msvcr90.dll"] {
-        for name in ["_initterm", "_initterm_e"] {
-            r.add(module, name, Conv::Cdecl { argc: 2 }, call);
-        }
         for name in ["_lock", "_unlock"] {
             r.add(module, name, Conv::Cdecl { argc: 1 }, call);
         }

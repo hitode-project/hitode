@@ -733,5 +733,21 @@
     "ownership": "Process signal slots live in the existing CRT module owner; SIGILL/SIGFPE/SIGSEGV retain per-thread native exception-table entries. errno, DOS errno, fpecode and exception pointers share one existing module/thread guest allocation and detach lifetime. No external console events are possible in the configured no-console profile.",
     "native_evidence": "Pinned Microsoft VC90 establishes SIG_GET queries, SIGABRT 6/22 sharing (while raise retains the original callback argument), process/thread split, pre-call handler reset, explicit FP reason 0x8c, pointer/FPE save-and-restore, and exact fault status mapping. PTD allocation starts zeroed, and its initializer does not change fpecode. Native VC80/VC90/UCRT reserved POSIX numbers 1/3/13/16/17 fail without changing errno. VC80/VC90 invoke invalid-parameter handling for other signal errors; UCRT signal only assigns EINVAL, while its raise invokes validation. Version parameters retain that difference. No native Windows execution is claimed.",
     "filters": "Legacy _XcptFilter searches ten pinned native fault entries, returns search for default/unknown, continue-execution for ignored/handled and execute-handler for the internal one-shot die action. __CppXcptFilter first rejects non-C++ statuses, then shares this table; the C++ code itself is absent and therefore returns search. No unconditional successful exception handling is fabricated. UCRT _seh_filter_exe uses twelve entries, adding SSE multiple faults/traps with reasons 0x8e/0x8d; _seh_filter_dll retains C++-only gating. The pinned Microsoft UCRT binary establishes both additions."
+  },
+  "termination_families": {
+    "headers": {
+      "stdlib.h": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+      "process.h": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
+      "corecrt_startup.h": "2e2e27515bfe462435f5222022e5afdc84a50f093f87ade27db8afcaea202cb7"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cexit-c-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/exit-exit-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/quick-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e"
+    ],
+    "projection": "Catalog-filtered x86 cdecl declarations select existing shared callback/initializer implementations across all CRT versions. _Exit shares _exit. UCRT _crt_at_quick_exit/quick_exit retain a separate table in the existing module owner, using the same heap and lock as ordinary callbacks; API-set aliases share UCRT state.",
+    "cleanup": "Full exit/_cexit closes only streams owned by the current CRT after draining callbacks; all currently modeled writes already reach the existing NT owner immediately. _c_exit returns without callbacks or stream flushing/closing. Quick exit drains only its own array and terminates without flushing streams. Process teardown releases both arrays without executing leftover callbacks.",
+    "native_evidence": "Pinned Microsoft VC90 confirms ascending initializer traversal with NULL entries skipped and _initterm_e stopping at the first nonzero result. Documented termination behavior supplies the ordinary/quick distinctions; no native Windows execution is claimed."
   }
 }

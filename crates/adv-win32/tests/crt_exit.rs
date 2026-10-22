@@ -16,19 +16,21 @@ const THIRD: u32 = CODE + 1536;
 const RUNTIME: &str = "api-ms-win-crt-runtime-l1-1-0.dll";
 
 fn machine<B: Backend>(cpu: B) -> Machine<B> {
-    let mut reg = Registry::default();
-    adv_win32::register(&mut reg);
-    adv_win32::msvcrt::register(&mut reg);
-    let mut machine = Machine::new(cpu, reg, Clock::virtual_time()).unwrap();
-    Win32::install(
-        &mut machine,
+    machine_with(
+        cpu,
         Win32Config::new(
             "/nonexistent/crt-exit",
             "fixture.exe",
             "/nonexistent/crt-exit-data",
         ),
     )
-    .unwrap();
+}
+fn machine_with<B: Backend>(cpu: B, config: Win32Config) -> Machine<B> {
+    let mut reg = Registry::default();
+    adv_win32::register(&mut reg);
+    adv_win32::msvcrt::register(&mut reg);
+    let mut machine = Machine::new(cpu, reg, Clock::virtual_time()).unwrap();
+    Win32::install(&mut machine, config).unwrap();
     machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
     machine
@@ -129,9 +131,17 @@ fn lifo<B: Backend>(cpu: B, module: &str) {
     assert_eq!(machine.cpu.read_u32(DATA + 20).unwrap(), 231);
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 2311);
 }
+// spec: CRT-LIB-18
 #[test]
 fn process_exit_registrations_are_lifo_and_accept_callbacks_added_during_waiting_drain() {
     for module in [
+        "msvcrt20.dll",
+        "msvcrt40.dll",
+        "msvcr70.dll",
+        "msvcr71.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
         "msvcrt.dll",
         "msvcr80.dll",
         "msvcr90.dll",
@@ -173,6 +183,7 @@ fn exit_mode<B: Backend>(cpu: B, module: &str, mode: &str) {
         "{module}!{mode}"
     );
 }
+// spec: CRT-LIB-18
 #[test]
 fn crt_exit_drains_but_fast_exit_kernel_exit_and_raw_entry_return_do_not() {
     for module in ["msvcr90.dll", RUNTIME] {
@@ -207,6 +218,7 @@ fn independent<B: Backend>(cpu: B) {
     assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 12);
 }
+// spec: CRT-LIB-18
 #[test]
 fn canonical_crt_instances_keep_independent_tables_while_ucrt_apisets_share_one() {
     for jit in [false, true] {
@@ -260,3 +272,6 @@ fn invalid_parameter_noinfo_returns_through_handler_or_ends_process() {
         }
     }
 }
+
+#[path = "crt_exit/versions.rs"]
+mod versions;

@@ -2315,3 +2315,73 @@ ucrtbase.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:str
 ucrtbase.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+# Shared SDK process.h/stdlib.h/corecrt_startup.h exit and initializer projections.
+api-ms-win-crt-runtime-l1-1-0.dll	_Exit	cdecl	void	void	status:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_c_exit	cdecl	void	void	
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_at_quick_exit	cdecl	i32	int	callback:_PVFV:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	quick_exit	cdecl	void	void	status:int:i32:1
+msvcr100.dll	_c_exit	cdecl	void	void	
+msvcr100.dll	_cexit	cdecl	void	void	
+msvcr100.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr100.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr100.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr100.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr100.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr100.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr110.dll	_c_exit	cdecl	void	void	
+msvcr110.dll	_cexit	cdecl	void	void	
+msvcr110.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr110.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr110.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr110.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr110.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr110.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr120.dll	_c_exit	cdecl	void	void	
+msvcr120.dll	_cexit	cdecl	void	void	
+msvcr120.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr120.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr120.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr120.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr120.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr120.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr70.dll	_c_exit	cdecl	void	void	
+msvcr70.dll	_cexit	cdecl	void	void	
+msvcr70.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr70.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr70.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr70.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr70.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr71.dll	_c_exit	cdecl	void	void	
+msvcr71.dll	_cexit	cdecl	void	void	
+msvcr71.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr71.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr71.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr71.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr71.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr80.dll	_c_exit	cdecl	void	void	
+msvcr80.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr80.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr90.dll	_c_exit	cdecl	void	void	
+msvcr90.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr90.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcrt.dll	_c_exit	cdecl	void	void	
+msvcrt.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcrt20.dll	_c_exit	cdecl	void	void	
+msvcrt20.dll	_cexit	cdecl	void	void	
+msvcrt20.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcrt20.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt20.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcrt20.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcrt20.dll	exit	cdecl	void	void	status:int:i32:1
+msvcrt40.dll	_c_exit	cdecl	void	void	
+msvcrt40.dll	_cexit	cdecl	void	void	
+msvcrt40.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcrt40.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt40.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcrt40.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcrt40.dll	exit	cdecl	void	void	status:int:i32:1
+ucrtbase.dll	_Exit	cdecl	void	void	status:int:i32:1
+ucrtbase.dll	_c_exit	cdecl	void	void	
+ucrtbase.dll	_crt_at_quick_exit	cdecl	i32	int	callback:_PVFV:ptr:1
+ucrtbase.dll	quick_exit	cdecl	void	void	status:int:i32:1

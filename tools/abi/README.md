@@ -367,3 +367,8 @@ Each cataloged `_HUGE` is a real writable eight-byte double initialized to posit
 All legacy command-line cells point to the existing Win32 string owner while retaining independent guest-writable pointer storage.
 `crt_data` checks static IATs and real dynamic lookup on all three CPU backends.
 The ABI generator accepts double data only as data and rejects function reinterpretation.
+
+Cataloged exit and initializer exports now select the shared runtime table across every CRT version.
+Ordinary and quick-exit callbacks retain separate guest arrays under the existing module owner, heap and lock; API sets share UCRT state.
+Full cleanup closes that CRT's streams after callbacks; fast cleanup preserves them.
+`crt_exit` checks version projections, reentrant LIFO draining, quick-array isolation, initializer stopping and stream ownership on interpreter and JIT.

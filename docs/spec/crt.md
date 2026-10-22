@@ -91,4 +91,14 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Signal FP-code and exception-pointer cells MUST share the error-cell allocation and lifetime, expose callback context/reason and restore prior values on normal return. Filters MUST derive dispositions from native actions, retaining ten legacy fault entries and twelve UCRT entries including both SSE statuses. Nonlocal signal exits MUST abandon the CRT continuation without restoring prior cells or resuming termination.
 **Verification**: Test
 
+### CRT-LIB-18 Termination families
+
+**Rule**: Cataloged CRT exit fronts MUST share module-owned callback arrays, with a separate UCRT quick-exit array and shared API-set aliases. Full cleanup MUST drain ordinary callbacks in LIFO order, accept registration during draining and close only that CRT's streams before returning or terminating. Quick exit MUST drain only quick callbacks, while `_exit`, `_Exit` and `_c_exit` MUST skip callbacks and flushing with `_c_exit` returning.
+**Verification**: Test
+
+### CRT-LIB-19 Initializer tables
+
+**Rule**: Cataloged CRT initializer fronts MUST share checked ascending table traversal, skip NULL entries and preserve guest callback execution. `_initterm_e` MUST stop at the first nonzero result and return it, while `_initterm` MUST visit every entry regardless of callback return values.
+**Verification**: Test
+
 Withdrawn: none
