@@ -1,5 +1,7 @@
 //! Owned path geometry shared by CPU coverage, bounds and gradient brushes.
 use zeno::{Command, Point};
+mod curves;
+mod editing;
 
 #[derive(Clone)]
 pub(in crate::gdiplus) struct Path {
@@ -9,6 +11,7 @@ pub(in crate::gdiplus) struct Path {
     current: Option<Point>,
     start: Option<Point>,
     closed: bool,
+    markers: std::collections::BTreeSet<usize>,
 }
 impl Path {
     pub fn transformed(&self, matrix: super::matrix::Matrix) -> Self {
@@ -33,6 +36,7 @@ impl Path {
             current: None,
             start: None,
             closed: false,
+            markers: Default::default(),
         })
     }
     fn connect(&mut self, point: Point) {

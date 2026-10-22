@@ -28,6 +28,22 @@ fn char_next(env: &mut Env<'_>, text: AnsiStr) -> Result<AnsiStr, MemFault> {
         .map(|address| AnsiStr(GuestPtr::new(address)))
 }
 
+#[win32(user32, name = "CharPrevA", level = implement)]
+fn char_previous(env: &mut Env<'_>, start: AnsiStr, current: AnsiStr) -> Result<AnsiStr, MemFault> {
+    let mut position = start.0.addr();
+    if current.0.addr() <= position {
+        return Ok(start);
+    }
+    let codec = env.ext.get::<Win32>().codec;
+    loop {
+        let next = next_ansi(env.cpu, codec, position)?;
+        if next == position || next >= current.0.addr() {
+            return Ok(AnsiStr(GuestPtr::new(position)));
+        }
+        position = next;
+    }
+}
+
 fn char_next_leaf(env: &mut Env<'_>) -> Option<u64> {
     let text = AnsiStr(GuestPtr::new(env.cpu.arg(0).ok()?));
     let next = char_next(env, text).ok()?;
@@ -137,17 +153,30 @@ fn packed_case(character: u32, codec: Codec, upper: bool) -> u32 {
 
 #[win32(user32, name = "OemToCharA", level = implement)]
 fn oem_to_char(env: &mut Env<'_>, source: AnsiStr, destination: AnsiStr) -> Result<i32, MemFault> {
-    // Read before writing: the ANSI API explicitly permits identical pointers.
+    ansi_codepage(env, source, destination, CP_OEMCP, CP_ACP)
+}
+
+#[win32(user32, name = "CharToOemA", level = implement)]
+fn char_to_oem(env: &mut Env<'_>, source: AnsiStr, destination: AnsiStr) -> Result<i32, MemFault> {
+    ansi_codepage(env, source, destination, CP_ACP, CP_OEMCP)
+}
+
+fn ansi_codepage(
+    env: &mut Env<'_>,
+    source: AnsiStr,
+    destination: AnsiStr,
+    from: u32,
+    to: u32,
+) -> Result<i32, MemFault> {
+    // Read before writing: both directions explicitly permit identical pointers.
     let input = source.read(env.cpu, 16 * 1024 * 1024)?;
     let codec = env.ext.get::<Win32>().codec;
-    let mut output = if codec.resolve(CP_OEMCP) == codec.resolve(CP_ACP) {
+    let mut output = if codec.resolve(from) == codec.resolve(to) {
         // Windows copies bytes when the two pages coincide, including an
         // isolated DBCS lead byte. A Unicode round trip would corrupt those.
         input
     } else {
-        codec
-            .from_utf16(CP_ACP, &codec.to_utf16(CP_OEMCP, &input))
-            .0
+        codec.from_utf16(to, &codec.to_utf16(from, &input)).0
     };
     output.push(0);
     adv_abi::guest::check_range(
@@ -245,6 +274,8 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(char_upper_ABI);
     reg.register(char_lower_ABI);
     reg.register(oem_to_char_ABI);
+    reg.register(char_to_oem_ABI);
+    reg.register(char_previous_ABI);
     reg.register(char_next_w_ABI);
     reg.register(char_upper_w_ABI);
     reg.register(char_lower_w_ABI);

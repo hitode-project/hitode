@@ -7,7 +7,9 @@ fn operation(filter: u32) -> Filter {
     match filter {
         1 => Filter::Copy,
         2 => Filter::Point,
-        _ => Filter::LinearWrap,
+        3 => Filter::LinearWrap,
+        4 => Filter::TriangleWrap,
+        _ => Filter::Box,
     }
 }
 
@@ -25,5 +27,7 @@ mod tests {
         assert_eq!(operation(1), Filter::Copy);
         assert_eq!(operation(2), Filter::Point);
         assert_eq!(operation(3), Filter::LinearWrap);
+        assert_eq!(operation(4), Filter::TriangleWrap);
+        assert_eq!(operation(5), Filter::Box);
     }
 }

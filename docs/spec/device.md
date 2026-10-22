@@ -103,7 +103,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-1 Image decoding
 
-**Rule**: Device image services MUST decode PNG, BMP, and DDS including DXT, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics.
+**Rule**: Device image services MUST decode PNG, BMP, and DDS including authored DXT mipmaps, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics. Default memory texture loading MUST publish a real complete mip chain through the shared D3D9 resource owner.
 **Verification**: Test
 
 ### DEV-IMAGE-2 GDI+ lifetime
@@ -123,7 +123,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-5 CPU bitmap rendering
 
-**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, source-over image drawing and filled paths through the shared device interface.
+**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, image drawing with retained compositing modes, filled paths and filled primitives through the shared device interface.
 **Verification**: Test
 **Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
 
@@ -162,9 +162,33 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-12 Image list storage
 
-**Rule**: Image list duplication MUST copy independent pixels, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
+**Rule**: Image list duplication MUST copy independent pixels, alpha modes, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
 **Verification**: Test
 **Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
+
+### DEV-IMAGE-13 GDI+ path geometry
+
+**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Cardinal curves MUST preserve tension, neighboring-point tangents and closed joins in cubic control points that affect shared raster output. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
+**Verification**: Test
+**Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
+
+### DEV-IMAGE-14 Image list bitmap inputs
+
+**Rule**: Bitmap strips MUST append independent RGBA and mask snapshots through shared GDI bitmap storage and palettes. Replacement MUST preserve list dimensions and all other images. Color-key insertion MUST derive transparency from the specified or upper-left palette color without consuming source handles.
+**Verification**: Test
+**Basis**: Microsoft ImageList_Add, ImageList_AddMasked and ImageList_Replace contracts.
+
+### DEV-IMAGE-15 Icon and image list raster output
+
+**Rule**: Icon and image list drawing MUST apply packed AND/XOR masks or premultiplied source-over through shared surfaces, mappings and clipping. Icon extraction MUST preserve independent pixels and monochrome double-height mask layout. Invalid destination storage MUST preserve pixels and damage versions.
+**Verification**: Test
+**Basis**: [DrawIconEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-drawiconex), [ICONINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-iconinfo), Microsoft ImageList_Draw and ImageList_GetIcon contracts.
+
+### DEV-IMAGE-16 GDI+ compositing and graphics properties
+
+**Rule**: Graphics compositing MUST select source-over blending or source-copy replacement without changing pixels outside primitive coverage. Smoothing getters MUST report normalized aliases, while text hint getters MUST report the retained device setting. Compositing MUST quantize premultiplied color and alpha channels before conversion to straight-alpha image pixels.
+**Verification**: Test
+**Basis**: Microsoft CompositingMode and SmoothingMode contracts and native-backed System.Drawing GraphicsTests pixel expectations.
 
 ## Audio ownership
 

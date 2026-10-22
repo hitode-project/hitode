@@ -51,6 +51,7 @@ pub(crate) fn release_texture(env: &mut Env<'_>, pointer: u32) {
 
 /// Returns the real texture pointer on success, an HRESULT on failure. The
 /// caller publishes this pointer only after the initial shared upload completes.
+#[cfg(test)]
 pub(crate) fn create(
     env: &mut Env<'_>,
     device: u32,
@@ -60,9 +61,28 @@ pub(crate) fn create(
     pool: i32,
     pixels: Vec<u8>,
 ) -> Outcome {
-    let Some(raw) = super::format::readback(format, pixels) else {
+    create_mipmaps(env, device, width, height, format, pool, vec![pixels])
+}
+
+pub(crate) fn create_mipmaps(
+    env: &mut Env<'_>,
+    device: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    pool: i32,
+    pixels: Vec<Vec<u8>>,
+) -> Outcome {
+    let Some(raw): Option<Vec<_>> = pixels
+        .into_iter()
+        .map(|pixels| super::format::readback(format, pixels))
+        .collect()
+    else {
         return Outcome::Return(INVALID);
     };
+    if raw.is_empty() {
+        return Outcome::Return(INVALID);
+    }
     let Some(slot) = alloc(env, 4) else {
         return Outcome::Return(OUT_OF_MEMORY);
     };
@@ -71,7 +91,7 @@ pub(crate) fn create(
         GuestPtr::new(device),
         width,
         height,
-        1,
+        raw.len() as u32,
         0,
         format,
         pool,
@@ -84,12 +104,20 @@ pub(crate) fn create(
         Outcome::Return(0) if pointer != 0 => {}
         other => return other,
     }
-    let storage = resources::resource(env, pointer).unwrap().storage;
-    if adv_abi::guest::check_range(env.cpu, storage, raw.len() as u32, Prot::WRITE).is_err()
-        || env.cpu.write(storage, &raw).is_err()
-    {
-        release(env, pointer);
-        return Outcome::Return(INVALID);
+    let resource = resources::resource(env, pointer).unwrap();
+    let storage = resource.storage;
+    let levels = resource.levels.clone();
+    for (level, bytes) in levels.into_iter().zip(raw) {
+        let target = storage + level.offset;
+        if super::format::length(format, level.desc.Width, level.desc.Height)
+            != Some(bytes.len() as u32)
+            || adv_abi::guest::check_range(env.cpu, target, bytes.len() as u32, Prot::WRITE)
+                .is_err()
+            || env.cpu.write(target, &bytes).is_err()
+        {
+            release(env, pointer);
+            return Outcome::Return(INVALID);
+        }
     }
     let guard = Rc::new(());
     env.ext

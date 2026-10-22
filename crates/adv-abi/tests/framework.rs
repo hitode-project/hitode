@@ -583,6 +583,49 @@ fn gdiplus_status_failure_is_nonzero_and_generated_tables_have_no_duplicates() {
     }
 }
 
+#[test]
+// spec: PERS-ABI-1
+fn selected_d3dx_graphics_helpers_keep_sdk_scalar_and_pointer_abi_kinds() {
+    use signature::AbiKind::{F32, I32, Pointer, U32};
+    for (name, kinds) in [
+        ("D3DXCreateLine", &[Pointer, Pointer][..]),
+        (
+            "D3DXCreateSphere",
+            &[Pointer, F32, U32, U32, Pointer, Pointer][..],
+        ),
+        (
+            "D3DXCreateTextureFromFileInMemory",
+            &[Pointer, Pointer, U32, Pointer][..],
+        ),
+        (
+            "D3DXLoadMeshFromXInMemory",
+            &[
+                Pointer, U32, U32, Pointer, Pointer, Pointer, Pointer, Pointer, Pointer,
+            ][..],
+        ),
+    ] {
+        let signature = signature::lookup("d3dx9_43.dll", name).unwrap();
+        assert_eq!(signature.return_kind, I32);
+        assert_eq!(signature.return_type, "HRESULT");
+        assert_eq!(
+            signature.conv,
+            Some(Conv::Stdcall {
+                argc: kinds.len() as u8
+            })
+        );
+        assert_eq!(signature.stack_words(), kinds.len() as u16);
+        assert_eq!(
+            signature
+                .parameters
+                .iter()
+                .map(|parameter| parameter.kind)
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        assert!(signature::lookup("d3dx9_29.dll", name).is_none());
+    }
+}
+
 // spec: EXEC-CORE-4
 #[test]
 fn audio_registration_rejects_both_leaf_kinds() {

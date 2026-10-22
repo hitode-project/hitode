@@ -1,7 +1,7 @@
 //! Authored affine examples cover every flat matrix operation on each CPU.
 use super::*;
 
-fn floats<B: Backend>(fixture: &mut Fixture<B>, at: u32, values: &[f32]) {
+fn floats<B: TestCpu>(fixture: &mut Fixture<B>, at: u32, values: &[f32]) {
     for (i, value) in values.iter().enumerate() {
         fixture
             .machine
@@ -10,7 +10,7 @@ fn floats<B: Backend>(fixture: &mut Fixture<B>, at: u32, values: &[f32]) {
             .unwrap();
     }
 }
-fn ints<B: Backend>(fixture: &mut Fixture<B>, at: u32, values: &[i32]) {
+fn ints<B: TestCpu>(fixture: &mut Fixture<B>, at: u32, values: &[i32]) {
     for (i, value) in values.iter().enumerate() {
         fixture
             .machine
@@ -19,7 +19,7 @@ fn ints<B: Backend>(fixture: &mut Fixture<B>, at: u32, values: &[i32]) {
             .unwrap();
     }
 }
-fn example<B: Backend>(cpu: B) {
+fn example<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     floats(&mut f, 1000, &[2., -3., -1., 0.5]);
     floats(&mut f, 1024, &[2., -3.]);

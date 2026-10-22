@@ -122,3 +122,7 @@ msvfw32.dll	MCIWndCreateA	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:
 msvfw32.dll	MCIWndCreateW	cdecl	handle	Windows.Win32.Foundation.HWND	hwndParent:Windows.Win32.Foundation.HWND:handle:1|hInstance:Windows.Win32.Foundation.HINSTANCE:handle:1|dwStyle:u32:u32:1|szFile:Windows.Win32.Foundation.PCWSTR:str16:1
 msvfw32.dll	MCIWndRegisterClass	cdecl	i32	Windows.Win32.Foundation.BOOL	
 ole32.dll	IsEqualGUID	stdcall	i32	Windows.Win32.Foundation.BOOL	rguid1:System.Guid*:ptr:1|rguid2:System.Guid*:ptr:1
+d3dx9_43.dll	D3DXCreateLine	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|ppLine:LPD3DXLINE*:ptr:1
+d3dx9_43.dll	D3DXCreateSphere	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|Radius:FLOAT:f32:1|Slices:UINT:u32:1|Stacks:UINT:u32:1|ppMesh:LPD3DXMESH*:ptr:1|ppAdjacency:LPD3DXBUFFER*:ptr:1
+d3dx9_43.dll	D3DXCreateTextureFromFileInMemory	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
+d3dx9_43.dll	D3DXLoadMeshFromXInMemory	stdcall	i32	HRESULT	Memory:LPCVOID:ptr:1|SizeOfMemory:DWORD:u32:1|Options:DWORD:u32:1|pD3DDevice:LPDIRECT3DDEVICE9:ptr:1|ppAdjacency:LPD3DXBUFFER*:ptr:1|ppMaterials:LPD3DXBUFFER*:ptr:1|ppEffectInstances:LPD3DXBUFFER*:ptr:1|pNumMaterials:DWORD*:ptr:1|ppMesh:LPD3DXMESH*:ptr:1

@@ -1,6 +1,6 @@
 use adv_device::surface::{
-    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Snapshot, SurfaceMemory,
-    Surfaces, VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
+    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Snapshot, Sprite, SpriteAlpha,
+    SpriteMode, SurfaceMemory, Surfaces, VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -1705,4 +1705,197 @@ fn source_color_keys_skip_keyed_pixels_when_copying_and_scaling() {
         .unwrap();
     let first: Vec<u8> = logical_pixels(&s, wide, &m).iter().map(|p| p[2]).collect();
     assert_eq!(first, vec![0, 0, 0xff, 0xff, 0, 0, 0, 0]);
+}
+
+#[test]
+// spec: DEV-IMAGE-15
+fn sprites_apply_documented_mask_xor_and_alpha_to_authored_pixels() {
+    for owned in [false, true] {
+        let mut memory = Memory::new(owned);
+        let mut store = store();
+        let id = store
+            .create(4, 1, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        let at = store[id].pixels;
+        let original = [10, 20, 30, 40].repeat(4);
+        memory.write(at, &original).unwrap();
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let mask = [0, 1, 0, 1];
+        let source = Sprite {
+            width: 4,
+            height: 1,
+            rgba: &rgba,
+            mask: Some(&mask),
+            mode: SpriteMode::Color {
+                alpha: SpriteAlpha::Ignore,
+                masked: true,
+            },
+            background: None,
+            preserve_alpha: false,
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 1,
+        };
+        let destination = BlitRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 1,
+        };
+        assert_eq!(
+            store
+                .sprite(id, source, rect, destination, &mut memory)
+                .unwrap(),
+            rect
+        );
+        assert_eq!(
+            memory.read(at, 16).unwrap().as_ref(),
+            [
+                0, 0, 255, 0, 10, 235, 30, 40, 255, 0, 0, 0, 245, 235, 225, 40
+            ]
+        );
+        for (alpha, red) in [
+            (SpriteAlpha::Straight, 255),
+            (SpriteAlpha::Premultiplied, 128),
+        ] {
+            memory.write(at, &original).unwrap();
+            let rgba = [red, 0, 0, 128, 0, 0, 0, 0, 0, 0, 255, 255, 0, 255, 0, 255];
+            let source = Sprite {
+                rgba: &rgba,
+                mode: SpriteMode::Color {
+                    alpha,
+                    masked: true,
+                },
+                ..source
+            };
+            store
+                .sprite(id, source, rect, destination, &mut memory)
+                .unwrap();
+            assert_eq!(
+                memory.read(at, 16).unwrap().as_ref(),
+                [
+                    5, 10, 143, 148, 10, 20, 30, 40, 255, 0, 0, 255, 0, 255, 0, 255
+                ]
+            );
+        }
+        memory.write(at, &original).unwrap();
+        store
+            .sprite(
+                id,
+                Sprite {
+                    preserve_alpha: true,
+                    ..source
+                },
+                rect,
+                destination,
+                &mut memory,
+            )
+            .unwrap();
+        assert_eq!(
+            memory.read(at, 16).unwrap().as_ref(),
+            [
+                0, 0, 255, 40, 10, 235, 30, 40, 255, 0, 0, 40, 245, 235, 225, 40
+            ]
+        );
+    }
+}
+
+#[test]
+// spec: DEV-IMAGE-15
+fn sprites_preserve_packed_neighbors_scaling_phase_and_failed_write_transactions() {
+    let mut memory = Memory::new(false);
+    let mut store = store();
+    let id = store
+        .create(4, 2, true, PixelFormat::Indexed4, &mut memory)
+        .unwrap();
+    let mut colors = [[0; 4]; 256];
+    for (i, color) in colors[..16].iter_mut().enumerate() {
+        *color = [(i * 17) as u8, (i * 17) as u8, (i * 17) as u8, 0];
+    }
+    store.get_mut(id).unwrap().palette = Some(Arc::new(colors));
+    let at = store[id].pixels;
+    memory
+        .write(at, &[0x12, 0x34, 0xcc, 0xdd, 0x56, 0x78, 0xaa, 0xbb])
+        .unwrap();
+    let source = Sprite {
+        width: 2,
+        height: 1,
+        rgba: &[255; 8],
+        mask: Some(&[1, 1]),
+        mode: SpriteMode::Color {
+            alpha: SpriteAlpha::Ignore,
+            masked: true,
+        },
+        background: None,
+        preserve_alpha: false,
+    };
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: 2,
+        h: 1,
+    };
+    let destination = BlitRect {
+        x: 1,
+        y: 0,
+        w: 2,
+        h: 1,
+    };
+    store
+        .sprite(id, source, rect, destination, &mut memory)
+        .unwrap();
+    assert_eq!(
+        memory.read(at, 8).unwrap().as_ref(),
+        [0x12, 0x34, 0xcc, 0xdd, 0x59, 0x88, 0xaa, 0xbb]
+    );
+    let before = memory.bytes.clone();
+    let version = store[id].version;
+    memory.denied = Some((at, 1));
+    assert!(
+        store
+            .sprite(
+                id,
+                source,
+                rect,
+                BlitRect {
+                    h: 2,
+                    ..destination
+                },
+                &mut memory
+            )
+            .is_err()
+    );
+    assert_eq!(memory.bytes, before);
+    assert_eq!(store[id].version, version);
+    memory.denied = None;
+    let rgba = [0, 0, 0, 255, 255, 255, 255, 255];
+    store
+        .sprite(
+            id,
+            Sprite {
+                rgba: &rgba,
+                mode: SpriteMode::Image {
+                    alpha: SpriteAlpha::Ignore,
+                },
+                ..source
+            },
+            rect,
+            BlitRect {
+                x: -1,
+                y: 1,
+                w: 4,
+                h: 1,
+            },
+            &mut memory,
+        )
+        .unwrap();
+    assert_eq!(
+        memory.read(at, 4).unwrap().as_ref(),
+        [0x0f, 0xf4, 0xcc, 0xdd]
+    );
 }

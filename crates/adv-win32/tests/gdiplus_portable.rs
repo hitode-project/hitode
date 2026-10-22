@@ -2,7 +2,7 @@
 use adv_abi::{ApiDiagnostics, Registry};
 use adv_cpu::{
     JitCpu,
-    backend::{Backend, GuestExt, Prot, asm::Asm},
+    backend::{GuestExt, Prot, asm::Asm},
 };
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
@@ -11,23 +11,34 @@ use adv_win32::{Win32, Win32Config};
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const REF: u32 = 0x7fab_0000;
+#[path = "support/test_cpu.rs"]
+mod test_cpu;
+use test_cpu::TestCpu;
 #[path = "gdiplus_portable/brush.rs"]
 mod brush;
+#[path = "gdiplus_portable/compositing.rs"]
+mod compositing;
+#[path = "gdiplus_portable/curves.rs"]
+mod curves;
+#[path = "gdiplus_portable/fill.rs"]
+mod fill;
 #[path = "gdiplus_portable/matrix.rs"]
 mod matrix;
 #[path = "gdiplus_portable/matrix_nonfinite.rs"]
 mod matrix_nonfinite;
+#[path = "gdiplus_portable/path.rs"]
+mod path;
 #[path = "gdiplus_portable/string_format.rs"]
 mod string_format;
 #[path = "gdiplus_portable/world.rs"]
 mod world;
 
-struct Fixture<B: Backend> {
+struct Fixture<B: TestCpu> {
     machine: Machine<B>,
     code: Asm,
     results: Vec<(&'static str, u32)>,
 }
-impl<B: Backend> Fixture<B> {
+impl<B: TestCpu> Fixture<B> {
     fn new(cpu: B) -> Self {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
@@ -61,6 +72,7 @@ impl<B: Backend> Fixture<B> {
     fn run(mut self) -> Machine<B> {
         self.code.ret();
         self.machine.cpu.write(CODE, &self.code.bytes).unwrap();
+        self.machine.cpu.code_region(CODE, self.code.bytes.len());
         self.machine
             .spawn("GDI+ fixture", CODE, &[], 65536)
             .unwrap();
@@ -86,7 +98,7 @@ impl<B: Backend> Fixture<B> {
     }
 }
 
-fn pixels<B: Backend>(cpu: B) {
+fn pixels<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     f.call(
@@ -180,7 +192,7 @@ fn pixels<B: Backend>(cpu: B) {
     }
 }
 
-fn formats<B: Backend>(cpu: B) {
+fn formats<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     f.call("GdipCreateStringFormat", &[0x1000, 0x409, DATA + 4], 0);
@@ -208,7 +220,7 @@ fn formats<B: Backend>(cpu: B) {
     }
 }
 
-fn coverage<B: Backend>(cpu: B) {
+fn coverage<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     f.call(

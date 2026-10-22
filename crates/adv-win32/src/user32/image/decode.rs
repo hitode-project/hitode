@@ -249,6 +249,12 @@ fn bitmap_size(bytes: &[u8], target_width: u32, target_height: u32) -> Option<Ic
         }
     }
     Some(IconImage {
+        alpha: has_alpha,
+        monochrome: bits == 1
+            && colors == 2
+            && bytes.get(header..header + 3) == Some(&[0, 0, 0])
+            && bytes.get(header + palette_entry..header + palette_entry + 3)
+                == Some(&[255, 255, 255]),
         width: target_width,
         height: target_height,
         pixels: rgba,

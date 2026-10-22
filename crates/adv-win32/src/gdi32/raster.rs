@@ -6,12 +6,14 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP};
 
+pub(crate) mod bitmap;
 pub(crate) mod clip;
 mod color_table;
 mod dib;
 pub(crate) mod fill;
 pub mod front;
 mod set_dib;
+pub(crate) mod sprite;
 pub use front::{DrawingProvider, install, register, set_provider};
 
 pub mod api {

@@ -1,7 +1,7 @@
 //! Native matrix storage accepts IEEE values even when inversion cannot proceed.
 use super::*;
 
-fn check<B: Backend>(cpu: B, coefficients: [f32; 6]) {
+fn check<B: TestCpu>(cpu: B, coefficients: [f32; 6]) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     let mut args = coefficients.map(f32::to_bits).to_vec();

@@ -281,4 +281,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft DispCallFunc contract and pinned WinMD x86 scalar layouts.
 
+### SYS-PRINT-2 Printer drawing contexts
+
+**Rule**: Printer DC creation MUST fail ordinarily when no matching printer exists, without creating a GDI handle. Spooling operations MUST reject display, memory and invalid DCs with `SP_ERROR` and `ERROR_INVALID_HANDLE`, without invoking abort callbacks.
+**Verification**: Test
+**Basis**: Microsoft CreateDC, StartDoc, StartPage, EndPage, EndDoc and SetAbortProc contracts and the configured printer-free profile.
+
 Withdrawn: none

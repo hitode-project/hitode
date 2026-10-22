@@ -1,6 +1,6 @@
 //! World matrices change path/image pixels while queries copy independent values.
 use super::*;
-fn transforms<B: Backend>(cpu: B) {
+fn transforms<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     f.call(

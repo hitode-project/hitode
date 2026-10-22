@@ -46,10 +46,20 @@ pub enum Create<'a> {
     GenericFormat(bool),
     Solid(u32),
     Path(i32),
+    PathPoints(&'a [[f32; 2]], &'a [u8], i32),
     Gradient(&'a Object),
     Clone(&'a Object),
 }
+#[derive(Clone, Copy)]
+pub enum GraphicsProperty {
+    CompositingMode,
+    Smoothing,
+    TextHint,
+}
 pub enum Op<'a> {
+    GraphicsProperty(GraphicsProperty, Option<i32>),
+    PathEdit(PathEdit<'a>),
+    PathData,
     Pixels,
     Upload(&'a [u8]),
     Size,
@@ -107,6 +117,7 @@ pub enum Op<'a> {
     ComposeWorld(matrix::Matrix, bool),
 }
 pub enum Reply {
+    PathData(Vec<[f32; 2]>, Vec<u8>),
     Digits(u16, i32),
     Tabs(f32, Vec<f32>),
     Matrix(matrix::Matrix),
@@ -116,6 +127,24 @@ pub enum Reply {
     Bounds([f32; 4]),
     Count(i32),
     Measure([f32; 4], i32, i32),
+}
+pub enum PathEdit<'a> {
+    Lines(&'a [[f32; 2]], bool),
+    Beziers(&'a [[f32; 2]]),
+    Curve {
+        points: &'a [[f32; 2]],
+        offset: i32,
+        segments: i32,
+        tension: f32,
+        closed: bool,
+    },
+    Rectangles(&'a [[f32; 4]]),
+    Ellipse([f32; 4]),
+    Pie([f32; 4], f32, f32),
+    Start,
+    CloseAll,
+    Marker(bool),
+    Transform(matrix::Matrix),
 }
 impl Runtime {
     pub fn new() -> Result<Arc<Self>, i32> {

@@ -2404,9 +2404,9 @@ pub(super) fn def_window_proc_encoded(
             }
             0
         }
-        wm::MOUSEACTIVATE => 1,
-        wm::ACTIVATE if wp & 0xffff != 0 => {
-            return window::set_focus(env, hwnd, move |env, _| then(env, 0));
+        wm::MOUSEACTIVATE | wm::NCACTIVATE => 1,
+        wm::ACTIVATE if wp & 0xffff != 0 && wp >> 16 == 0 => {
+            return window::focus::activate(env, hwnd, move |env| then(env, 0));
         }
         wm::WINDOWPOSCHANGED => {
             let flags = env.cpu.read_u32(lp + 24).unwrap_or(0);

@@ -57,6 +57,21 @@ impl crate::GuestArg for POINT {
     const WORDS: u8 = 2;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
+#[repr(C, align(2))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct POINTS {
+    pub x: i16,
+    pub y: i16,
+}
+const _: () = assert!(core::mem::size_of::<POINTS>() == 4);
+const _: () = assert!(core::mem::align_of::<POINTS>() == 2);
+const _: () = assert!(core::mem::offset_of!(POINTS, x) == 0);
+const _: () = assert!(core::mem::offset_of!(POINTS, y) == 2);
+impl crate::GuestArg for POINTS {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 1;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RECT {
@@ -74,6 +89,68 @@ const _: () = assert!(core::mem::offset_of!(RECT, bottom) == 12);
 impl crate::GuestArg for RECT {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TOUCHINPUT {
+    pub x: i32,
+    pub y: i32,
+    pub hSource: u32,
+    pub dwID: u32,
+    pub dwFlags: u32,
+    pub dwMask: u32,
+    pub dwTime: u32,
+    pub dwExtraInfo: u32,
+    pub cxContact: u32,
+    pub cyContact: u32,
+}
+const _: () = assert!(core::mem::size_of::<TOUCHINPUT>() == 40);
+const _: () = assert!(core::mem::align_of::<TOUCHINPUT>() == 4);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, x) == 0);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, y) == 4);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, hSource) == 8);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, dwID) == 12);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, dwFlags) == 16);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, dwMask) == 20);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, dwTime) == 24);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, dwExtraInfo) == 28);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, cxContact) == 32);
+const _: () = assert!(core::mem::offset_of!(TOUCHINPUT, cyContact) == 36);
+impl crate::GuestArg for TOUCHINPUT {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 10;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GESTUREINFO {
+    pub cbSize: u32,
+    pub dwFlags: u32,
+    pub dwID: u32,
+    pub hwndTarget: u32,
+    pub ptsLocation: POINTS,
+    pub dwInstanceID: u32,
+    pub dwSequenceID: u32,
+    pub _padding0: [u8; 4],
+    pub ullArguments: u64,
+    pub cbExtraArgs: u32,
+    pub _padding1: [u8; 4],
+}
+const _: () = assert!(core::mem::size_of::<GESTUREINFO>() == 48);
+const _: () = assert!(core::mem::align_of::<GESTUREINFO>() == 8);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, cbSize) == 0);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, dwFlags) == 4);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, dwID) == 8);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, hwndTarget) == 12);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, ptsLocation) == 16);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, dwInstanceID) == 20);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, dwSequenceID) == 24);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, ullArguments) == 32);
+const _: () = assert!(core::mem::offset_of!(GESTUREINFO, cbExtraArgs) == 40);
+impl crate::GuestArg for GESTUREINFO {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 12;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C, align(1))]

@@ -390,7 +390,13 @@ fn finish(env: &mut Env<'_>, header: Header, color: Bitmap, mask: Option<Bitmap>
                 }
             }
         }
+        let alpha = if alpha {
+            super::SpriteAlpha::Premultiplied
+        } else {
+            super::SpriteAlpha::Ignore
+        };
         images.push(Image {
+            alpha,
             rgba,
             mask: header.mask.then_some(and_mask),
         });

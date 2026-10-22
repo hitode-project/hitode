@@ -2,7 +2,7 @@
 use adv_abi::{ApiDiagnostics, Registry};
 use adv_cpu::{
     JitCpu,
-    backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
+    backend::{Guest, GuestExt, Prot, asm::Asm},
 };
 use adv_device::surface::{MemoryOperations, MemoryView, Snapshot, SurfaceStore};
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
@@ -15,6 +15,9 @@ use std::borrow::Cow;
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
+#[path = "support/test_cpu.rs"]
+mod test_cpu;
+use test_cpu::TestCpu;
 fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
     MemoryView::new(
         cpu,
@@ -36,7 +39,7 @@ fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
         },
     )
 }
-fn call<B: Backend>(
+fn call<B: TestCpu>(
     m: &mut Machine<B>,
     code: &mut Asm,
     dll: &str,
@@ -54,7 +57,7 @@ fn call<B: Backend>(
     code.call(m.resolve_import(dll, name).unwrap())
         .mov_mem_eax(out);
 }
-fn fixture<B: Backend>(cpu: B, alias: bool) {
+fn fixture<B: TestCpu>(cpu: B, alias: bool) {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
     assert!(registry.signature_conflicts().is_empty());
@@ -104,6 +107,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
     }
     code.ret();
     m.cpu.write(CODE, &code.bytes).unwrap();
+    m.cpu.code_region(CODE, code.bytes.len());
     m.spawn("create DIBs", CODE, &[], 65536).unwrap();
     assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
     let src = m.cpu.read_u32(DATA + 136).unwrap();
@@ -186,6 +190,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
     );
     code.ret();
     m.cpu.write(CODE + 512, &code.bytes).unwrap();
+    m.cpu.code_region(CODE + 512, code.bytes.len());
     m.spawn("composite DIBs", CODE + 512, &[], 65536).unwrap();
     assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
     for (i, expected) in [1, 0, 0, 3, 1].into_iter().enumerate() {
@@ -287,6 +292,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
         );
         code.ret();
         m.cpu.write(entry, &code.bytes).unwrap();
+        m.cpu.code_region(entry, code.bytes.len());
         m.spawn("gradient DIB", entry, &[], 65536).unwrap();
         assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
         assert_eq!(m.cpu.read_u32(DATA + 400).unwrap(), 1);
@@ -351,6 +357,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
     );
     code.ret();
     m.cpu.write(CODE + 2400, &code.bytes).unwrap();
+    m.cpu.code_region(CODE + 2400, code.bytes.len());
     m.spawn("unsupported gradient dithering", CODE + 2400, &[], 65536)
         .unwrap();
     assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
@@ -417,6 +424,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
     );
     code.ret();
     m.cpu.write(CODE + 2800, &code.bytes).unwrap();
+    m.cpu.code_region(CODE + 2800, code.bytes.len());
     m.spawn("composite allocation failure", CODE + 2800, &[], 65536)
         .unwrap();
     assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(_)));
@@ -463,6 +471,7 @@ fn fixture<B: Backend>(cpu: B, alias: bool) {
     );
     code.ret();
     m.cpu.write(CODE + 3000, &code.bytes).unwrap();
+    m.cpu.code_region(CODE + 3000, code.bytes.len());
     m.spawn("protected DIB backing", CODE + 3000, &[], 65536)
         .unwrap();
     let outcome = m.run_virtual(1_000_000);

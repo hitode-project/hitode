@@ -1,6 +1,6 @@
 //! Brush clones retain their colors while subsequent draws observe mutations.
 use super::*;
-fn colors<B: Backend>(cpu: B) {
+fn colors<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     f.call("GdiplusStartup", &[DATA, DATA + 256, 0], 0);
     f.call(

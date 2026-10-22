@@ -12,6 +12,7 @@ pub mod display;
 mod encoding;
 mod enumeration;
 mod formatting;
+mod geometry;
 mod hit_test;
 pub(crate) mod hooks;
 pub mod host_input;
@@ -36,6 +37,7 @@ pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
 mod tab;
+mod touch;
 pub(crate) mod update;
 pub mod window;
 
@@ -829,6 +831,7 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    touch::register(reg);
     encoding::register(reg);
     placement::register(reg);
     property::register(reg);
@@ -877,6 +880,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "UnionRect", 3, union_rect);
     s(reg, "AttachThreadInput", 3, |_| Outcome::Return(1));
     hit_test::register(reg);
+    geometry::register(reg);
     s(reg, "EnumWindows", 2, |_| Outcome::Return(1));
     s(reg, "EnumChildWindows", 3, |_| Outcome::Return(1));
     s(reg, "ChangeDisplaySettingsA", 2, |_| Outcome::Return(0));

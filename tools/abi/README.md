@@ -52,6 +52,7 @@ It distinguishes parameter count from stack words: `SetFilePointerEx` has four p
 Architecture attributes are filtered before type projection.
 Conflicting signatures stop generation.
 `structs.rs` contains the initial generated Pod structures, plus size, alignment and field-offset assertions, including the by-value `BLENDFUNCTION` and gradient mesh records.
+Touch and gesture records also come from the pinned x86 metadata; size checks use generated `TOUCHINPUT` and `GESTUREINFO` layouts.
 The supplemental binary64 validation accepts the existing `pow` and `_hypot` declarations with two double-width x86 arguments.
 `com.tsv` flattens inherited COM slots, including guest `this`, for DDraw, DSound, DInput, D3D9 and DirectShow.
 `constants.tsv` preserves the referenced enum and flag values.
@@ -135,6 +136,10 @@ The cited Win7 catalog is build 6.1.7100.0, rather than an authored SP1 native t
 The post-Win7 rows pin the SDK header revision, and these names remain unregistered and unavailable to guest discovery.
 SetHandleCount remains implemented: the Win7 export catalog contains it despite Learn's modern minimum-client label, and Learn describes its Win32 behavior as having no effect.
 
+`sdk-input.tsv` also supplies `d3dx9_43.dll!D3DXCreateLine/CreateSphere/CreateTextureFromFileInMemory/LoadMeshFromXInMemory` from the official Microsoft.DXSDK.D3DX 9.29.952.8 package; `sdk-source.json` records the four header hashes and Learn references.
+They are x86 WINAPI with HRESULT results and two, six, four and nine stack words; the sphere radius keeps its FLOAT kind, and the generator accepts only these exact declarations.
+`AbiMetadata.SupportedPlatforms` reads x86 import declarations' `SupportedOSPlatformAttribute` from the same WinMD for `post-win7.tsv`; rows without it cite a Learn requirements URL.
+
 ## CRT export catalog
 
 WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports: msvcrt, msvcrt20/40, msvcr70 through msvcr120, ucrtbase, vcruntime140, msvcp60 and the UCRT API-set contracts.
@@ -185,11 +190,11 @@ CRT runtime callback declarations additionally project terminate, unexpected, tr
 Terminate, unexpected and translator handlers use the existing CRT/thread owner; purecall handlers use CRT-global state.
 VC14's standard terminate entry uses UCRT's slot.
 Returning terminate handlers take the shared public abort path; returning unexpected handlers enter terminate.
-Default abort/runtime-error exits use the Windows process owner with statuses 3/255,
-bypassing CRT exit callbacks. Debugger hooks have no recipient in this profile.
+Default abort/runtime-error exits use the Windows process owner with statuses 3/255, bypassing CRT exit callbacks.
+Debugger hooks have no recipient in this profile.
 Signal/raise and legacy exception filters share CRT module/thread signal slots;
-FP-code and exception-pointer cells extend the existing errno allocation. Native
-handler reset, context restoration and UCRT validation differences remain explicit.
+FP-code and exception-pointer cells extend the existing errno allocation.
+Native handler reset, context restoration and UCRT validation differences remain explicit.
 Their callbacks execute as guest code, preserving explicit exits.
 
 The x86 internal SEH helpers use explicit ABI rows: EH2/EH3 take four cdecl arguments, EH4 common takes six, and local/global helpers retain caller cleanup.
@@ -228,61 +233,47 @@ These internal contracts use the pinned Microsoft x86 runtime observations descr
 `--check` detects stale entries.
 This scope manifest neither registers behavior nor changes export discovery; `tools/survey/coverage.py` continues to report the unfiltered catalogs.
 
-Declarations include floating controls, error cells, exit arrays and initializer
-ranges. Integer conversions share checked narrow/UTF-16 scanning, x86-width
-saturation, radix formatting and module/thread errno, including EDX:EAX returns and native
-end-pointer validation order. Legacy startup entries use Learn prototypes where SDK
-headers omit them. Their guest argv/environment arrays consume Win32 strings and
-process environment, with per-CRT guest-heap snapshots released on process detach.
-Glob expansion requests containing wildcards explicitly fail rather than report
-unexpanded arguments as success. Public `malloc/calloc/realloc/free/_msize/_expand`
-fronts in every cataloged runtime and public heap API set reuse the existing RTL
-process heap. Allocation failure and multiplication overflow publish ENOMEM;
-zero-byte malloc/calloc retain distinct one-byte blocks. A nonnull zero-sized
-realloc releases its block, while `_expand` retains one live byte and uses the
-RTL in-place flag. Failed resizing preserves the old block. NULL `_msize/_expand`
-inputs use the runtime's parameter-validation profile. Tests check every alias.
-Aligned malloc/free/size/realloc/recalloc fronts and their offset variants retain
-the native x86 guest header pointing into the same process heap. Resizing keeps
-the old backing until allocation and copying succeed; recalloc zeros the added
-extent. VC80/VC90's native zero-alignment acceptance is a version parameter;
-UCRT and the other profiles require the documented nonzero power of two. Native
-aligned size queries validate NULL and require the original alignment/offset.
+Declarations include floating controls, error cells, exit arrays and initializer ranges.
+Integer conversions share checked narrow/UTF-16 scanning, x86-width saturation, radix formatting and module/thread errno, including EDX:EAX returns and native end-pointer validation order.
+Legacy startup entries use Learn prototypes where SDK headers omit them.
+Their guest argv/environment arrays consume Win32 strings and process environment, with per-CRT guest-heap snapshots released on process detach.
+Glob expansion requests containing wildcards explicitly fail rather than report unexpanded arguments as success.
+Public `malloc/calloc/realloc/free/_msize/_expand` fronts in every cataloged runtime and public heap API set reuse the existing RTL process heap.
+Allocation failure and multiplication overflow publish ENOMEM; zero-byte malloc/calloc retain distinct one-byte blocks.
+A nonnull zero-sized realloc releases its block, while `_expand` retains one live byte and uses the RTL in-place flag.
+Failed resizing preserves the old block.
+NULL `_msize/_expand` inputs use the runtime's parameter-validation profile.
+Tests check every alias.
+Aligned malloc/free/size/realloc/recalloc fronts and their offset variants retain the native x86 guest header pointing into the same process heap.
+Resizing keeps the old backing until allocation and copying succeed; recalloc zeros the added extent.
+VC80/VC90's native zero-alignment acceptance is a version parameter;
+UCRT and the other profiles require the documented nonzero power of two.
+Native aligned size queries validate NULL and require the original alignment/offset.
 Tests check all versions and zeroing, release and error contracts in both backends.
-Legacy scalar `operator new/delete` use that same heap, including distinct live
-zero-byte allocations. The throwing `new` overload explicitly stops on allocation
-failure because guest `std::bad_alloc`/new-handler dispatch is not implemented;
-it never returns a fake NULL result. No array, nothrow, sized or aligned overload
-is advertised by this slice.
-`memcpy_s/memmove_s` reuse guest range checks, the common memory copy, errno and
-invalid-parameter callback state. Both accept zero count without pointer access.
-On parameter errors, `memcpy_s` clears the declared destination capacity and
-`memmove_s` leaves it unchanged. Only `memmove_s` defines overlapping-copy behavior.
-Legacy `_onexit`/`atexit` and UCRT `_crt_atexit` share the existing guest exit-array
-executor with per-CRT ownership. `_cexit` drains it, `exit` drains before Win32
-process termination, and `_exit` bypasses the callbacks. Direct `ExitProcess` and
-raw PE-entry returns do not synthesize a C-main return. Pending arrays and headers
-are released at the existing process-detach boundary. UCRT `_onexit`/`atexit`
-are static shims and are not advertised as native DLL exports.
-Cataloged legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in
-`corecrt_startup.h` and [Microsoft's command-line variable documentation](https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln).
-Cataloged `_adjust_fdiv` compatibility cells are also data, with a zero
-initial value; its data-section export was checked in the installed Microsoft
-x86 MSVCRT PE rather than represented by a function thunk. Storage rows use
-convention `data`, a scalar/pointer cell width and no parameters. The generator
-rejects malformed data declarations; the function macro rejects them as callable
-signatures. Registry assembly initializes pointer descriptors from the single
-Win32 command-line owner before module loading. Synthetic PE files and mapped
-modules publish the same eight-byte-aligned RW/NX cells; aliases share symbol
-identity, while distinct symbols with equal initial bytes retain separate cells.
-Static IATs and dynamic lookups refer to those cells. Getter calls never reset
-guest writes. Explicit code-page configuration refreshes the existing ANSI buffer
-only when the code page changes and propagates write failures to the caller.
-These bindings use normal Rust behavior functions over the guest FpuEnvironment,
-not host floating-control instructions. Modern `__control87_2` is not invented
-for the system MSVCRT profile, whose native export is absent on the oracle host.
-SDK prototypes establish ABI; authored MSVCRT/UCRT comparisons establish the
-selected behavior contract, not every historic VC runtime DLL revision.
+Legacy scalar `operator new/delete` use that same heap, including distinct live zero-byte allocations.
+The throwing `new` overload explicitly stops on allocation failure because guest `std::bad_alloc`/new-handler dispatch is not implemented; it never returns a fake NULL result.
+No array, nothrow, sized or aligned overload is advertised by this slice.
+`memcpy_s/memmove_s` reuse guest range checks, the common memory copy, errno and invalid-parameter callback state.
+Both accept zero count without pointer access.
+On parameter errors, `memcpy_s` clears the declared destination capacity and `memmove_s` leaves it unchanged.
+Only `memmove_s` defines overlapping-copy behavior.
+Legacy `_onexit`/`atexit` and UCRT `_crt_atexit` share the existing guest exit-array executor with per-CRT ownership.
+`_cexit` drains it, `exit` drains before Win32 process termination, and `_exit` bypasses the callbacks.
+Direct `ExitProcess` and raw PE-entry returns do not synthesize a C-main return.
+Pending arrays and headers are released at the existing process-detach boundary.
+UCRT `_onexit`/`atexit` are static shims and are not advertised as native DLL exports.
+Cataloged legacy `_acmdln`/`_wcmdln` rows describe pointer **data**, as declared in `corecrt_startup.h` and [Microsoft's command-line variable documentation](https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln).
+Cataloged `_adjust_fdiv` compatibility cells are also data, with a zero initial value; its data-section export was checked in the installed Microsoft x86 MSVCRT PE rather than represented by a function thunk.
+Storage rows use convention `data`, a scalar/pointer cell width and no parameters.
+The generator rejects malformed data declarations; the function macro rejects them as callable signatures.
+Registry assembly initializes pointer descriptors from the single Win32 command-line owner before module loading.
+Synthetic PE files and mapped modules publish the same eight-byte-aligned RW/NX cells; aliases share symbol identity, while distinct symbols with equal initial bytes retain separate cells.
+Static IATs and dynamic lookups refer to those cells.
+Getter calls never reset guest writes.
+Explicit code-page configuration refreshes the existing ANSI buffer only when the code page changes and propagates write failures to the caller.
+These bindings use normal Rust behavior functions over the guest FpuEnvironment, not host floating-control instructions.
+Modern `__control87_2` is not invented for the system MSVCRT profile, whose native export is absent on the oracle host.
+SDK prototypes establish ABI; authored MSVCRT/UCRT comparisons establish the selected behavior contract, not every historic VC runtime DLL revision.
 
 An API has one behavior function:
 

@@ -87,8 +87,12 @@ fn post_at(
         if message == 0x20a || message == 0x20e {
             lparam = make_long(sx, sy);
         } else {
-            let (tx, ty) = user.client_origin(&env.sys.objects, hwnd);
-            lparam = make_long(sx.wrapping_sub(tx), sy.wrapping_sub(ty));
+            let Some((x, y)) =
+                super::geometry::client_point(user, &env.sys.objects, hwnd, (sx, sy))
+            else {
+                return false;
+            };
+            lparam = make_long(x, y);
         }
         for (down, up, vk) in [(0x201, 0x202, 1), (0x204, 0x205, 2), (0x207, 0x208, 4)] {
             if message == down || message == down + 2 {
@@ -168,11 +172,22 @@ fn activate_app(env: &mut Env<'_>, active: bool) -> bool {
     };
     let thread = user.windows.get(&env.sys.objects, &top).unwrap().thread;
     let hwnd = user
-        .queues
-        .get(&thread)
-        .map(|queue| queue.active)
-        .filter(|&hwnd| valid_window(user, &env.sys.objects, hwnd, thread))
+        .windows
+        .get(&env.sys.objects, &user.foreground)
+        .filter(|w| !w.destroying && w.visible())
+        .map(|w| w.hwnd)
+        .or_else(|| {
+            user.queues
+                .get(&thread)
+                .map(|queue| queue.active)
+                .filter(|&hwnd| valid_window(user, &env.sys.objects, hwnd, thread))
+        })
         .unwrap_or(top);
+    let state = &mut env.ext.get_mut::<Win32>().user;
+    if active {
+        state.foreground = hwnd;
+    }
+    state.foreground_active = active;
     let flag = u32::from(active);
     let messages = if active {
         [
