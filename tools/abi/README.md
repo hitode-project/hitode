@@ -150,6 +150,9 @@ python tools/abi/crt_exports.py --mingw <mingw-w64-checkout> --check
 python -m unittest discover -s tools/abi -p test_crt_exports.py
 ```
 
+Byte/UTF-16 set scans share unsigned code-unit membership and checked page reads
+across all cataloged versions, without locale conversion or a fixed length cap.
+
 ## SDK CRT declarations
 
 WinMD omits CRT exports.

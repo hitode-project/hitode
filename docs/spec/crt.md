@@ -71,4 +71,9 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Integer radix output MUST use x86 input widths, lowercase digits, and a minus sign only for signed decimal inputs. Byte and UTF-16 fronts MUST share checked output, with capacities measured in code units. Secure fronts MUST clear the first unit before capacity/radix validation and report range failures through the runtime's parameter handler.
 **Verification**: Test
 
+### CRT-LIB-14 Set scans
+
+**Rule**: Byte and UTF-16 set searches MUST share code-unit membership without locale conversion. Spans MUST count units, and pointer results MUST identify the first matching source unit. Scans MUST stop at matching or terminating units without reading inaccessible following units or imposing an artificial string-length bound.
+**Verification**: Test
+
 Withdrawn: none

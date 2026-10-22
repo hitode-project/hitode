@@ -323,14 +323,16 @@
     "header": "ucrt/string.h:137-140,401-404,430-433",
     "header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
     "native_oracle_source_sha256": "428e97500fcc40b87b0d27a8f8e77d0ef52395c317b1e21f1326214fa6978fd6",
-    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Guest scans independently bound control and source to16MiB; limit violations warn/fail rather than return a fabricated NULL or span, and checked pointer faults are not advertised as native AV equivalence.",
-    "scope": "Three existing CRT aliases: strpbrk/strcspn/strspn are cdecl with two const char* arguments and two x86 words. strpbrk returns a pointer into the source or NULL; strcspn/strspn return unsigned32 size_t byte counts. C ABI strpbrk return is char* regardless of C++ const-correct overloads.",
+    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Checked guest reads preserve the authored early-stop boundary; no new native Windows execution is claimed.",
+    "scope": "Every cataloged CRT/public-string-API-set strpbrk/strcspn/strspn and wcspbrk/wcscspn/wcsspn front selects one shared code-unit kernel. Pointer searches return a source address or NULL; spans return x86 size_t counts in bytes or UTF-16 units.",
     "documentation": [
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strpbrk-wcspbrk-mbspbrk-mbspbrk-l",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcspn-wcscspn-mbscspn-mbscspn-l",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strspn-wcsspn-mbsspn-mbsspn-l"
     ],
-    "profile": "Read raw guest bytes through one bounded byte-membership scanner, including high bytes; no locale or Unicode conversion, new string storage, or fabricated invalid-parameter callback. Stop before unnecessary source-tail reads and warn/fail outside supported bounds."
+    "profile": "Unsigned byte and raw UTF-16-unit membership share page-local reads without locale decoding, surrogate conversion, a copied source string or an artificial scan-length limit. Guest address arithmetic is checked and cannot wrap; terminated valid strings can span the available address space.",
+    "wide_header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstring.h",
+    "wide_header_sha256": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
   },
   "x87_intrinsic_power": {
     "source": "Microsoft Learn _CIpow x86 compiler intrinsic declaration, 2026-10-07 read",
