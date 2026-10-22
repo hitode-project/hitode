@@ -1,7 +1,7 @@
 //! Independently authored flat calls check native format defaults and array copies.
 use super::*;
 
-fn settings<B: Backend>(cpu: B) {
+fn settings<B: TestCpu>(cpu: B) {
     let mut f = Fixture::new(cpu);
     for (i, value) in [1f32, 2.5, f32::INFINITY, f32::NAN, f32::NEG_INFINITY]
         .into_iter()
