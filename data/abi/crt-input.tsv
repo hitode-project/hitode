@@ -2609,3 +2609,58 @@ msvcrt20.dll	__p__iob	cdecl	ptr	FILE*
 msvcrt20.dll	_iob	data	aggregate	u8[640]	
 msvcrt40.dll	__p__iob	cdecl	ptr	FILE*	
 msvcrt40.dll	_iob	data	aggregate	u8[640]	
+# SDK sys/timeb.h and time.h clock/timeb declarations; native _o_ wrappers share the outer ABI.
+api-ms-win-crt-time-l1-1-0.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	clock	cdecl	i32	clock_t	
+msvcr100.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr100.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr100.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr100.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr100.dll	clock	cdecl	i32	clock_t	
+msvcr110.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr110.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr110.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr110.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr110.dll	clock	cdecl	i32	clock_t	
+msvcr120.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr120.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr120.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr120.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr120.dll	clock	cdecl	i32	clock_t	
+msvcr70.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr70.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr70.dll	clock	cdecl	i32	clock_t	
+msvcr71.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr71.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr71.dll	clock	cdecl	i32	clock_t	
+msvcr80.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr80.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr80.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr80.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr80.dll	clock	cdecl	i32	clock_t	
+msvcr90.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr90.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr90.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr90.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr90.dll	clock	cdecl	i32	clock_t	
+msvcrt.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcrt.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcrt.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcrt.dll	clock	cdecl	i32	clock_t	
+msvcrt20.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt20.dll	clock	cdecl	i32	clock_t	
+msvcrt40.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt40.dll	clock	cdecl	i32	clock_t	
+ucrtbase.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_o__ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_o__ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_o__ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_o__ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+ucrtbase.dll	clock	cdecl	i32	clock_t	

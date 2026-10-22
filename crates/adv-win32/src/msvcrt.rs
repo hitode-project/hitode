@@ -54,6 +54,7 @@ mod string_edit;
 mod strings;
 mod thread;
 mod time64;
+mod time_packet;
 mod versions;
 mod wide_scan;
 mod wide_string;
@@ -173,6 +174,7 @@ pub fn register(r: &mut Registry) {
     intrinsic_math::register(r);
     integer_format::register(r);
     time64::register(r);
+    time_packet::register(r);
     random::register(r);
     scalar_float::register(r);
     scalar_log::register(r);

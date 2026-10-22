@@ -785,5 +785,19 @@
     "native_evidence": "Pinned Microsoft VC80/VC90 PE data agrees on stdin flags 0x101, a 4096-byte static input buffer, stdout/stderr flags 2 and zeroed remaining objects. VC90 startup walks twenty entries at stride 32, then replaces each standard descriptor with -2 when its OS handle is zero, -1 or -2. Its iob getter returns the actual static array. No native Windows execution is claimed.",
     "ownership": "Legacy version profiles select the shared FILE layout. The existing guest heap backs each real input buffer with process detach cleanup; writable arrays belong to their synthetic PE data sections. Getters activate only their own DLL and return its original data address, retaining guest modifications. No console or output handle is fabricated.",
     "modern_scope": "UCRT does not gain a legacy _iob array or legacy getters. Its opaque FILE layout and __acrt_iob_func remain separate work."
+  },
+  "clock_timeb": {
+    "headers": {
+      "sys/timeb.h": "31a7314070ca5bf1992bf714df015a47e55cb564c9248d4e9eb2ad7c9fb43209",
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/clock",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftime-ftime32-ftime64",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftime-s-ftime32-s-ftime64-s"
+    ],
+    "clock": "Milliseconds from the existing process clock epoch, independently of host CPU consumption. Pinned VC90 returns the low 32 bits of elapsed milliseconds; UCRT rejects results above signed clock_t maximum. Profiles retain this difference without changing errno or LastError.",
+    "timeb": "x86 timeb32/timeb64 store 4/8-byte seconds followed by millitm, minutes west of UTC and DST shorts. The current fixed-offset Windows timezone supplies the bias and zero DST. Native routines preserve tail padding and write timezone, DST, milliseconds, then time; timeb32 stores the low DWORD rather than rejecting wraparound.",
+    "native_evidence": "Pinned Microsoft VC80/VC90/UCRT establish declarations, field offsets, NULL validation, low-word timeb32 output and clock overflow policy. Native void ftime wrappers share the secure bodies. The existing process clock epoch supplies initialization time for this personality; no native Windows execution is claimed."
   }
 }

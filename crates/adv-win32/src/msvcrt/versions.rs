@@ -16,6 +16,7 @@ pub(super) struct Profile {
     pub unicode_file_paths: bool,
     pub zero_file_error_success: bool,
     pub legacy_stdio: Option<StdioLayout>,
+    pub clock_overflow_failure: bool,
 }
 #[derive(Clone, Copy)]
 pub(super) struct StdioLayout {
@@ -40,6 +41,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcrt40.dll",
@@ -51,6 +53,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcrt.dll",
@@ -62,6 +65,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr70.dll",
@@ -73,6 +77,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr71.dll",
@@ -84,6 +89,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr80.dll",
@@ -95,6 +101,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr90.dll",
@@ -106,6 +113,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr100.dll",
@@ -117,6 +125,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr110.dll",
@@ -128,6 +137,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "msvcr120.dll",
@@ -139,6 +149,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
+        clock_overflow_failure: false,
     },
     Profile {
         module: "ucrtbase.dll",
@@ -150,6 +161,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: true,
         zero_file_error_success: false,
         legacy_stdio: None,
+        clock_overflow_failure: true,
     },
     Profile {
         module: "vcruntime140.dll",
@@ -161,6 +173,7 @@ pub(super) const PROFILES: &[Profile] = &[
         unicode_file_paths: false,
         zero_file_error_success: true,
         legacy_stdio: None,
+        clock_overflow_failure: true,
     },
 ];
 

@@ -131,4 +131,14 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Cataloged legacy `_iob` arrays MUST provide twenty 32-byte FILE objects, with initialized standard-stream flags and real stdin buffer storage. Without a console, their first three descriptors MUST contain minus two while the remaining entries stay closed. Legacy iob getters MUST return their runtime's actual array, preserving independent writable storage between DLL versions.
 **Verification**: Test
 
+### CRT-LIB-26 Time packets
+
+**Rule**: Cataloged timeb fronts MUST share the existing clock and timezone, use x86 field widths and preserve padding. Writes MUST follow native timezone, DST, millisecond and time order, with NULL validation selected by the runtime profile. The 32-bit packet MUST retain its native low-word timestamp behavior.
+**Verification**: Test
+
+### CRT-LIB-27 Clock ticks
+
+**Rule**: CRT clock ticks MUST measure elapsed milliseconds from the process clock epoch and preserve error cells. Version profiles MUST retain legacy 32-bit wrapping and UCRT failure beyond the signed clock range.
+**Verification**: Test
+
 Withdrawn: none

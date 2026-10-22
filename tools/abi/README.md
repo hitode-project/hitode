@@ -385,3 +385,6 @@ DOS error translation preserves the pinned first-match table, fallback ranges an
 Data-only `aggregate` declarations may use `u8[N]` for a verified fixed byte extent from 1 through 65536; aggregate function returns remain unsupported.
 Legacy `_iob` arrays use this descriptor for twenty 32-byte FILE objects, with real input-buffer storage and no-console descriptors.
 The native VC80/VC90 layout and startup evidence are recorded in `crt-source.json`; UCRT remains a distinct opaque FILE ABI.
+
+Clock/timeb fronts use the existing process clock and fixed Windows timezone, retaining x86 field widths and untouched structure padding.
+Native VC90/UCRT evidence selects clock overflow behavior and ordered packet writes; `crt_time_packet` covers version projections and protected fields in interpreter/JIT.
