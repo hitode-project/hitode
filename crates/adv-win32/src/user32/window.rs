@@ -46,6 +46,7 @@ use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr, set_last_error};
 use crate::{Win32, stdcall};
 mod activation;
+pub(super) mod focus;
 mod position;
 mod style;
 mod z_order;
@@ -415,6 +416,8 @@ impl Default for QueueKeys {
 
 #[derive(Default)]
 pub struct Queue {
+    focus_request: u64,
+    activation_focus: Option<u32>,
     pub(super) sent: super::message::sent::Queue,
     pub posted: std::collections::VecDeque<super::message::Msg>,
     /// Logical key state of input already removed from this thread's queue.
@@ -1876,25 +1879,7 @@ pub fn set_focus(
     hwnd: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let ctx = env.context;
-    let u = &mut env.ext.get_mut::<crate::Win32>().user;
-    if hwnd != 0 && !u.windows.contains_key(&env.sys.objects, &hwnd) {
-        return then(env, 0);
-    }
-    let q = u.queue(ctx);
-    let old = q.focus;
-    if old == hwnd {
-        return then(env, old);
-    }
-    q.focus = hwnd;
-    let mut msgs = Vec::new();
-    if old != 0 {
-        msgs.push([old, wm::KILLFOCUS, hwnd, 0]);
-    }
-    if hwnd != 0 {
-        msgs.push([hwnd, wm::SETFOCUS, old, 0]);
-    }
-    send_all(env, msgs.into(), move |env| then(env, old))
+    focus::request(env, hwnd, then)
 }
 
 pub const SWP_NOSIZE: u32 = 0x1;
@@ -2111,7 +2096,9 @@ fn enable_window(env: &mut Env<'_>, hwnd: AbiHandle, enable: i32) -> Outcome {
     if enable {
         notify(env)
     } else {
-        send(env, hwnd, wm::CANCELMODE, 0, 0, move |env, _| notify(env))
+        send(env, hwnd, wm::CANCELMODE, 0, 0, move |env, _| {
+            focus::cancel_subtree(env, hwnd, notify)
+        })
     }
 }
 

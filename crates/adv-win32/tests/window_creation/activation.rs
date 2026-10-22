@@ -118,6 +118,9 @@ fn foreign_queue<B: TestCpu>(cpu: B) {
         &[I(0), I(0), I(CODE + 0x6000), I(0), I(0), I(0)],
     );
     f.call("kernel32.dll!WaitForSingleObject", &[M(ready), I(u32::MAX)]);
+    let foreign_focus = f.call("SetFocus", &[M(other)]);
+    let foreign_focus_error = f.call("kernel32.dll!GetLastError", &[]);
+    let retained_focus = f.call("GetFocus", &[]);
     let previous = f.call("SetActiveWindow", &[M(other)]);
     let active = f.call("GetActiveWindow", &[]);
     let focus = f.call("GetFocus", &[]);
@@ -127,6 +130,11 @@ fn foreign_queue<B: TestCpu>(cpu: B) {
         &[M(thread), I(u32::MAX)],
     );
     f.run();
+    assert_eq!(
+        (f.value(foreign_focus), f.value(foreign_focus_error)),
+        (0, 87)
+    );
+    assert_eq!(f.value(retained_focus), f.value(first));
     assert_ne!(f.value(other), 0);
     assert_eq!(f.value(previous), f.value(first));
     assert_eq!(

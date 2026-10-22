@@ -1,17 +1,24 @@
 //! Activation follows guest NC vetoes and keeps NULL as a real deactivation path.
 use super::*;
+type Then = Box<dyn FnOnce(&mut Env<'_>, bool) -> Outcome>;
 pub(super) fn request(
     env: &mut Env<'_>,
     hwnd: u32,
     foreground: bool,
     then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
 ) -> Outcome {
+    request_boxed(env, hwnd, foreground, Box::new(then))
+}
+fn request_boxed(env: &mut Env<'_>, hwnd: u32, foreground: bool, then: Then) -> Outcome {
     let thread = if hwnd == 0 {
         env.context
     } else {
         let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd) else {
             return then(env, false);
         };
+        if window.destroying || !window.enabled() {
+            return then(env, false);
+        }
         window.thread
     };
     let old = user_mut(env).queue(thread).active;
@@ -46,7 +53,7 @@ pub(super) fn request(
             && !user(env)
                 .windows
                 .get(&env.sys.objects, &hwnd)
-                .is_some_and(|w| !w.destroying)
+                .is_some_and(|w| !w.destroying && w.enabled())
         {
             return then(env, false);
         }

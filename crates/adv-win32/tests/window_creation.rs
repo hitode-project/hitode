@@ -22,6 +22,8 @@ mod capture;
 mod dc_origin;
 #[path = "window_creation/deferred.rs"]
 mod deferred;
+#[path = "window_creation/focus.rs"]
+mod focus;
 #[path = "window_creation/geometry.rs"]
 mod geometry;
 #[path = "window_creation/style.rs"]
