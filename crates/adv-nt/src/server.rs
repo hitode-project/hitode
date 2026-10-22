@@ -25,9 +25,28 @@ pub const MACHINE_I386: u16 = 0x014c;
 /// it decides that none is coming.
 const PATIENCE: u32 = 4;
 
-/// Lets the server handle what its clients have sent so far.
+/// Lets the server handle what its clients have sent so far, and the
+/// timeouts that have passed by `time`.
 pub trait Progress {
-    fn run_server(&mut self);
+    fn run_server(&mut self, time: Time);
+}
+
+/// The guest's clocks, which the server reads as its own, in 100 ns ticks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Time {
+    /// The performance counter.
+    pub monotonic: u64,
+    /// Wall-clock time since 1970-01-01 UTC.
+    pub unix: u64,
+}
+
+impl Time {
+    pub fn now(clock: &mut adv_machine::Clock) -> Time {
+        Time {
+            monotonic: clock.now_us() * 10,
+            unix: clock.system_time() - adv_machine::clock::UNIX_EPOCH_SYSTEM_TIME,
+        }
+    }
 }
 
 /// A process's connection with what drives its server, kept in the
@@ -73,6 +92,32 @@ fn link<'a>(env: &'a mut adv_machine::Env<'_>) -> Result<&'a mut Link, crate::st
         .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))
 }
 
+/// Shows the server the guest's clocks as they read now.
+pub fn set_time(env: &mut adv_machine::Env<'_>) {
+    let time = Time::now(&mut env.sys.clock);
+    if let Some(link) = env.ext.try_get_mut::<Link>() {
+        link.connection.time = time;
+    }
+}
+
+/// What ended a wait the thread started with `select`.
+#[derive(Clone, Copy, Debug)]
+pub struct WakeUp {
+    pub cookie: u64,
+    /// The wait's status; with no cookie, the exit code of the killed
+    /// thread.
+    pub signaled: u32,
+}
+
+/// Lets the server run at the current time, then takes the wake-up it
+/// sent the thread, if any.
+pub fn wake_up(env: &mut adv_machine::Env<'_>) -> Result<Option<WakeUp>, crate::status::Error> {
+    set_time(env);
+    let link = link(env)?;
+    link.progress.run_server(link.connection.time);
+    link.connection.wake_up().map_err(broken)
+}
+
 fn broken(error: Error) -> crate::status::Error {
     crate::status::Error::Unsupported(format!("server: {error}"))
 }
@@ -100,7 +145,12 @@ pub fn handle_fd(
         .call(&mut *link.progress, &mut request, &[], &mut [])
         .map_err(broken)?;
     crate::status::check(reply.header.error)?;
-    let (tag, fd) = receive_fd(&link.connection.socket, &mut *link.progress).map_err(broken)?;
+    let (tag, fd) = receive_fd(
+        &link.connection.socket,
+        &mut *link.progress,
+        link.connection.time,
+    )
+    .map_err(broken)?;
     if tag != handle {
         return Err(crate::status::Error::Unsupported(format!(
             "the server sent the descriptor of handle {tag:#x} for {handle:#x}"
@@ -203,7 +253,9 @@ pub struct Connection {
     request: OwnedFd,
     reply: OwnedFd,
     /// The server writes here to end a wait the thread started with `select`.
-    _wait: OwnedFd,
+    wait: OwnedFd,
+    /// The time the server sees when the client lets it run.
+    pub time: Time,
 }
 
 impl Connection {
@@ -211,10 +263,11 @@ impl Connection {
     pub fn connect(
         socket: &Path,
         progress: &mut dyn Progress,
+        time: Time,
     ) -> Result<(Connection, FirstThread), Error> {
         let socket = UnixStream::connect(socket)?;
         socket.set_nonblocking(true)?;
-        let (version, request) = receive_fd(&socket, progress)?;
+        let (version, request) = receive_fd(&socket, progress, time)?;
         if version != PROTOCOL_VERSION {
             return Err(Error::Version(version));
         }
@@ -222,6 +275,7 @@ impl Connection {
         let (wait, wait_write) = pipe()?;
         set_nonblocking(&request)?;
         set_nonblocking(&reply)?;
+        set_nonblocking(&wait)?;
         // The first thread has no id yet; 0 names it.
         send_fd(&socket, 0, reply_write.as_raw_fd())?;
         send_fd(&socket, 0, wait_write.as_raw_fd())?;
@@ -229,7 +283,8 @@ impl Connection {
             socket,
             request,
             reply,
-            _wait: wait,
+            wait,
+            time,
         };
 
         let mut init = InitFirstThreadRequest {
@@ -309,7 +364,7 @@ impl Connection {
         for part in data {
             self.write(progress, part)?;
         }
-        progress.run_server();
+        progress.run_server(self.time);
 
         self.read(progress, fixed)?;
         // SAFETY: every reply starts with the reply header.
@@ -318,6 +373,42 @@ impl Connection {
         let size = (header.reply_size as usize).min(reply_data.len());
         self.read(progress, &mut reply_data[..size])?;
         Ok(size)
+    }
+
+    /// The wake-up the server sent, if one is waiting in the pipe.
+    fn wake_up(&mut self) -> Result<Option<WakeUp>, Error> {
+        // struct wake_up_reply
+        let mut reply = [0u8; 16];
+        loop {
+            // SAFETY: a valid descriptor and buffer.
+            let read = unsafe {
+                libc::read(
+                    self.wait.as_raw_fd(),
+                    reply.as_mut_ptr().cast(),
+                    reply.len(),
+                )
+            };
+            match read {
+                16 => break,
+                0 => return Err(Error::Closed),
+                read if read > 0 => {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "partial wake-up of {read} bytes"
+                    ))));
+                }
+                _ => {}
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EAGAIN) => return Ok(None),
+                Some(libc::EINTR) => {}
+                _ => return Err(error.into()),
+            }
+        }
+        Ok(Some(WakeUp {
+            cookie: u64::from_ne_bytes(reply[..8].try_into().unwrap()),
+            signaled: u32::from_ne_bytes(reply[8..12].try_into().unwrap()),
+        }))
     }
 
     /// The process socket, over which the server sends file descriptors.
@@ -340,7 +431,7 @@ impl Connection {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EAGAIN) if idle < PATIENCE => {
-                    progress.run_server();
+                    progress.run_server(self.time);
                     idle += 1;
                 }
                 Some(libc::EAGAIN) => return Err(Error::NoReply),
@@ -374,7 +465,7 @@ impl Connection {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
                 Some(libc::EAGAIN) if idle < PATIENCE => {
-                    progress.run_server();
+                    progress.run_server(self.time);
                     idle += 1;
                 }
                 Some(libc::EAGAIN) => return Err(Error::NoReply),
@@ -442,7 +533,11 @@ fn send_fd(socket: &UnixStream, tid: u32, fd: RawFd) -> io::Result<()> {
 }
 
 /// Receives a descriptor the server sent with a handle value.
-fn receive_fd(socket: &UnixStream, progress: &mut dyn Progress) -> Result<(u32, OwnedFd), Error> {
+fn receive_fd(
+    socket: &UnixStream,
+    progress: &mut dyn Progress,
+    time: Time,
+) -> Result<(u32, OwnedFd), Error> {
     let mut idle = 0;
     loop {
         let mut handle = 0u32;
@@ -479,7 +574,7 @@ fn receive_fd(socket: &UnixStream, progress: &mut dyn Progress) -> Result<(u32, 
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EAGAIN) if idle < PATIENCE => {
-                progress.run_server();
+                progress.run_server(time);
                 idle += 1;
             }
             Some(libc::EAGAIN) => return Err(Error::NoReply),

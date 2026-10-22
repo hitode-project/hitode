@@ -47,6 +47,9 @@ REQUESTS = [
     "get_process_info",
     "get_next_thread",
     "get_thread_info",
+    "select",
+    "create_event",
+    "event_op",
 ]
 
 INTEGERS = {

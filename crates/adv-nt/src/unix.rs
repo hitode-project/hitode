@@ -48,6 +48,7 @@ fn debug_write(env: &mut Env<'_>, params: u32) -> Outcome {
 
 /// Passes a request ntdll.dll prepared to the server.
 fn server_call(env: &mut Env<'_>, request: u32) -> Outcome {
+    crate::server::set_time(env);
     match forward(env, request) {
         Ok(status) => Outcome::Return(status),
         Err(error) => Outcome::Fail(error),

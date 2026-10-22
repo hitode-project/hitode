@@ -12,20 +12,19 @@ use std::path::PathBuf;
 
 use adv_cpu::Cpu;
 use adv_machine::{Machine, RunResult, layout::PARK_ADDR};
-use adv_nt::server::Progress;
+use adv_nt::server::{Progress, Time};
 use adv_nt::{dispatch::Platform, params::Startup, process};
 use adv_wineserver::{Clock, Config, Server, State};
 
-/// Time stands still: nothing in the test waits.
-struct TestClock(Cell<u64>);
+/// The guest's clocks, as the client last showed them to the server.
+struct GuestClock(Cell<Time>);
 
-impl Clock for TestClock {
+impl Clock for GuestClock {
     fn monotonic(&self) -> u64 {
-        self.0.get()
+        self.0.get().monotonic
     }
     fn unix(&self) -> u64 {
-        // 2026-01-01 UTC.
-        17_672_256_000_000_000 + self.0.get()
+        self.0.get().unix
     }
 }
 
@@ -46,11 +45,12 @@ impl log::Log for WineLog {
 
 struct Runtime {
     server: Server,
-    clock: TestClock,
+    clock: GuestClock,
 }
 
 impl Progress for Runtime {
-    fn run_server(&mut self) {
+    fn run_server(&mut self, time: Time) {
+        self.clock.0.set(time);
         let state = self.server.step(&self.clock);
         assert!(
             matches!(state, State::Waiting(_)),
@@ -60,7 +60,7 @@ impl Progress for Runtime {
 }
 
 #[test]
-fn loader_starts_the_probe() {
+fn the_probe_starts_waits_and_resumes() {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
@@ -96,7 +96,8 @@ fn loader_starts_the_probe() {
         }
     }
     std::fs::copy(&probe, prefix.join("drive_c/gate1.exe")).unwrap();
-    let clock = TestClock(Cell::new(0));
+    let mut machine_clock = adv_machine::Clock::virtual_time();
+    let clock = GuestClock(Cell::new(Time::now(&mut machine_clock)));
     let config = Config {
         prefix: prefix.clone(),
         install: dist,
@@ -107,7 +108,7 @@ fn loader_starts_the_probe() {
     let runtime = Runtime { server, clock };
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
-    let mut machine = Machine::new(cpu, Platform, adv_machine::Clock::virtual_time()).unwrap();
+    let mut machine = Machine::new(cpu, Platform, machine_clock).unwrap();
     let startup = Startup {
         image: r"C:\gate1.exe",
         command_line: "gate1.exe",
@@ -129,14 +130,19 @@ fn loader_starts_the_probe() {
     assert_ne!(started.thread.pid, 0);
 
     // The probe starts through the loader, which loads its imports and a
-    // library and runs its TLS callback, then sleeps.
-    let result = machine.run();
+    // library and runs its TLS callback; it sleeps, waits, and resumes
+    // from a fault.
+    // Time is virtual: when every context waits, it moves to the earliest
+    // deadline.
+    let result = loop {
+        match machine.run() {
+            RunResult::Idle {
+                next_deadline: Some(deadline),
+            } => machine.sys.clock.advance_to(deadline),
+            other => break other,
+        }
+    };
     std::fs::remove_dir_all(&root).unwrap();
-    match result {
-        RunResult::Failed(error) => assert_eq!(
-            error.message, "system call NtDelayExecution is not implemented",
-            "{error}"
-        ),
-        other => panic!("the probe did not stop: {other:?}"),
-    }
+    // It exits with 0 only when every step did what Windows does.
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
 }

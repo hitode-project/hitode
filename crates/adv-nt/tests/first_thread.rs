@@ -4,9 +4,10 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use adv_nt::server::{Connection, MACHINE_I386, Progress};
+use adv_nt::server::{Connection, MACHINE_I386, Progress, Time};
 use adv_wineserver::{Clock, Config, Server, State};
 
+/// Time stands still: nothing in the test waits.
 struct TestClock(Cell<u64>);
 
 impl Clock for TestClock {
@@ -25,7 +26,7 @@ struct Runtime<'a> {
 }
 
 impl Progress for Runtime<'_> {
-    fn run_server(&mut self) {
+    fn run_server(&mut self, _: Time) {
         assert!(matches!(self.server.step(self.clock), State::Waiting(_)));
     }
 }
@@ -57,7 +58,7 @@ fn first_thread_gets_ids_and_the_i386_machine() {
         clock: &clock,
     };
 
-    let (_connection, first) = Connection::connect(&socket, &mut runtime).unwrap();
+    let (_connection, first) = Connection::connect(&socket, &mut runtime, Time::default()).unwrap();
     assert_ne!(first.pid, 0);
     assert_ne!(first.tid, 0);
     assert_eq!(first.machines.first(), Some(&MACHINE_I386));

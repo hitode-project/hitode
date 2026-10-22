@@ -172,7 +172,8 @@ pub fn start<B: Backend>(
     mut progress: Box<dyn Progress>,
 ) -> Result<Process, Error> {
     // Connecting needs the server to run; `progress` drives it.
-    let (connection, registered) = Connection::connect(socket, &mut *progress)?;
+    let time = server::Time::now(&mut machine.sys.clock);
+    let (connection, registered) = Connection::connect(socket, &mut *progress, time)?;
     machine.sys.pid = registered.pid;
     let pe = Pe::parse(ntdll)?;
     let base = pe.image_base;

@@ -28,6 +28,7 @@ pub mod registry;
 pub mod section;
 pub mod server;
 pub mod status;
+pub mod sync;
 pub mod syscalls;
 pub mod system;
 pub mod timezone;

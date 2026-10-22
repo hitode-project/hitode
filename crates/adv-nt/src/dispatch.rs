@@ -12,8 +12,8 @@ use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
 use crate::{
-    exception, file, information, kuser, memory, nls, object, process, registry, section, system,
-    token, unix,
+    exception, file, information, kuser, memory, nls, object, process, registry, section, server,
+    sync, system, token, unix,
 };
 
 /// A system call, given its arguments.
@@ -23,9 +23,11 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtAllocateVirtualMemory", memory::allocate),
     ("NtClose", object::close),
     ("NtContinue", exception::resume),
+    ("NtCreateEvent", sync::create_event),
     ("NtCreateFile", file::create),
     ("NtCreateKey", registry::create),
     ("NtCreateSection", section::create),
+    ("NtDelayExecution", sync::delay),
     ("NtOpenDirectoryObject", object::open_directory),
     ("NtOpenFile", file::open),
     ("NtOpenKey", registry::open),
@@ -49,9 +51,13 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtQueryValueKey", registry::query_value),
     ("NtQueryVirtualMemory", memory::query),
     ("NtRaiseException", exception::raise),
+    ("NtResetEvent", sync::reset_event),
+    ("NtSetEvent", sync::set_event),
     ("NtSetValueKey", registry::set_value),
     ("NtTerminateProcess", process::terminate),
     ("NtUnmapViewOfSection", section::unmap_view),
+    ("NtWaitForMultipleObjects", sync::wait_multiple),
+    ("NtWaitForSingleObject", sync::wait_single),
     (
         "NtWow64IsProcessorFeaturePresent",
         kuser::is_processor_feature_present,
@@ -124,6 +130,7 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
         return Outcome::Fail(format!("system call {name} is not implemented"));
     };
     kuser::refresh(env);
+    server::set_time(env);
     let mut args = [0; MAX_ARGUMENTS];
     let count = bytes as usize / 4;
     for (index, arg) in args[..count].iter_mut().enumerate() {

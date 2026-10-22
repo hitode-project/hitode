@@ -777,3 +777,100 @@ impl Request for GetThreadInfoRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SelectRequest {
+    pub header: RequestHeader,
+    pub flags: i32,
+    pub cookie: u64,
+    pub timeout: i64,
+    pub size: u32,
+    pub prev_apc: u32,
+}
+const _: () = assert!(size_of::<SelectRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(SelectRequest, flags) == 12);
+const _: () = assert!(std::mem::offset_of!(SelectRequest, cookie) == 16);
+const _: () = assert!(std::mem::offset_of!(SelectRequest, timeout) == 24);
+const _: () = assert!(std::mem::offset_of!(SelectRequest, size) == 32);
+const _: () = assert!(std::mem::offset_of!(SelectRequest, prev_apc) == 36);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SelectReply {
+    pub header: ReplyHeader,
+    pub apc_handle: u32,
+    pub signaled: i32,
+}
+const _: () = assert!(size_of::<SelectReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(SelectReply, apc_handle) == 8);
+const _: () = assert!(std::mem::offset_of!(SelectReply, signaled) == 12);
+
+impl Request for SelectRequest {
+    const NUMBER: i32 = 29;
+    type Reply = SelectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateEventRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub manual_reset: i32,
+    pub initial_state: i32,
+}
+const _: () = assert!(size_of::<CreateEventRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CreateEventRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateEventRequest, manual_reset) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateEventRequest, initial_state) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateEventReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateEventReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateEventReply, handle) == 8);
+
+impl Request for CreateEventRequest {
+    const NUMBER: i32 = 30;
+    type Reply = CreateEventReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventOpRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub op: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<EventOpRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(EventOpRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(EventOpRequest, op) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventOpReply {
+    pub header: ReplyHeader,
+    pub state: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<EventOpReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(EventOpReply, state) == 8);
+
+impl Request for EventOpRequest {
+    const NUMBER: i32 = 31;
+    type Reply = EventOpReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
