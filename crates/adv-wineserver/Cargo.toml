@@ -1,0 +1,21 @@
+[package]
+name = "adv-wineserver"
+description = "Wine's server running inside the Hitode process, driven by the runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-or-later AND LGPL-2.1-or-later"
+publish.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+corosensei = "0.3"
+thiserror.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

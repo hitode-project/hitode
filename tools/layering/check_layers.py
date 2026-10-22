@@ -30,6 +30,8 @@ RULES: dict[str, set[str]] = {
     "adv-device": {"adv-sync"},
     "adv-win32": {"adv-os", "adv-device"},
     "adv-dx": {"adv-os", "adv-device"},
+    # Wine's server, run in process for the Wine userland stack (issue #58).
+    "adv-wineserver": set(),
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},

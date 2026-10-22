@@ -120,7 +120,7 @@ cargo build --release -p adv-run
 
 **运行核心**
 
-- [Wine](https://www.winehq.org/)：它的源码和测试是我们了解 Windows 行为的主要参考。我们没有链接或复制 Wine 的代码。
+- [Wine](https://www.winehq.org/)：它的源码和测试是我们了解 Windows 行为的主要参考，它的服务端在 Hitode 内运行。
 - [iced-x86](https://github.com/icedland/iced)：我们 CPU 底下的 x86 解码器。
 - [Unicorn](https://www.unicorn-engine.org/) 和 [QEMU](https://www.qemu.org/)：测试用来对照的参考 CPU。
 - [SingleStepTests/80386](https://github.com/SingleStepTests/80386)：逐条指令的测试向量。
@@ -157,5 +157,6 @@ Hitode 以 [GNU 通用公共许可证第 3 版或任何更新版本](COPYING)发
 - `crates/adv-cpu-core/softfloat`：Berkeley SoftFloat 3e，BSD-3-Clause。
 - `vendor/cpal`（Apache-2.0）和 `vendor/symphonia-codec-adpcm`（MPL-2.0）：打过补丁的上游代码。
 - `vendor/libtheora`：Xiph libtheora 1.2.0 解码部分，BSD-3-Clause，有本地修改，见其 `NOTICE`。
+- `vendor/wine`：Wine 11.0 的服务端及其包含的头文件，LGPL-2.1-or-later，未修改，见其 `NOTICE`。
 - `vendor/upscaling`：超分着色器源码，GPL-3.0 与各原作的许可证（Anime4K 为 MIT），见其 `NOTICE`。
 - `tools/fixtures/vendor/minhook`：测试夹具，见其 `LICENSE.txt`。

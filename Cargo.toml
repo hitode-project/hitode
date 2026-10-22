@@ -19,6 +19,7 @@ members = [
     "crates/adv-sync",
     "crates/adv-unicorn",
     "crates/adv-win32",
+    "crates/adv-wineserver",
     "apps/adv-run",
     "apps/adv-jit-helper",
     "apps/adv-launcher/src-tauri",

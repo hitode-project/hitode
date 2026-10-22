@@ -120,7 +120,7 @@ Hitode would not exist without these projects.
 
 **Runtime**
 
-- [Wine](https://www.winehq.org/): its source and tests are our main reference for how Windows behaves. We do not link or copy Wine code.
+- [Wine](https://www.winehq.org/): its source and tests are our main reference for how Windows behaves, and its server runs inside Hitode.
 - [iced-x86](https://github.com/icedland/iced): the x86 decoder under our CPU.
 - [Unicorn](https://www.unicorn-engine.org/) and [QEMU](https://www.qemu.org/): the reference CPUs our tests compare against.
 - [SingleStepTests/80386](https://github.com/SingleStepTests/80386): per-instruction test vectors.
@@ -157,5 +157,6 @@ Third-party parts keep their own licenses:
 - `crates/adv-cpu-core/softfloat`: Berkeley SoftFloat 3e, BSD-3-Clause.
 - `vendor/cpal` (Apache-2.0) and `vendor/symphonia-codec-adpcm` (MPL-2.0): patched upstream code.
 - `vendor/libtheora`: the decoder of Xiph libtheora 1.2.0, BSD-3-Clause, with local changes; see its `NOTICE`.
+- `vendor/wine`: the server of Wine 11.0 and the headers it includes, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
 - `vendor/upscaling`: upscaling shader sources, under GPL-3.0 and each original's license (MIT for Anime4K); see its `NOTICE`.
 - `tools/fixtures/vendor/minhook`: a test fixture; see its `LICENSE.txt`.

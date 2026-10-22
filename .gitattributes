@@ -11,3 +11,7 @@
 # Recorded fixture executables and native outputs (tools/fixtures/record_native.py).
 /tools/fixtures/native/**/*.exe binary
 /tools/fixtures/native/**/*.bin binary
+
+# Vendored Wine sources stay byte-identical to the upstream release.
+/vendor/wine/** -whitespace
+/vendor/wine/nls/*.nls binary
