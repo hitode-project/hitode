@@ -16,6 +16,8 @@ const DATA: u32 = 0x410000;
 const LOG: u32 = DATA + 0x8000;
 #[path = "window_creation/capture.rs"]
 mod capture;
+#[path = "window_creation/style.rs"]
+mod style;
 
 trait TestCpu: Backend {
     fn region(&mut self, _: u32, _: usize) {}

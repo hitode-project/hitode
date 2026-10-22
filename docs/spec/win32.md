@@ -153,9 +153,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Double-click APIs and metrics MUST share guest USER configuration, with timing independent of execution speed. They MUST NOT change host settings or transform guest-posted mouse messages.
 **Verification**: Test
 
-### WIN32-USER-10 Class state
+### WIN32-USER-10 USER metadata
 
-**Rule**: A/W class operations MUST share one owner and class-owned menu strings. Replacing a procedure MUST preserve the old procedure's encoding. Unsupported cross-encoding procedure thunks MUST fail explicitly.
+**Rule**: A/W metadata MUST share owners, retain class-owned menu strings, preserve replaced procedure encodings and avoid clearing LastError after successful writes. Style writes MUST send WM_STYLECHANGING and WM_STYLECHANGED, applying guest edits to STYLESTRUCT before publishing state. Unsupported cross-encoding procedure thunks MUST fail explicitly.
 **Verification**: Test
 
 ### WIN32-USER-11 Timed messages

@@ -43,8 +43,9 @@ use adv_os::Heaps;
 
 use super::message::{send, send_all};
 use super::{USER32, user, user_mut};
-use crate::util::{cstr, err, put_cstr, set_last_error};
+use crate::util::{cstr, put_cstr, set_last_error};
 use crate::{Win32, stdcall};
+mod style;
 
 pub const WS_OVERLAPPED: u32 = 0;
 pub const WS_MAXIMIZE: u32 = 0x0100_0000;
@@ -94,6 +95,8 @@ pub mod wm {
     pub const GETFONT: u32 = 0x31;
     pub const WINDOWPOSCHANGING: u32 = 0x46;
     pub const WINDOWPOSCHANGED: u32 = 0x47;
+    pub const STYLECHANGING: u32 = 0x7c;
+    pub const STYLECHANGED: u32 = 0x7d;
     pub const NCCREATE: u32 = 0x81;
     pub const NCDESTROY: u32 = 0x82;
     pub const NCHITTEST: u32 = 0x84;
@@ -2287,9 +2290,9 @@ fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcom
     }
 }
 
-fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, idx, v) = (env.arg(0), env.arg(1) as i32, env.arg(2));
-    set_window_long(env, hwnd, idx, v, false)
+#[win32(user32, name = "SetWindowLongA", level = state)]
+fn set_window_long_a(env: &mut Env<'_>, hwnd: AbiHandle, index: i32, value: i32) -> Outcome {
+    set_window_long(env, hwnd.0, index, value as u32, false)
 }
 
 #[win32(user32, name = "SetWindowLongW", level = state)]
@@ -2298,6 +2301,9 @@ fn set_window_long_w(env: &mut Env<'_>, hwnd: AbiHandle, index: i32, value: i32)
 }
 
 fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -> Outcome {
+    if matches!(idx, GWL_STYLE | GWL_EXSTYLE) {
+        return style::set(env, hwnd, idx, v);
+    }
     let Some(current) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
@@ -2360,8 +2366,6 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
         }
         GWL_HINSTANCE => Some(std::mem::replace(&mut w.instance, v)),
         GWL_ID => Some(std::mem::replace(&mut w.id, v)),
-        GWL_STYLE => Some(std::mem::replace(&mut w.style, v)),
-        GWL_EXSTYLE => Some(std::mem::replace(&mut w.ex_style, v)),
         GWL_USERDATA => Some(std::mem::replace(&mut w.user_data, v)),
         i if i >= 0 => w.set_extra_u32(i as u32, v),
         _ => None,
@@ -2374,7 +2378,6 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
                 *saved.entry(o).or_default() |= bit;
                 *saved.entry(v).or_default() |= bit;
             }
-            set_last_error(env, err::SUCCESS);
             Outcome::Return(o)
         }
         None => {
@@ -3146,7 +3149,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "AdjustWindowRect", 3, adjust_window_rect);
     s(reg, "AdjustWindowRectEx", 4, adjust_window_rect_ex);
     s(reg, "GetWindowLongA", 2, get_window_long_a);
-    s(reg, "SetWindowLongA", 3, set_window_long_a);
+    reg.register(set_window_long_a_ABI);
     reg.register(get_window_long_w_ABI);
     reg.register(set_window_long_w_ABI);
     reg.register(call_window_proc_w_ABI);
