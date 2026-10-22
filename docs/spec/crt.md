@@ -76,4 +76,9 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Byte and UTF-16 set searches MUST share code-unit membership without locale conversion. Spans MUST count units, and pointer results MUST identify the first matching source unit. Scans MUST stop at matching or terminating units without reading inaccessible following units or imposing an artificial string-length bound.
 **Verification**: Test
 
+### CRT-LIB-15 Runtime diagnostic defaults
+
+**Rule**: Default CRT abort MUST terminate through the Windows process owner with status three, without draining CRT exit callbacks. Runtime-error termination MUST use status 255 through that same owner. Debugger notifications MUST NOT fabricate a recipient or capability warning when no debugger is attached.
+**Verification**: Test
+
 Withdrawn: none

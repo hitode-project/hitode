@@ -2213,3 +2213,34 @@ ucrtbase.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str
 ucrtbase.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
 ucrtbase.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
 ucrtbase.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+
+# abort: SDK stdlib.h; diagnostics: explicit native Microsoft x86 internal ABI.
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	abort	cdecl	void	void	
+msvcr100.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr100.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr100.dll	abort	cdecl	void	void	
+msvcr110.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr110.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr110.dll	abort	cdecl	void	void	
+msvcr120.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr120.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr120.dll	abort	cdecl	void	void	
+msvcr70.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr70.dll	abort	cdecl	void	void	
+msvcr71.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr71.dll	abort	cdecl	void	void	
+msvcr80.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr80.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr80.dll	abort	cdecl	void	void	
+msvcr90.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr90.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr90.dll	abort	cdecl	void	void	
+msvcrt.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt.dll	abort	cdecl	void	void	
+msvcrt20.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt20.dll	abort	cdecl	void	void	
+msvcrt40.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt40.dll	abort	cdecl	void	void	
+ucrtbase.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+ucrtbase.dll	abort	cdecl	void	void	

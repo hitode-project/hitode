@@ -14,6 +14,7 @@ mod cpp_alloc;
 pub(crate) mod cpp_eh;
 mod cpp_runtime;
 mod data;
+mod diagnostics;
 mod directory;
 mod errors;
 mod exceptions;
@@ -156,6 +157,7 @@ pub fn register(r: &mut Registry) {
     byte_output::register(r);
     data::register(r);
     directory::register(r);
+    diagnostics::register(r);
     exceptions::register(r);
     find::register(r);
     formatting::register(r);
@@ -252,8 +254,6 @@ pub fn register(r: &mut Registry) {
         ("_strcmpi", 2),
         ("_strnicmp", 3),
         ("__p__iob", 0),
-        ("abort", 0),
-        ("_amsg_exit", 1),
         ("_purecall", 0),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
@@ -749,9 +749,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             0
         }
-        // abort exits with 3 and _amsg_exit with 255, as msvcrt does.
-        "abort" => return crate::kernel32::exit_process(e, 3),
-        "_amsg_exit" => return crate::kernel32::exit_process(e, 255),
         "_invalid_parameter_noinfo" => return invalid_parameter_noinfo(e),
         "gmtime" | "_gmtime32" => return time64::convert(e, a, false, false),
         "localtime" | "_localtime32" => return time64::convert(e, a, false, true),

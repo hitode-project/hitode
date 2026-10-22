@@ -697,5 +697,16 @@
     "scope": "Cataloged ordinary and secure int/long/unsigned-long/signed-64/unsigned-64 radix output, in byte and UTF-16 forms; one checked output kernel and existing invalid-parameter/errno owners.",
     "signedness": "Signed inputs have a minus sign only for radix ten. Other legal radices render the unsigned x86-width bit pattern. Digits above nine are lowercase ASCII in both encodings.",
     "native_evidence": "Pinned Microsoft VC90 secure helpers validate NULL/zero capacity first, clear the first unit, then check minimum capacity before radix. Insufficient capacity retains the reversed digit prefix written before overflow, clears the first unit, invokes the invalid-parameter path with ERANGE and returns ERANGE. Only valid plain radices have a documented contract; out-of-contract radices are rejected through the validation profile."
+  },
+  "runtime_diagnostics": {
+    "abort_header": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+    "abort_header_sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/abort",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/amsg-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    ],
+    "internal_abi": "Native Microsoft VC90 establishes void cdecl _amsg_exit(int) from its parameter load and immediate exit status 255. _crt_debugger_hook is void cdecl(int), established by its callers; the body clears an unexported debugger word without reading the input. No Windows native execution is claimed.",
+    "environment": "No debugger or console is attached. The debugger hook has no recipient. Default abort exits with status 3; runtime errors exit with status 255. Both use the existing Windows process owner without draining CRT atexit callbacks; C++ termination shares the abort body."
   }
 }

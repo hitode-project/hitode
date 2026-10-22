@@ -722,6 +722,7 @@ api-ms-win-crt-process-l1-1-0.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|p
 api-ms-win-crt-runtime-l1-1-0.dll	__doserrno	cdecl	ptr	unsigned long*	
 api-ms-win-crt-runtime-l1-1-0.dll	_cexit	cdecl	void	void	
 api-ms-win-crt-runtime-l1-1-0.dll	_crt_atexit	cdecl	i32	i32	function:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 api-ms-win-crt-runtime-l1-1-0.dll	_errno	cdecl	ptr	int*	
 api-ms-win-crt-runtime-l1-1-0.dll	_execute_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_exit	cdecl	void	void	status:i32:i32:1
@@ -739,6 +740,7 @@ api-ms-win-crt-runtime-l1-1-0.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
 api-ms-win-crt-runtime-l1-1-0.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_sleep	cdecl	void	void	milliseconds:unsigned long:u32:1
 api-ms-win-crt-runtime-l1-1-0.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
+api-ms-win-crt-runtime-l1-1-0.dll	abort	cdecl	void	void	
 api-ms-win-crt-runtime-l1-1-0.dll	exit	cdecl	void	void	status:i32:i32:1
 api-ms-win-crt-runtime-l1-1-0.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	system	cdecl	i32	int	command:const char*:str8:1
@@ -4646,7 +4648,9 @@ msvcr100.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size
 msvcr100.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr100.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 msvcr100.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr100.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr100.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr100.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr100.dll	_errno	cdecl	ptr	int*	
 msvcr100.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4749,6 +4753,7 @@ msvcr100.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr100.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr100.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr100.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr100.dll	abort	cdecl	void	void	
 msvcr100.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr100.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcr100.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -4817,7 +4822,9 @@ msvcr110.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size
 msvcr110.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr110.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 msvcr110.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr110.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr110.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr110.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr110.dll	_errno	cdecl	ptr	int*	
 msvcr110.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4920,6 +4927,7 @@ msvcr110.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr110.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr110.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr110.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr110.dll	abort	cdecl	void	void	
 msvcr110.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr110.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcr110.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -4988,7 +4996,9 @@ msvcr120.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size
 msvcr120.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr120.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 msvcr120.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr120.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr120.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr120.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr120.dll	_errno	cdecl	ptr	int*	
 msvcr120.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5092,6 +5102,7 @@ msvcr120.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr120.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr120.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
 msvcr120.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+msvcr120.dll	abort	cdecl	void	void	
 msvcr120.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr120.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcr120.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
@@ -5157,6 +5168,7 @@ msvcr70.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u
 msvcr70.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr70.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr70.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr70.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr70.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr70.dll	_errno	cdecl	ptr	int*	
 msvcr70.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5238,6 +5250,7 @@ msvcr70.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr70.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr70.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr70.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr70.dll	abort	cdecl	void	void	
 msvcr70.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr70.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcr70.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -5296,6 +5309,7 @@ msvcr71.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u
 msvcr71.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr71.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr71.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr71.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr71.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr71.dll	_errno	cdecl	ptr	int*	
 msvcr71.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5378,6 +5392,7 @@ msvcr71.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr71.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr71.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr71.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr71.dll	abort	cdecl	void	void	
 msvcr71.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr71.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcr71.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -5459,12 +5474,14 @@ msvcr80.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_
 msvcr80.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr80.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 msvcr80.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr80.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr80.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr80.dll	_cexit	cdecl	void	void	
 msvcr80.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
+msvcr80.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr80.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
 msvcr80.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr80.dll	_errno	cdecl	ptr	i32*	
@@ -5592,6 +5609,7 @@ msvcr80.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr80.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr80.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr80.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr80.dll	abort	cdecl	void	void	
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr80.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr80.dll	atol	cdecl	i32	long	text:const char*:str8:1
@@ -5717,6 +5735,7 @@ msvcr90.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_
 msvcr90.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcr90.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
 msvcr90.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr90.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcr90.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr90.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -5724,6 +5743,7 @@ msvcr90.dll	_cexit	cdecl	void	void
 msvcr90.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
+msvcr90.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
 msvcr90.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr90.dll	_errno	cdecl	ptr	i32*	
@@ -5851,6 +5871,7 @@ msvcr90.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr90.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr90.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr90.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr90.dll	abort	cdecl	void	void	
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr90.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcr90.dll	atol	cdecl	i32	long	text:const char*:str8:1
@@ -5967,6 +5988,7 @@ msvcrt.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u3
 msvcrt.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcrt.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
 msvcrt.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcrt.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcrt.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcrt.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcrt.dll	_cexit	cdecl	void	void	
@@ -6086,6 +6108,7 @@ msvcrt.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcrt.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt.dll	abort	cdecl	void	void	
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcrt.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcrt.dll	atol	cdecl	i32	long	text:const char*:str8:1
@@ -6171,6 +6194,7 @@ msvcrt20.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt20.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcrt20.dll	_acmdln	data	ptr	char*	
 msvcrt20.dll	_adjust_fdiv	data	i32	int	
+msvcrt20.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcrt20.dll	_errno	cdecl	ptr	int*	
 msvcrt20.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt20.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -6242,6 +6266,7 @@ msvcrt20.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:st
 msvcrt20.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt20.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt20.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt20.dll	abort	cdecl	void	void	
 msvcrt20.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcrt20.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcrt20.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -6293,6 +6318,7 @@ msvcrt40.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt40.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcrt40.dll	_acmdln	data	ptr	char*	
 msvcrt40.dll	_adjust_fdiv	data	i32	int	
+msvcrt40.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcrt40.dll	_errno	cdecl	ptr	int*	
 msvcrt40.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt40.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -6364,6 +6390,7 @@ msvcrt40.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:st
 msvcrt40.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt40.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt40.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt40.dll	abort	cdecl	void	void	
 msvcrt40.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 msvcrt40.dll	atol	cdecl	i32	long	text:const char*:str8:1
 msvcrt40.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -9241,6 +9268,7 @@ ucrtbase.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_crt_atexit	cdecl	i32	i32	function:callback:ptr:1
+ucrtbase.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 ucrtbase.dll	_errno	cdecl	ptr	i32*	
 ucrtbase.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 ucrtbase.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -9354,6 +9382,7 @@ ucrtbase.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+ucrtbase.dll	abort	cdecl	void	void	
 ucrtbase.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 ucrtbase.dll	atol	cdecl	i32	long	text:const char*:str8:1
 ucrtbase.dll	atoll	cdecl	i64	long long	text:const char*:str8:1

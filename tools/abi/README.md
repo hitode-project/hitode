@@ -176,7 +176,9 @@ A `system(NULL)` query returns zero without changing the error cells.
 CRT runtime callback declarations additionally project terminate, unexpected, translator and purecall aliases, including VC14's `__std_terminate`.
 Terminate, unexpected and translator handlers use the existing CRT/thread owner; purecall handlers use CRT-global state.
 VC14's standard terminate entry uses UCRT's slot.
-Returning terminate handlers take the abort path, and returning unexpected handlers enter terminate.
+Returning terminate handlers take the shared public abort path; returning unexpected handlers enter terminate.
+Default abort/runtime-error exits use the Windows process owner with statuses 3/255,
+bypassing CRT exit callbacks. Debugger hooks have no recipient in this profile.
 Their callbacks execute as guest code, preserving explicit exits.
 
 The x86 internal SEH helpers use explicit ABI rows: EH2/EH3 take four cdecl arguments, EH4 common takes six, and local/global helpers retain caller cleanup.

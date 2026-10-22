@@ -581,3 +581,6 @@ fn identity_and_sleep_fronts_share_windows_processes_and_virtual_scheduling() {
         }
     }
 }
+
+#[path = "crt_process/diagnostics.rs"]
+mod diagnostics;
