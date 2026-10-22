@@ -25,6 +25,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLastError() -> u32;
+    fn SetLastError(error: u32);
 }
 #[test]
 // spec: PERS-CRYPTO-7
@@ -218,6 +219,7 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
                 let mut native_output = [0xcd; 64];
                 let mut native_size = capacity;
                 let input_length = if encoding || !wide { 4 } else { 2 };
+                unsafe { SetLastError(0x12345678) };
                 let native_result = unsafe {
                     let destination = if capacity == 0 {
                         std::ptr::null_mut()
@@ -262,12 +264,7 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
                         )
                     }
                 };
-                assert_ne!(
-                    native_result,
-                    0,
-                    "wide={wide} encoding={encoding} capacity={capacity} error={}",
-                    unsafe { GetLastError() }
-                );
+                let native_error = unsafe { GetLastError() };
                 let mut registry = adv_abi::Registry::default();
                 adv_win32::register(&mut registry);
                 let cpu = JitCpu::new(PARK_ADDR, false).unwrap();
@@ -294,6 +291,12 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
                     if wide { "W" } else { "A" }
                 );
                 let api = machine.resolve_import("crypt32.dll", &name).unwrap();
+                let set_error = machine
+                    .resolve_import("kernel32.dll", "SetLastError")
+                    .unwrap();
+                let get_error = machine
+                    .resolve_import("kernel32.dll", "GetLastError")
+                    .unwrap();
                 let mut args = vec![
                     DATA,
                     input_length,
@@ -305,13 +308,16 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
                     args.extend([0, 0]);
                 }
                 let mut code = Asm::new(CODE);
+                code.push_imm(0x12345678).call(set_error);
                 for arg in args.into_iter().rev() {
                     code.push_imm(arg);
                 }
                 code.call(api)
                     .mov_mem_eax(DATA + 260)
-                    .mov_mem_imm(DATA + 264, 0)
-                    .mov_eax_mem(DATA + 264)
+                    .call(get_error)
+                    .mov_mem_eax(DATA + 264)
+                    .mov_mem_imm(DATA + 268, 0)
+                    .mov_eax_mem(DATA + 268)
                     .ret();
                 machine.cpu.write(CODE, &code.bytes).unwrap();
                 machine.spawn("binary control", CODE, &[], 65536).unwrap();
@@ -323,9 +329,14 @@ fn raw_binary_copies_match_native_buffer_and_length_rules() {
                 machine.cpu.read(DATA + 128, &mut guest_output).unwrap();
                 let guest_size = machine.cpu.read_u32(DATA + 256).unwrap();
                 let guest_result = machine.cpu.read_u32(DATA + 260).unwrap();
-                if guest_result != 1 || native_size != guest_size || native_output != guest_output {
+                let guest_error = machine.cpu.read_u32(DATA + 264).unwrap();
+                if guest_result != u32::from(native_result != 0)
+                    || (native_result == 0 && guest_error != native_error)
+                    || native_size != guest_size
+                    || native_output != guest_output
+                {
                     eprintln!(
-                        "{name} capacity={capacity} native-size={native_size} guest-size={guest_size} guest-result={guest_result} native={:?} guest={:?}",
+                        "{name} capacity={capacity} native-size={native_size} guest-size={guest_size} native-result={native_result} guest-result={guest_result} native-error={native_error} guest-error={guest_error} native={:?} guest={:?}",
                         &native_output[..20],
                         &guest_output[..20]
                     );
