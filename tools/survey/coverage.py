@@ -14,6 +14,7 @@ prints the missing names.
 """
 import argparse
 import collections
+import functools
 import pathlib
 import sys
 
@@ -44,7 +45,19 @@ def post_win7():
     return {(dll.lower(), name) for dll, name, *_ in rows(path)} if path.exists() else set()
 
 
+@functools.cache
+def ordinal_names():
+    return {(dll, "#" + ordinal): name
+            for dll, ordinal, name in rows(ABI / "import-ordinals.tsv")
+            if dll not in {"ntdll.dll", "kernel32.dll", "kernelbase.dll"}}
+
+
 def covered(have, dll, name):
+    if dll in have.get(name, ()):
+        return True
+    # The registry resolves optional-DLL SDK ordinals to the live named front.
+    # Core modules instead use their pinned PE export catalog.
+    name = ordinal_names().get((dll, name), name)
     dlls = have.get(name, ())
     return dll in dlls or (dll.startswith("api-ms-win-crt-") and "ucrtbase.dll" in dlls)
 
