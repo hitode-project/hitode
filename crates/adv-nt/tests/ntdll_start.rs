@@ -1,5 +1,5 @@
 //! Wine's ntdll.dll starts the main thread, with the in-process server, and
-//! starts a Wine program until it reads the registry.
+//! starts a Wine program, reading the registry.
 //!
 //! The test needs a Wine 11.0 i386 build: `ADV_WINE_DIST` names the directory
 //! that holds `lib/wine/i386-windows`. Without it the test is skipped.
@@ -43,7 +43,7 @@ impl Progress for Runtime {
 }
 
 #[test]
-fn loader_starts_a_wine_program_until_it_reads_the_registry() {
+fn loader_starts_a_wine_program_and_reads_the_registry() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
         return;
@@ -94,13 +94,13 @@ fn loader_starts_a_wine_program_until_it_reads_the_registry() {
 
     // The loader creates the process heap, moves the process parameters into
     // it, opens the current directory, asks what device it is on and reads
-    // the main image's headers. Then it reads its options from the
-    // registry.
+    // the main image's headers, and reads its options from the registry.
+    // Then it asks about the system.
     let result = machine.run();
     std::fs::remove_dir_all(&root).unwrap();
     match result {
         RunResult::Failed(error) => assert_eq!(
-            error.message, "system call NtOpenKey is not implemented",
+            error.message, "system call NtQuerySystemInformation is not implemented",
             "{error}"
         ),
         other => panic!("the loader did not stop: {other:?}"),

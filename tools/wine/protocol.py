@@ -33,6 +33,10 @@ REQUESTS = [
     "create_mapping",
     "get_mapping_info",
     "map_image_view",
+    "open_key",
+    "create_key",
+    "get_key_value",
+    "set_key_value",
 ]
 
 INTEGERS = {

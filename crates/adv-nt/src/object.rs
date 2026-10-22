@@ -25,6 +25,12 @@ pub fn write_u32(env: &mut Env<'_>, address: u32, value: u32) -> Result<(), Stat
         .map_err(|_| status::ACCESS_VIOLATION)
 }
 
+pub fn write_bytes(env: &mut Env<'_>, address: u32, bytes: &[u8]) -> Result<(), Status> {
+    env.cpu
+        .write(address, bytes)
+        .map_err(|_| status::ACCESS_VIOLATION)
+}
+
 /// The UTF-16 text of the UNICODE_STRING at `address`.
 pub fn read_unicode_string(env: &Env<'_>, address: u32) -> Result<Vec<u16>, Status> {
     let length = read_u32(env, address)? & 0xffff;

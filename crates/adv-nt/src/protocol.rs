@@ -302,3 +302,120 @@ impl Request for MapImageViewRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenKeyRequest {
+    pub header: RequestHeader,
+    pub parent: u32,
+    pub access: u32,
+    pub attributes: u32,
+}
+const _: () = assert!(size_of::<OpenKeyRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenKeyRequest, parent) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenKeyRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenKeyRequest, attributes) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenKeyReply {
+    pub header: ReplyHeader,
+    pub hkey: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenKeyReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenKeyReply, hkey) == 8);
+
+impl Request for OpenKeyRequest {
+    const NUMBER: i32 = 87;
+    type Reply = OpenKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateKeyRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub options: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateKeyRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CreateKeyRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateKeyRequest, options) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateKeyReply {
+    pub header: ReplyHeader,
+    pub hkey: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateKeyReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateKeyReply, hkey) == 8);
+
+impl Request for CreateKeyRequest {
+    const NUMBER: i32 = 86;
+    type Reply = CreateKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetKeyValueRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+}
+const _: () = assert!(size_of::<GetKeyValueRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetKeyValueRequest, hkey) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetKeyValueReply {
+    pub header: ReplyHeader,
+    pub r#type: i32,
+    pub total: u32,
+}
+const _: () = assert!(size_of::<GetKeyValueReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetKeyValueReply, r#type) == 8);
+const _: () = assert!(std::mem::offset_of!(GetKeyValueReply, total) == 12);
+
+impl Request for GetKeyValueRequest {
+    const NUMBER: i32 = 92;
+    type Reply = GetKeyValueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetKeyValueRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+    pub r#type: i32,
+    pub namelen: u32,
+}
+const _: () = assert!(size_of::<SetKeyValueRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetKeyValueRequest, hkey) == 12);
+const _: () = assert!(std::mem::offset_of!(SetKeyValueRequest, r#type) == 16);
+const _: () = assert!(std::mem::offset_of!(SetKeyValueRequest, namelen) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetKeyValueReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetKeyValueReply>() == 8);
+
+impl Request for SetKeyValueRequest {
+    const NUMBER: i32 = 91;
+    type Reply = SetKeyValueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
