@@ -4041,6 +4041,8 @@ user32.dll!ChildWindowFromPoint	user cache or win32k	not excluded	not excluded	n
 user32.dll!ClientToScreen	user cache or win32k	no	no	no	handler-owned state; same source	not required by fast path; ordinary not excluded	leaf	explicit nonblocking registration; decline before effects
 user32.dll!ClipCursor	user cache or win32k	not excluded	not excluded	not excluded	not excluded	live clock/input/window source	ordinary	ordinary required until all effects are proven safe
 user32.dll!CloseClipboard	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!CloseGestureInfoHandle	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!CloseTouchInputHandle	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CloseWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CopyAcceleratorTableA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CopyAcceleratorTableW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -4159,6 +4161,7 @@ user32.dll!GetDlgItemTextW	user cache or win32k	not excluded	not excluded	not ex
 user32.dll!GetDoubleClickTime	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetFocus	user cache or win32k	no	no	no	handler-owned state; same source	live clock/input/window source	leaf	explicit nonblocking registration; decline before effects
 user32.dll!GetForegroundWindow	user cache or win32k	no	no	no	handler-owned state; same source	live clock/input/window source	leaf	explicit nonblocking registration; decline before effects
+user32.dll!GetGestureInfo	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetIconInfo	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetKeyNameTextA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetKeyNameTextW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -4201,6 +4204,7 @@ user32.dll!GetSystemMenu	user cache or win32k	not excluded	not excluded	not excl
 user32.dll!GetSystemMetrics	user cache or win32k	no	no	no	handler-owned state; same source	live clock/input/window source	leaf	explicit nonblocking registration; decline before effects
 user32.dll!GetThreadDesktop	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetTopWindow	user cache or win32k	no	no	no	handler-owned state; same source	not required by fast path; ordinary not excluded	leaf	explicit nonblocking registration; decline before effects
+user32.dll!GetTouchInputInfo	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetUpdateRect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetUserObjectInformationA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!GetUserObjectInformationW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -4291,6 +4295,7 @@ user32.dll!RegisterClassExW	user cache or win32k	not excluded	not excluded	not e
 user32.dll!RegisterClassW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!RegisterClipboardFormatA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!RegisterClipboardFormatW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!RegisterTouchWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!RegisterWindowMessageA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!RegisterWindowMessageW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!ReleaseCapture	user cache or win32k	not excluded	not excluded	not excluded	not excluded	live clock/input/window source	ordinary	ordinary required until all effects are proven safe
@@ -4365,6 +4370,7 @@ user32.dll!UnhookWindowsHookEx	user cache or win32k	not excluded	not excluded	no
 user32.dll!UnionRect	user	no	no	no	guest memory/context	not required by fast path; ordinary not excluded	guest	authored guest body; ordinary implementation retained
 user32.dll!UnregisterClassA	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!UnregisterClassW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!UnregisterTouchWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!UpdateLayeredWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!UpdateLayeredWindowIndirect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!UpdateWindow	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe

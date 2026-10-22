@@ -289,6 +289,8 @@ pub struct Window {
     pub rect: Rect,
     /// Restore geometry and show history belong to this same USER object.
     pub placement: super::placement::PlacementState,
+    /// Touch registration flags, independent of device presence.
+    pub touch_flags: Option<u32>,
     pub text: String,
     pub extra: Vec<u8>,
     pub user_data: u32,
@@ -815,6 +817,7 @@ impl Window {
             instance: 0,
             rect,
             placement: super::placement::PlacementState::new(rect),
+            touch_flags: None,
             text: String::new(),
             extra: Vec::new(),
             user_data: 0,

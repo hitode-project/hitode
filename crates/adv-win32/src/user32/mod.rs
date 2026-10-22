@@ -37,6 +37,7 @@ pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
 mod tab;
+mod touch;
 pub(crate) mod update;
 pub mod window;
 
@@ -830,6 +831,7 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    touch::register(reg);
     encoding::register(reg);
     placement::register(reg);
     property::register(reg);

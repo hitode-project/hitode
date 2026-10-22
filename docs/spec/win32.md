@@ -168,9 +168,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 **Rule**: Committed text MUST reach keyboard focus as UTF-16 or packed ANSI `WM_IME_CHAR`, skipping unrepresentable characters. DefWindowProcA MUST split double-byte characters into lead and trail `WM_CHAR`; DefWindowProcW MUST preserve each unit.
 **Verification**: Test
 
-### WIN32-USER-13 IME boundaries
+### WIN32-USER-13 Input capability boundaries
 
-**Rule**: The personality MUST NOT fabricate IME windows or input contexts. Composition and `ImmGetCompositionString` MUST remain explicitly unavailable. `ImmIsIME` MUST report false for non-IME and unknown layouts without changing LastError.
+**Rule**: Missing IME providers and touch/gesture packets MUST NOT produce fabricated windows, contexts, composition data or input handles. `ImmIsIME` MUST report false for non-IME and unknown layouts without changing LastError. Touch registration MUST validate window ownership and flags, retaining changes in the shared window owner independently of device presence.
 **Verification**: Test
 
 ### WIN32-USER-14 Owner-draw button projection

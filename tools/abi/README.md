@@ -52,6 +52,7 @@ It distinguishes parameter count from stack words: `SetFilePointerEx` has four p
 Architecture attributes are filtered before type projection.
 Conflicting signatures stop generation.
 `structs.rs` contains the initial generated Pod structures, plus size, alignment and field-offset assertions, including the by-value `BLENDFUNCTION` and gradient mesh records.
+Touch and gesture records also come from the pinned x86 metadata; size checks use generated `TOUCHINPUT` and `GESTUREINFO` layouts.
 The supplemental binary64 validation accepts the existing `pow` and `_hypot` declarations with two double-width x86 arguments.
 `com.tsv` flattens inherited COM slots, including guest `this`, for DDraw, DSound, DInput, D3D9 and DirectShow.
 `constants.tsv` preserves the referenced enum and flag values.
