@@ -248,3 +248,9 @@ fn copy_to_read_only_destination_fails_instead_of_returning_success() {
         }
     }
 }
+
+#[path = "crt_strings/spans.rs"]
+mod spans;
+
+#[path = "crt_strings/edits.rs"]
+mod edits;

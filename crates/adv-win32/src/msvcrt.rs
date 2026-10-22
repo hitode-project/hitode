@@ -5,6 +5,7 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
 mod access;
+mod aligned;
 mod byte_output;
 mod byte_set;
 mod byte_sort;
@@ -13,17 +14,22 @@ mod cpp_alloc;
 pub(crate) mod cpp_eh;
 mod cpp_runtime;
 mod data;
+mod diagnostics;
 mod directory;
 mod errors;
 mod exceptions;
 mod file;
+mod file_mutation;
 mod find;
 mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
+mod integer_format;
 mod intrinsic_math;
+mod legacy_stdio;
 mod locale;
+mod make_time;
 mod mbcs;
 mod memory_ops;
 mod modern_stdio;
@@ -42,11 +48,14 @@ mod scan;
 mod secure_memory;
 mod seh;
 mod shared_file;
+mod signals;
 mod startup;
 mod stream_position;
+mod string_edit;
 mod strings;
 mod thread;
 mod time64;
+mod time_packet;
 mod versions;
 mod wide_scan;
 mod wide_string;
@@ -64,10 +73,12 @@ struct CrtState {
     cpp_eh_threads: HashMap<(String, u32), cpp_eh::Thread>,
     cpp_threads: HashMap<(String, u32), cpp_runtime::Thread>,
     purecall_handlers: HashMap<String, u32>,
+    signals: signals::State,
 }
 
 // The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
 struct CrtFile {
+    module: String,
     handle: u32,
     binary: bool,
     append: bool,
@@ -148,18 +159,24 @@ pub fn install<B: adv_cpu::backend::Backend>(
 
 pub fn register(r: &mut Registry) {
     access::register(r);
+    aligned::register(r);
     byte_set::register(r);
     byte_sort::register(r);
     byte_output::register(r);
     data::register(r);
     directory::register(r);
+    diagnostics::register(r);
     exceptions::register(r);
     find::register(r);
+    file_mutation::register(r);
     formatting::register(r);
     floating::register(r);
     errors::register(r);
     intrinsic_math::register(r);
+    integer_format::register(r);
     time64::register(r);
+    time_packet::register(r);
+    make_time::register(r);
     random::register(r);
     scalar_float::register(r);
     scalar_log::register(r);
@@ -179,10 +196,12 @@ pub fn register(r: &mut Registry) {
     secure_memory::register(r);
     seh::register(r);
     shared_file::register(r);
+    signals::register(r);
     stream_position::register(r);
     thread::register(r);
     heap::register(r);
     locale::register(r);
+    legacy_stdio::register(r);
     memory_ops::register(r);
     mbcs::register(r);
     modern_stdio::register(r);
@@ -190,21 +209,16 @@ pub fn register(r: &mut Registry) {
     wide_string::register(r);
     process::register(r);
     strings::register(r);
+    string_edit::register(r);
     versions::register(
         r,
         &[("_setjmp", call), ("_setjmp3", call), ("longjmp", call)],
     );
     for (name, argc) in [
-        ("malloc", 1),
-        ("calloc", 2),
-        ("realloc", 2),
-        ("free", 1),
         ("memcpy", 3),
         ("memmove", 3),
         ("memset", 3),
         ("memcmp", 3),
-        ("_initterm", 2),
-        ("_initterm_e", 2),
         ("_lock", 1),
         ("_unlock", 1),
         ("__dllonexit", 3),
@@ -217,15 +231,11 @@ pub fn register(r: &mut Registry) {
         ("_time32", 1),
         ("gmtime", 1),
         ("localtime", 1),
-        ("atoi", 1),
         ("abs", 1),
-        ("_itoa", 3),
         ("_strdup", 1),
-        ("strtoul", 3),
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
-        ("_XcptFilter", 2),
         ("__setusermatherr", 1),
         ("getenv", 1),
         ("??_U@YAPAXI@Z", 1),
@@ -254,9 +264,6 @@ pub fn register(r: &mut Registry) {
         ("_stricmp", 2),
         ("_strcmpi", 2),
         ("_strnicmp", 3),
-        ("__p__iob", 0),
-        ("abort", 0),
-        ("_amsg_exit", 1),
         ("_purecall", 0),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
@@ -264,9 +271,6 @@ pub fn register(r: &mut Registry) {
     // Whitelist implemented x86 cdecl constructor and heap helpers. Unknown
     // functions keep the loader's explicit unsupported handler.
     for module in ["msvcr80.dll", "msvcr90.dll"] {
-        for name in ["_initterm", "_initterm_e"] {
-            r.add(module, name, Conv::Cdecl { argc: 2 }, call);
-        }
         for name in ["_lock", "_unlock"] {
             r.add(module, name, Conv::Cdecl { argc: 1 }, call);
         }
@@ -275,20 +279,11 @@ pub fn register(r: &mut Registry) {
             ("__set_app_type", 1),
             ("__p__fmode", 0),
             ("__p__commode", 0),
-            ("__iob_func", 0),
             ("_invalid_parameter_noinfo", 0),
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
-        for (name, argc) in [
-            ("_malloc_crt", 1),
-            ("malloc", 1),
-            ("calloc", 2),
-            ("realloc", 2),
-            ("free", 1),
-        ] {
-            r.add(module, name, Conv::Cdecl { argc }, call);
-        }
+        r.add(module, "_malloc_crt", Conv::Cdecl { argc: 1 }, call);
         for (name, argc) in [
             ("_encode_pointer", 1),
             ("_decode_pointer", 1),
@@ -301,7 +296,6 @@ pub fn register(r: &mut Registry) {
             ("memset", 3),
             ("memcmp", 3),
             ("_strdup", 1),
-            ("strtoul", 3),
             ("_splitpath", 5),
             ("_makepath", 5),
             ("getenv", 1),
@@ -340,6 +334,7 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
         state.cpp_eh_threads.retain(|(_, id), _| *id != context);
         state.cpp_threads.retain(|(_, id), _| *id != context);
+        state.signals.release(Some(context));
     }
     random::release(env, Some(env.context));
     time64::release(env, Some(env.context))?;
@@ -351,12 +346,14 @@ pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
         state.cpp_eh_threads.clear();
         state.cpp_threads.clear();
+        state.signals.release(None);
         state.purecall_handlers.clear();
     }
     random::release(env, None);
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
     locale::release_process_tables(env)?;
+    legacy_stdio::release(env)?;
     time64::release(env, None)?;
     release_errno(env, None)
 }
@@ -516,7 +513,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     let arg = |i| e.arg(i);
     let (a, b, c) = (arg(0), arg(1), arg(2));
     let value = match name.as_str() {
-        "__set_app_type" | "__p__fmode" | "__p__commode" | "__iob_func" | "__p__iob" => {
+        "__set_app_type" | "__p__fmode" | "__p__commode" => {
             if e.ext.try_get::<CrtState>().is_none() {
                 e.ext.insert(CrtState::default());
             }
@@ -524,8 +521,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 e.sys.thunks.get(e.thunk).module.clone(),
                 if name == "__set_app_type" {
                     "app_type"
-                } else if name == "__iob_func" || name == "__p__iob" {
-                    "iob"
                 } else {
                     name.trim_start_matches("__p__")
                 }
@@ -535,12 +530,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let pointer = if let Some(pointer) = existing {
                 pointer
             } else {
-                let size = if name == "__iob_func" || name == "__p__iob" {
-                    128
-                } else {
-                    4
-                };
-                let pointer = allocate(e, size, true);
+                let pointer = allocate(e, 4, true);
                 if pointer == 0 {
                     return Outcome::Fail("CRT global allocation failed".into());
                 }
@@ -643,7 +633,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             e.sys.release_mutex(handle);
             0
         }
-        "malloc" | "_malloc_crt" | "??_U@YAPAXI@Z" => {
+        "_malloc_crt" | "??_U@YAPAXI@Z" => {
             if a > CRT_ALLOCATION_LIMIT {
                 return Outcome::Return(0);
             }
@@ -665,26 +655,11 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 |_, value| Outcome::Return(value.value()),
             );
         }
-        "calloc" => {
-            let Some(size) = a
-                .checked_mul(b)
-                .filter(|&size| size <= CRT_ALLOCATION_LIMIT)
-            else {
-                return Outcome::Return(0);
-            };
-            return crate::native_heap::allocate(e, size, true);
-        }
-        "free" | "??_V@YAXPAX@Z" => {
+        "??_V@YAXPAX@Z" => {
             if a == 0 {
                 return Outcome::Return(0);
             }
             return crate::native_heap::free(e, a);
-        }
-        "realloc" => {
-            if a == 0 && b > CRT_ALLOCATION_LIMIT {
-                return Outcome::Return(0);
-            }
-            return crate::native_heap::realloc(e, a, b);
         }
         "memcpy" | "memmove"
             if !e.cpu.accessible(b, c, adv_cpu::backend::Prot::READ)
@@ -776,9 +751,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             0
         }
-        // abort exits with 3 and _amsg_exit with 255, as msvcrt does.
-        "abort" => return crate::kernel32::exit_process(e, 3),
-        "_amsg_exit" => return crate::kernel32::exit_process(e, 255),
         "_invalid_parameter_noinfo" => return invalid_parameter_noinfo(e),
         "gmtime" | "_gmtime32" => return time64::convert(e, a, false, false),
         "localtime" | "_localtime32" => return time64::convert(e, a, false, true),
@@ -1091,54 +1063,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             ptr
         }
-        "atoi" => {
-            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
-            decimal_int(&wide) as u32
-        }
         "abs" => (a as i32).unsigned_abs(),
-        "_itoa" => {
-            if !(2..=36).contains(&c) {
-                return Outcome::Return(b);
-            }
-            // Only radix 10 is signed, as in msvcrt.
-            let (negative, mut magnitude) = if c == 10 && (a as i32) < 0 {
-                (true, (a as i32).unsigned_abs())
-            } else {
-                (false, a)
-            };
-            let mut text = Vec::new();
-            loop {
-                text.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(magnitude % c) as usize]);
-                magnitude /= c;
-                if magnitude == 0 {
-                    break;
-                }
-            }
-            if negative {
-                text.push(b'-');
-            }
-            text.reverse();
-            text.push(0);
-            if let Err(error) = e.cpu.write(b, &text) {
-                return Outcome::Fail(error.to_string());
-            }
-            b
-        }
-        "strtoul" => {
-            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
-                return Outcome::Fail("CRT string unmapped".into());
-            };
-            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
-            let (val, consumed, _) = convert::parse(&wide, c as i32);
-            if b != 0 {
-                let end = a.wrapping_add(consumed as u32);
-                let _ = e.cpu.write_u32(b, end);
-            }
-            val as u32
-        }
         "_splitpath" => {
             let Ok(path) = e.cpu.read_cstr(a, 4096) else {
                 return Outcome::Fail("CRT path unmapped".into());
@@ -1287,7 +1212,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 Err(_) => u32::MAX,
             }
         }
-        "_XcptFilter" => 1,
         "__setusermatherr" => 0,
         "frexp" => {
             let x = match double(e) {
@@ -1322,26 +1246,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
     };
     Outcome::Return(value)
-}
-
-/// `strtol(text, NULL, 10)`, saturating like the msvcrt `atoi`.
-fn decimal_int(text: &[u16]) -> i32 {
-    let (value, _, error) = convert::parse(text, 10);
-    let negative = text
-        .iter()
-        .find(|c| !matches!(c, 9..=13 | 32))
-        .is_some_and(|c| *c == u16::from(b'-'));
-    let magnitude = if negative {
-        value.wrapping_neg()
-    } else {
-        value
-    };
-    match (negative, error) {
-        (false, Some(_)) => i32::MAX,
-        (true, Some(_)) => i32::MIN,
-        (false, None) => magnitude.min(i32::MAX as u64) as i32,
-        (true, None) => (-(magnitude.min(1 << 31) as i64)) as i32,
-    }
 }
 
 #[cfg(test)]
@@ -1603,6 +1507,9 @@ mod tests {
             let free = m.resolve_import("ucrtbase.dll", "free").unwrap();
             let errno = m.resolve_import("ucrtbase.dll", "_errno").unwrap();
             let mut a = CodeAssembler::new(32).unwrap();
+            // Allocate thread storage first: a later errno allocation may
+            // legitimately reuse the original user block after realloc moves it.
+            a.call(u64::from(errno)).unwrap();
             a.push(16).unwrap();
             a.call(u64::from(malloc)).unwrap();
             a.add(esp, 4).unwrap();

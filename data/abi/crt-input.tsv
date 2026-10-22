@@ -44,8 +44,8 @@ api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:
 api-ms-win-crt-runtime-l1-1-0.dll	_execute_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
-ucrtbase.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
-api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
+ucrtbase.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
 ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 ucrtbase.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -1641,3 +1641,1071 @@ msvcrt40.dll	_HUGE	data	f64	double
 msvcrt40.dll	_acmdln	data	ptr	char*	
 msvcrt40.dll	_adjust_fdiv	data	i32	int	
 msvcrt40.dll	_wcmdln	data	ptr	wchar_t*	
+
+# SDK corecrt_malloc.h x86 cdecl shared heap fronts, size queries and in-place expansion.
+api-ms-win-crt-heap-l1-1-0.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr100.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr100.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr100.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr100.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr100.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr100.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr110.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr110.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr110.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr110.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr110.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr110.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr120.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr120.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr120.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr120.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr120.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr120.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr70.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr70.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr70.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr70.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr70.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr70.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr71.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr71.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr71.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr71.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr71.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr71.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr80.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr80.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr80.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr80.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr80.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr80.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr90.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr90.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcr90.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcr90.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcr90.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr90.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcrt.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcrt.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcrt.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt20.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt20.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcrt20.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcrt20.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcrt20.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt20.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt40.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt40.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+msvcrt40.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
+msvcrt40.dll	free	cdecl	void	void	pointer:void*:ptr:1
+msvcrt40.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt40.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+ucrtbase.dll	_expand	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+ucrtbase.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
+
+# Cataloged aligned CRT allocation family: pinned corecrt_malloc.h.
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+api-ms-win-crt-heap-l1-1-0.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr100.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr100.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr100.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr100.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr100.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr100.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr100.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr100.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr110.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr110.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr110.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr110.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr110.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr110.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr110.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr110.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr120.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr120.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr120.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr120.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr120.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr120.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr120.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr120.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr70.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr70.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr70.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr70.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr70.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr71.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr71.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr71.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr71.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr71.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr80.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr80.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr80.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr80.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr80.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr80.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr80.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr80.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr90.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcr90.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcr90.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr90.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr90.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr90.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcr90.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcr90.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+msvcrt.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+msvcrt.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+msvcrt.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcrt.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+msvcrt.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+ucrtbase.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
+ucrtbase.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
+ucrtbase.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
+ucrtbase.dll	_aligned_offset_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+ucrtbase.dll	_aligned_offset_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+ucrtbase.dll	_aligned_offset_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1|offset:size_t:u32:1
+ucrtbase.dll	_aligned_realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1|alignment:size_t:u32:1
+ucrtbase.dll	_aligned_recalloc	cdecl	ptr	void*	block:void*:ptr:1|count:size_t:u32:1|size:size_t:u32:1|alignment:size_t:u32:1
+
+# Shared signed/unsigned integer conversions: stdlib.h and corecrt_wstdlib.h.
+api-ms-win-crt-convert-l1-1-0.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+api-ms-win-crt-convert-l1-1-0.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	atol	cdecl	i32	long	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+api-ms-win-crt-convert-l1-1-0.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr100.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr100.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr100.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr100.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr100.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr100.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr100.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr100.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr110.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr110.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr110.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr110.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr110.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr110.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr110.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr110.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr120.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr120.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr120.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr120.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+msvcr120.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr120.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr120.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+msvcr120.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr120.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr70.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr70.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr70.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr70.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr70.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr70.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr70.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr70.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr71.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr71.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr71.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr71.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr71.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr71.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr71.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr71.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr80.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr80.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr80.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr80.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr80.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr80.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr80.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr80.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcr90.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcr90.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcr90.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr90.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcr90.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcr90.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcr90.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcr90.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+msvcrt.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+msvcrt.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt20.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt20.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt20.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt20.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt20.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt20.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt20.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt20.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt40.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+msvcrt40.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt40.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+msvcrt40.dll	atol	cdecl	i32	long	text:const char*:str8:1
+msvcrt40.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt40.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+msvcrt40.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+msvcrt40.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
+ucrtbase.dll	_strtoi64	cdecl	i64	__int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	_strtoui64	cdecl	u64	unsigned __int64	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wcstoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wcstoui64	cdecl	u64	unsigned __int64	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+ucrtbase.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+ucrtbase.dll	atoi	cdecl	i32	int	text:const char*:str8:1
+ucrtbase.dll	atol	cdecl	i32	long	text:const char*:str8:1
+ucrtbase.dll	atoll	cdecl	i64	long long	text:const char*:str8:1
+ucrtbase.dll	strtol	cdecl	i32	long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoll	cdecl	i64	long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoul	cdecl	u32	unsigned long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	strtoull	cdecl	u64	unsigned long long	text:const char*:str8:1|end:char**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+ucrtbase.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+
+# SDK radix formatting: ordinary and secure narrow/UTF-16 fronts.
+api-ms-win-crt-convert-l1-1-0.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+api-ms-win-crt-convert-l1-1-0.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr100.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr100.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr100.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr100.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr100.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr110.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr110.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr110.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr110.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr110.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr120.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr120.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr120.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr120.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr120.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr70.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr70.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr70.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr70.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr70.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr71.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr71.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr71.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr80.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr80.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr80.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr90.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr90.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr90.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr90.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr90.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt20.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_i64toa	cdecl	ptr	char*	value:__int64:i64:2|buffer:char*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_i64toa_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_i64tow	cdecl	ptr	wchar_t*	value:__int64:i64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_i64tow_s	cdecl	i32	errno_t	value:__int64:i64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_itoa	cdecl	ptr	char*	value:int:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_itoa_s	cdecl	i32	errno_t	value:int:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_itow	cdecl	ptr	wchar_t*	value:int:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_itow_s	cdecl	i32	errno_t	value:int:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ltoa	cdecl	ptr	char*	value:long:i32:1|buffer:char*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ltoa_s	cdecl	i32	errno_t	value:long:i32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ltow	cdecl	ptr	wchar_t*	value:long:i32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ltow_s	cdecl	i32	errno_t	value:long:i32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ui64toa_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ui64tow_s	cdecl	i32	errno_t	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+ucrtbase.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+
+# Shared byte/UTF-16 character-set searches: SDK string.h/corecrt_wstring.h.
+api-ms-win-crt-string-l1-1-0.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr100.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr100.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr100.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr100.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr100.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr100.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr110.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr110.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr110.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr110.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr110.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr110.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr120.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr120.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr120.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr120.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr120.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr120.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr70.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr70.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr70.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr70.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr70.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr70.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr71.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr71.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr71.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr71.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr71.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr71.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr80.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr80.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr80.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr90.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr90.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcr90.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt20.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt20.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcrt20.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt20.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt20.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt20.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt40.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt40.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcrt40.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt40.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt40.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+msvcrt40.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+ucrtbase.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+ucrtbase.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+ucrtbase.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+ucrtbase.dll	wcscspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+ucrtbase.dll	wcspbrk	cdecl	ptr	wchar_t*	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+ucrtbase.dll	wcsspn	cdecl	u32	size_t	text:const wchar_t*:str16:1|set:const wchar_t*:str16:1
+
+# abort: SDK stdlib.h; diagnostics: explicit native Microsoft x86 internal ABI.
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	abort	cdecl	void	void	
+msvcr100.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr100.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr100.dll	abort	cdecl	void	void	
+msvcr110.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr110.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr110.dll	abort	cdecl	void	void	
+msvcr120.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr120.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr120.dll	abort	cdecl	void	void	
+msvcr70.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr70.dll	abort	cdecl	void	void	
+msvcr71.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr71.dll	abort	cdecl	void	void	
+msvcr80.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr80.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr80.dll	abort	cdecl	void	void	
+msvcr90.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcr90.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr90.dll	abort	cdecl	void	void	
+msvcrt.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt.dll	abort	cdecl	void	void	
+msvcrt20.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt20.dll	abort	cdecl	void	void	
+msvcrt40.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
+msvcrt40.dll	abort	cdecl	void	void	
+ucrtbase.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+ucrtbase.dll	abort	cdecl	void	void	
+
+# SDK signal.h/float.h and pinned native legacy x86 exception-filter ABI.
+api-ms-win-crt-runtime-l1-1-0.dll	__fpecode	cdecl	ptr	int*	
+api-ms-win-crt-runtime-l1-1-0.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+api-ms-win-crt-runtime-l1-1-0.dll	raise	cdecl	i32	int	number:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr100.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr100.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr100.dll	__fpecode	cdecl	ptr	int*	
+msvcr100.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr100.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr100.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr110.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr110.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr110.dll	__fpecode	cdecl	ptr	int*	
+msvcr110.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr110.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr110.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr120.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr120.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr120.dll	__fpecode	cdecl	ptr	int*	
+msvcr120.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr120.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr120.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr70.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr70.dll	__fpecode	cdecl	ptr	int*	
+msvcr70.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr70.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr70.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr71.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr71.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr71.dll	__fpecode	cdecl	ptr	int*	
+msvcr71.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr71.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr71.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr80.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr80.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr80.dll	__fpecode	cdecl	ptr	int*	
+msvcr80.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr80.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr80.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr90.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr90.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr90.dll	__fpecode	cdecl	ptr	int*	
+msvcr90.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr90.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr90.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt.dll	__fpecode	cdecl	ptr	int*	
+msvcrt.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt20.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt20.dll	__fpecode	cdecl	ptr	int*	
+msvcrt20.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt20.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt20.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt40.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt40.dll	__fpecode	cdecl	ptr	int*	
+msvcrt40.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt40.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt40.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+ucrtbase.dll	__fpecode	cdecl	ptr	int*	
+ucrtbase.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+ucrtbase.dll	raise	cdecl	i32	int	number:int:i32:1
+ucrtbase.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+ucrtbase.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+ucrtbase.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+# Shared SDK process.h/stdlib.h/corecrt_startup.h exit and initializer projections.
+api-ms-win-crt-runtime-l1-1-0.dll	_Exit	cdecl	void	void	status:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_c_exit	cdecl	void	void	
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_at_quick_exit	cdecl	i32	int	callback:_PVFV:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	quick_exit	cdecl	void	void	status:int:i32:1
+msvcr100.dll	_c_exit	cdecl	void	void	
+msvcr100.dll	_cexit	cdecl	void	void	
+msvcr100.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr100.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr100.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr100.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr100.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr100.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr110.dll	_c_exit	cdecl	void	void	
+msvcr110.dll	_cexit	cdecl	void	void	
+msvcr110.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr110.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr110.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr110.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr110.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr110.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr120.dll	_c_exit	cdecl	void	void	
+msvcr120.dll	_cexit	cdecl	void	void	
+msvcr120.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr120.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr120.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr120.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr120.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr120.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr70.dll	_c_exit	cdecl	void	void	
+msvcr70.dll	_cexit	cdecl	void	void	
+msvcr70.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr70.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr70.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr70.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr70.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr71.dll	_c_exit	cdecl	void	void	
+msvcr71.dll	_cexit	cdecl	void	void	
+msvcr71.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcr71.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr71.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcr71.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcr71.dll	exit	cdecl	void	void	status:int:i32:1
+msvcr80.dll	_c_exit	cdecl	void	void	
+msvcr80.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr80.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcr90.dll	_c_exit	cdecl	void	void	
+msvcr90.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcr90.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcrt.dll	_c_exit	cdecl	void	void	
+msvcrt.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt.dll	_initterm_e	cdecl	i32	int	begin:_PIFV*:ptr:1|end:_PIFV*:ptr:1
+msvcrt20.dll	_c_exit	cdecl	void	void	
+msvcrt20.dll	_cexit	cdecl	void	void	
+msvcrt20.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcrt20.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt20.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcrt20.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcrt20.dll	exit	cdecl	void	void	status:int:i32:1
+msvcrt40.dll	_c_exit	cdecl	void	void	
+msvcrt40.dll	_cexit	cdecl	void	void	
+msvcrt40.dll	_exit	cdecl	void	void	status:int:i32:1
+msvcrt40.dll	_initterm	cdecl	void	void	begin:_PVFV*:ptr:1|end:_PVFV*:ptr:1
+msvcrt40.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
+msvcrt40.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
+msvcrt40.dll	exit	cdecl	void	void	status:int:i32:1
+ucrtbase.dll	_Exit	cdecl	void	void	status:int:i32:1
+ucrtbase.dll	_c_exit	cdecl	void	void	
+ucrtbase.dll	_crt_at_quick_exit	cdecl	i32	int	callback:_PVFV:ptr:1
+ucrtbase.dll	quick_exit	cdecl	void	void	status:int:i32:1
+# SDK byte/UTF-16 in-place edits; pinned UCRT _o_ wrappers retain these contracts.
+api-ms-win-crt-string-l1-1-0.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+api-ms-win-crt-string-l1-1-0.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+api-ms-win-crt-string-l1-1-0.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+api-ms-win-crt-string-l1-1-0.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+api-ms-win-crt-string-l1-1-0.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcr100.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr100.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcr100.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr100.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr100.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcr100.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr100.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr100.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr100.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr100.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcr110.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr110.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcr110.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr110.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr110.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcr110.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr110.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr110.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr110.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr110.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcr120.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr120.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcr120.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr120.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr120.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcr120.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr120.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr120.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr120.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr120.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcr70.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr70.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr70.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr70.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr70.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr70.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr71.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr71.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr71.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr71.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr71.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr71.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr80.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr80.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcr80.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr80.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr80.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcr80.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr80.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr80.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr80.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr80.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcr90.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr90.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcr90.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcr90.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcr90.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcr90.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr90.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcr90.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcr90.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcr90.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcrt.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcrt.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+msvcrt.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcrt.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcrt.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+msvcrt.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcrt.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcrt.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcrt.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcrt.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+msvcrt20.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcrt20.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcrt20.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcrt20.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcrt20.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcrt20.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+msvcrt40.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcrt40.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+msvcrt40.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+msvcrt40.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+msvcrt40.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+msvcrt40.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+ucrtbase.dll	_o__strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+ucrtbase.dll	_o__strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+ucrtbase.dll	_o__wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+ucrtbase.dll	_o__wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+ucrtbase.dll	_o__wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+ucrtbase.dll	_o__wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+ucrtbase.dll	_strnset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1|count:size_t:u32:1
+ucrtbase.dll	_strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
+ucrtbase.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
+ucrtbase.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
+ucrtbase.dll	_strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+ucrtbase.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
+ucrtbase.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
+ucrtbase.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
+ucrtbase.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
+ucrtbase.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+# SDK stdio.h/io.h/corecrt_wio.h file mutation fronts; native _dosmaperr cdecl contract.
+api-ms-win-crt-filesystem-l1-1-0.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr100.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr100.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr100.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr100.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr110.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr110.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr110.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr110.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr110.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr110.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr110.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr120.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr120.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr120.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr120.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr120.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr120.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr120.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr70.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr70.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr70.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr70.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr70.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr70.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr71.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr71.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr71.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr71.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr71.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr71.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr80.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr80.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr80.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr90.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr90.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr90.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt20.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt20.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt20.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt20.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt20.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt20.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt40.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt40.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt40.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt40.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt40.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt40.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+ucrtbase.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+# UCRT narrow conversion and pinned _o_ mutation wrappers.
+api-ms-win-crt-filesystem-l1-1-0.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	remove	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_o__unlink	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	_o__wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o__wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+ucrtbase.dll	_o__wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o_remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	_o_rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+# Native legacy x86 FILE[20], 32 bytes each; aggregate byte extent is data-only.
+msvcr100.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr100.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr100.dll	_iob	data	aggregate	u8[640]	
+msvcr110.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr110.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr110.dll	_iob	data	aggregate	u8[640]	
+msvcr120.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr120.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr120.dll	_iob	data	aggregate	u8[640]	
+msvcr70.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr70.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr70.dll	_iob	data	aggregate	u8[640]	
+msvcr71.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr71.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr71.dll	_iob	data	aggregate	u8[640]	
+msvcr80.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr80.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr80.dll	_iob	data	aggregate	u8[640]	
+msvcr90.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr90.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr90.dll	_iob	data	aggregate	u8[640]	
+msvcrt.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt.dll	_iob	data	aggregate	u8[640]	
+msvcrt20.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt20.dll	_iob	data	aggregate	u8[640]	
+msvcrt40.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt40.dll	_iob	data	aggregate	u8[640]	
+# SDK sys/timeb.h and time.h clock/timeb declarations; native _o_ wrappers share the outer ABI.
+api-ms-win-crt-time-l1-1-0.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	clock	cdecl	i32	clock_t	
+msvcr100.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr100.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr100.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr100.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr100.dll	clock	cdecl	i32	clock_t	
+msvcr110.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr110.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr110.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr110.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr110.dll	clock	cdecl	i32	clock_t	
+msvcr120.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr120.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr120.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr120.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr120.dll	clock	cdecl	i32	clock_t	
+msvcr70.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr70.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr70.dll	clock	cdecl	i32	clock_t	
+msvcr71.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr71.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr71.dll	clock	cdecl	i32	clock_t	
+msvcr80.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr80.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr80.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr80.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr80.dll	clock	cdecl	i32	clock_t	
+msvcr90.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcr90.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcr90.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcr90.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcr90.dll	clock	cdecl	i32	clock_t	
+msvcrt.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+msvcrt.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+msvcrt.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+msvcrt.dll	clock	cdecl	i32	clock_t	
+msvcrt20.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt20.dll	clock	cdecl	i32	clock_t	
+msvcrt40.dll	_ftime	cdecl	void	void	output:struct __timeb32*:ptr:1
+msvcrt40.dll	clock	cdecl	i32	clock_t	
+ucrtbase.dll	_ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_o__ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_o__ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
+ucrtbase.dll	_o__ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
+ucrtbase.dll	_o__ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+ucrtbase.dll	clock	cdecl	i32	clock_t	
+
+# Calendar normalization from SDK time.h; version limits are recorded in crt-source.json.
+api-ms-win-crt-time-l1-1-0.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr100.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr100.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr100.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr100.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr110.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr110.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr110.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr110.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr120.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr120.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr120.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr120.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr70.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr70.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr71.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr71.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr80.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr80.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr80.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr80.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr90.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr90.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr90.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr90.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcrt.dll	_mkgmtime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcrt.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcrt.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt20.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt40.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1

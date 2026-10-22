@@ -323,14 +323,16 @@
     "header": "ucrt/string.h:137-140,401-404,430-433",
     "header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
     "native_oracle_source_sha256": "428e97500fcc40b87b0d27a8f8e77d0ef52395c317b1e21f1326214fa6978fd6",
-    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Guest scans independently bound control and source to16MiB; limit violations warn/fail rather than return a fabricated NULL or span, and checked pointer faults are not advertised as native AV equivalence.",
-    "scope": "Three existing CRT aliases: strpbrk/strcspn/strspn are cdecl with two const char* arguments and two x86 words. strpbrk returns a pointer into the source or NULL; strcspn/strspn return unsigned32 size_t byte counts. C ABI strpbrk return is char* regardless of C++ const-correct overloads.",
+    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Checked guest reads preserve the authored early-stop boundary; no new native Windows execution is claimed.",
+    "scope": "Every cataloged CRT/public-string-API-set strpbrk/strcspn/strspn and wcspbrk/wcscspn/wcsspn front selects one shared code-unit kernel. Pointer searches return a source address or NULL; spans return x86 size_t counts in bytes or UTF-16 units.",
     "documentation": [
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strpbrk-wcspbrk-mbspbrk-mbspbrk-l",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcspn-wcscspn-mbscspn-mbscspn-l",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strspn-wcsspn-mbsspn-mbsspn-l"
     ],
-    "profile": "Read raw guest bytes through one bounded byte-membership scanner, including high bytes; no locale or Unicode conversion, new string storage, or fabricated invalid-parameter callback. Stop before unnecessary source-tail reads and warn/fail outside supported bounds."
+    "profile": "Unsigned byte and raw UTF-16-unit membership share page-local reads without locale decoding, surrogate conversion, a copied source string or an artificial scan-length limit. Guest address arithmetic is checked and cannot wrap; terminated valid strings can span the available address space.",
+    "wide_header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstring.h",
+    "wide_header_sha256": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
   },
   "x87_intrinsic_power": {
     "source": "Microsoft Learn _CIpow x86 compiler intrinsic declaration, 2026-10-07 read",
@@ -618,5 +620,196 @@
     "huge": "Eight-byte IEEE binary64 double, initial positive infinity 0x7ff0000000000000. Pinned VC80 and VC90 PE exports hold these bytes in writable .data. Modern corecrt_math.h provides the corresponding HUGE_VAL expression; its managed-only _HUGE declaration is not claimed as a native legacy header declaration.",
     "adjust_fdiv": "32-bit int initially zero for the virtual conforming x87 processor; cataloged versions share one descriptor kernel. No Pentium FDIV erratum is modeled.",
     "command_line": "Each CRT has independent four-byte pointer cells initialized from the existing Win32 ANSI/UTF-16 command-line owner. Public data addresses are real non-executable PE storage, retain guest writes and are identical through static IAT and dynamic lookup."
+  },
+  "shared_heap_fronts": {
+    "header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_malloc.h",
+    "sha256": "44bd1bb518e730ba0be045f44a4735869e08f7d54ab85c298270770812fcff80",
+    "scope": "Cataloged malloc/calloc/realloc/free/_msize/_expand versions and public heap API-set fronts share the existing process heap and RTL boundaries. Internal _calloc_crt/_malloc_crt policy stays distinct.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/free",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/msize",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/expand"
+    ],
+    "behavior": "Allocation failure and size/product overflow publish ENOMEM. Zero malloc/calloc requests retain a distinct one-byte block; realloc of a nonnull block to zero releases it. _expand uses HEAP_REALLOC_IN_PLACE_ONLY, preserves the original block on failure and retains one byte for a zero request. NULL _msize/_expand calls use the existing version-specific invalid-parameter policy.",
+    "native_boundary": "The pinned VC90 default NT-heap _expand entry normalizes a zero size to one and calls HeapReAlloc with flag 0x10; no alternate heap owner is introduced."
+  },
+  "aligned_heap_fronts": {
+    "header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_malloc.h",
+    "sha256": "44bd1bb518e730ba0be045f44a4735869e08f7d54ab85c298270770812fcff80",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-free",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-msize",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-recalloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-recalloc"
+    ],
+    "storage": "A native x86 aligned view stores its backing process-heap pointer at (view & ~3)-4. The existing RTL owner retains allocation, sizing and release. No host address map or separate allocator is introduced.",
+    "boundaries": "Native Microsoft VC80/VC90 accept zero alignment and normalize it to four, unlike pinned UCRT which rejects it; version parameters preserve this difference. Other version profiles follow the documented nonzero power-of-two precondition. Native VC80/VC90/UCRT accept zero-sized aligned requests with offset zero. Aligned size checks NULL and computes backing size minus max(alignment,4), (-offset)&3 and three bytes; alignment/offset must match the allocation.",
+    "resizing": "Replacement allocations preserve the old block on failure and copy its available user bytes before release. Recalloc uses the native aligned-size zeroing boundary. Nonnull zero-sized resizing releases the old backing before alignment/offset validation; product overflow publishes ENOMEM before any resize.",
+    "evidence": "Microsoft SDK declarations and Learn establish public contracts. The pinned native Microsoft x86 runtime binaries listed in the provenance establish guest header geometry, zero input differences and validation order; no native execution or Wine implementation is claimed."
+  },
+  "integer_conversions": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstdlib.h",
+        "sha256": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atoi-atoi-l-wtoi-wtoi-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atol-atol-l-wtol-wtol-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atoll-atoll-l-wtoll-wtoll-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtol-wcstol-strtol-l-wcstol-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoul-strtoul-l-wcstoul-wcstoul-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoi64-wcstoi64-strtoi64-l-wcstoi64-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtoui64-wcstoui64-strtoui64-l-wcstoui64-l"
+    ],
+    "scope": "Cataloged narrow and wide signed/unsigned 32/64-bit conversions without explicit locale handles; one checked prefix kernel uses the existing CRT locale and errno owners.",
+    "behavior": "Saturate to x86-width bounds and publish ERANGE; unsigned negative conversion negates modulo width unless the magnitude overflowed. End pointers advance in bytes or UTF-16 units; no digits reset to the original pointer. NULL/radix failures initialize end before the version-specific parameter path, including full EDX:EAX zero on 64-bit returns.",
+    "native_evidence": "Pinned Microsoft VC90 initializes end before source/radix checks, consumes a 0x prefix even without following digits, and stops overflow scanning early only when no end pointer was requested. Its wide parser accepts the documented Unicode decimal blocks reflected in the shared digit kernel; no machine code is copied or native Windows execution claimed."
+  },
+  "integer_formatting": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstdlib.h",
+        "sha256": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/itoa-itow",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/itoa-s-itow-s",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/i64toa-s-ui64toa-s-i64tow-s-ui64tow-s"
+    ],
+    "scope": "Cataloged ordinary and secure int/long/unsigned-long/signed-64/unsigned-64 radix output, in byte and UTF-16 forms; one checked output kernel and existing invalid-parameter/errno owners.",
+    "signedness": "Signed inputs have a minus sign only for radix ten. Other legal radices render the unsigned x86-width bit pattern. Digits above nine are lowercase ASCII in both encodings.",
+    "native_evidence": "Pinned Microsoft VC90 secure helpers validate NULL/zero capacity first, clear the first unit, then check minimum capacity before radix. Insufficient capacity retains the reversed digit prefix written before overflow, clears the first unit, invokes the invalid-parameter path with ERANGE and returns ERANGE. Only valid plain radices have a documented contract; out-of-contract radices are rejected through the validation profile."
+  },
+  "runtime_diagnostics": {
+    "abort_header": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+    "abort_header_sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/abort",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/amsg-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    ],
+    "internal_abi": "Native Microsoft VC90 establishes void cdecl _amsg_exit(int) from its parameter load and immediate exit status 255. _crt_debugger_hook is void cdecl(int), established by its callers; the body clears an unexported debugger word without reading the input. No Windows native execution is claimed.",
+    "environment": "No debugger or console is attached. The debugger hook has no recipient. Default abort exits with status 3; runtime errors exit with status 255. Both use the existing Windows process owner without draining CRT atexit callbacks; C++ termination shares the abort body."
+  },
+  "signals": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/signal.h",
+        "sha256": "3ba6c4e39e0996dcb9161b99e3baeb39ca7670beb93c8e63312fed1754e64997"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/float.h",
+        "sha256": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_startup.h",
+        "sha256": "2e2e27515bfe462435f5222022e5afdc84a50f093f87ade27db8afcaea202cb7"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/raise",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fpecode",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/pxcptinfoptrs"
+    ],
+    "ownership": "Process signal slots live in the existing CRT module owner; SIGILL/SIGFPE/SIGSEGV retain per-thread native exception-table entries. errno, DOS errno, fpecode and exception pointers share one existing module/thread guest allocation and detach lifetime. No external console events are possible in the configured no-console profile.",
+    "native_evidence": "Pinned Microsoft VC90 establishes SIG_GET queries, SIGABRT 6/22 sharing (while raise retains the original callback argument), process/thread split, pre-call handler reset, explicit FP reason 0x8c, pointer/FPE save-and-restore, and exact fault status mapping. PTD allocation starts zeroed, and its initializer does not change fpecode. Native VC80/VC90/UCRT reserved POSIX numbers 1/3/13/16/17 fail without changing errno. VC80/VC90 invoke invalid-parameter handling for other signal errors; UCRT signal only assigns EINVAL, while its raise invokes validation. Version parameters retain that difference. No native Windows execution is claimed.",
+    "filters": "Legacy _XcptFilter searches ten pinned native fault entries, returns search for default/unknown, continue-execution for ignored/handled and execute-handler for the internal one-shot die action. __CppXcptFilter first rejects non-C++ statuses, then shares this table; the C++ code itself is absent and therefore returns search. No unconditional successful exception handling is fabricated. UCRT _seh_filter_exe uses twelve entries, adding SSE multiple faults/traps with reasons 0x8e/0x8d; _seh_filter_dll retains C++-only gating. The pinned Microsoft UCRT binary establishes both additions."
+  },
+  "termination_families": {
+    "headers": {
+      "stdlib.h": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+      "process.h": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
+      "corecrt_startup.h": "2e2e27515bfe462435f5222022e5afdc84a50f093f87ade27db8afcaea202cb7"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cexit-c-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/exit-exit-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/quick-exit",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e"
+    ],
+    "projection": "Catalog-filtered x86 cdecl declarations select existing shared callback/initializer implementations across all CRT versions. _Exit shares _exit. UCRT _crt_at_quick_exit/quick_exit retain a separate table in the existing module owner, using the same heap and lock as ordinary callbacks; API-set aliases share UCRT state.",
+    "cleanup": "Full exit/_cexit closes only streams owned by the current CRT after draining callbacks; all currently modeled writes already reach the existing NT owner immediately. _c_exit returns without callbacks or stream flushing/closing. Quick exit drains only its own array and terminates without flushing streams. Process teardown releases both arrays without executing leftover callbacks.",
+    "native_evidence": "Pinned Microsoft VC90 confirms ascending initializer traversal with NULL entries skipped and _initterm_e stopping at the first nonzero result. Documented termination behavior supplies the ordinary/quick distinctions; no native Windows execution is claimed."
+  },
+  "string_edits": {
+    "headers": {
+      "string.h": "796b2226809790078984b919542d818ce74190d2110b119f93c2a7c3882b5de5",
+      "corecrt_wstring.h": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strrev-wcsrev-mbsrev-mbsrev-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strset-wcsset-mbsset-mbsset-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnset-wcsnset-mbsnset-mbsnset-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strset-s-strset-s-l-wcsset-s-wcsset-s-l-mbsset-s-mbsset-s-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnset-s-strnset-s-l-wcsnset-s-wcsnset-s-l-mbsnset-s-mbsnset-s-l"
+    ],
+    "behavior": "Byte/UTF-16 operations use raw code units and return the original destination. Secure forms incrementally replace at most capacity-1 units, validate the original remaining terminator even after count exhaustion or a zero replacement, then clear only the first unit and report EINVAL if the original string was unterminated. A bounded secure NULL/zero/zero request succeeds; other NULL/zero-capacity inputs validate before touching memory.",
+    "native_evidence": "Pinned Microsoft VC90 byte/wide set routines establish access order, partial modification, EINVAL and the zero-count exception. Pinned UCRT _o_ wrappers establish identical outer x86 cdecl contracts and select the configured single-application global state. No machine code is copied and no native Windows execution is claimed."
+  },
+  "file_mutations": {
+    "headers": {
+      "stdio.h": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+      "io.h": "fedd480bc429a85abb122962c158cbc5b2f117c3c0ca628db2934ca68f2ee1c1",
+      "corecrt_wio.h": "e6a08ad4c75ef96fd5fafcff334048c4cc610f990f39c15e07c03af14d607197",
+      "corecrt_wstdio.h": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/remove-wremove",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/rename-wrename",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/unlink-wunlink"
+    ],
+    "native_evidence": "Pinned Microsoft VC90 remove/_unlink and wide aliases call DeleteFileA/W; rename calls MoveFileA/W. UCRT wide rename uses MoveFileExW with COPY_ALLOWED. Legacy wrappers test GetLastError itself after false; UCRT preserves failure even when a replacement provider leaves error zero. Native _dosmaperr is cdecl void(unsigned long), writes DOS errno then errno and preserves LastError; its 45-entry first-match table precedes the access-denied and executable-format fallback ranges. No native Windows execution is claimed. UCRT narrow paths convert using the filename code page before the wide call, preserve NULL arguments, and reject malformed multibyte sequences with DOS error 1113/EILSEQ. Its sorted table removes the duplicate handle row and adds this Unicode translation mapping. Narrow rename allocates/converts the source before inspecting the destination, with reverse-order cleanup; this preserves allocation failure precedence over malformed later paths.",
+    "ownership": "All cataloged fronts use the live Windows file entries and existing VFS/native handle owner. UCRT narrow paths use checked conversion through the existing codec, with transient guest buffers allocated/freed through the existing RTL heap boundary. API sets and _o_ wrappers share UCRT state."
+  },
+  "legacy_stdio_data": {
+    "abi": "_iob is twenty 32-byte x86 FILE objects. Offsets are ptr 0, count 4, base 8, flag 12, file 16, charbuf 20, bufsiz 24 and temporary name 28. Byte-array storage in the ABI input records the complete 640-byte extent, with no function calling convention.",
+    "native_evidence": "Pinned Microsoft VC80/VC90 PE data agrees on stdin flags 0x101, a 4096-byte static input buffer, stdout/stderr flags 2 and zeroed remaining objects. VC90 startup walks twenty entries at stride 32, then replaces each standard descriptor with -2 when its OS handle is zero, -1 or -2. Its iob getter returns the actual static array. No native Windows execution is claimed.",
+    "ownership": "Legacy version profiles select the shared FILE layout. The existing guest heap backs each real input buffer with process detach cleanup; writable arrays belong to their synthetic PE data sections. Getters activate only their own DLL and return its original data address, retaining guest modifications. No console or output handle is fabricated.",
+    "modern_scope": "UCRT does not gain a legacy _iob array or legacy getters. Its opaque FILE layout and __acrt_iob_func remain separate work."
+  },
+  "clock_timeb": {
+    "headers": {
+      "sys/timeb.h": "31a7314070ca5bf1992bf714df015a47e55cb564c9248d4e9eb2ad7c9fb43209",
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/clock",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftime-ftime32-ftime64",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftime-s-ftime32-s-ftime64-s"
+    ],
+    "clock": "Milliseconds from the existing process clock epoch, independently of host CPU consumption. Pinned VC90 returns the low 32 bits of elapsed milliseconds; UCRT rejects results above signed clock_t maximum. Profiles retain this difference without changing errno or LastError.",
+    "timeb": "x86 timeb32/timeb64 store 4/8-byte seconds followed by millitm, minutes west of UTC and DST shorts. The current fixed-offset Windows timezone supplies the bias and zero DST. Native routines preserve tail padding and write timezone, DST, milliseconds, then time; timeb32 stores the low DWORD rather than rejecting wraparound.",
+    "native_evidence": "Pinned Microsoft VC80/VC90/UCRT establish declarations, field offsets, NULL validation, low-word timeb32 output and clock overflow policy. Native void ftime wrappers share the secure bodies. The existing process clock epoch supplies initialization time for this personality; no native Windows execution is claimed."
+  },
+  "calendar_normalization": {
+    "header": {
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mktime-mktime32-mktime64",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkgmtime-mkgmtime32-mkgmtime64"
+    ],
+    "native_evidence": "Pinned Microsoft VC80/VC90 and UCRT establish cdecl one-pointer arguments, signed EDX:EAX time64 results, year-first validation, observable tm_mon normalization before later failure and ascending nine-DWORD publication. Time32 validates each signed intermediate before later fields can cancel overflow. NULL follows the version validation policy; range errors set EINVAL without invoking its handler. No native Windows execution is claimed.",
+    "limits": "VC90 input tm_year is 69..1101 for time64, UCRT 69..1102; time32 accepts 69..139. Internal UTC helpers accept -43200 seconds. Pinned VC90 UTC/local maxima are 32535291599/32535244799, and UCRT 32536850399/32536799999; these native margins are retained separately from documented ordinary dates. Legacy profiles use the VC90 limits.",
+    "ownership": "Uses the existing Windows Gregorian conversion and fixed-offset timezone, sharing calendar decomposition with time64. Automatic DST stays zero; an explicit positive local tm_isdst applies the native default negative 3600-second daylight bias, then recomputes the calendar. UTC ignores input DST. There is no host timezone or second time owner."
   }
 }

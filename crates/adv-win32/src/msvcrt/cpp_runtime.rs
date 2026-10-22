@@ -132,7 +132,7 @@ pub(super) fn terminate_for(env: &mut Env<'_>, owner: &str) -> Outcome {
 }
 
 fn abort(env: &mut Env<'_>) -> Outcome {
-    crate::kernel32::exit_process(env, 3)
+    diagnostics::abort(env)
 }
 
 fn unexpected(env: &mut Env<'_>) -> Outcome {

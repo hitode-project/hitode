@@ -36,6 +36,7 @@ pub(super) fn open(
     share: u32,
     then: OpenDone,
 ) -> Outcome {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module).to_owned();
     let first = mode.as_bytes().first().copied();
     let update = mode.contains('+');
     let (access, disposition) = match first {
@@ -84,6 +85,7 @@ pub(super) fn open(
                     env.ext.get_or_default::<CrtState>().files.insert(
                         pointer,
                         CrtFile {
+                            module,
                             handle,
                             binary,
                             append,
@@ -119,6 +121,36 @@ pub(super) fn close(env: &mut Env<'_>, stream: u32, then: operations::Done<()>) 
         Box::new(move |env, result| {
             env.ext.get_mut::<CrtState>().files.remove(&stream);
             crate::native_heap::free_then(env, stream, Box::new(move |env, _| then(env, result)))
+        }),
+    )
+}
+
+/// Full CRT termination closes only streams owned by that runtime. All writes
+/// currently reach the NT owner immediately; close also retires read-ahead.
+pub(super) fn close_module(env: &mut Env<'_>, module: &str, then: operations::Done<()>) -> Outcome {
+    let stream = env.ext.try_get::<CrtState>().and_then(|state| {
+        state
+            .files
+            .iter()
+            .filter(|(_, file)| file.module == module)
+            .map(|(&stream, _)| stream)
+            .min()
+    });
+    let Some(stream) = stream else {
+        return then(env, Ok(()));
+    };
+    let module = module.to_owned();
+    close(
+        env,
+        stream,
+        Box::new(move |env, result| {
+            if let Err(status) = result {
+                match error(env, status, 0) {
+                    Outcome::Return(_) => {}
+                    fault => return fault,
+                }
+            }
+            close_module(env, &module, then)
         }),
     )
 }
