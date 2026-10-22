@@ -86,6 +86,12 @@ fn prepare(
                 }
             }
         }
+        image.alpha =
+            if source.depth == 32 && image.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0) {
+                SpriteAlpha::Premultiplied
+            } else {
+                SpriteAlpha::Ignore
+            };
         images.push(image);
     }
     Ok(images)

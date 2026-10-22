@@ -144,6 +144,21 @@ fn ellipse(env: &mut Env<'_>, dc: Handle, left: i32, top: i32, right: i32, botto
     paint_rectangles(env, dc, Paint::Color(word(12)), &wide(&outline), api)
 }
 
+pub(crate) fn solid_brush(env: &Env<'_>, brush: u32) -> Result<Option<u32>, u32> {
+    match brush.checked_sub(stock_object(0)) {
+        Some(0) => Ok(Some(0xffffff)),
+        Some(1) => Ok(Some(0xc0c0c0)),
+        Some(2) => Ok(Some(0x808080)),
+        Some(3) => Ok(Some(0x404040)),
+        Some(4) => Ok(Some(0)),
+        Some(5) => Ok(None),
+        _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush) {
+            Some(GdiObj::Brush { color }) => Ok(Some(*color)),
+            _ => Err(6),
+        },
+    }
+}
+
 /// What fills the rectangles: a brush, or a COLORREF such as a pen's.
 #[derive(Clone, Copy)]
 pub(crate) enum Paint {
@@ -178,17 +193,10 @@ pub(crate) fn paint_rectangles(
     let (target, palette, clip, modes) = (selected[3], *palette, clip.clone(), *modes);
     let color = match paint {
         Paint::Color(color) => color,
-        Paint::Brush(brush) => match brush.0.checked_sub(stock_object(0)) {
-            Some(0) => 0xffffff,
-            Some(1) => 0xc0c0c0,
-            Some(2) => 0x808080,
-            Some(3) => 0x404040,
-            Some(4) => 0,
-            Some(5) => return Outcome::Return(1),
-            _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush.0) {
-                Some(GdiObj::Brush { color }) => *color,
-                _ => return fail(env, 6),
-            },
+        Paint::Brush(brush) => match solid_brush(env, brush.0) {
+            Ok(Some(color)) => color,
+            Ok(None) => return Outcome::Return(1),
+            Err(error) => return fail(env, error),
         },
     };
     let rgb = match color >> 24 {

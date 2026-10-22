@@ -12,6 +12,8 @@ struct UserObject {
 /// Extracted icon pixels remain owned by the same USER object DestroyIcon closes.
 /// The AND mask is retained separately so monochrome XOR pixels are not lost.
 pub(crate) struct IconImage {
+    pub alpha: bool,
+    pub monochrome: bool,
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
@@ -134,6 +136,8 @@ impl UserObjects {
             .as_ref()
             .map(|image| -> Result<IconImage, u32> {
                 Ok(IconImage {
+                    alpha: image.alpha,
+                    monochrome: image.monochrome,
                     width: image.width,
                     height: image.height,
                     pixels: copy_bytes(&image.pixels)?,

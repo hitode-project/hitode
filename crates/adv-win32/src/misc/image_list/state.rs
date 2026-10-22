@@ -75,7 +75,11 @@ pub(super) fn blank(width: u32, height: u32, mask: bool) -> Result<Image, ()> {
     } else {
         None
     };
-    Ok(Image { rgba, mask })
+    Ok(Image {
+        alpha: SpriteAlpha::Ignore,
+        rgba,
+        mask,
+    })
 }
 #[win32(comctl32, name = "ImageList_SetImageCount", level = state)]
 fn set_count(env: &mut Env<'_>, handle: i32, count: u32) -> i32 {
@@ -143,6 +147,7 @@ fn duplicate(env: &mut Env<'_>, handle: i32) -> i32 {
             .map_err(|_| ())?;
         for image in &source.images {
             images.push(Image {
+                alpha: image.alpha,
                 rgba: copy_bytes(&image.rgba)?,
                 mask: image.mask.as_deref().map(copy_bytes).transpose()?,
             });

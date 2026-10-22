@@ -162,7 +162,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-IMAGE-12 Image list storage
 
-**Rule**: Image list duplication MUST copy independent pixels, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
+**Rule**: Image list duplication MUST copy independent pixels, alpha modes, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
 **Verification**: Test
 **Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
 
@@ -177,6 +177,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Bitmap strips MUST append independent RGBA and mask snapshots through shared GDI bitmap storage and palettes. Replacement MUST preserve list dimensions and all other images. Color-key insertion MUST derive transparency from the specified or upper-left palette color without consuming source handles.
 **Verification**: Test
 **Basis**: Microsoft ImageList_Add, ImageList_AddMasked and ImageList_Replace contracts.
+
+### DEV-IMAGE-15 Icon and image list raster output
+
+**Rule**: Icon and image list drawing MUST apply packed AND/XOR masks or premultiplied source-over through shared surfaces, mappings and clipping. Icon extraction MUST preserve independent pixels and monochrome double-height mask layout. Invalid destination storage MUST preserve pixels and damage versions.
+**Verification**: Test
+**Basis**: [DrawIconEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-drawiconex), [ICONINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-iconinfo), Microsoft ImageList_Draw and ImageList_GetIcon contracts.
 
 ## Audio ownership
 

@@ -13,6 +13,7 @@ mod dib;
 pub(crate) mod fill;
 pub mod front;
 mod set_dib;
+pub(crate) mod sprite;
 pub use front::{DrawingProvider, install, register, set_provider};
 
 pub mod api {
