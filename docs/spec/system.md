@@ -181,9 +181,9 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 ### SYS-REG-1 Shared registry entry points
 
-**Rule**: Legacy, extended, and native registry entry points MUST share keys, names, access checks and deleted-handle state. Enumeration MUST use stored spellings and bounded output buffers.
+**Rule**: Legacy, extended, and native registry entry points MUST share keys, names, access checks and deleted-handle state. Enumeration MUST use stored spellings and bounded output buffers. Shell value queries MUST reuse registry encoding and size negotiation.
 **Verification**: Test
-**Basis**: Microsoft RegEnumKey, RegDeleteKeyEx and NtOpenKey contracts.
+**Basis**: Microsoft RegEnumKey, RegDeleteKeyEx, NtOpenKey and SHGetValue contracts.
 
 ### SYS-STR-1 Counted RTL conversion
 

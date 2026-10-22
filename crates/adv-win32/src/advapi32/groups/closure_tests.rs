@@ -16,7 +16,9 @@ enum Arg {
 }
 use Arg::{I, L};
 fn call<B: Backend>(m: &mut Machine<B>, code: &mut Asm, name: &str, args: &[Arg], row: u32) {
-    let module = if name.starts_with("Nt") {
+    let module = if name == "SHGetValueA" {
+        "shlwapi.dll"
+    } else if name.starts_with("Nt") {
         "ntdll.dll"
     } else {
         "advapi32.dll"
@@ -286,4 +288,181 @@ fn legacy_names_and_extended_deletion_share_a_w_nt_owners_on_three_backends() {
         shared(cpu);
     }
     shared(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn shell_values<B: Backend>(cpu: B) {
+    let mut registry = Registry::default();
+    crate::register(&mut registry);
+    let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    Win32::install(
+        &mut m,
+        crate::Win32Config::new(".", "fixture.exe", "target/shell-registry-closure-tests"),
+    )
+    .unwrap();
+    m.ext.insert(VirtualRegistry::default());
+    m.cpu.map(CODE, 8192, Prot::RX).unwrap();
+    m.cpu.map(DATA, 8192, Prot::RW).unwrap();
+    const KEY: u32 = DATA + 0x800;
+    const LIMITED: u32 = KEY + 4;
+    const PATH: u32 = DATA + 0x1000;
+    const TEXT: u32 = PATH + 128;
+    const MISSING: u32 = TEXT + 64;
+    const OUT: u32 = DATA + 0x1400;
+    m.cpu.write(PATH, b"AuthoredShellRegistry\0").unwrap();
+    m.cpu.write(TEXT, &[0x42, 0x30, 0, 0]).unwrap();
+    m.cpu.write(MISSING, b"missing\0").unwrap();
+    m.cpu.write(OUT, &[0xcd; 256]).unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(0x12345678)
+        .call(m.resolve_import("kernel32.dll", "SetLastError").unwrap());
+    call(
+        &mut m,
+        &mut code,
+        "RegCreateKeyExA",
+        &[
+            I(0x80000001),
+            I(PATH),
+            I(0),
+            I(0),
+            I(0),
+            I(0xf003f),
+            I(0),
+            I(KEY),
+            I(0),
+        ],
+        DATA,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "RegSetValueExW",
+        &[L(KEY), I(0), I(0), I(1), I(TEXT), I(4)],
+        DATA + 4,
+    );
+    code.mov_mem_imm(OUT, 0);
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[I(0x80000001), I(PATH), I(0), I(OUT + 4), I(OUT + 8), I(OUT)],
+        DATA + 8,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[I(0x80000001), I(PATH), I(0), I(OUT + 16), I(0), I(OUT + 12)],
+        DATA + 12,
+    );
+    code.mov_mem_imm(OUT + 24, 3);
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[
+            I(0x80000001),
+            I(PATH),
+            I(0),
+            I(OUT + 28),
+            I(OUT + 32),
+            I(OUT + 24),
+        ],
+        DATA + 16,
+    );
+    code.mov_mem_imm(OUT + 48, 3);
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[L(KEY), I(0), I(0), I(0), I(OUT + 52), I(OUT + 48)],
+        DATA + 20,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[
+            L(KEY),
+            I(0),
+            I(MISSING),
+            I(OUT + 64),
+            I(OUT + 68),
+            I(OUT + 72),
+        ],
+        DATA + 24,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "RegOpenKeyExA",
+        &[I(0x80000001), I(PATH), I(0), I(2), I(LIMITED)],
+        DATA + 28,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "SHGetValueA",
+        &[L(LIMITED), I(0), I(0), I(OUT + 80), I(0), I(OUT + 84)],
+        DATA + 32,
+    );
+    call(&mut m, &mut code, "RegCloseKey", &[L(LIMITED)], DATA + 36);
+    call(&mut m, &mut code, "RegCloseKey", &[L(KEY)], DATA + 40);
+    code.call(m.resolve_import("kernel32.dll", "GetLastError").unwrap())
+        .mov_mem_eax(DATA + 44)
+        .mov_mem_imm(DATA + 48, 0)
+        .mov_eax_mem(DATA + 48)
+        .ret();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.spawn("Shell shared registry values", CODE, &[], 65536)
+        .unwrap();
+    let result = m.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    for (row, value) in [0, 0, 234, 0, 0, 0, 2, 0, 5, 0, 0, 0x12345678]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            m.cpu.read_u32(DATA + row as u32 * 4).unwrap(),
+            value,
+            "shell registry result {row}"
+        );
+    }
+    for (offset, value) in [
+        (0, 3),
+        (4, 1),
+        (8, 0xcdcdcdcd),
+        (12, 3),
+        (16, 1),
+        (24, 3),
+        (28, 1),
+        (64, 0xcdcdcdcd),
+        (72, 0xcdcdcdcd),
+        (80, 0xcdcdcdcd),
+        (84, 0xcdcdcdcd),
+    ] {
+        assert_eq!(
+            m.cpu.read_u32(OUT + offset).unwrap(),
+            value,
+            "shell registry output {offset}"
+        );
+    }
+    for offset in [32, 52] {
+        let mut bytes = [0; 3];
+        m.cpu.read(OUT + offset, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x82, 0xa0, 0]);
+    }
+    assert_eq!(
+        m.ext.get::<VirtualRegistry>().handle_count(&m.sys.objects),
+        0
+    );
+}
+#[test]
+// spec: SYS-REG-1
+fn shell_value_queries_share_registry_access_sizes_and_ansi_encoding_on_three_backends() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        shell_values(cpu);
+    }
+    shell_values(UnicornCpu::new(PARK_ADDR).unwrap());
 }
