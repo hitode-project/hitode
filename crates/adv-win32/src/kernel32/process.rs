@@ -16,6 +16,7 @@ pub(crate) mod native_thread;
 mod parameters;
 mod pointer;
 mod processor;
+mod queries;
 #[cfg(test)]
 mod tests;
 mod thread_context;
@@ -1000,6 +1001,7 @@ fn get_process_version(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    queries::register(reg);
     error_mode::register(reg);
     pointer::register(reg);
     reg.register(get_console_window_ABI);

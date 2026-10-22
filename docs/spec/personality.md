@@ -336,3 +336,9 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Modified native file entries MUST control profile opens, writes, truncation and closes. Failed writes MUST NOT truncate the file. Temporary native handles and guest scratch MUST be released after synchronous completion.
 **Verification**: Test
+
+### PERS-CORE-1 Win7 local feature queries
+
+**Rule**: GetTickCount64 MUST retain the shared clock's full millisecond count. Legacy processor topology MUST derive from the same single-processor profile as its Ex counterpart. String probes MUST check guest readability, and the native x86 profile MUST report WOW64 directories unavailable without modifying output.
+**Verification**: Test
+**Basis**: Microsoft GetTickCount64, GetLogicalProcessorInformation, IsBadStringPtr and GetSystemWow64Directory contracts.
