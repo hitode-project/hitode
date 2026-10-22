@@ -29,6 +29,7 @@ mod integer_format;
 mod intrinsic_math;
 mod legacy_stdio;
 mod locale;
+mod make_time;
 mod mbcs;
 mod memory_ops;
 mod modern_stdio;
@@ -175,6 +176,7 @@ pub fn register(r: &mut Registry) {
     integer_format::register(r);
     time64::register(r);
     time_packet::register(r);
+    make_time::register(r);
     random::register(r);
     scalar_float::register(r);
     scalar_log::register(r);

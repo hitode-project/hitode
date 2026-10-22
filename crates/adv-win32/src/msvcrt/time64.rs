@@ -107,12 +107,21 @@ pub(super) fn convert(env: &mut Env<'_>, input: u32, wide: bool, local: bool) ->
     } else {
         0
     };
-    let seconds = seconds + offset;
+    let tm = calendar(seconds + offset);
+    // tm_isdst=0 belongs to the existing fixed-offset virtual timezone. No CRT
+    // TZ environment/DST database or host local calendar is claimed here.
+    match output.write(env.cpu, tm) {
+        Ok(()) => Outcome::Return(output.addr()),
+        Err(error) => memory_failure(error),
+    }
+}
+
+pub(super) fn calendar(seconds: i64) -> [i32; 9] {
     let days = seconds.div_euclid(86_400);
     let day_seconds = seconds.rem_euclid(86_400);
     let (year, month, day) = crate::kernel32::civil_from_days(days);
     let year_day = days - crate::kernel32::days_from_civil(year, 1, 1);
-    let tm = [
+    [
         (day_seconds % 60) as i32,
         (day_seconds / 60 % 60) as i32,
         (day_seconds / 3600) as i32,
@@ -122,13 +131,7 @@ pub(super) fn convert(env: &mut Env<'_>, input: u32, wide: bool, local: bool) ->
         (days + 4).rem_euclid(7) as i32,
         year_day as i32,
         0,
-    ];
-    // tm_isdst=0 belongs to the existing fixed-offset virtual timezone. No CRT
-    // TZ environment/DST database or host local calendar is claimed here.
-    match output.write(env.cpu, tm) {
-        Ok(()) => Outcome::Return(output.addr()),
-        Err(error) => memory_failure(error),
-    }
+    ]
 }
 
 #[win32(msvcrt, name = "_time64", level = implement)]

@@ -368,11 +368,21 @@ public static class AbiMetadata
                     && f[4] == (secure ? "errno_t" : unit + "*") && f[5] == parameters;
                 if (!crtIntegerOutput) throw new InvalidDataException("CRT integer formatting stack contract changed: " + row);
             }
+            string makeTimeName = f.Length == 6 && f[1].StartsWith("_o_") ? f[1][3..] : (f.Length == 6 ? f[1] : "");
+            bool crtMakeTimeName = new[] { "mktime", "_mktime32", "_mktime64", "_mkgmtime", "_mkgmtime32", "_mkgmtime64" }.Contains(makeTimeName);
+            bool crtMakeTime = false;
+            if (crtMakeTimeName)
+            {
+                bool wide = makeTimeName.EndsWith("64");
+                crtMakeTime = f[2] == "cdecl" && f[3] == (wide ? "i64" : "i32")
+                    && f[4] == (wide ? "__time64_t" : "__time32_t") && f[5] == "time:struct tm*:ptr:1";
+                if (!crtMakeTime) throw new InvalidDataException("CRT calendar stack contract changed: " + row);
+            }
             bool crtDataArray = f.Length == 6 && f[2] == "data" && f[3] == "aggregate"
                 && ByteArrayStorage(f[4]) && f[5].Length == 0;
             bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
                 && f[4] == "double" && f[5].Length == 0;
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtInteger && !crtDataDouble && !crtDataArray && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtMakeTime && !crtInteger && !crtDataDouble && !crtDataArray && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

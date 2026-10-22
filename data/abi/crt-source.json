@@ -799,5 +799,17 @@
     "clock": "Milliseconds from the existing process clock epoch, independently of host CPU consumption. Pinned VC90 returns the low 32 bits of elapsed milliseconds; UCRT rejects results above signed clock_t maximum. Profiles retain this difference without changing errno or LastError.",
     "timeb": "x86 timeb32/timeb64 store 4/8-byte seconds followed by millitm, minutes west of UTC and DST shorts. The current fixed-offset Windows timezone supplies the bias and zero DST. Native routines preserve tail padding and write timezone, DST, milliseconds, then time; timeb32 stores the low DWORD rather than rejecting wraparound.",
     "native_evidence": "Pinned Microsoft VC80/VC90/UCRT establish declarations, field offsets, NULL validation, low-word timeb32 output and clock overflow policy. Native void ftime wrappers share the secure bodies. The existing process clock epoch supplies initialization time for this personality; no native Windows execution is claimed."
+  },
+  "calendar_normalization": {
+    "header": {
+      "time.h": "153b6f7fe5f847dea9e586bda3de786118bff9afbd3b710cac4ae5c0023ae5c0"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mktime-mktime32-mktime64",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkgmtime-mkgmtime32-mkgmtime64"
+    ],
+    "native_evidence": "Pinned Microsoft VC80/VC90 and UCRT establish cdecl one-pointer arguments, signed EDX:EAX time64 results, year-first validation, observable tm_mon normalization before later failure and ascending nine-DWORD publication. Time32 validates each signed intermediate before later fields can cancel overflow. NULL follows the version validation policy; range errors set EINVAL without invoking its handler. No native Windows execution is claimed.",
+    "limits": "VC90 input tm_year is 69..1101 for time64, UCRT 69..1102; time32 accepts 69..139. Internal UTC helpers accept -43200 seconds. Pinned VC90 UTC/local maxima are 32535291599/32535244799, and UCRT 32536850399/32536799999; these native margins are retained separately from documented ordinary dates. Legacy profiles use the VC90 limits.",
+    "ownership": "Uses the existing Windows Gregorian conversion and fixed-offset timezone, sharing calendar decomposition with time64. Automatic DST stays zero; an explicit positive local tm_isdst applies the native default negative 3600-second daylight bias, then recomputes the calendar. UTC ignores input DST. There is no host timezone or second time owner."
   }
 }

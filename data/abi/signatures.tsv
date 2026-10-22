@@ -811,6 +811,10 @@ api-ms-win-crt-time-l1-1-0.dll	_ftime32	cdecl	void	void	output:struct __timeb32*
 api-ms-win-crt-time-l1-1-0.dll	_ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
 api-ms-win-crt-time-l1-1-0.dll	_ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
 api-ms-win-crt-time-l1-1-0.dll	_ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+api-ms-win-crt-time-l1-1-0.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 api-ms-win-crt-time-l1-1-0.dll	clock	cdecl	i32	clock_t	
 avifil32.dll	AVIBuildFilterA	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PSTR:str8:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIBuildFilterW	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PWSTR:str16:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
@@ -4747,6 +4751,10 @@ msvcr100.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1
 msvcr100.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr100.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr100.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr100.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr100.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr100.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr100.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr100.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr100.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
 msvcr100.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -4960,6 +4968,10 @@ msvcr110.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1
 msvcr110.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr110.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr110.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr110.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr110.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr110.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr110.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr110.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr110.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
 msvcr110.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -5173,6 +5185,10 @@ msvcr120.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1
 msvcr120.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr120.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr120.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr120.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr120.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr120.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr120.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr120.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr120.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
 msvcr120.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -5364,6 +5380,7 @@ msvcr70.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|
 msvcr70.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr70.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr70.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr70.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr70.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr70.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
 msvcr70.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -5431,6 +5448,7 @@ msvcr70.dll	exit	cdecl	void	void	status:int:i32:1
 msvcr70.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr70.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr70.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr70.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
 msvcr70.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr70.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcr70.dll	remove	cdecl	i32	int	path:const char*:str8:1
@@ -5536,6 +5554,7 @@ msvcr71.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1|
 msvcr71.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr71.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr71.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+msvcr71.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr71.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr71.dll	_onexit	cdecl	ptr	_onexit_t	callback:_onexit_t:ptr:1
 msvcr71.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -5604,6 +5623,7 @@ msvcr71.dll	exit	cdecl	void	void	status:int:i32:1
 msvcr71.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr71.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr71.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr71.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
 msvcr71.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr71.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcr71.dll	remove	cdecl	i32	int	path:const char*:str8:1
@@ -5763,6 +5783,10 @@ msvcr80.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:siz
 msvcr80.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr80.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr80.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr80.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr80.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr80.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcr80.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -6059,6 +6083,10 @@ msvcr90.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:siz
 msvcr90.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcr90.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr90.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcr90.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcr90.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcr90.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcr90.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -6339,6 +6367,10 @@ msvcrt.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 msvcrt.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
 msvcrt.dll	_memicmp	cdecl	i32	int	left:const void*:ptr:1|right:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	_mkgmtime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+msvcrt.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+msvcrt.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 msvcrt.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcrt.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -6443,6 +6475,7 @@ msvcrt.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcrt.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
 msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
 msvcrt.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
@@ -6606,6 +6639,7 @@ msvcrt20.dll	exit	cdecl	void	void	status:int:i32:1
 msvcrt20.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcrt20.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt20.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt20.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
 msvcrt20.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt20.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcrt20.dll	remove	cdecl	i32	int	path:const char*:str8:1
@@ -6758,6 +6792,7 @@ msvcrt40.dll	exit	cdecl	void	void	status:int:i32:1
 msvcrt40.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcrt40.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt40.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt40.dll	mktime	cdecl	i32	__time32_t	time:struct tm*:ptr:1
 msvcrt40.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt40.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcrt40.dll	remove	cdecl	i32	int	path:const char*:str8:1
@@ -9696,12 +9731,20 @@ ucrtbase.dll	_mbsnbcpy	cdecl	ptr	unsigned char*	destination:unsigned char*:ptr:1
 ucrtbase.dll	_mbsnccnt	cdecl	u32	size_t	text:const unsigned char*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	_mbsnextc	cdecl	u32	unsigned int	text:const unsigned char*:ptr:1
 ucrtbase.dll	_mbsninc	cdecl	ptr	unsigned char*	text:const unsigned char*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	_mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 ucrtbase.dll	_msize	cdecl	u32	size_t	pointer:void*:ptr:1
 ucrtbase.dll	_o__ftime32	cdecl	void	void	output:struct __timeb32*:ptr:1
 ucrtbase.dll	_o__ftime32_s	cdecl	i32	errno_t	output:struct __timeb32*:ptr:1
 ucrtbase.dll	_o__ftime64	cdecl	void	void	output:struct __timeb64*:ptr:1
 ucrtbase.dll	_o__ftime64_s	cdecl	i32	errno_t	output:struct __timeb64*:ptr:1
 ucrtbase.dll	_o__get_terminate	cdecl	ptr	callback	
+ucrtbase.dll	_o__mkgmtime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mkgmtime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mktime32	cdecl	i32	__time32_t	time:struct tm*:ptr:1
+ucrtbase.dll	_o__mktime64	cdecl	i64	__time64_t	time:struct tm*:ptr:1
 ucrtbase.dll	_o__purecall	cdecl	i32	int	
 ucrtbase.dll	_o__strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
 ucrtbase.dll	_o__strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1

@@ -72,4 +72,7 @@ Reject-Change 'array-negative' "msvcr90.dll`t_iob" 4 'u8[-1]' 'Invalid supplemen
 Reject-Change 'array-nondecimal' "msvcr90.dll`t_iob" 4 'u8[0x280]' 'Invalid supplemental x86 signature'
 Reject-Change 'array-result' "msvcr90.dll`t_iob" 3 'f64' 'Invalid supplemental x86 signature'
 Reject-Change 'array-arguments' "msvcr90.dll`t_iob" 5 'value:int:i32:1' 'Invalid supplemental x86 signature'
-Write-Output 'CRT inputs: reproducible generation and twenty-eight malformed process/math/throw/jump/data/integer/array contracts verified.'
+Reject-Change 'calendar-result' "msvcr80.dll`t_mktime64" 3 'i32' 'calendar stack contract'
+Reject-Change 'calendar-convention' "ucrtbase.dll`t_mkgmtime32" 2 'stdcall' 'calendar stack contract'
+Reject-Change 'calendar-input' "ucrtbase.dll`t_o__mktime64" 5 'time:struct tm*:ptr:2' 'calendar stack contract'
+Write-Output 'CRT inputs: reproducible generation and thirty-one malformed process/math/throw/jump/data/integer/array/calendar contracts verified.'

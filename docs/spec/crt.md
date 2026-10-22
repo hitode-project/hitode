@@ -141,4 +141,9 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: CRT clock ticks MUST measure elapsed milliseconds from the process clock epoch and preserve error cells. Version profiles MUST retain legacy 32-bit wrapping and UCRT failure beyond the signed clock range.
 **Verification**: Test
 
+### CRT-LIB-28 Calendar normalization
+
+**Rule**: Cataloged mktime and UTC variants MUST share Windows Gregorian conversion and the existing fixed timezone, retaining x86 result widths and versioned calendar limits. Month normalization MUST remain visible after later failure, while range errors MUST set EINVAL without invoking parameter handlers. Conversion MUST check time32 intermediate overflow and publish successful normalized fields in ascending order, preserving earlier writes on later faults.
+**Verification**: Test
+
 Withdrawn: none

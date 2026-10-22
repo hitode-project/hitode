@@ -17,7 +17,24 @@ pub(super) struct Profile {
     pub zero_file_error_success: bool,
     pub legacy_stdio: Option<StdioLayout>,
     pub clock_overflow_failure: bool,
+    pub calendar_limits: CalendarLimits,
 }
+#[derive(Clone, Copy)]
+pub(super) struct CalendarLimits {
+    pub input_year_max: i64,
+    pub utc_max: i64,
+    pub local_max: i64,
+}
+const LEGACY_CALENDAR: CalendarLimits = CalendarLimits {
+    input_year_max: 1101,
+    utc_max: 32_535_291_599,
+    local_max: 32_535_244_799,
+};
+const UCRT_CALENDAR: CalendarLimits = CalendarLimits {
+    input_year_max: 1102,
+    utc_max: 32_536_850_399,
+    local_max: 32_536_799_999,
+};
 #[derive(Clone, Copy)]
 pub(super) struct StdioLayout {
     pub entry_bytes: u32,
@@ -42,6 +59,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcrt40.dll",
@@ -54,6 +72,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcrt.dll",
@@ -66,6 +85,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr70.dll",
@@ -78,6 +98,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr71.dll",
@@ -90,6 +111,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr80.dll",
@@ -102,6 +124,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr90.dll",
@@ -114,6 +137,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr100.dll",
@@ -126,6 +150,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr110.dll",
@@ -138,6 +163,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "msvcr120.dll",
@@ -150,6 +176,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: Some(LEGACY_STDIO),
         clock_overflow_failure: false,
+        calendar_limits: LEGACY_CALENDAR,
     },
     Profile {
         module: "ucrtbase.dll",
@@ -162,6 +189,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: false,
         legacy_stdio: None,
         clock_overflow_failure: true,
+        calendar_limits: UCRT_CALENDAR,
     },
     Profile {
         module: "vcruntime140.dll",
@@ -174,6 +202,7 @@ pub(super) const PROFILES: &[Profile] = &[
         zero_file_error_success: true,
         legacy_stdio: None,
         clock_overflow_failure: true,
+        calendar_limits: UCRT_CALENDAR,
     },
 ];
 

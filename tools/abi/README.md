@@ -388,3 +388,7 @@ The native VC80/VC90 layout and startup evidence are recorded in `crt-source.jso
 
 Clock/timeb fronts use the existing process clock and fixed Windows timezone, retaining x86 field widths and untouched structure padding.
 Native VC90/UCRT evidence selects clock overflow behavior and ordered packet writes; `crt_time_packet` covers version projections and protected fields in interpreter/JIT.
+
+Calendar normalization declarations come from SDK time.h, with signed time32/time64 results and one checked tm pointer.
+Pinned VC90/UCRT evidence in `crt-source.json` records intermediate month writes, overflow checks and native calendar margins.
+`crt_make_time` covers all projections, normalization, DST hints, invalid inputs and protected fields in interpreter/JIT.
