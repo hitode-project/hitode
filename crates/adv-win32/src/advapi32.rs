@@ -6,6 +6,7 @@ pub(crate) use crypto::digest::Digest;
 mod groups;
 mod identity;
 mod scm;
+mod security;
 pub(crate) mod token;
 mod transactions;
 
@@ -519,6 +520,7 @@ pub fn register(reg: &mut Registry) {
     identity::register(reg);
     scm::register(reg);
     token::register(reg);
+    security::register(reg);
     for (name, argc, handler) in [
         (
             "RegOpenKeyExA",

@@ -1,6 +1,7 @@
-//! Read-only primary-token queries for the ordinary, non-elevated guest user.
+//! Owned process and impersonation tokens for the ordinary, non-elevated guest user.
 //! Token handles use Objects ownership; no host account/token is acquired.
-use std::sync::Arc;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+mod permissions;
 
 use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, warn_unavailable, win32};
 use adv_cpu::backend::{GuestExt, Prot};
@@ -10,19 +11,54 @@ use crate::{kernel32::child_process::process_target, util::set_last_error};
 
 const QUERY: u32 = 8;
 const READ_CONTROL: u32 = 0x20000;
-const SUPPORTED_ACCESS: u32 = QUERY | READ_CONTROL;
+const SUPPORTED_ACCESS: u32 = 0xf01ff;
+#[derive(Clone)]
+struct TokenData {
+    kind: u32,
+    level: u32,
+    privileges: BTreeMap<u64, u32>,
+}
+impl Default for TokenData {
+    fn default() -> Self {
+        Self {
+            kind: 1,
+            level: 2,
+            privileges: BTreeMap::from([(19, 0), (23, 3), (25, 0), (33, 0), (34, 0)]),
+        }
+    }
+}
+#[derive(Default)]
+struct TokenOwner {
+    primary: Rc<RefCell<TokenData>>,
+    threads: BTreeMap<
+        adv_machine::CtxId,
+        (
+            std::sync::Weak<adv_machine::process::Completion>,
+            Rc<RefCell<TokenData>>,
+        ),
+    >,
+}
 
 struct Token {
     _process: Arc<ProcessIdentity>,
     access: u32,
+    data: Rc<RefCell<TokenData>>,
 }
 fn fail(env: &mut Env<'_>, error: u32) -> i32 {
     set_last_error(env, error);
     0
 }
 fn access(mut requested: u32) -> Option<u32> {
-    if requested & 0x80000000 != 0 {
-        requested = (requested & !0x80000000) | SUPPORTED_ACCESS;
+    for (generic, specific) in [
+        (0x80000000, READ_CONTROL | QUERY),
+        (0x40000000, READ_CONTROL | 0xe0),
+        (0x20000000, READ_CONTROL),
+        (0x10000000, SUPPORTED_ACCESS),
+        (0x02000000, SUPPORTED_ACCESS),
+    ] {
+        if requested & generic != 0 {
+            requested = (requested & !generic) | specific;
+        }
     }
     (requested & !SUPPORTED_ACCESS == 0).then_some(requested)
 }
@@ -42,19 +78,16 @@ fn open(env: &mut Env<'_>, process: Handle, desired: u32, output: GuestPtr<Handl
         return fail(env, 50);
     }
     let Some(access) = access(desired) else {
-        warn_unavailable(
-            env,
-            "advapi32.dll!OpenProcessToken",
-            "token access outside read-only queries is unavailable",
-        );
-        return fail(env, 50);
+        return fail(env, if desired & 0x01000000 != 0 { 1314 } else { 5 });
     };
     if check_range(env.cpu, output.addr(), 4, Prot::WRITE).is_err() {
         return fail(env, 998);
     }
+    let data = env.ext.get_or_default::<TokenOwner>().primary.clone();
     let handle = env.sys.objects.insert_host(Token {
         _process: identity,
         access,
+        data,
     });
     if handle == 0 {
         return fail(env, 8);
@@ -76,21 +109,17 @@ fn information(
     capacity: u32,
     required: GuestPtr<u32>,
 ) -> i32 {
-    let value: u32 = match class {
-        1 => 0,  // TOKEN_USER is serialized below using the shared guest account SID.
-        8 => 1,  // TokenPrimary
-        18 => 1, // TokenElevationTypeDefault: ordinary user, no linked token.
-        20 | 21 | 23 | 24 | 26 | 29 => 0, // Not elevated/filtered/virtualized/UIAccess/AppContainer.
-        9 => 0, // Primary-token type is rejected after validating the handle.
-        _ => {
-            warn_unavailable(
-                env,
-                "advapi32.dll!GetTokenInformation",
-                &format!("token information class {class} is unavailable"),
-            );
-            return fail(env, 50);
-        }
-    };
+    if class == 29 {
+        return fail(env, 87);
+    }
+    if !matches!(class, 1 | 3 | 8 | 9 | 18 | 20 | 21 | 23 | 24 | 26) {
+        warn_unavailable(
+            env,
+            "advapi32.dll!GetTokenInformation",
+            &format!("token information class {class} is unavailable"),
+        );
+        return fail(env, 50);
+    }
     // TokenElevation is a Win32 wrapper with exact-size validation before
     // token validation. Other scalar classes validate the token first.
     if class == 20 {
@@ -109,16 +138,21 @@ fn information(
     if token.access & QUERY == 0 {
         return fail(env, 5);
     }
-    if class == 9 {
-        return fail(env, 1349);
-    } // ERROR_BAD_TOKEN_TYPE
+    let data = token.data.borrow().clone();
+    let value = match class {
+        8 => data.kind,
+        9 if data.kind == 1 => return fail(env, 1349),
+        9 => data.level,
+        18 => 1,
+        _ => 0,
+    }; // ERROR_BAD_TOKEN_TYPE
     if check_range(env.cpu, required.addr(), 4, Prot::WRITE).is_err() {
         return fail(env, 998);
     }
-    let length = if class == 1 {
-        8 + adv_os::identity::current_user_sid().len() as u32
-    } else {
-        4
+    let length = match class {
+        1 => 8 + adv_os::identity::current_user_sid().len() as u32,
+        3 => 4 + 12 * data.privileges.len() as u32,
+        _ => 4,
     };
     if capacity < length {
         let _ = required.write(env.cpu, length);
@@ -131,6 +165,17 @@ fn information(
     if class == 1 {
         bytes[..4].copy_from_slice(&(output.addr() + 8).to_le_bytes());
         bytes[8..].copy_from_slice(&adv_os::identity::current_user_sid());
+    } else if class == 3 {
+        bytes[..4].copy_from_slice(&(data.privileges.len() as u32).to_le_bytes());
+        for (row, (&luid, &attrs)) in bytes[4..]
+            .as_chunks_mut::<12>()
+            .0
+            .iter_mut()
+            .zip(data.privileges.iter())
+        {
+            row[..8].copy_from_slice(&luid.to_le_bytes());
+            row[8..].copy_from_slice(&attrs.to_le_bytes());
+        }
     } else {
         bytes[..4].copy_from_slice(&value.to_le_bytes());
     }
@@ -153,6 +198,7 @@ pub(crate) fn duplicate(env: &mut Env<'_>, source: u32, desired: u32) -> Option<
     let value = Token {
         _process: token._process.clone(),
         access: granted,
+        data: token.data.clone(),
     };
     let handle = env.sys.objects.insert_host(value);
     Some(if handle == 0 { Err(8) } else { Ok(handle) })
@@ -209,6 +255,7 @@ fn sid_text_w(env: &mut Env<'_>, sid: GuestPtr<()>, output: GuestPtr<GuestPtr<u1
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    permissions::register(registry);
     registry.register(open_ABI);
     registry.register(information_ABI);
     registry.register(sid_text_a_ABI);

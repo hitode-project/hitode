@@ -221,4 +221,16 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft SystemTimeToTzSpecificLocalTime and TIME_ZONE_INFORMATION contracts.
 
+### SYS-SECURITY-1 Guest identity queries
+
+**Rule**: SID and account queries MUST use the existing guest identity and checked SID layouts. Security-descriptor owner queries MUST preserve relative and absolute owner pointers. Privilege-name lookup MUST return stable LUIDs without granting privileges.
+**Verification**: Test
+**Basis**: Microsoft IsValidSid, LookupAccountSid, LookupPrivilegeValue and GetSecurityDescriptorOwner contracts.
+
+### SYS-SECURITY-2 Ordinary token ownership
+
+**Rule**: Token aliases MUST share privilege state, while DuplicateTokenEx MUST create an independent token copy. AdjustTokenPrivileges MUST preserve absent privileges and report ERROR_NOT_ALL_ASSIGNED without granting authority. Impersonation MUST remain bound to its guest thread, and token process creation MUST enforce the ordinary caller's privilege restrictions.
+**Verification**: Test
+**Basis**: Microsoft AdjustTokenPrivileges, DuplicateTokenEx, ImpersonateLoggedOnUser and CreateProcessWithTokenW contracts.
+
 Withdrawn: none
