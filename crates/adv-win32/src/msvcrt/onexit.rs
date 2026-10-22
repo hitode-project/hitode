@@ -359,11 +359,11 @@ fn execute(env: &mut Env<'_>, pointer: GuestPtr<[u32; 3]>) -> Outcome {
 }
 #[win32(ucrtbase, name="_initterm", level=implement)]
 fn initterm(env: &mut Env<'_>, begin: GuestPtr<u32>, end: GuestPtr<u32>) -> Outcome {
-    initializers(env, begin.addr(), end.addr(), false)
+    initializer_table(env, begin.addr(), end.addr(), false)
 }
 #[win32(ucrtbase, name="_initterm_e", level=implement)]
 fn initterm_e(env: &mut Env<'_>, begin: GuestPtr<u32>, end: GuestPtr<u32>) -> Outcome {
-    initializers(env, begin.addr(), end.addr(), true)
+    initializer_table(env, begin.addr(), end.addr(), true)
 }
 
 #[cfg(test)]

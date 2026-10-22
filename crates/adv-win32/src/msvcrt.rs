@@ -427,6 +427,13 @@ fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
         .unwrap_or(0)
 }
 
+/// Every `_initterm` front validates the table bounds before running entries.
+fn initializer_table(e: &mut Env<'_>, begin: u32, end: u32, stop_on_error: bool) -> Outcome {
+    if end < begin || end - begin > 1024 * 1024 || !(end - begin).is_multiple_of(4) {
+        return Outcome::Fail("invalid initializer range".into());
+    }
+    initializers(e, begin, end, stop_on_error)
+}
 fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> Outcome {
     while p < end {
         let Ok(target) = e.cpu.read_u32(p) else {
@@ -685,12 +692,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "strlen" | "strcmp" | "strncmp" | "strchr" | "strrchr" | "strstr" | "strcpy"
         | "strncpy" | "strcat" | "strncat" | "wcslen" | "wcscmp" | "wcsncmp" | "wcschr"
         | "wcsrchr" | "wcsstr" | "wcscpy" | "wcsncpy" | "wcscat" => return strings::call(e),
-        "_initterm" | "_initterm_e" => {
-            if b < a || b - a > 1024 * 1024 || !(b - a).is_multiple_of(4) {
-                return Outcome::Fail("invalid initializer range".into());
-            }
-            return initializers(e, a, b, name == "_initterm_e");
-        }
+        "_initterm" | "_initterm_e" => return initializer_table(e, a, b, name == "_initterm_e"),
         "time" | "_time32" => {
             let ft = crate::kernel32::filetime_now(e);
             let unix_sec = (ft.saturating_sub(116_444_736_000_000_000) / 10_000_000) as u32;
